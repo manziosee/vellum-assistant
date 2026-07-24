@@ -283,14 +283,37 @@ export function classifySegment(
   registry: Record<string, CommandRiskSpec>,
   toolName: "bash" | "host_bash" = "bash",
 ): { risk: Risk; reason: string; matchType: RiskAssessment["matchType"] } {
-  // 1. Check user rules first (highest priority)
-  // TODO: implement user rule matching with specificity ordering.
-  // For now, userRules is always empty so this is a no-op.
-  for (const rule of userRules) {
+  // 1. Check user rules first (highest priority — short-circuits remaining pipeline).
+  // Sort by pattern length descending so more specific regex patterns win.
+  const sortedUserRules = userRules
+    .slice()
+    .sort((a, b) => b.pattern.length - a.pattern.length);
+  for (const rule of sortedUserRules) {
     const re = getCompiledPattern(rule.pattern);
     if (re.test(segment.command)) {
       return { risk: rule.risk, reason: rule.label, matchType: "user_rule" };
     }
+  }
+
+  // 1b. Short-circuit on user-defined trust rules from the cache.
+  // Rules with origin="user_defined" (created by the user) bypass the
+  // classification pipeline entirely, including arg-rule escalation.
+  // Rules with userModified=true (seeded defaults the user adjusted) fall
+  // through to step 4b, which overrides baseRisk while arg rules still apply.
+  try {
+    const cacheRule = getTrustRuleCache().findBaseRisk(
+      toolName,
+      segment.command,
+    );
+    if (cacheRule?.origin === "user_defined") {
+      return {
+        risk: cacheRule.risk,
+        reason: cacheRule.description,
+        matchType: "user_rule",
+      };
+    }
+  } catch {
+    // Cache not initialized (tests / pre-init path) — fall through to registry.
   }
 
   // 2. Look up command in default registry
