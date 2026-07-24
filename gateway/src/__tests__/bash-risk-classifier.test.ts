@@ -5,7 +5,10 @@ import {
   initTrustRuleCache,
   resetTrustRuleCache,
 } from "../risk/trust-rule-cache.js";
-import { classifySegment } from "../risk/bash-risk-classifier.js";
+import {
+  BashRiskClassifier,
+  classifySegment,
+} from "../risk/bash-risk-classifier.js";
 import { DEFAULT_COMMAND_REGISTRY } from "../risk/command-registry/index.js";
 import type { CommandSegment } from "../risk/shell-parser.js";
 import type { UserRule } from "../risk/risk-types.js";
@@ -349,6 +352,34 @@ describe("risk rule cache integration", () => {
 
     // --force arg rule still escalates through step 4b
     expect(result.risk).toBe("high");
+  });
+
+  test("exact compound-command rule short-circuits at classify() level", async () => {
+    // The "This exact command" allowlist option stores the full raw command
+    // string as the trust-rule pattern (e.g. "rm -rf /tmp && echo done").
+    // classifySegment never sees that full string — it receives each segment
+    // ("rm -rf /tmp" and "echo done") separately. The pre-parse check in
+    // classify() is the only place the exact compound pattern can match.
+    const compound = "rm -rf /tmp && echo done";
+    store.create({
+      tool: "bash",
+      pattern: compound,
+      risk: "low",
+      description: "Approved: clean /tmp then echo done",
+    });
+
+    initTrustRuleCache(store);
+
+    const classifier = new BashRiskClassifier();
+    const result = await classifier.classify({
+      command: compound,
+      toolName: "bash",
+    });
+
+    // Without the classify()-level check, rm -rf would escalate to "high"
+    // via arg rules. The exact user_defined rule must short-circuit first.
+    expect(result.riskLevel).toBe("low");
+    expect(result.matchType).toBe("user_rule");
   });
 });
 

@@ -1008,6 +1008,30 @@ export class BashRiskClassifier implements RiskClassifier<BashClassifierInput> {
       };
     }
 
+    // Pre-parse exact compound-command check.
+    // A compound command like "rm -rf /tmp && echo done" is split into segments
+    // before classifySegment is called, so step 1b inside classifySegment only
+    // sees each half. The "This exact command" allowlist option stores the full
+    // raw string as the trust-rule pattern, making it unreachable per-segment.
+    // Checking here — before cachedParse — is the only place that raw pattern
+    // can match. Only exact user-defined rules are probed (findBaseRisk tries
+    // the literal first, then the action: sibling, then progressively shorter
+    // prefixes); a compound command with && / || / ; only hits the literal step.
+    try {
+      const fullRule = getTrustRuleCache().findBaseRisk(toolName, command);
+      if (fullRule?.origin === "user_defined") {
+        return {
+          riskLevel: fullRule.risk,
+          reason: fullRule.description,
+          scopeOptions: [],
+          matchType: "user_rule",
+          allowlistOptions: [],
+        };
+      }
+    } catch {
+      // Cache not initialized — fall through to per-segment classification.
+    }
+
     const parsed = await cachedParse(command);
 
     let maxRiskLevel: Risk = "low";
