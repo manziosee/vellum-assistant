@@ -25,7 +25,7 @@ import {
 } from "@vellumai/plugin-api";
 
 import type { AssistantConfig } from "../../../../config/types.js";
-import { getDb } from "../../../../persistence/db-connection.js";
+import { getMemoryDb } from "../../../../persistence/db-connection.js";
 import type { MemoryJob } from "../../../../persistence/jobs-store.js";
 import { enqueueEmbedConceptPageJob } from "../jobs/embed-concept-page.js";
 import { getLogger } from "../logging.js";
@@ -65,10 +65,20 @@ export async function memoryV2MigrateJob(
   const force =
     typeof job.payload.force === "boolean" ? job.payload.force : false;
 
+  // The v1 graph the migration reads now lives in the dedicated memory
+  // database, so gatherV1State reads it there. Defer (throw for retry) if that
+  // connection cannot be opened rather than migrating an empty graph.
+  const database = getMemoryDb();
+  if (!database) {
+    throw new Error(
+      "memory database unavailable — deferring memory v2 migration",
+    );
+  }
+
   try {
     const result = await runMemoryV2Migration({
       workspaceDir: getWorkspaceDir(),
-      database: getDb(),
+      database,
       force,
       config,
     });
@@ -161,7 +171,6 @@ export async function memoryV2ActivationRecomputeJob(
   config: AssistantConfig,
 ): Promise<number> {
   const workspaceDir = getWorkspaceDir();
-  const database = getDb();
 
   // Activation maps still need to refresh for archived conversations — a
   // consolidated page can leave stale slugs above epsilon in their persisted
@@ -177,7 +186,7 @@ export async function memoryV2ActivationRecomputeJob(
 
   let updated = 0;
   for (const conv of conversations) {
-    const priorState = await hydrate(database, conv.id);
+    const priorState = await hydrate(conv.id);
     if (!priorState) {
       continue;
     } // Nothing to recompute when no row exists.
@@ -202,7 +211,7 @@ export async function memoryV2ActivationRecomputeJob(
     if (!nextState) {
       continue;
     }
-    await save(database, conv.id, nextState);
+    await save(conv.id, nextState);
     updated += 1;
   }
 

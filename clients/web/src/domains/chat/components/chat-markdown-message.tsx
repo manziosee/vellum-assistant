@@ -23,6 +23,7 @@ import {
 import type { DisplayAttachment } from "@/types/attachment-types";
 import { useAttachmentPreview } from "@/domains/chat/components/chat-attachments/use-attachment-preview";
 import { defaultUrlTransform } from "react-markdown";
+import { handleNativeAnchorClick } from "@/utils/native-anchor";
 
 import {
   openMarkdownOAuthLinkInPopup,
@@ -53,10 +54,7 @@ export function isVellumLink(href: string | undefined): boolean {
  * `vellum://` shapes are rejected to limit protocol-handler attack surface.
  */
 function vellumUrlTransform(url: string): string {
-  if (
-    url.startsWith("vellum://workspace/") ||
-    url.startsWith("vellum://host/")
-  ) {
+  if (isVellumLink(url)) {
     return url;
   }
   return defaultUrlTransform(url);
@@ -76,7 +74,11 @@ function OAuthAwareLink({
       onClick={(event) => {
         if (openMarkdownOAuthLinkInPopup(href)) {
           event.preventDefault();
+          return;
         }
+        // In the iOS webview a `target="_blank"` anchor silently no-ops;
+        // route through the native opener there (no-op elsewhere).
+        handleNativeAnchorClick(event, href);
       }}
       className="text-[var(--system-positive-strong)] underline hover:opacity-80"
     >

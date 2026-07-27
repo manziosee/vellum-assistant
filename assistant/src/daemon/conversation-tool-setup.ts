@@ -62,14 +62,18 @@ import {
   type UsageAttributionSnapshot,
 } from "../usage/attribution.js";
 import { getLogger } from "../util/logger.js";
+import { conversationSupportsDynamicUi } from "./channel-ui-capability.js";
 import type { Conversation } from "./conversation.js";
 import { projectSkillTools } from "./conversation-skill-tools.js";
-import { surfaceProxyResolver } from "./conversation-surfaces.js";
+import {
+  restoreSurfaceStateEntry,
+  surfaceProxyResolver,
+} from "./conversation-surfaces.js";
 import {
   isDoordashCommand,
   markDoordashStepInProgress,
 } from "./doordash-steps.js";
-import type { ServerMessage, UiSurfaceShow } from "./message-protocol.js";
+import type { AssistantEvent } from "./message-protocol.js";
 import { runPostExecutionSideEffects } from "./tool-side-effects.js";
 import { FALLBACK_TURN_TRUST, resolveTrustClass } from "./trust-context.js";
 
@@ -357,6 +361,8 @@ export function createToolExecutor(
       batchAuthorizedByTask: false,
       requesterExternalUserId: turnTrust.requesterExternalUserId,
       requesterChatId: turnTrust.requesterChatId,
+      sourceMessageId: turnTrust.sourceMessageId,
+      sourceThreadId: turnTrust.sourceThreadId,
       requesterIdentifier: turnTrust.requesterIdentifier,
       requesterDisplayName: turnTrust.requesterDisplayName,
       channelConversationType: turnTrust.conversationType,
@@ -385,19 +391,26 @@ export function createToolExecutor(
       enabledPluginSet: effectiveEnabledPluginSet,
       sendToClient: (msg) => {
         // Tool context's sendToClient uses a loose { type: string; [key: string]: unknown }
-        // signature, but at runtime these are always ServerMessage instances.
-        ctx.sendToClient(msg as ServerMessage);
+        // signature, but at runtime these are always AssistantEvent instances.
+        ctx.sendToClient(msg as AssistantEvent);
         if (msg.type === "ui_surface_show") {
-          const s = msg as unknown as UiSurfaceShow;
-          const surfaceToolCallId = s.toolCallId ?? toolUseId;
+          // The tool-context sendToClient signature is loose, so the show
+          // message's fields are untyped here; map them through the same
+          // schema-validating helper history restore uses so the tracked
+          // surface carries a correlated surfaceType/data pair.
+          const s = msg as Record<string, unknown>;
+          if (typeof s.surfaceId !== "string") {
+            return;
+          }
+          const entry = restoreSurfaceStateEntry(s);
+          const surfaceToolCallId =
+            (typeof s.toolCallId === "string" ? s.toolCallId : undefined) ??
+            toolUseId;
           ctx.currentTurnSurfaces.push({
             surfaceId: s.surfaceId,
-            surfaceType: s.surfaceType,
-            title: s.title,
-            data: s.data,
-            actions: s.actions,
-            display: s.display,
-            ...(s.persistent ? { persistent: true } : {}),
+            ...entry,
+            display: typeof s.display === "string" ? s.display : undefined,
+            ...(s.persistent === true ? { persistent: true } : {}),
             ...(surfaceToolCallId ? { toolCallId: surfaceToolCallId } : {}),
           });
         }
@@ -406,6 +419,10 @@ export function createToolExecutor(
         ctx.currentTurnIsNonInteractive !== undefined
           ? !ctx.currentTurnIsNonInteractive
           : !ctx.hasNoClient && !ctx.headlessLock,
+      // Lets UI-dependent tools (e.g. `ask_question`) degrade to text on
+      // channels that can't render dynamic surfaces (Telegram, SMS) instead of
+      // emitting one the channel silently drops.
+      supportsDynamicUi: conversationSupportsDynamicUi(ctx),
       proxyToolResolver: (
         toolName: string,
         proxyInput: Record<string, unknown>,
@@ -858,9 +875,11 @@ export function createResolveToolsCallback(
     void loadWorkspaceTools();
 
     // Same treatment for user-plugin tools: pull the plugin mtime-cache's
-    // active tool set into the registry (a no-op costs one sentinel stat +
-    // fingerprint compares), so a plugin installed/removed/edited at runtime
-    // is picked up without recreating the conversation.
+    // active tool set into the registry (a no-op costs a fingerprint compare
+    // per plugin). This pull is a pure cache read — plugin activation happens
+    // only at boot and through the install/uninstall routes, both main-daemon
+    // paths — so a plugin installed or removed through the routes is still
+    // picked up here without recreating the conversation.
     void loadPluginTools();
 
     // Read every registered plugin tool each turn (so runtime installs/edits

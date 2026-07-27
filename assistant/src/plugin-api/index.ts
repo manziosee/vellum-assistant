@@ -102,6 +102,7 @@ export type { LLMCallSite } from "../config/schemas/llm.js";
 export type {
   AgentLoopExitReason,
   ConversationDeletedContext,
+  ConversationsClearedContext,
   HookBroadcast,
   HookFunction,
   InitContext,
@@ -126,7 +127,14 @@ export { RiskLevel } from "./types.js";
 // Workspace-local plugins resolve these via the boot-time shim, which
 // re-binds each from the assistant's globalThis-parked namespace so they
 // share module identity with the assistant's own singletons.
-export type { AssistantEvent } from "../runtime/assistant-event.js";
+export type { AssistantEventEnvelope } from "../runtime/assistant-event.js";
+/**
+ * @deprecated Renamed to {@link AssistantEventEnvelope}. Retained as a
+ * compatibility alias so existing plugins that import `AssistantEvent` from
+ * `@vellumai/plugin-api` (the SSE envelope a hub subscriber receives) keep
+ * compiling. Prefer `AssistantEventEnvelope` in new plugin code.
+ */
+export type { AssistantEventEnvelope as AssistantEvent } from "../runtime/assistant-event.js";
 export type {
   AssistantEventCallback,
   AssistantEventFilter,
@@ -143,12 +151,18 @@ export type {
 export type { PluginEventHub } from "./event-hub-facade.js";
 /**
  * @deprecated Direct hub access is being replaced by narrower, purpose-built
- * importable helpers (e.g. a plugin-driven publish wrapper) so plugins don't
- * hold the general publish/subscribe surface. Avoid new usage; prefer the
- * scoped helpers as they land.
+ * importable helpers so plugins don't hold the general publish/subscribe
+ * surface. To emit an event, prefer {@link publishEvent}; avoid new usage of
+ * the raw hub.
  */
 export { pluginAssistantEventHub as assistantEventHub } from "./event-hub-facade.js";
 export { getModelProfiles } from "./model-profiles.js";
+// Purpose-built publish wrapper: emit a runtime event to the assistant's event
+// hub without holding the general hub handle. Route/hook authors surfacing a UI
+// invalidation (e.g. `sync_changed`) import this. Delegates to the same
+// capability-restricted facade, so host-proxy control events stay rejected.
+export type { PublishEventOptions } from "./publish-event.js";
+export { publishEvent } from "./publish-event.js";
 // Check whether a model or profile can process image input. Accepts a concrete
 // model id, a profile key, or a `ModelProfileInfo`; a bare string is resolved
 // as a model id first and then as a profile key. Profile resolution merges over
@@ -295,6 +309,25 @@ export {
 export type { SynthesizeTextOptions } from "../tts/synthesize-text.js";
 export { synthesizeText, TtsSynthesisError } from "../tts/synthesize-text.js";
 export type { TtsSynthesisResult } from "../tts/types.js";
+// Streaming speech-to-text — open a live transcription session against the
+// assistant's globally configured STT provider stack. The plugin feeds audio
+// chunks via `sendAudio` and receives partial/final transcript events through
+// the `start(onEvent)` callback, closing with `stop`. `SttStreamServerEvent`
+// and its variants type the events handed to `onEvent`; `SttErrorCategory`
+// classifies `error` events; `SttProviderId` names the resolved session's
+// provider.
+export type {
+  StreamingTranscriber,
+  SttErrorCategory,
+  SttProviderId,
+  SttStreamServerClosedEvent,
+  SttStreamServerErrorEvent,
+  SttStreamServerEvent,
+  SttStreamServerFinalEvent,
+  SttStreamServerFinalizedEvent,
+  SttStreamServerPartialEvent,
+} from "../stt/types.js";
+export { openTranscriptionSession } from "./transcription-session.js";
 // Conversation agent-loop turn — run a full conversation turn (persist user
 // message, execute the agent loop with history/tools/compaction/injections,
 // return the assistant's full content-block response). Accepts ContentBlock[]

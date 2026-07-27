@@ -14,6 +14,13 @@ import {
 } from "react-router";
 
 import { useAssistantLifecycleStore } from "@/assistant/lifecycle-store";
+import {
+  selectChatFocusActive,
+  selectHeaderCenterHidden,
+  selectHeaderControlsHidden,
+  selectTourActive,
+  useInChatOnboardingStore,
+} from "@/stores/in-chat-onboarding-store";
 import { useResolvedAssistantsStore } from "@/stores/resolved-assistants-store";
 import { MOBILE_MEDIA_QUERY, useIsMobile } from "@/hooks/use-is-mobile";
 import {
@@ -45,6 +52,7 @@ import { useChatLayoutDrawer } from "@/domains/chat/hooks/use-chat-layout-drawer
 import { useChatLayoutShortcuts } from "@/domains/chat/hooks/use-chat-layout-shortcuts";
 import { useConversationActions } from "@/domains/chat/hooks/use-conversation-actions";
 import { useConversationGroupActions } from "@/domains/chat/hooks/use-conversation-group-actions";
+import { useGroupNameRequestStore } from "@/domains/chat/group-name-request-store";
 import { useCanUseLlmInspector } from "@/domains/chat/inspector/access";
 import {
   navigateToConversation,
@@ -86,6 +94,7 @@ import { VoiceRoom } from "@/domains/chat/voice/voice-room/voice-room";
 import { useIsVoiceRoomVisible } from "@/domains/chat/voice/voice-room/use-is-voice-room-visible";
 import { ChatConversationHeader } from "./chat-conversation-header";
 import { ChatLayoutHeader } from "./chat-layout-header";
+import { GroupNameDialogFromStore } from "./group-name-dialog-from-store";
 import { RenameDialogFromStore } from "./rename-dialog-from-store";
 
 const CommandPalette = lazy(() =>
@@ -208,10 +217,11 @@ export function ChatLayout({
   // create/rename/delete affordances are rendered here, not in ChatPage.
   // The hook is self-sufficient (cache invalidation handles rollback), so
   // it can live wherever the sidebar lives.
-  const { handleRenameGroup, handleDeleteGroup } = useConversationGroupActions({
-    assistantId,
-    conversationGroups,
-  });
+  const { createGroup, renameGroup, handleDeleteGroup } =
+    useConversationGroupActions({
+      assistantId,
+      conversationGroups,
+    });
 
   // Mirror the unread count + signed-in flag into the Electron Dock
   // (no-op off Electron). Uses the conversation list this layout
@@ -236,6 +246,17 @@ export function ChatLayout({
   const showLlmInspector = useCanUseLlmInspector();
   const isNative = useIsNativePlatform();
   const electron = isElectron();
+  // In-chat onboarding prototype: the tour's opening beats hide the sidebar
+  // and header controls; the tour reveals them itself as it walks.
+  const chatFocusActive = useInChatOnboardingStore(selectChatFocusActive);
+  const headerControlsHidden = useInChatOnboardingStore(
+    selectHeaderControlsHidden,
+  );
+  const headerCenterHidden = useInChatOnboardingStore(
+    selectHeaderCenterHidden,
+  );
+  const navTourActive = useInChatOnboardingStore.use.navTourActive();
+  const tourActive = useInChatOnboardingStore(selectTourActive);
 
   // --- Assistant identity from store (written by ChatPage) ---
   const assistantName = useAssistantIdentityStore.use.name();
@@ -281,6 +302,11 @@ export function ChatLayout({
   // --- Sidebar collapsed / drawer state ---
   const [collapsed, setCollapsed] = useState<boolean>(readPersistedCollapsed);
   const [sidebarWidth, setSidebarWidth] = useState<number>(readPersistedWidth);
+  // The tour walks the sidebar's rows, which a 48px collapsed rail doesn't
+  // show — so the tour's whole run forces the rail expanded. Derived (not
+  // written through setCollapsed) so the user's persisted preference is
+  // untouched and the rail collapses back on its own when the tour ends.
+  const effectiveCollapsed = collapsed && !tourActive;
 
   useEffect(() => {
     setLocalBool(SIDEBAR_COLLAPSED_STORAGE_KEY, collapsed);
@@ -343,6 +369,12 @@ export function ChatLayout({
   const drawerVisible = isMobile && drawerOpen;
 
   const toggleSidebar = useCallback(() => {
+    // The tour forces the rail expanded; a toggle would only flip the
+    // persisted preference invisibly (Ctrl+\ still fires under the tour's
+    // click-blocking overlay), so ignore it for the tour's duration.
+    if (selectTourActive(useInChatOnboardingStore.getState())) {
+      return;
+    }
     haptic.light();
     if (window.matchMedia(MOBILE_MEDIA_QUERY).matches) {
       setDrawerOpen((value) => {
@@ -437,6 +469,8 @@ export function ChatLayout({
     handleMarkConversationUnread,
     handleMarkConversationRead,
     handleTogglePinConversation,
+    handleMoveToGroup,
+    handleRemoveFromGroup,
     handleRenameConversation,
     handleReorderConversations,
     handleMarkAllReadInGroup,
@@ -449,6 +483,36 @@ export function ChatLayout({
     startNewConversation,
     prePinGroupIdsRef,
   });
+
+  // The move-to-group menu's "New group…" item and the group actions menu's
+  // "Rename" open the shared NameInputDialog through the request store; the
+  // GroupNameDialogFromStore connector (mounted below) performs the
+  // create-then-move / rename on submit. "New group…" is the only
+  // group-creation entry point — there is no standalone create button.
+  const handleRequestCreateGroup = useCallback(
+    (conversation: Conversation) =>
+      useGroupNameRequestStore.getState().requestCreateGroup(conversation),
+    [],
+  );
+  const handleRequestRenameGroup = useCallback(
+    (groupId: string) => {
+      const currentName =
+        conversationGroups.find((g) => g.id === groupId)?.name ?? "";
+      useGroupNameRequestStore
+        .getState()
+        .requestRenameGroup(groupId, currentName);
+    },
+    [conversationGroups],
+  );
+
+  // A pending group-name request captures a specific conversation ("New
+  // group…") or group ("Rename"); if the active assistant changes before the
+  // user submits, that target belongs to the previous assistant while the
+  // create/move/rename would run against the new one. Clear it on assistant
+  // change so we never act across a mismatched assistant.
+  useEffect(() => {
+    useGroupNameRequestStore.getState().clearGroupNameRequest();
+  }, [assistantId]);
 
   // Resolve the active row from whichever list cache holds it (foreground,
   // background, or scheduled), fetching the single row when an open
@@ -472,12 +536,16 @@ export function ChatLayout({
         activeConversation={activeConversation}
         headerSupplements={headerSupplements}
         showLlmInspector={showLlmInspector}
+        conversationGroups={conversationGroups}
         onArchive={handleArchiveConversation}
         onUnarchive={handleUnarchiveConversation}
         onMarkUnread={handleMarkConversationUnread}
         onMarkRead={handleMarkConversationRead}
         onPinToggle={handleTogglePinConversation}
         onRename={handleRenameConversation}
+        onMoveToGroup={handleMoveToGroup}
+        onCreateGroupInto={handleRequestCreateGroup}
+        onRemoveFromGroup={handleRemoveFromGroup}
       />
     ) : null);
 
@@ -707,12 +775,15 @@ export function ChatLayout({
       onUnarchiveConversation={handleUnarchiveConversation}
       onMarkConversationUnread={handleMarkConversationUnread}
       onMarkConversationRead={handleMarkConversationRead}
-      onRenameGroup={handleRenameGroup}
+      onRenameGroup={handleRequestRenameGroup}
       onDeleteGroup={handleDeleteGroup}
       onMarkAllReadInGroup={handleMarkAllReadInGroup}
       onArchiveAllInGroup={handleArchiveAllInGroup}
       onOpenInNewWindow={isNative ? undefined : handleOpenInNewWindow}
       onInspect={showLlmInspector ? handleInspectConversation : undefined}
+      onMoveToGroup={handleMoveToGroup}
+      onCreateGroupInto={handleRequestCreateGroup}
+      onRemoveFromGroup={handleRemoveFromGroup}
       footerAction={
         <PreferencesMenu
           assistantId={assistantId}
@@ -724,10 +795,12 @@ export function ChatLayout({
       // The overlay subtree mounts mid edge-swipe while still off-screen;
       // mounting the tip card there stamps an impression for a tip never
       // seen, so the overlay only gets it once the drawer settles open.
+      // Hidden during the avatar tour for the same reason (plus noise) —
+      // the tour owns the sidebar's attention.
       tipCard={
-        args.variant === "overlay" && !drawerOpen ? undefined : (
-          <SidebarTipCard />
-        )
+        (args.variant === "overlay" && !drawerOpen) || navTourActive
+          ? undefined
+          : <SidebarTipCard />
       }
       onClose={args.onClose}
     />
@@ -746,9 +819,15 @@ export function ChatLayout({
         <ChatLayoutHeader
           isMobile={isMobile}
           drawerOpen={drawerOpen}
-          collapsed={collapsed}
+          collapsed={effectiveCollapsed}
           sidebarWidth={sidebarWidth}
           toggleSidebar={toggleSidebar}
+          controlsHidden={headerControlsHidden}
+          centerHidden={headerCenterHidden}
+          // The tour dims the header's clusters for its whole run — no
+          // beat ever focuses them. (Center-hidden is true exactly while
+          // the tour runs, so it doubles as the dim signal.)
+          controlsDimmed={headerCenterHidden}
           topBarCenter={topBarCenter}
           // The voice-session pill is composed here — NOT registered through
           // useChatLayoutSlotsStore — because slot registration is owned by
@@ -855,11 +934,24 @@ export function ChatLayout({
         <div className="flex min-w-0 flex-1 gap-4 p-4 min-h-0 overflow-hidden flex-col md:flex-row">
           <aside
             id="chat-side-menu"
-            className="shrink-0"
+            className="shrink-0 overflow-hidden"
             aria-label="Navigation"
+            // Explicit width (matching the rail's own) so the onboarding
+            // prototype's focused stage can slide the whole rail away; the
+            // negative margin cancels the row gap so the chat goes full-width.
+            // Hiding eases smoothly; revealing uses a back-ease so the rail
+            // lands with a slight bounce (the tour's takeover moment).
+            style={{
+              width: chatFocusActive ? 0 : effectiveCollapsed ? 48 : sidebarWidth,
+              opacity: chatFocusActive ? 0 : 1,
+              marginRight: chatFocusActive ? -16 : 0,
+              transition: chatFocusActive
+                ? "width 500ms ease-in-out, opacity 300ms ease-in-out, margin-right 500ms ease-in-out"
+                : "width 550ms cubic-bezier(0.34, 1.56, 0.64, 1), opacity 250ms ease-out, margin-right 550ms cubic-bezier(0.34, 1.56, 0.64, 1)",
+            }}
           >
             {renderSideMenu({
-              collapsed,
+              collapsed: effectiveCollapsed,
               variant: "rail",
               width: sidebarWidth,
               onWidthChange: handleSidebarWidthChange,
@@ -893,6 +985,11 @@ export function ChatLayout({
       <OnboardingAvatarApplier />
 
       <RenameDialogFromStore assistantId={assistantId} />
+      <GroupNameDialogFromStore
+        createGroup={createGroup}
+        renameGroup={renameGroup}
+        moveToGroup={handleMoveToGroup}
+      />
       {commandPalette.isOpen ? (
         <LazyBoundary>
           <CommandPalette

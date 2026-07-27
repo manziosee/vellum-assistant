@@ -450,6 +450,14 @@ import { migrateMoveActivationSessionsToMemoryDb } from "./migrations/339-move-a
 import { migrateSweepOrphanedGraphNodeVectors } from "./migrations/340-sweep-orphaned-graph-node-vectors.js";
 import { migrateSweepCachelessGraphNodeVectors } from "./migrations/341-sweep-cacheless-graph-node-vectors.js";
 import { migrateAddConversationParentId } from "./migrations/342-add-conversation-parent-id.js";
+import { migrateMoveActivationStateToMemoryDb } from "./migrations/343-move-activation-state-to-memory-db.js";
+import { migrateMoveConversationGraphMemoryStateToMemoryDb } from "./migrations/344-move-conversation-graph-memory-state-to-memory-db.js";
+import { migrateMoveMemoryV3EverInjectedToMemoryDb } from "./migrations/345-move-memory-v3-ever-injected-to-memory-db.js";
+import { migrateMoveMemoryRetrospectiveStateToMemoryDb } from "./migrations/346-move-memory-retrospective-state-to-memory-db.js";
+import { migrateDeleteStrayGreetingConversation } from "./migrations/347-delete-stray-greeting-conversation.js";
+import { migrateMemorySummariesScopeUpdatedIndex } from "./migrations/348-memory-summaries-scope-updated-index.js";
+import { migrateMoveMemoryGraphTablesToMemoryDb } from "./migrations/349-move-memory-graph-tables-to-memory-db.js";
+import { migrateConversationsTotalInputTokensNullable } from "./migrations/350-conversations-total-input-tokens-nullable.js";
 import type { MigrationStep } from "./migrations/run-migrations.js";
 
 export const migrationSteps: MigrationStep[] = [
@@ -1399,4 +1407,70 @@ export const migrationSteps: MigrationStep[] = [
   migrateSweepOrphanedGraphNodeVectors,
   migrateSweepCachelessGraphNodeVectors,
   migrateAddConversationParentId,
+  {
+    name: "migrateMoveActivationStateToMemoryDb",
+    run: migrateMoveActivationStateToMemoryDb,
+    // migrateDeletePrivateConversations purges activation_state via the main-DB
+    // FK cascade; moving the table first drops that cascade, so a deferred or
+    // retried private delete would orphan private snapshots. Wait for it.
+    dependsOn: [
+      "migrateActivationState",
+      "migrateActivationStateFkCascade",
+      "migrateDeletePrivateConversations",
+    ],
+  },
+  {
+    name: "migrateMoveConversationGraphMemoryStateToMemoryDb",
+    run: migrateMoveConversationGraphMemoryStateToMemoryDb,
+    // Same guard: migrateDeletePrivateConversations relies on the main-DB FK
+    // cascade to purge conversation_graph_memory_state, so the move must not
+    // run before it is checkpointed.
+    dependsOn: [
+      "migrateCreateConversationGraphMemoryState",
+      "migrateDeletePrivateConversations",
+    ],
+  },
+  {
+    name: "migrateMoveMemoryV3EverInjectedToMemoryDb",
+    run: migrateMoveMemoryV3EverInjectedToMemoryDb,
+    dependsOn: ["migrateAddMemoryV3EverInjected"],
+  },
+  {
+    name: "migrateMoveMemoryRetrospectiveStateToMemoryDb",
+    run: migrateMoveMemoryRetrospectiveStateToMemoryDb,
+    dependsOn: [
+      "migrateMemoryRetrospectiveState",
+      "migrateMemoryRetrospectiveRememberedLog",
+    ],
+  },
+  migrateDeleteStrayGreetingConversation,
+  migrateMemorySummariesScopeUpdatedIndex,
+  {
+    name: "migrateMoveMemoryGraphTablesToMemoryDb",
+    run: migrateMoveMemoryGraphTablesToMemoryDb,
+    // Gate the move on every migration that reads or writes a graph table on the
+    // main connection, so it never drains a table another migration still
+    // expects on main. Two are easy to miss: migrateToolCreatedItems (in the
+    // memory plugin, not migrations/) inserts legacy tool memories into
+    // memory_graph_nodes on main and must land before the move so those rows are
+    // carried over; and migrateDeletePrivateConversations deletes private-scoped
+    // graph rows on main directly, so were the move to run first those rows would
+    // land in the memory DB and that delete would no-op against an empty main
+    // table, stranding them there. (The runtime conversation-delete path is
+    // separate: the graph is scope-keyed, not conversation-keyed, so it stays out
+    // of CONVERSATION_KEYED_MEMORY_TABLES.)
+    dependsOn: [
+      "migrateCreateMemoryGraphTables",
+      "migrateToolCreatedItems",
+      "migrateRenameMemoryGraphTypeValues",
+      "migrateMemoryGraphImageRefs",
+      "migrateCreateMemoryGraphNodeEdits",
+      "migrateDeletePrivateConversations",
+      "migrate231RepairMemoryGraphEventDates",
+      "migrateDeleteNonDefaultMemoryScopes",
+      "migrateSweepOrphanedGraphNodeVectors",
+      "migrateSweepCachelessGraphNodeVectors",
+    ],
+  },
+  migrateConversationsTotalInputTokensNullable,
 ];

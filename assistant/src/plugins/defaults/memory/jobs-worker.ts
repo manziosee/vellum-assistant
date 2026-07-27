@@ -58,6 +58,7 @@ import {
   SLOW_LLM_JOB_TYPES,
 } from "../../../persistence/jobs-store.js";
 import type { JobHandler } from "../../types.js";
+import { sweepOrphanConversationMemoryTables } from "./conversation-memory-orphan-sweep.js";
 import { getLogger } from "./logging.js";
 import { sweepOrphanMemoryRetrospectiveConversations } from "./memory-retrospective-startup-cleanup.js";
 import { getWorkspaceDir } from "./paths.js";
@@ -254,6 +255,18 @@ export function startMemoryJobsWorkerLoop(): MemoryJobsWorker {
     );
   });
 
+  // Also catch up on relocated conversation-keyed tables orphaned while the
+  // plugin was disabled: with memory off, the conversation-deleted hook never
+  // fired, so deletes during that window left rows behind (the pre-Wave-2 main
+  // DB cascade caught these regardless of plugin state). Detached and
+  // best-effort, same as the sweep above.
+  void sweepOrphanConversationMemoryTables().catch((err: unknown) => {
+    log.warn(
+      { err },
+      "Relocated-memory-table orphan sweep failed; continuing worker startup",
+    );
+  });
+
   let stopped = false;
   let tickRunning = false;
   let timer: ReturnType<typeof setTimeout>;
@@ -380,6 +393,7 @@ export async function runMemoryJobsOnce(
       maybeEnqueueScheduledCleanupJobs(config);
     }
     maybeEnqueueGraphMaintenanceJobs(config);
+    maybeEnqueueRetrospectiveSweepJob(config);
     if (memoryEnabled) {
       await maybeRunDbMaintenance();
       await maybeRunPassiveWalCheckpoint();
@@ -449,6 +463,7 @@ export async function runMemoryJobsOnce(
     maybeEnqueueScheduledCleanupJobs(config);
   }
   maybeEnqueueGraphMaintenanceJobs(config);
+  maybeEnqueueRetrospectiveSweepJob(config);
   await maybeRunDbMaintenance();
   await maybeRunPassiveWalCheckpoint();
   return slowProcessed + fastProcessed + embedProcessed;
@@ -828,6 +843,62 @@ export const GRAPH_MAINTENANCE_CHECKPOINTS = {
   pkbFiling: "pkb_filing_last_run",
   pkbCompaction: "pkb_compaction_last_run",
 } as const;
+
+/**
+ * Durable checkpoint (epoch-ms) tracking the last scheduled retrospective
+ * sweep so the cadence survives daemon restarts.
+ */
+export const RETROSPECTIVE_SWEEP_CHECKPOINT = "retro_sweep:last_run";
+
+/**
+ * Enqueue the scheduled `memory_retrospective_sweep` job once its interval has
+ * elapsed — the timer-driven backstop for retrospective triggers that an
+ * abnormal turn end (crash / IPC drop) skipped. See
+ * `memory-retrospective-sweep.ts`.
+ *
+ * First-run seeding: a missing checkpoint is seeded to `nowMs` WITHOUT
+ * enqueuing, so the first sweep fires one full interval after startup instead
+ * of treating the sweep as immediately overdue — a `?? "0"` fallback would make
+ * `nowMs - 0 >= sweepIntervalMs` true on the first tick and enqueue
+ * retrospective LLM work the moment the worker starts, violating the
+ * no-startup-LLM-work invariant. Mirrors the PKB schedule's null-checkpoint
+ * seed.
+ *
+ * Deduped against an in-flight sweep so a slow scan can't stack copies; the
+ * checkpoint still advances in that case to hold the cadence steady.
+ *
+ * Exported for tests; the worker calls it on every idle/drain tick. Returns
+ * true if a sweep job was enqueued this call.
+ */
+export function maybeEnqueueRetrospectiveSweepJob(
+  config: AssistantConfig,
+  nowMs = Date.now(),
+): boolean {
+  if (config.memory.enabled === false) {
+    return false;
+  }
+
+  const checkpoint = getMemoryCheckpoint(RETROSPECTIVE_SWEEP_CHECKPOINT);
+  if (checkpoint === null) {
+    setMemoryCheckpoint(RETROSPECTIVE_SWEEP_CHECKPOINT, String(nowMs));
+    return false;
+  }
+
+  const lastRun = parseInt(checkpoint, 10);
+  const sweepIntervalMs = config.memory.retrospective.sweepIntervalMs;
+  if (nowMs - lastRun < sweepIntervalMs) {
+    return false;
+  }
+
+  if (hasActiveJobOfType("memory_retrospective_sweep")) {
+    setMemoryCheckpoint(RETROSPECTIVE_SWEEP_CHECKPOINT, String(nowMs));
+    return false;
+  }
+
+  enqueueMemoryJob("memory_retrospective_sweep", {});
+  setMemoryCheckpoint(RETROSPECTIVE_SWEEP_CHECKPOINT, String(nowMs));
+  return true;
+}
 
 /**
  * Enqueue periodic graph maintenance jobs.

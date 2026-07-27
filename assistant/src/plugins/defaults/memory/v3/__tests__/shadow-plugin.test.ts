@@ -28,8 +28,8 @@ import { drizzle } from "drizzle-orm/bun-sqlite";
 
 import { setConfig } from "../../../../../__tests__/helpers/set-config.js";
 import { MemoryV3GateSchema } from "../../../../../config/schemas/memory-v3.js";
-import { migrateAddMemoryV3EverInjected } from "../../../../../persistence/migrations/277-add-memory-v3-ever-injected.js";
 import { ensureMemoryV3SelectionsSchema } from "../../../../../persistence/migrations/338-move-memory-v3-selections-to-memory-db.js";
+import { ensureMemoryV3EverInjectedSchema } from "../../../../../persistence/migrations/345-move-memory-v3-ever-injected-to-memory-db.js";
 import * as schema from "../../../../../persistence/schema/index.js";
 import { DEFAULT_BM25_NORM_K } from "../gate.js";
 import type { HotSetEntry, HotSetOptions } from "../hot-set.js";
@@ -76,10 +76,22 @@ const realCliCommandStore = {
 };
 const realCoreSet = { ...(await import("../core-set.js")) };
 const realHotSet = { ...(await import("../hot-set.js")) };
+const realLanesVersionStore = {
+  ...(await import("../lanes-version-store.js")),
+};
 
 let shadowMockActive = false;
 
 // ─── mutable test state, read by the mocks below ────────────────────────────
+
+// In-memory stand-in for the plugin-owned lanes-version token file, so tests
+// drive the cross-process signal without touching disk. `null` mirrors an
+// absent token; a fresh string mirrors another process's bump. Each mocked
+// bump writes a distinct value (via `bumpCounter`) like the real store's UUID.
+// `lanesVersionReadThrows` mirrors the store's "read failed → undefined" branch.
+let mockLanesVersion: string | null = null;
+let lanesVersionReadThrows = false;
+let bumpCounter = 0;
 
 let liveEnabled = false;
 let memoryEnabled = true;
@@ -91,9 +103,6 @@ let extraRealConceptPages = 0;
 // Mutable mocked config knob (orchestrate-only) for asserting per-turn tuning
 // re-resolution from a live config edit.
 let selectorEnabledCfg = false;
-// Drives the `memory-v3-injection-gate` feature flag through the shared
-// assistant-feature-flags mock below (default off).
-let gateFlagEnabled = false;
 // Mutable `memory.v3.gate.enabled` config kill-switch carried by the mocked
 // config (default on, mirroring the schema default).
 let gateEnabledCfg = true;
@@ -101,8 +110,7 @@ let messages: Array<{ role: string; content: string }> = [];
 
 // Schema defaults for `memory.v3.gate` (the tuning the mocked config carries
 // and the gate-config threading test asserts against). Includes the default-on
-// `enabled` kill-switch; `observeTurn` overwrites `enabled` with the effective
-// flag AND config value.
+// `enabled` kill-switch that `observeTurn` threads through to orchestrate.
 const GATE_DEFAULTS = MemoryV3GateSchema.parse({});
 
 // A synthetic skill capability slug the page index carries. Its rendered
@@ -170,9 +178,9 @@ let hotSetOpts: HotSetOptions | null = null;
 // page body.
 let capturedPageBody: ((slug: string) => Promise<string>) | null = null;
 
-// Shared in-memory DBs so writes are observable from the test. Selection rows
-// live on the dedicated memory connection (`memorySqlite`, resolved through
-// the stubbed `getMemorySqlite`); the everInjected store stays in main.
+// Shared in-memory DBs so writes are observable from the test. The selection
+// and everInjected rows live on the dedicated memory connection (`memorySqlite`,
+// resolved through the stubbed `getMemorySqlite`).
 let testSqlite: Database;
 let memorySqlite: Database;
 // When false, the stubbed `getMemorySqlite` resolves to null — the contract
@@ -183,10 +191,10 @@ function makeDb() {
   testSqlite = new Database(":memory:");
   testSqlite.exec("PRAGMA journal_mode=WAL");
   const db = drizzle(testSqlite, { schema });
-  // The live injector's net-new dedup reads/writes the everInjected store.
-  migrateAddMemoryV3EverInjected(db);
   memorySqlite = new Database(":memory:");
   ensureMemoryV3SelectionsSchema(memorySqlite);
+  // The live injector's net-new dedup reads/writes the everInjected store.
+  ensureMemoryV3EverInjectedSchema(memorySqlite);
   return db;
 }
 
@@ -206,11 +214,7 @@ const FAKE_SECTION_INDEX: SectionIndex = {
 
 mock.module("../../../../../config/assistant-feature-flags.js", () => ({
   isAssistantFeatureFlagEnabled: (key: string) =>
-    key === "memory-v3-live"
-      ? liveEnabled
-      : key === "memory-v3-injection-gate"
-        ? gateFlagEnabled
-        : false,
+    key === "memory-v3-live" ? liveEnabled : false,
 }));
 
 // `observeTurn` and the injector resolve their tuning through the real
@@ -240,9 +244,8 @@ function seedMemoryConfig(): void {
       },
       edge: { hubDegree: 30, seedCount: 6, perSeed: 1, cap: 6 },
       entity: { enabled: true, idfFloor: 4, cap: 8 },
-      // Gate tuning (schema defaults) with the mutable `enabled` kill-switch;
-      // `observeTurn` spreads this and overwrites `enabled` with the effective
-      // flag AND config value before passing to orchestrate.
+      // Gate tuning (schema defaults) with the mutable `enabled` kill-switch,
+      // threaded through to orchestrate as-is.
       gate: { ...GATE_DEFAULTS, enabled: gateEnabledCfg },
     },
     qdrant: { vectorSize: 8, onDisk: false },
@@ -282,6 +285,8 @@ mock.module("../../../../../persistence/db-connection.js", () => ({
   getDb: () => testDb,
   getSqliteFrom: () => testSqlite,
   getMemorySqlite: () => (memoryDbAvailable ? memorySqlite : null),
+  getMemoryDb: () =>
+    memoryDbAvailable ? drizzle(memorySqlite, { schema }) : null,
 }));
 
 mock.module("../substrate/page-index.js", () => ({
@@ -459,6 +464,27 @@ mock.module("../orchestrate.js", () => ({
       : realOrchestrate.orchestrate(...args),
 }));
 
+mock.module("../lanes-version-store.js", () => ({
+  ...realLanesVersionStore,
+  readLanesVersion: (workspaceDir: string) => {
+    if (!shadowMockActive) {
+      return realLanesVersionStore.readLanesVersion(workspaceDir);
+    }
+    // The store swallows read errors and returns `undefined`; mirror that so
+    // `getLanes` exercises its "cannot judge staleness → serve memo" branch.
+    if (lanesVersionReadThrows) return undefined;
+    return mockLanesVersion;
+  },
+  bumpLanesVersion: (workspaceDir: string) => {
+    if (!shadowMockActive) {
+      return realLanesVersionStore.bumpLanesVersion(workspaceDir);
+    }
+    const token = `bump-${++bumpCounter}`;
+    mockLanesVersion = token;
+    return token;
+  },
+}));
+
 // Import AFTER mocks so the plugin binds to them.
 const {
   observeTurn: observeTurnImpl,
@@ -500,7 +526,6 @@ beforeEach(() => {
   learnedEdgesCap = 0;
   extraRealConceptPages = 0;
   selectorEnabledCfg = false;
-  gateFlagEnabled = false;
   gateEnabledCfg = true;
   messages = [
     {
@@ -520,6 +545,9 @@ beforeEach(() => {
   hotSetResult = [];
   hotSetOpts = null;
   testDb = makeDb();
+  mockLanesVersion = null;
+  lanesVersionReadThrows = false;
+  bumpCounter = 0;
   resetShadowLanesForTests();
   // The injector memoizes one orchestration per (conversation, turn); clear it
   // so tests reusing the same ids observe fresh orchestrations.
@@ -751,16 +779,15 @@ describe("memory-v3 engine", () => {
     expect(secondDeps.selectorEnabled).toBe(true);
   });
 
-  test("flag on → threads the gate tuning plus enabled:true into orchestrate", async () => {
-    gateFlagEnabled = true;
+  test("gate enabled (default) → threads the gate tuning plus enabled:true into orchestrate", async () => {
     await observeTurn("conv-1", 0);
 
     const deps = (
       orchestrateSpy.mock.calls as unknown as unknown[][]
     )[0]![1] as { gateConfig?: unknown };
-    // The spread is the live gate config: the `memory.v3.gate` tuning with the
-    // flag-derived `enabled` folded in, and bm25NormK resolved from null to the
-    // calibrated default (empty section index → DEFAULT_BM25_NORM_K).
+    // The live gate config is the `memory.v3.gate` tuning with bm25NormK
+    // resolved from null to the calibrated default (empty section index →
+    // DEFAULT_BM25_NORM_K).
     expect(deps.gateConfig).toEqual({
       ...GATE_DEFAULTS,
       enabled: true,
@@ -768,35 +795,15 @@ describe("memory-v3 engine", () => {
     });
   });
 
-  test("flag off (default) → gate config threads inert (enabled:false, schema-default tuning)", async () => {
-    // gateFlagEnabled defaults to false in beforeEach.
-    await observeTurn("conv-1", 0);
-
-    const deps = (
-      orchestrateSpy.mock.calls as unknown as unknown[][]
-    )[0]![1] as { gateConfig?: { enabled?: boolean; [k: string]: unknown } };
-    // Flag off → the gate is wired in but inert, and the tuning fields are the
-    // schema defaults the config carries. bm25NormK is resolved from null to the
-    // calibrated default (empty section index → DEFAULT_BM25_NORM_K).
-    expect(deps.gateConfig?.enabled).toBe(false);
-    expect(deps.gateConfig).toEqual({
-      ...GATE_DEFAULTS,
-      enabled: false,
-      bm25NormK: DEFAULT_BM25_NORM_K,
-    });
-  });
-
-  test("flag on + gate.enabled:false config kill-switch → gate threads inert", async () => {
-    gateFlagEnabled = true;
+  test("gate.enabled:false config kill-switch → gate threads inert", async () => {
     gateEnabledCfg = false;
     await observeTurn("conv-1", 0);
 
     const deps = (
       orchestrateSpy.mock.calls as unknown as unknown[][]
     )[0]![1] as { gateConfig?: unknown };
-    // The config kill-switch wins over the flag: the effective `enabled` is
-    // false, so selection always runs. bm25NormK is resolved from null to the
-    // calibrated default (empty section index → DEFAULT_BM25_NORM_K).
+    // The kill-switch makes the effective `enabled` false, so selection
+    // always runs. bm25NormK is resolved from null to the calibrated default.
     expect(deps.gateConfig).toEqual({
       ...GATE_DEFAULTS,
       enabled: false,
@@ -940,6 +947,45 @@ describe("memory-v3 engine", () => {
     await Promise.all([observeTurn("conv-1", 1), observeTurn("conv-1", 2)]);
     expect(sectionBuilds).toBe(2);
     expect(needleBuilds).toBe(2);
+  });
+
+  test("invalidateLanes writes a new, distinct lanes-version token each call", () => {
+    invalidateLanes();
+    const first = mockLanesVersion;
+    invalidateLanes();
+    const second = mockLanesVersion;
+    expect(first).not.toBeNull();
+    expect(second).not.toBeNull();
+    expect(second).not.toBe(first);
+  });
+
+  test("a lanes-version bump from another process forces a rebuild on the next turn", async () => {
+    await observeTurn("conv-1", 0);
+    await observeTurn("conv-1", 1);
+    expect(sectionBuilds).toBe(1);
+
+    // Simulate the memory worker's invalidateLanes(): its in-process memo
+    // clear is invisible to this process — only the persisted token write
+    // crosses the boundary.
+    mockLanesVersion = "worker-bump-1";
+
+    await observeTurn("conv-1", 2);
+    expect(sectionBuilds).toBe(2);
+    expect(needleBuilds).toBe(2);
+
+    // The rebuild captured the new token — the observer path never re-bumps,
+    // so later turns reuse the rebuilt memo instead of churning.
+    await observeTurn("conv-1", 3);
+    expect(sectionBuilds).toBe(2);
+  });
+
+  test("a lanes-version read failure serves the memoized lanes", async () => {
+    await observeTurn("conv-1", 0);
+    expect(sectionBuilds).toBe(1);
+
+    lanesVersionReadThrows = true;
+    await observeTurn("conv-1", 1);
+    expect(sectionBuilds).toBe(1);
   });
 
   test("no user message → no orchestrate, no writes", async () => {

@@ -5,6 +5,7 @@ import {
   CircleCheck,
   Copy,
   ExternalLink,
+  FolderInput,
   GitBranch,
   MessageCircle,
   Microscope,
@@ -17,7 +18,9 @@ import {
 } from "lucide-react";
 import { useState, type ReactNode } from "react";
 
+import type { MoveToGroupTarget } from "@/domains/chat/utils/group-conversations";
 import { useIsMobile } from "@/hooks/use-is-mobile";
+import { openExternalUrl } from "@/runtime/browser";
 import { useIsNativePlatform } from "@/runtime/native-auth";
 import {
   BottomSheet,
@@ -29,7 +32,7 @@ import {
 /**
  * Hover-revealed "more" menu for a conversation row. Renders an ellipsis
  * button; clicking it opens a dropdown menu with Pin / Rename / Archive /
- * Mark as unread actions.
+ * Mark as unread actions, plus an optional "Move to group" submenu.
  *
  * The same item set is also rendered by the row's right-click context menu
  * (`AssistantSideMenu`) via the shared `renderConversationMenuItems` helper
@@ -58,6 +61,9 @@ type MenuAlign = "start" | "center" | "end";
 export type ConversationMenuPrimitive = {
   Item: typeof Menu.Item | typeof ContextMenu.Item;
   Separator: typeof Menu.Separator | typeof ContextMenu.Separator;
+  Sub: typeof Menu.Sub | typeof ContextMenu.Sub;
+  SubTrigger: typeof Menu.SubTrigger | typeof ContextMenu.SubTrigger;
+  SubContent: typeof Menu.SubContent | typeof ContextMenu.SubContent;
 };
 
 export interface ConversationMenuItemsProps {
@@ -90,6 +96,28 @@ export interface ConversationMenuItemsProps {
    */
   onMarkRead?: () => void;
   /**
+   * Custom groups this conversation can be filed into, excluding the one it
+   * already belongs to. Rendered as items in the "Move to group" submenu.
+   */
+  moveToGroups?: MoveToGroupTarget[];
+  /** Move the conversation to an existing custom group. */
+  onMoveToGroup?: (groupId: string) => void;
+  /**
+   * Create a new custom group and move the conversation into it. When
+   * provided together with `onMoveToGroup`, a "Move to group" submenu is
+   * shown with a "New group…" item — the only entry point for creating a
+   * group (there is no standalone create button). Available even when
+   * `moveToGroups` is empty.
+   */
+  onCreateGroupInto?: () => void;
+  /**
+   * Remove the conversation from its current custom group, falling back to
+   * Recents. When provided, a "Remove from group" item appears at the end of
+   * the submenu. Callers pass this only for conversations that belong to a
+   * custom group.
+   */
+  onRemoveFromGroup?: () => void;
+  /**
    * Hide write-affording menu items (Mark-as-read/unread) when
    * the conversation is read-only. Items are hidden entirely, not
    * disabled. Today this fires for channel-bound conversations (Slack,
@@ -121,6 +149,14 @@ export interface ConversationMenuItemsProps {
   onCopyConversation?: () => void;
   /** Re-fetch the chat context and reload the current conversation. */
   onRefresh?: () => void;
+  /**
+   * Deep link back to the conversation's source thread/message in the
+   * originating external channel (e.g. the Slack thread). When provided,
+   * an "Open in <channel>" item appears alongside the other open actions —
+   * the same destination as the top-bar source pill, kept in the menu so
+   * the link stays discoverable from the conversation heading.
+   */
+  channelSourceLink?: { href: string; label: string } | null;
   /** Controls item order and labels. "header" uses macOS-parity order; "sidebar" preserves the original order. */
   variant?: "header" | "sidebar";
 }
@@ -142,6 +178,10 @@ export function renderConversationMenuItems({
   onMarkUnread,
   isMarkUnreadDisabled = false,
   onMarkRead,
+  moveToGroups,
+  onMoveToGroup,
+  onCreateGroupInto,
+  onRemoveFromGroup,
   isReadonly = false,
   onForkConversation,
   onOpenInNewWindow,
@@ -149,10 +189,16 @@ export function renderConversationMenuItems({
   onInspect,
   onCopyConversation,
   onRefresh,
+  channelSourceLink,
   variant = "sidebar",
 }: ConversationMenuItemsProps & {
   Primitive: ConversationMenuPrimitive;
 }): ReactNode {
+  // The submenu shows whenever move + create are wired, even with zero
+  // existing groups — "New group…" is always a valid action and is the only
+  // way to create a group.
+  const showMoveToGroup = Boolean(onMoveToGroup && onCreateGroupInto);
+
   const pinItem = onPinToggle ? (
     <Primitive.Item
       leftIcon={isPinned ? <PinOff size={14} /> : <Pin size={14} />}
@@ -200,12 +246,51 @@ export function renderConversationMenuItems({
       </Primitive.Item>
     ) : null;
 
+  const moveToGroupItem = showMoveToGroup ? (
+    <Primitive.Sub>
+      <Primitive.SubTrigger leftIcon={<FolderInput size={14} />}>
+        Move to group
+      </Primitive.SubTrigger>
+      <Primitive.SubContent>
+        {(moveToGroups ?? []).map((group) => (
+          <Primitive.Item
+            key={group.id}
+            onSelect={() => onMoveToGroup?.(group.id)}
+          >
+            {group.name}
+          </Primitive.Item>
+        ))}
+        {moveToGroups && moveToGroups.length > 0 ? (
+          <Primitive.Separator />
+        ) : null}
+        <Primitive.Item onSelect={onCreateGroupInto}>New group…</Primitive.Item>
+        {onRemoveFromGroup ? (
+          <>
+            <Primitive.Separator />
+            <Primitive.Item onSelect={onRemoveFromGroup}>
+              Remove from group
+            </Primitive.Item>
+          </>
+        ) : null}
+      </Primitive.SubContent>
+    </Primitive.Sub>
+  ) : null;
+
   const openInNewWindowItem = onOpenInNewWindow ? (
     <Primitive.Item
       leftIcon={<ExternalLink size={14} />}
       onSelect={onOpenInNewWindow}
     >
       {variant === "header" ? "Open in new window" : "Open in New Window"}
+    </Primitive.Item>
+  ) : null;
+
+  const channelSourceLinkItem = channelSourceLink ? (
+    <Primitive.Item
+      leftIcon={<ExternalLink size={14} />}
+      onSelect={() => void openExternalUrl(channelSourceLink.href)}
+    >
+      {channelSourceLink.label}
     </Primitive.Item>
   ) : null;
 
@@ -236,6 +321,7 @@ export function renderConversationMenuItems({
           </Primitive.Item>
         ) : null}
 
+        {channelSourceLinkItem}
         {openInNewWindowItem}
 
         {onRefresh ? (
@@ -249,6 +335,7 @@ export function renderConversationMenuItems({
 
         {pinItem}
         {renameItem}
+        {moveToGroupItem}
         {archiveItem}
         {inspectItem}
       </>
@@ -262,6 +349,8 @@ export function renderConversationMenuItems({
       {archiveItem}
 
       {markReadUnreadItem}
+      {moveToGroupItem}
+      {channelSourceLinkItem}
       {openInNewWindowItem}
 
       {onShareFeedback ? (
@@ -360,6 +449,10 @@ export function renderConversationMenuItemsAsPanelItems({
   onMarkUnread,
   isMarkUnreadDisabled = false,
   onMarkRead,
+  moveToGroups,
+  onMoveToGroup,
+  onCreateGroupInto,
+  onRemoveFromGroup,
   isReadonly = false,
   onForkConversation,
   onOpenInNewWindow,
@@ -367,6 +460,7 @@ export function renderConversationMenuItemsAsPanelItems({
   onInspect,
   onCopyConversation,
   onRefresh,
+  channelSourceLink,
   variant = "sidebar",
   onClose,
   isNativePlatform = false,
@@ -374,6 +468,9 @@ export function renderConversationMenuItemsAsPanelItems({
   onClose: () => void;
   isNativePlatform?: boolean;
 }): ReactNode {
+  // BottomSheet is a single-level surface, so the "Move to group" submenu is
+  // flattened into an inline labeled block (mirrors the desktop submenu).
+  const showMoveToGroup = Boolean(onMoveToGroup && onCreateGroupInto);
   const pinItem = onPinToggle
     ? buildPanelItem({
         key: "pin",
@@ -433,6 +530,41 @@ export function renderConversationMenuItemsAsPanelItems({
           })
         : null;
 
+  const moveToGroupBlock = showMoveToGroup ? (
+    <>
+      <MobileMenuDivider />
+      <div className="flex items-center gap-2 px-2 pt-1 pb-1 text-body-small-default uppercase tracking-wide text-[var(--content-tertiary)]">
+        <FolderInput size={14} aria-hidden />
+        Move to group
+      </div>
+      {(moveToGroups ?? []).map((group) =>
+        buildPanelItem({
+          key: `move-to-${group.id}`,
+          label: group.name,
+          className: "pl-7",
+          run: () => onMoveToGroup?.(group.id),
+          onClose,
+        }),
+      )}
+      {buildPanelItem({
+        key: "move-to-new-group",
+        label: "New group…",
+        className: "pl-7",
+        run: () => onCreateGroupInto?.(),
+        onClose,
+      })}
+      {onRemoveFromGroup
+        ? buildPanelItem({
+            key: "remove-from-group",
+            label: "Remove from group",
+            className: "pl-7",
+            run: onRemoveFromGroup,
+            onClose,
+          })
+        : null}
+    </>
+  ) : null;
+
   const openInNewWindowItem =
     onOpenInNewWindow && !isNativePlatform
       ? buildPanelItem({
@@ -444,6 +576,16 @@ export function renderConversationMenuItemsAsPanelItems({
           onClose,
         })
       : null;
+
+  const channelSourceLinkItem = channelSourceLink
+    ? buildPanelItem({
+        key: "channel-source-link",
+        icon: ExternalLink,
+        label: channelSourceLink.label,
+        run: () => void openExternalUrl(channelSourceLink.href),
+        onClose,
+      })
+    : null;
 
   const inspectItem = onInspect
     ? buildPanelItem({
@@ -478,6 +620,7 @@ export function renderConversationMenuItemsAsPanelItems({
             })
           : null}
 
+        {channelSourceLinkItem}
         {openInNewWindowItem}
 
         {onRefresh
@@ -493,6 +636,7 @@ export function renderConversationMenuItemsAsPanelItems({
         {pinItem}
         {renameItem}
         {archiveItem}
+        {moveToGroupBlock}
         {inspectItem}
       </>
     );
@@ -504,6 +648,8 @@ export function renderConversationMenuItemsAsPanelItems({
       {renameItem}
       {archiveItem}
       {markReadUnreadItem}
+      {moveToGroupBlock}
+      {channelSourceLinkItem}
       {openInNewWindowItem}
 
       {onShareFeedback ? (

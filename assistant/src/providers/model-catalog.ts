@@ -52,6 +52,13 @@ export interface CatalogModel {
   adaptiveThinkingOnly?: boolean;
   supportsCaching?: boolean;
   supportsVision?: boolean;
+  /**
+   * The model's serving surface accepts OpenAI chat-completions `input_audio`
+   * content parts (base64 wav/mp3), so eligible audio attachments are sent
+   * inline instead of as a text placeholder. Daemon-only: not projected into
+   * the client catalog (see scripts/sync-llm-catalog.ts).
+   */
+  supportsAudioInput?: boolean;
   supportsToolUse?: boolean;
   pricing?: CatalogModelPricing;
   /**
@@ -177,6 +184,23 @@ const RAW_PROVIDER_CATALOG: ProviderCatalogEntry[] = [
           outputPer1mTokens: 50,
           cacheWritePer1mTokens: 12.5,
           cacheReadPer1mTokens: 1,
+        },
+      },
+      {
+        id: "claude-opus-5",
+        displayName: "Claude Opus 5",
+        contextWindowTokens: 1000000,
+        maxOutputTokens: 128000,
+        longContextPricingThresholdTokens: 200000,
+        supportsThinking: true,
+        supportsCaching: true,
+        supportsVision: true,
+        supportsToolUse: true,
+        pricing: {
+          inputPer1mTokens: 5,
+          outputPer1mTokens: 25,
+          cacheWritePer1mTokens: 6.25,
+          cacheReadPer1mTokens: 0.5,
         },
       },
       {
@@ -1001,6 +1025,23 @@ const RAW_PROVIDER_CATALOG: ProviderCatalogEntry[] = [
         },
       },
       {
+        id: "anthropic/claude-opus-5",
+        displayName: "Claude Opus 5",
+        contextWindowTokens: 1000000,
+        maxOutputTokens: 128000,
+        longContextPricingThresholdTokens: 200000,
+        supportsThinking: true,
+        supportsCaching: true,
+        supportsVision: true,
+        supportsToolUse: true,
+        pricing: {
+          inputPer1mTokens: 5,
+          outputPer1mTokens: 25,
+          cacheWritePer1mTokens: 6.25,
+          cacheReadPer1mTokens: 0.5,
+        },
+      },
+      {
         id: "anthropic/claude-opus-4.8",
         displayName: "Claude Opus 4.8",
         contextWindowTokens: 1000000,
@@ -1734,6 +1775,23 @@ const RAW_PROVIDER_CATALOG: ProviderCatalogEntry[] = [
         },
       },
       {
+        id: "anthropic/claude-opus-5",
+        displayName: "Claude Opus 5",
+        contextWindowTokens: 1000000,
+        maxOutputTokens: 128000,
+        longContextPricingThresholdTokens: 200000,
+        supportsThinking: true,
+        supportsCaching: true,
+        supportsVision: true,
+        supportsToolUse: true,
+        pricing: {
+          inputPer1mTokens: 5,
+          outputPer1mTokens: 25,
+          cacheWritePer1mTokens: 6.25,
+          cacheReadPer1mTokens: 0.5,
+        },
+      },
+      {
         id: "anthropic/claude-opus-4.8",
         displayName: "Claude Opus 4.8",
         contextWindowTokens: 1000000,
@@ -2031,6 +2089,9 @@ const RAW_PROVIDER_CATALOG: ProviderCatalogEntry[] = [
         supportsThinking: true,
         supportsCaching: true,
         supportsVision: true,
+        // Inkling ingests audio natively (dMel tokens); Baseten's serving
+        // surface accepts `input_audio` parts for it.
+        supportsAudioInput: true,
         supportsToolUse: true,
         // Baseten's reasoning_effort for Inkling tops out at "xhigh" (no
         // "max"), matching the chat-completions client's default ceiling.
@@ -2117,5 +2178,17 @@ export function getCatalogProviderForModel(
 export function isAdaptiveThinkingOnlyModel(modelId: string): boolean {
   return PROVIDER_CATALOG.some((p) =>
     p.models.some((m) => m.id === modelId && m.adaptiveThinkingOnly === true),
+  );
+}
+
+/**
+ * Whether a model's serving surface accepts OpenAI chat-completions
+ * `input_audio` content parts, driven by the `supportsAudioInput` capability
+ * in the catalog. Matches the model ID across every provider (same pattern as
+ * {@link isAdaptiveThinkingOnlyModel}).
+ */
+export function modelSupportsAudioInput(modelId: string): boolean {
+  return PROVIDER_CATALOG.some((p) =>
+    p.models.some((m) => m.id === modelId && m.supportsAudioInput === true),
   );
 }

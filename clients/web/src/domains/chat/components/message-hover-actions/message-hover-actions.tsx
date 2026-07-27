@@ -5,8 +5,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { DisplayMessage } from "@/domains/chat/types/types";
 import { messagePlainText } from "@/domains/chat/utils/message-plain-text";
 import {
-  useBookmarksEnabled,
   useBookmarkToggle,
+  useCanBookmark,
   useIsBookmarked,
 } from "@/hooks/use-bookmarks";
 
@@ -103,17 +103,10 @@ export function MessageHoverActions({
 }: MessageHoverActionsProps) {
   const { role } = message;
 
-  // Bookmarks are feature-flag gated, and only persisted messages qualify —
-  // optimistic/streaming rows carry a client-generated id the daemon can't
-  // resolve. The toggle's data hooks live in `MessageBookmarkButton` so they
-  // only mount (and only touch TanStack Query) for bookmarkable rows; that
-  // keeps the flag-off and no-conversation paths free of any query client.
-  const bookmarksEnabled = useBookmarksEnabled();
-  const canBookmark =
-    bookmarksEnabled &&
-    Boolean(conversationId) &&
-    Boolean(message.id) &&
-    !message.isOptimistic;
+  // The toggle's data hooks live in `MessageBookmarkButton` so they only mount
+  // (and only touch TanStack Query) for bookmarkable rows; that keeps the
+  // unsupported-assistant and no-conversation paths free of any query client.
+  const canBookmark = useCanBookmark(message, conversationId);
 
   // Flat plain-text body derived from the message's text blocks; this is the
   // copy payload and mirrors the daemon's `joinWithSpacing`.

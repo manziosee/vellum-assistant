@@ -28,6 +28,16 @@ mock.module("../tools/registry.js", () => ({
   getAllTools: () => [fakeTool],
 }));
 
+// Mock the dynamic-skill predicate so isSensitiveTool's skill_load branch is
+// exercised without a real skill catalog: "dynamic-skill" is an inline-command
+// load, anything else is plain.
+mock.module("../permissions/checker.js", () => ({
+  isDynamicSkillLoadInvocation: (
+    _name: string,
+    input: Record<string, unknown>,
+  ) => input?.skill === "dynamic-skill",
+}));
+
 // Capture tool-audit terminal calls so tests can assert on denied/error outcomes
 // the way they previously asserted on emitted lifecycle events.
 const auditCalls = {
@@ -49,6 +59,10 @@ function resetAuditCalls(): void {
   auditCalls.executed.length = 0;
   auditCalls.prompted.length = 0;
 }
+
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
   mintGrantFromDecision,
@@ -519,7 +533,7 @@ describe("ToolApprovalHandler / pre-exec gate grant check", () => {
 });
 
 describe("isSensitiveTool", () => {
-  test("sensitivity is a property of the tool and execution target only", () => {
+  test("sensitivity is a property of the tool and execution target", () => {
     // Side-effect tools are sensitive wherever they run.
     expect(isSensitiveTool("bash", "sandbox")).toBe(true);
     expect(isSensitiveTool("file_write", "sandbox")).toBe(true);
@@ -530,6 +544,84 @@ describe("isSensitiveTool", () => {
     expect(isSensitiveTool("ui_show", "host")).toBe(false);
     expect(isSensitiveTool("ui_update", "host")).toBe(false);
     expect(isSensitiveTool("ui_dismiss", "host")).toBe(false);
+  });
+
+  test("an inline-command (dynamic) skill_load is sensitive; a plain one is not", () => {
+    // skill_load is not a side-effect tool, but a load that executes embedded
+    // shell at load time must pass through the capability floor — so a
+    // non-guardian's dynamic load escalates to the guardian, Full-access-proof.
+    expect(
+      isSensitiveTool("skill_load", "sandbox", { skill: "dynamic-skill" }),
+    ).toBe(true);
+    expect(
+      isSensitiveTool("skill_load", "sandbox", { skill: "plain-skill" }),
+    ).toBe(false);
+    // Without input, skill_load falls back to the name/target rule.
+    expect(isSensitiveTool("skill_load", "sandbox")).toBe(false);
+  });
+
+  test("an out-of-workspace file_read is sensitive; an in-workspace one is not", () => {
+    const workingDir = mkdtempSync(join(tmpdir(), "sensitive-tool-test-"));
+    try {
+      // Out-of-workspace file access is host-equivalent: the host-fallback
+      // path policy executes the escape, so it carries the host capability
+      // floor even for the read-only sandbox tool.
+      expect(
+        isSensitiveTool(
+          "file_read",
+          "sandbox",
+          { path: "/etc/hosts" },
+          workingDir,
+        ),
+      ).toBe(true);
+      expect(
+        isSensitiveTool(
+          "file_read",
+          "sandbox",
+          { path: "notes.txt" },
+          workingDir,
+        ),
+      ).toBe(false);
+      // `path` is the executed field — a benign `file_path` must not mask it.
+      expect(
+        isSensitiveTool(
+          "file_read",
+          "sandbox",
+          { path: "/etc/hosts", file_path: "notes.txt" },
+          workingDir,
+        ),
+      ).toBe(true);
+      // Container-style /workspace paths remap to the workspace.
+      expect(
+        isSensitiveTool(
+          "file_read",
+          "sandbox",
+          { path: "/workspace/notes.txt" },
+          workingDir,
+        ),
+      ).toBe(false);
+      // Without a workingDir the boundary is unknown — name/target rule only.
+      expect(
+        isSensitiveTool("file_read", "sandbox", { path: "/etc/hosts" }),
+      ).toBe(false);
+      // Containerized installs keep the hard execution boundary, so the
+      // escape never executes and does not need the floor.
+      process.env.IS_CONTAINERIZED = "true";
+      try {
+        expect(
+          isSensitiveTool(
+            "file_read",
+            "sandbox",
+            { path: "/etc/hosts" },
+            workingDir,
+          ),
+        ).toBe(false);
+      } finally {
+        delete process.env.IS_CONTAINERIZED;
+      }
+    } finally {
+      rmSync(workingDir, { recursive: true, force: true });
+    }
   });
 });
 

@@ -74,13 +74,11 @@ import { resolveCapabilities } from "../runtime/capabilities.js";
 import type { SubagentState } from "../subagent/types.js";
 import { TERMINAL_STATUSES } from "../subagent/types.js";
 import { canonicalizeInboundIdentity } from "../util/canonicalize-identity.js";
+import { channelSupportsInlineOptions } from "./channel-ui-capability.js";
 import { findConversationOrSubagent } from "./conversation-registry.js";
+import type { SurfaceShowPair } from "./conversation-surfaces.js";
 import { canonicalizeTimeZone, formatTurnTimestamp } from "./date-context.js";
-import type {
-  DynamicPageSurfaceData,
-  SurfaceData,
-  SurfaceType,
-} from "./message-protocol.js";
+import type {} from "./message-protocol.js";
 import { filterMessagesForUntrustedActor } from "./message-provenance.js";
 import type { TrustContext } from "./trust-context-types.js";
 import { timeLatencySubSpan } from "./turn-latency-sub-spans.js";
@@ -100,6 +98,13 @@ export interface ChannelCapabilities {
   dashboardCapable: boolean;
   /** Whether the channel supports dynamic UI surfaces (ui_show / ui_update). */
   supportsDynamicUi: boolean;
+  /**
+   * Whether the channel's adapter can render inline tappable options — approval
+   * buttons and (next) question option pickers. Distinct from `supportsDynamicUi`:
+   * a text-only channel can render inline buttons without dynamic UI. Optional;
+   * absent is treated as `false`.
+   */
+  supportsInlineOptions?: boolean;
   /** Whether the channel supports voice/microphone input. */
   supportsVoiceInput: boolean;
   /** The client OS/interface identifier (e.g. "macos", "ios", "web"). */
@@ -285,6 +290,7 @@ export function resolveChannelCapabilities(
         channel,
         dashboardCapable: supportsDesktopUi,
         supportsDynamicUi: supportsDesktopUi || iface === "web",
+        supportsInlineOptions: channelSupportsInlineOptions(channel),
         supportsVoiceInput: supportsDesktopUi,
         clientOS: iface ?? undefined,
         chatType: resolvedChatType,
@@ -299,6 +305,7 @@ export function resolveChannelCapabilities(
         channel,
         dashboardCapable: false,
         supportsDynamicUi: false,
+        supportsInlineOptions: channelSupportsInlineOptions(channel),
         supportsVoiceInput: false,
         chatType: resolvedChatType,
       };
@@ -307,6 +314,7 @@ export function resolveChannelCapabilities(
         channel,
         dashboardCapable: false,
         supportsDynamicUi: false,
+        supportsInlineOptions: channelSupportsInlineOptions(channel),
         supportsVoiceInput: false,
         chatType: resolvedChatType,
       };
@@ -363,10 +371,7 @@ interface ActiveSurfaceContext {
 export function buildActiveSurfaceContext(params: {
   currentActiveSurfaceId: string | undefined;
   currentPage: string | undefined;
-  surfaceState: ReadonlyMap<
-    string,
-    { surfaceType: SurfaceType; data: SurfaceData }
-  >;
+  surfaceState: ReadonlyMap<string, SurfaceShowPair>;
 }): ActiveSurfaceContext | null {
   const { currentActiveSurfaceId, currentPage, surfaceState } = params;
   if (!currentActiveSurfaceId) {
@@ -378,7 +383,7 @@ export function buildActiveSurfaceContext(params: {
     return null;
   }
 
-  const data = stored.data as DynamicPageSurfaceData;
+  const data = stored.data;
   const activeSurface: ActiveSurfaceContext = {
     surfaceId: currentActiveSurfaceId,
     html: data.html,

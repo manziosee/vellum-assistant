@@ -17,40 +17,49 @@ export interface PlanTierCopy {
   cta: string;
   /** Small caption rendered under the price. */
   priceCaption: string;
-  /** Marks the "MOST POPULAR" tier — also renders as the light/white card. */
-  mostPopular?: boolean;
+  /** Marks the recommended tier; plans-page keys the light/white card off this. */
+  recommended?: boolean;
   /** Feature rows appended after the catalog-derived rows. */
   extraFeatures?: readonly string[];
+  /** One-line pitch shown on the billing page's dark "Upgrade to X" card. */
+  upgradeBlurb?: string;
 }
 
 export const PLAN_TIER_COPY: Record<PlanTierKey, PlanTierCopy> = {
   free: {
-    tagline: "Get to know your assistant",
+    tagline: "Get to know your assistant.",
     cta: "Start Free",
     priceCaption: "Forever",
   },
   mighty: {
-    tagline: "Empower your assistant to level you up.",
+    tagline: "More capacity for consistent use.",
     cta: "Power Up",
     priceCaption: "Billed monthly",
+    recommended: true,
+    upgradeBlurb: "$25 in Credits, more storage and power",
   },
   super: {
-    tagline: "Give your assistant real muscle to help you grow",
+    tagline: "Stronger performance for heavier workloads.",
     cta: "Go Super",
     priceCaption: "Billed monthly",
-    mostPopular: true,
     extraFeatures: ["Assistant email and subdomain"],
+    upgradeBlurb: "$45 credits, 3× storage, more power, and email.",
   },
   ultra: {
-    tagline:
-      "Our most powerful assistant. There's nothing you can't tackle together",
+    tagline: "Built for sustained, high-demand work.",
     cta: "Unleash Ultra",
     priceCaption: "Billed monthly",
     extraFeatures: ["Assistant email and subdomain"],
+    upgradeBlurb: "$115 credits, 2x storage, more power, and email.",
   },
 };
 
 /** Copy for a tier key, or `undefined` for a catalog key with no entry. */
 export function getPlanTierCopy(key: string): PlanTierCopy | undefined {
   return PLAN_TIER_COPY[key as PlanTierKey];
+}
+
+/** CTA label for a tier that sits below the user's current tier. */
+export function downgradeLabel(name: string): string {
+  return `Downgrade to ${name}`;
 }

@@ -18,6 +18,7 @@
 import type { AgentLoopConfig } from "../agent/loop.js";
 import { AgentLoop } from "../agent/loop.js";
 import type { AssistantActivityStateEvent } from "../api/events/assistant-activity-state.js";
+import type { ConfirmationStateChangedEvent } from "../api/events/confirmation-state-changed.js";
 import { decideGuardianRequest } from "../channels/gateway-guardian-requests.js";
 import type {
   ChannelId,
@@ -88,10 +89,6 @@ import type { InteractiveUiResult } from "../runtime/interactive-ui.js";
 import { publishSyncInvalidation } from "../runtime/sync/sync-publisher.js";
 import { getSubagentManager } from "../subagent/index.js";
 import type { SubagentState } from "../subagent/types.js";
-import {
-  type ActivationMomentParam,
-  isActivationMomentParam,
-} from "../telemetry/activation-funnel.js";
 import { ToolExecutor } from "../tools/executor.js";
 import { getAllToolDefinitions } from "../tools/registry.js";
 import type { OnboardingContext } from "../types/onboarding-context.js";
@@ -149,7 +146,9 @@ import {
   flushPendingSurfaceDataPersists,
   handleSurfaceAction as handleSurfaceActionImpl,
   handleSurfaceUndo as handleSurfaceUndoImpl,
+  restoreSurfaceStateEntry,
   type SurfaceActionResult,
+  type SurfaceStateEntry,
 } from "./conversation-surfaces.js";
 import type {
   SubagentToolGateMode,
@@ -165,15 +164,13 @@ import { HostAppControlProxy } from "./host-app-control-proxy.js";
 import { HostCuProxy } from "./host-cu-proxy.js";
 import { shouldAttachHostProxyForCapability } from "./host-proxy-preactivation.js";
 import type {
-  ServerMessage,
-  SurfaceData,
+  AssistantEvent,
   SurfaceType,
   UsageStats,
 } from "./message-protocol.js";
 import { filterMessagesForUntrustedActor } from "./message-provenance.js";
 import type { ConversationTransportMetadata } from "./message-types/conversations.js";
 import { isHostProxyTransport } from "./message-types/conversations.js";
-import type { ConfirmationStateChanged } from "./message-types/messages.js";
 import { conversationMetadataSyncTag } from "./message-types/sync.js";
 import {
   resolveSummarizeBoundary,
@@ -323,7 +320,7 @@ export class Conversation {
   /** @internal */ prompter: PermissionPrompter;
   /** @internal */ secretPrompter: SecretPrompter;
   private executor: ToolExecutor;
-  /** @internal */ sendToClient: (msg: ServerMessage) => void;
+  /** @internal */ sendToClient: (msg: AssistantEvent) => void;
   /** @internal */ workingDir: string;
   /** @internal */ allowedToolNames?: Set<string>;
   /**
@@ -550,26 +547,7 @@ export class Conversation {
     string,
     { actionId: string; data?: Record<string, unknown> }
   >();
-  /** @internal */ surfaceState = new Map<
-    string,
-    {
-      surfaceType: SurfaceType;
-      data: SurfaceData;
-      title?: string;
-      actions?: Array<{
-        id: string;
-        label: string;
-        style?: string;
-        data?: Record<string, unknown>;
-      }>;
-      /**
-       * Commit-timing activation-rail tag (daemon-only). Rehydrated by
-       * `restoreSurfaceStateFromHistory` so a post-reload commit still records
-       * its funnel milestone. Never sent to the client.
-       */
-      activationMoment?: ActivationMomentParam;
-    }
-  >();
+  /** @internal */ surfaceState = new Map<string, SurfaceStateEntry>();
   /** @internal */ surfaceUndoStacks = new Map<string, string[]>();
   /** @internal */ accumulatedSurfaceState = new Map<
     string,
@@ -694,7 +672,7 @@ export class Conversation {
   originChannel: ChannelId | undefined = undefined;
   /** @internal */ activityVersion = 0;
   /** Last emitted activity state message, retained for replay on SSE reconnection. */
-  /** @internal */ lastActivityStateMsg: ServerMessage | null = null;
+  /** @internal */ lastActivityStateMsg: AssistantEvent | null = null;
   /** Set by the agent loop to track confirmation outcomes for persistence. */
   onConfirmationOutcome?: (
     requestId: string,
@@ -707,7 +685,7 @@ export class Conversation {
     conversationId: string,
     provider: Provider,
     systemPrompt: string,
-    sendToClient: (msg: ServerMessage) => void,
+    sendToClient: (msg: AssistantEvent) => void,
     workingDir: string,
     options?: ConversationConstructorOptions,
   ) {
@@ -1427,28 +1405,7 @@ export class Conversation {
       for (const block of msg.content) {
         const b = block as unknown as Record<string, unknown>;
         if (b.type === "ui_surface" && typeof b.surfaceId === "string") {
-          // Rehydrate the daemon-only commit-timing activation tag so a commit
-          // after reload still records its funnel milestone. Validated and
-          // dropped if malformed; this field never reaches the client.
-          const activationMoment =
-            typeof b.activationMoment === "string" &&
-            isActivationMomentParam(b.activationMoment)
-              ? b.activationMoment
-              : undefined;
-          this.surfaceState.set(b.surfaceId, {
-            surfaceType: (b.surfaceType ?? "dynamic_page") as SurfaceType,
-            data: (b.data ?? {}) as SurfaceData,
-            title: b.title as string | undefined,
-            actions: Array.isArray(b.actions)
-              ? (b.actions as Array<{
-                  id: string;
-                  label: string;
-                  style?: string;
-                  data?: Record<string, unknown>;
-                }>)
-              : undefined,
-            ...(activationMoment ? { activationMoment } : {}),
-          });
+          this.surfaceState.set(b.surfaceId, restoreSurfaceStateEntry(b));
         }
       }
     }
@@ -1474,7 +1431,7 @@ export class Conversation {
   }
 
   updateClient(
-    sendToClient: (msg: ServerMessage) => void,
+    sendToClient: (msg: AssistantEvent) => void,
     hasNoClient = false,
   ): void {
     this.sendToClient = sendToClient;
@@ -1496,7 +1453,7 @@ export class Conversation {
   }
 
   /** Returns the current sendToClient reference for identity comparison. */
-  getCurrentSender(): (msg: ServerMessage) => void {
+  getCurrentSender(): (msg: AssistantEvent) => void {
     return this.sendToClient;
   }
 
@@ -1793,7 +1750,7 @@ export class Conversation {
       selectedScope?: string;
       decisionContext?: string;
       emissionContext?: {
-        source?: ConfirmationStateChanged["source"];
+        source?: ConfirmationStateChangedEvent["source"];
         causedByRequestId?: string;
         decisionText?: string;
       };
@@ -1907,12 +1864,12 @@ export class Conversation {
   // ── Server-authoritative state signals ─────────────────────────────
 
   emitConfirmationStateChanged(
-    params: Omit<ConfirmationStateChanged, "type">,
+    params: Omit<ConfirmationStateChangedEvent, "type">,
   ): void {
-    const msg: ServerMessage = {
+    const msg: AssistantEvent = {
       type: "confirmation_state_changed",
       ...params,
-    } as ServerMessage;
+    } as AssistantEvent;
     try {
       this.sendToClient(msg);
     } catch (err) {
@@ -1934,7 +1891,7 @@ export class Conversation {
   ): void {
     const { anchor = "assistant_turn", requestId, statusText } = options ?? {};
     this.activityVersion++;
-    const msg: ServerMessage = {
+    const msg: AssistantEvent = {
       type: "assistant_activity_state",
       conversationId: this.conversationId,
       activityVersion: this.activityVersion,
@@ -1943,7 +1900,7 @@ export class Conversation {
       requestId,
       reason,
       ...(statusText ? { statusText } : {}),
-    } as ServerMessage;
+    } as AssistantEvent;
     this.lastActivityStateMsg = msg;
     try {
       this.sendToClient(msg);
@@ -2497,7 +2454,7 @@ export class Conversation {
     content: string,
     userMessageId: string,
     options?: {
-      onEvent?: (msg: ServerMessage) => void;
+      onEvent?: (msg: AssistantEvent) => void;
       isInteractive?: boolean;
       isUserMessage?: boolean;
       titleText?: string;

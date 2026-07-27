@@ -7,6 +7,8 @@ import { isToolAllowedInChannel } from "../channels/permission-profiles.js";
 import type { ChannelId } from "../channels/types.js";
 import { getConfig } from "../config/loader.js";
 import type { AutoApproveThreshold } from "../permissions/approval-policy.js";
+import { isDynamicSkillLoadInvocation } from "../permissions/checker.js";
+import { isOutOfWorkspaceFileInvocation } from "../permissions/workspace-policy.js";
 import {
   isUnparseableToolArgs,
   unparseableToolArgsMessage,
@@ -238,13 +240,18 @@ const UI_SURFACE_TOOLS = new Set(["ui_show", "ui_update", "ui_dismiss"]);
 
 /**
  * Tool-sensitivity predicate: does invoking this tool require an approval
- * decision at all? This is purely about the tool and where it executes —
- * actor identity never feeds in here (it enters the decision only through
- * the `CapabilitySet` floor, see {@link resolveSensitiveToolDecision}).
+ * decision at all? This is about the tool, where it executes, and — for
+ * `skill_load` — whether the invocation will execute embedded shell at load
+ * time (inline command expansions run outside the tool pipeline, so they must
+ * be gated like other code execution). Actor identity never feeds in here; it
+ * enters the decision only through the `CapabilitySet` floor, see
+ * {@link resolveSensitiveToolDecision}.
  */
 export function isSensitiveTool(
   toolName: string,
   executionTarget: ExecutionTarget,
+  input?: Record<string, unknown>,
+  workingDir?: string,
 ): boolean {
   // UI surface tools are passive, user-visible operations (cards, forms,
   // tables). User input is voluntary and user-controlled — they are not
@@ -252,6 +259,36 @@ export function isSensitiveTool(
   // established.
   if (UI_SURFACE_TOOLS.has(toolName)) {
     return false;
+  }
+
+  // An inline-command ("dynamic") skill_load executes embedded shell at load
+  // time. skill_load is not a side-effect tool, so without this it would skip
+  // the capability floor entirely. Routing it through the gate makes a
+  // non-guardian's dynamic load escalate to the guardian like any other code
+  // execution — the floor is deterministic, so neither Full access nor a
+  // covering trust rule lifts it. (The guardian self-approves; the trust-rule
+  // escape hatch still applies to the guardian's own load in the risk lane.)
+  if (
+    toolName === "skill_load" &&
+    input &&
+    isDynamicSkillLoadInvocation(toolName, input)
+  ) {
+    return true;
+  }
+
+  // A sandbox file tool targeting a path outside the workspace reaches the
+  // host filesystem on non-containerized installs (the host-fallback path
+  // policy executes the escape once the permission lane approves). That is
+  // host-equivalent access — a read-only escape can leak local secrets — so
+  // it carries the same capability floor as executionTarget === "host":
+  // non-guardian actors escalate to the guardian, and no risk threshold or
+  // trust rule lifts it.
+  if (
+    input &&
+    workingDir &&
+    isOutOfWorkspaceFileInvocation(toolName, input, workingDir)
+  ) {
+    return true;
   }
 
   // Side-effect tools are sensitive. Read-only host execution is too,
@@ -486,7 +523,12 @@ export class ToolApprovalHandler {
       | Parameters<typeof consumeGrantForInvocation>[0]
       | null = null;
 
-    const sensitive = isSensitiveTool(name, executionTarget);
+    const sensitive = isSensitiveTool(
+      name,
+      executionTarget,
+      input,
+      context.workingDir,
+    );
     const { sensitiveToolApproval } = resolveCapabilities(context.trustClass);
     // cellThreshold stays unresolved: the decision does not consult it
     // (the floor is deterministic), and resolving a live threshold here
@@ -672,6 +714,8 @@ export class ToolApprovalHandler {
           conversationId: context.conversationId,
           requesterExternalUserId: context.requesterExternalUserId,
           requesterChatId: context.requesterChatId,
+          sourceMessageId: context.sourceMessageId,
+          sourceThreadId: context.sourceThreadId,
           toolName: name,
           inputDigest,
           questionText: buildToolGrantQuestionText(name, input, context),

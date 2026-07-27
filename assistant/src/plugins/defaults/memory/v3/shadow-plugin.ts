@@ -7,10 +7,13 @@
  * and returns it at v2's dynamic-memory placement (`after-memory-prefix`).
  *
  * On each live turn:
- *   1. Lazy-init the v3 lanes ONCE across the whole process (section index,
- *      section-grain BM25 needle, dense lane config, link-graph edge graph,
- *      curated core set, frecency hot set), memoizing the init promise so
- *      concurrent first turns share a single build.
+ *   1. Lazy-init the v3 lanes (section index, section-grain BM25 needle,
+ *      dense lane config, link-graph edge graph, curated core set, frecency
+ *      hot set), memoizing the init promise so concurrent first turns share a
+ *      single build. The memo lives until the persisted lanes-version token
+ *      changes (see `./lanes-version-store.js`) — writers in any process bump
+ *      it via {@link invalidateLanes}, and {@link getLanes} observes the change
+ *      and rebuilds.
  *   2. Build a {@link MemoryRoutingTurn} from the conversation's recent messages.
  *   3. Run {@link orchestrate} and record its selection set to
  *      `memory_v3_selections` with a best-effort lane attribution.
@@ -51,8 +54,8 @@ import { buildEntityIndex } from "./entity-lane.js";
 import { getActiveSlugs } from "./ever-injected-store.js";
 import { computeFreshSet } from "./fresh-set.js";
 import { calibrateBm25NormK } from "./gate.js";
-import { isMemoryV3InjectionGateEnabled } from "./gate-flag.js";
 import { computeHotSet } from "./hot-set.js";
+import { bumpLanesVersion, readLanesVersion } from "./lanes-version-store.js";
 import { computeLearnedEdgeGraph } from "./learned-edges.js";
 import type { OrchestrateResult } from "./orchestrate.js";
 import { orchestrate } from "./orchestrate.js";
@@ -64,7 +67,7 @@ import { ensureSectionCollection } from "./section-dense-store.js";
 import type { SectionNeedle } from "./section-needle.js";
 import { buildSectionNeedle } from "./section-needle.js";
 import { buildSectionIndex } from "./sections.js";
-import { getPageIndex } from "./substrate/page-index.js";
+import { getPageIndex, invalidatePageIndex } from "./substrate/page-index.js";
 import { readPage, renderPageContent } from "./substrate/page-store.js";
 import { resolveV3Tuning } from "./tuning-profile.js";
 import {
@@ -142,16 +145,50 @@ const DAY_MS = 24 * 60 * 60 * 1000;
  */
 let lanesPromise: Promise<ShadowLanes> | null = null;
 
+/** The persisted lanes-version token captured when the memoized build started
+ *  ({@link readLanesVersion}). {@link getLanes} rebuilds when the store's token
+ *  differs. */
+let builtLanesVersion: string | null = null;
+
+/** Drop THIS process's lane caches: the memo and the page-index cache the
+ *  rebuild reads through. Shared by the writer path ({@link invalidateLanes})
+ *  and the observer path in {@link getLanes}. */
+function dropLanesLocal(): void {
+  lanesPromise = null;
+  invalidatePageIndex();
+}
+
 /**
  * Drop the memoized lanes so the NEXT `getLanes` rebuilds them from scratch
  * (fresh section index + fresh needle + fresh edge graph). The rebuild is lazy
- * — this only clears the cache, so the cost is paid by the next caller, and
+ * — this only clears the caches, so the cost is paid by the next caller, and
  * concurrent first-callers after the invalidation still share a single build via
  * the re-memoized promise. Call this whenever the underlying pages change on
  * disk.
+ *
+ * Three effects, and every caller needs all three:
+ *   - null the local memo, so this process rebuilds on its next turn;
+ *   - drop the page-index cache, so the rebuild re-scans the workspace even
+ *     when the pages changed without a daemon tool hook firing (direct disk
+ *     edits, another process's writes);
+ *   - bump the persisted lanes-version token, so OTHER processes observe the
+ *     invalidation — the memory worker is where the maintain job calls this,
+ *     and without the bump the daemon's lanes would never rebuild.
+ *
+ * The bump is best-effort: invalidation must never throw (it runs inside
+ * jobs, the rebuild-index route, and tests), so a token-write failure only
+ * logs — the local invalidation above still holds.
  */
 export function invalidateLanes(): void {
-  lanesPromise = null;
+  dropLanesLocal();
+  try {
+    bumpLanesVersion(getWorkspaceDir());
+  } catch (err) {
+    log.warn(
+      { err },
+      "lanes-version bump failed; other processes will not observe this invalidation",
+    );
+  }
 }
 
 /** Test-only alias for {@link invalidateLanes}. */
@@ -373,9 +410,28 @@ async function initLanes(config: AssistantConfig): Promise<ShadowLanes> {
   };
 }
 
-/** Lazy, memoized accessor for the shadow lanes. */
+/**
+ * Lazy, memoized accessor for the shadow lanes. The memo is valid while the
+ * persisted lanes-version token matches the one captured at build start; a
+ * mismatch (another process — or this one — called {@link invalidateLanes})
+ * drops the memo and rebuilds. A failed token read serves the memo unchanged.
+ */
 function getLanes(config: AssistantConfig): Promise<ShadowLanes> {
+  if (lanesPromise) {
+    const current = readLanesVersion(getWorkspaceDir());
+    if (current !== undefined && current !== builtLanesVersion) {
+      // A writer bumped the persisted token since this build — the memory
+      // worker's maintain job after a consolidation, or the rebuild-index
+      // route. This observer path never re-bumps the token: writers bump,
+      // observers only compare — a re-bump here would make every rebuild
+      // trigger another one on the following turn.
+      dropLanesLocal();
+    }
+  }
   if (!lanesPromise) {
+    // Capture the token BEFORE building: a bump that lands mid-build is then
+    // detected on the next call (one extra rebuild, never a missed one).
+    builtLanesVersion = readLanesVersion(getWorkspaceDir()) ?? null;
     lanesPromise = initLanes(config).catch((err) => {
       // Reset on failure so a transient init error doesn't permanently wedge
       // the shadow lane — the next turn retries.
@@ -646,10 +702,6 @@ export async function observeTurn(
       () => getLanes(cfg),
     );
     const v3 = cfg.memory.v3;
-    // Resolve the effective gate enable once for the turn: the feature flag
-    // AND the `memory.v3.gate.enabled` config kill-switch. Tuning lives in
-    // `memory.v3.gate`.
-    const gateEnabled = isMemoryV3InjectionGateEnabled(cfg);
     // Re-resolve the corpus-adaptive tuning each turn from the CURRENT config
     // (with the lane-build corpus-size signal) so a live config.json edit to a
     // per-turn knob (selectorEnabled, denseK, replyQueryK, edge.*) takes effect
@@ -677,6 +729,7 @@ export async function observeTurn(
       activeSlugs: getActiveSlugs(conversationId),
       entityCap: v3.entity.cap,
       replyQueryK: tuning.replyQueryK,
+      spanQueryK: tuning.spanQueryK,
       edgeSeeds: tuning.edgeSeedCount,
       edgePerSeed: tuning.edgePerSeed,
       edgeCap: tuning.edgeCap,
@@ -688,15 +741,12 @@ export async function observeTurn(
         v3.selectorPromptPath,
         getWorkspaceDir(),
       ),
-      // Per-turn injection gate: the `memory.v3.gate` tuning with the raw
-      // config `enabled` overwritten by the effective enable (flag AND config),
-      // and `bm25NormK` resolved to a corpus-calibrated value when the user has
-      // not set an explicit override (null). The spread is the compile-time
-      // drift guard — if the gate schema and `V3GateConfig` diverge, this
-      // stops typechecking.
+      // Per-turn injection gate: the `memory.v3.gate` tuning with bm25NormK
+      // resolved from null to a corpus-calibrated value when the user has not
+      // set an explicit override. The spread is the compile-time drift guard —
+      // if the gate schema and `V3GateConfig` diverge, this stops typechecking.
       gateConfig: {
         ...v3.gate,
-        enabled: gateEnabled,
         bm25NormK:
           v3.gate.bm25NormK ??
           calibrateBm25NormK(lanes.sectionIndex.sections.length),

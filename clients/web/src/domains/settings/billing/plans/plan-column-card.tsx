@@ -1,6 +1,7 @@
 import { CircleCheck } from "lucide-react";
 
 import { PlanTierAvatar } from "@/domains/settings/billing/plan-tier-meta";
+import type { TierRelation } from "@/domains/settings/billing/package-types";
 import { Button } from "@vellumai/design-library/components/button";
 import { Tag } from "@vellumai/design-library/components/tag";
 
@@ -15,7 +16,8 @@ export interface PlanColumnCardProps {
   /** CTA label for a selectable tier; ignored when `isCurrent`. */
   ctaLabel: string;
   features: readonly string[];
-  mostPopular?: boolean;
+  /** Renders the "Recommended" chip — only on a non-current, non-downgrade column. */
+  recommended?: boolean;
   /**
    * The featured tier renders as the white/light card; the rest stay dark. The
    * value drives a nested `data-theme` scope so the design tokens inside the
@@ -23,6 +25,12 @@ export interface PlanColumnCardProps {
    */
   tone?: "dark" | "light";
   isCurrent: boolean;
+  /**
+   * How this tier relates to the user's current tier. Drives the CTA chrome:
+   * "downgrade" renders an outlined button; "upgrade" (default) and "current"
+   * keep the existing primary / disabled rendering.
+   */
+  intent?: TierRelation;
   /** A checkout is in flight — disable every CTA until it resolves. */
   pending: boolean;
   onCta: () => void;
@@ -40,16 +48,18 @@ export function PlanColumnCard({
   priceCaption,
   ctaLabel,
   features,
-  mostPopular = false,
+  recommended = false,
   tone = "dark",
   isCurrent,
+  intent = "upgrade",
   pending,
   onCta,
 }: PlanColumnCardProps) {
+  const isDowngrade = intent === "downgrade" && !isCurrent;
   return (
     <div
       data-theme={tone}
-      className="flex w-full flex-col gap-4 rounded-2xl bg-[var(--surface-lift)] p-4"
+      className="flex w-full flex-col gap-3 rounded-2xl bg-[var(--surface-lift)] p-3 sm:gap-4 sm:p-4"
     >
       <PlanTierAvatar tier={tierKey} size={50} />
 
@@ -58,14 +68,14 @@ export function PlanColumnCard({
           <span className="text-[20px] font-medium text-[var(--content-emphasised)]">
             {name}
           </span>
-          {mostPopular ? (
+          {recommended && !isDowngrade && !isCurrent ? (
             <Tag className="bg-[var(--feed-digest-weak)] text-[12px] font-semibold uppercase text-[var(--credits-accent)]">
-              Most Popular
+              Recommended
             </Tag>
           ) : null}
         </div>
 
-        <p className="h-9 overflow-hidden text-[14px] font-medium leading-[18px] text-[var(--content-tertiary)]">
+        <p className="overflow-hidden text-[14px] font-medium leading-[18px] text-[var(--content-tertiary)] sm:h-9">
           {tagline}
         </p>
       </div>
@@ -82,7 +92,7 @@ export function PlanColumnCard({
       </div>
 
       <Button
-        variant="primary"
+        variant={isDowngrade ? "outlined" : "primary"}
         fullWidth
         disabled={isCurrent || pending}
         onClick={onCta}
@@ -92,7 +102,7 @@ export function PlanColumnCard({
 
       <div className="h-px w-full bg-[var(--border-hover)]" />
 
-      <div className="flex flex-col gap-4">
+      <div className="flex flex-col gap-2 sm:gap-4">
         <span className="text-[12px] font-medium text-[var(--content-tertiary)]">
           Includes:
         </span>

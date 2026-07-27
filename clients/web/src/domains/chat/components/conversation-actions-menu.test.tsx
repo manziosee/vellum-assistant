@@ -170,6 +170,32 @@ describe("renderConversationMenuItems", () => {
     expect(html).not.toContain("Mark as unread");
   });
 
+  test("renders the channel source link item when provided", () => {
+    const html = renderToStaticMarkup(
+      <>{renderConversationMenuItems({
+        Primitive: Menu as unknown as ConversationMenuPrimitive,
+        variant: "header",
+        channelSourceLink: {
+          href: "https://slack.com/archives/C01ABC/p1700000000000100",
+          label: "Open in Slack",
+        },
+        onPinToggle: () => {},
+      })}</>,
+    );
+    expect(html).toContain("Open in Slack");
+  });
+
+  test("omits the channel source link item when absent", () => {
+    const html = renderToStaticMarkup(
+      <>{renderConversationMenuItems({
+        Primitive: Menu as unknown as ConversationMenuPrimitive,
+        variant: "header",
+        onPinToggle: () => {},
+      })}</>,
+    );
+    expect(html).not.toContain("Open in Slack");
+  });
+
   test("renders header variant with correct item order", () => {
     const html = renderToStaticMarkup(
       <>{renderConversationMenuItems({
@@ -185,6 +211,91 @@ describe("renderConversationMenuItems", () => {
     expect(html).toContain("Fork conversation");
     expect(html).toContain("Pin");
     expect(html).toContain("Rename");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// "Move to group" submenu
+// ---------------------------------------------------------------------------
+
+describe("renderConversationMenuItems — Move to group submenu", () => {
+  test("omitted entirely when move/create handlers are not wired", () => {
+    const html = renderToStaticMarkup(
+      <>{renderConversationMenuItems({
+        Primitive: Menu as unknown as ConversationMenuPrimitive,
+        onPinToggle: () => {},
+      })}</>,
+    );
+    expect(html).not.toContain("Move to group");
+  });
+
+  test("shows the submenu with New group… even when there are no groups", () => {
+    const html = renderToStaticMarkup(
+      <>{renderConversationMenuItems({
+        Primitive: Menu as unknown as ConversationMenuPrimitive,
+        moveToGroups: [],
+        onMoveToGroup: () => {},
+        onCreateGroupInto: () => {},
+      })}</>,
+    );
+    expect(html).toContain("Move to group");
+    expect(html).toContain("New group…");
+  });
+
+  test("lists existing custom groups as targets", () => {
+    const html = renderToStaticMarkup(
+      <>{renderConversationMenuItems({
+        Primitive: Menu as unknown as ConversationMenuPrimitive,
+        moveToGroups: [
+          { id: "g_research", name: "Research" },
+          { id: "g_ideas", name: "Ideas" },
+        ],
+        onMoveToGroup: () => {},
+        onCreateGroupInto: () => {},
+      })}</>,
+    );
+    expect(html).toContain("Research");
+    expect(html).toContain("Ideas");
+    expect(html).toContain("New group…");
+  });
+
+  test("appends Remove from group only when onRemoveFromGroup is provided", () => {
+    const withRemove = renderToStaticMarkup(
+      <>{renderConversationMenuItems({
+        Primitive: Menu as unknown as ConversationMenuPrimitive,
+        moveToGroups: [{ id: "g_research", name: "Research" }],
+        onMoveToGroup: () => {},
+        onCreateGroupInto: () => {},
+        onRemoveFromGroup: () => {},
+      })}</>,
+    );
+    expect(withRemove).toContain("Remove from group");
+
+    const withoutRemove = renderToStaticMarkup(
+      <>{renderConversationMenuItems({
+        Primitive: Menu as unknown as ConversationMenuPrimitive,
+        moveToGroups: [{ id: "g_research", name: "Research" }],
+        onMoveToGroup: () => {},
+        onCreateGroupInto: () => {},
+      })}</>,
+    );
+    expect(withoutRemove).not.toContain("Remove from group");
+  });
+
+  test("mobile bottom sheet renders the flattened Move to group block", () => {
+    const html = renderToStaticMarkup(
+      <>
+        {renderConversationMenuItemsAsPanelItems({
+          moveToGroups: [{ id: "g_research", name: "Research" }],
+          onMoveToGroup: () => {},
+          onCreateGroupInto: () => {},
+          onClose: () => {},
+        })}
+      </>,
+    );
+    expect(html).toContain("Move to group");
+    expect(html).toContain("Research");
+    expect(html).toContain("New group…");
   });
 });
 
@@ -395,6 +506,23 @@ describe("renderConversationMenuItemsAsPanelItems", () => {
     expect(html).toContain("Pin");
     expect(html).toContain("Rename");
     expect(html).toContain("Archive");
+  });
+
+  test("renders the channel source link row when provided", () => {
+    const html = renderToStaticMarkup(
+      <>
+        {renderConversationMenuItemsAsPanelItems({
+          variant: "header",
+          channelSourceLink: {
+            href: "https://slack.com/archives/C01ABC/p1700000000000100",
+            label: "Open in Slack",
+          },
+          onPinToggle: () => {},
+          onClose: () => {},
+        })}
+      </>,
+    );
+    expect(html).toContain("Open in Slack");
   });
 });
 

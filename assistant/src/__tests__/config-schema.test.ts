@@ -68,11 +68,11 @@ describe("AssistantConfigSchema", () => {
     expect(result.services["image-generation"].model).toBe(
       "gemini-3.1-flash-image-preview",
     );
-    expect(result.services["image-generation"].mode).toBe("your-own");
+    expect(result.services["image-generation"]).not.toHaveProperty("mode");
     expect(result.services["web-search"].provider).toBe(
       "inference-provider-native",
     );
-    expect(result.services["web-search"].mode).toBe("your-own");
+    expect(result.services["web-search"]).not.toHaveProperty("mode");
     expect(result.llm.profileSession).toEqual({
       defaultTtlSeconds: 1800,
       maxTtlSeconds: 43200,
@@ -94,8 +94,20 @@ describe("AssistantConfigSchema", () => {
       enabled: true,
       blockIngress: true,
       allowOneTimeSend: false,
+      blockTokenShapedMessages: true,
     });
     expect(result.auditLog).toEqual({ retentionDays: 0 });
+  });
+
+  test("accepts vellum as an image generation provider", () => {
+    const result = AssistantConfigSchema.parse({
+      services: {
+        "image-generation": { provider: "vellum", model: "gpt-image-2" },
+      },
+    });
+
+    expect(result.services["image-generation"].provider).toBe("vellum");
+    expect(result.services["image-generation"].model).toBe("gpt-image-2");
   });
 
   test("accepts Tavily as a web search provider", () => {
@@ -106,7 +118,8 @@ describe("AssistantConfigSchema", () => {
     });
 
     expect(result.services["web-search"].provider).toBe("tavily");
-    expect(result.services["web-search"].mode).toBe("your-own");
+    // A mode key sent by an older client is stripped at parse.
+    expect(result.services["web-search"]).not.toHaveProperty("mode");
   });
 
   test("accepts Firecrawl as a web search provider", () => {
@@ -117,7 +130,7 @@ describe("AssistantConfigSchema", () => {
     });
 
     expect(result.services["web-search"].provider).toBe("firecrawl");
-    expect(result.services["web-search"].mode).toBe("your-own");
+    expect(result.services["web-search"]).not.toHaveProperty("mode");
   });
 
   test("defaults the web-fetch provider to the built-in fetcher", () => {
@@ -605,6 +618,38 @@ describe("AssistantConfigSchema", () => {
       rateLimit: { maxRequestsPerMinute: -1 },
     });
     expect(result.success).toBe(false);
+  });
+
+  // ── apiRateLimit config (authenticated /v1/* API limiter) ────────────
+
+  test("applies apiRateLimit default of 300 when unset", () => {
+    const result = AssistantConfigSchema.parse({});
+    expect(result.apiRateLimit).toEqual({
+      authenticatedMaxRequestsPerMinute: 300,
+    });
+  });
+
+  test("accepts a custom apiRateLimit.authenticatedMaxRequestsPerMinute override", () => {
+    const result = AssistantConfigSchema.parse({
+      apiRateLimit: { authenticatedMaxRequestsPerMinute: 600 },
+    });
+    expect(result.apiRateLimit.authenticatedMaxRequestsPerMinute).toBe(600);
+  });
+
+  test("rejects zero, negative, and non-integer apiRateLimit budgets", () => {
+    for (const bad of [0, -1, 12.5, "300"]) {
+      const result = AssistantConfigSchema.safeParse({
+        apiRateLimit: { authenticatedMaxRequestsPerMinute: bad },
+      });
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(
+          result.error.issues.some((i) =>
+            i.path.join(".").includes("authenticatedMaxRequestsPerMinute"),
+          ),
+        ).toBe(true);
+      }
+    }
   });
 
   test("rejects negative auditLog.retentionDays", () => {

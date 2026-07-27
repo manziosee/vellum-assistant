@@ -62,7 +62,6 @@ import type { ContentBlock, Message } from "../providers/types.js";
 import type { Provider } from "../providers/types.js";
 import { resolveCapabilities } from "../runtime/capabilities.js";
 import { publishConversationMessagesChanged } from "../runtime/sync/resource-sync-events.js";
-import type { ActivationMomentParam } from "../telemetry/activation-funnel.js";
 import { stampTurnOutcome } from "../telemetry/turn-outcome.js";
 import {
   emitToolProfilingSummary,
@@ -83,6 +82,7 @@ import {
   type EventHandlerDeps,
   finalizePendingToolResultRow,
   markHistoryStrippedBestEffort,
+  settlePendingPartialFlush,
 } from "./conversation-agent-loop-handlers.js";
 import {
   approveHostAttachmentRead,
@@ -105,18 +105,18 @@ import {
   resolveTurnInboundActorContext,
   type SlackChronologicalContext,
 } from "./conversation-runtime-assembly.js";
+import type { CurrentTurnSurface } from "./conversation-surfaces.js";
 import { markSurfaceCompleted } from "./conversation-surfaces.js";
 import { runDeferredTurnTail } from "./conversation-turn-finalize.js";
 import { recordUsage } from "./conversation-usage.js";
 import { resolveTurnTimezoneContext } from "./date-context.js";
 import { getDiskPressureStatus } from "./disk-pressure-guard.js";
 import { classifyDiskPressureTurnPolicy } from "./disk-pressure-policy.js";
-import type {
-  ServerMessage,
-  SurfaceData,
-  SurfaceType,
-  UsageStats,
-} from "./message-protocol.js";
+import {
+  registerInflightTurn,
+  unregisterInflightTurn,
+} from "./inflight-turn-registry.js";
+import type { AssistantEvent, UsageStats } from "./message-protocol.js";
 import type { TrustContext } from "./trust-context-types.js";
 import { resolveTurnCallSite } from "./turn-call-site.js";
 import { runWithLatencySubSpans } from "./turn-latency-sub-spans.js";
@@ -163,34 +163,12 @@ const FALLBACK_TURN_TRUST: TrustContext = {
 };
 
 /**
- * Per-surface entry tracked on the current turn. Inline shape kept stable so
- * routes and persistence helpers can consume it via a named import instead of
- * `infer`-extracting from {@link Conversation}.
+ * Per-surface entry tracked on the current turn. Named alias over the
+ * discriminated {@link CurrentTurnSurface} so routes and persistence helpers
+ * consume it via a named import instead of `infer`-extracting from
+ * {@link Conversation}.
  */
-export interface AssistantSurface {
-  surfaceId: string;
-  surfaceType: SurfaceType;
-  title?: string;
-  data: SurfaceData;
-  actions?: Array<{
-    id: string;
-    label: string;
-    style?: string;
-    data?: Record<string, unknown>;
-  }>;
-  display?: string;
-  persistent?: boolean;
-  /** Id of the tool call that produced this surface (the `ui_show` proxy tool). Persisted so app previews can gate on the tool result's arrival rather than whole-turn streaming state. */
-  toolCallId?: string;
-  /**
-   * Commit-timing activation-rail tag (daemon-only). Persisted into the
-   * server-side `ui_surface` history block — NOT the client `ui_surface_show`
-   * message — so `restoreSurfaceStateFromHistory` can rehydrate the tag and a
-   * post-reload commit still records its funnel milestone. Show-timing moments
-   * record at render and are never stored here.
-   */
-  activationMoment?: ActivationMomentParam;
-}
+export type AssistantSurface = CurrentTurnSurface;
 
 // ── abort watchdog ───────────────────────────────────────────────────
 
@@ -262,7 +240,7 @@ export async function runAgentLoopImpl(
   ctx: Conversation,
   content: string,
   userMessageId: string,
-  onEvent: (msg: ServerMessage) => void,
+  onEvent: (msg: AssistantEvent) => void,
   options?: {
     isInteractive?: boolean;
     isUserMessage?: boolean;
@@ -622,6 +600,11 @@ export async function runAgentLoopImpl(
   startToolProfilingRequest(ctx.conversationId);
   let turnStarted = false;
   const state = createEventHandlerState();
+  // Publish this turn's flushed-content watermark so the worker → daemon
+  // persist hand-off can cap a snapshot anchor at flushed content rather than
+  // the live seq counter, which runs ahead while the turn streams. Cleared in
+  // the `finally`.
+  registerInflightTurn(ctx.conversationId, state);
   let persistedErrorAssistantMessage = false;
   let deletedReservedAssistantMessage = false;
   // Abnormal turn outcome for telemetry, stamped onto the user-message row in
@@ -1541,8 +1524,13 @@ export async function runAgentLoopImpl(
 
     // The terminal SSE for this turn has now been emitted (message_complete,
     // generation_handoff, or generation_cancelled), so the composer is already
-    // re-enabling. Drain the deferred bookkeeping now — after the SSE, before
-    // the `finally` commits and drains the queue for the next turn.
+    // re-enabling. Settle any pending debounced partial flush FIRST — a
+    // cancelled turn exits with the timer still pending, and a flush firing
+    // after the tail's stranded fold (or the voice bridge's transcript
+    // hygiene) would write raw content into an already-settled row. Then
+    // drain the deferred bookkeeping — after the SSE, before the `finally`
+    // commits and drains the queue for the next turn.
+    await settlePendingPartialFlush(state, deps);
     await runDeferredTurnTail({ ctx, state, rlog, generationCompletedAt });
   } catch (err) {
     clearConversationNotices(ctx.conversationId);
@@ -1605,6 +1593,10 @@ export async function runAgentLoopImpl(
     }
     ctx.abortController = null;
     ctx.setProcessing(false);
+    // The turn's content is fully flushed by here (`settlePendingPartialFlush`
+    // ran inside the try), so daemon-side callers can safely fall back to the
+    // live seq counter once this registration is gone.
+    unregisterInflightTurn(ctx.conversationId, state);
 
     if (turnStarted) {
       ctx.turnCount++;
@@ -1688,7 +1680,7 @@ function emitUsage(
   inputTokens: number,
   outputTokens: number,
   model: string,
-  onEvent: (msg: ServerMessage) => void,
+  onEvent: (msg: AssistantEvent) => void,
   actor: UsageActor,
   requestId: string | null = null,
   cacheCreationInputTokens = 0,
@@ -1777,7 +1769,7 @@ export async function applyCompactionResult(
     summaryCallSite?: LLMCallSite;
     summaryOverrideProfile?: string | null;
   },
-  onEvent: (msg: ServerMessage) => void,
+  onEvent: (msg: AssistantEvent) => void,
   reqId: string | null,
   options: {
     slackContextCompactionWatermarkTs?: string | null;

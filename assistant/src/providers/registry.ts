@@ -75,12 +75,10 @@ export interface ProvidersConfig {
   services: {
     inference: Record<string, never>;
     "image-generation": {
-      mode: "managed" | "your-own";
       provider: string;
       model: string;
     };
     "web-search": {
-      mode: "managed" | "your-own";
       provider: string;
     };
   };

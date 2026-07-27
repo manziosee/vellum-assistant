@@ -13,8 +13,8 @@ import { useCallback, useMemo, useState } from "react";
 import type { MessageHoverActionsProps } from "@/domains/chat/components/message-hover-actions/message-hover-actions";
 import { messagePlainText } from "@/domains/chat/utils/message-plain-text";
 import {
-  useBookmarksEnabled,
   useBookmarkToggle,
+  useCanBookmark,
   useIsBookmarked,
 } from "@/hooks/use-bookmarks";
 import { BottomSheet, PanelItem } from "@vellumai/design-library";
@@ -45,12 +45,7 @@ export function MessageLongPressActions({
   open,
   onOpenChange,
 }: MessageLongPressActionsProps) {
-  const bookmarksEnabled = useBookmarksEnabled();
-  const canBookmark =
-    bookmarksEnabled &&
-    Boolean(conversationId) &&
-    Boolean(message.id) &&
-    !message.isOptimistic;
+  const canBookmark = useCanBookmark(message, conversationId);
 
   const content = useMemo(() => messagePlainText(message), [message]);
 

@@ -32,9 +32,11 @@ import {
 import { z } from "zod";
 
 import { getConfig } from "../../../../config/loader.js";
-import { usesConceptPageMemory } from "../../../../config/memory-v3-gate.js";
+import {
+  isMemoryGraphSupported,
+  usesConceptPageMemory,
+} from "../../../../config/memory-v3-gate.js";
 import type { AssistantConfig } from "../../../../config/types.js";
-import { getDb } from "../../../../persistence/db-connection.js";
 import {
   generateSparseEmbedding,
   getMemoryBackendStatus,
@@ -71,8 +73,13 @@ import type {
   MemoryType,
   NewNode,
 } from "../graph/types.js";
+import {
+  findPendingEntryForContent,
+  readPendingBufferEntries,
+} from "../graph-topology/pending-buffer.js";
 import { consolidationBackoffRemainingMs } from "../jobs-worker.js";
 import { getLogger } from "../logging.js";
+import { memoryDbOrNull } from "../memory-db.js";
 import { getWorkspaceDir } from "../paths.js";
 import { getPageIndex } from "../v3/substrate/page-index.js";
 
@@ -312,7 +319,8 @@ async function handleListMemoryItems(queryParams: Record<string, string>) {
     );
   }
 
-  const db = getDb();
+  const db = memoryDbOrNull("listMemoryItems");
+  if (!db) throw new Error("memory database unavailable");
 
   // Build fidelity filter based on status param
   const fidelityFilter =
@@ -487,11 +495,19 @@ function handleGetMemoryItem(id: string) {
  * concepts-only filter in `build-memory-graph.ts`, but never triggers the
  * expensive `getMemoryGraph` build (edge / learned / cluster graph) — the
  * concept graph is deliberately kept off identity-page load.
+ *
+ * `graph_supported` reports whether the memory-concept graph is available for
+ * this assistant — the same `isMemoryGraphSupported` condition under which
+ * `GET /memory-graph` returns `supported: true` (memory enabled + v3 live). It
+ * is a cheap config read (no page I/O), so glanceable surfaces can gate the
+ * graph entry point on real availability without triggering the graph build.
  */
-async function handleGetMemoryStats(): Promise<{ concepts: number }> {
+async function handleGetMemoryStats(
+  config: AssistantConfig,
+): Promise<{ concepts: number; graph_supported: boolean }> {
   const pageIndex = await getPageIndex(getWorkspaceDir());
   const concepts = pageIndex.entries.filter((e) => e.modifiedAt > 0).length;
-  return { concepts };
+  return { concepts, graph_supported: isMemoryGraphSupported(config) };
 }
 
 async function handleCreateMemoryItem(body: Record<string, unknown>) {
@@ -521,7 +537,8 @@ async function handleCreateMemoryItem(body: Record<string, unknown>) {
     : trimmedStatement;
 
   // Check for duplicate content
-  const db = getDb();
+  const db = memoryDbOrNull("createMemoryItem");
+  if (!db) throw new Error("memory database unavailable");
   const existing = db
     .select({ id: memoryGraphNodes.id })
     .from(memoryGraphNodes)
@@ -640,7 +657,8 @@ async function handleUpdateMemoryItem(
     changes.fidelity === "vivid" && existing.fidelity === "gone";
   if (contentChanged || reactivating) {
     const contentToCheck = changes.content ?? existing.content;
-    const db = getDb();
+    const db = memoryDbOrNull("updateMemoryItem");
+    if (!db) throw new Error("memory database unavailable");
     const collision = db
       .select({ id: memoryGraphNodes.id })
       .from(memoryGraphNodes)
@@ -811,12 +829,20 @@ export const ROUTES: RouteDefinition[] = [
     description:
       "Return a cheap count of concept pages from the cached memory page " +
       "index, for glanceable surfaces like the identity Memory card. Counts " +
-      "concept pages only and never builds the memory-concept graph.",
+      "concept pages only and never builds the memory-concept graph. Also " +
+      "reports graph_supported: whether the memory-concept graph is available " +
+      "for this assistant (memory enabled and v3 live), so callers can gate " +
+      "the graph entry point without building the graph.",
     tags: ["memory"],
     responseBody: z.object({
       concepts: z.number().describe("Number of concept pages in memory"),
+      graph_supported: z
+        .boolean()
+        .describe(
+          "Whether the memory-concept graph is available (memory enabled and v3 live)",
+        ),
     }),
-    handler: () => handleGetMemoryStats(),
+    handler: () => handleGetMemoryStats(getConfig()),
   },
 
   {
@@ -1054,11 +1080,20 @@ export const ROUTES: RouteDefinition[] = [
     },
     summary: "Create a memory by remembering a fact",
     description:
-      "Append a user-authored fact to the memory buffer via handleRemember. The fact surfaces in the memory graph immediately as a pending node, and a consolidation run is nudged (deduped, backoff-respecting) so it files into concept pages promptly.",
+      "Append a user-authored fact to the memory buffer via handleRemember. The fact surfaces in the memory graph immediately as a pending node (its id is returned so clients can navigate to it), and a consolidation run is nudged (deduped, backoff-respecting) so it files into concept pages promptly.",
     tags: ["memory"],
     requestBody: z.object({ content: z.string() }),
-    responseBody: z.object({ message: z.string(), success: z.boolean() }),
-    handler: ({ body }) => {
+    responseBody: z.object({
+      message: z.string(),
+      success: z.boolean(),
+      pendingNodeId: z
+        .string()
+        .optional()
+        .describe(
+          "Graph node id (`buffer:<hash>`) of the pending entry this create appended, for fly-to-node navigation. Absent when the buffer can't be re-read.",
+        ),
+    }),
+    handler: async ({ body }) => {
       const parsed = z.object({ content: z.string() }).safeParse(body ?? {});
       if (!parsed.success) {
         throw new BadRequestError("content (string) is required");
@@ -1072,10 +1107,28 @@ export const ROUTES: RouteDefinition[] = [
         "web",
         config,
       );
-      if (result.success) {
-        maybeEnqueueConsolidationForCreate(config);
+      if (!result.success) {
+        return result;
       }
-      return result;
+      maybeEnqueueConsolidationForCreate(config);
+
+      // Resolve the pending graph-node id of the entry just appended so the
+      // client can fly the map to it. Matched by this request's content
+      // (normalized through the same buffer parse) rather than the buffer
+      // tail, so a concurrently interleaved remember from another writer is
+      // never reported as this one's entry. Best-effort — the create already
+      // succeeded, so a read failure returns no id rather than an error.
+      let pendingNodeId: string | undefined;
+      try {
+        const entries = await readPendingBufferEntries(getWorkspaceDir());
+        pendingNodeId = findPendingEntryForContent(
+          entries,
+          parsed.data.content,
+        )?.id;
+      } catch (err) {
+        log.warn({ err }, "Failed to resolve pending node id after create");
+      }
+      return pendingNodeId ? { ...result, pendingNodeId } : result;
     },
   },
 ];
