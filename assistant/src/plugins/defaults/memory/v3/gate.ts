@@ -33,21 +33,24 @@ export const DEFAULT_BM25_NORM_K = 9.0;
 /**
  * Derive a per-corpus BM25F normalization constant from the section count.
  *
- * The gate normalizes a raw BM25F score as `score / (score + k)`. A good `k`
- * maps the normalization midpoint (0.5) to a "typical good match" for the
- * actual corpus — the expected peak BM25F score for a 3-body-term query at
- * ~5% document frequency in an average-length section.
+ * The gate normalizes a raw BM25F score as `score / (score + k)`. Setting k
+ * to the expected peak raw score maps the normalization midpoint (0.5) to
+ * exactly that match quality, giving a scale-invariant operating point across
+ * corpus sizes.
  *
- * Derivation: for body terms at df/N ≈ 0.05 and an average-length section,
- * the per-term TF-normalized score is ~1.0 and IDF ≈ ln(20) ≈ 3.0, giving
- * a 3-term raw score of ~9.0 — matching DEFAULT_BM25_NORM_K for N ≈ 33
- * sections. For smaller corpora IDF is lower (fewer sections for terms to be
- * "rare" against), so raw scores are lower and k must shrink to match.
+ * Derivation: assume three query terms each appearing in exactly one section
+ * (df=1), with a TF-normalized contribution of 1.0 per term. Using the Okapi
+ * IDF from section-needle.ts:
  *
- * The formula below tracks this by computing the expected IDF for df=1 (the
- * rarest case) scaled by the 3-term multiplier:
+ *   IDF(df=1) = ln(1 + (N − 0.5) / 1.5)
+ *
+ * The expected peak raw score for three such terms is 3 × IDF(df=1), so:
  *
  *   k = 3 × ln(1 + (N − 0.5) / 1.5)
+ *
+ * Scale invariance: a match with the same relative rarity (df=1 per term)
+ * lands at normalized score 0.5 at any corpus size. At N=33 this gives
+ * k ≈ 9.4, reproducing DEFAULT_BM25_NORM_K.
  *
  * Floored at 3 to keep the sparse lane usable on single-section corpora.
  * Falls back to DEFAULT_BM25_NORM_K for an empty corpus.
