@@ -376,6 +376,7 @@ async function initLanes(config: AssistantConfig): Promise<ShadowLanes> {
           now: Date.now(),
           windowMs: LEARNED_EDGES_WINDOW_DAYS * DAY_MS,
           knownSlugs: new Set(sectionIndex.byArticle.keys()),
+          structuralPrior: edgeGraph,
         })
       : undefined;
   // Ensuring the dense collection is best-effort: the needle + edge lanes and
