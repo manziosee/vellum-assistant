@@ -18300,7 +18300,7 @@ paths:
                       properties:
                         pageCountRange:
                           type: string
-                          description: Concept page count range (e.g. '10–49')
+                          description: Concept page count range (e.g. '10-49' or '200+')
                         total:
                           type: number
                           description: All gate runs in this bucket (scored + pass-open)
@@ -18321,7 +18321,7 @@ paths:
                             type: string
                           additionalProperties:
                             type: number
-                          description: Gate reason code → run count (dense_pass, fail_no_signal, …)
+                          description: Gate reason code to run count (dense_pass, fail_no_signal, ...)
                       required:
                         - pageCountRange
                         - total
@@ -18330,7 +18330,7 @@ paths:
                         - scoredPassRate
                         - reasons
                       additionalProperties: false
-                    description: Stats by concept page count range, lean→large
+                    description: Stats by concept page count range, lean to large
                   unknownPageCount:
                     type: object
                     properties:
@@ -18349,7 +18349,7 @@ paths:
                       - passed
                       - reasons
                     additionalProperties: false
-                    description: Runs with no real_concept_page_count in telemetry detail
+                    description: Runs with no real_concept_page_count recorded
                 required:
                   - lookbackDays
                   - totalRuns
