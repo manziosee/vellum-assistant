@@ -6,7 +6,7 @@
       "scope": "client",
       "key": "in-chat-onboarding-tour",
       "label": "In-Chat Onboarding Tour",
-      "description": "Multivariate experiment for the eyes-led in-chat onboarding tour. control = straight to chat after research onboarding (current behavior); tour = the extended tour auto-plays on first workspace entry, and the header replay button shows. Desktop-only: phone-width viewports and the native shell get neither the tour nor its telemetry (not even the exposure event), so the funnel measures desktop sessions exclusively. Targeted via LaunchDarkly (planned 70% tour / 30% control).",
+      "description": "Multivariate experiment for the eyes-led in-chat onboarding tour. control = straight to chat after research onboarding (current behavior); tour = the extended tour auto-plays on first workspace entry. Desktop-only: phone-width viewports and the native shell get neither the tour nor its telemetry (not even the exposure event), so the funnel measures desktop sessions exclusively. Targeted via LaunchDarkly (70% tour / 30% control).",
       "defaultEnabled": "control",
       "values": ["control", "tour"]
     },
@@ -115,22 +115,6 @@
       "key": "backward-releases",
       "label": "Backward Releases",
       "description": "Show older versions in the version picker, allowing rollback to previous releases",
-      "defaultEnabled": false
-    },
-    {
-      "id": "voice-mode",
-      "scope": "assistant",
-      "key": "voice-mode",
-      "label": "Voice Mode",
-      "description": "Show the live voice conversation button in the composer",
-      "defaultEnabled": false
-    },
-    {
-      "id": "voice-duplex-handoff",
-      "scope": "assistant",
-      "key": "voice-duplex-handoff",
-      "label": "Voice Duplex Handoff",
-      "description": "When a user barges in during live voice, keep the interrupted turn running as a background subagent instead of discarding it (true-duplex handoff)",
       "defaultEnabled": false
     },
     {
@@ -363,6 +347,14 @@
       "key": "memory-v3-bm25-auto-calibration",
       "label": "Memory v3 BM25 Auto-Calibration",
       "description": "Derives the BM25F normalization constant k from the live corpus size instead of using the fixed DEFAULT_BM25_NORM_K=9. Lowers k for small corpora (<33 sections) so the sparse gate fires at fewer matched terms; raises k for large corpora (>33 sections) to hold the same normalized score threshold. Gate behind this flag while large-corpus fire-rate data is gathered.",
+      "defaultEnabled": false
+    },
+    {
+      "id": "marketing-pricing-takeover",
+      "scope": "client",
+      "key": "marketing-pricing-takeover",
+      "label": "Marketing Pricing Takeover",
+      "description": "Gates the marketing pricing takeover page (www.vellum.ai/pricing) and the `/assistant/checkout?package=<slug>` deep link its package CTAs target. One flag covers both halves of the funnel so they can never be enabled independently and strand a CTA. When off, the checkout deep link redirects to the in-app plans takeover.",
       "defaultEnabled": false
     }
   ]
