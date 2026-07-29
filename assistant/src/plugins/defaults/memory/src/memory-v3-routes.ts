@@ -19,15 +19,14 @@ import { z } from "zod";
 
 import { getConfig } from "../../../../config/loader.js";
 import type { AssistantConfig } from "../../../../config/types.js";
-import { getTelemetrySqlite } from "../../../../persistence/db-connection.js";
 import {
   ACTOR_PRINCIPALS,
   type RoutePolicy,
 } from "../../../../runtime/auth/route-policy.js";
 import type { RouteDefinition } from "../../../../runtime/routes/types.js";
 import { getLogger } from "../logging.js";
+import { memorySqliteOrNull } from "../memory-db.js";
 import { backfillAllSections } from "../v3/maintain-job.js";
-import { MEMORY_V3_INJECTION_GATE_CHECK_NAME } from "../v3/orchestrate.js";
 import { invalidateLanes } from "../v3/shadow-plugin.js";
 
 const log = getLogger("memory-v3-routes");
@@ -125,7 +124,7 @@ interface BucketAcc {
   total: number;
   scored: number;
   passed: number;
-  /** Passes that came from scored runs — the numerator for scoredPassRate. */
+  /** Passes from scored runs only: the numerator for scoredPassRate. */
   scoredPassed: number;
   reasons: Record<string, number>;
 }
@@ -139,17 +138,17 @@ function corpusBucketLabel(pageCount: number): BucketLabel {
   return "200+";
 }
 
-interface GatePayloadDetail {
-  pass?: boolean;
-  reason?: string;
-  scored?: boolean;
-  real_concept_page_count?: number;
+interface GateRunRow {
+  pass: number;
+  scored: number;
+  reason: string | null;
+  real_concept_page_count: number | null;
 }
 
 const GateStatsBucketSchema = z.object({
   pageCountRange: z
     .string()
-    .describe("Concept page count range (e.g. '10–49')"),
+    .describe("Concept page count range (e.g. '10-49' or '200+')"),
   total: z
     .number()
     .describe("All gate runs in this bucket (scored + pass-open)"),
@@ -165,7 +164,9 @@ const GateStatsBucketSchema = z.object({
     ),
   reasons: z
     .record(z.string(), z.number())
-    .describe("Gate reason code → run count (dense_pass, fail_no_signal, …)"),
+    .describe(
+      "Gate reason code to run count (dense_pass, fail_no_signal, ...)",
+    ),
 });
 
 const GateStatsResponseSchema = z.object({
@@ -173,31 +174,35 @@ const GateStatsResponseSchema = z.object({
   totalRuns: z.number().describe("Total gate runs found in the window"),
   buckets: z
     .array(GateStatsBucketSchema)
-    .describe("Stats by concept page count range, lean→large"),
+    .describe("Stats by concept page count range, lean to large"),
   unknownPageCount: z
     .object({
       total: z.number(),
       passed: z.number(),
       reasons: z.record(z.string(), z.number()),
     })
-    .describe("Runs with no real_concept_page_count in telemetry detail"),
+    .describe("Runs with no real_concept_page_count recorded"),
 });
 
 export type GateStatsResponse = z.infer<typeof GateStatsResponseSchema>;
 
 /**
- * Aggregate memory v3 injection gate runs from the telemetry outbox for the
- * given lookback window. Groups runs by concept page count bucket and computes
- * pass rates and reason distributions per bucket.
+ * Aggregate memory v3 injection gate runs from the durable local
+ * `memory_v3_gate_runs` table for the given lookback window. Groups runs by
+ * concept page count bucket and computes pass rates and reason distributions.
+ *
+ * Reads from the memory DB, not the telemetry outbox. The outbox rows are
+ * deleted after each successful platform flush, so they cover only a short
+ * recent window in a healthy system. The `memory_v3_gate_runs` table persists
+ * across flushes and supports the full MAX_LOOKBACK_DAYS window.
  *
  * Pass-open shortcuts (dense disabled/unavailable, gate threw) are included in
  * `total` but not in `scored`, so `scoredPassRate` reflects only contested gate
- * decisions — the signal that actually reveals whether the gate thresholds are
- * calibrated correctly.
+ * decisions: the signal that reveals whether the gate thresholds are calibrated.
  */
 export function handleMemoryV3GateStats(
   lookbackDays: number = DEFAULT_LOOKBACK_DAYS,
-  db: ReturnType<typeof getTelemetrySqlite> = getTelemetrySqlite(),
+  db: ReturnType<typeof memorySqliteOrNull> = memorySqliteOrNull("gate-stats"),
 ): GateStatsResponse {
   const days = Math.min(
     Math.max(1, Math.floor(lookbackDays)),
@@ -226,15 +231,12 @@ export function handleMemoryV3GateStats(
   const rows = db
     .query(
       /*sql*/ `
-      SELECT payload FROM telemetry_events
-      WHERE name = 'watchdog'
-        AND created_at >= ?
-        AND json_extract(payload, '$.check_name') = ?
+      SELECT pass, scored, reason, real_concept_page_count
+      FROM memory_v3_gate_runs
+      WHERE created_at >= ?
     `,
     )
-    .all(since, MEMORY_V3_INJECTION_GATE_CHECK_NAME) as Array<{
-    payload: string;
-  }>;
+    .all(since) as GateRunRow[];
 
   const bucketMap = new Map<BucketLabel, BucketAcc>(
     CORPUS_BUCKETS.map((b) => [
@@ -251,17 +253,9 @@ export function handleMemoryV3GateStats(
   };
 
   for (const row of rows) {
-    let detail: GatePayloadDetail;
-    try {
-      const parsed = JSON.parse(row.payload) as { detail?: GatePayloadDetail };
-      detail = parsed.detail ?? {};
-    } catch {
-      continue;
-    }
-
     const pageCount =
-      typeof detail.real_concept_page_count === "number"
-        ? detail.real_concept_page_count
+      typeof row.real_concept_page_count === "number"
+        ? row.real_concept_page_count
         : null;
 
     const acc =
@@ -270,17 +264,16 @@ export function handleMemoryV3GateStats(
         : unknown;
 
     acc.total += 1;
-    if (detail.scored === true) {
+    if (row.scored === 1) {
       acc.scored += 1;
-      if (detail.pass === true) {
+      if (row.pass === 1) {
         acc.scoredPassed += 1;
       }
     }
-    if (detail.pass === true) {
+    if (row.pass === 1) {
       acc.passed += 1;
     }
-    const reason =
-      typeof detail.reason === "string" ? detail.reason : "unknown";
+    const reason = typeof row.reason === "string" ? row.reason : "unknown";
     acc.reasons[reason] = (acc.reasons[reason] ?? 0) + 1;
   }
 

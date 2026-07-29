@@ -467,6 +467,7 @@ import { migrateAddSubagentParentToolUseId } from "./migrations/356-add-subagent
 import { migrateMoveMemorySegmentsToMemoryDb } from "./migrations/357-move-memory-segments-to-memory-db.js";
 import { migrateMoveMemoryEmbeddingsToMemoryDb } from "./migrations/358-move-memory-embeddings-to-memory-db.js";
 import { migrateMoveMemorySummariesToMemoryDb } from "./migrations/359-move-memory-summaries-to-memory-db.js";
+import { migrateAddMemoryV3GateRuns } from "./migrations/360-add-memory-v3-gate-runs.js";
 import type { MigrationStep } from "./migrations/run-migrations.js";
 
 export const migrationSteps: MigrationStep[] = [
@@ -1540,5 +1541,10 @@ export const migrationSteps: MigrationStep[] = [
       "migrateDeletePrivateConversations",
       "migrateMemorySummariesScopeUpdatedIndex",
     ],
+  },
+  {
+    name: "migrateAddMemoryV3GateRuns",
+    run: migrateAddMemoryV3GateRuns,
+    dependsOn: ["migrateCoreTables"],
   },
 ];

@@ -65,6 +65,7 @@ import {
 } from "../../../../daemon/turn-latency-sub-spans.js";
 import { recordWatchdogEvent } from "../../../../telemetry/watchdog-events-store.js";
 import { getLogger } from "../logging.js";
+import { memorySqliteOrNull } from "../memory-db.js";
 import type { DenseHitScored } from "./dense.js";
 import { denseLaneScored } from "./dense.js";
 import type { EdgeGraph } from "./edge.js";
@@ -121,6 +122,54 @@ function recordGateRun(detail: Record<string, unknown>): void {
   } catch {
     // recordWatchdogEvent already no-ops on opt-out and a missing telemetry
     // DB; anything past that is not worth failing the turn over.
+  }
+  recordGateRunLocal(detail);
+}
+
+/**
+ * Write one gate run to the durable local `memory_v3_gate_runs` table in the
+ * memory DB. Unlike the telemetry outbox, rows here are NOT deleted after a
+ * platform flush, so `GET /memory/v3/gate-stats` can return meaningful
+ * history regardless of flush cadence. Fail-soft: any error is swallowed so
+ * a write failure never costs the turn its memory.
+ */
+function recordGateRunLocal(detail: Record<string, unknown>): void {
+  try {
+    const raw = memorySqliteOrNull("recordGateRunLocal");
+    if (!raw) {
+      return;
+    }
+    raw
+      .prepare(
+        /*sql*/ `
+        INSERT OR IGNORE INTO memory_v3_gate_runs
+          (id, created_at, pass, scored, reason,
+           real_concept_page_count, top_dense_score,
+           top_norm_sparse_score, checked_articles)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      )
+      .run(
+        crypto.randomUUID(),
+        Date.now(),
+        detail.pass === true ? 1 : 0,
+        detail.scored === true ? 1 : 0,
+        typeof detail.reason === "string" ? detail.reason : null,
+        typeof detail.real_concept_page_count === "number"
+          ? detail.real_concept_page_count
+          : null,
+        typeof detail.top_dense_score === "number"
+          ? detail.top_dense_score
+          : null,
+        typeof detail.top_norm_sparse_score === "number"
+          ? detail.top_norm_sparse_score
+          : null,
+        typeof detail.checked_articles === "number"
+          ? detail.checked_articles
+          : null,
+      );
+  } catch {
+    // Never let a local write failure cost the turn.
   }
 }
 
