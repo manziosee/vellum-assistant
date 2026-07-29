@@ -125,6 +125,8 @@ interface BucketAcc {
   total: number;
   scored: number;
   passed: number;
+  /** Passes that came from scored runs — the numerator for scoredPassRate. */
+  scoredPassed: number;
   reasons: Record<string, number>;
 }
 
@@ -158,7 +160,9 @@ const GateStatsBucketSchema = z.object({
   scoredPassRate: z
     .number()
     .nullable()
-    .describe("passed / scored; null when no scored runs in bucket"),
+    .describe(
+      "scoredPasses / scored (contested decisions only); null when no scored runs in bucket",
+    ),
   reasons: z
     .record(z.string(), z.number())
     .describe("Gate reason code → run count (dense_pass, fail_no_signal, …)"),
@@ -235,10 +239,16 @@ export function handleMemoryV3GateStats(
   const bucketMap = new Map<BucketLabel, BucketAcc>(
     CORPUS_BUCKETS.map((b) => [
       b.label,
-      { total: 0, scored: 0, passed: 0, reasons: {} },
+      { total: 0, scored: 0, passed: 0, scoredPassed: 0, reasons: {} },
     ]),
   );
-  const unknown: BucketAcc = { total: 0, scored: 0, passed: 0, reasons: {} };
+  const unknown: BucketAcc = {
+    total: 0,
+    scored: 0,
+    passed: 0,
+    scoredPassed: 0,
+    reasons: {},
+  };
 
   for (const row of rows) {
     let detail: GatePayloadDetail;
@@ -262,6 +272,9 @@ export function handleMemoryV3GateStats(
     acc.total += 1;
     if (detail.scored === true) {
       acc.scored += 1;
+      if (detail.pass === true) {
+        acc.scoredPassed += 1;
+      }
     }
     if (detail.pass === true) {
       acc.passed += 1;
@@ -278,7 +291,7 @@ export function handleMemoryV3GateStats(
       total: acc.total,
       scored: acc.scored,
       passed: acc.passed,
-      scoredPassRate: acc.scored > 0 ? acc.passed / acc.scored : null,
+      scoredPassRate: acc.scored > 0 ? acc.scoredPassed / acc.scored : null,
       reasons: acc.reasons,
     };
   });

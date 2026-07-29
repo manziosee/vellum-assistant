@@ -131,8 +131,37 @@ describe("handleMemoryV3GateStats", () => {
     expect(bucket.total).toBe(1);
     expect(bucket.scored).toBe(0);
     expect(bucket.passed).toBe(1);
-    // No scored runs → scoredPassRate is null
+    // No scored runs → scoredPassRate is null (unscored pass does not count)
     expect(bucket.scoredPassRate).toBeNull();
+  });
+
+  test("unscored pass mixed with scored fail does not inflate scoredPassRate", () => {
+    // Regression: before fix, pass-open + scored-fail in same bucket gave 100%
+    const rows = [
+      {
+        payload: makePayload({
+          pass: true,
+          reason: "dense_unavailable",
+          scored: false,
+          real_concept_page_count: 30,
+        }),
+      },
+      {
+        payload: makePayload({
+          pass: false,
+          reason: "fail_no_signal",
+          scored: true,
+          real_concept_page_count: 40,
+        }),
+      },
+    ];
+    const result = handleMemoryV3GateStats(30, fakeDb(rows));
+    const bucket = result.buckets.find((b) => b.pageCountRange === "10–49")!;
+    expect(bucket.total).toBe(2);
+    expect(bucket.scored).toBe(1);
+    expect(bucket.passed).toBe(1); // total passes (scored + unscored)
+    // Only the scored fail counts toward the rate — no scored passes
+    expect(bucket.scoredPassRate).toBe(0);
   });
 
   test("rows with no real_concept_page_count go to unknownPageCount", () => {
