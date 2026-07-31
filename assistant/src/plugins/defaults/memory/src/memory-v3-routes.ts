@@ -19,14 +19,15 @@ import { z } from "zod";
 
 import { getConfig } from "../../../../config/loader.js";
 import type { AssistantConfig } from "../../../../config/types.js";
+import { getTelemetrySqlite } from "../../../../persistence/db-connection.js";
 import {
   ACTOR_PRINCIPALS,
   type RoutePolicy,
 } from "../../../../runtime/auth/route-policy.js";
 import type { RouteDefinition } from "../../../../runtime/routes/types.js";
 import { getLogger } from "../logging.js";
-import { memorySqliteOrNull } from "../memory-db.js";
 import { backfillAllSections } from "../v3/maintain-job.js";
+import { MEMORY_V3_INJECTION_GATE_CHECK_NAME } from "../v3/orchestrate.js";
 import { invalidateLanes } from "../v3/shadow-plugin.js";
 
 const log = getLogger("memory-v3-routes");
@@ -138,11 +139,11 @@ function corpusBucketLabel(pageCount: number): BucketLabel {
   return "200+";
 }
 
-interface GateRunRow {
-  pass: number;
-  scored: number;
-  reason: string | null;
-  real_concept_page_count: number | null;
+interface GatePayloadDetail {
+  pass?: boolean;
+  reason?: string;
+  scored?: boolean;
+  real_concept_page_count?: number;
 }
 
 const GateStatsBucketSchema = z.object({
@@ -181,20 +182,20 @@ const GateStatsResponseSchema = z.object({
       passed: z.number(),
       reasons: z.record(z.string(), z.number()),
     })
-    .describe("Runs with no real_concept_page_count recorded"),
+    .describe("Runs with no real_concept_page_count in telemetry detail"),
 });
 
 export type GateStatsResponse = z.infer<typeof GateStatsResponseSchema>;
 
 /**
- * Aggregate memory v3 injection gate runs from the durable local
- * `memory_v3_gate_runs` table for the given lookback window. Groups runs by
- * concept page count bucket and computes pass rates and reason distributions.
+ * Aggregate memory v3 injection gate runs from the telemetry outbox for the
+ * given lookback window. Groups runs by concept page count bucket and computes
+ * pass rates and reason distributions per bucket.
  *
- * Reads from the memory DB, not the telemetry outbox. The outbox rows are
- * deleted after each successful platform flush, so they cover only a short
- * recent window in a healthy system. The `memory_v3_gate_runs` table persists
- * across flushes and supports the full MAX_LOOKBACK_DAYS window.
+ * Coverage is limited to gate runs still pending platform flush. In a healthy
+ * system the outbox holds only the last few minutes to hours of events, so
+ * lookbackDays is an upper bound, not a guarantee. Long-window aggregation
+ * lives on the platform side on top of flushed watchdog events.
  *
  * Pass-open shortcuts (dense disabled/unavailable, gate threw) are included in
  * `total` but not in `scored`, so `scoredPassRate` reflects only contested gate
@@ -202,7 +203,7 @@ export type GateStatsResponse = z.infer<typeof GateStatsResponseSchema>;
  */
 export function handleMemoryV3GateStats(
   lookbackDays: number = DEFAULT_LOOKBACK_DAYS,
-  db: ReturnType<typeof memorySqliteOrNull> = memorySqliteOrNull("gate-stats"),
+  db: ReturnType<typeof getTelemetrySqlite> = getTelemetrySqlite(),
 ): GateStatsResponse {
   const days = Math.min(
     Math.max(1, Math.floor(lookbackDays)),
@@ -231,12 +232,16 @@ export function handleMemoryV3GateStats(
   const rows = db
     .query(
       /*sql*/ `
-      SELECT pass, scored, reason, real_concept_page_count
-      FROM memory_v3_gate_runs
-      WHERE created_at >= ?
+      SELECT payload FROM telemetry_events
+      WHERE name = 'watchdog'
+        AND created_at >= ?
+        AND json_valid(payload)
+        AND json_extract(payload, '$.check_name') = ?
     `,
     )
-    .all(since) as GateRunRow[];
+    .all(since, MEMORY_V3_INJECTION_GATE_CHECK_NAME) as Array<{
+    payload: string;
+  }>;
 
   const bucketMap = new Map<BucketLabel, BucketAcc>(
     CORPUS_BUCKETS.map((b) => [
@@ -253,9 +258,17 @@ export function handleMemoryV3GateStats(
   };
 
   for (const row of rows) {
+    let detail: GatePayloadDetail;
+    try {
+      const parsed = JSON.parse(row.payload) as { detail?: GatePayloadDetail };
+      detail = parsed.detail ?? {};
+    } catch {
+      continue;
+    }
+
     const pageCount =
-      typeof row.real_concept_page_count === "number"
-        ? row.real_concept_page_count
+      typeof detail.real_concept_page_count === "number"
+        ? detail.real_concept_page_count
         : null;
 
     const acc =
@@ -264,16 +277,17 @@ export function handleMemoryV3GateStats(
         : unknown;
 
     acc.total += 1;
-    if (row.scored === 1) {
+    if (detail.scored === true) {
       acc.scored += 1;
-      if (row.pass === 1) {
+      if (detail.pass === true) {
         acc.scoredPassed += 1;
       }
     }
-    if (row.pass === 1) {
+    if (detail.pass === true) {
       acc.passed += 1;
     }
-    const reason = typeof row.reason === "string" ? row.reason : "unknown";
+    const reason =
+      typeof detail.reason === "string" ? detail.reason : "unknown";
     acc.reasons[reason] = (acc.reasons[reason] ?? 0) + 1;
   }
 
@@ -347,9 +361,10 @@ export const ROUTES: RouteDefinition[] = [
     },
     summary: "Gate fire-rate stats bucketed by corpus size",
     description:
-      "Reads the memory v3 injection gate telemetry and returns pass rates and reason " +
-      "distributions grouped by concept page count bucket. Useful for verifying whether " +
-      "gate behavior changes at large corpus sizes.",
+      "Reads the memory v3 injection gate telemetry outbox and returns pass rates and " +
+      "reason distributions grouped by concept page count bucket. Coverage is limited to " +
+      "runs still pending platform flush (typically minutes to hours in a healthy system). " +
+      "Useful for spot-checking gate behavior; long-window aggregation lives on the platform.",
     tags: ["memory"],
     responseBody: GateStatsResponseSchema,
   },

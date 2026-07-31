@@ -1,55 +1,45 @@
 /**
  * Tests for `handleMemoryV3GateStats` in `memory-v3-routes.ts`.
  *
- * The handler aggregates gate runs from the durable `memory_v3_gate_runs`
- * table in the memory DB. These tests cover:
+ * The handler aggregates gate telemetry from the telemetry DB and buckets it
+ * by concept page count. These tests cover:
  *   - empty DB returns zero counts, all buckets present, scoredPassRate null
  *   - mixed rows land in the correct buckets by real_concept_page_count
  *   - scored vs unscored runs are counted separately
  *   - rows with no real_concept_page_count go to unknownPageCount
  *   - lookbackDays is clamped to [1, 90]
+ *   - malformed JSON rows are skipped
  *   - null/absent DB returns a zero response
  */
 
 import type { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 
-import { ensureMemoryV3GateRunsSchema } from "../../../../../persistence/migrations/360-add-memory-v3-gate-runs.js";
 import { handleMemoryV3GateStats } from "../memory-v3-routes.js";
 
 // ---------------------------------------------------------------------------
-// Minimal fake SQLite DB backed by an in-memory SQLite instance
+// Minimal fake SQLite DB that returns pre-set rows
 // ---------------------------------------------------------------------------
 
-type GateRow = {
-  pass: number;
-  scored: number;
-  reason?: string | null;
-  real_concept_page_count?: number | null;
-};
+type FakeRow = { payload: string };
 
-function fakeDb(rows: GateRow[]): Database {
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { Database } = require("bun:sqlite") as typeof import("bun:sqlite");
-  const sqlite = new Database(":memory:");
-  ensureMemoryV3GateRunsSchema(sqlite);
-  const stmt = sqlite.prepare(
-    `INSERT INTO memory_v3_gate_runs
-       (id, created_at, pass, scored, reason, real_concept_page_count)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-  );
-  let seq = 0;
-  for (const row of rows) {
-    stmt.run(
-      `id-${seq++}`,
-      Date.now(),
-      row.pass,
-      row.scored,
-      row.reason ?? null,
-      row.real_concept_page_count ?? null,
-    );
-  }
-  return sqlite;
+function makePayload(detail: Record<string, unknown>): string {
+  return JSON.stringify({
+    type: "watchdog",
+    daemon_event_id: "test-id",
+    recorded_at: Date.now(),
+    check_name: "memory_v3_injection_gate",
+    value: 1,
+    detail,
+  });
+}
+
+function fakeDb(rows: FakeRow[]): Database {
+  return {
+    query: (_sql: string) => ({
+      all: (..._args: unknown[]) => rows,
+    }),
+  } as unknown as Database;
 }
 
 // ---------------------------------------------------------------------------
@@ -86,12 +76,14 @@ describe("handleMemoryV3GateStats", () => {
   });
 
   test("buckets a dense_pass row into 10-49 bucket", () => {
-    const rows: GateRow[] = [
+    const rows = [
       {
-        pass: 1,
-        scored: 1,
-        reason: "dense_pass",
-        real_concept_page_count: 25,
+        payload: makePayload({
+          pass: true,
+          reason: "dense_pass",
+          scored: true,
+          real_concept_page_count: 25,
+        }),
       },
     ];
     const result = handleMemoryV3GateStats(30, fakeDb(rows));
@@ -105,12 +97,14 @@ describe("handleMemoryV3GateStats", () => {
   });
 
   test("buckets a fail row into 200+ bucket", () => {
-    const rows: GateRow[] = [
+    const rows = [
       {
-        pass: 0,
-        scored: 1,
-        reason: "fail_no_signal",
-        real_concept_page_count: 350,
+        payload: makePayload({
+          pass: false,
+          reason: "fail_no_signal",
+          scored: true,
+          real_concept_page_count: 350,
+        }),
       },
     ];
     const result = handleMemoryV3GateStats(30, fakeDb(rows));
@@ -122,12 +116,14 @@ describe("handleMemoryV3GateStats", () => {
   });
 
   test("unscored pass-open rows count in total but not scored", () => {
-    const rows: GateRow[] = [
+    const rows = [
       {
-        pass: 1,
-        scored: 0,
-        reason: "dense_unavailable",
-        real_concept_page_count: 5,
+        payload: makePayload({
+          pass: true,
+          reason: "dense_unavailable",
+          scored: false,
+          real_concept_page_count: 5,
+        }),
       },
     ];
     const result = handleMemoryV3GateStats(30, fakeDb(rows));
@@ -141,18 +137,22 @@ describe("handleMemoryV3GateStats", () => {
 
   test("unscored pass mixed with scored fail does not inflate scoredPassRate", () => {
     // Regression: before fix, pass-open + scored-fail in same bucket gave 100%
-    const rows: GateRow[] = [
+    const rows = [
       {
-        pass: 1,
-        scored: 0,
-        reason: "dense_unavailable",
-        real_concept_page_count: 30,
+        payload: makePayload({
+          pass: true,
+          reason: "dense_unavailable",
+          scored: false,
+          real_concept_page_count: 30,
+        }),
       },
       {
-        pass: 0,
-        scored: 1,
-        reason: "fail_no_signal",
-        real_concept_page_count: 40,
+        payload: makePayload({
+          pass: false,
+          reason: "fail_no_signal",
+          scored: true,
+          real_concept_page_count: 40,
+        }),
       },
     ];
     const result = handleMemoryV3GateStats(30, fakeDb(rows));
@@ -165,7 +165,15 @@ describe("handleMemoryV3GateStats", () => {
   });
 
   test("rows with no real_concept_page_count go to unknownPageCount", () => {
-    const rows: GateRow[] = [{ pass: 0, scored: 1, reason: "fail_no_signal" }];
+    const rows = [
+      {
+        payload: makePayload({
+          pass: false,
+          reason: "fail_no_signal",
+          scored: true,
+        }),
+      },
+    ];
     const result = handleMemoryV3GateStats(30, fakeDb(rows));
     expect(result.unknownPageCount.total).toBe(1);
     expect(result.unknownPageCount.passed).toBe(0);
@@ -176,34 +184,49 @@ describe("handleMemoryV3GateStats", () => {
   });
 
   test("mixed rows across multiple buckets are aggregated correctly", () => {
-    const rows: GateRow[] = [
+    const rows: FakeRow[] = [
       // 0-9 bucket: 1 unscored pass
       {
-        pass: 1,
-        scored: 0,
-        reason: "dense_disabled",
-        real_concept_page_count: 3,
+        payload: makePayload({
+          pass: true,
+          reason: "dense_disabled",
+          scored: false,
+          real_concept_page_count: 3,
+        }),
       },
       // 10-49 bucket: 1 pass, 1 fail (both scored)
-      { pass: 1, scored: 1, reason: "dense_pass", real_concept_page_count: 20 },
       {
-        pass: 0,
-        scored: 1,
-        reason: "fail_no_signal",
-        real_concept_page_count: 45,
+        payload: makePayload({
+          pass: true,
+          reason: "dense_pass",
+          scored: true,
+          real_concept_page_count: 20,
+        }),
+      },
+      {
+        payload: makePayload({
+          pass: false,
+          reason: "fail_no_signal",
+          scored: true,
+          real_concept_page_count: 45,
+        }),
       },
       // 50-199 bucket: 2 passes
       {
-        pass: 1,
-        scored: 1,
-        reason: "sparse_only_strong",
-        real_concept_page_count: 100,
+        payload: makePayload({
+          pass: true,
+          reason: "sparse_only_strong",
+          scored: true,
+          real_concept_page_count: 100,
+        }),
       },
       {
-        pass: 1,
-        scored: 1,
-        reason: "dense_pass",
-        real_concept_page_count: 150,
+        payload: makePayload({
+          pass: true,
+          reason: "dense_pass",
+          scored: true,
+          real_concept_page_count: 150,
+        }),
       },
     ];
 
@@ -235,5 +258,24 @@ describe("handleMemoryV3GateStats", () => {
     expect(r2.lookbackDays).toBe(90);
     const r3 = handleMemoryV3GateStats(30, fakeDb([]));
     expect(r3.lookbackDays).toBe(30);
+  });
+
+  test("malformed JSON payload rows are skipped", () => {
+    const rows: FakeRow[] = [
+      { payload: "not-valid-json" },
+      {
+        payload: makePayload({
+          pass: true,
+          reason: "dense_pass",
+          scored: true,
+          real_concept_page_count: 25,
+        }),
+      },
+    ];
+    const result = handleMemoryV3GateStats(30, fakeDb(rows));
+    // totalRuns counts raw rows before parse
+    expect(result.totalRuns).toBe(2);
+    const bucket = result.buckets.find((b) => b.pageCountRange === "10–49")!;
+    expect(bucket.total).toBe(1);
   });
 });

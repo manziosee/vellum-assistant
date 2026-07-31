@@ -18268,8 +18268,10 @@ paths:
       operationId: memory_v3_gatestats_get
       summary: Gate fire-rate stats bucketed by corpus size
       description:
-        Reads the memory v3 injection gate telemetry and returns pass rates and reason distributions grouped by
-        concept page count bucket. Useful for verifying whether gate behavior changes at large corpus sizes.
+        Reads the memory v3 injection gate telemetry outbox and returns pass rates and reason distributions grouped
+        by concept page count bucket. Coverage is limited to runs still pending platform flush (typically minutes to
+        hours in a healthy system). Useful for spot-checking gate behavior; long-window aggregation lives on the
+        platform.
       tags:
         - memory
       parameters:
@@ -18349,7 +18351,7 @@ paths:
                       - passed
                       - reasons
                     additionalProperties: false
-                    description: Runs with no real_concept_page_count recorded
+                    description: Runs with no real_concept_page_count in telemetry detail
                 required:
                   - lookbackDays
                   - totalRuns

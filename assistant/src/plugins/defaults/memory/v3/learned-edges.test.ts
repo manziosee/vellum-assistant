@@ -19,7 +19,6 @@ import {
 } from "../../../../persistence/db-singleton.js";
 import { ensureMemoryV3SelectionsSchema } from "../../../../persistence/migrations/338-move-memory-v3-selections-to-memory-db.js";
 import * as schema from "../../../../persistence/schema/index.js";
-import type { EdgeGraph } from "./edge.js";
 import {
   computeLearnedEdgeGraph,
   type LearnedEdgesOptions,
@@ -202,112 +201,9 @@ describe("computeLearnedEdgeGraph", () => {
     expect(graph.hubs.size).toBe(0);
   });
 
-  // ---------------------------------------------------------------------------
-  // Cold-start structural seeding
-  // ---------------------------------------------------------------------------
-
-  describe("structural cold-start (no behavioral data)", () => {
-    function makeEdgeGraph(
-      adjacency: Record<string, string[]>,
-      hubs: string[] = [],
-    ): EdgeGraph {
-      const knownSlugs = new Set([
-        "page-a",
-        "page-b",
-        "page-c",
-        "page-d",
-        "skills/widget",
-      ]);
-      return {
-        adjacency: new Map(
-          Object.entries(adjacency).map(([source, targets]) => [
-            source,
-            new Map(targets.map((t) => [t, undefined])),
-          ]),
-        ),
-        hubs: new Set(hubs),
-        slugs: knownSlugs,
-      };
-    }
-
-    test("uses structural prior when no behavioral rows exist", () => {
-      // No seedCall: selection log is empty.
-      const prior = makeEdgeGraph({ "page-a": ["page-b", "page-c"] });
-      const graph = graphOf({ structuralPrior: prior });
-
-      expect(peersOf(graph, "page-a")).toEqual(["page-b", "page-c"]);
-      // Structural seeding is directional (authored link, not behavioral
-      // co-selection). page-b had no authored edges in the prior.
-      expect(peersOf(graph, "page-b")).toEqual([]);
-    });
-
-    test("cold-start edges are filtered to knownSlugs", () => {
-      // Prior includes a target not in knownSlugs: it should be dropped.
-      const prior: EdgeGraph = {
-        adjacency: new Map([
-          [
-            "page-a",
-            new Map<string, undefined>([
-              ["page-b", undefined],
-              ["deleted-page", undefined], // not in knownSlugs
-            ]),
-          ],
-        ]),
-        hubs: new Set(),
-        slugs: new Set(["page-a", "page-b", "deleted-page"]),
-      };
-      const graph = graphOf({ structuralPrior: prior });
-
-      expect(peersOf(graph, "page-a")).toEqual(["page-b"]);
-      expect(graph.adjacency.has("deleted-page")).toBe(false);
-    });
-
-    test("cold-start edges are capped at maxPerPage", () => {
-      // page-a has 4 authored neighbors; maxPerPage is 2 → only 2 survive.
-      const prior = makeEdgeGraph({
-        "page-a": ["page-b", "page-c", "page-d", "skills/widget"],
-      });
-      const graph = graphOf({ structuralPrior: prior, maxPerPage: 2 });
-
-      expect(peersOf(graph, "page-a")).toHaveLength(2);
-      expect(peersOf(graph, "page-a")).toEqual(["page-b", "page-c"]);
-    });
-
-    test("hub pages from the prior are preserved in the cold-start graph", () => {
-      // page-c is a hub in the authored graph: should carry through.
-      const prior = makeEdgeGraph({ "page-a": ["page-b", "page-c"] }, [
-        "page-c",
-      ]);
-      const graph = graphOf({ structuralPrior: prior });
-
-      expect(graph.hubs.has("page-c")).toBe(true);
-      // page-c still appears as a neighbor (hub exclusion is edgeExpand's job,
-      // not the graph builder's).
-      expect(peersOf(graph, "page-a")).toContain("page-c");
-    });
-
-    test("structural prior is ignored once behavioral data exists", () => {
-      // Seed two calls so a real NPMI edge forms between page-b and page-d.
-      seedCall(["page-b", "page-d"], NOW, "conv-1");
-      seedCall(["page-b", "page-d"], NOW, "conv-2");
-      seedCall(["page-a"], NOW, "conv-3"); // background
-
-      // Prior has an authored edge page-a → page-b that would dominate if the
-      // behavioral path were skipped.
-      const prior = makeEdgeGraph({ "page-a": ["page-b"] });
-      const graph = graphOf({ structuralPrior: prior, minCount: 2 });
-
-      // Behavioral NPMI edge exists; authored prior is NOT applied.
-      expect(peersOf(graph, "page-b")).toEqual(["page-d"]);
-      // page-a had no behavioral co-selections: it forms no edges through
-      // the behavioral path, and the prior is not used (rows > 0).
-      expect(peersOf(graph, "page-a")).toEqual([]);
-    });
-
-    test("returns empty graph when no prior and no behavioral data", () => {
-      // Original behavior preserved: no prior, no rows → empty.
-      const graph = graphOf();
-      expect(graph.adjacency.size).toBe(0);
-    });
+  test("returns empty graph when no behavioral data exists", () => {
+    // No seedCall: selection log is empty → empty graph.
+    const graph = graphOf();
+    expect(graph.adjacency.size).toBe(0);
   });
 });

@@ -42,43 +42,6 @@ import { memorySqliteOrNull } from "../memory-db.js";
 import type { EdgeGraph } from "./edge.js";
 import type { Slug } from "./types.js";
 
-/**
- * Build a structural cold-start EdgeGraph from the authored link graph.
- *
- * Used when the selection log is empty (new assistant): authored `[[link]]` /
- * `links:` frontmatter co-citation relationships seed the learned-edge lane so
- * it is not silently empty for every new assistant's first N conversations.
- * Neighbors are capped at `maxPerPage`, hub pages are preserved from the prior
- * (hub membership is corpus-structural, not behavioral), and descriptions are
- * stripped (learned edges carry no curated descriptions).
- */
-function buildStructuralColdStart(
-  prior: EdgeGraph,
-  knownSlugs: Set<string>,
-  maxPerPage: number,
-): EdgeGraph {
-  const adjacency = new Map<Slug, Map<Slug, undefined>>();
-  for (const [source, neighbors] of prior.adjacency) {
-    if (!knownSlugs.has(source)) {
-      continue;
-    }
-    const out = new Map<Slug, undefined>();
-    for (const [target] of neighbors) {
-      if (out.size >= maxPerPage) {
-        break;
-      }
-      if (!knownSlugs.has(target)) {
-        continue;
-      }
-      out.set(target, undefined);
-    }
-    if (out.size > 0) {
-      adjacency.set(source, out);
-    }
-  }
-  return { adjacency, hubs: prior.hubs, slugs: knownSlugs };
-}
-
 export interface LearnedEdgesOptions {
   /** Decay half-life in milliseconds: a selector call this old contributes
    *  half the weight of one made now. */
@@ -101,12 +64,6 @@ export interface LearnedEdgesOptions {
    *  selections of since-deleted pages can never surface a dangling
    *  candidate. */
   knownSlugs: Set<string>;
-  /** Authored link-graph to use as a structural prior when the selection log
-   *  has no rows in the window (new-assistant cold start). When provided and
-   *  the window is empty, authored co-citation edges seed the learned lane so
-   *  a new assistant is not silently missing all behavioral associations for
-   *  its first N conversations. Ignored once behavioral data exists. */
-  structuralPrior?: EdgeGraph;
 }
 
 interface SelectionRow {
@@ -151,13 +108,7 @@ export function computeLearnedEdgeGraph(opts: LearnedEdgesOptions): EdgeGraph {
     )
     .all(now - windowMs) as SelectionRow[];
   if (rows.length === 0) {
-    return opts.structuralPrior !== undefined
-      ? buildStructuralColdStart(
-          opts.structuralPrior,
-          opts.knownSlugs,
-          maxPerPage,
-        )
-      : empty;
+    return empty;
   }
 
   // Group into selector calls; one decayed weight per call.
