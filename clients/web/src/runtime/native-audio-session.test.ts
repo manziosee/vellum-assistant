@@ -1,11 +1,8 @@
 /**
  * Tests for the `VoiceAudioSession` bridge.
  *
- * The contract under test is skew-safety: the iOS shell ships through App Store
- * review while this bundle deploys continuously, so an arbitrarily old shell
- * can host it with no such plugin compiled in. Every exported function must
- * therefore resolve — never reject, never hang — whether the plugin answers,
- * rejects, or does not exist, and must not touch the bridge at all off iOS.
+ * Both mobile shells may lag behind the web bundle. Exports fall back outside
+ * native mobile and whenever the optional plugin is missing.
  */
 
 import { beforeEach, describe, expect, mock, test } from "bun:test";
@@ -13,10 +10,12 @@ import type { PluginListenerHandle } from "@capacitor/core";
 
 import type { VoiceAudioInterruptionEvent } from "@/runtime/native-audio-session";
 
-let onNativeIOS = false;
+let onNativeMobile = false;
 
 mock.module("@/runtime/platform-detection", () => ({
-  isNativeIOS: () => onNativeIOS,
+  isNativeAndroid: () => false,
+  isNativeIOS: () => onNativeMobile,
+  isNativeMobile: () => onNativeMobile,
 }));
 
 type Handler = (event: VoiceAudioInterruptionEvent) => void;
@@ -26,12 +25,6 @@ let handlers: Handler[] = [];
 
 const activate = mock(async () => ({ activated: true }));
 const deactivate = mock(async () => undefined);
-const defaultDescribe = async () => ({
-  category: "AVAudioSessionCategoryPlayAndRecord",
-  mode: "AVAudioSessionModeVoiceChat",
-  outputs: ["Speaker"],
-});
-const describeSession = mock(defaultDescribe);
 const remove = mock(async () => undefined);
 
 // Registration is async on the real bridge, so the handle only lands a
@@ -49,7 +42,6 @@ mock.module("@capacitor/core", () => ({
   registerPlugin: () => ({
     activate,
     deactivate,
-    describe: describeSession,
     addListener,
   }),
 }));
@@ -57,31 +49,28 @@ mock.module("@capacitor/core", () => ({
 const {
   activateVoiceAudioSession,
   deactivateVoiceAudioSession,
-  describeVoiceAudioSession,
   subscribeVoiceAudioInterruptions,
 } = await import("@/runtime/native-audio-session");
 
 beforeEach(() => {
-  onNativeIOS = true;
+  onNativeMobile = true;
   handlers = [];
   activate.mockClear();
   activate.mockImplementation(async () => ({ activated: true }));
   deactivate.mockClear();
   deactivate.mockImplementation(async () => undefined);
-  describeSession.mockClear();
-  describeSession.mockImplementation(defaultDescribe);
   remove.mockClear();
   addListener.mockClear();
   addListener.mockImplementation(defaultAddListener);
 });
 
 // ---------------------------------------------------------------------------
-// Off-native — the browser and Electron paths
+// Outside native mobile: browser and Electron paths
 // ---------------------------------------------------------------------------
 
-describe("off the iOS shell", () => {
+describe("outside a native mobile shell", () => {
   beforeEach(() => {
-    onNativeIOS = false;
+    onNativeMobile = false;
   });
 
   test("activate resolves false without touching the bridge", async () => {
@@ -94,11 +83,6 @@ describe("off the iOS shell", () => {
     expect(deactivate).not.toHaveBeenCalled();
   });
 
-  test("describe resolves null without touching the bridge", async () => {
-    expect(await describeVoiceAudioSession()).toBeNull();
-    expect(describeSession).not.toHaveBeenCalled();
-  });
-
   test("subscribing registers nothing and unsubscribing is safe", () => {
     const unsubscribe = subscribeVoiceAudioInterruptions(() => undefined);
     expect(addListener).not.toHaveBeenCalled();
@@ -107,7 +91,7 @@ describe("off the iOS shell", () => {
 });
 
 // ---------------------------------------------------------------------------
-// On the iOS shell, plugin present
+// Native mobile shell with the plugin present
 // ---------------------------------------------------------------------------
 
 describe("with the plugin present", () => {
@@ -124,29 +108,6 @@ describe("with the plugin present", () => {
     expect(deactivate).toHaveBeenCalledTimes(1);
   });
 
-  test("describe reads the session back without configuring it", async () => {
-    const description = await describeVoiceAudioSession();
-
-    expect(description).toMatchObject({
-      category: "AVAudioSessionCategoryPlayAndRecord",
-      mode: "AVAudioSessionModeVoiceChat",
-      outputs: ["Speaker"],
-    });
-    // Reading the category back is the only sanctioned way to test a belief
-    // about the shared session: activating one underneath WebKit's live
-    // capture unit has broken live voice on a handset twice.
-    expect(activate).not.toHaveBeenCalled();
-    expect(deactivate).not.toHaveBeenCalled();
-  });
-
-  test("describe resolves null when an older shell has no such method", async () => {
-    describeSession.mockImplementation(async () => {
-      throw new Error("not implemented");
-    });
-
-    expect(await describeVoiceAudioSession()).toBeNull();
-  });
-
   test("interruption events reach the handler until unsubscribed", async () => {
     const handler = mock((_event: VoiceAudioInterruptionEvent) => undefined);
     const unsubscribe = subscribeVoiceAudioInterruptions(handler);
@@ -155,8 +116,11 @@ describe("with the plugin present", () => {
       expect.any(Function),
     );
 
-    handlers[0]?.({ type: "began" });
-    expect(handler).toHaveBeenCalledWith({ type: "began" });
+    handlers[0]?.({ type: "began", reason: "route-change" });
+    expect(handler).toHaveBeenCalledWith({
+      type: "began",
+      reason: "route-change",
+    });
 
     // Let the registration settle so the handle is held, then release it.
     await Promise.resolve();
@@ -176,7 +140,7 @@ describe("with the plugin present", () => {
 });
 
 // ---------------------------------------------------------------------------
-// On the iOS shell, older shell without the plugin — the skew case
+// Native mobile shell without the plugin
 // ---------------------------------------------------------------------------
 
 describe("with an older shell that has no plugin", () => {
