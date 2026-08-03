@@ -746,6 +746,9 @@ the outbox holds only the last few minutes to hours of events, so
 --lookback-days is an upper bound, not a guarantee; long-window aggregation
 lives on the platform side on top of flushed watchdog events.
 
+Reads the telemetry database directly — the assistant does not need to be
+running.
+
 Intended use: verify that gate firing rates shift as expected after a
 config or threshold change, and check whether the bm25-auto-calibration
 flag is worth enabling for large corpora.

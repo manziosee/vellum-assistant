@@ -4,11 +4,11 @@
  * Validates:
  *   - Subcommand registration (rebuild-index, backfill-sections, gate-stats)
  *     under `memory v3`.
- *   - Each subcommand maps to the right `cliIpcCall` method.
+ *   - `rebuild-index` and `backfill-sections` route through IPC to the daemon.
  *   - `backfill-sections` passes a long IPC timeout (the one-time full-corpus
- *     embed easily outlasts the default 60s), while `rebuild-index` and
- *     `gate-stats` do not.
- *   - IPC error paths return a non-zero exit code without throwing.
+ *     embed easily outlasts the default 60s).
+ *   - `gate-stats` calls handleMemoryV3GateStats directly — no daemon required.
+ *   - Error paths return a non-zero exit code without throwing.
  */
 
 import { beforeEach, describe, expect, mock, test } from "bun:test";
@@ -40,6 +40,47 @@ let mockIpcResult: {
 /** Captured log output for assertion. */
 let logOutput: string[] = [];
 
+/** Shared fake gate-stats payload used across gate-stats tests. */
+const fakeGateStats = {
+  lookbackDays: 30,
+  totalRuns: 10,
+  buckets: [
+    {
+      pageCountRange: "0–9",
+      total: 2,
+      scored: 1,
+      passed: 2,
+      scoredPassRate: 1,
+      reasons: { dense_pass: 1, dense_disabled: 1 },
+    },
+    {
+      pageCountRange: "10–49",
+      total: 5,
+      scored: 4,
+      passed: 3,
+      scoredPassRate: 0.75,
+      reasons: { dense_pass: 3, fail_no_signal: 1 },
+    },
+    {
+      pageCountRange: "50–199",
+      total: 2,
+      scored: 2,
+      passed: 1,
+      scoredPassRate: 0.5,
+      reasons: { dense_pass: 1, fail_no_signal: 1 },
+    },
+    {
+      pageCountRange: "200+",
+      total: 1,
+      scored: 1,
+      passed: 0,
+      scoredPassRate: 0,
+      reasons: { fail_no_signal: 1 },
+    },
+  ],
+  unknownPageCount: { total: 0, passed: 0, reasons: {} },
+};
+
 // ---------------------------------------------------------------------------
 // Mocks
 // ---------------------------------------------------------------------------
@@ -67,6 +108,33 @@ const fakeLogger = {
 mock.module("../../../../util/logger.js", () => ({
   getLogger: () => fakeLogger,
   getCliLogger: () => fakeLogger,
+}));
+
+// ---------------------------------------------------------------------------
+// gate-stats direct-invocation mocks
+// ---------------------------------------------------------------------------
+
+/** Args captured from the last handleMemoryV3GateStats call. */
+let lastGateStatsArgs: { lookbackDays: number; db: unknown } | null = null;
+
+/** What handleMemoryV3GateStats returns, or an error to throw. */
+let gateStatsImpl: (() => unknown) | null = null;
+
+mock.module(
+  "../../../../plugins/defaults/memory/src/memory-v3-routes.js",
+  () => ({
+    handleMemoryV3GateStats: (lookbackDays: number, db: unknown) => {
+      lastGateStatsArgs = { lookbackDays, db };
+      if (gateStatsImpl) {
+        return gateStatsImpl();
+      }
+      return fakeGateStats;
+    },
+  }),
+);
+
+mock.module("../../../../persistence/db-connection.js", () => ({
+  getTelemetrySqlite: () => ({}),
 }));
 
 // ---------------------------------------------------------------------------
@@ -136,6 +204,8 @@ beforeEach(() => {
     ok: true,
     result: { articles: 3, sections: 12, failures: 0 },
   };
+  lastGateStatsArgs = null;
+  gateStatsImpl = null;
   logOutput = [];
   process.exitCode = 0;
 });
@@ -240,77 +310,28 @@ describe("memory v3 backfill-sections", () => {
 });
 
 // ---------------------------------------------------------------------------
-// gate-stats
+// gate-stats (direct invocation — no daemon required)
 // ---------------------------------------------------------------------------
 
-const fakeGateStats = {
-  lookbackDays: 30,
-  totalRuns: 10,
-  buckets: [
-    {
-      pageCountRange: "0–9",
-      total: 2,
-      scored: 1,
-      passed: 2,
-      scoredPassRate: 1,
-      reasons: { dense_pass: 1, dense_disabled: 1 },
-    },
-    {
-      pageCountRange: "10–49",
-      total: 5,
-      scored: 4,
-      passed: 3,
-      scoredPassRate: 0.75,
-      reasons: { dense_pass: 3, fail_no_signal: 1 },
-    },
-    {
-      pageCountRange: "50–199",
-      total: 2,
-      scored: 2,
-      passed: 1,
-      scoredPassRate: 0.5,
-      reasons: { dense_pass: 1, fail_no_signal: 1 },
-    },
-    {
-      pageCountRange: "200+",
-      total: 1,
-      scored: 1,
-      passed: 0,
-      scoredPassRate: 0,
-      reasons: { fail_no_signal: 1 },
-    },
-  ],
-  unknownPageCount: { total: 0, passed: 0, reasons: {} },
-};
-
 describe("memory v3 gate-stats", () => {
-  test("sends memory_v3_gate_stats via IPC with default lookback", async () => {
-    mockIpcResult = { ok: true, result: fakeGateStats };
-
+  test("calls handleMemoryV3GateStats directly with default lookback (no IPC)", async () => {
     const { exitCode } = await runCommand(["memory", "v3", "gate-stats"]);
 
     expect(exitCode).toBe(0);
-    expect(lastIpcCall!.method).toBe("memory_v3_gate_stats");
-    expect(lastIpcCall!.params).toMatchObject({
-      queryParams: { lookbackDays: "30" },
-    });
-    // gate-stats is fast; it does not override the default IPC timeout.
-    expect(lastIpcCall!.options).toBeUndefined();
+    // Must NOT have gone through IPC.
+    expect(lastIpcCall).toBeNull();
+    // Must have called the handler directly with the default lookback.
+    expect(lastGateStatsArgs!.lookbackDays).toBe(30);
   });
 
-  test("forwards --lookback-days to the IPC call", async () => {
-    mockIpcResult = { ok: true, result: { ...fakeGateStats, lookbackDays: 7 } };
-
+  test("forwards --lookback-days directly to handleMemoryV3GateStats", async () => {
     await runCommand(["memory", "v3", "gate-stats", "--lookback-days", "7"]);
 
-    expect(lastIpcCall!.params).toMatchObject({
-      queryParams: { lookbackDays: "7" },
-    });
+    expect(lastIpcCall).toBeNull();
+    expect(lastGateStatsArgs!.lookbackDays).toBe(7);
   });
 
   test("prints formatted table on success (no --json)", async () => {
-    mockIpcResult = { ok: true, result: fakeGateStats };
-
     await runCommand(["memory", "v3", "gate-stats"]);
 
     expect(logOutput.some((l) => l.includes("Gate-stats"))).toBe(true);
@@ -319,8 +340,6 @@ describe("memory v3 gate-stats", () => {
   });
 
   test("emits raw JSON with --json", async () => {
-    mockIpcResult = { ok: true, result: fakeGateStats };
-
     await runCommand(["memory", "v3", "gate-stats", "--json"]);
 
     const raw = logOutput.join("");
@@ -329,11 +348,14 @@ describe("memory v3 gate-stats", () => {
     expect(parsed.buckets).toHaveLength(4);
   });
 
-  test("exits with code 1 on IPC failure", async () => {
-    mockIpcResult = { ok: false, error: "Daemon unavailable" };
+  test("exits with code 1 when handleMemoryV3GateStats throws", async () => {
+    gateStatsImpl = () => {
+      throw new Error("telemetry DB locked");
+    };
 
     const { exitCode } = await runCommand(["memory", "v3", "gate-stats"]);
 
     expect(exitCode).toBe(1);
+    expect(logOutput.some((l) => l.includes("telemetry DB locked"))).toBe(true);
   });
 });

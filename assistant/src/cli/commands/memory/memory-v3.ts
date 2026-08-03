@@ -66,7 +66,7 @@ function formatGateStats(r: GateStatsResponse): string {
         ? `${(b.scoredPassRate * 100).toFixed(1)}%`
         : "n/a";
     const topReasons = Object.entries(b.reasons)
-      .sort(([, a], [, bv]) => bv - a)
+      .sort(([, a], [, bv]) => (bv as number) - (a as number))
       .slice(0, 3)
       .map(([k, v]) => `${k}: ${v}`)
       .join(", ");
@@ -304,20 +304,30 @@ export function registerMemoryV3Command(memory: Command): void {
   );
 
   // ── gate-stats ────────────────────────────────────────────────────────
+  // Reads the telemetry DB directly — no daemon required.
 
   subcommand(v3, "gate-stats").action(
     async (opts: { lookbackDays: string; json?: boolean }) => {
       const lookbackDays = Number(opts.lookbackDays);
-      const result = await cliIpcCall<GateStatsResponse>(
-        "memory_v3_gate_stats",
-        { queryParams: { lookbackDays: String(Math.floor(lookbackDays)) } },
-      );
-      if (!result.ok) {
-        log.error(result.error ?? "Failed to fetch gate stats");
+      const [{ handleMemoryV3GateStats }, { getTelemetrySqlite }] =
+        await Promise.all([
+          import("../../../plugins/defaults/memory/src/memory-v3-routes.js"),
+          import("../../../persistence/db-connection.js"),
+        ]);
+      let payload;
+      try {
+        payload = handleMemoryV3GateStats(
+          Number.isFinite(lookbackDays) ? lookbackDays : 30,
+          getTelemetrySqlite(),
+        );
+      } catch (err) {
+        log.error(
+          "Failed to read gate stats: %s",
+          err instanceof Error ? err.message : String(err),
+        );
         process.exitCode = 1;
         return;
       }
-      const payload = result.result!;
       if (opts.json === true) {
         log.info(JSON.stringify(payload, null, 2));
         return;
