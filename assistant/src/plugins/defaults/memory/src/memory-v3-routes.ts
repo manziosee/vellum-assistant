@@ -168,7 +168,7 @@ const GateStatsBucketSchema = z.object({
     .describe("Gate reason code → run count (dense_pass, fail_no_signal, …)"),
 });
 
-const GateStatsResponseSchema = z.object({
+export const GateStatsResponseSchema = z.object({
   lookbackDays: z.number().describe("Lookback window applied"),
   totalRuns: z.number().describe("Total gate runs found in the window"),
   buckets: z
@@ -329,35 +329,5 @@ export const ROUTES: RouteDefinition[] = [
       "One-time: embed every page's sections (incl synthetic skill/CLI rows) into the dense store",
     tags: ["memory"],
     responseBody: MemoryV3BackfillSectionsResultSchema,
-  },
-  {
-    operationId: "memory_v3_gate_stats",
-    method: "GET",
-    policy: {
-      requiredScopes: ["settings.read"],
-      allowedPrincipalTypes: ACTOR_PRINCIPALS,
-    },
-    endpoint: "memory/v3/gate-stats",
-    queryParams: [
-      {
-        name: "lookbackDays",
-        required: false,
-        description: `Days of telemetry to aggregate (1–${MAX_LOOKBACK_DAYS}, default ${DEFAULT_LOOKBACK_DAYS})`,
-      },
-    ],
-    handler: ({ queryParams = {} }) => {
-      const raw = queryParams["lookbackDays"];
-      const parsed = raw !== undefined ? Number(raw) : DEFAULT_LOOKBACK_DAYS;
-      return handleMemoryV3GateStats(
-        Number.isFinite(parsed) ? parsed : DEFAULT_LOOKBACK_DAYS,
-      );
-    },
-    summary: "Gate fire-rate stats bucketed by corpus size",
-    description:
-      "Reads the memory v3 injection gate telemetry and returns pass rates and reason " +
-      "distributions grouped by concept page count bucket. Useful for verifying whether " +
-      "gate behavior changes at large corpus sizes.",
-    tags: ["memory"],
-    responseBody: GateStatsResponseSchema,
   },
 ];
