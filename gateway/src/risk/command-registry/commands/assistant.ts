@@ -197,6 +197,7 @@ const ASSISTANT_SUPPORTED_COMMAND_PATHS = [
   "memory v3 backfill-sections",
   "memory v3 eval",
   "memory v3 eval-tally",
+  "memory v3 gate-stats",
   "memory retrospective",
   "memory retrospective run",
   "memory retrospective list",
@@ -705,6 +706,12 @@ const riskOverrides: AssistantRiskOverride[] = [
     risk: "medium",
     reason:
       "Daemon handler is read-only, but the CLI writes the tally result to a user-supplied path when --out is provided; classifying medium so file-write invocations are not auto-approved as read-only",
+  },
+  {
+    path: "memory v3 gate-stats",
+    risk: "low",
+    reason:
+      "Read-only telemetry diagnostic: queries the local SQLite telemetry outbox and prints gate pass-rate stats; no writes, no daemon required",
   },
   {
     path: "memory retrospective run",
