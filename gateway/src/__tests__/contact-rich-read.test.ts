@@ -330,6 +330,16 @@ describe("ContactStore.listContactsRich", () => {
     expect(result.map((c) => c.id)).toEqual(["bot1"]);
   });
 
+  test("contactType filter throws on assistant DB outage (not silent empty)", async () => {
+    seedGatewayContact({ id: "h1" });
+    seedAssistantInfo({ id: "h1", contactType: "human" });
+    fakeAssistantDb.throwOnQuery = true;
+
+    await expect(
+      new ContactStore().listContactsWithInfo({ contactType: "human" }),
+    ).rejects.toThrow();
+  });
+
   test("missing assistant-DB row degrades gracefully (info null, no throw)", async () => {
     seedGatewayContact({ id: "gap" });
     seedGatewayChannel({ id: "ch-gap", contactId: "gap", interactionCount: 3 });
