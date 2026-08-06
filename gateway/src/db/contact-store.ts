@@ -282,7 +282,9 @@ export class ContactStore {
       )
       .all();
 
-    let results = await this.joinInfoIntoContacts(rows);
+    let results = await this.joinInfoIntoContacts(rows, {
+      throwOnInfoFailure: !!opts?.contactType,
+    });
 
     if (opts?.contactType) {
       results = results.filter((c) => c.contactType === opts.contactType);
@@ -494,6 +496,7 @@ export class ContactStore {
    */
   private async joinInfoIntoContacts(
     rows: { contact: Contact; channel: ContactChannel | null }[],
+    opts: { throwOnInfoFailure?: boolean } = {},
   ): Promise<ContactWithInfo[]> {
     // Group channels by contact, preserving first-seen contact order.
     const orderedIds: string[] = [];
@@ -516,6 +519,9 @@ export class ContactStore {
     try {
       infoMap = await fetchInfoForContacts(orderedIds);
     } catch (err) {
+      if (opts.throwOnInfoFailure) {
+        throw err;
+      }
       log.warn(
         { err, count: orderedIds.length },
         "listContactsWithInfo: assistant DB info read failed; returning ACL-only shape",
