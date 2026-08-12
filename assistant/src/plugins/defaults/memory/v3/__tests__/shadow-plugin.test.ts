@@ -94,6 +94,7 @@ let lanesVersionReadThrows = false;
 let bumpCounter = 0;
 
 let liveEnabled = false;
+let bm25CalibrationEnabled = false;
 let memoryEnabled = true;
 let learnedEdgesCap = 0;
 // Synthetic real concept pages (modifiedAt > 0) appended to the mocked page
@@ -213,8 +214,15 @@ const FAKE_SECTION_INDEX: SectionIndex = {
 // ─── module mocks (installed before the plugin import) ──────────────────────
 
 mock.module("../../../../../config/assistant-feature-flags.js", () => ({
-  isAssistantFeatureFlagEnabled: (key: string) =>
-    key === "memory-v3-live" ? liveEnabled : false,
+  isAssistantFeatureFlagEnabled: (key: string) => {
+    if (key === "memory-v3-live") {
+      return liveEnabled;
+    }
+    if (key === "memory-v3-bm25-auto-calibration") {
+      return bm25CalibrationEnabled;
+    }
+    return false;
+  },
 }));
 
 // `observeTurn` and the injector resolve their tuning through the real
@@ -527,6 +535,7 @@ function readRows() {
 beforeEach(() => {
   shadowMockActive = true;
   liveEnabled = false;
+  bm25CalibrationEnabled = false;
   memoryEnabled = true;
   memoryDbAvailable = true;
   learnedEdgesCap = 0;
@@ -815,6 +824,17 @@ describe("memory-v3 engine", () => {
       enabled: false,
       bm25NormK: DEFAULT_BM25_NORM_K,
     });
+  });
+
+  test("auto-calibration flag on + empty corpus → falls back to DEFAULT_BM25_NORM_K", async () => {
+    // flag on but no sections → calibrateBm25NormK(0) = DEFAULT_BM25_NORM_K
+    bm25CalibrationEnabled = true;
+    await observeTurn("conv-1", 0);
+
+    const deps = (
+      orchestrateSpy.mock.calls as unknown as unknown[][]
+    )[0]![1] as { gateConfig?: { bm25NormK?: number } };
+    expect(deps.gateConfig?.bm25NormK).toBe(DEFAULT_BM25_NORM_K);
   });
 
   test("initLanes filters core to existing pages and excludes core from the hot set", async () => {

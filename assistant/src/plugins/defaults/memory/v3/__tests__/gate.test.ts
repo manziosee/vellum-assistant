@@ -225,4 +225,20 @@ describe("calibrateBm25NormK", () => {
     expect(k).toBeGreaterThan(DEFAULT_BM25_NORM_K);
     expect(k).toBeLessThan(50);
   });
+
+  test("scale invariance: a df=1 three-term match always normalizes to 0.5", () => {
+    // Core property: k = 3 × IDF(df=1), so a peak-quality three-term match
+    // (raw score = k) always lands at score / (score + k) = k / 2k = 0.5,
+    // regardless of corpus size. Tested at several N values where the floor
+    // does not bind (N >= 10 comfortably clears the floor of 3).
+    const counts = [10, 33, 100, 500, 10_000];
+    for (const N of counts) {
+      const k = calibrateBm25NormK(N);
+      // Expected peak raw BM25F using the same IDF the formula is built on.
+      const idf = Math.log(1 + (N - 0.5) / 1.5);
+      const peakRaw = 3 * idf;
+      const normalized = peakRaw / (peakRaw + k);
+      expect(normalized).toBeCloseTo(0.5, 10);
+    }
+  });
 });
