@@ -4,6 +4,7 @@ import {
   expect,
   jest,
   mock,
+  beforeEach,
   afterEach,
   beforeAll,
   afterAll,
@@ -2389,6 +2390,10 @@ describe("handleDeleteContact (gateway-native)", () => {
       })
       .run();
   }
+
+  beforeEach(() => {
+    getGatewayDb().delete(gwContacts).run();
+  });
 
   afterEach(() => {
     getGatewayDb().delete(gwContacts).run();
