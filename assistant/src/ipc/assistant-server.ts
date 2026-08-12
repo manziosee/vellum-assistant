@@ -28,10 +28,20 @@
  * back to a shorter deterministic path so CLI commands can still connect.
  */
 
-import { existsSync, unlinkSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 
-import { ensureSocketDir, SocketWatchdog } from "@vellumai/ipc-server-utils";
+import {
+  ensureSocketDir,
+  type IpcEnvelope,
+  IpcFrameReader,
+  ipcListenOptions,
+  removeIpcEndpointFile,
+  SocketWatchdog,
+  writeLegacyMessage,
+  writeMessage,
+  writeStreamChunk,
+  writeStreamEnd,
+} from "@vellumai/ipc-server-utils";
 
 import {
   getDbMigrationReadiness,
@@ -47,18 +57,11 @@ import type {
 } from "../runtime/routes/types.js";
 import { RouteResponse } from "../runtime/routes/types.js";
 import { getLogger } from "../util/logger.js";
-import {
-  type IpcEnvelope,
-  IpcFrameReader,
-  writeLegacyMessage,
-  writeMessage,
-  writeStreamChunk,
-  writeStreamEnd,
-} from "./ipc-framing.js";
 import { CONTACTS_INFO_IPC_METHODS } from "./routes/contacts-info-ipc-routes.js";
 import { CONTACTS_MIRROR_IPC_METHODS } from "./routes/contacts-mirror-ipc-routes.js";
 import { CONVERSATION_SYNC_IPC_METHODS } from "./routes/conversation-sync-ipc-routes.js";
 import { type DbProxyParams, handleDbProxy } from "./routes/db-proxy.js";
+import { DOCUMENTS_SYNC_IPC_METHODS } from "./routes/documents-sync-ipc-routes.js";
 import { EVENTS_IPC_METHODS } from "./routes/events-ipc-routes.js";
 import { GUARDIAN_LABEL_IPC_METHODS } from "./routes/guardian-label-ipc-routes.js";
 import { INVITE_IPC_METHODS } from "./routes/invite-ipc-routes.js";
@@ -214,6 +217,7 @@ export class AssistantIpcServer {
       CONTACTS_MIRROR_IPC_METHODS,
       GUARDIAN_LABEL_IPC_METHODS,
       CONVERSATION_SYNC_IPC_METHODS,
+      DOCUMENTS_SYNC_IPC_METHODS,
       EVENTS_IPC_METHODS,
     ]) {
       for (const [operationId, handler] of Object.entries(methodMap)) {
@@ -256,8 +260,18 @@ export class AssistantIpcServer {
     await ensureSocketPathFree(this.socketPath);
 
     this.server = this.createListeningServer();
-    this.server.listen(this.socketPath, () => {
-      log.info({ path: this.socketPath }, "Assistant IPC server listening");
+    await new Promise<void>((resolve, reject) => {
+      const server = this.server!;
+      const onError = (err: Error): void => {
+        this.server = null;
+        reject(err);
+      };
+      server.once("error", onError);
+      server.listen(ipcListenOptions(this.socketPath), () => {
+        server.off("error", onError);
+        log.info({ path: this.socketPath }, "Assistant IPC server listening");
+        resolve();
+      });
     });
 
     this.watchdog.start();
@@ -289,13 +303,7 @@ export class AssistantIpcServer {
       this.server = null;
     }
 
-    if (existsSync(this.socketPath)) {
-      try {
-        unlinkSync(this.socketPath);
-      } catch {
-        // Ignore
-      }
-    }
+    removeIpcEndpointFile(this.socketPath);
   }
 
   /** Get the socket path (for diagnostics). */
@@ -385,8 +393,6 @@ export class AssistantIpcServer {
       return;
     }
 
-    void binary;
-
     // Skip AbortController for the $cancel meta-method itself
     const needsAbortTracking = req.method !== "$cancel";
     let abortController: AbortController | undefined;
@@ -398,6 +404,11 @@ export class AssistantIpcServer {
     try {
       const handlerArgs = {
         ...injectLocalActorHeader(req.params),
+        // A binary frame on the request is the caller's raw body. Route
+        // handlers already model this as `rawBody` and pass it through
+        // untouched, so a caller that sends bytes gets them delivered as
+        // bytes rather than having them re-encoded as JSON.
+        ...(binary && { rawBody: binary }),
         ...(abortController && { abortSignal: abortController.signal }),
       };
       const result = handler(handlerArgs);

@@ -51,7 +51,7 @@ import {
   prependConversation,
   removeConversation,
   resolveDraftKey,
-  shouldSurfaceConversationOnUserSend,
+  shouldSurfaceConversation,
   surfaceConversationInCaches,
 } from "@/utils/conversation-cache-mutations";
 import {
@@ -138,6 +138,17 @@ export interface SendChatMessageOptions {
    * blocked. Applies to this send alone and is never persisted.
    */
   bypassSecretCheck?: boolean;
+  /**
+   * True when this turn was auto-sent on the user's behalf rather than typed
+   * the onboarding research prompt, the kickoff greeting, the legacy
+   * pre-chat bootstrap. Forwarded to the daemon, which stamps it on the turn
+   * so activation metrics can exclude it for every user rather than only
+   * those whose diagnostics consent lets the trace classifier see it.
+   *
+   * Independent of `hidden`: the research prompt is visible AND scripted, the
+   * kickoff greeting is hidden AND scripted. Omit for ordinary composer sends.
+   */
+  scripted?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -270,7 +281,7 @@ export function useSendMessage({
         }
       }
 
-      if (!shouldSurfaceConversationOnUserSend(conversation)) {
+      if (!shouldSurfaceConversation(conversation)) {
         return;
       }
 
@@ -306,6 +317,11 @@ export function useSendMessage({
       clientMessageId?: string,
       isHidden = false,
       bypassSecretCheck = false,
+      // Tri-state, so the default is `undefined` (unknown), NOT false. This
+      // helper has callers that genuinely cannot say, and inventing a `false`
+      // here would assert "the user typed this" on their behalf. The daemon
+      // applies its own default for an omitted field.
+      scripted?: boolean,
     ): Promise<SendStreamResult> => {
       if (!activeConversationId || !assistantId) {
         return {
@@ -370,28 +386,36 @@ export function useSendMessage({
         draftPlugins && (await resolveSupportsNewChatPlugins())
           ? [...draftPlugins].sort()
           : undefined;
-      const postResult = await postChatMessage(
-        requestAssistantId,
-        useServerMint ? null : requestConversationId,
-        content,
-        {
-          attachmentIds,
-          onboarding: onboardingContext ?? undefined,
-          clientMessageId,
-          inferenceProfile: inferenceProfileForSend,
-          enabledPlugins: enabledPluginsForSend,
-          hidden: isHidden,
-          bypassSecretCheck,
-        },
-      );
-      if (
-        useServerMint &&
-        pendingDraftMintRef.current === requestConversationId
-      ) {
-        // Clear only if we still own the gate. A re-mount or scope flip
-        // during the await could have already replaced it with a newer
-        // draft's mint.
-        pendingDraftMintRef.current = null;
+      let postResult: Awaited<ReturnType<typeof postChatMessage>>;
+      try {
+        postResult = await postChatMessage(
+          requestAssistantId,
+          useServerMint ? null : requestConversationId,
+          content,
+          {
+            attachmentIds,
+            onboarding: onboardingContext ?? undefined,
+            clientMessageId,
+            inferenceProfile: inferenceProfileForSend,
+            enabledPlugins: enabledPluginsForSend,
+            hidden: isHidden,
+            bypassSecretCheck,
+            scripted,
+          },
+        );
+      } finally {
+        // Release the gate however the POST settles. A throw that skipped this
+        // would leave it held for the rest of the session, rejecting every
+        // later send for this draft with the "setting up your conversation"
+        // message. Clear only if we still own it: a re-mount or scope flip
+        // during the await could have already replaced it with a newer draft's
+        // mint.
+        if (
+          useServerMint &&
+          pendingDraftMintRef.current === requestConversationId
+        ) {
+          pendingDraftMintRef.current = null;
+        }
       }
       if (!postResult.ok) {
         if (!isCurrentSendScope()) {
@@ -754,6 +778,7 @@ export function useSendMessage({
               clientMessageId,
               hidden: isHidden,
               bypassSecretCheck,
+              scripted: opts.scripted,
             },
           );
           if (!postResult.ok) {
@@ -819,9 +844,11 @@ export function useSendMessage({
                 requestId,
                 messageId: userMessage.id,
                 setOptimisticSends,
+                // Mapping cleanup only. `pendingQueuedCount` moves on the
+                // daemon's `message_queued_deleted` broadcast, which lands on
+                // this tab too, so decrementing here would double-count.
                 onDeleted: () => {
                   useChatSessionStore.getState().popRequestIdMapping(requestId);
-                  useTurnStore.getState().deleteQueuedMessage();
                 },
               });
             }
@@ -874,6 +901,7 @@ export function useSendMessage({
           clientMessageId,
           isHidden,
           bypassSecretCheck,
+          opts.scripted,
         );
 
         if (result.status === "failed") {
@@ -908,6 +936,15 @@ export function useSendMessage({
         }
 
         resolvedId = result.resolvedConversationId;
+
+        // The send materialized the conversation, so the key is no longer a
+        // draft: history is real from here and must show the normal loading
+        // state when the user navigates back to it. Clears whether or not the
+        // server kept the client key. When it assigned a different one, the
+        // old key is dead and this is just cleanup.
+        useConversationStore
+          .getState()
+          .clearDraftConversationId(activeConversationId);
 
         // Resolve draft key -> server-assigned conversation ID.
         if (resolvedId && resolvedId !== activeConversationId) {

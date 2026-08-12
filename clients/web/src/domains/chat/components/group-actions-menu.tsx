@@ -8,26 +8,30 @@
  * - {@link renderGroupMenuItems} — Radix `ContextMenu` / `Menu` items, used
  *   for the desktop right-click menu on a section header.
  * - {@link renderGroupMenuItemsAsPanelItems} — the same item set flattened
- *   into `PanelItem` rows for the popover and the mobile bottom sheet.
- * - {@link GroupActionsMenu} — the trailing "…" button on custom-group
- *   headers, which renders the PanelItem set in a Popover (desktop) or a
- *   BottomSheet (mobile).
+ *   into `PanelItem` rows for the popover and the touch bottom sheet.
+ * - {@link GroupActionsMenu} — the trailing "…" button on a section header,
+ *   which renders the PanelItem set in a Popover (desktop) or a BottomSheet
+ *   (mobile). Every section carries one, so a section's actions never depend
+ *   on the user knowing to right-click.
  *
  * `conversation-actions-menu.tsx` splits the per-conversation menu the same
  * way; the `PanelItem` row primitives both use live in `panel-menu-item.tsx`.
  */
 
 import {
-    Archive,
-    CircleCheck,
-    Copy,
-    MoreHorizontal,
-    Pencil,
-    Trash2,
+  Archive,
+  ArrowDown,
+  ArrowUp,
+  CircleCheck,
+  Copy,
+  Layers,
+  Pencil,
+  Trash2,
 } from "lucide-react";
 import { type ReactNode, useState } from "react";
 
-import { useIsMobile } from "@/hooks/use-is-mobile";
+import { useTouchMobile } from "@/hooks/use-touch-mobile";
+import { SectionActionsButton } from "@/components/section-actions-button";
 import {
   buildPanelMenuItem,
   PanelMenuDivider,
@@ -61,6 +65,28 @@ export interface GroupMenuItemsProps {
    * reference into chat (the assistant resolves group ids directly).
    */
   onCopyGroupId?: () => void;
+  /**
+   * Move this section one slot up / down in the sidebar. Omitted when the
+   * section is already at that end, which is also why they're separate
+   * optional callbacks rather than one `onMove(delta)`: absence *is* the
+   * disabled state, so the menu never offers a move that does nothing.
+   *
+   * These are the pointer-free path to the same reordering the header's
+   * drag handle performs - HTML5 drag events fire on neither touch nor the
+   * keyboard, so without them section layout would be mouse-only.
+   */
+  onMoveUp?: () => void;
+  onMoveDown?: () => void;
+  /**
+   * Switch the sidebar between one flat chat list and one section per origin
+   * channel. Offered by the sections the switch actually changes (Chats and
+   * the channel sections), which is why it sits beside their bulk actions
+   * rather than in a sidebar-wide header: the section carrying the toggle is
+   * the section it reshapes.
+   */
+  onToggleGroupByChannel?: () => void;
+  /** Whether channel grouping is on, which decides the toggle's label. */
+  isGroupedByChannel?: boolean;
 }
 
 /**
@@ -73,13 +99,19 @@ export function hasAnyGroupMenuAction({
   onRename,
   onDelete,
   onCopyGroupId,
+  onToggleGroupByChannel,
+  onMoveUp,
+  onMoveDown,
 }: GroupMenuItemsProps): boolean {
   return (
     onMarkAllRead != null ||
     onArchiveAll != null ||
     onRename != null ||
     onDelete != null ||
-    onCopyGroupId != null
+    onCopyGroupId != null ||
+    onToggleGroupByChannel != null ||
+    onMoveUp != null ||
+    onMoveDown != null
   );
 }
 
@@ -92,13 +124,40 @@ export function renderGroupMenuItems({
   onRename,
   onDelete,
   onCopyGroupId,
+  onToggleGroupByChannel,
+  isGroupedByChannel = false,
+  onMoveUp,
+  onMoveDown,
 }: GroupMenuItemsProps & { Primitive: GroupMenuPrimitive }): ReactNode {
   const hasBulkActions = onMarkAllRead != null || onArchiveAll != null;
   const hasIndividualActions =
-    onRename != null || onDelete != null || onCopyGroupId != null;
+    onRename != null ||
+    onDelete != null ||
+    onCopyGroupId != null ||
+    onToggleGroupByChannel != null;
+  const hasMoveActions = onMoveUp != null || onMoveDown != null;
 
   return (
     <>
+      {/* Layout actions lead: they apply to every section, so keeping them
+          in one place means the menu doesn't reshuffle between a channel
+          section (no rename/delete) and a custom group. */}
+      {onMoveUp ? (
+        <Primitive.Item leftIcon={<ArrowUp size={14} />} onSelect={onMoveUp}>
+          Move Section Up
+        </Primitive.Item>
+      ) : null}
+      {onMoveDown ? (
+        <Primitive.Item
+          leftIcon={<ArrowDown size={14} />}
+          onSelect={onMoveDown}
+        >
+          Move Section Down
+        </Primitive.Item>
+      ) : null}
+      {hasMoveActions && (hasBulkActions || hasIndividualActions) ? (
+        <Primitive.Separator />
+      ) : null}
       {onMarkAllRead ? (
         <Primitive.Item
           leftIcon={<CircleCheck size={14} />}
@@ -133,6 +192,14 @@ export function renderGroupMenuItems({
           Copy group ID
         </Primitive.Item>
       ) : null}
+      {onToggleGroupByChannel ? (
+        <Primitive.Item
+          leftIcon={<Layers size={14} />}
+          onSelect={onToggleGroupByChannel}
+        >
+          {isGroupedByChannel ? "Ungroup" : "Group by channel"}
+        </Primitive.Item>
+      ) : null}
     </>
   );
 }
@@ -149,14 +216,43 @@ export function renderGroupMenuItemsAsPanelItems({
   onRename,
   onDelete,
   onCopyGroupId,
+  onToggleGroupByChannel,
+  isGroupedByChannel = false,
+  onMoveUp,
+  onMoveDown,
   onClose,
 }: GroupMenuItemsProps & { onClose: () => void }): ReactNode {
   const hasBulkActions = onMarkAllRead != null || onArchiveAll != null;
   const hasIndividualActions =
-    onRename != null || onDelete != null || onCopyGroupId != null;
+    onRename != null ||
+    onDelete != null ||
+    onCopyGroupId != null ||
+    onToggleGroupByChannel != null;
+  const hasMoveActions = onMoveUp != null || onMoveDown != null;
 
   return (
     <>
+      {onMoveUp
+        ? buildPanelMenuItem({
+            key: "move-section-up",
+            icon: ArrowUp,
+            label: "Move Section Up",
+            run: onMoveUp,
+            onClose,
+          })
+        : null}
+      {onMoveDown
+        ? buildPanelMenuItem({
+            key: "move-section-down",
+            icon: ArrowDown,
+            label: "Move Section Down",
+            run: onMoveDown,
+            onClose,
+          })
+        : null}
+      {hasMoveActions && (hasBulkActions || hasIndividualActions) ? (
+        <PanelMenuDivider />
+      ) : null}
       {onMarkAllRead
         ? buildPanelMenuItem({
             key: "mark-all-read",
@@ -205,12 +301,21 @@ export function renderGroupMenuItemsAsPanelItems({
             onClose,
           })
         : null}
+      {onToggleGroupByChannel
+        ? buildPanelMenuItem({
+            key: "toggle-group-by-channel",
+            icon: Layers,
+            label: isGroupedByChannel ? "Ungroup" : "Group by channel",
+            run: onToggleGroupByChannel,
+            onClose,
+          })
+        : null}
     </>
   );
 }
 
 // ---------------------------------------------------------------------------
-// GroupActionsMenu — the trailing "…" button on a custom group header
+// GroupActionsMenu — the trailing "…" button on a section header
 // ---------------------------------------------------------------------------
 
 export interface GroupActionsMenuProps extends GroupMenuItemsProps {
@@ -219,19 +324,21 @@ export interface GroupActionsMenuProps extends GroupMenuItemsProps {
 }
 
 /**
- * Trailing "…" affordance on a custom-group header. Renders the shared group
- * menu items, so this menu and the header's right-click menu always offer the
- * same actions.
+ * Trailing "…" affordance on a section header. Renders the shared group menu
+ * items, so this menu, the header's right-click menu and the mobile long-press
+ * sheet always offer the same actions - the reachability the sidebar's grouping
+ * toggle depends on (LUM-3120).
  */
 export function GroupActionsMenu({
   label,
   ...menuProps
 }: GroupActionsMenuProps) {
   const [open, setOpen] = useState(false);
-  const isMobile = useIsMobile();
+  const isTouchMobile = useTouchMobile();
   const closeMenu = () => setOpen(false);
+  const hasItems = hasAnyGroupMenuAction(menuProps);
 
-  if (!hasAnyGroupMenuAction(menuProps)) {
+  if (!hasItems) {
     return null;
   }
 
@@ -240,19 +347,9 @@ export function GroupActionsMenu({
     onClose: closeMenu,
   });
 
-  const trigger = (
-    <button
-      type="button"
-      aria-label={`${label} actions`}
-      aria-haspopup="menu"
-      onClick={(event) => event.stopPropagation()}
-      className="flex h-5 w-5 items-center justify-center rounded-[4px] text-[var(--content-tertiary)] transition-colors hover:bg-[var(--surface-hover)] hover:text-[var(--content-secondary)] aria-[expanded=true]:bg-[var(--surface-active)] aria-[expanded=true]:text-[var(--content-emphasised)]"
-    >
-      <MoreHorizontal size={14} aria-hidden />
-    </button>
-  );
+  const trigger = <SectionActionsButton label={label} />;
 
-  if (isMobile) {
+  if (isTouchMobile) {
     return (
       <BottomSheet.Root open={open} onOpenChange={setOpen}>
         <BottomSheet.Trigger asChild>{trigger}</BottomSheet.Trigger>

@@ -24,19 +24,22 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { Check, Square, Volume2 } from "lucide-react";
 
-import { cn } from "@vellumai/design-library";
+import {
+  cn,
+  hoverRevealClasses,
+  hoverRevealYieldClasses,
+} from "@vellumai/design-library";
 import { Button } from "@vellumai/design-library/components/button";
-import { Dropdown } from "@vellumai/design-library/components/dropdown";
-import { toast } from "@vellumai/design-library/components/toast";
+import { Select } from "@vellumai/design-library/components/select";
 
 import { useManagedVoiceSelection } from "@/components/speech/use-managed-voice-selection";
+import { useVoiceSamplePreview } from "@/components/speech/use-voice-sample-preview";
 import {
   groupVoicesByAccent,
   MANAGED_VOICE_SOURCE_LABELS,
   splitVoiceDescription,
   voiceTraitsLabel,
 } from "@/lib/tts/managed-voice-catalog";
-import { type ManagedVoiceOption } from "@/lib/tts/use-managed-voices";
 
 /**
  * A voice's label: its character traits lead (sentence-cased), with the accent
@@ -60,64 +63,6 @@ export function VoiceLabel({
       )}
     </span>
   );
-}
-
-/**
- * On-demand preview of a single voice via its hosted sample. Tracks which
- * voice is playing so the row can show a spinner; tears down on a new play and
- * on unmount so a late-resolving `play()` can't leak onto a gone component.
- */
-function useVoiceSamplePreview(): {
-  previewingModel: string | null;
-  play: (voice: ManagedVoiceOption) => void;
-  stop: () => void;
-} {
-  const [previewingModel, setPreviewingModel] = useState<string | null>(null);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
-  const tokenRef = useRef(0);
-
-  const stop = () => {
-    // Bump the token so a late-resolving play() bails, then tear down.
-    tokenRef.current++;
-    audioRef.current?.pause();
-    audioRef.current = null;
-    setPreviewingModel(null);
-  };
-
-  useEffect(
-    () => () => {
-      tokenRef.current++;
-      audioRef.current?.pause();
-      audioRef.current = null;
-    },
-    [],
-  );
-
-  function play(voice: ManagedVoiceOption): void {
-    if (!voice.sampleUrl) {
-      return;
-    }
-    audioRef.current?.pause();
-    const token = ++tokenRef.current;
-    const audio = new Audio(voice.sampleUrl);
-    audioRef.current = audio;
-    setPreviewingModel(voice.model);
-    const clear = () => {
-      if (tokenRef.current === token) {
-        setPreviewingModel(null);
-      }
-    };
-    audio.onended = clear;
-    audio.onerror = clear;
-    void audio.play().catch(() => {
-      if (tokenRef.current === token) {
-        toast.error("Could not play the voice sample.");
-        setPreviewingModel(null);
-      }
-    });
-  }
-
-  return { previewingModel, play, stop };
 }
 
 export interface VoiceListProps {
@@ -257,7 +202,7 @@ export function VoiceList({
       )}
       {showSourceFilter && (
         <div className="px-1 pb-1">
-          <Dropdown
+          <Select
             value={selectedSource ?? ""}
             onChange={setSourceOverride}
             options={sources.map((s) => ({
@@ -335,9 +280,7 @@ export function VoiceList({
                         }
                         className={cn(
                           "absolute inset-0 transition-opacity",
-                          isPreviewing
-                            ? "opacity-100"
-                            : "opacity-0 group-hover:opacity-100 focus-visible:opacity-100 touch-mobile:opacity-100",
+                          isPreviewing ? "opacity-100" : hoverRevealClasses,
                         )}
                         // Preview / stop only — don't let the row's select fire.
                         onClick={(event) => {
@@ -354,13 +297,13 @@ export function VoiceList({
                       <Check
                         aria-hidden
                         className={cn(
-                          "pointer-events-none size-4 text-[var(--system-positive-strong)] transition-opacity",
-                          // Hide the check whenever the speaker is showing (hover
-                          // /focus or previewing), so they never stack.
+                          "pointer-events-none size-4 text-[var(--system-positive-strong)]",
+                          // The check yields the slot whenever the speaker is
+                          // showing, so they never stack.
                           isPreviewing
-                            ? "opacity-0"
+                            ? "opacity-0 transition-opacity"
                             : voice.sampleUrl !== ""
-                              ? "opacity-100 group-hover:opacity-0 group-focus-within:opacity-0"
+                              ? hoverRevealYieldClasses
                               : "opacity-100",
                         )}
                       />

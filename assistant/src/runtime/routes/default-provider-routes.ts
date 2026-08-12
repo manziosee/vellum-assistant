@@ -15,37 +15,38 @@
  */
 import { z } from "zod";
 
-import { DEFAULT_PROFILE_PROVIDERS } from "../../config/default-profile-names.js";
 import { setDefaultProvider } from "../../config/default-provider.js";
 import {
   getDefaultProviderFromConfig,
   resolveDefaultConnectionName,
 } from "../../config/default-provider-resolution.js";
 import { getConfigReadOnly } from "../../config/loader.js";
-import { DefaultProviderSchema } from "../../config/schemas/llm.js";
-import { computeConnectionAvailability } from "../../providers/inference/connection-availability.js";
+import {
+  DEFAULT_PROVIDER_CHOICES,
+  DefaultProviderSchema,
+} from "../../config/schemas/llm.js";
+import { ROUTING_IDENTITY_PROVIDERS } from "../../providers/inference/auth.js";
+import {
+  computeConnectionAvailability,
+  CONNECTION_AVAILABILITY_STATUSES,
+} from "../../providers/inference/connection-availability.js";
 import { ACTOR_PRINCIPALS } from "../auth/route-policy.js";
 import { BadRequestError } from "./errors.js";
 import type { RouteDefinition, RouteHandlerArgs } from "./types.js";
 
 const availabilitySchema = z.object({
-  status: z.enum([
-    "ok",
-    "missing_default",
-    "missing_connection",
-    "missing_credential",
-    "provider_mismatch",
-    "unsupported_auth",
-    "vellum_unauthenticated",
-    "unknown",
-  ]),
+  // `missing_default` is this route's own verdict (no default provider is
+  // configured at all), so it extends the shared set rather than living in it.
+  status: z.enum([...CONNECTION_AVAILABILITY_STATUSES, "missing_default"]),
   /** Present on every non-`ok` status: names the broken thing and the fix. */
   message: z.string().optional(),
 });
 
 const defaultProviderStatusSchema = z
   .object({
-    provider: z.enum(DEFAULT_PROFILE_PROVIDERS).nullable(),
+    provider: z
+      .enum(DEFAULT_PROVIDER_CHOICES as [string, ...string[]])
+      .nullable(),
     /** Explicit connection pin, when the persisted value carries one. */
     connectionName: z.string().optional(),
     /** The connection the default resolves to (explicit pin or convention). */
@@ -88,10 +89,24 @@ async function handlePutDefaultProvider({
   const result = DefaultProviderSchema.safeParse(body);
   if (!result.success) {
     throw new BadRequestError(
-      `Invalid default provider. "provider" must be one of: ${DEFAULT_PROFILE_PROVIDERS.join(
+      `Invalid default provider. "provider" must be one of: ${DEFAULT_PROVIDER_CHOICES.join(
         ", ",
       )}; "connectionName" is optional and must be a non-empty string.`,
     );
+  }
+  // Routing identities dispatch through their canonical row regardless of
+  // any stored pin (`resolveRoutingIdentity`), so a noncanonical
+  // connectionName would be judged by availability and the deletion guards
+  // while inference uses a different row. Reject it here rather than
+  // persisting a pin that status and dispatch disagree about.
+  const { provider, connectionName } = result.data;
+  if (connectionName != null && ROUTING_IDENTITY_PROVIDERS.has(provider)) {
+    const canonical = resolveDefaultConnectionName({ provider });
+    if (connectionName !== canonical) {
+      throw new BadRequestError(
+        `Provider "${provider}" always dispatches through its canonical connection "${canonical}". Omit "connectionName" or pass "${canonical}".`,
+      );
+    }
   }
   setDefaultProvider(result.data);
   return handleGetDefaultProvider();

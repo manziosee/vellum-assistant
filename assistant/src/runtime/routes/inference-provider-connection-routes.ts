@@ -21,6 +21,7 @@ import { getDb } from "../../persistence/db-connection.js";
 import {
   type Auth,
   AuthSchema,
+  CHATGPT_SUBSCRIPTION_CONNECTION_NAME,
   type ConnectionModel,
   ConnectionModelSchema,
   ConnectionProviderSchema,
@@ -39,6 +40,10 @@ import {
   updateConnection,
 } from "../../providers/inference/connections.js";
 import { PROVIDER_CATALOG } from "../../providers/model-catalog.js";
+import {
+  isVellumManagedConnection,
+  VELLUM_MANAGED_PROVIDER,
+} from "../../providers/vellum-model-routing.js";
 import { credentialKey } from "../../security/credential-key.js";
 import { deleteSecureKeyAsync } from "../../security/secure-keys.js";
 import {
@@ -191,6 +196,51 @@ function deriveConnectionAuth(provider: string, credential: unknown): Auth {
   return derived;
 }
 
+/**
+ * Platform auth and `provider: "vellum"` record the same fact (the managed
+ * route) in two columns, and derivation always sets them together. Only an
+ * explicit `auth` object can split them, producing a row dispatch bills to
+ * the platform while every provider-keyed check reads it as BYOK, or the
+ * reverse.
+ */
+function assertAuthMatchesProvider(provider: string, auth: Auth): void {
+  const managedAuth = auth.type === "platform";
+  const managedProvider = provider === VELLUM_MANAGED_PROVIDER;
+  if (managedAuth !== managedProvider) {
+    throw new BadRequestError(
+      managedAuth
+        ? `Auth type "platform" is only valid for provider "${VELLUM_MANAGED_PROVIDER}", not "${provider}". Vellum-managed routing is selected by the provider, so omit "auth" to derive it.`
+        : `Provider "${VELLUM_MANAGED_PROVIDER}" is always platform-authenticated; "${auth.type}" auth is not valid for it. Omit "auth" to derive it, or name a real provider for key-based auth.`,
+    );
+  }
+  // Same rule for the subscription identity: provider "chatgpt" and
+  // oauth_subscription auth record one fact and must pair, or a key-auth
+  // row under the identity would dispatch against the API while the user
+  // believes they are on subscription billing.
+  const subscriptionAuth = auth.type === "oauth_subscription";
+  const subscriptionProvider = provider === "chatgpt";
+  if (subscriptionAuth !== subscriptionProvider) {
+    throw new BadRequestError(
+      subscriptionAuth
+        ? `Auth type "oauth_subscription" is only valid for provider "chatgpt", not "${provider}". Run the ChatGPT sign-in flow to connect a subscription.`
+        : `Provider "chatgpt" is always subscription-authenticated; "${auth.type}" auth is not valid for it. Run the ChatGPT sign-in flow, or name a real provider for key-based auth.`,
+    );
+  }
+}
+
+/**
+ * Stable form of an auth object for equality checks. Auth values are flat, so
+ * sorting the entries is enough to make two encodings of the same auth
+ * compare equal regardless of key order.
+ */
+function authFingerprint(auth: Auth): string {
+  return JSON.stringify(
+    Object.fromEntries(
+      Object.entries(auth).sort(([a], [b]) => a.localeCompare(b)),
+    ),
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
@@ -278,10 +328,39 @@ async function handleCreateConnection({ body = {} }: RouteHandlerArgs) {
     throw new BadRequestError("name must be a non-empty string");
   }
 
+  // Canonical names belong to boot seeding, which skips a name already taken
+  // by a user-owned row, leaving the install with no managed connection and a
+  // BYOK row that managed routing then ignores. Refuse the name up front.
+  if (MANAGED_CONNECTION_NAMES.has(name)) {
+    throw new BadRequestError(
+      `Connection name "${name}" is reserved for the Vellum-managed connection. Pick another name.`,
+    );
+  }
+  // Provider ids and routing identities are labels in profile config, so an
+  // entry under one of those names could never be referenced by name (the
+  // label reads as the vendor), and a future catalog addition must never
+  // capture an existing user name. Reserve the whole vocabulary.
+  if (VALID_CONNECTION_PROVIDERS.includes(name)) {
+    throw new BadRequestError(
+      `Connection name "${name}" is reserved as a provider id. Pick another name.`,
+    );
+  }
+
   const providerResult = ConnectionProviderSchema.safeParse(provider);
   if (!providerResult.success) {
     throw new BadRequestError(
       `Invalid provider "${String(provider)}". Valid: ${VALID_CONNECTION_PROVIDERS.join(", ")}`,
+    );
+  }
+  // The chatgpt identity lives on its canonical row: routing resolves the
+  // subscription by that name, so an identity row under any other name can
+  // never dispatch.
+  if (
+    providerResult.data === "chatgpt" &&
+    name !== CHATGPT_SUBSCRIPTION_CONNECTION_NAME
+  ) {
+    throw new BadRequestError(
+      `Provider "chatgpt" is reserved for the "${CHATGPT_SUBSCRIPTION_CONNECTION_NAME}" connection. Run the ChatGPT sign-in flow to connect a subscription.`,
     );
   }
   const authResult = AuthSchema.safeParse(
@@ -290,6 +369,10 @@ async function handleCreateConnection({ body = {} }: RouteHandlerArgs) {
   if (!authResult.success) {
     throw new BadRequestError(`Invalid auth: ${authResult.error.message}`);
   }
+  // Asserted on derived auth as well: derivation pairs every provider
+  // correctly except the chatgpt identity, whose fallthrough would mint
+  // api_key auth from a bare credential.
+  assertAuthMatchesProvider(providerResult.data, authResult.data);
 
   const labelRaw = body.label;
   if (
@@ -385,6 +468,32 @@ async function handleUpdateConnection({
   if (!authResult.success) {
     throw new BadRequestError(`Invalid auth: ${authResult.error.message}`);
   }
+  // The canonical subscription row owns the "chatgpt" identity: writing
+  // subscription auth to it stamps the provider with the auth, mirroring
+  // the daemon's own sign-in exchange route. The CLI's login-chatgpt PATCHes
+  // auth through this route, and without the stamp a row the identity
+  // migration deliberately skipped (a claiming row with key auth) would end
+  // up as provider "openai" with subscription auth. Provider stays
+  // immutable for every other row.
+  const chatgptIdentityStamp =
+    name === CHATGPT_SUBSCRIPTION_CONNECTION_NAME &&
+    authResult.data.type === "oauth_subscription" &&
+    existing.provider !== "chatgpt";
+
+  // The pairing is enforced on an actual auth change, not on the field being
+  // present: the web editor and the CLI both resend the stored auth on every
+  // edit, so a row whose columns already disagree stays relabelable and
+  // re-pointable. Judged against the stamped provider when the stamp
+  // applies, since that is the pair being written.
+  if (
+    body.auth !== undefined &&
+    authFingerprint(authResult.data) !== authFingerprint(existing.auth)
+  ) {
+    assertAuthMatchesProvider(
+      chatgptIdentityStamp ? "chatgpt" : existing.provider,
+      authResult.data,
+    );
+  }
 
   const labelRaw = body.label;
   if (
@@ -396,19 +505,6 @@ async function handleUpdateConnection({
       `Invalid label: must be a non-blank string or null`,
     );
   }
-  // Managed connections: lock auth to `{type:"platform"}`. The boot upsert in
-  // `seedCanonicalConnections` would revert any other value on next restart;
-  // reject the write here so the surprise loop never happens. Label remains
-  // user-editable (the boot upsert leaves it alone).
-  if (
-    MANAGED_CONNECTION_NAMES.has(name) &&
-    authResult.data.type !== "platform"
-  ) {
-    throw new BadRequestError(
-      `Cannot change auth on managed connection "${name}". Auth is locked to platform.`,
-    );
-  }
-
   const customFields = await parseCustomProviderFields(body, existing.provider);
 
   // Only a CHANGED label is validated: keeping a stored label — whatever it
@@ -427,6 +523,7 @@ async function handleUpdateConnection({
 
   const result = updateConnection(getDb(), name, {
     auth: authResult.data,
+    ...(chatgptIdentityStamp ? { provider: "chatgpt" } : {}),
     ...(labelRaw !== undefined ? { label: labelRaw as string | null } : {}),
     ...customFields,
   });
@@ -469,7 +566,14 @@ async function handleDeleteConnection({ pathParams = {} }: RouteHandlerArgs) {
   // produces a confusing delete → reappear loop. Reject outright. Mirrors
   // `rejectManagedProfileDeletion` for managed profiles (which are similarly
   // re-overlaid by `seed-inference-profiles.ts` on boot).
-  if (MANAGED_CONNECTION_NAMES.has(name)) {
+  //
+  // Gated on the row, not the name: an install predating the reserved name can
+  // hold a user-owned row here, which boot seeding refuses to overwrite and
+  // managed routing ignores. That row must stay deletable, since deleting it
+  // is what lets boot seeding restore the real managed connection.
+  const claimsManagedName =
+    MANAGED_CONNECTION_NAMES.has(name) && !isVellumManagedConnection(existing);
+  if (MANAGED_CONNECTION_NAMES.has(name) && !claimsManagedName) {
     throw new BadRequestError(
       `Cannot delete managed connection "${name}". This is a Vellum-managed connection that is re-seeded on every startup.`,
     );
@@ -488,7 +592,11 @@ async function handleDeleteConnection({ pathParams = {} }: RouteHandlerArgs) {
   // managed rows are excluded from the count for the same reason the list
   // route hides them — they aren't user-manageable connections.
   const dp = getDefaultProviderFromConfig(config);
-  if (dp) {
+  // A `vellum` default resolves to the canonical name, so this guard would
+  // otherwise block deleting a row that merely claims that name. Deleting it
+  // does not orphan the default: boot seeding writes the real managed
+  // connection under the same name on the next restart.
+  if (dp && !claimsManagedName) {
     if (name === resolveDefaultConnectionName(dp)) {
       throw new ConflictError(
         `Connection "${name}" is referenced by llm.defaultProvider. Update llm.defaultProvider before deleting.`,
@@ -517,10 +625,21 @@ async function handleDeleteConnection({ pathParams = {} }: RouteHandlerArgs) {
   // above; this keeps the scan a faithful backstop rather than one that
   // silently skips the defaults.
   const profiles = getEffectiveProfilesForProvider(config.llm?.profiles, dp);
+  // A binding lives in `provider` (the entry name) under the entries model,
+  // or in the legacy `provider_connection` field; both count, or deleting a
+  // bound entry would dangle the profile behind selection's silent healing.
+  // Provider values count only for non-vendor names: a profile saying
+  // "vellum" references the routing identity, never a row that happens to
+  // claim that name, and the claiming-row delete is the recovery path.
+  const nameIsEntryName = !VALID_CONNECTION_PROVIDERS.includes(name);
   const referencingProfiles = Object.entries(profiles)
-    .filter(
-      ([, p]) => (p as Record<string, unknown>).provider_connection === name,
-    )
+    .filter(([, p]) => {
+      const entry = p as Record<string, unknown>;
+      return (
+        entry.provider_connection === name ||
+        (nameIsEntryName && entry.provider === name)
+      );
+    })
     .map(([profileName]) => profileName);
 
   const result = deleteConnection(getDb(), name, {
@@ -619,7 +738,7 @@ export const ROUTES: RouteDefinition[] = [
     },
     summary: "Create a provider connection",
     description:
-      "Create a new named provider connection. When auth is omitted it is derived from the provider (keyless providers get none, vellum gets platform, everything else needs credential for api_key auth). Fails with 409 if a connection with this name already exists.",
+      "Create a new named provider connection. When auth is omitted it is derived from the provider (keyless providers get none, vellum gets platform, everything else needs credential for api_key auth). An explicit auth object must agree with the provider; platform auth belongs to vellum and only to vellum. Fails with 409 if a connection with this name already exists.",
     tags: ["inference"],
     requestBody: z.object({
       name: z.string().min(1),
@@ -648,7 +767,7 @@ export const ROUTES: RouteDefinition[] = [
     },
     summary: "Update a provider connection",
     description:
-      "Update an existing connection. Cannot rename or change the provider. Omitting auth keeps the stored auth; passing credential alone rotates the key via provider-derived api_key auth. For the Vellum-managed connection (vellum) the auth is locked to platform; label remains editable.",
+      "Update an existing connection. Cannot rename or change the provider. Omitting auth keeps the stored auth; passing credential alone rotates the key via provider-derived api_key auth. An explicit auth object must agree with the connection's provider; platform auth belongs to vellum and only to vellum. For the Vellum-managed connection (vellum) the auth is locked to platform; label remains editable.",
     tags: ["inference"],
     pathParams: [{ name: "name", description: "Connection name" }],
     requestBody: z.object({

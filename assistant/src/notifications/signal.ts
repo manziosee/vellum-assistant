@@ -26,6 +26,7 @@ export const NOTIFICATION_SOURCE_CHANNELS = [
   { id: "platform", description: "Platform-managed channel" },
   { id: "a2a", description: "Agent-to-agent protocol channel" },
   { id: "discord", description: "Discord channel" },
+  { id: "plugin", description: "Channel brought by an installed plugin" },
   { id: "scheduler", description: "Scheduled task runner (reminders, cron)" },
   { id: "watcher", description: "File/event watcher subsystem" },
 ] as const;
@@ -64,6 +65,18 @@ export const NOTIFICATION_SOURCE_EVENT_NAMES = [
   {
     id: "schedule.notify",
     description: "Scheduled notification triggered (one-shot or recurring)",
+  },
+  {
+    id: "schedule.definition_error",
+    description: "Plugin schedule declaration failed to parse or validate",
+  },
+  {
+    id: "schedule.declared",
+    description: "Plugin-declared schedule armed for the first time",
+  },
+  {
+    id: "schedule.definition_changed",
+    description: "Plugin upgrade changed an armed schedule's definition",
   },
   {
     id: "guardian.question",
@@ -121,6 +134,11 @@ export const NOTIFICATION_SOURCE_EVENT_NAMES = [
     id: "credential.health_alert",
     description:
       "OAuth credential health issue detected (expired, revoked, missing scopes)",
+  },
+  {
+    id: "chat.assistant_reply",
+    description:
+      "Assistant finished replying to a user-initiated turn the user is no longer watching",
   },
   {
     id: "telegram.webhook_health_alert",
@@ -231,6 +249,11 @@ export interface NotificationSignal<TEventName extends string = string> {
   sourceEventName: TEventName; // free-form: 'reminder_fired', 'guardian_question', etc.
   contextPayload: NotificationContextPayload<TEventName>;
   attentionHints: AttentionHints;
+  /**
+   * Producer-supplied deduplication key. Deterministic decision paths reuse it
+   * as the decision's dedupeKey so the decision row matches the event row.
+   */
+  dedupeKey?: string;
   /** Routing intent from the source (e.g. reminder). Controls post-decision channel enforcement. */
   routingIntent?: RoutingIntent;
   /** Free-form hints from the source for the decision engine (e.g. preferred channels). */

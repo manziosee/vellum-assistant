@@ -198,7 +198,11 @@ describe("forkConversationForRetrospective", () => {
     const assistant = await addMessage(source.id, "assistant", "see mockup", {
       skipIndexing: true,
     });
-    const uploaded = uploadAttachment("wireframe.png", "image/png", "iVBORw0K");
+    const uploaded = await uploadAttachment(
+      "wireframe.png",
+      "image/png",
+      "iVBORw0K",
+    );
     linkAttachmentToMessage(assistant.id, uploaded.id, 0);
 
     const asyncFork = await forkConversationForRetrospective({
@@ -717,5 +721,29 @@ describe("forkConversationForRetrospective — compacted source", () => {
       summary: "Tie summary",
       compactedMessageCount: 0,
     });
+  });
+});
+
+describe("forkConversationForRetrospective with unfinalized rows", () => {
+  beforeEach(() => {
+    resetTables();
+  });
+
+  test("skips the unfinalized tail and anchors at the last finalized message", async () => {
+    const source = await seedSource("Mid-turn retro");
+    const tail = getMessages(source.id).at(-1)!;
+    const db = getDb();
+    db.run(`UPDATE messages SET finalized = 0 WHERE id = '${tail.id}'`);
+
+    const fork = await forkConversationForRetrospective({
+      conversationId: source.id,
+    });
+    const forkMessages = getMessages(fork.id);
+
+    // Invariant: only finalized rows are copied, and the lineage anchor is a
+    // row the fork actually holds.
+    expect(forkMessages).toHaveLength(3);
+    expect(forkMessages.every((row) => row.finalized === 1)).toBe(true);
+    expect(fork.forkParentMessageId).not.toBe(tail.id);
   });
 });

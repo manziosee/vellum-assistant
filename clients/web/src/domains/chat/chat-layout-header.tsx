@@ -1,16 +1,21 @@
-import { Button, Popover } from "@vellumai/design-library";
+import { Button } from "@vellumai/design-library";
 import {
   ChevronLeft,
   ChevronRight,
   Menu as MenuIcon,
-  MoreHorizontal,
   PanelLeft,
   Search,
 } from "lucide-react";
 import { useCallback, useEffect, type ReactNode } from "react";
 
+import { NATIVE_MOBILE_BARE_ICON_BUTTON } from "@/domains/chat/utils/native-mobile-button-constants";
 import { isElectron } from "@/runtime/is-electron";
+import { isNativeMobile } from "@/runtime/platform-detection";
 import { useCommandPaletteStore } from "@/stores/command-palette-store";
+import {
+  resolveShellBackground,
+  usePageSurfaceStore,
+} from "@/stores/page-surface-store";
 import { useTitleBarStore } from "@/stores/title-bar-store";
 
 // On macOS the native window controls (traffic lights) overlay the top-left of
@@ -48,17 +53,6 @@ export interface ChatLayoutHeaderProps {
    * notification bell.
    */
   topBarRightLeading?: ReactNode;
-  /**
-   * Collapse the rest of the right cluster (search, `topBarRightSlot`) behind
-   * a single ⋯ popover, leaving `topBarRightLeading` beside it. Set while the
-   * voice-session pill occupies the row: two icon buttons is the budget that
-   * keeps a conversation title readable at phone widths.
-   *
-   * The leading slot deliberately stays out of the popover — a live
-   * microphone must keep an indicator visible in the chrome, not one the user
-   * has to open a menu to discover.
-   */
-  collapseRightCluster?: boolean;
   topBarRightSlot?: ReactNode;
   canGoBack?: boolean;
   canGoForward?: boolean;
@@ -77,7 +71,6 @@ export function ChatLayoutHeader({
   controlsDimmed = false,
   topBarCenter,
   topBarRightLeading,
-  collapseRightCluster = false,
   topBarRightSlot,
   canGoBack,
   canGoForward,
@@ -100,13 +93,13 @@ export function ChatLayoutHeader({
   const electron = isElectron();
 
   // Mobile-only: on desktop the same affordance lives in the left cluster.
-  // Hoisted so the collapsed and expanded arms render the identical node.
   const searchButton = isMobile ? (
     <Button
       variant="ghost"
       iconOnly={<Search />}
       aria-label="Search (Ctrl+K)"
       tooltip="Search (Ctrl+K)"
+      className={NATIVE_MOBILE_BARE_ICON_BUTTON}
       onClick={handleSearchClick}
     />
   ) : null;
@@ -121,6 +114,14 @@ export function ChatLayoutHeader({
     return () => setInlineTitleBarActive(false);
   }, [electron, setInlineTitleBarActive]);
 
+  // The header sits between the safe-area strips and the page content, both of
+  // which take the route's published surface on the native shells. Painting it
+  // from the same resolver is what makes the color continuous instead of a
+  // neutral band across the top. Off native mobile, and on any route that
+  // publishes nothing, this resolves to the usual neutral chrome.
+  const pageSurface = usePageSurfaceStore.use.surface();
+  const headerBackground = resolveShellBackground(pageSurface, isNativeMobile());
+
   return (
     <header
       data-slot="chat-layout-header"
@@ -130,7 +131,7 @@ export function ChatLayoutHeader({
           : ""
       }`}
       style={{
-        background: "var(--surface-base)",
+        background: headerBackground,
         minHeight: electron ? "44px" : "40px",
         paddingTop: electron ? 0 : undefined,
       }}
@@ -160,6 +161,7 @@ export function ChatLayoutHeader({
             aria-expanded={drawerOpen}
             aria-controls="chat-side-menu"
             tooltip="Open navigation"
+            className={NATIVE_MOBILE_BARE_ICON_BUTTON}
             onClick={toggleSidebar}
           />
         ) : (
@@ -206,7 +208,10 @@ export function ChatLayoutHeader({
 
       <div
         inert={controlsHidden || centerHidden || undefined}
-        className={`flex min-w-0 flex-1 items-center justify-center transition-opacity duration-300${controlsHidden || centerHidden ? " pointer-events-none opacity-0" : ""}`}
+        // Left-aligned on mobile, pulled in 12px past the header's own
+        // `gap-4` (16px) to sit closer to the menu button, 4px total.
+        // Desktop keeps the title centered in the remaining space.
+        className={`flex min-w-0 flex-1 items-center max-md:-ml-3 max-md:justify-start justify-center transition-opacity duration-300${controlsHidden || centerHidden ? " pointer-events-none opacity-0" : ""}`}
       >
         {topBarCenter}
       </div>
@@ -221,36 +226,8 @@ export function ChatLayoutHeader({
         className={`flex shrink-0 items-center gap-2 max-md:justify-end transition-opacity duration-300${controlsHidden ? " pointer-events-none opacity-0" : controlsDimmed ? " opacity-40" : ""}`}
       >
         {topBarRightLeading}
-        {collapseRightCluster ? (
-          // The collapsed controls are relocated, not rebuilt: they render as
-          // the same nodes inside the popover, so contributors to
-          // `topBarRightSlot` need no menu-item form of themselves.
-          <Popover.Root>
-            <Popover.Trigger asChild>
-              {/* No `tooltip`: the collapse is mobile-only, and touch has no
-                  hover to show one on. The `aria-label` is what names the
-                  control for assistive tech. */}
-              <Button
-                variant="ghost"
-                iconOnly={<MoreHorizontal />}
-                aria-label="More controls"
-              />
-            </Popover.Trigger>
-            <Popover.Content
-              side="bottom"
-              align="end"
-              className="flex w-auto items-center gap-1 p-1"
-            >
-              {searchButton}
-              {topBarRightSlot}
-            </Popover.Content>
-          </Popover.Root>
-        ) : (
-          <>
-            {searchButton}
-            {topBarRightSlot}
-          </>
-        )}
+        {searchButton}
+        {topBarRightSlot}
       </div>
     </header>
   );

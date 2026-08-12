@@ -147,6 +147,19 @@ describe("stt-routes", () => {
     expect(transcribeFile.policy?.requiredScopes).toContain("chat.write");
   });
 
+  // -- Providers list -------------------------------------------------------
+
+  test("providers list includes each provider's languageSelection", async () => {
+    const { handler } = getRoute("stt/providers");
+    const result = (await handler(makeArgs({}))) as {
+      providers: Array<{ id: string; languageSelection: string }>;
+    };
+
+    const byId = new Map(result.providers.map((p) => [p.id, p]));
+    expect(byId.get("deepgram")?.languageSelection).toBe("manual");
+    expect(byId.get("google-gemini")?.languageSelection).toBe("auto");
+  });
+
   // -- Success path ---------------------------------------------------------
 
   test("returns transcribed text with provider and boundary ids", async () => {
@@ -273,6 +286,31 @@ describe("stt-routes", () => {
       "SERVICE_UNAVAILABLE",
     );
     expect(err.message).toContain("not available");
+  });
+
+  test("surfaces a typed resolver error verbatim instead of the generic copy", async () => {
+    // A streaming-only provider IS configured, so the "nothing configured"
+    // and "not available" strings would both send the caller looking for a
+    // problem that does not exist.
+    const reason =
+      'Deepgram Flux is streaming-only. Batch transcription requires the deepgram provider: set services.stt.provider to "deepgram".';
+    mockResolveError = new SttError("provider-error", reason, {
+      userFacing: true,
+    });
+
+    const { handler } = getRoute("stt/transcribe");
+    const err = await expectRouteError(
+      () =>
+        handler(
+          makeArgs({
+            audioBase64: toBase64("audio-data"),
+            mimeType: "audio/wav",
+          }),
+        ),
+      503,
+      "SERVICE_UNAVAILABLE",
+    );
+    expect(err.message).toBe(reason);
   });
 
   // -- Timeout --------------------------------------------------------------

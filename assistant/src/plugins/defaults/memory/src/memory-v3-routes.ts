@@ -170,7 +170,7 @@ const GateStatsBucketSchema = z.object({
     ),
 });
 
-const GateStatsResponseSchema = z.object({
+export const GateStatsResponseSchema = z.object({
   lookbackDays: z.number().describe("Lookback window applied"),
   totalRuns: z.number().describe("Total gate runs found in the window"),
   buckets: z

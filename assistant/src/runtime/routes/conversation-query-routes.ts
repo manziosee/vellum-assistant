@@ -29,7 +29,6 @@ import {
   LatencyBreakdownSchema,
   LLMRequestLogEntrySchema,
 } from "../../api/responses/llm-request-log-entry.js";
-import { CALL_SITE_DEFAULTS } from "../../config/call-site-defaults.js";
 import {
   deepMergeOverwrite,
   fillContextDefaultsForMissingKeys,
@@ -47,11 +46,11 @@ import { AssistantConfigSchema } from "../../config/schema.js";
 import { getSchemaAtPath } from "../../config/schema-utils.js";
 import {
   DefaultProviderSchema,
-  type LLMCallSite,
   LLMConfigBase,
   LLMConfigFragment,
   ProfileEntry,
   routingIdentityModelIssue,
+  unknownLlmProviderIssue,
 } from "../../config/schemas/llm.js";
 import { VALID_MEMORY_EMBEDDING_PROVIDERS } from "../../config/schemas/memory-storage.js";
 import { ServiceModeSchema } from "../../config/schemas/services.js";
@@ -87,14 +86,18 @@ import {
   getMessageById,
 } from "../../persistence/conversation-crud.js";
 import { getConversationByKey } from "../../persistence/conversation-key-store.js";
+import {
+  type ConversationKind,
+  resolveConversationKind,
+} from "../../persistence/conversation-types.js";
 import { getDb } from "../../persistence/db-connection.js";
 import { clearEmbeddingBackendCache } from "../../persistence/embeddings/embedding-backend.js";
 import { getLlmRequestLogSource } from "../../persistence/llm-request-log-source.js";
 import { type LogRow } from "../../persistence/llm-request-log-store.js";
 import { getMemoryRecallLogByMessageIds } from "../../plugins/defaults/memory/memory-recall-log-store.js";
-import { MEMORY_V2_CONSOLIDATION_SOURCE } from "../../plugins/defaults/memory/substrate/constants.js";
 import { getMemoryV2ActivationLogByMessageIds } from "../../plugins/defaults/memory/v2/activation-log-store.js";
 import { getMemoryV3SelectionForInspectorByMessageIds } from "../../plugins/defaults/memory/v3/selection-log-store.js";
+import { writableProfileProviderIssue } from "../../providers/connection-resolution.js";
 import { ROUTING_IDENTITY_PROVIDERS } from "../../providers/inference/auth.js";
 import { PROVIDERS_REQUIRING_BASE_URL_AND_MODELS } from "../../providers/inference/auth.js";
 import {
@@ -113,7 +116,14 @@ import {
   resolvePricingForUsage,
   usesAnthropicPricingRules,
 } from "../../util/pricing.js";
-import { BadRequestError, InternalError, NotFoundError } from "./errors.js";
+import { resolveActorPrincipalIdForLocalGuardian } from "../local-actor-identity.js";
+import { publishConfigChanged } from "../sync/resource-sync-events.js";
+import {
+  BadRequestError,
+  ForbiddenError,
+  InternalError,
+  NotFoundError,
+} from "./errors.js";
 import {
   type LlmContextSummary,
   normalizeLlmContextPayloads,
@@ -140,6 +150,7 @@ type LlmContextRouteResult = Omit<LlmContextNormalizationResult, "summary"> & {
 };
 
 import {
+  CODE_OWNED_PROFILE_NAMES,
   getEffectiveProfilesForProvider,
   INVARIANT_PROFILE_NAMES,
   MANAGED_PROFILE_NAMES,
@@ -914,53 +925,6 @@ function stripWireOnlyProfileKeys(patch: unknown): void {
 }
 
 /**
- * Backfill shipped call-site tuning into NEWLY created `llm.callSites`
- * entries in a config-write fragment, in place.
- *
- * The resolver's tweak layer is `llm.callSites[id] ?? CALL_SITE_DEFAULTS[id]`
- * — an explicit entry replaces the shipped default wholesale. Workspace
- * migrations that materialize entries therefore mirror the shipped tuning
- * exactly (see 090-memory-router-cost-optimized-profile); a client writing a
- * bare `{ profile }` for a site it has no entry for would silently drop
- * shipped knobs like `memoryRouter`'s 1M input window or `recall`'s token/
- * effort bounds. Enforce the same invariant here: when a patch creates an
- * entry, copy in any shipped tuning key the patch doesn't set itself.
- *
- * `profile` is never backfilled — it is the selection discriminator, and
- * stamping it onto a custom provider/model entry would change winner
- * selection. Existing on-disk entries are never touched: deep-merge already
- * preserves their keys, and their values may be deliberate customization.
- */
-function backfillNewCallSiteEntries(
-  raw: Record<string, unknown>,
-  patch: unknown,
-): void {
-  const patchSites = readPlainObject(
-    readPlainObject(readPlainObject(patch)?.llm)?.callSites,
-  );
-  if (!patchSites) {
-    return;
-  }
-  const rawSites = readPlainObject(readPlainObject(raw.llm)?.callSites);
-  for (const [id, value] of Object.entries(patchSites)) {
-    const entry = readPlainObject(value);
-    if (!entry || rawSites?.[id] != null) {
-      continue;
-    }
-    const shipped = CALL_SITE_DEFAULTS[id as LLMCallSite];
-    if (!shipped) {
-      continue;
-    }
-    for (const [key, shippedValue] of Object.entries(shipped)) {
-      if (key === "profile" || key in entry) {
-        continue;
-      }
-      entry[key] = structuredClone(shippedValue);
-    }
-  }
-}
-
-/**
  * Normalize managed default-profile entries in a config-write fragment, in
  * place, so a `config get` → write round-trip of the enriched wire view is a
  * no-op while genuine edit attempts still reach the invariant guard's
@@ -1381,7 +1345,9 @@ function completeChangedCustomProfiles(
  * would let the pair reach disk and be stripped on the next read — a silent
  * no-op where the user expects a saved override.
  */
-function assertRoutableIdentityEntries(raw: Record<string, unknown>): void {
+function collectProviderEntries(
+  raw: Record<string, unknown>,
+): [string, { provider?: unknown; model?: unknown }][] {
   const llm = raw.llm as
     | {
         default?: { provider?: unknown; model?: unknown } | null;
@@ -1409,9 +1375,39 @@ function assertRoutableIdentityEntries(raw: Record<string, unknown>): void {
       }
     }
   }
+  return entries;
+}
+
+function assertRoutableIdentityEntries(
+  preWrite: Record<string, unknown>,
+  raw: Record<string, unknown>,
+): void {
+  const entries = collectProviderEntries(raw);
+  const priorProviders = new Map(
+    collectProviderEntries(preWrite).flatMap(([label, entry]) =>
+      typeof entry.provider === "string" ? [[label, entry.provider]] : [],
+    ),
+  );
   for (const [label, entry] of entries) {
     if (typeof entry.provider !== "string") {
       continue;
+    }
+    // The provider schema is an open string (a stored value outside the
+    // known set parses instead of stripping its profile), so write-time
+    // membership is enforced here and at the profiles route. Scoped to
+    // providers this write introduces or changes: a stored value outside
+    // the known set is readable and dispatchable by design, and
+    // re-validating it on every write would make all later settings saves
+    // fail with no in-product repair path. Profiles accept entry names;
+    // call-site fragments and the legacy default blob stay vendor-only
+    // (overrides become model-only with the entries demolition).
+    if (entry.provider !== priorProviders.get(label)) {
+      const providerIssue = label.startsWith("llm.profiles.")
+        ? writableProfileProviderIssue(entry.provider)
+        : unknownLlmProviderIssue(entry.provider);
+      if (providerIssue) {
+        throw new BadRequestError(`${providerIssue} (${label})`);
+      }
     }
     const issue = routingIdentityModelIssue(
       entry.provider,
@@ -1434,7 +1430,7 @@ export async function commitConfigWrite(
   const preWrite = loadRawConfig();
   completeChangedCustomProfiles(preWrite, raw);
   assertInvariantProfilesPreserved(preWrite, raw);
-  assertRoutableIdentityEntries(raw);
+  assertRoutableIdentityEntries(preWrite, raw);
 
   // Suppress the file-watcher callback for the duration of the debounce
   // window. Without this, the ConfigWatcher detects the config.json write
@@ -1475,6 +1471,13 @@ export async function commitConfigWrite(
     const message = err instanceof Error ? err.message : String(err);
     log.error({ err }, `${opLabel} config: provider reinit failed: ${message}`);
   }
+
+  // Notify clients. The file watcher normally publishes this, but it is
+  // suppressed for the whole debounce window above, so a route-driven write
+  // (profile create, active-profile switch, config patch) would otherwise
+  // leave every other client rendering stale config until a manual refresh —
+  // e.g. the chat composer still showing the previous model profile.
+  publishConfigChanged();
 }
 
 /**
@@ -1499,6 +1502,34 @@ function scrubRemovedServiceModes(raw: Record<string, unknown>): void {
   }
 }
 
+/**
+ * A persisted `services.stt` block must satisfy SttServiceSchema, whose
+ * `provider` is required. The services-level default fills the provider only
+ * when `services.stt` is wholly absent, so a sparse patch like
+ * `{ services: { stt: { language } } }` deep-merged into a config with no
+ * stt block persists a provider-less block that fails validation and trips
+ * the loader's salvage ladder: the patched value never applies and the whole
+ * `services` section can reset to defaults on the next load (the LUM-2758
+ * failure family). Seed the effective provider into any stt block that lacks
+ * a non-empty string one so every config_patch writer stays self-consistent.
+ * The seed applies to any stt key, not just language: the schema requires
+ * the provider whenever the block exists. A block carrying a non-empty
+ * string provider is left alone, even an invalid one, so an explicit
+ * provider write is never silently rewritten.
+ */
+function seedSttProviderForSparseBlock(raw: Record<string, unknown>): void {
+  const services = readPlainObject(raw.services);
+  const stt = readPlainObject(services?.stt);
+  if (!stt) {
+    return;
+  }
+  const provider = stt.provider;
+  if (typeof provider === "string" && provider.trim().length > 0) {
+    return;
+  }
+  stt.provider = getConfig().services.stt.provider;
+}
+
 async function handlePatchConfig({ body }: RouteHandlerArgs) {
   if (
     !body ||
@@ -1515,9 +1546,9 @@ async function handlePatchConfig({ body }: RouteHandlerArgs) {
 
   const raw = loadRawConfig();
   const patch = body as Record<string, unknown>;
-  backfillNewCallSiteEntries(raw, patch);
   deepMergeOverwrite(raw, patch);
   scrubRemovedServiceModes(raw);
+  seedSttProviderForSparseBlock(raw);
 
   await commitConfigWrite(raw, "patch");
 
@@ -1617,6 +1648,11 @@ async function handleSetConfig({ body }: RouteHandlerArgs) {
       written.source = "managed";
     }
   }
+  // A SET can create `services.stt` with a leaf like `language` and no
+  // `provider`, which SttServiceSchema requires whenever the block exists;
+  // the same seeding that guards PATCH keeps this write's persisted block
+  // schema-valid.
+  seedSttProviderForSparseBlock(raw);
 
   await commitConfigWrite(raw, "set");
   // A `memory.v2` substrate tunable whose `memory.substrate` twin is set does
@@ -1701,6 +1737,15 @@ async function handleReplaceInferenceProfile({
   ) {
     throw new BadRequestError(
       `Profile "${name}" is not currently available and cannot be edited.`,
+    );
+  }
+  if (CODE_OWNED_PROFILE_NAMES.has(name)) {
+    // A code-owned profile resolves from the catalog whatever the workspace
+    // holds, so even a status re-enable would persist a stub that never
+    // governs anything. Reject the write rather than accept a silent no-op.
+    throw new BadRequestError(
+      `Profile "${name}" is code-owned and cannot be edited. ` +
+        `Duplicate it to a custom profile to customize.`,
     );
   }
   if (isManaged) {
@@ -1926,28 +1971,6 @@ function handleGetMessageContent({
   return result;
 }
 
-type ConversationKind =
-  | "user"
-  | "background"
-  | "background_memory_consolidation"
-  | "scheduled";
-
-function resolveConversationKind(
-  source: string,
-  conversationType: string,
-): ConversationKind {
-  if (source === MEMORY_V2_CONSOLIDATION_SOURCE) {
-    return "background_memory_consolidation";
-  }
-  if (conversationType === "background") {
-    return "background";
-  }
-  if (conversationType === "scheduled") {
-    return "scheduled";
-  }
-  return "user";
-}
-
 async function handleGetLlmContext({
   pathParams = {},
   queryParams = {},
@@ -2122,29 +2145,53 @@ function resolveQueuedMessageConversationId({
     : undefined;
 }
 
-function handleDeleteQueuedMessage(args: RouteHandlerArgs) {
-  const { pathParams = {} } = args;
+async function handleDeleteQueuedMessage(args: RouteHandlerArgs) {
+  const { pathParams = {}, headers = {} } = args;
   const conversationId = resolveQueuedMessageConversationId(args);
   if (!conversationId) {
     throw new BadRequestError("Missing required parameter: conversationId");
   }
-  const result = deleteQueuedMessage(conversationId, pathParams.id ?? "");
+  // Verified caller identity. Both adapters derive this header from the auth
+  // context, never from a caller-supplied one. Normalize it exactly as the
+  // send path does before comparing against the principal recorded at
+  // enqueue, or the two disagree: `resolveActorPrincipalIdForLocalGuardian`
+  // translates the synthetic `dev-bypass` principal to the real local
+  // guardian under `DISABLE_HTTP_AUTH=true` (a no-op for real JWT
+  // principals), and every sibling handler in this layer trims first.
+  const actorPrincipalId = await resolveActorPrincipalIdForLocalGuardian(
+    headers["x-vellum-actor-principal-id"]?.trim() || undefined,
+  );
+  const result = deleteQueuedMessage(conversationId, pathParams.id ?? "", {
+    actorPrincipalId,
+  });
   if (result.removed) {
     return { ok: true, conversationId, requestId: pathParams.id };
   }
   if (result.reason === "conversation_not_found") {
     throw new NotFoundError("Conversation not found");
   }
+  if (result.reason === "forbidden") {
+    throw new ForbiddenError(
+      "Queued message was sent by a different user and cannot be cancelled here",
+    );
+  }
   throw new NotFoundError("Queued message not found");
 }
 
-function handleSteerToMessage(args: RouteHandlerArgs) {
-  const { pathParams = {} } = args;
+async function handleSteerToMessage(args: RouteHandlerArgs) {
+  const { pathParams = {}, headers = {} } = args;
   const conversationId = resolveQueuedMessageConversationId(args);
   if (!conversationId) {
     throw new BadRequestError("Missing required parameter: conversationId");
   }
-  const result = steerToMessage(conversationId, pathParams.id ?? "");
+  // Verified caller identity, normalized exactly as the delete path above
+  // (see the comment in `handleDeleteQueuedMessage`).
+  const actorPrincipalId = await resolveActorPrincipalIdForLocalGuardian(
+    headers["x-vellum-actor-principal-id"]?.trim() || undefined,
+  );
+  const result = steerToMessage(conversationId, pathParams.id ?? "", {
+    actorPrincipalId,
+  });
   if (result.steered) {
     return { ok: true, conversationId, requestId: pathParams.id };
   }
@@ -2154,6 +2201,11 @@ function handleSteerToMessage(args: RouteHandlerArgs) {
   if (result.reason === "not_processing") {
     throw new BadRequestError(
       "Cannot steer: conversation is not currently processing",
+    );
+  }
+  if (result.reason === "forbidden") {
+    throw new ForbiddenError(
+      "Queued message was sent by a different user and cannot be steered to here",
     );
   }
   throw new NotFoundError("Queued message not found");
@@ -2480,7 +2532,8 @@ export const ROUTES: RouteDefinition[] = [
     },
     summary: "Delete a queued message",
     description:
-      "Remove a pending message from the conversation queue before it is processed.",
+      "Remove a pending message from the conversation queue before it is processed. " +
+      "Broadcasts `message_queued_deleted` so every client can close out the pending row.",
     tags: ["messages"],
     queryParams: [
       {
@@ -2490,6 +2543,15 @@ export const ROUTES: RouteDefinition[] = [
         description: "Conversation ID (required)",
       },
     ],
+    additionalResponses: {
+      "403": {
+        description:
+          "The queued message was enqueued by a different actor principal.",
+      },
+      "404": {
+        description: "Conversation or queued message not found.",
+      },
+    },
     handler: handleDeleteQueuedMessage,
   },
   {
@@ -2512,6 +2574,15 @@ export const ROUTES: RouteDefinition[] = [
         description: "Conversation ID (required)",
       },
     ],
+    additionalResponses: {
+      "403": {
+        description:
+          "The queued message was enqueued by a different actor principal.",
+      },
+      "404": {
+        description: "Conversation or queued message not found.",
+      },
+    },
     handler: handleSteerToMessage,
   },
 ];

@@ -1,5 +1,10 @@
 import { z } from "zod";
 
+import {
+  PROVIDERS_REQUIRING_BASE_URL_AND_MODELS,
+  ROUTING_IDENTITY_PROVIDERS,
+} from "../../providers/inference/auth.js";
+import { PROVIDER_CATALOG } from "../../providers/model-catalog.js";
 import { isCodexSubscriptionModel } from "../../providers/openai/codex-models.js";
 import {
   getManagedUpstream,
@@ -8,7 +13,6 @@ import {
 import {
   DEFAULT_PROFILE_KEYS,
   DEFAULT_PROFILE_PROVIDERS,
-  INTERNAL_PROFILE_KEYS,
 } from "../default-profile-names.js";
 
 /**
@@ -24,35 +28,101 @@ import {
 // Provider enum
 // ---------------------------------------------------------------------------
 
-export const LLMProvider = z
-  .enum([
-    "anthropic",
-    "openai",
-    "gemini",
-    "ollama",
-    "fireworks",
-    "openrouter",
-    "vercel-ai-gateway",
-    "openai-compatible",
-    "minimax",
-    "atlascloud",
-    "together",
-    "litellm",
-    "baseten",
-    "poolside",
-    // Routing identities rather than adapters: "vellum" = the platform-managed
-    // route (upstream derived from the model at dispatch), "chatgpt" = the
-    // subscription route to OpenAI. Neither has a PROVIDER_CATALOG entry;
-    // dispatch substitutes the real upstream before any adapter lookup.
-    "vellum",
-    "chatgpt",
-  ])
-  .meta({ id: "LLMProvider" });
-type LLMProvider = z.infer<typeof LLMProvider>;
+/**
+ * The provider values the write surfaces accept today: adapter-backed
+ * catalog providers plus the two routing identities. The schema itself is
+ * an open string so a stored provider outside this list parses instead of
+ * stripping its profile; dispatch resolves such a label as a connection
+ * entry name and fails with an explainable resolution error when no row
+ * carries it. Write-time membership is enforced at the profiles route and
+ * the `commitConfigWrite` choke point (`unknownLlmProviderIssue`), which
+ * is where entry names unlock when the entries model enables them.
+ */
+export const KNOWN_LLM_PROVIDERS = [
+  "anthropic",
+  "openai",
+  "gemini",
+  "ollama",
+  "fireworks",
+  "openrouter",
+  "vercel-ai-gateway",
+  "openai-compatible",
+  "minimax",
+  "atlascloud",
+  "together",
+  "litellm",
+  "baseten",
+  "poolside",
+  // Routing identities rather than adapters: "vellum" = the platform-managed
+  // route (upstream derived from the model at dispatch), "chatgpt" = the
+  // subscription route to OpenAI. Neither has a PROVIDER_CATALOG entry;
+  // dispatch substitutes the real upstream before any adapter lookup.
+  "vellum",
+  "chatgpt",
+] as const;
 
-// Deliberately narrower than `LLMProvider`: only providers that can serve
-// the code-defined default profile catalog.
-const DefaultProviderEnum = z.enum(DEFAULT_PROFILE_PROVIDERS);
+export const LLMProvider = z.string().min(1).meta({ id: "LLMProvider" });
+export type LLMProvider = z.infer<typeof LLMProvider>;
+
+/**
+ * Write-surface membership check for a provider value. Returns a message
+ * when the value is outside {@link KNOWN_LLM_PROVIDERS}, null when it is
+ * allowed. Pure and sync so the profiles route and the config-write choke
+ * point share one rule.
+ */
+export function unknownLlmProviderIssue(provider: string): string | null {
+  return (KNOWN_LLM_PROVIDERS as readonly string[]).includes(provider)
+    ? null
+    : `Invalid provider "${provider}". Valid providers: ${KNOWN_LLM_PROVIDERS.join(", ")}.`;
+}
+
+/**
+ * Providers that can back `llm.defaultProvider`: the named columns of the
+ * default-profile matrix plus every API-key catalog provider whose personal
+ * connection can serve the shared BYOK templates (fixed base URL, and a
+ * non-empty catalog `defaultModel` for the intent fallback in
+ * `resolveModelIntent`). Deliberately narrower than `LLMProvider`: keyless
+ * (ollama) and endpoint-supplied (openai-compatible, litellm) providers have
+ * no code-resolvable default profile implementation.
+ */
+export const DEFAULT_PROVIDER_CHOICES: readonly LLMProvider[] = [
+  ...new Set<LLMProvider>([
+    ...DEFAULT_PROFILE_PROVIDERS,
+    ...PROVIDER_CATALOG.filter(
+      (entry) =>
+        entry.setupMode === "api-key" &&
+        !PROVIDERS_REQUIRING_BASE_URL_AND_MODELS.has(entry.id) &&
+        entry.defaultModel !== "",
+    )
+      .map((entry) => entry.id)
+      // A catalog provider outside the known provider set cannot be
+      // referenced by any profile, so it cannot back the defaults either.
+      .filter((id): id is LLMProvider =>
+        (KNOWN_LLM_PROVIDERS as readonly string[]).includes(id),
+      ),
+  ]),
+];
+
+export function isDefaultProviderChoice(value: string): value is LLMProvider {
+  return (DEFAULT_PROVIDER_CHOICES as readonly string[]).includes(value);
+}
+
+/**
+ * Default-provider choices whose profiles materialize from the shared BYOK
+ * templates: every choice except the routing identities (`vellum`,
+ * `chatgpt`), whose defaults are pinned models on code-owned columns.
+ */
+export function isByokDefaultProviderChoice(
+  value: string,
+): value is LLMProvider {
+  return (
+    !ROUTING_IDENTITY_PROVIDERS.has(value) && isDefaultProviderChoice(value)
+  );
+}
+
+const DefaultProviderEnum = z.enum(
+  DEFAULT_PROVIDER_CHOICES as [LLMProvider, ...LLMProvider[]],
+);
 
 /**
  * Validation for routing-identity (provider, model) pairs in stored config.
@@ -145,7 +215,7 @@ export const LLMCallSiteEnum = z.enum([
   "skillCategoryInference",
   "inference",
   "vision",
-  "voiceFrontDecision",
+  "voiceProgressNarration",
   "voiceFrontDoor",
   "trustRuleSuggestion",
   "homeGreeting",
@@ -670,18 +740,11 @@ export const LLMSchema = z
       ...Object.keys(config.profiles ?? {}),
       ...DEFAULT_PROFILE_KEYS,
     ]);
-    // Internal profiles exist only to be named by a call site, so they are
-    // valid reference targets there and nowhere else — never for
-    // `activeProfile`/`advisorProfile`, which are user-facing selections.
-    const callSiteProfileNames = new Set([
-      ...profileNames,
-      ...INTERNAL_PROFILE_KEYS,
-    ]);
     for (const [siteId, siteConfig] of Object.entries(config.callSites ?? {})) {
       if (siteConfig?.profile == null) {
         continue;
       }
-      if (!callSiteProfileNames.has(siteConfig.profile)) {
+      if (!profileNames.has(siteConfig.profile)) {
         ctx.addIssue({
           code: "custom",
           path: ["callSites", siteId, "profile"],

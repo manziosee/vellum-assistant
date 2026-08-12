@@ -17,6 +17,7 @@ import { ContextMenu, PanelItem } from "@vellumai/design-library";
 import { cn } from "@vellumai/design-library/utils/cn";
 
 import { SwipeActionReveal } from "@/components/swipe-action-reveal";
+import { useIsMobile } from "@/hooks/use-is-mobile";
 import {
   ConversationActionsMenu,
   ConversationActionsSheet,
@@ -28,16 +29,18 @@ import {
   hasThreadStatus,
   ThreadStatusIndicator,
 } from "@/domains/chat/components/thread-status-indicator";
-import type { DragReorderItemProps } from "@/domains/chat/hooks/use-drag-reorder";
 import { isChannelConversation } from "@/domains/chat/utils/conversation-channel";
 import { copyIdToClipboard } from "@/domains/chat/utils/copy-id-to-clipboard";
 import {
   buildMoveToGroupTargets,
-  isConversationPinned,
   isInCustomGroup,
 } from "@/domains/chat/utils/group-conversations";
 import type { Conversation } from "@/types/conversation-types";
-import { canMarkRead, canMarkUnread } from "@/utils/conversation-predicates";
+import {
+  canMarkRead,
+  canMarkUnread,
+  isConversationPinned,
+} from "@/utils/conversation-predicates";
 import { isPointerCoarse } from "@/utils/pointer";
 import type { SwipeAction } from "@/hooks/use-swipe-to-reveal";
 
@@ -48,13 +51,6 @@ import {
 
 export interface ConversationRowProps {
   conversation: Conversation;
-  /**
-   * Drag-reorder section key. Omit for non-reorderable lists (Recents,
-   * channel sections) — only Pinned and custom groups reorder.
-   */
-  dragSection?: string;
-  /** The section's full ordered list, for drag math. Defaults to nothing. */
-  dragSiblings?: Conversation[];
   /** Wrap in a right-click context menu. Default true; false in the rail flyout. */
   withContextMenu?: boolean;
   /** Marquee the title on hover. Default true; false in the rail flyout. */
@@ -113,36 +109,6 @@ export function buildMenuProps(
     onCopyConversationId: hasId
       ? () => copyIdToClipboard(conversation.conversationId!, "Conversation ID")
       : undefined,
-  };
-}
-
-export function buildDragProps(
-  ctx: ConversationListContextValue,
-  conversation: Conversation,
-  dragSection: string | undefined,
-  dragSiblings: Conversation[] | undefined,
-): Partial<DragReorderItemProps> & { className?: string } {
-  if (
-    !dragSection ||
-    !ctx.canReorder ||
-    !dragSiblings ||
-    dragSiblings.length < 2
-  ) {
-    return {};
-  }
-  const { draggingId, dropIndicator } = ctx.dragReorder;
-  const edge =
-    dropIndicator?.section === dragSection &&
-    dropIndicator.itemId === conversation.conversationId
-      ? dropIndicator.edge
-      : null;
-  return {
-    ...ctx.dragReorder.getItemProps(dragSection, dragSiblings, conversation),
-    className: cn(
-      draggingId === conversation.conversationId && "opacity-50",
-      edge === "before" && "shadow-[inset_0_2px_0_0_var(--primary-base)]",
-      edge === "after" && "shadow-[inset_0_-2px_0_0_var(--primary-base)]",
-    ),
   };
 }
 
@@ -215,8 +181,6 @@ export function buildSwipeActions(
 
 export function ConversationRow({
   conversation,
-  dragSection,
-  dragSiblings,
   withContextMenu = true,
   marquee = true,
   onSelect,
@@ -245,18 +209,21 @@ export function ConversationRow({
     needsAttention,
     hasUnread: conversation.hasUnseenLatestAssistantMessage === true,
   };
-  const dragProps = buildDragProps(
-    ctx,
-    conversation,
-    dragSection,
-    dragSiblings,
-  );
   const { leadingActions, trailingActions } = buildSwipeActions(
     ctx,
     conversation,
   );
 
   const isTouch = isPointerCoarse();
+  // The ellipsis-hiding decision below also honors a narrow *viewport*, not
+  // just a coarse *pointer*: `isTouch` alone misses a desktop browser
+  // window narrowed to the mobile width with a mouse/trackpad, which still
+  // gets the mobile row layout (`max-md:` styling) but isn't touch. This
+  // doesn't affect which affordance actually opens the menu below (that
+  // still keys off real touch capability, via `isTouch`): a narrow desktop
+  // window still falls through to the right-click `ContextMenu.Root`
+  // branch, just without a visible ellipsis prompting it.
+  const isMobileViewport = useIsMobile();
 
   const panelItem = (
     <SwipeActionReveal
@@ -268,17 +235,30 @@ export function ConversationRow({
         marqueeOnHover={marquee}
         active={conversationId === ctx.activeConversationId}
         onSelect={() => select(conversationId)}
-        hideTrailingActionOnTouch={withContextMenu}
         badge={
           hasThreadStatus(status) ? (
             <ThreadStatusIndicator {...status} />
           ) : undefined
         }
-        trailingAction={<ConversationActionsMenu {...menuProps} />}
-        {...dragProps}
+        badgeBare
+        // On touch, or a mobile-width viewport, the row already opens this
+        // exact menu another way (long-press → bottom sheet on touch,
+        // right-click on a narrow desktop window), so the trailing button
+        // isn't just hidden, it's absent: no leftover hover/active-state
+        // opacity rule can force it visible (as `hideTrailingActionOnTouch`
+        // alone didn't, for an active row), and the dot lands at the row's
+        // true right edge instead of sitting next to an invisible-but-
+        // space-reserving button.
+        trailingAction={
+          (isTouch || isMobileViewport) && withContextMenu ? undefined : (
+            <ConversationActionsMenu {...menuProps} />
+          )
+        }
         className={cn(
-          "h-[30px] p-[6px] text-[var(--content-default)]",
-          dragProps.className,
+          // `!` forces this over PanelItem's own max-md:py-3: cross-package
+          // Tailwind generation order doesn't reliably favor a plain
+          // (unmarked) override here.
+          "h-[30px] p-[6px] max-md:p-2! text-[var(--content-default)]",
         )}
       />
     </SwipeActionReveal>

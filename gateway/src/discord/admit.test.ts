@@ -2,7 +2,6 @@ import { describe, expect, test } from "bun:test";
 
 import {
   admitDiscordMessage,
-  parseAllowedChannelIds,
   type AdmissionCandidate,
   type AdmissionPolicy,
 } from "./admit.js";
@@ -55,12 +54,36 @@ describe("admitDiscordMessage", () => {
     expect(verdict).toEqual({ admitted: false, reason: "bot_authored" });
   });
 
-  test("drops DMs — they match no entry on a guild-channel allow-list", () => {
+  test("admits a DM without an allow-list entry or a mention", () => {
+    // A DM is already addressed to the bot alone, so neither guild check
+    // applies: it sits in no listable channel and needs no mention to be
+    // meant for the bot. This is the lane a verification code answers on.
     const verdict = admitDiscordMessage(
-      candidate({ guildId: undefined }),
+      candidate({
+        guildId: undefined,
+        channelId: "800000000000000009",
+        mentionedUserIds: [],
+      }),
       policy,
     );
-    expect(verdict).toEqual({ admitted: false, reason: "not_a_guild_message" });
+    expect(verdict).toEqual({ admitted: true });
+  });
+
+  test("drops the bot's own DM echo", () => {
+    // The DM lane runs after the self and bot checks, not around them.
+    const verdict = admitDiscordMessage(
+      candidate({ guildId: undefined, authorId: BOT }),
+      policy,
+    );
+    expect(verdict).toEqual({ admitted: false, reason: "self_authored" });
+  });
+
+  test("drops another bot's DM", () => {
+    const verdict = admitDiscordMessage(
+      candidate({ guildId: undefined, authorIsBot: true }),
+      policy,
+    );
+    expect(verdict).toEqual({ admitted: false, reason: "bot_authored" });
   });
 
   test("drops a mention in a channel that is not allow-listed", () => {
@@ -165,26 +188,5 @@ describe("admitDiscordMessage", () => {
       allowedChannelIds: new Set(),
     });
     expect(verdict).toEqual({ admitted: false, reason: "channel_not_allowed" });
-  });
-});
-
-describe("parseAllowedChannelIds", () => {
-  test("parses a comma-separated list, trimming entries", () => {
-    expect(
-      parseAllowedChannelIds(` ${ALLOWED_CHANNEL} , ${OTHER_CHANNEL} `),
-    ).toEqual(new Set([ALLOWED_CHANNEL, OTHER_CHANNEL]));
-  });
-
-  test("yields an empty set for undefined, blank, and comma-only values", () => {
-    expect(parseAllowedChannelIds(undefined)).toEqual(new Set());
-    expect(parseAllowedChannelIds("")).toEqual(new Set());
-    expect(parseAllowedChannelIds("   ")).toEqual(new Set());
-    expect(parseAllowedChannelIds(",,")).toEqual(new Set());
-  });
-
-  test("drops blanks rather than admitting an empty-string channel", () => {
-    expect(parseAllowedChannelIds(`${ALLOWED_CHANNEL},,`)).toEqual(
-      new Set([ALLOWED_CHANNEL]),
-    );
   });
 });

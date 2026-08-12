@@ -423,6 +423,19 @@
       "icon": "✈️"
     },
     {
+      "name": "unabyss",
+      "source": {
+        "source": "github",
+        "repo": "Unabyss/unabyss-vellum",
+        "ref": "9f0bb0753dad09dace8578e242961bc2da912af3"
+      },
+      "description": "Personal and company context from Unabyss, available to your agent through the Unabyss MCP server.",
+      "category": "memory",
+      "homepage": "https://unabyss.com",
+      "license": "MIT",
+      "icon": "🌊"
+    },
+    {
       "name": "vellum-client-qa",
       "source": {
         "source": "github",
@@ -434,6 +447,19 @@
       "homepage": "https://github.com/vellum-ai/vellum-client-qa",
       "license": "MIT",
       "icon": "🧪"
+    },
+    {
+      "name": "ledger",
+      "source": {
+        "source": "github",
+        "repo": "simensgreen/ledger",
+        "ref": "7fc04fd77b20ad4b27ccd51be22c101274b370f6"
+      },
+      "description": "Structured storage for Vellum agents: tables via JSON Schema, query/aggregate via JSON, named saved queries.",
+      "category": "developer",
+      "homepage": "https://github.com/simensgreen/ledger",
+      "license": "MIT",
+      "icon": "🗄️"
     },
     {
       "name": "virlo",

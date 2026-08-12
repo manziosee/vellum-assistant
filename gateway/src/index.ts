@@ -143,10 +143,17 @@ import {
 } from "./http/routes/channel-admission-policy.js";
 import {
   createChannelIngressApproveHandler,
+  createChannelIngressListHandler,
   createChannelIngressRevokeHandler,
 } from "./http/routes/channel-ingress.js";
 import { createPluginWebhookHandler } from "./http/routes/plugin-webhook.js";
+import {
+  createPluginWebhookWebsocketHandler,
+  getPluginWebhookWebsocketHandlers,
+  isPluginWebhookSocketData,
+} from "./http/routes/plugin-webhook-websocket.js";
 import { resolveCachedPluginIngress } from "./channels/plugin-ingress-approvals.js";
+import { PLUGIN_WEBHOOK_PATH_PATTERN } from "./channels/plugin-ingress.js";
 import {
   createChannelPermissionOverridesListHandler,
   createChannelPermissionOverrideSetHandler,
@@ -168,7 +175,7 @@ import {
 import { downloadSlackFile } from "./slack/download.js";
 import { slackBotContactNote } from "./slack/actor.js";
 import { DiscordGatewayClient } from "./discord/gateway-socket.js";
-import { parseAllowedChannelIds } from "./discord/admit.js";
+import { readDiscordAllowedChannelIds } from "./discord/allowed-channels.js";
 import { handleInbound } from "./handlers/handle-inbound.js";
 import { upsertContactChannel } from "./verification/contact-helpers.js";
 import { checkAuthRateLimit } from "./http/middleware/rate-limit.js";
@@ -223,6 +230,7 @@ import { AvatarChannelSyncer } from "./avatar-sync/avatar-channel-syncer.js";
 import { AvatarSyncWatcher } from "./avatar-sync/avatar-sync-watcher.js";
 import { SlackAvatarSyncer } from "./avatar-sync/slack-avatar-syncer.js";
 import { initGatewayDb } from "./db/connection.js";
+import { cleanupExpiredInboundEvents } from "./db/inbound-dedup-store.js";
 import { runPostAssistantReady } from "./post-assistant-ready.js";
 import {
   clearManagedPublicBaseUrl,
@@ -340,6 +348,15 @@ function getClientIp(
   const addr = server.requestIP(req);
   return addr?.address ?? "unknown";
 }
+
+/**
+ * How often expired inbound dedup claims are swept.
+ *
+ * Hourly, because nothing depends on the sweep being timely: an expired claim
+ * is already reclaimed in place by the next delivery on the same key, so this
+ * is a size bound, not a correctness one.
+ */
+const INBOUND_DEDUP_CLEANUP_INTERVAL_MS = 60 * 60 * 1_000;
 
 async function main() {
   const config = loadConfig();
@@ -505,6 +522,11 @@ async function main() {
   const handleTwilioMediaWs = createTwilioMediaWebsocketHandler(config, {
     configFile: configFileCache,
   });
+  const handlePluginWebhookWs = createPluginWebhookWebsocketHandler({
+    config,
+    resolve: resolveCachedPluginIngress,
+    credentials: credentialCache,
+  });
   const handleSttStreamWs = createSttStreamWebsocketHandler(config);
   const handleLiveVoiceWs = createLiveVoiceWebsocketHandler(config);
   const handleSpeechRelaySttWs = createSpeechRelayUpgradeHandler(
@@ -518,6 +540,7 @@ async function main() {
     { credentials: credentialCache },
   );
   const twilioMediaStreamWebsocketHandlers = getMediaStreamWebsocketHandlers();
+  const pluginWebhookWebsocketHandlers = getPluginWebhookWebsocketHandlers();
   const sttStreamWebsocketHandlers = getSttStreamWebsocketHandlers();
   const liveVoiceWebsocketHandlers = getLiveVoiceWebsocketHandlers();
   const speechRelayWebsocketHandlers = getSpeechRelayWebsocketHandlers();
@@ -605,6 +628,7 @@ async function main() {
     createChannelAdmissionPolicySetHandler();
   const handleChannelAdmissionPolicyDelete =
     createChannelAdmissionPolicyDeleteHandler();
+  const handleChannelIngressList = createChannelIngressListHandler();
   const handleChannelIngressApprove = createChannelIngressApproveHandler();
   const handleChannelIngressRevoke = createChannelIngressRevokeHandler();
   const handlePluginWebhook = createPluginWebhookHandler({
@@ -703,12 +727,13 @@ async function main() {
       path: "/webhooks/mailgun",
       handler: (req) => handleMailgunWebhook(req),
     },
-    // Plugin-declared webhooks. Unauthenticated like their neighbours above;
-    // what makes them safe is that only a guardian-approved declaration
-    // creates one, and every other path here 404s. Any method — the plugin's
-    // route module decides which verbs it answers.
+    // Plugin-declared webhooks. Public like their neighbours above; what makes
+    // them safe is that only a guardian-approved declaration creates one, every
+    // other path here 404s, and each request is signature-checked. Any method —
+    // the plugin's route module decides which verbs it answers. WebSocket-kind
+    // declarations are upgraded in the pre-router, before this entry is reached.
     {
-      path: /^\/webhooks\/plugins\/([^/]+)\/(.+)$/,
+      path: PLUGIN_WEBHOOK_PATH_PATTERN,
       handler: (req, params) =>
         handlePluginWebhook(req, params[0]!, params[1]!),
     },
@@ -1581,8 +1606,16 @@ async function main() {
     // is the decision the assistant must not make for itself; and there are no
     // assistant-scoped variants, because the guardian reaches these directly
     // rather than through the platform proxy. Deliberately absent from the IPC
-    // surface for the same reason as the auth choice. POST verb paths — a
-    // grant has no id of its own until a guardian creates one.
+    // surface for the same reason as the auth choice. Approve and revoke are
+    // POST verb paths because a grant has no id of its own until a guardian
+    // creates one. The listing is guardian-only for a different reason: it says
+    // which declarations are waiting, which the public surface will not.
+    {
+      path: /^\/v1\/channel-ingress\/?$/,
+      method: "GET",
+      auth: "edge-guardian",
+      handler: () => handleChannelIngressList(),
+    },
     {
       path: /^\/v1\/channel-ingress\/([^/]+)\/approve\/?$/,
       method: "POST",
@@ -1591,6 +1624,33 @@ async function main() {
     },
     {
       path: /^\/v1\/channel-ingress\/([^/]+)\/revoke\/?$/,
+      method: "POST",
+      auth: "edge-guardian",
+      handler: (req, params) => handleChannelIngressRevoke(req, params[0]!),
+    },
+
+    // ── Channel ingress: assistant-scoped variants ──
+    // Same handlers, same guardian auth, reached through the prefix a client
+    // built on the platform's addressing produces. Approvals are
+    // gateway-global, so the assistant id is matched and discarded, the same
+    // precedent as channel-permission-overrides below. These exist because the
+    // web client's generated gateway SDK only speaks the prefixed form; the
+    // guardian decision they carry is unchanged, since `edge-guardian` is what
+    // decides who may call them and it applies to both spellings.
+    {
+      path: /^\/v1\/assistants\/[^/]+\/channel-ingress\/?$/,
+      method: "GET",
+      auth: "edge-guardian",
+      handler: () => handleChannelIngressList(),
+    },
+    {
+      path: /^\/v1\/assistants\/[^/]+\/channel-ingress\/([^/]+)\/approve\/?$/,
+      method: "POST",
+      auth: "edge-guardian",
+      handler: (req, params) => handleChannelIngressApprove(req, params[0]!),
+    },
+    {
+      path: /^\/v1\/assistants\/[^/]+\/channel-ingress\/([^/]+)\/revoke\/?$/,
       method: "POST",
       auth: "edge-guardian",
       handler: (req, params) => handleChannelIngressRevoke(req, params[0]!),
@@ -1761,6 +1821,10 @@ async function main() {
           twilioMediaStreamWebsocketHandlers.open(ws as never);
           return;
         }
+        if (isPluginWebhookSocketData(ws.data)) {
+          pluginWebhookWebsocketHandlers.open(ws as never);
+          return;
+        }
         if (isSttStreamSocketData(ws.data)) {
           sttStreamWebsocketHandlers.open(ws as never);
           return;
@@ -1780,6 +1844,10 @@ async function main() {
           twilioMediaStreamWebsocketHandlers.message(ws as never, message);
           return;
         }
+        if (isPluginWebhookSocketData(ws.data)) {
+          pluginWebhookWebsocketHandlers.message(ws as never, message);
+          return;
+        }
         if (isSttStreamSocketData(ws.data)) {
           sttStreamWebsocketHandlers.message(ws as never, message);
           return;
@@ -1797,6 +1865,10 @@ async function main() {
       close(ws, code, reason) {
         if (isMediaStreamSocketData(ws.data)) {
           twilioMediaStreamWebsocketHandlers.close(ws as never, code, reason);
+          return;
+        }
+        if (isPluginWebhookSocketData(ws.data)) {
+          pluginWebhookWebsocketHandlers.close(ws as never, code, reason);
           return;
         }
         if (isSttStreamSocketData(ws.data)) {
@@ -2002,6 +2074,23 @@ async function main() {
       return undefined as unknown as Response;
     }
 
+    // Plugin ingress declared as `websocket`. Claimed only for a genuine
+    // upgrade — a plain request to the same path stays with the route table,
+    // where the HTTP half 404s it for not being an approved HTTP route.
+    if (req.headers.get("upgrade")?.toLowerCase() === "websocket") {
+      const match = url.pathname.match(PLUGIN_WEBHOOK_PATH_PATTERN);
+      if (match) {
+        const upgradeResult = await handlePluginWebhookWs(
+          req,
+          server,
+          match[1]!,
+          match[2]!,
+        );
+        if (upgradeResult !== undefined) return upgradeResult;
+        return undefined as unknown as Response;
+      }
+    }
+
     if (url.pathname === "/v1/stt/stream") {
       const upgradeResult = handleSttStreamWs(req, server);
       if (upgradeResult !== undefined) return upgradeResult;
@@ -2110,6 +2199,21 @@ async function main() {
   whatsappDedupCache.startCleanup();
   emailDedupCache.startCleanup();
 
+  // The persistent inbound claims sweep too, more slowly. Expired rows are
+  // already reclaimed in place by the next claim on the same key, so this only
+  // keeps the table from growing a row per message that nothing will read
+  // again.
+  const inboundDedupCleanup = setInterval(() => {
+    try {
+      const evicted = cleanupExpiredInboundEvents();
+      if (evicted > 0) {
+        log.debug({ evicted }, "Evicted expired inbound dedup claims");
+      }
+    } catch (err) {
+      log.warn({ err }, "Inbound dedup cleanup failed");
+    }
+  }, INBOUND_DEDUP_CLEANUP_INTERVAL_MS);
+
   const telegramCaches = {
     credentials: credentialCache,
     configFile: configFileCache,
@@ -2132,6 +2236,12 @@ async function main() {
 
   // ── Slack Socket Mode lifecycle ──
   let slackSocketClient: SlackSocketModeClient | null = null;
+  // Guards concurrent startSlackSocket calls: at boot both the credential
+  // watcher's and the config-file watcher's initial polls fire it, and the
+  // second call can pass the stop() guard while the first is still awaiting
+  // credentials, leaving the first client running (open WebSocket, reconnect
+  // loop, cleanup timer) with no reference to stop it.
+  let slackStartGeneration = 0;
 
   /** Fire-and-forget: notify the platform of inbound Slack activity so the
    *  idle-sleep timer is reset for this assistant.
@@ -2183,6 +2293,7 @@ async function main() {
   }
 
   async function startSlackSocket(): Promise<void> {
+    const generation = ++slackStartGeneration;
     if (slackSocketClient) {
       slackSocketClient.stop();
       slackSocketClient = null;
@@ -2194,6 +2305,11 @@ async function main() {
     const appToken = await credentialCache.get(
       credentialKey("slack_channel", "app_token"),
     );
+    // A newer call started while we awaited credentials, so let it own the
+    // client. Everything below is synchronous, so one check suffices.
+    if (generation !== slackStartGeneration) {
+      return;
+    }
     if (!botToken || !appToken) return;
 
     const threadModeRaw = configFileCache.getString("slack", "threadMode");
@@ -2498,9 +2614,7 @@ async function main() {
         // Read live (the config cache is TTL'd) so an allow-list edit applies
         // without a client restart, which would spend an IDENTIFY.
         readAllowedChannelIds: () =>
-          parseAllowedChannelIds(
-            configFileCache.getString("discord", "allowedChannelIds"),
-          ),
+          readDiscordAllowedChannelIds(configFileCache),
       },
       (event) => {
         // Reset the platform idle-sleep timer — inbound Discord activity
@@ -2509,15 +2623,35 @@ async function main() {
 
         // Seed a contact channel for the actor (dual-write, fire-and-forget)
         // so later verification flows have a record to upgrade.
+        //
+        // `externalChatId` is recorded only for a DM, where the conversation
+        // address is a private one-to-one channel. A guild channel is a room
+        // the actor happens to be standing in, and storing it as their
+        // delivery address is how a private notice ends up posted in public.
         void upsertContactChannel({
           sourceChannel: "discord",
           externalUserId: event.actor.actorExternalId,
+          ...(event.source.chatType === "dm"
+            ? { externalChatId: event.message.conversationExternalId }
+            : {}),
           displayName: event.actor.displayName,
           username: event.actor.username,
         }).catch(() => {});
 
-        // Read-only slice: no replyCallbackUrl until the send path exists.
-        handleInbound(config, event).catch((err) => {
+        // Where the assistant posts its reply. The daemon owns Discord egress
+        // directly (`messaging/providers/discord`), so this callback is
+        // resolved to that transport rather than proxied back through here.
+        //
+        // `threadId` carries the thread's own snowflake when the message came
+        // from one: the event's conversation address is the *parent* channel
+        // for a threaded message, and a Discord thread is itself a channel, so
+        // without this param the reply would land outside the thread.
+        const threadId = event.source.threadId;
+        const replyCallbackUrl = threadId
+          ? `${config.gatewayInternalBaseUrl}/deliver/discord?${new URLSearchParams({ threadId })}`
+          : `${config.gatewayInternalBaseUrl}/deliver/discord`;
+
+        handleInbound(config, event, { replyCallbackUrl }).catch((err) => {
           log.error(
             {
               err,
@@ -2862,6 +2996,7 @@ async function main() {
     telegramDedupCache.stopCleanup();
     whatsappDedupCache.stopCleanup();
     emailDedupCache.stopCleanup();
+    clearInterval(inboundDedupCleanup);
     if (slackSocketClient) {
       slackSocketClient.stop();
       slackSocketClient = null;

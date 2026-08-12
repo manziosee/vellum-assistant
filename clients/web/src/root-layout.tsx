@@ -1,4 +1,4 @@
-import { lazy, useEffect, useState } from "react";
+import { lazy, useEffect, useRef, useState } from "react";
 import { Outlet, useLocation, useNavigate } from "react-router";
 
 import { LazyBoundary } from "@/components/lazy-boundary";
@@ -6,21 +6,27 @@ import { useAppTheme } from "@/hooks/use-app-theme";
 import { useEventBusInit } from "@/hooks/use-event-bus-init";
 import { useOpenUrlDirectives } from "@/hooks/use-open-url-directives";
 import { useGlobalDeepLinkConsumer } from "@/hooks/use-global-deep-link-consumer";
-import { useIsMobile } from "@/hooks/use-is-mobile";
-import {
-  useVisibleViewport,
-  KEYBOARD_OPEN_THRESHOLD_PX,
-} from "@/hooks/use-visible-viewport";
+import { useKeyboardOpen } from "@/hooks/use-keyboard-open";
+import { useVisibleViewport } from "@/hooks/use-visible-viewport";
 import { useAssistantLifecycle } from "@/assistant/use-lifecycle";
 import { useAssistantLifecycleStore } from "@/assistant/lifecycle-store";
 import { useChannelSetupCloseNotify } from "@/domains/chat/hooks/use-channel-setup-close-notify";
+import {
+  isLiveVoiceSessionActive,
+  useLiveVoiceStore,
+} from "@/domains/chat/voice/live-voice/live-voice-store";
+import { requestVoiceStart } from "@/domains/chat/voice/live-voice/start-voice-request";
 import {
   useAuthStore,
   useIsSessionInitializing,
   useHasPlatformSession,
 } from "@/stores/auth-store";
 import { handleLogout } from "@/lib/auth/handle-logout";
-import { getSelectedAssistant, isLocalMode } from "@/lib/local-mode";
+import {
+  getLockfileAssistant,
+  getSelectedAssistant,
+  isLocalClient,
+} from "@/lib/local-mode";
 import { useOnboardingLogin } from "@/hooks/use-onboarding-login";
 import { setMenuPlatformSession } from "@/runtime/menu";
 import { useVellumCommands } from "@/runtime/vellum-commands";
@@ -49,19 +55,31 @@ import { useViewerStore } from "@/stores/viewer-store";
 import { useAssistantAvatar } from "@/hooks/use-assistant-avatar";
 import { useAvatarAccentVar } from "@/hooks/use-avatar-accent-var";
 import { useDynamicFavicon } from "@/hooks/use-dynamic-favicon";
+import { useCompanionMirror } from "@/domains/chat/hooks/use-companion-mirror";
 import { useElectronIconSync } from "@/hooks/use-electron-icon-sync";
+import { useIslandAvatarSource } from "@/hooks/use-island-avatar-source";
 import { useElectronIdentitySync } from "@/hooks/use-electron-identity-sync";
 import { useElectronStatusSync } from "@/hooks/use-electron-status-sync";
 import { useElectronFeatureFlagBridge } from "@/runtime/electron-feature-flags";
+import { subscribeAndroidBackButtonSource } from "@/runtime/event-sources/android-back-button";
 import { isElectron } from "@/runtime/is-electron";
+import { isNativeMobile } from "@/runtime/platform-detection";
+import {
+  resolveShellBackground,
+  usePageSurfaceStore,
+} from "@/stores/page-surface-store";
 import { isPopoutWindow } from "@/runtime/popout-window";
 import { GlobalPushToTalkBridge } from "@/domains/chat/voice/global-push-to-talk-bridge";
 import { TimezoneSync } from "@/components/timezone-sync";
 import { StatusBanner } from "@/components/status-banner";
 import { UpdateToast } from "@/components/update-toast";
 import { retireAssistant } from "@/assistant/retire-service";
-import { setSelectedAssistant } from "@/assistant/selection";
+import {
+  removePairedAssistant,
+  switchToAssistant,
+} from "@/assistant/switch-service";
 import { CreateAssistantDialog } from "@/components/create-assistant-dialog";
+import { RemoveFromDeviceDialog } from "@/components/remove-from-device-dialog";
 import { RetireConfirmDialog } from "@/components/retire-confirm-dialog";
 import { toast } from "@vellumai/design-library/components/toast";
 
@@ -72,7 +90,7 @@ const ShareFeedbackModal = lazy(() =>
 );
 
 /**
- * App-level layout route. Owns three cross-route concerns:
+ * App-level layout route. Owns four cross-route concerns:
  *
  * 1. Safe-area insets and iOS visual-viewport keyboard tracking.
  * 2. The single assistant lifecycle (`useAssistantLifecycle`). Mounted
@@ -87,6 +105,8 @@ const ShareFeedbackModal = lazy(() =>
  *    app-state) need to be alive on every authenticated route — not
  *    just chat — so cross-tab sync invalidations keep firing while the
  *    user is on settings, logs, etc.
+ * 4. Android system Back routing. The active UI layer gets first refusal,
+ *    followed by WebView history and app minimization at the root.
  *
  * References:
  * - React Router layout routes: https://reactrouter.com/start/data/routing
@@ -95,7 +115,7 @@ const ShareFeedbackModal = lazy(() =>
  */
 export function RootLayout() {
   useAppTheme();
-  const isMobile = useIsMobile();
+  const keyboardOpen = useKeyboardOpen();
   const visibleViewport = useVisibleViewport();
 
   const location = useLocation();
@@ -109,7 +129,6 @@ export function RootLayout() {
   useEffect(() => {
     void setMenuPlatformSession(hasPlatformSession);
   }, [hasPlatformSession]);
-  useClientFeatureFlagSync(!isSessionInitializing);
   useAssistantLifecycle({
     sessionStatus,
     hasPlatformSession,
@@ -127,6 +146,7 @@ export function RootLayout() {
     (s) => s.assistantState.kind,
   );
   const isAssistantActive = assistantStateKind === "active";
+  useClientFeatureFlagSync(!isSessionInitializing, isAssistantActive);
   // Hydrate the assistant identity store (name + version) at the app root so
   // the name is ready on every authenticated route — chat, settings, logs —
   // and the Electron window title / tray / About panel (published below by
@@ -152,7 +172,14 @@ export function RootLayout() {
   useDynamicFavicon(avatar.customImageUrl, avatar.components, avatar.traits);
   // Publish the avatar accent as `--avatar-accent` so chat loading shimmers
   // (and any future accent-tinted UI) can read it from plain CSS.
-  useAvatarAccentVar(avatar.components, avatar.traits);
+  useAvatarAccentVar(avatar.components, avatar.traits, avatar.customImageUrl);
+  // Publish the same avatar for the iOS Live Activity, which cannot fetch an
+  // image at render time and needs the bytes to travel with the activity.
+  useIslandAvatarSource(
+    avatar.customImageUrl,
+    avatar.components,
+    avatar.traits,
+  );
 
   // Feed the same avatar to the Electron Dock + menu-bar icons, and publish
   // the live connection status to the menu-bar dot. Both no-op off Electron.
@@ -168,6 +195,7 @@ export function RootLayout() {
   useOnboardingWindowSize();
 
   useEventBusInit({ assistantId, isAssistantActive });
+  useEffect(() => subscribeAndroidBackButtonSource(), []);
   // Inbound deep-link navigation + window activation. Mounted here
   // (not in `ChatPage`) so a `vellum://thread/...` arriving while
   // the user is on `/assistant/settings`, `/logs`, etc. still
@@ -179,6 +207,12 @@ export function RootLayout() {
   // here so the browser opens even when no chat stream consumer exists —
   // Settings/Logs routes, or a draft conversation that isn't persisted yet.
   useOpenUrlDirectives();
+  // The assistant's name and the tail of the open conversation, mirrored onto
+  // the macOS companion surface so a message sent from its composer can be
+  // answered there. Mounted here rather than in the chat layout because the
+  // surface is on screen for as long as the app is, including on routes with no
+  // transcript rendered.
+  useCompanionMirror();
 
   const [feedbackOpen, setFeedbackOpen] = useState(false);
   // Id of the assistant a tray "Retire <assistant>…" command targets. The tray
@@ -186,8 +220,16 @@ export function RootLayout() {
   // the retire can run without first routing the user to settings.
   const [retireId, setRetireId] = useState<string | null>(null);
   const [retirePending, setRetirePending] = useState(false);
+  // Id of the paired assistant a tray "Remove from this Mac…" command targets.
+  const [removePairedId, setRemovePairedId] = useState<string | null>(null);
+  const [removePairedPending, setRemovePairedPending] = useState(false);
   // Whether the tray "New Assistant…" name-prompt dialog is open.
   const [createOpen, setCreateOpen] = useState(false);
+  // The conversation the companion surface's open composer is talking to,
+  // minted by its first message. Held here because the surface never learns the
+  // id: it says only whether it is starting or continuing, and this is the side
+  // that mints one.
+  const companionConversationRef = useRef<string | null>(null);
 
   const { login } = useOnboardingLogin();
 
@@ -220,17 +262,22 @@ export function RootLayout() {
     shareFeedback: () => setFeedbackOpen(true),
     selectAssistant: (command) => {
       if (command.kind === "selectAssistant") {
-        // The tray lists managed (platform-hosted) assistants, so switching
-        // goes through the platform selection path — not connectLocalAssistant,
-        // which primes a local gateway and no-ops for managed assistants.
-        void setSelectedAssistant(command.assistantId);
+        // Paired-aware switch: paired entries connect through
+        // connectPairedAssistant, managed ones through the platform
+        // selection path (see switch-service).
+        void switchToAssistant(command.assistantId).then((outcome) => {
+          if (!outcome.ok) {
+            toast.error(outcome.error);
+            void navigate(routes.selectAssistant);
+          }
+        });
       }
     },
     chooseAssistant: () => {
       // The chooser route is local-only — navigation-resolver redirects
       // platform users away — so platform sessions switch via the Switch
       // Assistant picker on the settings page instead.
-      if (isLocalMode()) {
+      if (isLocalClient()) {
         void navigate(`${routes.selectAssistant}?noAutoSkip=1`);
       } else {
         void navigate(routes.settings.general);
@@ -244,6 +291,11 @@ export function RootLayout() {
         setRetireId(command.assistantId);
       }
     },
+    removePairedAssistant: (command) => {
+      if (command.kind === "removePairedAssistant") {
+        setRemovePairedId(command.assistantId);
+      }
+    },
     quickInputSubmit: (command) => {
       if (command.kind !== "quickInputSubmit") {
         return;
@@ -255,6 +307,68 @@ export function RootLayout() {
         `${routes.conversation(draftId)}?prompt=${encodeURIComponent(command.message)}`,
       );
     },
+    startVoice: () => {
+      // A session already running is the session the user is in, so the press
+      // is spent: the starter refuses a second one anyway, and navigating
+      // would only walk the app away from the composer that owns it.
+      if (isLiveVoiceSessionActive(useLiveVoiceStore.getState().state)) {
+        return;
+      }
+      // The draft composer, because the session starts with no conversation
+      // and the server assigns one on `ready`. Navigating is also what mounts
+      // `ChatLayout` and therefore the starter this request is waiting for;
+      // until then it stays parked.
+      //
+      // The window is deliberately not raised. This command comes from the
+      // companion surface, which the user reached for precisely because they
+      // are working somewhere else, and that surface is where the call then
+      // shows itself.
+      void navigate(routes.assistant);
+      requestVoiceStart();
+    },
+    companionSubmit: (command) => {
+      if (command.kind !== "companionSubmit") {
+        return;
+      }
+      // **The surface's own thread.** Opening its composer starts a
+      // conversation rather than sending into whatever the app has selected:
+      // the user reached past the app to a floating avatar, so they are
+      // starting something, not adding to a thread they cannot see. Every
+      // follow-up continues that one.
+      //
+      // Which is the remembered id, not the active conversation, because the
+      // two come apart: pressing the avatar brings the app forward with the
+      // card still open, and picking a different thread there leaves the app's
+      // selection somewhere the card's conversation is not. A follow-up
+      // resolved against the selection would land in the thread the user
+      // happened to open rather than the one they were typing to.
+      //
+      // The fallback covers the composer outliving this window's memory of it,
+      // which a reload does: the active conversation is the best guess left.
+      const conversations = useConversationStore.getState();
+      const conversationId = command.startsConversation
+        ? createDraftConversationId()
+        : (companionConversationRef.current ??
+          conversations.activeConversationId ??
+          createDraftConversationId());
+      companionConversationRef.current = conversationId;
+      conversations.setActiveConversationId(conversationId);
+      // The `?prompt=` auto-send pathway (`use-auto-send-effects`), with a
+      // relay token so sending the same words twice sends twice instead of
+      // deduping to one. Navigating is also what mounts the chat layout the
+      // send needs, which is why this routes rather than calling a sender.
+      //
+      // The layout is left alone and the window is deliberately not raised,
+      // as with `startVoice`: this command comes from a surface the user
+      // reached for precisely because they are working somewhere else.
+      void navigate(
+        routes.conversationWithPrompt(
+          conversationId,
+          command.message,
+          crypto.randomUUID(),
+        ),
+      );
+    },
     replayOnboarding: () => {
       void navigate(`${routes.onboarding.privacy}?preview=true`);
     },
@@ -262,6 +376,23 @@ export function RootLayout() {
       void navigate(`${routes.onboarding.hatching}?preview=true&fail=1`);
     },
   });
+
+  const handleConfirmRemovePaired = async () => {
+    if (!removePairedId) {
+      return;
+    }
+    setRemovePairedPending(true);
+    const outcome = await removePairedAssistant(removePairedId);
+    setRemovePairedPending(false);
+    setRemovePairedId(null);
+    if (!outcome.ok) {
+      toast.error(outcome.error);
+      return;
+    }
+    if (outcome.nextRoute) {
+      void navigate(outcome.nextRoute, { replace: true });
+    }
+  };
 
   const handleConfirmRetire = async () => {
     if (!retireId) {
@@ -279,11 +410,6 @@ export function RootLayout() {
     setRetirePending(false);
     setRetireId(null);
   };
-
-  const keyboardOpen =
-    isMobile &&
-    visibleViewport !== null &&
-    visibleViewport.keyboardHeight > KEYBOARD_OPEN_THRESHOLD_PX;
 
   // When the iOS keyboard opens, the system scrolls the layout viewport
   // down by `offsetTop` to keep the focused input visible. Size the outer
@@ -315,6 +441,13 @@ export function RootLayout() {
   // stacked on top of the keyboard offset when the keyboard is open.
   const topSafeAreaInset =
     "var(--safe-area-inset-top, env(safe-area-inset-top, 0px))";
+  // This element owns the safe-area padding, so its background is what fills
+  // the strips beside the notch and the home indicator. A route that renders on
+  // a themed surface can publish that color and have it run edge to edge rather
+  // than stopping at its content's rounded corner. Native mobile only: on
+  // desktop the neutral canvas is what makes a page read as a card on a page.
+  const pageSurface = usePageSurfaceStore.use.surface();
+  const shellBackground = resolveShellBackground(pageSurface, isNativeMobile());
   const shellPaddingTop =
     keyboardOffsetTop > 0
       ? appShellOwnsTopInset
@@ -329,7 +462,7 @@ export function RootLayout() {
       data-slot="root-layout"
       className="app-shell"
       style={{
-        background: "var(--surface-base)",
+        background: shellBackground,
         height:
           keyboardOpen && visibleViewport
             ? `${visibleViewport.height + keyboardOffsetTop}px`
@@ -384,6 +517,21 @@ export function RootLayout() {
         isPending={retirePending}
         onConfirm={handleConfirmRetire}
         onCancel={() => setRetireId(null)}
+      />
+
+      {/* Confirmation for the tray "Remove from this Mac…" command. Shares
+          the chooser's remove dialog: forgetting the pairing on this device
+          never touches the assistant on its host machine. */}
+      <RemoveFromDeviceDialog
+        open={removePairedId !== null}
+        kind="paired"
+        assistantName={
+          (removePairedId && getLockfileAssistant(removePairedId)?.name) ||
+          "the assistant"
+        }
+        isPending={removePairedPending}
+        onConfirm={() => void handleConfirmRemovePaired()}
+        onCancel={() => setRemovePairedId(null)}
       />
 
       {/* Name-prompt for the tray "New Assistant…" command — hatches an

@@ -71,6 +71,7 @@ import {
   shouldAttachHostProxyForCapability,
 } from "./host-proxy-preactivation.js";
 import type { SubagentToolGateMode } from "./tool-setup-types.js";
+import { restingTrust } from "./trust-context-types.js";
 
 const log = getLogger("process-message");
 
@@ -455,7 +456,10 @@ export async function processMessage(
   if (slashResult.kind === "unknown") {
     const serverTurnCtx = conversation.getTurnChannelContext();
     const serverProvenance = provenanceFromTrustContext(
-      conversation.trustContext,
+      // Ingress persists before any per-turn stamp; the slot was just written
+      // by this message's own resolution, and the per-turn field may still
+      // hold the previous turn's actor.
+      restingTrust(conversation),
     );
     const imageSourcePaths: Record<string, string> = {};
     for (let i = 0; i < attachments.length; i++) {
@@ -484,12 +488,12 @@ export async function processMessage(
     const userMetaWithSlack = slackMeta
       ? { ...serverChannelMeta, slackMeta }
       : serverChannelMeta;
-    const cleanMsg = createUserMessage(content, attachments);
+    const cleanMsg = await createUserMessage(content, attachments);
     const llmMsg = enrichMessageWithSourcePaths(cleanMsg, attachments);
     const persisted = await addMessage(
       conversationId,
       "user",
-      serializePersistedUserMessageContent(
+      await serializePersistedUserMessageContent(
         content,
         options?.displayContent,
         attachments,
@@ -557,7 +561,10 @@ export async function processMessage(
   if (slashResult.kind === "compact") {
     const serverTurnCtx = conversation.getTurnChannelContext();
     const serverProvenance = provenanceFromTrustContext(
-      conversation.trustContext,
+      // Ingress persists before any per-turn stamp; the slot was just written
+      // by this message's own resolution, and the per-turn field may still
+      // hold the previous turn's actor.
+      restingTrust(conversation),
     );
     const compactChannelMeta = {
       ...serverProvenance,
@@ -578,11 +585,11 @@ export async function processMessage(
     const compactUserMeta = slackMeta
       ? { ...compactChannelMeta, slackMeta }
       : compactChannelMeta;
-    const cleanMsg = createUserMessage(content, attachments);
+    const cleanMsg = await createUserMessage(content, attachments);
     const persisted = await addMessage(
       conversationId,
       "user",
-      serializePersistedUserMessageContent(
+      await serializePersistedUserMessageContent(
         content,
         options?.displayContent,
         attachments,
@@ -612,7 +619,10 @@ export async function processMessage(
   if (slashResult.kind === "clean") {
     const serverTurnCtx = conversation.getTurnChannelContext();
     const serverProvenance = provenanceFromTrustContext(
-      conversation.trustContext,
+      // Ingress persists before any per-turn stamp; the slot was just written
+      // by this message's own resolution, and the per-turn field may still
+      // hold the previous turn's actor.
+      restingTrust(conversation),
     );
     const cleanChannelMeta = {
       ...serverProvenance,
@@ -633,11 +643,11 @@ export async function processMessage(
     const cleanUserMeta = slackMeta
       ? { ...cleanChannelMeta, slackMeta }
       : cleanChannelMeta;
-    const cleanMsg = createUserMessage(content, attachments);
+    const cleanMsg = await createUserMessage(content, attachments);
     const persisted = await addMessage(
       conversationId,
       "user",
-      serializePersistedUserMessageContent(
+      await serializePersistedUserMessageContent(
         content,
         options?.displayContent,
         attachments,

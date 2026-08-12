@@ -17,11 +17,16 @@ import {
   isConnectionCompatibleWithModel,
 } from "./connection-model-compat.js";
 import {
+  connectionProviderKind,
+  dispatchProviderResolvable,
+  expectedVendorProvider,
+  resolveEntryConnectionName,
   resolveRoutingIdentity,
   tryResolveProviderForConnectionName,
 } from "./connection-resolution.js";
 import { listConnections } from "./inference/connections.js";
 import { initializeProviders, listProviders } from "./registry.js";
+import { recordProviderRequestDiagnostics } from "./request-diagnostics.js";
 import type {
   ContentBlock,
   Message,
@@ -36,6 +41,13 @@ const log = getLogger("provider-send-message");
 export interface ConfiguredProviderResult {
   provider: Provider;
   configuredProviderName: string;
+  /**
+   * True when the profile's provider was an entry label and dispatch routed
+   * through that row. The row's own credential already signed resolution, so
+   * vendor-keyed preflights (which check the generic per-vendor key slot)
+   * do not apply to this result.
+   */
+  entryRouted: boolean;
 }
 
 export type ConfiguredProviderOptions = Pick<
@@ -139,7 +151,10 @@ export async function resolveConfiguredProvider(
     }
   }
 
-  const resolved = resolveCallSiteConfig(callSite, config.llm, opts);
+  const resolved = resolveCallSiteConfig(callSite, config.llm, {
+    ...opts,
+    isResolvableProvider: dispatchProviderResolvable,
+  });
   const inferenceProvider = resolved.provider;
   let connectionName = resolved.provider_connection;
 
@@ -156,6 +171,14 @@ export async function resolveConfiguredProvider(
       inferenceProvider,
       resolved.model,
     )?.connectionName;
+  }
+  // An entry-name provider IS the connection name: the label points at a
+  // row, and the row's own provider drives dispatch.
+  const entryRoute = connectionName
+    ? null
+    : resolveEntryConnectionName(inferenceProvider);
+  if (entryRoute) {
+    connectionName = entryRoute;
   }
   if (!connectionName) {
     if (inferenceProvider) {
@@ -201,7 +224,7 @@ export async function resolveConfiguredProvider(
   const connectionProvider = await tryResolveProviderForConnectionName(
     connectionName,
     config,
-    inferenceProvider,
+    expectedVendorProvider(inferenceProvider, resolved.model),
     resolved.model,
   );
   if (!connectionProvider) {
@@ -221,6 +244,11 @@ export async function resolveConfiguredProvider(
     );
     return null;
   }
+  // Which credential signs the request is only known here, and a failed
+  // request is unactionable without it ("which key was this?"). Recorded once
+  // the adapter exists, so a connection that resolved to nothing is never
+  // reported as the one that signed the request.
+  recordProviderRequestDiagnostics({ connection_name: connectionName });
   return {
     provider: new CallSiteConfiguredProvider(
       connectionProvider,
@@ -228,7 +256,14 @@ export async function resolveConfiguredProvider(
       opts.overrideProfile,
       opts.forceOverrideProfile,
     ),
-    configuredProviderName: inferenceProvider,
+    // The dispatched vendor kind, not the config label: an entry-name
+    // provider reports its row's kind so provider-keyed consumers
+    // (telemetry, pricing) never see a label that matches no catalog id.
+    configuredProviderName:
+      (entryRoute
+        ? connectionProviderKind(entryRoute, resolved.model)
+        : undefined) ?? inferenceProvider,
+    entryRouted: entryRoute !== null,
   };
 }
 

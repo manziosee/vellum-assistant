@@ -115,6 +115,12 @@ const BASELINE: Record<string, readonly string[]> = {
     "../../../../config/skill-state.js",
     "../../../../config/skills.js",
     "../../../../config/types.js",
+    // Same host module the retrospective job couples to (the `../../../`
+    // entry below): the sweep job and v2 router warm the guardian-delivery
+    // cache before their sync `resolveUserName` reads so worker-process
+    // prompts address the guardian instead of the default profile. No
+    // plugin-api equivalent.
+    "../../../../contacts/guardian-delivery-reader.js",
     "../../../../context/token-estimator.js",
     "../../../../daemon/conversation-error.js",
     "../../../../daemon/conversation-notices.js",
@@ -125,6 +131,7 @@ const BASELINE: Record<string, readonly string[]> = {
     "../../../../daemon/turn-latency-sub-spans.js",
     "../../../../notifications/emit-signal.js",
     "../../../../persistence/checkpoints.js",
+    "../../../../persistence/conversation-types.js",
     "../../../../persistence/db-connection.js",
     "../../../../persistence/embeddings/embed.js",
     "../../../../persistence/embeddings/embedding-backend.js",
@@ -147,6 +154,7 @@ const BASELINE: Record<string, readonly string[]> = {
     "../../../../runtime/auth/route-policy.js",
     "../../../../runtime/background-job-runner.js",
     "../../../../runtime/routes/errors.js",
+    "../../../../runtime/routes/parse-body.js",
     "../../../../runtime/routes/types.js",
     "../../../../security/secret-scanner.js",
     "../../../../skills/catalog-cache.js",
@@ -182,6 +190,7 @@ const BASELINE: Record<string, readonly string[]> = {
     "../../../persistence/checkpoints.js",
     "../../../persistence/cleanup-schedule-state.js",
     "../../../persistence/conversation-crud.js",
+    "../../../persistence/conversation-types.js",
     "../../../persistence/db-connection.js",
     "../../../persistence/db-maintenance.js",
     "../../../persistence/embeddings/embedding-backend.js",
@@ -221,6 +230,7 @@ const BASELINE: Record<string, readonly string[]> = {
     "../../../util/sqlite-retry.js",
     "../../../util/strip-comment-lines.js",
     "../../../util/truncate.js",
+    "../../../util/worker-compute.js",
     "../../../util/worker-memory.js",
     "../../../util/worker-process.js",
     "../../types.js",

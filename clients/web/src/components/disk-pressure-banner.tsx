@@ -70,7 +70,9 @@ export function DiskPressureBanner(props: DiskPressureBannerProps) {
             </span>
           </div>
           <p className="m-0">
-            Free up space or add more storage to avoid interruptions.
+            {onUpgradeStorage
+              ? "Free up space or add more storage to avoid interruptions."
+              : "Free up space to avoid interruptions."}
           </p>
           <div className="flex flex-wrap items-center gap-2">
             {onReviewWorkspaceData && (
@@ -216,10 +218,8 @@ export function DiskPressureBanner(props: DiskPressureBannerProps) {
         }}
       >
         <Modal.Content size="sm">
-          <Modal.Header>
-            <Modal.Title icon={AlertTriangle}>
-              Storage is critically low
-            </Modal.Title>
+          <Modal.Header icon={AlertTriangle}>
+            <Modal.Title>Storage is critically low</Modal.Title>
           </Modal.Header>
           <Modal.Body>
             <Modal.Description>

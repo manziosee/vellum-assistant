@@ -1,6 +1,7 @@
 import { useState } from "react";
-import { Link } from "react-router";
+import { Link, useLocation } from "react-router";
 
+import { useTranslation } from "@/i18n";
 import { NativeSplash } from "@/components/native-splash";
 import { AuthWaitSpinner } from "@/domains/account/components/auth-wait-spinner";
 import {
@@ -15,6 +16,14 @@ import {
   buildProviderCallbackUrl,
 } from "@/domains/account/login-flow";
 import {
+  isUserCancelledAuthError,
+  nativeAuthErrorDetail,
+  AUTH_ERROR_COMMUNITY_LINK,
+  nativeAuthErrorKey,
+} from "@/domains/account/native-auth-error";
+import { withPreservedAttribution } from "@/domains/account/social-auth";
+import { captureError } from "@/lib/sentry/capture-error";
+import {
   startAuthFlow,
   startNativeLogin,
   useIsNativePlatform,
@@ -22,17 +31,13 @@ import {
 import { routes } from "@/utils/routes";
 import { Button } from "@vellumai/design-library";
 
-const AUTH_ERROR_MESSAGES: Record<string, string> = {
-  signup_closed:
-    "Sign-ups are currently closed. Visit vellum.ai/community to request access.",
-};
-
 /**
- * Capacitor iOS login: single "Sign in" button inside NativeSplash.
- * Opens a Safari sheet via `/accounts/native/start` with no provider
- * hint — WorkOS AuthKit handles Apple / Google / email selection.
+ * Capacitor native login: single "Sign in" button inside NativeSplash.
+ * Opens the platform browser auth surface with no provider hint; WorkOS
+ * AuthKit handles Apple / Google / email selection.
  */
 function NativeLoginForm({ returnTo }: { returnTo: string | null }) {
+  const { t } = useTranslation("account");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
@@ -42,31 +47,21 @@ function NativeLoginForm({ returnTo }: { returnTo: string | null }) {
     try {
       await startNativeLogin({ returnTo: returnTo ?? null });
     } catch (err) {
-      const errorCode =
-        err && typeof err === "object" && "code" in err ? err.code : undefined;
-      if (errorCode === "USER_CANCELLED") {
+      if (isUserCancelledAuthError(err)) {
         setLoading(false);
         return;
       }
-      if (errorCode === "AUTH_ERROR") {
-        const errorKey =
-          err &&
-          typeof err === "object" &&
-          "data" in err &&
-          err.data &&
-          typeof err.data === "object" &&
-          "authError" in err.data &&
-          typeof err.data.authError === "string"
-            ? err.data.authError
-            : undefined;
-        setErrorMessage(
-          (errorKey && AUTH_ERROR_MESSAGES[errorKey]) ??
-            "Something went wrong. Please try again.",
-        );
-      } else {
-        console.error("[native-auth] auth flow failed:", err);
-        setErrorMessage("Something went wrong. Please try again.");
-      }
+      // Report every real failure, classified or not. This is the screen the
+      // "I tried to log in and it errored right away" reports come from, and
+      // until now the classified branch logged nothing at all — so the reports
+      // arrived with no trace of which refusal the platform issued.
+      captureError(err, {
+        context: "native_login",
+        tags: { authError: nativeAuthErrorDetail(err) ?? "unclassified" },
+      });
+      setErrorMessage(
+        t(nativeAuthErrorKey(err), { community: AUTH_ERROR_COMMUNITY_LINK }),
+      );
       setLoading(false);
     }
   };
@@ -91,7 +86,7 @@ function NativeLoginForm({ returnTo }: { returnTo: string | null }) {
           disabled={loading}
           className="max-w-[300px]"
         >
-          Sign in
+          {t("loginPage.signIn")}
         </Button>
       </div>
     </NativeSplash>
@@ -104,12 +99,18 @@ function NativeLoginForm({ returnTo }: { returnTo: string | null }) {
  * theme context (the web login screen is always dark per Figma).
  */
 function WebLoginForm({ returnTo }: { returnTo: string | null }) {
+  const { t } = useTranslation("account");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const callbackUrl = buildProviderCallbackUrl(returnTo);
-  const signUpHref = returnTo
-    ? `${routes.account.signup}?returnTo=${encodeURIComponent(returnTo)}`
-    : routes.account.signup;
+  // Keep URL-borne attribution alive across the pivot to signup.
+  const { search } = useLocation();
+  const signUpHref = withPreservedAttribution(
+    returnTo
+      ? `${routes.account.signup}?returnTo=${encodeURIComponent(returnTo)}`
+      : routes.account.signup,
+    search,
+  );
 
   const handleContinue = async () => {
     setErrorMessage(null);
@@ -117,8 +118,13 @@ function WebLoginForm({ returnTo }: { returnTo: string | null }) {
     try {
       await startAuthFlow(PROVIDER_ID, callbackUrl, { returnTo });
     } catch (err) {
-      console.error("[web-login] auth flow failed:", err);
-      setErrorMessage("Something went wrong. Please try again.");
+      captureError(err, {
+        context: "web_login",
+        tags: { authError: nativeAuthErrorDetail(err) ?? "unclassified" },
+      });
+      setErrorMessage(
+        t(nativeAuthErrorKey(err), { community: AUTH_ERROR_COMMUNITY_LINK }),
+      );
       setLoading(false);
     }
   };
@@ -126,7 +132,7 @@ function WebLoginForm({ returnTo }: { returnTo: string | null }) {
   return (
     <DarkLoginShell>
       <LoginCard>
-        <LoginHeading>Sign in to Vellum</LoginHeading>
+        <LoginHeading>{t("loginPage.heading")}</LoginHeading>
         {errorMessage && <LoginErrorText>{errorMessage}</LoginErrorText>}
         <div className="flex flex-col items-center gap-3">
           <Button
@@ -137,18 +143,18 @@ function WebLoginForm({ returnTo }: { returnTo: string | null }) {
             disabled={loading}
             className="max-w-[300px]"
           >
-            Continue
+            {t("loginPage.continue")}
           </Button>
         </div>
         <p className="text-body-small-default flex justify-center gap-1">
           <span className="text-[var(--content-secondary)]">
-            Don&apos;t have an account?
+            {t("loginPage.noAccount")}
           </span>
           <Link
             to={signUpHref}
             className="font-medium text-[var(--content-emphasised)] hover:underline"
           >
-            Sign up
+            {t("loginPage.signUp")}
           </Link>
         </p>
       </LoginCard>
@@ -159,7 +165,7 @@ function WebLoginForm({ returnTo }: { returnTo: string | null }) {
 /**
  * Branded sign-in screen for `/account/login`.
  *
- * Delegates to `NativeLoginForm` (Capacitor iOS) or `WebLoginForm`
+ * Delegates to `NativeLoginForm` (Capacitor native) or `WebLoginForm`
  * (standard browser / Electron) based on platform detection.
  *
  * `useReturnToShortCircuit` owns whether an existing session skips OAuth and

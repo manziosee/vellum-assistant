@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 
 let connectionsByName: Record<string, unknown> = {};
 let secureKeys: Record<string, string | undefined> = {};
@@ -74,6 +74,11 @@ beforeEach(() => {
   secureKeys = { "credential/anthropic/api_key": "sk-ant" };
   cesUnreachable = false;
   platformLoggedIn = false;
+  delete process.env.IS_PLATFORM;
+});
+
+afterEach(() => {
+  delete process.env.IS_PLATFORM;
 });
 
 describe("preflightResolvedConfig", () => {
@@ -148,6 +153,31 @@ describe("preflightResolvedConfig", () => {
     expect(err?.reason).toBe("platform_unauthenticated");
   });
 
+  test("a user-owned row claiming the vellum name preflights the platform", async () => {
+    // Dispatch ignores that row, so its credential is irrelevant to the
+    // verdict: signed in passes, signed out is the platform's own failure.
+    connectionsByName["vellum"] = {
+      name: "vellum",
+      provider: "openai",
+      auth: { type: "api_key", credential: "credential/openai/api_key" },
+    };
+    secureKeys["credential/openai/api_key"] = "sk-openai";
+    const collided = resolved({
+      provider: "vellum",
+      provider_connection: "",
+      model: "gpt-5.6-luna",
+    });
+
+    platformLoggedIn = true;
+    await expect(
+      preflightResolvedConfig(collided, {}),
+    ).resolves.toBeUndefined();
+
+    platformLoggedIn = false;
+    const err = await preflightError(collided);
+    expect(err?.reason).toBe("platform_unauthenticated");
+  });
+
   test("an unroutable vellum model throws unroutable_managed_model", async () => {
     const err = await preflightError(
       resolved({
@@ -163,6 +193,63 @@ describe("preflightResolvedConfig", () => {
     connectionsByName["chatgpt-subscription"] = {
       name: "chatgpt-subscription",
       provider: "openai",
+      auth: {
+        type: "oauth_subscription",
+        credential: "credential/chatgpt/access_token",
+      },
+    };
+    const missing = await preflightError(
+      resolved({
+        provider: "chatgpt",
+        provider_connection: "",
+        model: "gpt-5.5",
+      }),
+    );
+    expect(missing?.reason).toBe("missing_credential");
+
+    secureKeys["credential/chatgpt/access_token"] = "tok";
+    await expect(
+      preflightResolvedConfig(
+        resolved({
+          provider: "chatgpt",
+          provider_connection: "",
+          model: "gpt-5.5",
+        }),
+        {},
+      ),
+    ).resolves.toBeUndefined();
+  });
+
+  test("an explicit connection outranks an entry-name provider, matching dispatch", async () => {
+    // A healthy entry row must not mask the row the request actually uses.
+    connectionsByName["anthropic-work"] = {
+      name: "anthropic-work",
+      provider: "anthropic",
+      auth: {
+        type: "api_key",
+        credential: "credential/anthropic-work/api_key",
+      },
+    };
+    secureKeys["credential/anthropic-work/api_key"] = "healthy";
+
+    const err = await preflightError(
+      resolved({
+        provider: "anthropic-work",
+        provider_connection: "deleted-row",
+        model: "claude-opus-4-8",
+      }),
+    );
+    expect(err?.reason).toBe("not_found");
+    expect(err?.connectionName).toBe("deleted-row");
+  });
+
+  test("a chatgpt-identity subscription row preflights the same way", async () => {
+    // Migration 366 stamps the row with provider "chatgpt"; preflight judges
+    // its subscription credential, not a provider equality with the openai
+    // upstream.
+    connectionsByName["chatgpt-subscription"] = {
+      name: "chatgpt-subscription",
+      provider: "chatgpt",
       auth: {
         type: "oauth_subscription",
         credential: "credential/chatgpt/access_token",
@@ -273,5 +360,57 @@ describe("preflightResolvedConfig", () => {
       auth: { type: "none" },
     };
     expect(await preflightError(resolved())).toBeUndefined();
+  });
+});
+
+describe("preflightResolvedConfig platform-managed credential messaging", () => {
+  const platformManaged = () => {
+    connectionsByName = {
+      vellum: {
+        name: "vellum",
+        provider: "vellum",
+        auth: { type: "platform" },
+      },
+    };
+    process.env.IS_PLATFORM = "true";
+  };
+  const managedRoute = () => resolved({ provider_connection: "vellum" });
+
+  test("store unreachable surfaces a retriable message with no login text", async () => {
+    platformManaged();
+    cesUnreachable = true;
+    const err = await preflightError(managedRoute());
+    expect(err?.reason).toBe("platform_unauthenticated");
+    expect(err?.message).toContain("temporarily unavailable");
+    expect(err?.message).not.toContain("log in");
+  });
+
+  test("credential absent asks for platform re-provisioning, not a login", async () => {
+    platformManaged();
+    // Logged out with a reachable store means the credential is genuinely absent.
+    const err = await preflightError(managedRoute());
+    expect(err?.reason).toBe("platform_unauthenticated");
+    expect(err?.message).toContain("must be re-provisioned");
+    expect(err?.message).not.toContain("log in");
+  });
+
+  test("a healthy platform login passes silently", async () => {
+    platformManaged();
+    platformLoggedIn = true;
+    expect(await preflightError(managedRoute())).toBeUndefined();
+  });
+
+  test("non-platform install keeps the log-in-or-switch wording", async () => {
+    connectionsByName = {
+      vellum: {
+        name: "vellum",
+        provider: "vellum",
+        auth: { type: "platform" },
+      },
+    };
+    // IS_PLATFORM left unset covers both local and self-hosted Docker installs.
+    const err = await preflightError(managedRoute());
+    expect(err?.reason).toBe("platform_unauthenticated");
+    expect(err?.message).toContain("log in or pick a different provider");
   });
 });

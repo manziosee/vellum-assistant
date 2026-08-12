@@ -798,6 +798,65 @@ describe("always-candidate frontmatter parsing", () => {
     const wf = loadSkillCatalog().find((s) => s.id === "workflows");
     expect(wf?.alwaysCandidate).toBe(true);
   });
+
+  test("the bundled visualize skill is flagged always-candidate", () => {
+    const viz = loadSkillCatalog().find((s) => s.id === "visualize");
+    expect(viz?.alwaysCandidate).toBe(true);
+  });
+
+  test("every always-candidate bundled skill's card fits its budget", async () => {
+    // The card is pinned into the selector's stable prefix every turn, and
+    // `buildSkillContent` hard-truncates at the budget — a skill that overruns
+    // silently loses its last activation hints and its avoid-when list, which
+    // is exactly the guidance the pinning was added to deliver.
+    const { ALWAYS_CANDIDATE_CARD_CHARS, buildSkillContent } =
+      await import("../plugins/defaults/memory/substrate/skill-content.js");
+    const pinned = loadSkillCatalog().filter(
+      (skill) => skill.bundled && skill.alwaysCandidate === true,
+    );
+    expect(pinned.length).toBeGreaterThan(0);
+
+    const overrun = pinned
+      .map((skill) => ({
+        id: skill.id,
+        chars: buildSkillContent(skill, Number.MAX_SAFE_INTEGER).length,
+      }))
+      .filter(({ chars }) => chars > ALWAYS_CANDIDATE_CARD_CHARS)
+      .map(({ id, chars }) => `${id}: ${chars}`);
+    expect(overrun).toEqual([]);
+  });
+
+  test("the bundled acp skill's card fits the default budget", async () => {
+    // `acp` owns Claude Code and Codex setup, sign-in, and delegation, and the
+    // terms that route those turns to it live in this card. The card is
+    // hard-truncated at the default budget, so an overrun drops the trailing
+    // hints and the whole avoid-when list from what the selector sees.
+    const { DEFAULT_CARD_CHARS, buildSkillContent } =
+      await import("../plugins/defaults/memory/substrate/skill-content.js");
+    const acp = loadSkillCatalog().find((skill) => skill.id === "acp");
+    expect(acp).toBeDefined();
+
+    // A card that overran is cut to exactly the budget, so staying under it is
+    // what proves nothing was dropped. `avoid-when` is appended last and is
+    // therefore the first content a truncation eats.
+    const card = buildSkillContent(acp!);
+    expect(card.length).toBeLessThan(DEFAULT_CARD_CHARS);
+    expect(card).toContain("Avoid when:");
+  });
+
+  test("the bundled acp card carries its setup and sign-in vocabulary", async () => {
+    // A "configure Claude Code" or "let's do the auth" turn only reaches this
+    // skill if the card actually says it covers setup and authentication;
+    // delegation-only wording routes those turns to a terminal skill instead.
+    const { buildSkillContent } =
+      await import("../plugins/defaults/memory/substrate/skill-content.js");
+    const acp = loadSkillCatalog().find((skill) => skill.id === "acp");
+    const card = buildSkillContent(acp!).toLowerCase();
+
+    for (const term of ["set up", "install", "authenticate", "connect"]) {
+      expect(card).toContain(term);
+    }
+  });
 });
 
 describe("bundled skill categories", () => {

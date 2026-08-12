@@ -35,6 +35,12 @@ mock.module("@/hooks/use-is-mobile", () => ({
   MOBILE_MEDIA_QUERY: "(max-width: 767px)",
 }));
 
+const isTouchMobileRef = { value: false };
+mock.module("@/hooks/use-touch-mobile", () => ({
+  useTouchMobile: () => isTouchMobileRef.value,
+  TOUCH_MOBILE_MEDIA_QUERY: "(width < 48rem) and (pointer: coarse)",
+}));
+
 // --- toast -------------------------------------------------------------------
 const toastSuccess = mock((_msg: string) => {});
 const toastError = mock((_msg: string) => {});
@@ -143,7 +149,13 @@ const configGetMock = mock(
     data: {
       llm: {
         profileOrder: ["smart"],
-        profiles: { smart: { label: "Smart" } },
+        profiles: {
+          smart: {
+            label: "Smart",
+            provider: "anthropic",
+            model: "claude-fable-5",
+          },
+        },
         activeProfile: "smart",
       },
     },
@@ -172,10 +184,12 @@ mock.module("@/generated/daemon/sdk.gen", () => ({
   conversationsByIdInferenceprofilePut: inferenceprofilePut,
 }));
 
+import { ComposerCompactProvider } from "@/domains/chat/components/chat-composer/composer-compact";
 import { ComposerSettingsMenu } from "@/domains/chat/components/composer-settings-menu";
 // Real store (not mocked) — the component reads the draft conversation id and
 // the pending-profile stash from it.
 import { useConversationStore } from "@/stores/conversation-store";
+import { ApiError } from "@/utils/api-errors";
 
 function renderMenu() {
   const queryClient = new QueryClient({
@@ -195,6 +209,7 @@ function renderMenu() {
 
 beforeEach(() => {
   isMobileRef.value = false;
+  isTouchMobileRef.value = false;
   openProfileQuickAdd.mockClear();
   inferenceprofilePut.mockClear();
   configPatchMock.mockClear();
@@ -222,6 +237,7 @@ describe("Model Profile quick-add", () => {
 
   test('"+" New Profile renders on mobile', async () => {
     isMobileRef.value = true;
+    isTouchMobileRef.value = true;
     renderMenu();
     await waitFor(() => {
       expect(screen.getByLabelText("New Profile")).toBeTruthy();
@@ -283,8 +299,16 @@ describe("Model Profile quick-add", () => {
         llm: {
           profileOrder: ["smart", NEW_PROFILE_NAME],
           profiles: {
-            smart: { label: "Smart" },
-            [NEW_PROFILE_NAME]: { label: NEW_PROFILE_LABEL },
+            smart: {
+              label: "Smart",
+              provider: "anthropic",
+              model: "claude-fable-5",
+            },
+            [NEW_PROFILE_NAME]: {
+              label: NEW_PROFILE_LABEL,
+              provider: "anthropic",
+              model: "claude-fable-5",
+            },
           },
           activeProfile: "smart",
         },
@@ -411,8 +435,16 @@ describe("Profile trigger updates", () => {
       llm: {
         profileOrder: ["balanced", "quality"],
         profiles: {
-          balanced: { label: "Balanced" },
-          quality: { label: "Quality" },
+          balanced: {
+            label: "Balanced",
+            provider: "anthropic",
+            model: "claude-fable-5",
+          },
+          quality: {
+            label: "Quality",
+            provider: "anthropic",
+            model: "claude-fable-5",
+          },
         },
         activeProfile: "balanced",
       },
@@ -482,7 +514,13 @@ describe("Profile selection with no active conversation (new draft chat)", () =>
       data: {
         llm: {
           profileOrder: ["smart"],
-          profiles: { smart: { label: "Smart" } },
+          profiles: {
+            smart: {
+              label: "Smart",
+              provider: "anthropic",
+              model: "claude-fable-5",
+            },
+          },
           activeProfile: "smart",
         },
       },
@@ -529,5 +567,129 @@ describe("Profile selection with no active conversation (new draft chat)", () =>
     // is written (no server conversation exists yet).
     expect(configPatchMock).not.toHaveBeenCalled();
     expect(inferenceprofilePut).not.toHaveBeenCalled();
+  });
+});
+
+describe("Profile activation rejected by the daemon", () => {
+  /** Load the menu and click the "Smart" profile row. */
+  async function selectSmart() {
+    // Guard against a hanging/altered config impl leaking from a prior test.
+    configGetMock.mockImplementation(async () => ({
+      data: {
+        llm: {
+          profileOrder: ["smart"],
+          profiles: {
+            smart: {
+              label: "Smart",
+              provider: "anthropic",
+              model: "claude-fable-5",
+            },
+          },
+          activeProfile: "smart",
+        },
+      },
+    }));
+    renderMenu();
+    await waitFor(() =>
+      expect(screen.getAllByText("Smart").length).toBeGreaterThan(0),
+    );
+    const smart = screen
+      .getAllByTestId("menu-item")
+      .find((b) => b.textContent?.includes("Smart"));
+    // The rejection rolls the optimistic selection back asynchronously — flush
+    // that state update inside `act` so the assertion sees a settled tree.
+    await act(async () => {
+      fireEvent.click(smart!);
+    });
+  }
+
+  test("surfaces the server's 400 reason instead of generic retry copy", async () => {
+    // The daemon rejects a profile it can't dispatch through with a 400 naming
+    // what's missing; retry copy would send the user round the same loop.
+    inferenceprofilePut.mockImplementationOnce(async () => {
+      throw new ApiError(
+        400,
+        'Profile "smart" has no API key for provider "gemini".',
+      );
+    });
+
+    await selectSmart();
+
+    await waitFor(() => {
+      expect(toastError).toHaveBeenCalledWith(
+        'Profile "smart" has no API key for provider "gemini".',
+      );
+    });
+  });
+
+  test("keeps the generic copy for a non-400 failure", async () => {
+    inferenceprofilePut.mockImplementationOnce(async () => {
+      throw new ApiError(500, "boom: db offline");
+    });
+
+    await selectSmart();
+
+    await waitFor(() => {
+      expect(toastError).toHaveBeenCalledWith(
+        "Failed to switch profile. Please try again.",
+      );
+    });
+  });
+});
+
+describe("compact composer collapse", () => {
+  function renderCompact(segments: "both" | "access" | "profile") {
+    const queryClient = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    });
+    return render(
+      createElement(
+        QueryClientProvider,
+        { client: queryClient },
+        createElement(ComposerCompactProvider, {
+          compact: true,
+          children: createElement(ComposerSettingsMenu, {
+            assistantId: "assistant-1",
+            conversationId: "conv-1",
+            segments,
+          }),
+        }),
+      ),
+    );
+  }
+
+  test("folds both segments into one hamburger trigger", async () => {
+    // The composer mounts only the access-segment instance when compact, so
+    // that instance has to carry the model profile too, or the picker is
+    // unreachable on a narrow window.
+    renderCompact("access");
+
+    const trigger = await screen.findByLabelText(
+      "Assistant access and model profile",
+    );
+    expect(trigger).toBeTruthy();
+    // No labelled split triggers alongside it.
+    expect(screen.queryByLabelText("Model profile")).toBeNull();
+
+    await waitFor(() => {
+      expect(screen.getByText("Smart")).toBeTruthy();
+    });
+    // Access presets live in the same menu, under their own section label.
+    expect(screen.getByText("Assistant Access")).toBeTruthy();
+    expect(screen.getByText("Model Profile")).toBeTruthy();
+  });
+
+  test("stays split when the composer is wide", async () => {
+    renderMenu();
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Model profile")).toBeTruthy();
+    });
+    expect(
+      screen.queryByLabelText("Assistant access and model profile"),
+    ).toBeNull();
   });
 });

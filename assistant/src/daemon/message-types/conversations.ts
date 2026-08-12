@@ -29,15 +29,22 @@ interface BaseTransportMetadata {
   /** IANA timezone reported by the active client for the current turn. */
   clientTimezone?: string;
   /**
-   * The client's operating-system surface ("web" | "ios" | "macos"),
-   * reported independently of {@link interfaceId}. The web bundle ships to a
-   * browser, the Capacitor iOS shell, and the Electron macOS app, all on the
-   * same `"web"` transport interface — `clientOs` is what tells the assistant
-   * which OS it is actually talking to (rendered as the `client_os:` line in
-   * the per-turn context) WITHOUT perturbing transport/host-proxy capability
-   * inference, which keys off `interfaceId`.
+   * The client's operating-system surface, reported independently of
+   * {@link interfaceId}. The web bundle ships to browsers, mobile shells, and
+   * Electron desktop apps on the same `"web"` transport interface. `clientOs`
+   * tells the assistant which OS it is actually talking to, rendered as the
+   * `client_os:` line in the per-turn context, without perturbing
+   * transport/host-proxy capability inference, which keys off `interfaceId`.
    */
   clientOs?: string;
+  /**
+   * Id of the app the client currently has open on screen (the app viewer or
+   * the app-editing split). Rendered as the `visible_app:` line in the per-turn
+   * context so the assistant knows which app "the app" refers to without the
+   * user naming it. View state only: it never affects transport or tool
+   * gating, and is absent whenever no app is in view.
+   */
+  visibleAppId?: string;
 }
 
 /**

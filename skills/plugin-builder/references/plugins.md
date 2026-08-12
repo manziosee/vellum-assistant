@@ -133,6 +133,19 @@ Values, not just types, that a plugin consumes at module-load or init time. A bo
 | `resolveCredential`         | value | Resolve a stored credential to its plaintext value (the same value `assistant credentials reveal` prints) from a UUID or a `service/field` reference. When a plugin is in context, resolution is scoped to credentials whose `field` matches the plugin's manifest name; outside any plugin it is unscoped. Throws `CredentialResolutionError` on failure. |
 | `CredentialResolutionError` | class | Thrown when the credential ref does not resolve, the store is unreachable, or the credential is out of the plugin's scope. Catch it to degrade gracefully rather than crashing the hook.                                                                                                                                                                   |
 
+#### Public URLs
+
+Both resolve through the same host logic, which decides between a managed
+platform callback route and a configured public ingress. Both throw when the
+assistant has neither, since no URL would work in that case and a plausible
+one produces a registration that silently receives nothing.
+
+| Export                    | Kind  | Purpose                                                                                                                                                                                                                                                                                                                                                                |
+| ------------------------- | ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `resolveWebhookUrl`       | value | Resolve the public URL a third party should deliver to for one of the plugin's own ingress routes, in the plugin's reserved namespace. Takes the route `path`, and the `plugin` (defaulting to the one in context) plus an optional `sourceIdentifier` for admin display.                                                                                              |
+| `resolveOauthCallbackUrl` | value | Resolve the redirect URI an authorization server should send a user back to after consent. One shared route serves every OAuth flow, demultiplexed by OAuth `state`, so it takes no arguments and returns the same URL for every caller and every attempt. Use it where something must name the redirect URI ahead of the flow, such as a Client ID Metadata Document. |
+| `WebhookUrlOptions`       | type  | Options for `resolveWebhookUrl`.                                                                                                                                                                                                                                                                                                                                       |
+
 #### Inference helpers
 
 | Export                   | Kind  | Purpose                                                                                                                                                                                                                                                                                                               |
@@ -151,10 +164,25 @@ Values, not just types, that a plugin consumes at module-load or init time. A bo
 
 Host-resolved operations on the shared embedding and vector-store subsystem. Each reads live workspace config internally, so plugins hold no config. Async because the facade loads the embed graph lazily on first call.
 
-| Export                              | Kind  | Purpose                                                                                                                                                                           |
-| ----------------------------------- | ----- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `embedAndUpsert`                    | value | Embed a text or multimodal input and upsert the vector into the host's vector store. Returns the embedding and the upserted id.                                                   |
-| `selectedBackendSupportsMultimodal` | value | Check whether the currently selected embedding backend supports multimodal input (text + image). Gate multimodal embedding logic on this rather than assuming a specific backend. |
+Two families sit alongside the legacy `embedAndUpsert` write:
+
+- **Compute-only** (`embed`, `generateSparseEmbedding`): run the workspace backend and return raw vectors, with no persistence. Use when the plugin stores its own vectors (e.g. sqlite-vec) but wants the workspace's embedding config.
+- **Index** (`indexDocument` / `queryIndex` / `getDocument` / `removeDocument`): a plugin-owned semantic namespace with hybrid (dense + sparse) search. Scoping is automatic: every write is tagged with the calling plugin's manifest name (taken from the execution context, never an argument), so reads and deletes only ever see that plugin's own documents. **This index never participates in agent recall**, it is search _inside the plugin_ only. These throw if called outside a plugin execution context. Treat it as a derived cache of the plugin's own source data: its vectors are tied to the workspace embedding model, so a model or dimension change invalidates them and the plugin re-indexes from its source.
+
+| Export                               | Kind  | Purpose                                                                                                                                                                                                                              |
+| ------------------------------------ | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `embedAndUpsert`                     | value | Legacy write-only path: embed a text or multimodal input and upsert the vector into the host's shared vector store. Returns nothing.                                                                                                 |
+| `embed`                              | value | Embed a text or multimodal input and return the raw dense vector plus the provider/model/dimensions that produced it. No persistence.                                                                                                |
+| `generateSparseEmbedding`            | value | Generate the sparse (lexical) vector for a text using the host's shared encoder. Pure and local: no backend call, no persistence.                                                                                                    |
+| `indexDocument`                      | value | Embed and upsert a document into the calling plugin's private index (not agent recall). Returns a `documentId`. Pass `opts.documentId` to overwrite in place; `opts.metadata` to carry opaque provenance round-tripped on query/get. |
+| `queryIndex`                         | value | Hybrid (dense + sparse) semantic search over the calling plugin's index only. Falls back to dense-only when the query has no lexical tokens.                                                                                         |
+| `getDocument`                        | value | Fetch a single document (text, modality, metadata, createdAt) from the calling plugin's index by `documentId`, or null. Scoped to the calling plugin.                                                                                |
+| `removeDocument`                     | value | Remove a single document from the calling plugin's index by `documentId`. Scoped to the calling plugin.                                                                                                                              |
+| `selectedBackendSupportsMultimodal`  | value | Check whether the currently selected embedding backend supports multimodal input (text + image). Gate multimodal embedding logic on this rather than assuming a specific backend.                                                    |
+| `EmbedResult`                        | type  | Return shape of `embed`: `{ vector, provider, model, dimensions }`.                                                                                                                                                                  |
+| `IndexHit`                           | type  | A `queryIndex` hit: `{ documentId, score, text, modality, metadata? }`.                                                                                                                                                              |
+| `IndexedDocument`                    | type  | A `getDocument` result: `{ documentId, text, modality, metadata?, createdAt }`.                                                                                                                                                      |
+| `EmbeddingInput` / `SparseEmbedding` | type  | Input/output value shapes shared by the compute and index APIs (`EmbeddingInput` accepts a raw string or a multimodal `{ type, ... }` block).                                                                                        |
 
 #### Skills catalog
 

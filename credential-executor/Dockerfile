@@ -19,8 +19,7 @@ ENV PATH="/root/.bun/bin:${PATH}"
 # Note that we don't need source code to resolve cross-workspace dependencies.
 COPY package.json bun.lock ./
 COPY patches ./patches
-COPY clients/macos/package.json ./clients/macos/
-COPY clients/web/package.json ./clients/web/
+COPY --parents clients/*/package.json ./
 COPY cli/package.json ./cli/
 COPY gateway/package.json ./gateway/
 COPY credential-executor/package.json ./credential-executor/
@@ -57,6 +56,7 @@ COPY --from=builder --chown=ces:ces /app /app
 COPY --chown=ces:ces packages/service-contracts /app/packages/service-contracts
 COPY --chown=ces:ces packages/credential-storage /app/packages/credential-storage
 COPY --chown=ces:ces packages/egress-proxy /app/packages/egress-proxy
+COPY --chown=ces:ces packages/ipc-server-utils /app/packages/ipc-server-utils
 COPY --chown=ces:ces credential-executor ./
 
 # Pre-create /ces-data so the non-root ces user can write to it

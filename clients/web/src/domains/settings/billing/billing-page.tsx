@@ -1,14 +1,17 @@
 import { Loader2 } from "lucide-react";
 import { Suspense, useCallback, useEffect, useState } from "react";
 
-import { useNavigate, useSearchParams } from "react-router";
+import { useLocation, useNavigate, useSearchParams } from "react-router";
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { useActiveAssistantId } from "@/assistant/use-active-assistant-id";
 import { PlatformLoginNotice } from "@/components/platform-login-notice";
+import { AndroidBillingGate } from "@/domains/settings/billing/android-billing-gate";
 import { BillingOnboardingModal } from "@/domains/settings/billing/pro-onboarding/billing-onboarding-modal";
 import { shouldShowBillingTab } from "@/domains/settings/billing/billing-tab-visibility";
+import { CheckoutBonusModal } from "@/domains/settings/billing/checkout-bonus-modal";
+import { useCheckoutBonusOffer } from "@/domains/settings/billing/use-checkout-bonus-offer";
 import { proPackageDisplayName } from "@/domains/settings/billing/package-types";
 import { UsageTab } from "@/domains/settings/billing/usage/usage-tab";
 import { AdjustPlanModal } from "@/domains/settings/components/adjust-plan-modal";
@@ -22,9 +25,10 @@ import { useAssistantDomains } from "@/domains/settings/billing/pro-onboarding/u
 import {
   organizationsBillingSubscriptionOnboardingRetrieveOptions,
   organizationsBillingSubscriptionRetrieveOptions,
-  organizationsBillingSummaryRetrieveOptions,
 } from "@/generated/api/@tanstack/react-query.gen";
 import { useIsOrgReady } from "@/hooks/use-is-org-ready";
+import { notifyCheckoutSuccess } from "@/lib/billing/checkout-success";
+import { useTranslation } from "@/i18n";
 import {
   useActiveAssistantIsPlatformHosted,
   useActiveAssistantLifecycleIsLoading,
@@ -39,12 +43,22 @@ import { toast } from "@vellumai/design-library/components/toast";
 
 /**
  * Handles the `billing_status` query parameter that Stripe redirects back with
- * after checkout completes (success) or is cancelled.
+ * after checkout completes (success) or is cancelled. The upgrade-cancel page
+ * funnels into the cancel branch too, tagged `billing_context=upgrade` so the
+ * toast keeps its copy. A cancel is also lifted into parent state via
+ * `onCheckoutCancelled` before the navigate below wipes the query string, so
+ * the abandoned-checkout bonus offer can run its server-side eligibility
+ * check.
  */
-function BillingStatusHandler() {
+function BillingStatusHandler({
+  onCheckoutCancelled,
+}: {
+  onCheckoutCancelled: () => void;
+}) {
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const { t } = useTranslation("settings");
 
   useEffect(() => {
     const billingStatus = searchParams.get("billing_status");
@@ -53,23 +67,19 @@ function BillingStatusHandler() {
     }
 
     if (billingStatus === "success") {
-      toast.success(
-        "Payment received! Your credit balance will update shortly.",
-        {
-          id: "billing-status",
-        },
-      );
-      queryClient.invalidateQueries({
-        queryKey: organizationsBillingSummaryRetrieveOptions().queryKey,
-      });
+      notifyCheckoutSuccess(queryClient);
     } else if (billingStatus === "cancel") {
-      toast.info("Checkout was cancelled. No credits were added.", {
-        id: "billing-status",
-      });
+      toast.info(
+        searchParams.get("billing_context") === "upgrade"
+          ? t("billingStatusHandler.upgradeCancelToast")
+          : t("billingStatusHandler.topUpCancelToast"),
+        { id: "billing-status" },
+      );
+      onCheckoutCancelled();
     }
 
     navigate(routes.settings.usageBilling, { replace: true });
-  }, [searchParams, navigate, queryClient]);
+  }, [searchParams, navigate, queryClient, onCheckoutCancelled, t]);
 
   return null;
 }
@@ -132,7 +142,7 @@ function FinishProSetupNotice({
   );
 }
 
-function BillingTab() {
+function BillingTabContent() {
   const platformGate = usePlatformGate({ platformHostedOnly: true });
   const billingGate = usePlatformGate();
   const isPlatformHosted = useActiveAssistantIsPlatformHosted();
@@ -145,6 +155,28 @@ function BillingTab() {
   const [resizeModalOpen, setResizeModalOpen] = useState(false);
   const onTierUpgraded = useCallback(() => setResizeModalOpen(true), []);
   const [proOnboardingOpen, setProOnboardingOpen] = useState(false);
+
+  // Abandoned-checkout bonus: the cancel signal lives in state (not the URL)
+  // because BillingStatusHandler immediately navigate-replaces the query
+  // string away. It's a timestamp, not a boolean: this tab is a persistent
+  // mount on Electron/iOS, so a second cancel must read as a fresh trigger
+  // (the hook re-asks the server) instead of latching after the first. The
+  // server's answer alone decides whether the offer shows. Local dismissal
+  // keeps a declined offer closed until the next cancel re-arms it.
+  const [checkoutCancelledAt, setCheckoutCancelledAt] = useState<number | null>(
+    null,
+  );
+  const [bonusDismissed, setBonusDismissed] = useState(false);
+  const onCheckoutCancelled = useCallback(() => {
+    setCheckoutCancelledAt(Date.now());
+    setBonusDismissed(false);
+  }, []);
+  const { showOffer, amountUsd } = useCheckoutBonusOffer(checkoutCancelledAt);
+  const onBonusOpenChange = useCallback((open: boolean) => {
+    if (!open) {
+      setBonusDismissed(true);
+    }
+  }, []);
 
   useEffect(() => {
     // Only consume the modal-opening params once billing is usable (signed
@@ -247,7 +279,7 @@ function BillingTab() {
   return (
     <div className="space-y-4">
       <Suspense fallback={null}>
-        <BillingStatusHandler />
+        <BillingStatusHandler onCheckoutCancelled={onCheckoutCancelled} />
         <BillingPortalReturnHandler />
       </Suspense>
       {showPlanManagement && <GracePeriodBanner />}
@@ -264,6 +296,11 @@ function BillingTab() {
           onTierUpgraded={onTierUpgraded}
         />
       )}
+      <CheckoutBonusModal
+        open={showOffer && !bonusDismissed}
+        onOpenChange={onBonusOpenChange}
+        amountUsd={amountUsd}
+      />
       <Suspense fallback={null}>
         <BillingPanel />
       </Suspense>
@@ -287,6 +324,14 @@ function BillingTab() {
   );
 }
 
+function BillingTab() {
+  return (
+    <AndroidBillingGate>
+      <BillingTabContent />
+    </AndroidBillingGate>
+  );
+}
+
 function UsagePanel() {
   const assistantId = useActiveAssistantId();
   const chartGate = usePlatformGate({ platformHostedOnly: true });
@@ -303,7 +348,9 @@ function UsagePanel() {
 
 export function BillingPage() {
   const billingGate = usePlatformGate();
-  const [searchParams, setSearchParams] = useSearchParams();
+  const [searchParams] = useSearchParams();
+  const navigate = useNavigate();
+  const { hash } = useLocation();
   // Shown when signed in (`"full"`); for a signed-out-but-reachable viewer
   // (`"disabled"`) it stays reachable only when the URL carries billing intent
   // (a deeplink / upgrade CTA / Stripe return), so the BillingTab login notice
@@ -335,14 +382,17 @@ export function BillingPage() {
     if (searchParams.get("tab") !== activeTab) {
       const next = new URLSearchParams(searchParams);
       next.set("tab", activeTab);
-      setSearchParams(next, { replace: true });
+      // Not `setSearchParams` — that drops the URL hash, and anchor deep
+      // links (`#daily-credit-limit` from the daily-limit email) must survive
+      // this normalization however late the anchored card mounts.
+      void navigate({ search: `?${next}`, hash }, { replace: true });
     }
-  }, [isPlatformSessionSettled, searchParams, activeTab, setSearchParams]);
+  }, [isPlatformSessionSettled, searchParams, activeTab, navigate, hash]);
 
   const handleTabChange = (value: string) => {
     const next = new URLSearchParams(searchParams);
     next.set("tab", value);
-    setSearchParams(next, { replace: true });
+    void navigate({ search: `?${next}`, hash }, { replace: true });
   };
 
   return (

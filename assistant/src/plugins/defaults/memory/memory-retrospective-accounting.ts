@@ -23,7 +23,7 @@
 // accounting; once newer real messages arrive it is copied into the next
 // run's fork as inert prefix context.
 
-import { and, eq, like } from "drizzle-orm";
+import { and, eq, gt, like, or } from "drizzle-orm";
 
 import {
   countMessagesAfter,
@@ -52,18 +52,30 @@ export function isSkillCardMessage(row: { metadata: string | null }): boolean {
 }
 
 /**
- * `getMessagesAfter` minus skill-card rows. The retrospective job's
- * new-message slice: a card-only tail yields an empty slice (the job's
- * `no_new_messages` early return), and a mixed tail's cutoff lands on the
- * last real message rather than the card.
+ * `getMessagesAfter` truncated at the first unfinalized row, minus skill-card
+ * rows. The retrospective job's new-message slice: a card-only tail yields an
+ * empty slice (the job's `no_new_messages` early return), and a mixed tail's
+ * cutoff lands on the last real message rather than the card.
+ *
+ * The slice STOPS BEFORE the first unfinalized row rather than filtering it
+ * out. The job's cutoff (and therefore `lastProcessedMessageId` on success)
+ * is chosen from this slice, while the fork the job reviews skips unfinalized
+ * rows, so the cursor must never move past one: filtering through a stale
+ * mid-slice `finalized = 0` row would advance the cursor beyond it, and once
+ * the row later finalizes its `(createdAt, id)` sits behind the cursor,
+ * unreviewed forever. Truncating parks the cursor before the unfinalized row;
+ * the rows behind it are reviewed by the retrospective that runs after the
+ * row resolves (finalizes, or is repaired away by crash recovery).
  */
 export function getRetrospectiveMessagesAfter(
   conversationId: string,
   afterMessageId: string | null,
 ): MessageRow[] {
-  return getMessagesAfter(conversationId, afterMessageId).filter(
-    (row) => !isSkillCardMessage(row),
-  );
+  const rows = getMessagesAfter(conversationId, afterMessageId);
+  const firstUnfinalized = rows.findIndex((row) => row.finalized !== 1);
+  const bounded =
+    firstUnfinalized === -1 ? rows : rows.slice(0, firstUnfinalized);
+  return bounded.filter((row) => !isSkillCardMessage(row));
 }
 
 /**
@@ -83,6 +95,110 @@ export function countRetrospectiveMessagesAfter(
   }
   const cardCount = countSkillCardMessagesAfter(conversationId, afterMessageId);
   return Math.max(0, total - cardCount);
+}
+
+/**
+ * True when any block in a parsed content array is something other than a
+ * tool result (`tool_result` / `web_search_tool_result`). Both are transport
+ * blocks for tool output riding on user-role rows, not user-authored
+ * activity; an empty array carries nothing.
+ */
+function blocksCarryNonToolResult(
+  blocks: ReadonlyArray<{ type?: unknown }>,
+): boolean {
+  return blocks.some(
+    (block) =>
+      block.type !== "tool_result" && block.type !== "web_search_tool_result",
+  );
+}
+
+/**
+ * True when the slice contains at least one user-authored message: a
+ * user-role row whose resolved content carries a non-tool_result block. Tool
+ * results ride on user-role rows, so a bare role check would count any
+ * tool-using assistant stretch as user activity.
+ */
+export function messagesHaveUserActivity(
+  rows: ReadonlyArray<Pick<MessageRow, "role" | "content">>,
+): boolean {
+  return rows.some(
+    (row) => row.role === "user" && blocksCarryNonToolResult(row.content),
+  );
+}
+
+/**
+ * Existence probe for user-authored activity strictly after the
+ * `(createdAt, id)` cursor: at least one user-role row whose content carries
+ * a non-tool_result block. Powers the `memory.retrospective.requireUserActivity`
+ * enqueue gate, so only user rows are loaded. Cursor semantics mirror
+ * `countMessagesAfter`: a null/`""` reference scans the whole conversation,
+ * and a vanished reference means no new work.
+ *
+ * Operates on the raw `content` column: rows that do not parse to a block
+ * array (file-backed `{ ref }` rows, legacy plain strings) count as
+ * user-authored, so the gate fails toward running the retrospective.
+ */
+export function hasQualifyingUserMessageAfter(
+  conversationId: string,
+  afterMessageId: string | null,
+): boolean {
+  const cursorId =
+    afterMessageId === null || afterMessageId === "" ? null : afterMessageId;
+  const db = getDb();
+
+  let ref: { createdAt: number } | undefined;
+  if (cursorId !== null) {
+    ref = db
+      .select({ createdAt: messages.createdAt })
+      .from(messages)
+      .where(eq(messages.id, cursorId))
+      .get();
+    if (!ref) {
+      return false;
+    }
+  }
+
+  const afterCursor =
+    cursorId !== null && ref
+      ? [
+          or(
+            gt(messages.createdAt, ref.createdAt),
+            and(
+              eq(messages.createdAt, ref.createdAt),
+              gt(messages.id, cursorId),
+            ),
+          ),
+        ]
+      : [];
+  const rows = db
+    .select({ content: messages.content })
+    .from(messages)
+    .where(
+      and(
+        eq(messages.conversationId, conversationId),
+        eq(messages.role, "user"),
+        ...afterCursor,
+      ),
+    )
+    .all();
+
+  return rows.some((row) => rawUserContentCarriesActivity(row.content));
+}
+
+/** Raw-column twin of the block check used by {@link messagesHaveUserActivity}. */
+function rawUserContentCarriesActivity(raw: string | null): boolean {
+  if (raw === null || raw === "") {
+    return false;
+  }
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      return true;
+    }
+    return blocksCarryNonToolResult(parsed as Array<{ type?: unknown }>);
+  } catch {
+    return true;
+  }
 }
 
 /**

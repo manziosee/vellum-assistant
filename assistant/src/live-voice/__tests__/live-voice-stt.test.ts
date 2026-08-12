@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, mock, test } from "bun:test";
 
 import type { VoiceTurnOptions } from "../../calls/voice-session-bridge.js";
+import { loadRawConfig, saveRawConfig } from "../../config/loader.js";
 import type {
   StreamingTranscriber,
   SttStreamServerEvent,
@@ -11,6 +12,7 @@ import {
   type LiveVoiceStreamingTranscriberResolver,
 } from "../live-voice-session.js";
 import type { LiveVoiceSessionFactoryContext } from "../live-voice-session-manager.js";
+import type { LiveVoiceTtsOptions } from "../live-voice-tts.js";
 import {
   createLiveVoiceServerFrameSequencer,
   type LiveVoiceClientStartFrame,
@@ -28,13 +30,19 @@ const START_FRAME = {
 } as const satisfies LiveVoiceClientStartFrame;
 
 class MockStreamingTranscriber implements StreamingTranscriber {
-  readonly providerId = "deepgram" as const;
+  // Configurable: the session gates the language-pin fallback on the DIALED
+  // transcriber's providerId (see turnLanguageFor).
+  readonly providerId: StreamingTranscriber["providerId"];
   readonly boundaryId = "daemon-streaming" as const;
   readonly audioChunks: Buffer[] = [];
   readonly mimeTypes: string[] = [];
   started = false;
   stopped = false;
   private onEvent: ((event: SttStreamServerEvent) => void) | null = null;
+
+  constructor(providerId: StreamingTranscriber["providerId"] = "deepgram") {
+    this.providerId = providerId;
+  }
 
   async start(onEvent: (event: SttStreamServerEvent) => void): Promise<void> {
     this.started = true;
@@ -44,6 +52,11 @@ class MockStreamingTranscriber implements StreamingTranscriber {
   sendAudio(audio: Buffer, mimeType: string): void {
     this.audioChunks.push(audio);
     this.mimeTypes.push(mimeType);
+    // Mirrors real providers: silence produces no interim results, so an
+    // all-zero chunk (flushed pre-roll silence) forwards without a partial.
+    if (audio.every((byte) => byte === 0)) {
+      return;
+    }
     this.onEvent?.({
       type: "partial",
       text: `partial-${this.audioChunks.length}`,
@@ -129,6 +142,39 @@ function completingVoiceTurnStarter() {
   });
 }
 
+// A starter whose leg streams one spoken sentence so the turn reaches TTS.
+function speakingVoiceTurnStarter(reply = "Okay.") {
+  return mock(async (options: VoiceTurnOptions) => {
+    options.callbacks?.assistant_text_delta?.({
+      type: "assistant_text_delta",
+      text: reply,
+      conversationId: options.conversationId,
+    });
+    options.callbacks?.message_complete?.({
+      type: "message_complete",
+      conversationId: options.conversationId,
+      messageId: "assistant-message-123",
+    });
+    return { turnId: "bridge-turn-1", abort: mock() };
+  });
+}
+
+// Records the exact options object of every TTS synthesis request.
+function recordingTtsStreamer() {
+  const ttsCalls: LiveVoiceTtsOptions[] = [];
+  const streamTtsAudio = mock(async (options: LiveVoiceTtsOptions) => {
+    ttsCalls.push(options);
+    return {
+      provider: "fish-audio" as const,
+      contentType: "audio/pcm",
+      sampleRate: 24_000,
+      chunks: 0,
+      bytes: 0,
+    };
+  });
+  return { streamTtsAudio, ttsCalls };
+}
+
 function createContext(overrides: Partial<LiveVoiceClientStartFrame> = {}): {
   context: LiveVoiceSessionFactoryContext;
   frames: LiveVoiceServerFrame[];
@@ -162,6 +208,10 @@ function loudPcmChunk(amplitude = 8_000, sampleCount = 240): Uint8Array {
   return new Uint8Array(buffer);
 }
 
+function silentPcmChunk(sampleCount = 240): Uint8Array {
+  return new Uint8Array(Buffer.alloc(sampleCount * 2));
+}
+
 function createSessionWithTranscriber(
   transcriber = new MockStreamingTranscriber(),
 ) {
@@ -193,7 +243,12 @@ describe("LiveVoiceSession STT", () => {
 
     await session.start();
 
-    expect(resolver).toHaveBeenCalledWith({ sampleRate: 24_000 });
+    // The config default is "multi", so the session carries a language into
+    // the resolver rather than leaving it to be inferred downstream.
+    expect(resolver).toHaveBeenCalledWith({
+      sampleRate: 24_000,
+      language: "multi",
+    });
     expect(transcriber.started).toBe(true);
     expect(frames).toEqual([
       {
@@ -204,6 +259,20 @@ describe("LiveVoiceSession STT", () => {
         turnDetection: "manual",
       },
     ]);
+  });
+
+  test("ignores model-integrated turn-detection events", async () => {
+    const { frames, session, transcriber } = createSessionWithTranscriber();
+
+    await session.start();
+    transcriber.emit({ type: "turn-start" });
+    transcriber.emit({ type: "eager-turn-end", text: "eager" });
+    transcriber.emit({ type: "turn-resumed" });
+    transcriber.emit({ type: "turn-end", text: "committed", confidence: 0.9 });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(frames.map((frame) => frame.type)).toEqual(["ready"]);
+    expect(session.finalTranscriptText).toBe("");
   });
 
   test("marks transient transcriber errors recoverable while the session continues", async () => {
@@ -742,6 +811,317 @@ describe("LiveVoiceSession STT", () => {
     expect(transcriber.stopCalls).toBe(1);
   });
 
+  test("re-dials a fresh transcriber when services.stt.language changes between utterances", async () => {
+    const originalRaw = loadRawConfig();
+    const transcribers: FinalizingMockStreamingTranscriber[] = [];
+    const resolver = mock(async () => {
+      const transcriber = new FinalizingMockStreamingTranscriber();
+      transcribers.push(transcriber);
+      return transcriber;
+    });
+    const startVoiceTurn = completingVoiceTurnStarter();
+    const { context, frames } = createContext({ turnDetection: "server_vad" });
+    const session = new LiveVoiceSession(context, {
+      resolveTranscriber: resolver,
+      startVoiceTurn,
+    });
+
+    try {
+      await session.start();
+      await session.handleBinaryAudio(loudPcmChunk());
+      await session.handleClientFrame({ type: "ptt_release" });
+      await waitFor(
+        () => frames.filter((frame) => frame.type === "tts_done").length === 1,
+      );
+
+      // The voice-room gear patches services.stt.language while the session
+      // idles between turns; no session protocol message is involved.
+      const rawServices = (originalRaw.services ?? {}) as Record<
+        string,
+        unknown
+      >;
+      saveRawConfig({
+        ...originalRaw,
+        services: {
+          ...rawServices,
+          stt: {
+            ...((rawServices.stt ?? {}) as Record<string, unknown>),
+            language: "hi",
+          },
+        },
+      });
+
+      await session.handleBinaryAudio(loudPcmChunk());
+      await waitFor(() => transcribers.length === 2);
+      await session.handleClientFrame({ type: "ptt_release" });
+      await waitFor(
+        () => frames.filter((frame) => frame.type === "tts_done").length === 2,
+      );
+
+      // The old-language stream is stopped and a fresh one dialed; both
+      // turns read "utterance 1" because each transcriber's finalize
+      // counter starts at one, which is itself proof the second stream is
+      // a fresh instance rather than the reused first.
+      expect(resolver).toHaveBeenCalledTimes(2);
+      expect(transcribers[0]?.stopCalls).toBe(1);
+      expect(transcribers[1]?.startCalls).toBe(1);
+      expect(transcribers[1]?.stopCalls).toBe(0);
+      expect(startVoiceTurn.mock.calls.map((call) => call[0].content)).toEqual([
+        "utterance 1",
+        "utterance 1",
+      ]);
+      expect(
+        frames.flatMap((frame) =>
+          frame.type === "stt_final" ? [frame.text] : [],
+        ),
+      ).toEqual(["utterance 1", "utterance 1"]);
+
+      // A retired stream's stop() emits closed asynchronously, possibly
+      // after the replacement stream is installed. The stale close must
+      // leave the replacement's shared-stream state intact: the next
+      // utterance re-arms the replacement instead of dialing a third
+      // stream.
+      transcribers[0]?.emit({ type: "closed" });
+      await session.handleBinaryAudio(loudPcmChunk());
+      await session.handleClientFrame({ type: "ptt_release" });
+      await waitFor(
+        () => frames.filter((frame) => frame.type === "tts_done").length === 3,
+      );
+      expect(resolver).toHaveBeenCalledTimes(2);
+      expect(transcribers[1]?.stopCalls).toBe(0);
+    } finally {
+      await session.close("websocket_close");
+      saveRawConfig(originalRaw);
+    }
+  });
+
+  test("re-dials for a language change when the eager cycle holds only pre-roll silence", async () => {
+    const originalRaw = loadRawConfig();
+    const transcribers: FinalizingMockStreamingTranscriber[] = [];
+    const resolver = mock(async () => {
+      const transcriber = new FinalizingMockStreamingTranscriber();
+      transcribers.push(transcriber);
+      return transcriber;
+    });
+    // Deferred turn completion: silence sent while the turn is in flight
+    // parks in the VAD pre-roll ring, so the finalize-time eager re-arm
+    // flushes it into the next cycle (assigning a turnId without speech).
+    const pendingCompletions: Array<() => void> = [];
+    const startVoiceTurn = mock(async (options: VoiceTurnOptions) => {
+      pendingCompletions.push(() => {
+        options.callbacks?.message_complete?.({
+          type: "message_complete",
+          conversationId: options.conversationId,
+          messageId: "assistant-message-123",
+        });
+      });
+      return { turnId: "bridge-turn-1", abort: mock() };
+    });
+    const { context, frames } = createContext({ turnDetection: "server_vad" });
+    const session = new LiveVoiceSession(context, {
+      resolveTranscriber: resolver,
+      startVoiceTurn,
+    });
+
+    try {
+      await session.start();
+      await session.handleBinaryAudio(loudPcmChunk());
+      await session.handleClientFrame({ type: "ptt_release" });
+      await waitFor(() => pendingCompletions.length === 1);
+      // Idle mic while the assistant responds: silence lands in the
+      // pre-roll ring ahead of the eager re-arm.
+      await session.handleBinaryAudio(silentPcmChunk());
+      await session.handleBinaryAudio(silentPcmChunk());
+      pendingCompletions.shift()?.();
+      await waitFor(
+        () => frames.filter((frame) => frame.type === "tts_done").length === 1,
+      );
+
+      const rawServices = (originalRaw.services ?? {}) as Record<
+        string,
+        unknown
+      >;
+      saveRawConfig({
+        ...originalRaw,
+        services: {
+          ...rawServices,
+          stt: {
+            ...((rawServices.stt ?? {}) as Record<string, unknown>),
+            language: "hi",
+          },
+        },
+      });
+
+      // First speech after the change: the silence-only eager cycle retires
+      // with the old-language stream and a fresh one dials.
+      await session.handleBinaryAudio(loudPcmChunk());
+      await waitFor(() => transcribers.length === 2);
+      await session.handleClientFrame({ type: "ptt_release" });
+      await waitFor(() => pendingCompletions.length === 1);
+      pendingCompletions.shift()?.();
+      await waitFor(
+        () => frames.filter((frame) => frame.type === "tts_done").length === 2,
+      );
+
+      expect(resolver).toHaveBeenCalledTimes(2);
+      expect(transcribers[0]?.stopCalls).toBe(1);
+      expect(transcribers[1]?.stopCalls).toBe(0);
+    } finally {
+      await session.close("websocket_close");
+      saveRawConfig(originalRaw);
+    }
+  });
+
+  test("keeps the old-language stream when the eager cycle already carries a committed final", async () => {
+    const originalRaw = loadRawConfig();
+    const transcribers: FinalizingMockStreamingTranscriber[] = [];
+    const resolver = mock(async () => {
+      const transcriber = new FinalizingMockStreamingTranscriber();
+      transcribers.push(transcriber);
+      return transcriber;
+    });
+    // Deferred turn completion so the eager post-turn re-arm binds the next
+    // cycle to the shared stream while the session idles.
+    const pendingCompletions: Array<() => void> = [];
+    const startVoiceTurn = mock(async (options: VoiceTurnOptions) => {
+      pendingCompletions.push(() => {
+        options.callbacks?.message_complete?.({
+          type: "message_complete",
+          conversationId: options.conversationId,
+          messageId: "assistant-message-123",
+        });
+      });
+      return { turnId: "bridge-turn-1", abort: mock() };
+    });
+    const { context, frames } = createContext({ turnDetection: "server_vad" });
+    const session = new LiveVoiceSession(context, {
+      resolveTranscriber: resolver,
+      startVoiceTurn,
+    });
+
+    try {
+      await session.start();
+      await session.handleBinaryAudio(loudPcmChunk());
+      await session.handleClientFrame({ type: "ptt_release" });
+      await waitFor(() => pendingCompletions.length === 1);
+      pendingCompletions.shift()?.();
+      await waitFor(
+        () => frames.filter((frame) => frame.type === "tts_done").length === 1,
+      );
+
+      // Wait until the eagerly re-armed cycle owns shared-stream events (a
+      // partial that lands before the re-arm targets the dispatched cycle
+      // and is dropped), then land a late tail final from the previous
+      // utterance's audio on it. Its stt_final frame reaches the client.
+      const shared = transcribers[0];
+      if (!shared) {
+        throw new Error("Expected the shared transcriber to be resolved");
+      }
+      await waitFor(() => {
+        shared.emit({ type: "partial", text: "tail probe" });
+        return frames.some(
+          (frame) =>
+            frame.type === "stt_partial" && frame.text === "tail probe",
+        );
+      });
+      shared.emit({ type: "final", text: "late tail" });
+      await waitFor(() =>
+        frames.some(
+          (frame) => frame.type === "stt_final" && frame.text === "late tail",
+        ),
+      );
+
+      const rawServices = (originalRaw.services ?? {}) as Record<
+        string,
+        unknown
+      >;
+      saveRawConfig({
+        ...originalRaw,
+        services: {
+          ...rawServices,
+          stt: {
+            ...((rawServices.stt ?? {}) as Record<string, unknown>),
+            language: "hi",
+          },
+        },
+      });
+
+      // Speech after the change: the cycle carries a committed final the
+      // client already displayed, so it keeps the old-language stream (no
+      // re-dial for this utterance) and its turn carries the tail text.
+      await session.handleBinaryAudio(loudPcmChunk());
+      await session.handleClientFrame({ type: "ptt_release" });
+      await waitFor(() => pendingCompletions.length === 1);
+
+      expect(resolver).toHaveBeenCalledTimes(1);
+      expect(shared.stopCalls).toBe(0);
+      expect(startVoiceTurn.mock.calls[1]?.[0]?.content).toBe(
+        "late tail utterance 2",
+      );
+
+      pendingCompletions.shift()?.();
+      await waitFor(
+        () => frames.filter((frame) => frame.type === "tts_done").length === 2,
+      );
+
+      // The language change applies from the following utterance: the next
+      // re-arm retires the old-language stream and dials a fresh one.
+      await waitFor(() => transcribers.length === 2);
+      expect(shared.stopCalls).toBe(1);
+    } finally {
+      await session.close("websocket_close");
+      saveRawConfig(originalRaw);
+    }
+  });
+
+  test("keeps the zero-round-trip re-arm when the configured language is unchanged", async () => {
+    const originalRaw = loadRawConfig();
+    const rawServices = (originalRaw.services ?? {}) as Record<string, unknown>;
+    saveRawConfig({
+      ...originalRaw,
+      services: {
+        ...rawServices,
+        stt: {
+          ...((rawServices.stt ?? {}) as Record<string, unknown>),
+          language: "en-US",
+        },
+      },
+    });
+    const transcriber = new FinalizingMockStreamingTranscriber();
+    const resolver = mock(async () => transcriber);
+    const startVoiceTurn = completingVoiceTurnStarter();
+    const { context, frames } = createContext({ turnDetection: "server_vad" });
+    const session = new LiveVoiceSession(context, {
+      resolveTranscriber: resolver,
+      startVoiceTurn,
+    });
+
+    try {
+      await session.start();
+      await session.handleBinaryAudio(loudPcmChunk());
+      await session.handleClientFrame({ type: "ptt_release" });
+      await waitFor(
+        () => frames.filter((frame) => frame.type === "tts_done").length === 1,
+      );
+
+      await session.handleBinaryAudio(loudPcmChunk());
+      await session.handleClientFrame({ type: "ptt_release" });
+      await waitFor(
+        () => frames.filter((frame) => frame.type === "tts_done").length === 2,
+      );
+
+      // A set-and-unchanged language matches at every re-arm, so the
+      // session keeps the single shared stream.
+      expect(resolver).toHaveBeenCalledTimes(1);
+      expect(transcriber.startCalls).toBe(1);
+      expect(transcriber.stopCalls).toBe(0);
+      expect(transcriber.finalizeCalls).toBe(2);
+    } finally {
+      await session.close("websocket_close");
+      saveRawConfig(originalRaw);
+    }
+  });
+
   test("grace timeout starts the turn with collected segments when the finalize flush never arrives", async () => {
     const transcriber = new FinalizingMockStreamingTranscriber();
     transcriber.respondToFinalize = false;
@@ -1009,6 +1389,269 @@ describe("LiveVoiceSession STT", () => {
       "utterance 1",
       "utterance 1",
     ]);
+  });
+
+  test("finals tagged with a detected language carry it to TTS and the control prompt", async () => {
+    const transcriber = new MockStreamingTranscriber();
+    const startVoiceTurn = speakingVoiceTurnStarter();
+    const { streamTtsAudio, ttsCalls } = recordingTtsStreamer();
+    const { context } = createContext();
+    const session = new LiveVoiceSession(context, {
+      resolveTranscriber: mock(async () => transcriber),
+      startVoiceTurn,
+      streamTtsAudio,
+    });
+
+    await session.start();
+    await session.handleBinaryAudio(new Uint8Array([1]));
+    transcriber.emit({ type: "final", text: "नमस्ते", languages: ["hi"] });
+    await session.handleClientFrame({ type: "ptt_release" });
+    await waitFor(() => ttsCalls.length >= 1);
+
+    expect(ttsCalls[0]?.language).toBe("hi");
+    expect(startVoiceTurn.mock.calls[0]?.[0]?.voiceControlPrompt).toContain(
+      'speaking the language with code "hi"',
+    );
+  });
+
+  test("a tagged partial supplies the turn language when finals carry no tags", async () => {
+    // Speculative turns dispatch from partials before the first tagged
+    // final, so the latest tagged partial must resolve the language.
+    const transcriber = new MockStreamingTranscriber();
+    const startVoiceTurn = speakingVoiceTurnStarter();
+    const { streamTtsAudio, ttsCalls } = recordingTtsStreamer();
+    const { context } = createContext();
+    const session = new LiveVoiceSession(context, {
+      resolveTranscriber: mock(async () => transcriber),
+      startVoiceTurn,
+      streamTtsAudio,
+    });
+
+    await session.start();
+    await session.handleBinaryAudio(new Uint8Array([1]));
+    transcriber.emit({ type: "partial", text: "hola", languages: ["es"] });
+    transcriber.emit({ type: "final", text: "hola amigo" });
+    await session.handleClientFrame({ type: "ptt_release" });
+    await waitFor(() => ttsCalls.length >= 1);
+
+    expect(ttsCalls[0]?.language).toBe("es");
+  });
+
+  test("empty finals carrying language tags do not vote", async () => {
+    // Silence frames can carry container-level tags describing no emitted
+    // words; they must not outvote the language of real speech.
+    const transcriber = new MockStreamingTranscriber();
+    const startVoiceTurn = speakingVoiceTurnStarter();
+    const { streamTtsAudio, ttsCalls } = recordingTtsStreamer();
+    const { context } = createContext();
+    const session = new LiveVoiceSession(context, {
+      resolveTranscriber: mock(async () => transcriber),
+      startVoiceTurn,
+      streamTtsAudio,
+    });
+
+    await session.start();
+    await session.handleBinaryAudio(new Uint8Array([1]));
+    transcriber.emit({ type: "final", text: "", languages: ["es"] });
+    transcriber.emit({ type: "final", text: "", languages: ["es"] });
+    transcriber.emit({ type: "final", text: "hello there", languages: ["en"] });
+    await session.handleClientFrame({ type: "ptt_release" });
+    await waitFor(() => ttsCalls.length >= 1);
+
+    expect(ttsCalls[0]?.language).toBe("en");
+  });
+
+  test("only each final's dominant language votes", async () => {
+    // `languages` is dominance-ranked per event: a Spanish-dominant segment
+    // tagged ["es", "en"] plus a short English segment tagged ["en"] must
+    // resolve to Spanish (one vote each, tie broken by first appearance),
+    // not English by counting the secondary tag as a full vote.
+    const transcriber = new MockStreamingTranscriber();
+    const startVoiceTurn = speakingVoiceTurnStarter();
+    const { streamTtsAudio, ttsCalls } = recordingTtsStreamer();
+    const { context } = createContext();
+    const session = new LiveVoiceSession(context, {
+      resolveTranscriber: mock(async () => transcriber),
+      startVoiceTurn,
+      streamTtsAudio,
+    });
+
+    await session.start();
+    await session.handleBinaryAudio(new Uint8Array([1]));
+    transcriber.emit({
+      type: "final",
+      text: "hola amigo como estas hoy",
+      languages: ["es", "en"],
+    });
+    transcriber.emit({ type: "final", text: "ok", languages: ["en"] });
+    await session.handleClientFrame({ type: "ptt_release" });
+    await waitFor(() => ttsCalls.length >= 1);
+
+    expect(ttsCalls[0]?.language).toBe("es");
+  });
+
+  test("a tagged final outranks an earlier tagged partial", async () => {
+    const transcriber = new MockStreamingTranscriber();
+    const startVoiceTurn = speakingVoiceTurnStarter();
+    const { streamTtsAudio, ttsCalls } = recordingTtsStreamer();
+    const { context } = createContext();
+    const session = new LiveVoiceSession(context, {
+      resolveTranscriber: mock(async () => transcriber),
+      startVoiceTurn,
+      streamTtsAudio,
+    });
+
+    await session.start();
+    await session.handleBinaryAudio(new Uint8Array([1]));
+    transcriber.emit({ type: "partial", text: "hola", languages: ["es"] });
+    transcriber.emit({ type: "final", text: "नमस्ते", languages: ["hi"] });
+    await session.handleClientFrame({ type: "ptt_release" });
+    await waitFor(() => ttsCalls.length >= 1);
+
+    expect(ttsCalls[0]?.language).toBe("hi");
+  });
+
+  test("a monolingual services.stt.language pin is the turn language when finals carry no tags", async () => {
+    const originalRaw = loadRawConfig();
+    const rawServices = (originalRaw.services ?? {}) as Record<string, unknown>;
+    saveRawConfig({
+      ...originalRaw,
+      services: {
+        ...rawServices,
+        stt: {
+          ...((rawServices.stt ?? {}) as Record<string, unknown>),
+          language: "ja",
+        },
+      },
+    });
+    const transcriber = new MockStreamingTranscriber();
+    const startVoiceTurn = speakingVoiceTurnStarter();
+    const { streamTtsAudio, ttsCalls } = recordingTtsStreamer();
+    const { context } = createContext();
+    const session = new LiveVoiceSession(context, {
+      resolveTranscriber: mock(async () => transcriber),
+      startVoiceTurn,
+      streamTtsAudio,
+    });
+
+    try {
+      await session.start();
+      await session.handleBinaryAudio(new Uint8Array([1]));
+      await session.handleClientFrame({ type: "ptt_release" });
+      await waitFor(() => ttsCalls.length >= 1);
+
+      expect(ttsCalls[0]?.language).toBe("ja");
+      expect(startVoiceTurn.mock.calls[0]?.[0]?.voiceControlPrompt).toContain(
+        'speaking the language with code "ja"',
+      );
+    } finally {
+      await session.close("websocket_close");
+      saveRawConfig(originalRaw);
+    }
+  });
+
+  test("a pin on an auto-detecting provider does not become the turn language", async () => {
+    // google-gemini and openai-whisper ignore services.stt.language, so a
+    // stale persisted pin must not force every turn into that language.
+    const originalRaw = loadRawConfig();
+    const rawServices = (originalRaw.services ?? {}) as Record<string, unknown>;
+    saveRawConfig({
+      ...originalRaw,
+      services: {
+        ...rawServices,
+        stt: {
+          ...((rawServices.stt ?? {}) as Record<string, unknown>),
+          provider: "google-gemini",
+          language: "es",
+        },
+      },
+    });
+    const transcriber = new MockStreamingTranscriber("google-gemini");
+    const startVoiceTurn = speakingVoiceTurnStarter();
+    const { streamTtsAudio, ttsCalls } = recordingTtsStreamer();
+    const { context } = createContext();
+    const session = new LiveVoiceSession(context, {
+      resolveTranscriber: mock(async () => transcriber),
+      startVoiceTurn,
+      streamTtsAudio,
+    });
+
+    try {
+      await session.start();
+      await session.handleBinaryAudio(new Uint8Array([1]));
+      await session.handleClientFrame({ type: "ptt_release" });
+      await waitFor(() => ttsCalls.length >= 1);
+
+      expect(ttsCalls[0] && "language" in ttsCalls[0]).toBe(false);
+    } finally {
+      await session.close("websocket_close");
+      saveRawConfig(originalRaw);
+    }
+  });
+
+  test("the pin gate follows the dialed provider, not the configured one", async () => {
+    // A BYOK gemini config without credentials silently dials the managed
+    // vellum transcriber, which DOES honor the pin; the gate must follow
+    // what was dialed, not what was configured.
+    const originalRaw = loadRawConfig();
+    const rawServices = (originalRaw.services ?? {}) as Record<string, unknown>;
+    saveRawConfig({
+      ...originalRaw,
+      services: {
+        ...rawServices,
+        stt: {
+          ...((rawServices.stt ?? {}) as Record<string, unknown>),
+          provider: "google-gemini",
+          language: "es",
+        },
+      },
+    });
+    const transcriber = new MockStreamingTranscriber("vellum");
+    const startVoiceTurn = speakingVoiceTurnStarter();
+    const { streamTtsAudio, ttsCalls } = recordingTtsStreamer();
+    const { context } = createContext();
+    const session = new LiveVoiceSession(context, {
+      resolveTranscriber: mock(async () => transcriber),
+      startVoiceTurn,
+      streamTtsAudio,
+    });
+
+    try {
+      await session.start();
+      await session.handleBinaryAudio(new Uint8Array([1]));
+      await session.handleClientFrame({ type: "ptt_release" });
+      await waitFor(() => ttsCalls.length >= 1);
+
+      expect(ttsCalls[0]?.language).toBe("es");
+    } finally {
+      await session.close("websocket_close");
+      saveRawConfig(originalRaw);
+    }
+  });
+
+  test('the default "multi" with tag-less finals leaves every language-aware path untouched', async () => {
+    const transcriber = new MockStreamingTranscriber();
+    const startVoiceTurn = speakingVoiceTurnStarter();
+    const { streamTtsAudio, ttsCalls } = recordingTtsStreamer();
+    const { context } = createContext();
+    const session = new LiveVoiceSession(context, {
+      resolveTranscriber: mock(async () => transcriber),
+      startVoiceTurn,
+      streamTtsAudio,
+    });
+
+    await session.start();
+    await session.handleBinaryAudio(new Uint8Array([1]));
+    await session.handleClientFrame({ type: "ptt_release" });
+    await waitFor(() => ttsCalls.length >= 1);
+
+    // With the language unknown the TTS request carries no language key at
+    // all and the control prompt has no per-turn language note: byte-for-byte
+    // the language-blind behavior.
+    expect("language" in ttsCalls[0]!).toBe(false);
+    expect(startVoiceTurn.mock.calls[0]?.[0]?.voiceControlPrompt).not.toContain(
+      "language with code",
+    );
   });
 
   test("uses the production streaming transcriber resolver by default", () => {

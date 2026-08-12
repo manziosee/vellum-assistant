@@ -19,7 +19,7 @@ import {
 } from "@/domains/settings/components/assistant-upgrades";
 import { DeleteAccountSection } from "@/domains/settings/components/delete-account-section";
 import { DevModeVersionUnlock } from "@/domains/settings/components/dev-mode-version-unlock";
-import { IOSAppCard } from "@/domains/settings/components/ios-app-card";
+import { NativeAppCard } from "@/domains/settings/components/native-app-card";
 import { PairDeviceCard } from "@/domains/settings/pair-device/pair-device-card";
 import { PreferencesModal } from "@/domains/settings/components/preferences-modal";
 import { PreviewReleaseChannel } from "@/domains/settings/components/preview-release-channel";
@@ -36,13 +36,20 @@ import {
   useActiveAssistantIsPlatformHosted,
   usePlatformGate,
 } from "@/hooks/use-platform-gate";
+import { remoteGatewayPublicBaseUrl } from "@/lib/auth/remote-gateway-session";
 import {
+  getRemoteGatewayAssistantName,
+  getRemoteGatewayHubUrl,
   getSelectedAssistant,
   isLocalAssistant,
-  isLocalMode,
+  isLocalClient,
   isRemoteGatewayMode,
 } from "@/lib/local-mode";
 import { isElectron } from "@/runtime/is-electron";
+import {
+  useIsNativeAndroid,
+  useIsNativeMobile,
+} from "@/runtime/platform-detection";
 import { useAssistantFeatureFlagStore } from "@/stores/assistant-feature-flag-store";
 import { useIsAuthenticated } from "@/stores/auth-store";
 import { useClientFeatureFlagStore } from "@/stores/client-feature-flag-store";
@@ -59,15 +66,33 @@ export function GeneralPage() {
   } = useAssistantWithHealthz();
   const multiPlatformAssistant =
     useClientFeatureFlagStore.use.multiPlatformAssistant();
+  const assistantSwitcher = useClientFeatureFlagStore.use.assistantSwitcher();
   const teleportEnabled = useClientFeatureFlagStore.use.teleport();
   const accountMfaEnabled = useClientFeatureFlagStore.use.accountMfa();
   const settingsSleepPolicy =
     useAssistantFeatureFlagStore.use.settingsSleepPolicy();
   const isAuthenticated = useIsAuthenticated();
+  const isNativeMobile = useIsNativeMobile();
+  // The assistant-switcher flag gates every chooser surface; the card
+  // supersedes the in-page picker so the two never render together. On
+  // remote-gateway origins and native shells the client flag store settles to
+  // registry defaults (no LD fetch), so the registry default / env /
+  // localStorage override governs there, not per-user LD targeting.
+  //
+  // Deliberately wider than `useGatedSelectedAssistantId` in
+  // `assistant/selection.ts`: that gate closes under `isGatewayAuthMode()`,
+  // which is exactly where this card hands off to the hub chooser.
+  const showAssistantSwitcherCard =
+    assistantSwitcher &&
+    (isLocalClient() ||
+      isAuthenticated ||
+      isRemoteGatewayMode() ||
+      isNativeMobile);
   const navigate = useNavigate();
   const platformGate = usePlatformGate();
   const infraGate = usePlatformGate({ platformHostedOnly: true });
   const isPlatformHosted = useActiveAssistantIsPlatformHosted();
+  const isNativeAndroid = useIsNativeAndroid();
   const diskPressure = useDiskPressureMonitor({
     assistantId: assistant?.id ?? null,
     enabled: infraGate === "full" && isPlatformHosted,
@@ -90,10 +115,10 @@ export function GeneralPage() {
   }, [searchParams, setSearchParams]);
 
   const platformAssistant =
-    assistant?.is_local && !isLocalMode() ? null : assistant;
+    assistant?.is_local && !isLocalClient() ? null : assistant;
   const selected = getSelectedAssistant();
   const hasSelectedLocalAssistant =
-    isLocalMode() && !!assistant && !!selected && isLocalAssistant(selected);
+    isLocalClient() && !!assistant && !!selected && isLocalAssistant(selected);
   const canRetireLocally = hasSelectedLocalAssistant;
   const canUpgradeLocally = hasSelectedLocalAssistant && !isRemoteGatewayMode();
   // Whether an upgrade panel (platform or local) is on screen. Both panels
@@ -121,6 +146,29 @@ export function GeneralPage() {
   const versionValue =
     healthz?.version ?? assistant?.current_release_version ?? null;
 
+  const openAssistantChooser = () => {
+    const hubUrl = getRemoteGatewayHubUrl();
+    if (isRemoteGatewayMode() && !isNativeMobile && hubUrl) {
+      // Self-registration handoff: landing on the hub chooser records this
+      // origin in the hub's remembered list. `hubUrl` is the hub SPA's
+      // assistant root (`<origin>/assistant`), so the absolute chooser route
+      // hangs off its origin.
+      const params = new URLSearchParams({
+        register: remoteGatewayPublicBaseUrl(),
+      });
+      const assistantName = getRemoteGatewayAssistantName();
+      if (assistantName) {
+        params.set("name", assistantName);
+      }
+      const hubOrigin = new URL(hubUrl).origin;
+      window.location.assign(
+        `${hubOrigin}${routes.selectAssistant}?${params.toString()}`,
+      );
+      return;
+    }
+    void navigate(`${routes.selectAssistant}?noAutoSkip=1`);
+  };
+
   const showRetire =
     ((platformGate === "full" || canRetireLocally) && !!platformAssistant) ||
     (platformGate === "disabled" && !canRetireLocally);
@@ -141,7 +189,9 @@ export function GeneralPage() {
             void navigate(`${routes.workspace}?sort=size`)
           }
           onUpgradeStorage={
-            infraGate === "full" ? () => void navigate(routes.plans) : null
+            infraGate === "full" && !isNativeAndroid
+              ? () => void navigate(routes.plans)
+              : null
           }
         />
       )}
@@ -290,7 +340,7 @@ export function GeneralPage() {
 
       {teleportEnabled && isElectron() && <TeleportCard />}
 
-      <IOSAppCard />
+      <NativeAppCard />
 
       <PairDeviceCard />
 
@@ -313,7 +363,21 @@ export function GeneralPage() {
         </DetailCard>
       )}
 
-      {multiPlatformAssistant && <AssistantPicker />}
+      {multiPlatformAssistant && !showAssistantSwitcherCard && (
+        <AssistantPicker />
+      )}
+
+      {showAssistantSwitcherCard && (
+        <DetailCard
+          title="Switch Assistant"
+          subtitle="Choose which assistant this device is connected to."
+          accessory={
+            <Button variant="outlined" onClick={openAssistantChooser}>
+              Choose Assistant
+            </Button>
+          }
+        />
+      )}
 
       {(showRetire || showDeleteAccount) && (
         <DetailCard variant="danger" title="Danger Zone">

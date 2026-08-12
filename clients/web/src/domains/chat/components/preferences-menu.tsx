@@ -1,4 +1,3 @@
-import { useQuery } from "@tanstack/react-query";
 import {
   ChevronDown,
   ChevronUp,
@@ -16,20 +15,18 @@ import {
   PanelItem,
   Popover,
   SideMenu,
+  useSideMenuCollapsed,
 } from "@vellumai/design-library";
 
 import { LazyBoundary } from "@/components/lazy-boundary";
 import { ThemeToggle } from "@/components/theme-toggle";
-import { organizationsBillingSummaryRetrieveOptions } from "@/generated/api/@tanstack/react-query.gen";
-import { useIsMobile } from "@/hooks/use-is-mobile";
-import { useIsOrgReady } from "@/hooks/use-is-org-ready";
-import {
-  useActiveAssistantIsPlatformHosted,
-  usePlatformGate,
-} from "@/hooks/use-platform-gate";
+import { useBillingBalanceStatus } from "@/hooks/use-billing-balance-status";
+import { useTouchMobile } from "@/hooks/use-touch-mobile";
+import { usePlatformGate } from "@/hooks/use-platform-gate";
 import { isElectron } from "@/runtime/is-electron";
 import { useAuthStore, useIsAuthenticated } from "@/stores/auth-store";
 import { openUrl } from "@/runtime/browser";
+import { useIsNativeAndroid } from "@/runtime/platform-detection";
 import { adminUrl, routes } from "@/utils/routes";
 
 import { CreditsCard } from "./credits-card";
@@ -42,6 +39,13 @@ const ShareFeedbackModal = lazy(() =>
     default: m.ShareFeedbackModal,
   })),
 );
+
+/**
+ * The trigger names the menu it opens, never the signed-in account. This is a
+ * settings entry point rather than a profile row, and the account's identity
+ * belongs on the Settings page the menu links to.
+ */
+const PREFERENCES_LABEL = "Preferences";
 
 export interface PreferencesMenuProps {
   assistantId?: string | null;
@@ -60,9 +64,14 @@ export function PreferencesMenu({
   activeConversationId,
   triggerVariant = "item",
 }: PreferencesMenuProps) {
+  /* From the menu rather than a prop: this trigger has to reduce to a tile at
+     the same moment every other rail entry does, and a threaded prop is that
+     one fact derived twice, free to disagree with the menu rendering around
+     it. The `pill` variant ignores it, and only renders on the overlay, where
+     it reads false regardless. */
+  const collapsed = useSideMenuCollapsed();
   const isAuthenticated = useIsAuthenticated();
-  const isMobile = useIsMobile();
-  const user = useAuthStore.use.user();
+  const isTouchMobile = useTouchMobile();
   const [isOpen, setIsOpen] = useState(false);
   const [isFeedbackOpen, setIsFeedbackOpen] = useState(false);
 
@@ -72,19 +81,6 @@ export function PreferencesMenu({
 
   const closeMenu = () => setIsOpen(false);
 
-  // Only a platform account carries a real identity; the local gateway user is
-  // a synthetic placeholder whose "Local"/"User" name fields would otherwise
-  // render as a profile.
-  const account = user?.kind === "platform" ? user : null;
-
-  // Prefer the account's real name; fall back to username, then email, then the
-  // generic label so the trigger is never blank.
-  const displayName =
-    [account?.firstName, account?.lastName].filter(Boolean).join(" ").trim() ||
-    account?.username ||
-    account?.email ||
-    "Preferences";
-
   const trigger =
     triggerVariant === "pill" ? (
       /* Solid surface + shadow: the pill floats over the scrolling
@@ -92,20 +88,53 @@ export function PreferencesMenu({
       <Button
         variant="ghost"
         leftIcon={<CircleUser />}
-        aria-label={displayName}
-        title={displayName}
         className="h-10 w-full min-w-0 rounded-full border border-[var(--border-base)] bg-[var(--surface-lift)] px-4 shadow-[var(--shadow-lg)]"
       >
-        {/* A long name/email must not force the pill wider and overlap the
-            sibling New Chat pill, so truncate the visible label; the full
-            value stays available via aria-label/title. */}
-        <span className="min-w-0 truncate">{displayName}</span>
+        {/* `truncate` is belt-and-braces: the label is a fixed short string,
+            but the pill shares its row with New Chat and must never grow
+            wide enough to overlap it at narrow viewports. */}
+        <span className="min-w-0 truncate">{PREFERENCES_LABEL}</span>
       </Button>
-    ) : (
+    ) : collapsed ? (
+      /* Collapsed, the same tile every other rail entry reduces to: a circle
+         at the pill's own height with the glyph centred and no label, its name
+         carried by the hover tooltip. A pill is sized by its content, so one
+         keeping its label is wider than the collapsed rail and gets clipped
+         mid-word, and one with only the label dropped is still a
+         content-width capsule with the glyph against its leading edge.
+         `SideMenu.Item` owns that whole treatment, and it is what the pinned
+         apps above and the section tiles use, so the foot of the rail is drawn
+         by the same component as the rest of it.
+
+         No chevron: it says which way the popover will open, and a tile has
+         no room for it beside the glyph. */
       <SideMenu.Item
         icon={CircleUser}
-        label={displayName}
-        trailingIcon={isOpen ? ChevronDown : ChevronUp}
+        label={PREFERENCES_LABEL}
+        showCollapsedTooltip
+        shape="tile"
+        active={isOpen}
+        /* `active` is the open-popover surface here, not a location: this
+           tile opens a menu over the rail rather than navigating, so it drops
+           the `aria-current="page"` a real destination row sets. Mirrors the
+           section tiles in `CollapsedGroupIcon`. */
+        aria-current={undefined}
+        aria-haspopup="dialog"
+        data-tour-id="settings"
+      />
+    ) : (
+      /* A pill, matching the identity and pinned-app entries it shares the
+         rail with: these are destinations you keep, not rows in a list.
+         Distinct from `triggerVariant="pill"` above, which is the mobile
+         overlay's floating action button. */
+      <PanelItem
+        shape="pill"
+        /* The popover owns the click, so this row takes no handler of its
+           own and needs telling that it is still a control. */
+        trigger
+        icon={CircleUser}
+        label={PREFERENCES_LABEL}
+        expandChevron={isOpen ? ChevronDown : ChevronUp}
         active={isOpen}
         data-tour-id="settings"
       />
@@ -120,7 +149,7 @@ export function PreferencesMenu({
 
   return (
     <>
-      {isMobile ? (
+      {isTouchMobile ? (
         <BottomSheet.Root open={isOpen} onOpenChange={setIsOpen}>
           <BottomSheet.Trigger asChild>{trigger}</BottomSheet.Trigger>
           <BottomSheet.Content className="max-h-[85dvh]">
@@ -177,16 +206,9 @@ function PreferencesMenuContent({
   const navigate = useNavigate();
   const user = useAuthStore.use.user();
   const platformGate = usePlatformGate();
-  const billingPlatformGate = usePlatformGate({ platformHostedOnly: true });
-  const isPlatformHosted = useActiveAssistantIsPlatformHosted();
-  const isOrgReady = useIsOrgReady();
-  const showBillingRows =
-    billingPlatformGate === "full" && isPlatformHosted && isOrgReady;
-  const { data: billingSummary } = useQuery({
-    ...organizationsBillingSummaryRetrieveOptions(),
-    enabled: showBillingRows,
-  });
-  const effectiveBalance = billingSummary?.effective_balance ?? null;
+  const { enabled: showBillingRows, balance: effectiveBalance } =
+    useBillingBalanceStatus();
+  const isNativeAndroid = useIsNativeAndroid();
 
   return (
     <>
@@ -198,10 +220,14 @@ function PreferencesMenuContent({
         <div className="my-2">
           <CreditsCard
             balance={formatWholeCredits(effectiveBalance)}
-            onAddCredits={() => {
-              onClose();
-              navigate(routes.settings.usageBilling);
-            }}
+            onAddCredits={
+              isNativeAndroid
+                ? undefined
+                : () => {
+                    onClose();
+                    navigate(routes.settings.usageBilling);
+                  }
+            }
           />
         </div>
       ) : null}

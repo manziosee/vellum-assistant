@@ -14,6 +14,7 @@ import type { AuthContext } from "../runtime/auth/types.js";
 import { getLogger } from "../util/logger.js";
 import type { UserMessageAttachment } from "./message-protocol.js";
 import type { ConversationTransportMetadata } from "./message-types/conversations.js";
+import type { TrustContext } from "./trust-context-types.js";
 
 const log = getLogger("conversation-queue");
 
@@ -33,6 +34,15 @@ export interface QueuedMessage {
   sourceActorPrincipalId?: string;
   /** Full auth snapshot captured at enqueue time for turn-scoped authorization decisions. */
   authContext?: AuthContext;
+  /**
+   * Sender's trust captured at enqueue time. The conversation-level
+   * `trustContext` is a single mutable slot holding whichever actor last sent
+   * a message, so a drain that read it would run this message under a
+   * different actor's trust whenever another actor sent in between. Trust
+   * governs `trustClass`, `executionChannel`, and `requesterExternalUserId`,
+   * so reading the wrong one misroutes the whole tool-approval path.
+   */
+  trustContext?: TrustContext;
   /** Transport metadata snapshot captured at enqueue time, applied when this message becomes active. */
   transport?: ConversationTransportMetadata;
   /** Original user message text to persist to DB when recording intent stripping produced a different `content`. */
@@ -42,6 +52,15 @@ export interface QueuedMessage {
   /** Client-generated correlation nonce. Echoed back on `user_message_echo`
    *  so the originating client can dedupe its optimistic row. */
   clientMessageId?: string;
+  /**
+   * True once a drain has told clients this message was dequeued and before
+   * the turn it was dequeued for actually took over. A drain that sends the
+   * message back to the queue after that point owes clients the corrective
+   * `message_requeued`; one that gives up before announcing owes nothing.
+   * Set by the drain's dequeue announcement, cleared by the requeue that
+   * settles it.
+   */
+  dequeueAnnounced?: boolean;
 }
 
 /**
@@ -197,6 +216,16 @@ export class MessageQueue {
     const [promoted] = this.items.splice(idx, 1);
     this.items.unshift(promoted);
     return promoted;
+  }
+
+  /**
+   * Read-only lookup of a queued message by its requestId. Returns the live
+   * reference (callers must treat it as read-only), or undefined when this
+   * queue holds no such message. Lets a caller inspect an item (to
+   * authorize a delete, say) before deciding whether to remove it.
+   */
+  findByRequestId(requestId: string): QueuedMessage | undefined {
+    return this.items.find((m) => m.requestId === requestId);
   }
 
   /**

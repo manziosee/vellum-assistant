@@ -22,7 +22,7 @@ import {
   PanelMenuDivider,
 } from "@/domains/chat/components/panel-menu-item";
 import type { MoveToGroupTarget } from "@/domains/chat/utils/group-conversations";
-import { useIsMobile } from "@/hooks/use-is-mobile";
+import { useTouchMobile } from "@/hooks/use-touch-mobile";
 import { openExternalUrl } from "@/runtime/browser";
 import { useIsNativePlatform } from "@/runtime/native-auth";
 import { BottomSheet, ContextMenu, Menu } from "@vellumai/design-library";
@@ -37,9 +37,10 @@ import { BottomSheet, ContextMenu, Menu } from "@vellumai/design-library";
  * exported from this module — both surfaces stay byte-identical because
  * they consume one source of truth.
  *
- * On mobile (`useIsMobile() === true`), the dropdown is replaced with a
- * `BottomSheet` that slides up from the viewport bottom — see
- * `renderConversationMenuItemsAsPanelItems` for the parallel item builder.
+ * On a touch-first surface (`useTouchMobile()`: narrow viewport and coarse
+ * pointer), the dropdown is replaced with a `BottomSheet` that slides up from
+ * the viewport bottom. See `renderConversationMenuItemsAsPanelItems` for the
+ * parallel item builder.
  *
  * The ellipsis button is hidden by default and revealed via `group-hover`
  * on the parent `PanelItem`'s row. When the menu is open the button stays
@@ -490,7 +491,7 @@ export function renderConversationMenuItemsAsPanelItems({
   const moveToGroupBlock = showMoveToGroup ? (
     <>
       <PanelMenuDivider />
-      <div className="flex items-center gap-2 px-2 pt-1 pb-1 text-body-small-default uppercase tracking-wide text-[var(--content-tertiary)]">
+      <div className="flex items-center gap-2 px-2 pt-2 pb-1 text-body-small-default uppercase tracking-wide text-[var(--content-tertiary)]">
         <FolderInput size={14} aria-hidden />
         Move to group
       </div>
@@ -671,11 +672,25 @@ export function ConversationActionsSheet({
       {trigger ? (
         <BottomSheet.Trigger asChild>{trigger}</BottomSheet.Trigger>
       ) : null}
-      <BottomSheet.Content aria-describedby={undefined}>
+      {/* This sheet's item list is open-ended (bulk actions, "Move to
+          group" targets, …), so it grows with its content rather than
+          taking the shared default's 50dvh ceiling. `!` forces this over
+          that default: cross-package Tailwind generation order doesn't
+          reliably favor a plain (unmarked) override here. Once content
+          would come within 120px of the top of the screen, the sheet stops
+          growing and its body scrolls instead. */}
+      <BottomSheet.Content
+        aria-describedby={undefined}
+        className="max-h-[calc(100dvh-120px)]!"
+      >
         <BottomSheet.Header className="sr-only">
           <BottomSheet.Title>Conversation actions</BottomSheet.Title>
         </BottomSheet.Header>
-        <BottomSheet.Body className="pt-0">
+        {/* Scrollbar hidden, not just at rest: this sheet has no fixed
+            track-width budget to spare, so a hover-revealed thumb would
+            shift the row content instead. Scroll itself (wheel/trackpad/
+            touch) is unaffected. */}
+        <BottomSheet.Body className="pt-0 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
           {renderConversationMenuItemsAsPanelItems({
             ...itemProps,
             onClose: () => onOpenChange(false),
@@ -708,7 +723,7 @@ export function ConversationActionsMenu({
   sideOffset = 4,
   ...itemProps
 }: ConversationActionsMenuProps) {
-  const isMobile = useIsMobile();
+  const isTouchMobile = useTouchMobile();
   const [open, setOpen] = useState(false);
 
   const defaultTrigger = (
@@ -720,15 +735,15 @@ export function ConversationActionsMenu({
         event.stopPropagation();
         event.preventDefault();
       }}
-      className="flex h-6 w-6 items-center justify-center rounded-[4px] outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)] text-[var(--content-tertiary)] transition-colors hover:bg-[var(--surface-hover)] hover:text-[var(--content-secondary)] aria-[expanded=true]:bg-[var(--surface-active)] aria-[expanded=true]:text-[var(--content-emphasised)]"
+      className="flex h-6 w-6 items-center justify-center rounded-[4px] outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)] text-[var(--content-tertiary)] transition-colors hover:bg-[var(--surface-hover)] hover:text-[var(--content-secondary)] aria-[expanded=true]:bg-[var(--surface-active)] aria-[expanded=true]:text-[var(--content-emphasised)] max-md:h-[30px] max-md:w-[30px]"
     >
-      <MoreHorizontal size={14} aria-hidden />
+      <MoreHorizontal size={14} aria-hidden className="max-md:h-[21px] max-md:w-[21px]" />
     </button>
   );
 
   const resolvedTrigger = trigger ?? defaultTrigger;
 
-  if (isMobile) {
+  if (isTouchMobile) {
     // The sheet body is the shared controlled surface (ConversationActionsSheet
     // uses the same builder), so the trailing-ellipsis menu and the row
     // long-press never drift. The trigger stays wired through BottomSheet so a

@@ -9,6 +9,7 @@ import {
   onboardingProvider,
   type OnboardingProviderId,
 } from "@/domains/onboarding/provider-catalog";
+import { SETUP_NAVIGATE } from "@/domains/onboarding/onboarding-navigation";
 import {
   peekPendingProviderKey,
   setPendingProviderKey,
@@ -16,7 +17,7 @@ import {
 import { isElectron } from "@/runtime/is-electron";
 import { routes } from "@/utils/routes";
 import { Button } from "@vellumai/design-library/components/button";
-import { Dropdown } from "@vellumai/design-library/components/dropdown";
+import { Select } from "@vellumai/design-library/components/select";
 import { Input } from "@vellumai/design-library/components/input";
 
 import { MOBILE_INPUT_NO_ZOOM } from "@/domains/onboarding/onboarding-step-layout";
@@ -80,15 +81,16 @@ export function ApiKeyScreen() {
       hosting
         ? `${routes.onboarding.privacy}?hosting=${hosting}`
         : routes.onboarding.privacy,
+      SETUP_NAVIGATE,
     );
   };
 
   const onBack = () => {
-    void navigate(routes.onboarding.hosting);
+    void navigate(routes.onboarding.hosting, SETUP_NAVIGATE);
   };
 
   return (
-    <OnboardingLayout>
+    <OnboardingLayout showAvatarWave>
       <div
         className={`mx-auto flex w-full max-w-xl flex-col items-center ${electron ? "min-h-full px-8 pt-21 pb-4 electron-prechat-type" : "px-6 py-16"} text-[var(--content-default)]`}
       >
@@ -117,7 +119,7 @@ export function ApiKeyScreen() {
             <label className="text-body-small-default text-[var(--content-tertiary)]">
               Provider
             </label>
-            <Dropdown
+            <Select
               aria-label="Provider"
               value={provider}
               onChange={(v) => {
@@ -140,7 +142,7 @@ export function ApiKeyScreen() {
               <label className="text-body-small-default text-[var(--content-tertiary)]">
                 Model
               </label>
-              <Dropdown
+              <Select
                 aria-label="Model"
                 value={model}
                 onChange={setModel}

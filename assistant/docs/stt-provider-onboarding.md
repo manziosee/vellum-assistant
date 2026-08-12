@@ -13,6 +13,7 @@ Add a new entry to the `CATALOG` map with:
 - `supportedBoundaries` — the set of `SttBoundaryId` values the provider supports. Valid values are `"daemon-batch"` (post-recording transcription) and `"daemon-streaming"` (real-time streaming transcription during conversation).
 - `conversationStreamingMode` — how the provider handles streaming transcription in conversation mode: `"realtime-ws"` (provider supports real-time streaming natively via WebSocket), `"incremental-batch"` (streaming emulated via throttled polling), or `"none"` (no streaming support). Required for all providers.
 - `telephonyMode` — how the provider participates in real-time telephony STT: `"realtime-ws"`, `"batch-only"`, or `"none"`. The telephony capability resolver (`resolveTelephonySttCapability()` in `src/providers/speech-to-text/resolve.ts`) reads this field plus credential availability to decide whether phone calls can run with the provider.
+- `turnDetection`: whether the provider decides end-of-turn itself, `"provider"` or `"none"`. Use `"provider"` only when the adapter emits `turn-start` / `turn-end` on its transcript stream; a live-voice session reads this via `supportsProviderTurnDetection()` to decide whether to arm its provider turn-end path. Default to `"none"`: a provider that declares `"provider"` but never emits the events makes every turn wait out the fail-open deadline before falling back to the silence boundary. A provider declaring `"provider"` should also number its turns, because the staleness check prefers the turn index on the event and degrades to the session's VAD generation counter without one.
 
 ## 2. Type-system registration
 
@@ -29,6 +30,8 @@ This ensures the exhaustive switch in `daemon-batch-transcriber.ts` produces a c
 - Append the new provider ID string to the `VALID_STT_PROVIDERS` tuple.
 
 The `services.stt.providers` map uses a sparse `z.record(z.string(), ...)` schema, so adding a new provider does **not** require a workspace migration to seed a `services.stt.providers.<id>` entry. Users only need to set `services.stt.provider` to the new ID and supply credentials.
+
+**Language handling.** `services.stt.language` is resolved centrally in `resolveStreamingTranscriber()` (and in `resolveBatchTranscriber()` for the daemon-batch boundary), so a new adapter inherits it for free: accept a `language` option in the adapter's constructor and forward it to the provider. If the provider auto-detects natively and has no language parameter (as Gemini and Whisper do), accept nothing and let the resolver's value be ignored; document that choice in the adapter, because "no language param" means auto-detect for some providers and _English_ for others (Deepgram), and that difference is an easy source of silent wrong-language transcription. A provider that supports both batch and streaming must forward the language on **both** paths, not just the streaming one.
 
 ## 4. Adapter wiring
 
@@ -52,13 +55,14 @@ If the new provider **shares** an existing credential name (e.g. reuses `"openai
 
 All client-facing metadata is part of the daemon's provider catalog entry (`src/providers/speech-to-text/provider-catalog.ts`). When adding a new provider, include these fields in the catalog entry:
 
-| Field              | Description                                                               |
-| ------------------ | ------------------------------------------------------------------------- |
-| `displayName`      | Human-readable name shown in client settings UI.                          |
-| `subtitle`         | Short description displayed below the provider selector.                  |
-| `setupMode`        | `"api-key"` (inline key field) or `"cli"` (instructions-only).            |
-| `setupHint`        | Brief guidance shown during setup.                                        |
-| `credentialsGuide` | Object with `description`, `url`, and `linkLabel` for the key mgmt page.  |
+| Field               | Description                                                                                                                                                             |
+| ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `displayName`       | Human-readable name shown in client settings UI.                                                                                                                        |
+| `subtitle`          | Short description displayed below the provider selector.                                                                                                                |
+| `setupMode`         | `"api-key"` (inline key field) or `"cli"` (instructions-only).                                                                                                          |
+| `setupHint`         | Brief guidance shown during setup.                                                                                                                                      |
+| `languageSelection` | `"manual"` (provider takes a language parameter, clients show a picker) or `"auto"` (native detection, picker hidden). See the "Language handling" paragraph in step 3. |
+| `credentialsGuide`  | Object with `description`, `url`, and `linkLabel` for the key mgmt page.                                                                                                |
 
 Native clients fetch this metadata at launch via `GET /v1/stt/providers`. No separate client-side file updates are needed.
 
@@ -68,10 +72,11 @@ Native clients fetch this metadata at launch via `GET /v1/stt/providers`. No sep
 | ---------------- | -------------------- | ------------- |
 | `openai-whisper` | `openai`             | shared        |
 | `deepgram`       | `deepgram`           | exclusive     |
+| `deepgram-flux`  | `deepgram`           | shared        |
 | `google-gemini`  | `gemini`             | shared        |
 | `xai`            | `xai`                | exclusive     |
 
-When the provider ID differs from the credential provider name (e.g. `google-gemini` maps to `gemini`), the key is **shared** with other services that use the same credential.
+When the provider ID differs from the credential provider name (e.g. `google-gemini` maps to `gemini`), the key is **shared** with other services that use the same credential. Two STT providers may also name the same credential: `deepgram-flux` is a model on the same Deepgram account as `deepgram`, so it reads that key rather than introducing one of its own. Reuse an existing `credentialProvider` whenever the new provider authenticates against an account the catalog already covers, and keep the `credentialsGuide` text identical across them (`DEEPGRAM_CREDENTIALS_GUIDE` is shared by both entries for that reason).
 
 ### Client settings key behavior
 

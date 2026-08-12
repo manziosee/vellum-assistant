@@ -1,3 +1,4 @@
+import { Capacitor } from "@capacitor/core";
 import type { BrowserOptions } from "@sentry/react";
 
 import { snapshotCommitPressure } from "@/lib/commit-pressure";
@@ -12,14 +13,6 @@ import { isElectron } from "@/runtime/is-electron";
 import { isNativePlatform } from "@/runtime/native-auth";
 import { detectClientOs } from "@/runtime/platform-detection";
 
-/**
- * Resolve the Sentry DSN for the current host. The shared bundle reports to a
- * per-host project: Electron renderer → `VITE_SENTRY_DSN_MACOS`
- * (vellum-assistant-macos), iOS WKWebview → `VITE_SENTRY_DSN_IOS`
- * (vellum-assistant-ios), web → `VITE_SENTRY_DSN` (vellum-assistant-web).
- *
- * The Electron check comes first since the renderer also runs the web bundle.
- */
 /**
  * Recognize React's nested-update-limit error in every form it ships as.
  *
@@ -40,11 +33,16 @@ function isReactError185(message: string): boolean {
   return REACT_ERROR_185.test(message);
 }
 
+/** Resolve the Sentry DSN for the current host. */
 function resolveDsn(): string | undefined {
   if (isElectron()) {
     return import.meta.env.VITE_SENTRY_DSN_MACOS;
   }
   if (isNativePlatform()) {
+    const platform = Capacitor.getPlatform();
+    if (platform === "android") {
+      return import.meta.env.VITE_SENTRY_DSN_ANDROID;
+    }
     return import.meta.env.VITE_SENTRY_DSN_IOS;
   }
   return import.meta.env.VITE_SENTRY_DSN;
@@ -177,7 +175,8 @@ const options: BrowserOptions = {
  * is available when the consent gate reads localStorage.
  *
  * Also syncs the effective (session-gated) reporting gate to the Electron main
- * process (no-op on web/iOS) so the main-process Sentry client matches.
+ * process (no-op on web and native mobile) so the main-process Sentry client
+ * matches.
  */
 export function initSentry(): void {
   // Resolve host-detected values at init time (post host-detection), not at

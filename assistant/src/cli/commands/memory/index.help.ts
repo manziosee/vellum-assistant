@@ -35,7 +35,8 @@ Examples:
   $ assistant memory items update 9f2c4f3a-3f1a-41e4-88e7-abc123 --statement "Prefers tea"
   $ assistant memory items delete 9f2c4f3a-3f1a-41e4-88e7-abc123
   $ assistant memory v2 validate
-  $ assistant memory v3 rebuild-index`,
+  $ assistant memory v3 rebuild-index
+  $ assistant memory ingest --dir .mv3/staging --dry-run`,
   subcommands: [
     {
       name: "nodes",
@@ -605,7 +606,9 @@ that live state safely.
 
 Examples:
   $ assistant memory v3 rebuild-index
-  $ assistant memory v3 backfill-sections`,
+  $ assistant memory v3 backfill-sections
+  $ assistant memory v3 gate-stats
+  $ assistant memory v3 gate-stats --lookback-days 7 --json`,
       subcommands: [
         {
           name: "rebuild-index",
@@ -717,6 +720,46 @@ Examples:
   $ assistant memory v3 eval --snapshot .mv3/snapshot/concepts --staging .mv3/staging --out .mv3/eval --exclude-conversation <migration-conv-id>`,
         },
         {
+          name: "gate-stats",
+          description:
+            "Show injection gate pass rates bucketed by corpus size (read-only)",
+          options: [
+            {
+              flags: "--lookback-days <n>",
+              description: "Days of telemetry to aggregate (1–90, default 30)",
+              defaultValue: "30",
+            },
+            {
+              flags: "--json",
+              description: "Emit raw JSON instead of a formatted table",
+            },
+          ],
+          helpText: `
+Reads the memory v3 injection gate telemetry outbox and prints pass rates
+and reason distributions grouped by concept page count bucket
+(0–9 / 10–49 / 50–199 / 200+). Scored runs (dense lane was available and
+actually weighed scores) are reported separately from pass-open shortcuts
+(dense disabled / unavailable / gate threw) so scoredPassRate reflects
+only contested gate decisions — the signal relevant for threshold calibration.
+
+Coverage is limited to runs still pending platform flush. In a healthy system
+the outbox holds only the last few minutes to hours of events, so
+--lookback-days is an upper bound, not a guarantee; long-window aggregation
+lives on the platform side on top of flushed watchdog events.
+
+Reads the telemetry database directly — the assistant does not need to be
+running.
+
+Intended use: verify that gate firing rates shift as expected after a
+config or threshold change, and check whether the bm25-auto-calibration
+flag is worth enabling for large corpora.
+
+Examples:
+  $ assistant memory v3 gate-stats
+  $ assistant memory v3 gate-stats --lookback-days 7
+  $ assistant memory v3 gate-stats --json | jq '.buckets[] | select(.pageCountRange == "200+")'`,
+        },
+        {
           name: "eval-tally",
           description:
             "Unblind + tally blind-judge verdicts against key.json with a noise-aware win/tie/loss verdict",
@@ -760,6 +803,59 @@ Example:
   $ assistant memory v3 eval-tally --verdicts .mv3/eval/verdicts.json --key .mv3/eval/key.json`,
         },
       ],
+    },
+    {
+      name: "ingest",
+      description:
+        "Batch-ingest staged concept pages directly into memory (bypasses the consolidation buffer)",
+      options: [
+        {
+          flags: "--dir <path>",
+          description:
+            "Directory of staged .md pages; slug = relative path minus .md, with forward slashes",
+        },
+        {
+          flags: "--file <path>",
+          description:
+            "JSON manifest file: an array of { slug, content } objects",
+        },
+        {
+          flags: "--dry-run",
+          description: "Validate and report without writing any pages",
+        },
+        {
+          flags: "--overwrite",
+          description:
+            "Rewrite pages whose slug already exists (default: skip them)",
+        },
+        {
+          flags: "--json",
+          description: "Machine-readable compact JSON summary output",
+        },
+      ],
+      helpText: `
+Input sources (pick exactly one):
+  --dir   Walks the directory recursively for .md files. Each file's slug is
+          its relative path minus the .md extension, with forward slashes
+          (people/alice.md becomes people/alice).
+  --file  Reads a JSON manifest: an array of { slug, content } objects where
+          content is the full page markdown (frontmatter + body).
+  stdin   With neither flag, the same JSON manifest is read from stdin when
+          it is piped (not a TTY).
+
+Behavior:
+  Writes fully-formed concept pages straight into memory/concepts/, bypassing
+  the consolidation buffer. Pages whose slug already exists are skipped unless
+  --overwrite is passed. Every page is validated and reported individually;
+  invalid pages set a non-zero exit code without blocking valid ones. Requests
+  are sent in batches of 200 pages. When the consolidation lock is held the
+  command fails and names the holder; retry after the current writer finishes.
+  Requires concept-page memory (memory.v3.live or memory.v2.enabled).
+
+Examples:
+  $ assistant memory ingest --dir .mv3/staging --dry-run
+  $ assistant memory ingest --dir .mv3/staging --overwrite
+  $ cat pages.json | assistant memory ingest --json`,
     },
     {
       name: "retrospective",

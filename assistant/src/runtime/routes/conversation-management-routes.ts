@@ -29,11 +29,7 @@ import {
   discardLastAssistantDisplayTurn,
   extractUserPromptText,
 } from "../../daemon/conversation-history.js";
-import {
-  formatSummarizeUpToResult,
-  isBackgroundEventMetadata,
-  isEchoSuppressedUserMessage,
-} from "../../daemon/conversation-process.js";
+import { formatSummarizeUpToResult } from "../../daemon/conversation-process.js";
 import { findConversation } from "../../daemon/conversation-registry.js";
 import {
   destroyActiveConversation,
@@ -50,11 +46,13 @@ import { normalizeConversationType } from "../../daemon/message-types/shared.js"
 import { stripConversationIds } from "../../home/feed-writer.js";
 import {
   archiveConversation,
-  batchSetDisplayOrders,
+  batchSetConversationPlacement,
   countConversationsByScheduleJobId,
   deleteConversation,
   forkConversation as forkConversationInStore,
   getConversation,
+  isBackgroundEventMetadata,
+  isEchoSuppressedUserMessage,
   setConversationEnabledPlugins,
   setConversationSurfaced,
   unarchiveConversation,
@@ -65,9 +63,10 @@ import {
   resolveConversationId,
   setConversationKeyIfAbsent,
 } from "../../persistence/conversation-key-store.js";
+import type { NonScheduledConversationType } from "../../persistence/conversation-types.js";
 import { enqueueMemoryJob } from "../../persistence/jobs-store.js";
 import { linkRequestLogsToMessage } from "../../persistence/llm-request-log-store.js";
-import { deleteSchedule } from "../../schedule/schedule-store.js";
+import { deleteSchedule, getSchedule } from "../../schedule/schedule-store.js";
 import { UserError } from "../../util/errors.js";
 import { safeParseRecord } from "../../util/json.js";
 import { getLogger } from "../../util/logger.js";
@@ -102,6 +101,12 @@ const log = getLogger("conversation-management-routes");
 // Helpers
 // ---------------------------------------------------------------------------
 
+/** Conversation types this endpoint may mint. */
+const createConversationTypeSchema = z.enum([
+  "standard",
+  "background",
+] as const satisfies readonly NonScheduledConversationType[]);
+
 function resolveOrThrow(rawId: string): string {
   const id = resolveConversationId(rawId);
   if (!id) {
@@ -113,11 +118,17 @@ function resolveOrThrow(rawId: string): string {
 async function cancelScheduleIfLast(conversationId: string): Promise<void> {
   const conv = getConversation(conversationId);
   if (
-    conv?.scheduleJobId &&
-    countConversationsByScheduleJobId(conv.scheduleJobId) <= 1
+    !conv?.scheduleJobId ||
+    countConversationsByScheduleJobId(conv.scheduleJobId) > 1
   ) {
-    await deleteSchedule(conv.scheduleJobId);
+    return;
   }
+  // A plugin-declared schedule outlives its run conversations: its lifecycle
+  // belongs to the reconciler, and `deleteSchedule` refuses sourced rows.
+  if (getSchedule(conv.scheduleJobId)?.sourceKey != null) {
+    return;
+  }
+  await deleteSchedule(conv.scheduleJobId);
 }
 
 // ---------------------------------------------------------------------------
@@ -128,14 +139,26 @@ function handleCreateConversation({ body = {}, headers }: RouteHandlerArgs) {
   const conversationKey =
     (body.conversationKey as string | undefined) ?? crypto.randomUUID();
   // The shared route adapter does not runtime-validate the body against the
-  // Zod requestBody (it's codegen-only), so guard the type before trimming —
-  // a malformed `{ title: 123 }` would otherwise throw on `.trim()` and 500.
+  // Zod requestBody (it's codegen-only), so guard the types here: a malformed
+  // `{ title: 123 }` would otherwise throw on `.trim()` and 500, and an
+  // unsupported conversationType would reach the store unchecked.
+  // `.nullish()`: an explicit JSON `null` is how serializers spell an absent
+  // optional, so it means the same thing as omitting the key.
+  const requestedType = createConversationTypeSchema
+    .nullish()
+    .safeParse(body.conversationType);
+  if (!requestedType.success) {
+    throw new BadRequestError(
+      `conversationType must be one of ${createConversationTypeSchema.options.join(", ")}`,
+    );
+  }
   if (body.title !== undefined && typeof body.title !== "string") {
     throw new BadRequestError("title must be a string");
   }
   const customTitle = body.title?.trim() || undefined;
+  const conversationType = requestedType.data ?? "standard";
   const result = getOrCreateConversation(conversationKey, {
-    conversationType: "standard",
+    conversationType,
   });
   if (result.created) {
     // A caller-supplied title is user-set: persist it with isAutoTitle = 0 so
@@ -153,10 +176,14 @@ function handleCreateConversation({ body = {}, headers }: RouteHandlerArgs) {
       headers?.["x-vellum-client-id"]?.trim() || undefined,
     );
   }
+  // On a conversationKey hit the row already exists, so the type it carries
+  // can differ from the requested one.
+  const storedType = normalizeConversationType(result.conversationType);
   log.info(
     {
       conversationId: result.conversationId,
       conversationKey,
+      conversationType: storedType,
       created: result.created,
     },
     "Created conversation via POST",
@@ -164,7 +191,7 @@ function handleCreateConversation({ body = {}, headers }: RouteHandlerArgs) {
   return {
     id: result.conversationId,
     conversationKey,
-    conversationType: normalizeConversationType(result.conversationType),
+    conversationType: storedType,
     created: result.created,
   };
 }
@@ -280,7 +307,14 @@ async function handleSummarizeConversation({ body = {} }: RouteHandlerArgs) {
       conversation.emitActivityState("thinking", "context_compacting", {
         statusText: "Summarizing conversation",
       });
-      const result = await conversation.summarizeUpToMessage(beforeMessageId);
+      // The context-window usage push goes out on the same broadcast path as
+      // the result card below: this route resolves its conversation outside
+      // the send path, so the instance may still hold the store's no-op
+      // sender and a `sendToClient` emit would reach nobody.
+      const result = await conversation.summarizeUpToMessage(
+        beforeMessageId,
+        broadcastMessage,
+      );
       // Stop aborted the in-flight summary: the compactor reports the aborted
       // provider call as a non-compacted result (it swallows the abort rather
       // than throwing), so detect cancellation via the signal. A cancelled
@@ -745,6 +779,13 @@ async function handleRetryLastAssistantTurn({
         onEvent: broadcastMessage,
         isUserMessage: true,
         isInteractive,
+        // The re-run carries none of the anchor's original delivery
+        // orchestration: a channel anchor's reply is not posted back to
+        // Slack/Telegram (that is owned by the inbound event's
+        // `finalizeEventDelivery`) and a voice anchor's is not spoken over a
+        // session. The regenerated reply reaches SSE subscribers only, so the
+        // push is the user's only copy once they leave.
+        replyDeliveredInAppOnly: true,
         ...(isHiddenPrompt ? { isHiddenPrompt: true } : {}),
       });
     } catch (err) {
@@ -804,7 +845,6 @@ function handleReorderConversations({ body = {}, headers }: RouteHandlerArgs) {
   const updates = body.updates as
     | Array<{
         conversationId: string;
-        displayOrder?: number;
         isPinned?: boolean;
         groupId?: string | null;
       }>
@@ -812,10 +852,9 @@ function handleReorderConversations({ body = {}, headers }: RouteHandlerArgs) {
   if (!Array.isArray(updates)) {
     throw new BadRequestError("Missing updates array");
   }
-  batchSetDisplayOrders(
+  batchSetConversationPlacement(
     updates.map((u) => ({
       id: u.conversationId,
-      displayOrder: u.displayOrder ?? null,
       isPinned: u.isPinned,
       groupId: u.groupId,
     })),
@@ -851,10 +890,11 @@ export const ROUTES: RouteDefinition[] = [
         .describe(
           "Optional external key. Echoed back in the response. Non-vellum channels (Telegram, WhatsApp) use this to scope to a logical channel thread; vellum-web clients can omit it and rely on the assistant-minted `id`.",
         ),
-      conversationType: z
-        .literal("standard")
+      conversationType: createConversationTypeSchema
         .optional()
-        .describe("Only standard conversations are created by this endpoint"),
+        .describe(
+          'Conversation type for the new row. "background" keeps it out of the foreground list and the sidebar\'s Recents grouping, used by internal side-channel flows (onboarding research, persona/identity rewrites) that mint a throwaway thread the user should never see. "scheduled" is not accepted here; scheduled rows are owned by the schedule pipeline.',
+        ),
       title: z
         .string()
         .optional()
@@ -1262,14 +1302,15 @@ export const ROUTES: RouteDefinition[] = [
       requiredScopes: ["chat.write"],
       allowedPrincipalTypes: ACTOR_PRINCIPALS,
     },
-    summary: "Reorder conversations",
-    description: "Batch-update display order and pin state for conversations.",
+    summary: "Move conversations between sections",
+    description:
+      "Batch-update which group holds each conversation, and its pin state. " +
+      "Lists are ordered by recency, so this sets placement, not order.",
     tags: ["conversations"],
     requestBody: z.object({
       updates: z.array(
         z.object({
           conversationId: z.string(),
-          displayOrder: z.number().optional(),
           isPinned: z.boolean().optional(),
           groupId: z.string().nullable().optional(),
         }),

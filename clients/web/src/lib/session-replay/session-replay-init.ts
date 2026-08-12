@@ -7,17 +7,15 @@ import {
 } from "@/lib/session-replay/session-replay-control";
 import { isElectron } from "@/runtime/is-electron";
 import { isNativePlatform } from "@/runtime/native-auth";
+import { detectClientOs } from "@/runtime/platform-detection";
 
 /**
  * Detect the host surface. Electron is checked first since its renderer also
  * runs the web bundle (mirrors `resolveDsn()` in `sentry-init.ts`).
  */
 function sessionReplaySurface(): SessionReplayConfig["surface"] {
-  if (isElectron()) {
-    return "macos";
-  }
-  if (isNativePlatform()) {
-    return "ios";
+  if (isElectron() || isNativePlatform()) {
+    return detectClientOs();
   }
   return "web";
 }

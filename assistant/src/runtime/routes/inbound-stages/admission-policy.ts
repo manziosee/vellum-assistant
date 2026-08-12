@@ -27,6 +27,7 @@ import {
   ADMISSION_FLOOR,
   type AdmissionPolicy,
   isAdmissionPolicyExemptChannel,
+  TRUST_CLASS_RANK,
 } from "@vellumai/gateway-client";
 
 import type { ChannelId } from "../../../channels/types.js";
@@ -74,23 +75,6 @@ export type AdmissionPolicyResult =
 // ---------------------------------------------------------------------------
 
 /**
- * Trust-class ordinal compared against {@link ADMISSION_FLOOR} to make the
- * admission decision (`rank >= floor`). Higher rank = more trusted.
- * Blocked/revoked never reach this comparison — they short-circuit to deny on
- * member status above — so they carry no rank here.
- *
- * The two halves of the floor check: this table is keyed by `TrustClass`,
- * `ADMISSION_FLOOR` (from `@vellumai/gateway-client`) by `AdmissionPolicy`.
- * They are only ever read together, here, so they live next to their use.
- */
-const TRUST_CLASS_RANK: Record<TrustClass, number> = {
-  guardian: 4,
-  trusted_contact: 3,
-  unverified_contact: 2,
-  unknown: 1,
-};
-
-/**
  * Policies under which completing verification could lift the sender past
  * the floor. Used to decide whether to fire the upgrade UX on deny.
  * `unverified_contact` (rank 2) reaches `any_contact` (floor 2) and
@@ -101,6 +85,24 @@ const POLICIES_THAT_COULD_UPGRADE: ReadonlySet<AdmissionPolicy> = new Set([
   "any_contact",
   "strangers",
 ]);
+
+/**
+ * Whether promoting a caller to a trusted contact would lift them past this
+ * floor.
+ *
+ * A guardian approving an access request activates the requester as a trusted
+ * contact (directly for voice, per `guardian-request-resolvers.ts`; via the
+ * minted verification code for text), so approval only helps on floors at or
+ * below the trusted-contact rank. `guardian_only` and `no_one` sit above it:
+ * an approved caller would still be below the floor, so callers denied by
+ * those floors must not be routed into an approval flow that cannot admit
+ * them.
+ */
+export function trustedContactPromotionClearsFloor(
+  policy: AdmissionPolicy,
+): boolean {
+  return ADMISSION_FLOOR[policy] <= TRUST_CLASS_RANK.trusted_contact;
+}
 
 /**
  * Enforce the admission policy floor against the resolved trust class.

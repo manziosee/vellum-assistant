@@ -13,6 +13,7 @@ import {
 import {
   createDraftConversationId,
   resolveBootstrappedConversationId,
+  shouldMintNewChatDraft,
 } from "@/domains/chat/utils/conversation-selection";
 import {
   loadLastViewedConversationId,
@@ -24,17 +25,20 @@ import { useChatSessionStore } from "@/domains/chat/chat-session-store";
 import { requestComposerFocus } from "@/domains/chat/composer-focus";
 import { useSubagentStore } from "@/domains/chat/subagent-store";
 import { useWorkflowStore } from "@/domains/chat/workflow-store";
+import { isNativeMobile } from "@/runtime/platform-detection";
 import { useConversationStore } from "@/stores/conversation-store";
 import { haptic } from "@/utils/haptics";
 import { routes } from "@/utils/routes";
 import { useNavigate } from "react-router";
 
 import { useConversationHistory } from "@/domains/chat/hooks/use-conversation-history";
+import { useTurnTimeout } from "@/domains/chat/hooks/use-turn-timeout";
 import type { AssistantStateKind } from "@/domains/chat/types";
 import { shouldSuppressGenericChatErrorNotice } from "@/domains/chat/utils/error-classification";
 import { useQueryClient } from "@tanstack/react-query";
 
 import { useConversationListQuery } from "@/hooks/conversation-queries";
+import { useResumeGrace } from "@/hooks/use-resume-grace";
 import { groupsGetQueryKey } from "@/generated/daemon/@tanstack/react-query.gen";
 import type { Conversation } from "@/types/conversation-types";
 import { ApiError } from "@/utils/api-errors";
@@ -79,11 +83,12 @@ interface UseConversationLoaderParams {
  * polling for new messages.
  *
  * Owns the primary data-fetching lifecycle for the chat sidebar and
- * transcript. Returns `switchConversation`, `startNewConversation`,
- * and `refreshConversations` for use by sibling hooks.
+ * transcript. Returns `startNewConversation` and `refreshConversations` for
+ * use by sibling hooks.
  *
  * Delegates to:
  * - `useConversationHistory` -- conversation switch, cache, and history loading
+ * - `useTurnTimeout` -- terminates a turn whose stream went silent
  *
  * Attention/processing-key tracking is owned by `useAttentionTracking`,
  * mounted in `ChatLayout` so the bus-driven `interaction_resolved`
@@ -225,7 +230,13 @@ export function useConversationLoader({
   //
   // When the query recovers (data arrives), clear any prior load-failed
   // banner. Other error codes are left untouched.
+  //
+  // A failure inside the resume grace window is held back: the refetch that
+  // fires when the client returns from the background often fails transiently
+  // against a still-waking pod. The banner surfaces once the window expires
+  // and the query is still in error with nothing cached.
   // -------------------------------------------------------------------------
+  const isResumeGraceActive = useResumeGrace();
   useEffect(() => {
     if (assistantStateKind !== "active") {
       return;
@@ -240,6 +251,9 @@ export function useConversationLoader({
         context: "conversationList.bootstrap",
         level: "warning",
       });
+      if (isResumeGraceActive) {
+        return;
+      }
       useChatSessionStore.getState().setError((prev) => {
         if (shouldSuppressGenericChatErrorNotice(prev)) {
           return prev;
@@ -270,6 +284,7 @@ export function useConversationLoader({
     queryConversations,
     conversationListError,
     conversationListIsError,
+    isResumeGraceActive,
     shouldSuppressGenericChatErrorNotice,
   ]);
 
@@ -299,17 +314,32 @@ export function useConversationLoader({
     }
 
     const explicitConversationId = urlConversationId;
+    const currentConversationId =
+      useConversationStore.getState().activeConversationId;
+
+    // Native mobile shells cold-launch into a fresh draft instead of
+    // resuming a conversation. A draft is minted only while nothing is selected
+    // in the URL or the store, and the minting pass writes the key to the store
+    // in the same body, so the gate closes for the rest of the session.
+    const newChatDraftConversationId = shouldMintNewChatDraft({
+      platformStartsInNewChat: isNativeMobile(),
+      urlConversationId: explicitConversationId,
+      currentConversationId,
+    })
+      ? createDraftConversationId()
+      : null;
 
     // Only the "resume last-viewed" / "land on latest foreground" fallbacks
-    // read the fetched list. An explicit URL key, an onboarding draft, or the
-    // existing in-memory selection all resolve without it — so the chat
-    // transcript the user opened renders immediately instead of blocking on
-    // the sidebar's conversation-list API.
+    // read the fetched list. An explicit URL key, an onboarding draft, the
+    // existing in-memory selection, or a new-chat draft all resolve without
+    // it, so the chat transcript the user opened renders immediately instead
+    // of blocking on the sidebar's conversation-list API.
     const needsConversationList = !(
       explicitConversationId != null ||
       searchParams.get("onboarding") === "1" ||
       (assistantIdRef.current === assistantId &&
-        useConversationStore.getState().activeConversationId != null)
+        currentConversationId != null) ||
+      newChatDraftConversationId != null
     );
     if (needsConversationList && conversationListIsPending) {
       return;
@@ -346,8 +376,8 @@ export function useConversationLoader({
     const key = resolveBootstrappedConversationId({
       queryParamKey: explicitConversationId,
       onboardingDraftConversationId,
-      currentConversationId:
-        useConversationStore.getState().activeConversationId,
+      newChatDraftConversationId,
+      currentConversationId,
       currentAssistantId: assistantIdRef.current,
       nextAssistantId: assistantId,
       storedConversationId: loadLastViewedConversationId(assistantId),
@@ -399,24 +429,10 @@ export function useConversationLoader({
   });
 
   // -------------------------------------------------------------------------
-  // switchConversation
+  // Delegate: stranded-turn watchdog. Terminates a turn whose stream went
+  // silent and revalidates history so the UI settles on server truth.
   // -------------------------------------------------------------------------
-  const switchConversation = useCallback(
-    (key: string) => {
-      useViewerStore.getState().setMainView("chat");
-      // Same-conversation reselect: return to the chat view but keep the
-      // per-conversation process stores — wiping them kills the inline
-      // cards of still-running subagents, which only repopulate from live
-      // SSE events (LUM-2875).
-      if (key === useConversationStore.getState().activeConversationId) {
-        return;
-      }
-      useSubagentStore.getState().reset();
-      useWorkflowStore.getState().reset();
-      void navigate(routes.conversation(key));
-    },
-    [navigate],
-  );
+  useTurnTimeout({ assistantId, activeConversationId });
 
   // -------------------------------------------------------------------------
   // startNewConversation
@@ -428,6 +444,7 @@ export function useConversationLoader({
       }
       useSubagentStore.getState().reset();
       useWorkflowStore.getState().reset();
+      useViewerStore.getState().clearTranscriptPanelPayloads();
       useViewerStore.getState().setMainView("chat");
       const draftConversationId = createDraftConversationId();
       useConversationStore
@@ -441,7 +458,6 @@ export function useConversationLoader({
 
   return {
     refreshConversations,
-    switchConversation,
     startNewConversation,
     conversationExistsOnServer,
     historyResult,

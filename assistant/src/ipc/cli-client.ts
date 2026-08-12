@@ -11,8 +11,9 @@
 
 import { Socket } from "node:net";
 
+import { IpcFrameReader, writeMessage } from "@vellumai/ipc-server-utils";
+
 import { getLogger } from "../util/logger.js";
-import { IpcFrameReader, writeMessage } from "./ipc-framing.js";
 import { getAssistantSocketPath } from "./socket-path.js";
 
 const log = getLogger("cli-ipc-client");
@@ -57,6 +58,15 @@ export interface CliIpcCallResult<T = unknown> {
    * when the originating daemon-side error carried a `details` field.
    */
   errorDetails?: unknown;
+  /**
+   * Set when the call was abandoned because `timeoutMs` elapsed with no
+   * response. Distinct from every other `ok: false` shape: the request WAS
+   * delivered and the daemon may still be executing it — closing the client
+   * socket does not abort the handler. Callers that would otherwise retry a
+   * transport failure must not retry this one until the original can no
+   * longer be in flight.
+   */
+  timedOut?: boolean;
 }
 
 /**
@@ -177,7 +187,7 @@ export async function cliIpcCall<T = unknown>(
           { method, socketPath, timeoutMs: callTimeoutMs },
           "CLI IPC call timed out waiting for response",
         );
-        finish({ ok: false, error: "Request timed out" });
+        finish({ ok: false, error: "Request timed out", timedOut: true });
       }, callTimeoutMs);
 
       socket.on("data", (chunk) => {
