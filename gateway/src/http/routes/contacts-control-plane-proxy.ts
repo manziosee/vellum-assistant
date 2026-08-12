@@ -1099,7 +1099,12 @@ export function createContactsControlPlaneProxyHandler(config: GatewayConfig) {
      */
     async handleListContacts(req: Request): Promise<Response> {
       const url = new URL(req.url);
-      const limit = Number(url.searchParams.get("limit") ?? 50);
+      const rawLimit = url.searchParams.get("limit");
+      const parsedLimit = rawLimit !== null ? Number(rawLimit) : NaN;
+      const limit =
+        Number.isFinite(parsedLimit) && parsedLimit > 0
+          ? Math.floor(parsedLimit)
+          : 50;
       const role = url.searchParams.get("role") ?? undefined;
       const contactType = url.searchParams.get("contactType") ?? undefined;
       const query = url.searchParams.get("query") ?? undefined;

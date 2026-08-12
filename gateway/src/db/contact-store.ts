@@ -185,7 +185,7 @@ export class ContactStore {
       const contactRows = this.db
         .select({ id: contacts.id })
         .from(contacts)
-        .where(conditions.length === 1 ? conditions[0] : undefined)
+        .where(conditions.length > 0 ? and(...conditions) : undefined)
         .orderBy(
           sql`${contacts.role} = 'guardian' DESC`,
           desc(contacts.updatedAt),
@@ -325,13 +325,10 @@ export class ContactStore {
    * List contacts in the shared ContactRead shape: gateway-DB identity + ACL
    * channels joined to assistant-DB info fields.
    *
-   * Filters: `role` (gateway DB), `limit` (default 50, capped 200 to mirror
-   * the daemon's listContacts), or an explicit `ids` set (the daemon's telemetry
-   * hydration for its native search/contactType reads — bypasses role/limit).
-   * The daemon serves contactType-filtered list reads natively (filtering in SQL
-   * before the limit) so a tight limit doesn't under-return and an assistant-DB
-   * outage degrades rather than dropping every row — the relay never carries a
-   * contactType filter.
+   * Filters: `role` (gateway DB), `limit` (default 50, capped 200), or an
+   * explicit `ids` set (bypasses role/limit). Daemon relay callers use the
+   * `ids` path; they do not pass contactType because the gateway handles that
+   * filter natively in `listContactsWithInfo` before this adapter is reached.
    *
    * Thin adapter over `listContactsWithInfo` (shared assembly/soft-fail logic),
    * projected down to the ContactRead subset.

@@ -330,6 +330,22 @@ describe("ContactStore.listContactsRich", () => {
     expect(result.map((c) => c.id)).toEqual(["bot1"]);
   });
 
+  test("role + contactType combined: only contacts matching both filters are returned", async () => {
+    seedGatewayContact({ id: "guardian-human", role: "guardian" });
+    seedGatewayContact({ id: "contact-human", role: "contact" });
+    seedGatewayContact({ id: "contact-bot", role: "contact" });
+    seedAssistantInfo({ id: "guardian-human", contactType: "human" });
+    seedAssistantInfo({ id: "contact-human", contactType: "human" });
+    seedAssistantInfo({ id: "contact-bot", contactType: "assistant" });
+
+    const result = await new ContactStore().listContactsWithInfo({
+      role: "contact",
+      contactType: "human",
+    });
+
+    expect(result.map((c) => c.id)).toEqual(["contact-human"]);
+  });
+
   test("contactType filter throws on assistant DB outage (not silent empty)", async () => {
     seedGatewayContact({ id: "h1" });
     seedAssistantInfo({ id: "h1", contactType: "human" });
