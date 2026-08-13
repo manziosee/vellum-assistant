@@ -23,7 +23,7 @@ describe("bearer token redaction", () => {
 });
 
 // ---------------------------------------------------------------------------
-// API-key patterns — sourced from service-contracts (these were missing from
+// API-key patterns - sourced from service-contracts (these were missing from
 // the old hardcoded gateway list and are the main motivation for this change)
 // ---------------------------------------------------------------------------
 
@@ -129,7 +129,7 @@ describe("API key patterns from service-contracts", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Sensitive headers — always fully redacted regardless of value
+// Sensitive headers - always fully redacted regardless of value
 // ---------------------------------------------------------------------------
 
 describe("sensitive header redaction", () => {
@@ -213,7 +213,7 @@ describe("deep value redaction", () => {
   });
 
   test("stops recursing at depth 8 to prevent stack overflow", () => {
-    // Build an object 10 levels deep — beyond the depth cap it returns as-is
+    // Build an object 10 levels deep - beyond the depth cap it returns as-is
     let deep: unknown = "leaf-value";
     for (let i = 0; i < 10; i++) {
       deep = { child: deep };

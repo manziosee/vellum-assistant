@@ -4,7 +4,7 @@
  *
  * API-key patterns are sourced from @vellumai/service-contracts/secret-detection,
  * the shared source of truth across all packages. Adding a new integration's
- * key pattern there automatically reaches gateway logs — no copy to maintain.
+ * key pattern there automatically reaches gateway logs - no copy to maintain.
  */
 
 import { REDACTION_PREFIX_PATTERNS } from "@vellumai/service-contracts/secret-detection";
@@ -75,7 +75,7 @@ function redactValue(value: unknown, depth: number): unknown {
 }
 
 // ---------------------------------------------------------------------------
-// Error serialization — extracts non-enumerable Error fields and cause chain
+// Error serialization - extracts non-enumerable Error fields and cause chain
 // ---------------------------------------------------------------------------
 
 function serializeError(err: unknown, depth: number): unknown {
