@@ -131,7 +131,8 @@ describe("AuthRateLimiter", () => {
   describe("capacity management", () => {
     test("stale IPs are evicted at capacity, making room for new ones", () => {
       const windowMs = 60_000;
-      setSystemTime(new Date(0));
+      const base = 1_000_000;
+      setSystemTime(new Date(base));
       const limiter = new AuthRateLimiter(3, windowMs);
 
       for (let i = 0; i < MAX_TRACKED_IPS; i++) {
@@ -139,7 +140,7 @@ describe("AuthRateLimiter", () => {
       }
 
       // Advance past the window so all existing entries are stale
-      setSystemTime(new Date(windowMs + 1));
+      setSystemTime(new Date(base + windowMs + 1));
 
       // Recording a new IP should evict the stale entries
       const newIp = "10.0.0.1";
