@@ -84,6 +84,10 @@ import {
   stopGuardianExpirySweep,
 } from "./routes/guardian-expiry-sweep.js";
 import {
+  startGuardianReminderSweep,
+  stopGuardianReminderSweep,
+} from "./routes/guardian-reminder-sweep.js";
+import {
   dbMigrationUnavailableResponse,
   handleHealth,
   handleReadyz,
@@ -510,6 +514,9 @@ export class RuntimeHttpServer {
     startGuardianExpirySweep();
     log.info("Guardian request expiry sweep started");
 
+    startGuardianReminderSweep();
+    log.info("Guardian request reminder sweep started");
+
     startInferenceProfileSessionReaper();
     log.info("Inference profile session reaper started");
 
@@ -526,6 +533,7 @@ export class RuntimeHttpServer {
 
   async stop(): Promise<void> {
     stopGuardianExpirySweep();
+    stopGuardianReminderSweep();
     stopInferenceProfileSessionReaper();
     stopTelegramWebhookHealthSweep();
     stopPluginScheduleReconcileSweep();

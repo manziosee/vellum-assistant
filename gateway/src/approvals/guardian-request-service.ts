@@ -35,6 +35,7 @@ import {
   type ListGuardianRequestsIpcParams,
   type ListPendingGuardianRequestsByDestinationIpcParams,
   type SweepExpiredGuardianRequestsIpcResponse,
+  type SweepPendingForRemindersIpcResponse,
   type UpdateGuardianRequestDeliveryIpcParams,
 } from "@vellumai/gateway-client";
 
@@ -57,6 +58,7 @@ import {
   listPendingByConversationScope,
   listPendingByDestinationChat,
   listPendingByDestinationConversation,
+  listPendingRequestsDueForReminder,
   resolveGuardianRequest,
   sweepExpiredGuardianRequests,
   updateDelivery,
@@ -143,6 +145,23 @@ export function sweepExpiredRequests(
 ): SweepExpiredGuardianRequestsIpcResponse {
   return {
     expired: sweepExpiredGuardianRequests(now).map(toGuardianRequestWire),
+  };
+}
+
+/**
+ * Reminder sweep: returns persistent pending requests that have been waiting
+ * longer than `olderThanMs` without a followupState, so the daemon can send
+ * a reminder to the guardian and mark them as reminded.
+ */
+export function sweepPendingForReminders(params: {
+  olderThanMs?: number;
+  now?: number;
+}): SweepPendingForRemindersIpcResponse {
+  const olderThanMs = params.olderThanMs ?? 10 * 60 * 1000;
+  return {
+    pending: listPendingRequestsDueForReminder(olderThanMs, params.now).map(
+      toGuardianRequestWire,
+    ),
   };
 }
 

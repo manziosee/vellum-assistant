@@ -417,7 +417,8 @@ export interface ResolveGuardianRequestDecision {
 }
 
 export type ResolveGuardianRequestResult =
-  { applied: true; request: GuardianRequest } | { applied: false };
+  | { applied: true; request: GuardianRequest }
+  | { applied: false };
 
 /**
  * Compare-and-swap resolve: only transitions the request from
@@ -556,6 +557,35 @@ export function sweepExpiredGuardianRequests(
       rowToRequest({ ...row, status: "expired", updatedAt }),
     );
   });
+}
+
+/**
+ * Return pending requests that have been waiting longer than `olderThanMs`
+ * and have never been reminded (`followupState IS NULL`).
+ *
+ * Interaction-bound kinds (`tool_approval`, `pending_question`) are excluded
+ * because they have their own in-daemon interaction timeout and would expire
+ * before any reminder window elapsed.
+ */
+export function listPendingRequestsDueForReminder(
+  olderThanMs: number,
+  now = Date.now(),
+): GuardianRequest[] {
+  const db = getGatewayDb();
+  const cutoff = now - olderThanMs;
+  return db
+    .select()
+    .from(guardianRequests)
+    .where(
+      and(
+        eq(guardianRequests.status, "pending"),
+        isNull(guardianRequests.followupState),
+        lt(guardianRequests.createdAt, cutoff),
+        notInArray(guardianRequests.kind, INTERACTION_BOUND_KINDS),
+      ),
+    )
+    .all()
+    .map(rowToRequest);
 }
 
 /**
