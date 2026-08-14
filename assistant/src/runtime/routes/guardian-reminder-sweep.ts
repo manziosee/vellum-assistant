@@ -6,27 +6,25 @@
  * REMINDER_THRESHOLD_MS without any followup, and sends a reminder text to the
  * guardian so requests are not silently forgotten.
  *
- * The gateway query is intentionally read-only - it returns rows due for a
- * reminder without mutating them. The daemon then, for each row:
- *   1. Marks followupState = 'reminded' via updateGuardianRequest (fail-safe:
- *      prevents double-reminding even if delivery fails).
- *   2. Attempts to deliver a reminder text to the guardian's channel.
+ * The gateway atomically claims each eligible row (sets followupState =
+ * 'reminded') and returns only the rows it successfully claimed, so the daemon
+ * never delivers a reminder for a request that was concurrently resolved or
+ * expired. No separate updateGuardianRequest call is needed from the daemon.
  *
- * Channels where the guardian cannot be individually addressed (Telegram,
- * WhatsApp) skip delivery; the followupState is still marked so the request
- * is not re-queried on the next sweep.
+ * Reminder delivery routes through the recorded guardian_request_deliveries,
+ * not through sourceChannel + guardianExternalUserId, so reminders reach
+ * whatever surfaces the original card was sent to. Channels without a
+ * deliverable route (e.g. vellum in-app) are skipped silently.
  *
  * Unreachable-gateway posture: log and skip the round.
  */
 
+import { resolveDeliverCallbackUrlForChannel } from "../../approvals/guardian-channel-delivery.js";
 import {
-  channelDeliversToUserId,
-  resolveDeliverCallbackUrlForChannel,
-} from "../../approvals/guardian-channel-delivery.js";
-import {
+  type GuardianRequestDeliveryWire,
   type GuardianRequestWire,
+  listGuardianRequestDeliveriesOrEmpty,
   sweepPendingGuardianRequestsForReminders,
-  updateGuardianRequest,
 } from "../../channels/gateway-guardian-requests.js";
 import { getLogger } from "../../util/logger.js";
 import { DAEMON_INTERNAL_ASSISTANT_ID } from "../assistant-scope.js";
@@ -47,13 +45,15 @@ let sweepTimer: ReturnType<typeof setInterval> | null = null;
 let sweepInProgress = false;
 
 /**
- * Run one reminder sweep round: fetch pending requests due for a reminder,
- * mark each as reminded, then attempt channel delivery. Returns the count of
- * requests reminded.
+ * Run one reminder sweep round: the gateway atomically claims rows due for a
+ * reminder and returns them; the daemon fans out delivery per recorded
+ * delivery destination. Returns the count of requests reminded.
  */
 export async function runGuardianReminderSweep(): Promise<number> {
   let pending: GuardianRequestWire[];
   try {
+    // The gateway atomically marks followupState = 'reminded' and returns
+    // only the rows it claimed - no separate updateGuardianRequest needed.
     pending = await sweepPendingGuardianRequestsForReminders(
       REMINDER_THRESHOLD_MS,
     );
@@ -76,19 +76,7 @@ export async function runGuardianReminderSweep(): Promise<number> {
       "Guardian request pending without action - sending reminder",
     );
 
-    // Mark reminded first (fail-safe: prevents double-reminding regardless of
-    // whether the channel delivery below succeeds).
-    try {
-      await updateGuardianRequest(request.id, { followupState: "reminded" });
-    } catch (err) {
-      log.warn(
-        { err, requestId: request.id },
-        "Failed to mark guardian request as reminded - skipping delivery to avoid double-remind risk",
-      );
-      continue;
-    }
-
-    await deliverReminderToGuardian(request);
+    await deliverRemindersForRequest(request);
   }
 
   if (pending.length > 0) {
@@ -105,41 +93,71 @@ export async function runGuardianReminderSweep(): Promise<number> {
 }
 
 /**
- * Attempt to deliver a reminder text to the guardian on their channel.
- * Only channels that support DM delivery by user ID (Slack, Discord) are
- * attempted; all others skip silently (followupState is already marked).
- * Best-effort and non-throwing.
+ * Deliver a reminder to every surface the original approval card was sent to.
+ *
+ * Routes through the recorded guardian_request_deliveries rather than
+ * reconstructing routing from sourceChannel + guardianExternalUserId. The
+ * delivery records tell us exactly where the card landed, so the reminder
+ * reaches the right channel even when the guardian's notification surfaces
+ * differ from the request's source channel.
+ *
+ * Best-effort and non-throwing: a failed delivery on one surface is logged
+ * and does not block the others. followupState is already marked by the time
+ * this runs, so failures here are non-fatal.
  */
-async function deliverReminderToGuardian(
+async function deliverRemindersForRequest(
   request: GuardianRequestWire,
 ): Promise<void> {
-  const channel = request.sourceChannel ?? "";
-  const guardianUserId = request.guardianExternalUserId;
-
-  if (!guardianUserId || !channelDeliversToUserId(channel)) {
-    return;
-  }
-
-  const deliverUrl = resolveDeliverCallbackUrlForChannel(channel);
-  if (!deliverUrl) {
+  const deliveries = await listGuardianRequestDeliveriesOrEmpty(request.id);
+  if (deliveries.length === 0) {
     return;
   }
 
   const text = buildReminderText(request);
 
+  for (const delivery of deliveries) {
+    await deliverReminderToDestination(request, delivery, text);
+  }
+}
+
+/**
+ * Attempt to deliver a reminder text to one recorded delivery destination.
+ *
+ * Only surfaces with a callback-less deliver route and a known chatId are
+ * attempted. In-app (vellum) and other surfaces without a deliver route are
+ * skipped silently.
+ */
+async function deliverReminderToDestination(
+  request: GuardianRequestWire,
+  delivery: GuardianRequestDeliveryWire,
+  text: string,
+): Promise<void> {
+  const deliverUrl = resolveDeliverCallbackUrlForChannel(
+    delivery.destinationChannel,
+  );
+  const chatId = delivery.destinationChatId;
+
+  if (!deliverUrl || !chatId) {
+    return;
+  }
+
   try {
     await deliverChannelReply(deliverUrl, {
-      chatId: guardianUserId,
+      chatId,
       text,
       assistantId: DAEMON_INTERNAL_ASSISTANT_ID,
     });
     log.info(
-      { requestId: request.id, kind: request.kind, channel },
+      {
+        requestId: request.id,
+        kind: request.kind,
+        channel: delivery.destinationChannel,
+      },
       "Delivered guardian request reminder",
     );
   } catch (err) {
     log.warn(
-      { err, requestId: request.id, channel },
+      { err, requestId: request.id, channel: delivery.destinationChannel },
       "Failed to deliver guardian request reminder (non-fatal - state already marked)",
     );
   }

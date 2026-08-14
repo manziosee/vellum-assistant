@@ -14,6 +14,7 @@ import {
   inArray,
   isNotNull,
   isNull,
+  like,
   lt,
   notInArray,
   or,
@@ -560,32 +561,75 @@ export function sweepExpiredGuardianRequests(
 }
 
 /**
- * Return pending requests that have been waiting longer than `olderThanMs`
- * and have never been reminded (`followupState IS NULL`).
+ * Atomically claim pending requests due for a reminder by setting
+ * followupState = 'reminded' on them in the same transaction, then return
+ * the claimed rows. This eliminates the race where the daemon marks a row
+ * after the gateway query but before a concurrent decision or expiry can
+ * resolve it.
  *
- * Interaction-bound kinds (`tool_approval`, `pending_question`) are excluded
- * because they have their own in-daemon interaction timeout and would expire
- * before any reminder window elapsed.
+ * Eligible rows:
+ * - status = 'pending'
+ * - createdAt < now - olderThanMs
+ * - NOT an interaction-bound kind (tool_approval, pending_question)
+ * - followupState IS NULL  **OR**  followupState LIKE 'inline_wait_active:%'
+ *   (stale inline-wait markers left by a daemon crash are safe to override
+ *   when the request is already older than olderThanMs, because the inline
+ *   wait budget is capped far below any reasonable olderThanMs value)
+ *
+ * The CAS guard on the UPDATE (same predicates as the SELECT) is belt-and-
+ * suspenders inside SQLite's serialized write model: it prevents a claimed
+ * row from being claimed again by a concurrent sweep connection that somehow
+ * ran the SELECT before this transaction's UPDATE committed.
  */
-export function listPendingRequestsDueForReminder(
+export function claimPendingRequestsForReminders(
   olderThanMs: number,
   now = Date.now(),
 ): GuardianRequest[] {
   const db = getGatewayDb();
   const cutoff = now - olderThanMs;
-  return db
-    .select()
-    .from(guardianRequests)
-    .where(
-      and(
-        eq(guardianRequests.status, "pending"),
-        isNull(guardianRequests.followupState),
-        lt(guardianRequests.createdAt, cutoff),
-        notInArray(guardianRequests.kind, INTERACTION_BOUND_KINDS),
-      ),
-    )
-    .all()
-    .map(rowToRequest);
+  const updatedAt = now;
+
+  const reminderEligible = or(
+    isNull(guardianRequests.followupState),
+    like(guardianRequests.followupState, "inline_wait_active:%"),
+  );
+
+  return db.transaction(() => {
+    const due = db
+      .select()
+      .from(guardianRequests)
+      .where(
+        and(
+          eq(guardianRequests.status, "pending"),
+          reminderEligible,
+          lt(guardianRequests.createdAt, cutoff),
+          notInArray(guardianRequests.kind, INTERACTION_BOUND_KINDS),
+        ),
+      )
+      .all();
+
+    if (due.length === 0) {
+      return [];
+    }
+
+    db.update(guardianRequests)
+      .set({ followupState: "reminded", updatedAt })
+      .where(
+        and(
+          inArray(
+            guardianRequests.id,
+            due.map((r) => r.id),
+          ),
+          eq(guardianRequests.status, "pending"),
+          reminderEligible,
+        ),
+      )
+      .run();
+
+    return due.map((row) =>
+      rowToRequest({ ...row, followupState: "reminded", updatedAt }),
+    );
+  });
 }
 
 /**
