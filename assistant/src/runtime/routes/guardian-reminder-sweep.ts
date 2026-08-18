@@ -19,8 +19,6 @@
  * Unreachable-gateway posture: log and skip the round.
  */
 
-import { z } from "zod";
-
 import { resolveDeliverCallbackUrlForChannel } from "../../approvals/guardian-channel-delivery.js";
 import {
   type GuardianRequestDeliveryWire,
@@ -30,9 +28,7 @@ import {
 } from "../../channels/gateway-guardian-requests.js";
 import { getLogger } from "../../util/logger.js";
 import { DAEMON_INTERNAL_ASSISTANT_ID } from "../assistant-scope.js";
-import { ACTOR_PRINCIPALS } from "../auth/route-policy.js";
 import { deliverChannelReply } from "../gateway-client.js";
-import type { RouteDefinition } from "./types.js";
 
 const log = getLogger("guardian-reminder-sweep");
 
@@ -221,46 +217,3 @@ export function stopGuardianReminderSweep(): void {
   }
   sweepInProgress = false;
 }
-
-// ---------------------------------------------------------------------------
-// POST /v1/guardian-requests/remind-sweep — manual trigger
-// ---------------------------------------------------------------------------
-
-export const ROUTES: RouteDefinition[] = [
-  {
-    operationId: "guardian_reminder_sweep",
-    endpoint: "guardian-requests/remind-sweep",
-    method: "POST",
-    policy: {
-      requiredScopes: ["approval.write"],
-      allowedPrincipalTypes: ACTOR_PRINCIPALS,
-    },
-    requireGuardian: true,
-    summary: "Manually trigger the guardian reminder sweep",
-    description:
-      "Claims and delivers reminders for pending guardian requests older than the reminder threshold. Returns the count of requests reminded.",
-    tags: ["guardian"],
-    requestBody: z
-      .object({
-        olderThanMs: z
-          .number()
-          .positive()
-          .optional()
-          .describe(
-            "Custom age threshold in milliseconds (defaults to 10 minutes)",
-          ),
-      })
-      .optional(),
-    responseBody: z.object({
-      remindedCount: z.number().describe("Number of requests reminded"),
-    }),
-    handler: async ({ body }) => {
-      const olderThanMs =
-        body && typeof body === "object" && "olderThanMs" in body
-          ? (body as { olderThanMs?: number }).olderThanMs
-          : undefined;
-      const remindedCount = await runGuardianReminderSweep(olderThanMs);
-      return { remindedCount };
-    },
-  },
-];

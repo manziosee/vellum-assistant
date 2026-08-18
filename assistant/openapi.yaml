@@ -12475,40 +12475,6 @@ paths:
                   - conversationId
                   - prompts
                 additionalProperties: false
-  /v1/guardian-requests/remind-sweep:
-    post:
-      operationId: guardianrequests_remindsweep_post
-      summary: Manually trigger the guardian reminder sweep
-      description:
-        Claims and delivers reminders for pending guardian requests older than the reminder threshold. Returns the
-        count of requests reminded.
-      tags:
-        - guardian
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                olderThanMs:
-                  description: Custom age threshold in milliseconds (defaults to 10 minutes)
-                  type: number
-                  exclusiveMinimum: 0
-      responses:
-        "200":
-          description: Successful response
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  remindedCount:
-                    type: number
-                    description: Number of requests reminded
-                required:
-                  - remindedCount
-                additionalProperties: false
   /v1/health:
     get:
       operationId: health_get
