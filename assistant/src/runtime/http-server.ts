@@ -83,10 +83,7 @@ import {
   startGuardianExpirySweep,
   stopGuardianExpirySweep,
 } from "./routes/guardian-expiry-sweep.js";
-import {
-  startGuardianReminderSweep,
-  stopGuardianReminderSweep,
-} from "./routes/guardian-reminder-sweep.js";
+import { stopGuardianReminderSweep } from "./routes/guardian-reminder-sweep.js";
 import {
   dbMigrationUnavailableResponse,
   handleHealth,
@@ -513,9 +510,6 @@ export class RuntimeHttpServer {
 
     startGuardianExpirySweep();
     log.info("Guardian request expiry sweep started");
-
-    startGuardianReminderSweep();
-    log.info("Guardian request reminder sweep started");
 
     startInferenceProfileSessionReaper();
     log.info("Inference profile session reaper started");

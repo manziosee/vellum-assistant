@@ -19,6 +19,8 @@
  * Unreachable-gateway posture: log and skip the round.
  */
 
+import { z } from "zod";
+
 import { resolveDeliverCallbackUrlForChannel } from "../../approvals/guardian-channel-delivery.js";
 import {
   type GuardianRequestDeliveryWire,
@@ -28,7 +30,9 @@ import {
 } from "../../channels/gateway-guardian-requests.js";
 import { getLogger } from "../../util/logger.js";
 import { DAEMON_INTERNAL_ASSISTANT_ID } from "../assistant-scope.js";
+import { ACTOR_PRINCIPALS } from "../auth/route-policy.js";
 import { deliverChannelReply } from "../gateway-client.js";
+import type { RouteDefinition } from "./types.js";
 
 const log = getLogger("guardian-reminder-sweep");
 
@@ -49,14 +53,14 @@ let sweepInProgress = false;
  * reminder and returns them; the daemon fans out delivery per recorded
  * delivery destination. Returns the count of requests reminded.
  */
-export async function runGuardianReminderSweep(): Promise<number> {
+export async function runGuardianReminderSweep(
+  olderThanMs = REMINDER_THRESHOLD_MS,
+): Promise<number> {
   let pending: GuardianRequestWire[];
   try {
     // The gateway atomically marks followupState = 'reminded' and returns
     // only the rows it claimed - no separate updateGuardianRequest needed.
-    pending = await sweepPendingGuardianRequestsForReminders(
-      REMINDER_THRESHOLD_MS,
-    );
+    pending = await sweepPendingGuardianRequestsForReminders(olderThanMs);
   } catch (err) {
     log.warn(
       { err },
@@ -197,7 +201,7 @@ export function startGuardianReminderSweep(): void {
       return;
     }
     sweepInProgress = true;
-    void runGuardianReminderSweep()
+    void runGuardianReminderSweep(REMINDER_THRESHOLD_MS)
       .catch((err) => {
         log.error({ err }, "Guardian reminder sweep failed");
       })
@@ -217,3 +221,46 @@ export function stopGuardianReminderSweep(): void {
   }
   sweepInProgress = false;
 }
+
+// ---------------------------------------------------------------------------
+// POST /v1/guardian-requests/remind-sweep — manual trigger
+// ---------------------------------------------------------------------------
+
+export const ROUTES: RouteDefinition[] = [
+  {
+    operationId: "guardian_reminder_sweep",
+    endpoint: "guardian-requests/remind-sweep",
+    method: "POST",
+    policy: {
+      requiredScopes: ["approval.write"],
+      allowedPrincipalTypes: ACTOR_PRINCIPALS,
+    },
+    requireGuardian: true,
+    summary: "Manually trigger the guardian reminder sweep",
+    description:
+      "Claims and delivers reminders for pending guardian requests older than the reminder threshold. Returns the count of requests reminded.",
+    tags: ["guardian"],
+    requestBody: z
+      .object({
+        olderThanMs: z
+          .number()
+          .positive()
+          .optional()
+          .describe(
+            "Custom age threshold in milliseconds (defaults to 10 minutes)",
+          ),
+      })
+      .optional(),
+    responseBody: z.object({
+      remindedCount: z.number().describe("Number of requests reminded"),
+    }),
+    handler: async ({ body }) => {
+      const olderThanMs =
+        body && typeof body === "object" && "olderThanMs" in body
+          ? (body as { olderThanMs?: number }).olderThanMs
+          : undefined;
+      const remindedCount = await runGuardianReminderSweep(olderThanMs);
+      return { remindedCount };
+    },
+  },
+];
