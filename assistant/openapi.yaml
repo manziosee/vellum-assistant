@@ -12429,6 +12429,73 @@ paths:
                   - conversationId
                   - prompts
                 additionalProperties: false
+  /v1/guardian-requests:
+    get:
+      operationId: guardianrequests_get
+      summary: List guardian request history
+      description:
+        Returns guardian requests ordered newest-first. Supports filtering by status and kind, and keyset
+        pagination via limit + before (epoch-ms createdAt cursor).
+      tags:
+        - guardian
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum:
+              - pending
+              - approved
+              - denied
+              - expired
+          description: Filter by request status
+        - name: kind
+          in: query
+          required: false
+          schema:
+            type: string
+            enum:
+              - access_request
+              - tool_approval
+              - tool_grant_request
+              - pending_question
+          description: Filter by request kind
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+          description: Maximum rows to return (default 50, max 200)
+        - name: before
+          in: query
+          required: false
+          schema:
+            type: number
+          description:
+            "Keyset cursor: return only rows created before this epoch-ms timestamp (use the createdAt of the last item
+            from the previous page)"
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  requests:
+                    type: array
+                    items: {}
+                    description: Guardian request objects
+                  hasMore:
+                    type: boolean
+                    description: True when more pages exist beyond this result set
+                required:
+                  - requests
+                  - hasMore
+                additionalProperties: false
   /v1/health:
     get:
       operationId: health_get

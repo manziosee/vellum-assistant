@@ -303,6 +303,10 @@ export interface ListGuardianRequestsFilters {
   sourceChannel?: string;
   kind?: string;
   toolName?: string;
+  /** Maximum rows to return. Results are always newest-first (createdAt DESC). */
+  limit?: number;
+  /** Keyset cursor: return only rows created strictly before this epoch-ms timestamp. */
+  before?: number;
 }
 
 export function listGuardianRequests(
@@ -352,17 +356,24 @@ export function listGuardianRequests(
   if (filters?.toolName) {
     conditions.push(eq(guardianRequests.toolName, filters.toolName));
   }
-
-  if (conditions.length === 0) {
-    return db.select().from(guardianRequests).all().map(rowToRequest);
+  if (filters?.before !== undefined) {
+    conditions.push(lt(guardianRequests.createdAt, filters.before));
   }
 
-  return db
+  const query = db
     .select()
     .from(guardianRequests)
-    .where(and(...conditions))
-    .all()
-    .map(rowToRequest);
+    .orderBy(desc(guardianRequests.createdAt));
+
+  const withWhere =
+    conditions.length > 0 ? query.where(and(...conditions)) : query;
+
+  const rows =
+    filters?.limit !== undefined
+      ? withWhere.limit(filters.limit).all()
+      : withWhere.all();
+
+  return rows.map(rowToRequest);
 }
 
 export interface UpdateGuardianRequestParams {
@@ -417,7 +428,8 @@ export interface ResolveGuardianRequestDecision {
 }
 
 export type ResolveGuardianRequestResult =
-  { applied: true; request: GuardianRequest } | { applied: false };
+  | { applied: true; request: GuardianRequest }
+  | { applied: false };
 
 /**
  * Compare-and-swap resolve: only transitions the request from

@@ -318,6 +318,10 @@ export const ListGuardianRequestsIpcParamsSchema = z.object({
   sourceChannel: z.string().optional(),
   kind: GuardianRequestKindSchema.optional(),
   toolName: z.string().optional(),
+  /** Maximum rows to return. Results are ordered newest-first (createdAt DESC). */
+  limit: z.number().int().positive().optional(),
+  /** Keyset cursor: return only rows created strictly before this epoch-ms timestamp. */
+  before: z.number().optional(),
 });
 
 export type ListGuardianRequestsIpcParams = z.infer<
