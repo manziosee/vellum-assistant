@@ -9,8 +9,10 @@
 import type { Database } from "bun:sqlite";
 import {
   and,
+  asc,
   desc,
   eq,
+  gt,
   inArray,
   isNotNull,
   isNull,
@@ -303,10 +305,12 @@ export interface ListGuardianRequestsFilters {
   sourceChannel?: string;
   kind?: string;
   toolName?: string;
-  /** Maximum rows to return. Results are always newest-first (createdAt DESC). */
+  /** Maximum rows to return. Results are ordered newest-first (createdAt DESC, id ASC). */
   limit?: number;
-  /** Keyset cursor: return only rows created strictly before this epoch-ms timestamp. */
+  /** Keyset cursor — epoch-ms createdAt of the last item on the previous page. */
   before?: number;
+  /** Keyset cursor — id of the last item (tiebreaker for equal createdAt). */
+  beforeId?: string;
 }
 
 export function listGuardianRequests(
@@ -357,13 +361,25 @@ export function listGuardianRequests(
     conditions.push(eq(guardianRequests.toolName, filters.toolName));
   }
   if (filters?.before !== undefined) {
-    conditions.push(lt(guardianRequests.createdAt, filters.before));
+    const beforeMs = filters.before;
+    const beforeId = filters.beforeId;
+    conditions.push(
+      beforeId !== undefined
+        ? or(
+            lt(guardianRequests.createdAt, beforeMs),
+            and(
+              eq(guardianRequests.createdAt, beforeMs),
+              gt(guardianRequests.id, beforeId),
+            ),
+          )!
+        : lt(guardianRequests.createdAt, beforeMs),
+    );
   }
 
   const query = db
     .select()
     .from(guardianRequests)
-    .orderBy(desc(guardianRequests.createdAt));
+    .orderBy(desc(guardianRequests.createdAt), asc(guardianRequests.id));
 
   const withWhere =
     conditions.length > 0 ? query.where(and(...conditions)) : query;

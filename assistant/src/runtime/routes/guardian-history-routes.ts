@@ -3,14 +3,15 @@
  *
  * Returns the guardian's request history from the gateway, ordered
  * newest-first. Supports filtering by status and kind, plus keyset
- * pagination via `limit` + `before` (epoch-ms createdAt cursor).
+ * pagination via `limit` + `before` + `beforeId` (composite cursor).
  *
  * Callers check `hasMore` to decide whether to fetch the next page:
- *   GET /v1/guardian-requests?limit=50&before=<last item's createdAt>
+ *   GET /v1/guardian-requests?limit=50&before=<last createdAt>&beforeId=<last id>
  */
 
 import {
   GuardianRequestKindSchema,
+  GuardianRequestSchema,
   GuardianRequestStatusSchema,
   type GuardianRequestWire,
 } from "@vellumai/gateway-client";
@@ -32,6 +33,7 @@ async function handleListGuardianRequests({
 }> {
   const rawLimit = queryParams.limit;
   const rawBefore = queryParams.before;
+  const rawBeforeId = queryParams.beforeId;
   const rawStatus = queryParams.status;
   const rawKind = queryParams.kind;
 
@@ -47,13 +49,15 @@ async function handleListGuardianRequests({
     throw new BadRequestError("before must be a positive epoch-ms timestamp");
   }
 
+  const beforeId = rawBeforeId !== undefined ? String(rawBeforeId) : undefined;
+
   const statusResult =
     rawStatus !== undefined
       ? GuardianRequestStatusSchema.safeParse(rawStatus)
       : null;
   if (statusResult && !statusResult.success) {
     throw new BadRequestError(
-      `status must be one of: pending, approved, denied, expired`,
+      `status must be one of: ${GuardianRequestStatusSchema.options.join(", ")}`,
     );
   }
 
@@ -61,7 +65,7 @@ async function handleListGuardianRequests({
     rawKind !== undefined ? GuardianRequestKindSchema.safeParse(rawKind) : null;
   if (kindResult && !kindResult.success) {
     throw new BadRequestError(
-      `kind must be one of: access_request, tool_approval, tool_grant_request, pending_question`,
+      `kind must be one of: ${GuardianRequestKindSchema.options.join(", ")}`,
     );
   }
 
@@ -72,6 +76,7 @@ async function handleListGuardianRequests({
     ...(statusResult ? { status: statusResult.data } : {}),
     ...(kindResult ? { kind: kindResult.data } : {}),
     ...(before !== undefined ? { before } : {}),
+    ...(beforeId !== undefined ? { beforeId } : {}),
     limit: fetchLimit,
   });
 
@@ -93,14 +98,14 @@ export const ROUTES: RouteDefinition[] = [
     requireGuardian: true,
     summary: "List guardian request history",
     description:
-      "Returns guardian requests ordered newest-first. Supports filtering by status and kind, and keyset pagination via limit + before (epoch-ms createdAt cursor).",
+      "Returns guardian requests ordered newest-first (createdAt DESC, id ASC). Supports filtering by status and kind, and keyset pagination via limit + before + beforeId.",
     tags: ["guardian"],
     queryParams: [
       {
         name: "status",
         schema: {
           type: "string",
-          enum: ["pending", "approved", "denied", "expired"],
+          enum: [...GuardianRequestStatusSchema.options],
         },
         description: "Filter by request status",
       },
@@ -108,12 +113,7 @@ export const ROUTES: RouteDefinition[] = [
         name: "kind",
         schema: {
           type: "string",
-          enum: [
-            "access_request",
-            "tool_approval",
-            "tool_grant_request",
-            "pending_question",
-          ],
+          enum: [...GuardianRequestKindSchema.options],
         },
         description: "Filter by request kind",
       },
@@ -126,11 +126,19 @@ export const ROUTES: RouteDefinition[] = [
         name: "before",
         schema: { type: "number" },
         description:
-          "Keyset cursor: return only rows created before this epoch-ms timestamp (use the createdAt of the last item from the previous page)",
+          "Keyset cursor: epoch-ms createdAt of the last item from the previous page",
+      },
+      {
+        name: "beforeId",
+        schema: { type: "string" },
+        description:
+          "Keyset cursor: id of the last item from the previous page (required when before is set, for correct pagination when multiple items share the same createdAt)",
       },
     ],
     responseBody: z.object({
-      requests: z.array(z.unknown()).describe("Guardian request objects"),
+      requests: z
+        .array(GuardianRequestSchema)
+        .describe("Guardian request objects"),
       hasMore: z
         .boolean()
         .describe("True when more pages exist beyond this result set"),
