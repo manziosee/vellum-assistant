@@ -14,9 +14,11 @@ function isScopeMatch(
   scope: string | null | undefined,
   cwd: string | undefined,
 ): boolean {
-  if (!scope) return true; // global rule
+  if (!scope || scope === "everywhere") return true; // global rule
   if (!cwd) return true; // caller has no cwd — don't silently drop the rule
-  const normalizedScope = scope.endsWith("/") ? scope : scope + "/";
+  // Strip the "/*" glob suffix emitted by generateDirectoryScopeOptions()
+  const dir = scope.endsWith("/*") ? scope.slice(0, -2) : scope;
+  const normalizedScope = dir.endsWith("/") ? dir : dir + "/";
   const normalizedCwd = cwd.endsWith("/") ? cwd : cwd + "/";
   return (
     normalizedCwd === normalizedScope ||

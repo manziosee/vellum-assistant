@@ -754,7 +754,7 @@ export class FileRiskClassifier implements RiskClassifier<
       const override = ruleCache.findToolOverride(
         toolName,
         filePath,
-        workingDir,
+        dirname(filePath),
       );
       if (
         override &&
