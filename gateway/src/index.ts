@@ -109,6 +109,7 @@ import { createOAuthAppsProxyHandler } from "./http/routes/oauth-apps-proxy.js";
 import { createOAuthProvidersProxyHandler } from "./http/routes/oauth-providers-proxy.js";
 import { createChannelReadinessProxyHandler } from "./http/routes/channel-readiness-proxy.js";
 import { createPsHandler } from "./http/routes/ps.js";
+import { createVelayStatusHandler } from "./http/routes/velay-status.js";
 import { createRuntimeHealthProxyHandler } from "./http/routes/runtime-health-proxy.js";
 import { createUpgradeBroadcastProxyHandler } from "./http/routes/upgrade-broadcast-proxy.js";
 import {
@@ -593,6 +594,7 @@ async function main() {
   const oauthProvidersProxy = createOAuthProvidersProxyHandler(config);
   const channelReadinessProxy = createChannelReadinessProxyHandler(config);
   const psHandler = createPsHandler(config);
+  const velayStatusHandler = createVelayStatusHandler(velayTunnelClient);
   const runtimeHealthProxy = createRuntimeHealthProxyHandler(config);
   const upgradeBroadcastProxy = createUpgradeBroadcastProxyHandler(config);
   const migrationExportProxy = createMigrationExportProxyHandler(config);
@@ -798,6 +800,14 @@ async function main() {
       method: "GET",
       auth: "edge",
       handler: () => psHandler.handlePs(),
+    },
+
+    // ── Velay tunnel status ──
+    {
+      path: "/v1/velay/status",
+      method: "GET",
+      auth: "edge",
+      handler: () => velayStatusHandler.handleVelayStatus(),
     },
 
     // ── Brain graph ──
