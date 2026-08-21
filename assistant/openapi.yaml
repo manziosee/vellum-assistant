@@ -25071,30 +25071,6 @@ paths:
                 required:
                   - processes
                 additionalProperties: false
-  /v1/velay/status:
-    get:
-      operationId: velay_status_get
-      summary: Velay tunnel status
-      description: "Returns the current state of the Velay tunnel connection: whether it is connected and its public URL when available. Returns { connected: false, publicUrl: null } when Velay is not configured."
-      tags:
-        - system
-      responses:
-        "200":
-          description: Successful response
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  connected:
-                    type: boolean
-                  publicUrl:
-                    type: string
-                    nullable: true
-                required:
-                  - connected
-                  - publicUrl
-                additionalProperties: false
   /v1/question-response:
     post:
       operationId: questionresponse_post
