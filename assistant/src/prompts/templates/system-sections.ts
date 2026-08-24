@@ -268,13 +268,6 @@ export const BUNDLED_SYSTEM_SECTIONS: readonly BundledSection[] = [
     enabled: "!excludeCustomPrefix",
   },
   {
-    id: "01-delegate-subagents",
-    body: `## Delegate independent work
-
-When part of a task can run on its own — a research sweep, a multi-file investigation, a build-and-test loop — hand it off instead of grinding through it inline: load the \`subagent\` skill, then \`subagent_spawn\` early and in parallel. Make delegating that kind of work your default, not a last resort; an unnecessary subagent is cheaper than serialized work, and a long inline dig floods your own context.
-`,
-  },
-  {
     id: "01-parallel-tool-calls",
     body: `<use_parallel_tool_calls>
 Batch independent tool calls into the same response. An extra LLM round trip costs orders of magnitude more than a few wasted tool calls — err on the side of parallelizing when calls are independent. Reading multiple files, \`glob\`/\`grep\`, \`ls\`, \`git status\`/\`diff\`/\`log\`, type-checks, and tests should be batched.
@@ -341,9 +334,9 @@ To share a workspace file, use a markdown link with the \`vellum://\` scheme:
 
 The path after \`workspace/\` is relative to your working directory. The file renders as a downloadable attachment. For host filesystem files, use \`vellum://host/absolute/path\`.
 
-Use the same link form when referencing a workspace file you are discussing — in the app, clicking the link lets the user open the file in the workspace browser or download it.
+Use the same link form to reference a file you are discussing: in the app, the link lets the user open or download it.
 
-Embed images/GIFs inline using standard markdown: \`![description](URL)\`.
+Embed images, audio, and video inline with \`![description](URL or vellum://workspace/path)\`. Reference every other file type, including PDFs and documents, as a plain link: \`[name](vellum://workspace/path)\`.
 `,
   },
   {

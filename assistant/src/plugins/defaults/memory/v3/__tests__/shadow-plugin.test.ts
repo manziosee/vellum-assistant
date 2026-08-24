@@ -24,9 +24,11 @@ import { join } from "node:path";
 import { Database } from "bun:sqlite";
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 
+import { VOICE_ESCALATION_CONTINUATION_MESSAGE_KIND } from "@vellumai/plugin-api";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 
 import { setConfig } from "../../../../../__tests__/helpers/set-config.js";
+import { ESCALATION_CONTINUATION_CONTENT } from "../../../../../calls/voice-triage-escalate.js";
 import { MemoryV3GateSchema } from "../../../../../config/schemas/memory-v3.js";
 import { ensureMemoryV3SelectionsSchema } from "../../../../../persistence/migrations/338-move-memory-v3-selections-to-memory-db.js";
 import { ensureMemoryV3EverInjectedSchema } from "../../../../../persistence/migrations/345-move-memory-v3-ever-injected-to-memory-db.js";
@@ -107,7 +109,11 @@ let selectorEnabledCfg = false;
 // Mutable `memory.v3.gate.enabled` config kill-switch carried by the mocked
 // config (default on, mirroring the schema default).
 let gateEnabledCfg = true;
-let messages: Array<{ role: string; content: string }> = [];
+let messages: Array<{
+  role: string;
+  content: string;
+  metadata?: string | null;
+}> = [];
 
 // Schema defaults for `memory.v3.gate` (the tuning the mocked config carries
 // and the gate-config threading test asserts against). Includes the default-on
@@ -579,7 +585,9 @@ async function produce(conversationId: string, turnIndex: number) {
     requestId: "r1",
     conversationId,
     turnIndex,
-    trust: {} as never,
+    // v3 cards are personal memory, so the injector only produces for an actor
+    // allowed to see them. These cases are about the commit hook, not the gate.
+    trust: { trustClass: "guardian", sourceChannel: "vellum" } as never,
   });
   const commit = block?.meta?.[MEMORY_V3_COMMIT_META_KEY];
   if (typeof commit === "function") {
@@ -722,6 +730,65 @@ describe("memory-v3 engine", () => {
     expect(turn.conversationId).toBe("conv-1");
     expect(turn.turnNumber).toBe(0);
     expect(turn.currentMessage).toBe("hello world");
+  });
+
+  test("voice escalation continuation routes on the preceding caller message", async () => {
+    messages = [
+      {
+        role: "user",
+        content: JSON.stringify([
+          { type: "text", text: "what did I say my favorite color was?" },
+        ]),
+      },
+      {
+        role: "assistant",
+        content: JSON.stringify([
+          { type: "text", text: "Let me think about that for a second." },
+        ]),
+      },
+      {
+        role: "user",
+        content: JSON.stringify([
+          { type: "text", text: ESCALATION_CONTINUATION_CONTENT },
+        ]),
+        metadata: JSON.stringify({
+          hidden: true,
+          messageKind: VOICE_ESCALATION_CONTINUATION_MESSAGE_KIND,
+        }),
+      },
+    ];
+
+    await observeTurn("conv-1", 1);
+
+    const turn = (
+      orchestrateSpy.mock.calls as unknown as unknown[][]
+    )[0]![0] as MemoryRoutingTurn;
+    expect(turn.currentMessage).toBe("what did I say my favorite color was?");
+  });
+
+  test("generic hidden prompts route on their own content", async () => {
+    messages = [
+      {
+        role: "user",
+        content: JSON.stringify([
+          { type: "text", text: "visible caller message" },
+        ]),
+      },
+      {
+        role: "user",
+        content: JSON.stringify([
+          { type: "text", text: "generic hidden prompt" },
+        ]),
+        metadata: JSON.stringify({ hidden: true }),
+      },
+    ];
+
+    await observeTurn("conv-1", 1);
+
+    const turn = (
+      orchestrateSpy.mock.calls as unknown as unknown[][]
+    )[0]![0] as MemoryRoutingTurn;
+    expect(turn.currentMessage).toBe("generic hidden prompt");
   });
 
   test("orchestrate receives the lane deps", async () => {

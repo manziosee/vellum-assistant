@@ -5,8 +5,11 @@ import path from "node:path";
 
 import {
   getLockfileData,
+  isPairedLockfileEntry,
+  renameLockfileAssistantIfPresent,
   replacePlatformAssistants,
   upsertLockfileAssistant,
+  upsertRendererLockfileAssistant,
 } from "./lockfile";
 
 let dir: string;
@@ -112,6 +115,32 @@ describe("getLockfileData", () => {
   });
 });
 
+// Hosts pass {paired} to getGuardianAccessToken so expired pairings get
+// re-pair guidance instead of hatch/wake; this pins the classification.
+describe("isPairedLockfileEntry", () => {
+  test("classifies paired cloud entries and host pairing markers as paired", () => {
+    writeOnDisk({
+      assistants: [
+        { assistantId: "paired-1", cloud: "paired" },
+        { assistantId: "paired-marker", cloud: "local", paired: true },
+        { assistantId: "local-1", cloud: "local" },
+      ],
+      activeAssistant: "local-1",
+    });
+
+    expect(isPairedLockfileEntry([lockfilePath], "paired-1")).toBe(true);
+    expect(isPairedLockfileEntry([lockfilePath], "paired-marker")).toBe(true);
+    expect(isPairedLockfileEntry([lockfilePath], "local-1")).toBe(false);
+    expect(isPairedLockfileEntry([lockfilePath], "missing")).toBe(false);
+  });
+
+  test("an absent lockfile never classifies as paired", () => {
+    expect(
+      isPairedLockfileEntry([path.join(dir, "absent.json")], "paired-1"),
+    ).toBe(false);
+  });
+});
+
 describe("upsertLockfileAssistant", () => {
   test("rejects an assistant with no id", () => {
     const result = upsertLockfileAssistant(
@@ -196,6 +225,33 @@ describe("upsertLockfileAssistant", () => {
     });
   });
 
+  test("a name-only payload preserves resources and on-disk secrets byte-for-byte", () => {
+    const entry = {
+      assistantId: "asst_1",
+      cloud: "local",
+      runtimeUrl: "http://a",
+      name: "Old Name",
+      resources: { gatewayPort: 7830, daemonPort: 7831, dataDir: "/tmp/x" },
+      signingKey: "sk-on-disk-secret",
+      bearerToken: "bt-on-disk-secret",
+      guardianBootstrapSecret: "gb-on-disk-secret",
+    };
+    writeOnDisk({ activeAssistant: "asst_1", assistants: [entry] });
+
+    const result = upsertLockfileAssistant(
+      [lockfilePath],
+      { assistantId: "asst_1", name: "Renamed" },
+      undefined,
+    );
+
+    expect(result.ok).toBe(true);
+    const assistants = readOnDisk().assistants as Array<
+      Record<string, unknown>
+    >;
+    expect(assistants).toHaveLength(1);
+    expect(assistants[0]).toEqual({ ...entry, name: "Renamed" });
+  });
+
   test("preserves activeAssistant when no active id is provided", () => {
     writeOnDisk({
       activeAssistant: "asst_active",
@@ -223,7 +279,322 @@ describe("upsertLockfileAssistant", () => {
   });
 });
 
+describe("renameLockfileAssistantIfPresent", () => {
+  const entry = {
+    assistantId: "asst_1",
+    cloud: "local",
+    runtimeUrl: "http://a",
+    name: "Old Name",
+    resources: { gatewayPort: 7830, daemonPort: 7831, dataDir: "/tmp/x" },
+    signingKey: "sk-on-disk-secret",
+    bearerToken: "bt-on-disk-secret",
+  };
+
+  test("renames the entry preserving resources, secrets, and activeAssistant", () => {
+    writeOnDisk({
+      activeAssistant: "asst_other",
+      assistants: [entry, { assistantId: "asst_other", cloud: "local" }],
+    });
+
+    const result = renameLockfileAssistantIfPresent(
+      [lockfilePath],
+      "asst_1",
+      "Renamed",
+    );
+
+    expect(result.ok).toBe(true);
+    const onDisk = readOnDisk();
+    expect(onDisk.activeAssistant).toBe("asst_other");
+    const assistants = onDisk.assistants as Array<Record<string, unknown>>;
+    expect(assistants).toEqual([
+      { ...entry, name: "Renamed" },
+      { assistantId: "asst_other", cloud: "local" },
+    ]);
+  });
+
+  test("refuses a missing entry without writing the file", () => {
+    const result = renameLockfileAssistantIfPresent(
+      [lockfilePath],
+      "asst_gone",
+      "Renamed",
+    );
+
+    expect(result).toEqual({
+      ok: false,
+      status: 404,
+      error: "No lockfile entry for this assistant",
+    });
+    expect(fs.existsSync(lockfilePath)).toBe(false);
+  });
+
+  test("refuses when the id names another process's retired entry", () => {
+    writeOnDisk({ activeAssistant: null, assistants: [entry] });
+    const before = fs.readFileSync(lockfilePath, "utf-8");
+
+    const result = renameLockfileAssistantIfPresent(
+      [lockfilePath],
+      "asst_retired",
+      "Renamed",
+    );
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.status).toBe(404);
+    }
+    expect(fs.readFileSync(lockfilePath, "utf-8")).toBe(before);
+  });
+
+  test("refuses a corrupt on-disk file without clobbering it", () => {
+    fs.writeFileSync(lockfilePath, "{ not json");
+
+    const result = renameLockfileAssistantIfPresent(
+      [lockfilePath],
+      "asst_1",
+      "Renamed",
+    );
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.status).toBe(409);
+    }
+    expect(fs.readFileSync(lockfilePath, "utf-8")).toBe("{ not json");
+  });
+
+  test("refuses non-object JSON on disk without clobbering it", () => {
+    for (const raw of ["null", "[]", '"text"', "7"]) {
+      fs.writeFileSync(lockfilePath, raw);
+
+      const result = renameLockfileAssistantIfPresent(
+        [lockfilePath],
+        "asst_1",
+        "Renamed",
+      );
+
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.status).toBe(409);
+      }
+      expect(fs.readFileSync(lockfilePath, "utf-8")).toBe(raw);
+    }
+  });
+
+  test("an already-equal name succeeds without rewriting the file", () => {
+    // Compact formatting: any rewrite would re-indent and change the bytes.
+    fs.writeFileSync(
+      lockfilePath,
+      JSON.stringify({ activeAssistant: null, assistants: [entry] }),
+    );
+    const before = fs.readFileSync(lockfilePath, "utf-8");
+
+    const result = renameLockfileAssistantIfPresent(
+      [lockfilePath],
+      "asst_1",
+      "Old Name",
+    );
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.lockfile.assistants[0]?.name).toBe("Old Name");
+      expect(result.lockfile.assistants[0]).not.toHaveProperty("signingKey");
+    }
+    expect(fs.readFileSync(lockfilePath, "utf-8")).toBe(before);
+  });
+
+  test("rejects a missing id or name without touching disk", () => {
+    writeOnDisk({ activeAssistant: null, assistants: [entry] });
+    const before = fs.readFileSync(lockfilePath, "utf-8");
+
+    expect(renameLockfileAssistantIfPresent([lockfilePath], "", "N").ok).toBe(
+      false,
+    );
+    expect(
+      renameLockfileAssistantIfPresent([lockfilePath], "asst_1", "").ok,
+    ).toBe(false);
+    expect(fs.readFileSync(lockfilePath, "utf-8")).toBe(before);
+  });
+});
+
+describe("lockfile writers under lock contention", () => {
+  const entry = {
+    assistantId: "asst_1",
+    cloud: "local",
+    runtimeUrl: "http://a",
+    name: "Old Name",
+  };
+
+  function holdLock(): string {
+    const lockDir = `${lockfilePath}.lock`;
+    fs.mkdirSync(lockDir);
+    return lockDir;
+  }
+
+  test("rename refuses with 423 and leaves the file untouched", () => {
+    writeOnDisk({ activeAssistant: null, assistants: [entry] });
+    const before = fs.readFileSync(lockfilePath, "utf-8");
+    holdLock();
+
+    const result = renameLockfileAssistantIfPresent(
+      [lockfilePath],
+      "asst_1",
+      "Renamed",
+    );
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.status).toBe(423);
+    }
+    expect(fs.readFileSync(lockfilePath, "utf-8")).toBe(before);
+  });
+
+  test("upsert refuses with 423 and leaves the file untouched", () => {
+    writeOnDisk({ activeAssistant: null, assistants: [entry] });
+    const before = fs.readFileSync(lockfilePath, "utf-8");
+    holdLock();
+
+    const result = upsertLockfileAssistant(
+      [lockfilePath],
+      { assistantId: "asst_2", cloud: "local" },
+      undefined,
+    );
+
+    expect(result).toMatchObject({ ok: false, status: 423 });
+    expect(fs.readFileSync(lockfilePath, "utf-8")).toBe(before);
+  });
+
+  test("platform replace refuses with 423 and leaves the file untouched", () => {
+    writeOnDisk({ activeAssistant: null, assistants: [entry] });
+    const before = fs.readFileSync(lockfilePath, "utf-8");
+    holdLock();
+
+    const result = replacePlatformAssistants(
+      [lockfilePath],
+      [{ assistantId: "asst_p", cloud: "vellum", runtimeUrl: "http://p" }],
+    );
+
+    expect(result).toMatchObject({ ok: false, status: 423 });
+    expect(fs.readFileSync(lockfilePath, "utf-8")).toBe(before);
+  });
+
+  test("a successful rename leaves no lock dir behind", () => {
+    writeOnDisk({ activeAssistant: null, assistants: [entry] });
+
+    const result = renameLockfileAssistantIfPresent(
+      [lockfilePath],
+      "asst_1",
+      "Renamed",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(fs.existsSync(`${lockfilePath}.lock`)).toBe(false);
+  });
+});
+
+describe("upsertRendererLockfileAssistant", () => {
+  const paired = {
+    assistantId: "paired-1",
+    cloud: "paired",
+    paired: true,
+    runtimeUrl: "https://gateway.example.com",
+    name: "Paired assistant",
+  };
+
+  test("rejects creating or reclassifying an entry as paired", () => {
+    expect(
+      upsertRendererLockfileAssistant([lockfilePath], paired, "paired-1"),
+    ).toMatchObject({ ok: false, status: 403 });
+
+    writeOnDisk({
+      assistants: [{ assistantId: "local-1", cloud: "local" }],
+      activeAssistant: "local-1",
+    });
+    expect(
+      upsertRendererLockfileAssistant(
+        [lockfilePath],
+        {
+          assistantId: "local-1",
+          cloud: "paired",
+          runtimeUrl: "https://gateway.example.com",
+        },
+        undefined,
+      ),
+    ).toMatchObject({ ok: false, status: 403 });
+  });
+
+  test("rejects retargeting or reclassifying an existing paired entry", () => {
+    writeOnDisk({ assistants: [paired], activeAssistant: "paired-1" });
+
+    expect(
+      upsertRendererLockfileAssistant(
+        [lockfilePath],
+        { assistantId: "paired-1", runtimeUrl: "https://attacker.example.com" },
+        undefined,
+      ),
+    ).toMatchObject({ ok: false, status: 403 });
+    expect(
+      upsertRendererLockfileAssistant(
+        [lockfilePath],
+        { assistantId: "paired-1", cloud: "local" },
+        undefined,
+      ),
+    ).toMatchObject({ ok: false, status: 403 });
+    expect(readOnDisk()).toEqual({
+      assistants: [paired],
+      activeAssistant: "paired-1",
+    });
+  });
+
+  test("allows non-security updates and activation of an existing pairing", () => {
+    writeOnDisk({ assistants: [paired], activeAssistant: null });
+
+    const result = upsertRendererLockfileAssistant(
+      [lockfilePath],
+      {
+        assistantId: "paired-1",
+        cloud: "paired",
+        runtimeUrl: "https://gateway.example.com",
+        name: "Renamed pairing",
+      },
+      "paired-1",
+    );
+
+    expect(result.ok).toBe(true);
+    expect(readOnDisk()).toEqual({
+      assistants: [{ ...paired, name: "Renamed pairing" }],
+      activeAssistant: "paired-1",
+    });
+  });
+});
+
 describe("replacePlatformAssistants", () => {
+  test("rejects a renderer sync that tries to create a paired entry", () => {
+    writeOnDisk({
+      activeAssistant: "asst_local",
+      assistants: [
+        { assistantId: "asst_local", cloud: "local", runtimeUrl: "http://l" },
+      ],
+    });
+
+    expect(
+      replacePlatformAssistants(
+        [lockfilePath],
+        [
+          {
+            assistantId: "asst_local",
+            cloud: "paired",
+            paired: true,
+            runtimeUrl: "https://attacker.example.com",
+          },
+        ],
+      ),
+    ).toMatchObject({ ok: false, status: 403 });
+    expect(readOnDisk()).toEqual({
+      activeAssistant: "asst_local",
+      assistants: [
+        { assistantId: "asst_local", cloud: "local", runtimeUrl: "http://l" },
+      ],
+    });
+  });
+
   test("replaces platform assistants while keeping local ones and unknown fields", () => {
     writeOnDisk({
       schemaVersion: 99,

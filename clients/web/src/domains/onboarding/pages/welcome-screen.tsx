@@ -1,74 +1,37 @@
 import { useNavigate } from "react-router";
 
-import { OnboardingLayout } from "@/domains/onboarding/components/onboarding-layout";
-import { useOnboardingLogin } from "@/hooks/use-onboarding-login";
+import { AuthWelcomeScreen } from "@/components/auth-welcome-screen";
+import { SETUP_NAVIGATE } from "@/domains/onboarding/onboarding-navigation";
 import { hasAssistants } from "@/lib/local-mode";
+import { useTranslation } from "@/i18n";
 import { routes } from "@/utils/routes";
-import { Button } from "@vellumai/design-library/components/button";
 
+/**
+ * `/assistant/welcome` — the local client's front door. Shares its screen with
+ * `/account/login`; the account this build doesn't require is what makes the
+ * difference, so the second button walks past the login entirely.
+ */
 export function WelcomeScreen() {
+  const { t } = useTranslation("onboarding");
   const navigate = useNavigate();
-  const { loading, error, login, cancel } = useOnboardingLogin();
 
   const handleContinueWithoutAccount = () => {
-    if (loading) {
-      cancel();
-    }
+    // `replace`, like every other step of the setup flow: the funnel occupies a
+    // single history entry so a Back press can never re-enter it (see
+    // `SETUP_NAVIGATE` in `onboarding-navigation.ts`).
     if (hasAssistants()) {
-      void navigate(routes.selectAssistant);
+      void navigate(routes.selectAssistant, SETUP_NAVIGATE);
     } else {
-      void navigate(routes.onboarding.hosting);
+      void navigate(routes.onboarding.hosting, SETUP_NAVIGATE);
     }
   };
 
   return (
-    <OnboardingLayout>
-      <div className="mx-auto flex min-h-screen w-full max-w-xl flex-col items-center px-6 pb-40 text-[var(--content-default)]">
-        <div className="flex flex-1 flex-col items-center justify-center">
-          <h1
-            className="text-3xl font-semibold tracking-tight"
-            style={{ animation: "fadeInUp 0.5s ease-out 0.1s both" }}
-          >
-            Welcome to Vellum
-          </h1>
-          <p
-            className="mt-3 text-body-medium-lighter text-[var(--content-tertiary)]"
-            style={{ animation: "fadeInUp 0.5s ease-out 0.3s both" }}
-          >
-            Your own personal intelligence is just a step away.
-          </p>
-
-          {error && (
-            <p className="mt-4 text-body-small-default text-[var(--system-negative-strong)]">
-              {error}
-            </p>
-          )}
-
-          <div
-            className="mt-10 flex w-full max-w-sm flex-col gap-3"
-            style={{ animation: "fadeInUp 0.5s ease-out 0.5s both" }}
-          >
-            <Button
-              variant="primary"
-              size="regular"
-              fullWidth
-              className="h-11 text-base"
-              onClick={loading ? cancel : () => void login()}
-            >
-              {loading ? "Cancel" : "Log In"}
-            </Button>
-            <Button
-              variant="ghost"
-              size="regular"
-              fullWidth
-              className="h-11 text-base"
-              onClick={handleContinueWithoutAccount}
-            >
-              Continue without account
-            </Button>
-          </div>
-        </div>
-      </div>
-    </OnboardingLayout>
+    <AuthWelcomeScreen
+      secondary={{
+        label: t("welcome.continueWithoutAccount"),
+        onSelect: handleContinueWithoutAccount,
+      }}
+    />
   );
 }

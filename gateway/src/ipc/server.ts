@@ -21,14 +21,15 @@
 import {
   SocketWatchdog,
   ensureSocketDir,
+  ipcListenOptions,
+  removeIpcEndpointFile,
 } from "@vellumai/ipc-server-utils";
-import { existsSync, unlinkSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 
 import type { z } from "zod";
 
 import { getLogger } from "../logger.js";
-import { resolveIpcSocketPath } from "./socket-path.js";
+import { resolveIpcSocketPath } from "./endpoint.js";
 
 const log = getLogger("ipc-server");
 
@@ -81,6 +82,32 @@ export type IpcRoute = {
   schema?: z.ZodType;
   handler: IpcMethodHandler;
 };
+
+/**
+ * Define a schema-validated route whose handler receives the parsed params
+ * already typed.
+ *
+ * The server validates `req.params` against `schema` and passes the parsed
+ * value to the handler, but {@link IpcMethodHandler} widens it back to
+ * `Record<string, unknown>`; recovering the type at each handler means either
+ * a cast or a second `schema.parse()` of data the server just validated. This
+ * helper does that narrowing once, where the guarantee is made.
+ *
+ * New schema-validated routes use this. Older routes still parse their params
+ * a second time inside the handler, which is redundant but harmless.
+ */
+export function ipcRoute<S extends z.ZodType>(route: {
+  method: string;
+  schema: S;
+  handler: (params: z.output<S>) => unknown | Promise<unknown>;
+}): IpcRoute {
+  return {
+    method: route.method,
+    schema: route.schema,
+    // Safe by construction: the server validated with this exact schema.
+    handler: (params) => route.handler(params as z.output<S>),
+  };
+}
 
 /** Optional configuration for {@link GatewayIpcServer}. */
 export interface GatewayIpcServerOptions {
@@ -153,16 +180,10 @@ export class GatewayIpcServer {
     ensureSocketDir(this.socketPath);
 
     // Clean up stale socket file from a previous run
-    if (existsSync(this.socketPath)) {
-      try {
-        unlinkSync(this.socketPath);
-      } catch {
-        // Ignore — may already be gone
-      }
-    }
+    removeIpcEndpointFile(this.socketPath);
 
     this.server = this.createListeningServer();
-    this.server.listen(this.socketPath, () => {
+    this.server.listen(ipcListenOptions(this.socketPath), () => {
       log.info({ path: this.socketPath }, "IPC server listening");
     });
 
@@ -191,13 +212,7 @@ export class GatewayIpcServer {
     }
 
     // Clean up socket file
-    if (existsSync(this.socketPath)) {
-      try {
-        unlinkSync(this.socketPath);
-      } catch {
-        // Ignore
-      }
-    }
+    removeIpcEndpointFile(this.socketPath);
   }
 
   /** Push an event to all connected clients. */
@@ -278,7 +293,12 @@ export class GatewayIpcServer {
     } catch {
       this.sendResponse(
         socket,
-        buildProtocolErrorResponse("unknown", "Invalid JSON", 400, "BAD_REQUEST"),
+        buildProtocolErrorResponse(
+          "unknown",
+          "Invalid JSON",
+          400,
+          "BAD_REQUEST",
+        ),
       );
       return;
     }
@@ -411,7 +431,11 @@ export function buildProtocolErrorResponse(
 export function buildErrorResponse(id: string, err: unknown): IpcResponse {
   const response: IpcResponse = { id, error: String(err) };
   if (err && typeof err === "object") {
-    const e = err as { statusCode?: unknown; code?: unknown; details?: unknown };
+    const e = err as {
+      statusCode?: unknown;
+      code?: unknown;
+      details?: unknown;
+    };
     if (typeof e.statusCode === "number") response.statusCode = e.statusCode;
     if (typeof e.code === "string") response.errorCode = e.code;
     if (e.details !== undefined) response.errorDetails = e.details;

@@ -34,6 +34,17 @@ const ASSISTANT_SETUP_PROMPTS: Record<SetupChannelId, string> = {
   phone: "I want to be able to call you. Let's set you up with a phone number.",
 };
 
+/**
+ * Sent instead when a channel holds credentials but is not working. Setup got
+ * part way, so asking to start over describes the wrong problem and tells the
+ * assistant to do the wrong thing.
+ */
+const ASSISTANT_FINISH_PROMPTS: Record<SetupChannelId, string> = {
+  slack: "Slack is set up but not working. Can you finish it off?",
+  telegram: "Telegram is set up but not working. Can you finish it off?",
+  phone: "My phone number is set up but not working. Can you finish it off?",
+};
+
 const READINESS_REFETCH_MS = 15000;
 
 export interface UseAssistantChannelsOptions {
@@ -85,13 +96,17 @@ export function useAssistantChannels({
     [readinessQuery.data],
   );
 
-  const slackConnected = channels.some(
-    (ch) => ch.key === "slack" && ch.status === "ready",
+  // Setup, not health: the connection card stays mounted through a socket
+  // outage, and its thread-mode control renders a default when this has no
+  // data, so a query gated on delivery would show a setting the assistant is
+  // not using and let the user save over the stored one.
+  const slackConfigured = channels.some(
+    (ch) => ch.key === "slack" && ch.configured,
   );
 
   const slackConfigQuery = useQuery({
     ...integrationsSlackChannelConfigGetOptions(pathOpts),
-    enabled: slackConnected,
+    enabled: slackConfigured,
     select: (data: IntegrationsSlackChannelConfigGetResponse) =>
       data.threadMode,
   });
@@ -142,12 +157,15 @@ export function useAssistantChannels({
     },
   });
 
-  const saveTelegramMutateAsync = saveTelegramMutation.mutateAsync;
+  // Mirrors the Slack shape: `mutate` rather than `mutateAsync`, with status
+  // and error published alongside, so the setup wizard reads outcome from the
+  // mutation instead of owning save state of its own.
+  const saveTelegramMutate = saveTelegramMutation.mutate;
   const onSaveTelegramToken = useCallback(
-    async (botToken: string): Promise<void> => {
-      await saveTelegramMutateAsync(botToken);
+    (botToken: string) => {
+      saveTelegramMutate(botToken);
     },
-    [saveTelegramMutateAsync],
+    [saveTelegramMutate],
   );
 
   const saveSlackMutate = saveSlackMutation.mutate;
@@ -178,11 +196,15 @@ export function useAssistantChannels({
   );
 
   const handleSetup = useCallback(
-    (channelKey: SetupChannelId) => {
+    (channelKey: SetupChannelId, incomplete = false) => {
       if (!onStartSetupConversation) {
         return;
       }
-      onStartSetupConversation(ASSISTANT_SETUP_PROMPTS[channelKey]);
+      onStartSetupConversation(
+        incomplete
+          ? ASSISTANT_FINISH_PROMPTS[channelKey]
+          : ASSISTANT_SETUP_PROMPTS[channelKey],
+      );
     },
     [onStartSetupConversation],
   );
@@ -210,6 +232,8 @@ export function useAssistantChannels({
     onSetup: onStartSetupConversation ? handleSetup : undefined,
     onDisconnect,
     onSaveTelegramToken,
+    telegramSaveStatus: saveTelegramMutation.status,
+    telegramSaveError: saveTelegramMutation.error?.message ?? null,
     onSaveSlackConfig,
     slackSaveStatus: saveSlackMutation.status,
     slackSaveError: saveSlackMutation.error?.message ?? null,
@@ -235,6 +259,8 @@ function deriveChannelStates(
     return {
       key,
       status,
+      configured: snap?.setupStatus === "ready",
+      health: snap?.health,
       address: snap?.channelHandle ?? undefined,
     };
   });
@@ -246,11 +272,14 @@ function toChannelStatus(
   if (!snap) {
     return "not_configured";
   }
-  if (snap.ready || snap.setupStatus === "ready") {
+  // Working, not merely configured: every list renders this as the connection
+  // state, and a channel whose delivery is failing is honestly not connected.
+  // The wizard-versus-card decision asks `configured` instead.
+  if (snap.ready) {
     return "ready";
   }
-  if (snap.setupStatus === "incomplete") {
-    return "incomplete";
+  if (snap.setupStatus === "not_configured") {
+    return "not_configured";
   }
-  return "not_configured";
+  return "incomplete";
 }

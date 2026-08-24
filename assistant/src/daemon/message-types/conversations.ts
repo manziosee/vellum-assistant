@@ -29,30 +29,35 @@ interface BaseTransportMetadata {
   /** IANA timezone reported by the active client for the current turn. */
   clientTimezone?: string;
   /**
-   * The client's operating-system surface ("web" | "ios" | "macos"),
-   * reported independently of {@link interfaceId}. The web bundle ships to a
-   * browser, the Capacitor iOS shell, and the Electron macOS app, all on the
-   * same `"web"` transport interface — `clientOs` is what tells the assistant
-   * which OS it is actually talking to (rendered as the `client_os:` line in
-   * the per-turn context) WITHOUT perturbing transport/host-proxy capability
-   * inference, which keys off `interfaceId`.
+   * The client's operating-system surface, reported independently of
+   * {@link interfaceId}. The web bundle ships to browsers, mobile shells, and
+   * Electron desktop apps on the same `"web"` transport interface. `clientOs`
+   * tells the assistant which OS it is actually talking to, rendered as the
+   * `client_os:` line in the per-turn context, without perturbing
+   * transport/host-proxy capability inference, which keys off `interfaceId`.
    */
   clientOs?: string;
+  /**
+   * Id of the app the client currently has open on screen (the app viewer or
+   * the app-editing split). Rendered as the `visible_app:` line in the per-turn
+   * context so the assistant knows which app "the app" refers to without the
+   * user naming it. View state only: it never affects transport or tool
+   * gating, and is absent whenever no app is in view.
+   */
+  visibleAppId?: string;
 }
 
 /**
- * Transport metadata for interfaces that support the full desktop host-proxy
- * set (see `HostProxyInterfaceId` / `supportsHostProxy`). Carries the host
+ * Transport metadata for interfaces that support desktop host-proxy tools
+ * (see `HostProxyInterfaceId` / `supportsHostProxy`). Carries the host
  * environment fields the client reports so the `<workspace>` block renders
  * the user's actual machine rather than a containerized daemon's own OS.
  *
- * Today this variant is populated only by the macOS client, but the shape
- * is capability-keyed (not interface-name-keyed) so future host-capable
- * clients (e.g. a native Linux or Windows desktop) get the same treatment
- * automatically when added to `HostProxyInterfaceId`.
+ * The shape is capability-keyed so each native desktop client gets the same
+ * host-environment treatment through `HostProxyInterfaceId`.
  */
 export interface HostProxyTransportMetadata extends BaseTransportMetadata {
-  /** Interface identifier — restricted to interfaces that support host proxies. */
+  /** Interface identifier restricted to interfaces that support host proxies. */
   interfaceId: HostProxyInterfaceId;
   /** Home directory of the user on the host machine (e.g. `NSHomeDirectory()`). */
   hostHomeDir?: string;

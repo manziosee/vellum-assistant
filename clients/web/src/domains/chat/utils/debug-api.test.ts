@@ -65,16 +65,21 @@ const DEFAULT_UI_CONTEXT: UIContext = {
 };
 
 const DEFAULT_PENDING_INTERACTIONS: PendingInteractionsSnapshot = {
+  submittingByKind: {
+    confirmation: null,
+    question: null,
+    secret: null,
+    contactRequest: null,
+  },
   pendingSecret: null,
-  isSubmittingSecret: false,
   pendingConfirmation: null,
-  isSubmittingConfirmation: false,
   pendingContactRequest: null,
-  isSubmittingContactRequest: false,
   pendingQuestion: null,
-  isSubmittingQuestion: false,
   isQuestionCardDismissed: false,
   inlineConfirmationToolCallId: null,
+  pendingAcpConnect: null,
+  dismissedAcpConnectToolUseIds: [],
+  pendingAcpContinue: false,
 };
 
 interface MakeRefsOverrides extends Partial<ChatDebugRefs> {
@@ -713,7 +718,12 @@ describe("createChatDebugApi.listPendingInteractions", () => {
             label: "OpenAI API Key",
             description: "needed for inference",
           },
-          isSubmittingSecret: true,
+          submittingByKind: {
+            confirmation: null,
+            question: null,
+            secret: "s1",
+            contactRequest: null,
+          },
         },
       }),
     );
@@ -723,7 +733,7 @@ describe("createChatDebugApi.listPendingInteractions", () => {
       label: "OpenAI API Key",
       description: "needed for inference",
     });
-    expect(snapshot.isSubmittingSecret).toBe(true);
+    expect(snapshot.submittingByKind.secret).toBe("s1");
     // Unrelated prompt slots remain null/false.
     expect(snapshot.pendingConfirmation).toBeNull();
     expect(snapshot.pendingContactRequest).toBeNull();
@@ -764,12 +774,17 @@ describe("createChatDebugApi.listPendingInteractions", () => {
         description: "irreversible",
         riskLevel: "high",
       },
-      isSubmittingConfirmation: true,
+      submittingByKind: {
+        confirmation: "req-confirm-1",
+        question: null,
+        secret: null,
+        contactRequest: null,
+      },
       inlineConfirmationToolCallId: "tc-42",
     };
     const second = api.listPendingInteractions();
     expect(second.pendingConfirmation?.requestId).toBe("req-confirm-1");
-    expect(second.isSubmittingConfirmation).toBe(true);
+    expect(second.submittingByKind.confirmation).toBe("req-confirm-1");
     expect(second.inlineConfirmationToolCallId).toBe("tc-42");
   });
 
@@ -812,6 +827,50 @@ describe("createChatDebugApi.listPendingInteractions", () => {
     expect(snapshot.pendingConfirmation?.input).not.toBe(input);
   });
 
+  test("forwards the ACP Connect card state", () => {
+    const api = createChatDebugApi(
+      makeRefs({
+        pendingInteractions: {
+          pendingAcpConnect: {
+            toolUseId: "toolu-acp-1",
+            reason: "auth_required",
+          },
+          dismissedAcpConnectToolUseIds: ["toolu-acp-0", "toolu-acp-2"],
+          pendingAcpContinue: true,
+        },
+      }),
+    );
+    const snapshot = api.listPendingInteractions();
+    expect(snapshot.pendingAcpConnect).toEqual({
+      toolUseId: "toolu-acp-1",
+      reason: "auth_required",
+    });
+    expect(snapshot.dismissedAcpConnectToolUseIds).toEqual([
+      "toolu-acp-0",
+      "toolu-acp-2",
+    ]);
+    expect(snapshot.pendingAcpContinue).toBe(true);
+  });
+
+  test("keeps the ACP Connect card state when a confirmation is redacted", () => {
+    const api = createChatDebugApi(
+      makeRefs({
+        pendingInteractions: {
+          pendingConfirmation: {
+            requestId: "req-confirm-1",
+            input: { api_key: "sk-live-secret-value" },
+          },
+          pendingAcpConnect: { toolUseId: "toolu-acp-1" },
+        },
+      }),
+    );
+    const snapshot = api.listPendingInteractions();
+    expect(snapshot.pendingConfirmation?.input).toEqual({
+      api_key: "[redacted]",
+    });
+    expect(snapshot.pendingAcpConnect?.toolUseId).toBe("toolu-acp-1");
+  });
+
   test("leaves a confirmation without input untouched", () => {
     const api = createChatDebugApi(
       makeRefs({
@@ -841,6 +900,7 @@ type DebugWindow = Window & {
     events?: { getClients: unknown; getEvents: unknown };
     flags?: {
       impersonateVersion?: (v?: string | null) => string | null;
+      toggleAppsSandboxDisabled?: (v?: boolean) => boolean;
     };
     other?: unknown;
   };
@@ -848,6 +908,7 @@ type DebugWindow = Window & {
 
 const makeFlagsApi = () => ({
   impersonateVersion: (_value?: string | null): string | null => null,
+  toggleAppsSandboxDisabled: (_value?: boolean): boolean => false,
 });
 
 describe("installVellumDebugApi", () => {
@@ -861,6 +922,7 @@ describe("installVellumDebugApi", () => {
     expect(typeof root?.events?.getClients).toBe("function");
     expect(typeof root?.events?.getEvents).toBe("function");
     expect(typeof root?.flags?.impersonateVersion).toBe("function");
+    expect(typeof root?.flags?.toggleAppsSandboxDisabled).toBe("function");
     uninstall();
   });
 

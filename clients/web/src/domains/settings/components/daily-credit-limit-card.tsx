@@ -1,7 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState, type ChangeEvent } from "react";
 
+import { extractDrfFieldErrors } from "@/domains/settings/utils/drf-errors";
 import {
+  organizationsBillingAutoTopUpRetrieveOptions,
   organizationsBillingDailyCreditLimitRetrieveOptions,
   organizationsBillingDailyCreditLimitRetrieveQueryKey,
   organizationsBillingDailyCreditLimitRetrieveSetQueryData,
@@ -9,16 +11,22 @@ import {
   organizationsBillingSummaryRetrieveOptions,
   organizationsBillingSummaryRetrieveQueryKey,
 } from "@/generated/api/@tanstack/react-query.gen";
+import { useResumeDailyLimit } from "@/hooks/use-daily-limit-skip";
+import { useScrollToAnchor } from "@/hooks/use-scroll-to-anchor";
+import { t, useTranslation } from "@/i18n";
+import { dailyResetTimePhrase } from "@/utils/daily-reset-time";
+import { formatUsd } from "@/utils/format-usd";
 import { Button } from "@vellumai/design-library/components/button";
 import { Input } from "@vellumai/design-library/components/input";
 import { Notice } from "@vellumai/design-library/components/notice";
 import { Toggle } from "@vellumai/design-library/components/toggle";
 
-/** Format a USD decimal string ("5.00") as "$5.00" for display copy. */
-function formatUsd(value: string): string {
-  const n = parseFloat(value);
-  return Number.isFinite(n) ? `$${n.toFixed(2)}` : `$${value}`;
-}
+/**
+ * In-page anchor for deep links straight to this card (chat banner "Adjust
+ * Limit", the platform's daily-limit email). Must match the hash in
+ * `routes.settings.usageBillingDailyLimit`.
+ */
+export const DAILY_CREDIT_LIMIT_ANCHOR_ID = "daily-credit-limit";
 
 /**
  * Validate the daily-limit input against the bounds the backend enforces
@@ -30,16 +38,16 @@ function formatUsd(value: string): string {
 export function validateDailyLimit(raw: string): string | undefined {
   const trimmed = raw.trim();
   if (trimmed === "") {
-    return "Enter a daily limit";
+    return t("settings:dailyCreditLimitCard.errorEmpty");
   }
   const n = parseFloat(trimmed);
   if (!Number.isFinite(n) || n < 1) {
-    return "Must be at least $1";
+    return t("settings:dailyCreditLimitCard.errorMin");
   }
   // Reject more than two decimal places (backend requires exactly two; we pad
   // on save, but can't silently round away cents the user typed).
   if (!/^\d+(\.\d{1,2})?$/.test(trimmed)) {
-    return "Use at most two decimal places";
+    return t("settings:dailyCreditLimitCard.errorDecimals");
   }
   return undefined;
 }
@@ -49,20 +57,35 @@ export function validateDailyLimit(raw: string): string | undefined {
  * Credit Balance card by `BillingPanel.tsx`, under its own enable toggle. When
  * on, an always-visible input caps how much Vellum credit the org can spend per
  * UTC day; the spend counter resets at midnight UTC. Turning the toggle off
- * clears the limit (`null`).
+ * clears the limit (`null`), except when a saved limit is holding up enabled
+ * automatic top-ups: the backend requires one in that state, so the toggle
+ * stays locked on.
  *
  * The editable limit comes from the daily-credit-limit endpoint; today's spend
  * for the progress readout comes from the billing summary. Saving invalidates
  * both so the summary's `daily_limit_reached`/`daily_spend_usd` stay in sync.
  */
 export function DailyCreditLimitCard() {
+  const { t } = useTranslation("settings");
   const queryClient = useQueryClient();
   const limitQuery = useQuery(
     organizationsBillingDailyCreditLimitRetrieveOptions(),
   );
   const summaryQuery = useQuery(organizationsBillingSummaryRetrieveOptions());
+  const autoTopUpQuery = useQuery(
+    organizationsBillingAutoTopUpRetrieveOptions(),
+  );
   const updateMutation = useMutation(
     organizationsBillingDailyCreditLimitUpdateMutation(),
+  );
+  const resumeMutation = useResumeDailyLimit();
+
+  // Deep links (`#daily-credit-limit`) land here once both queries have
+  // settled, so the content above the anchor has taken its final height
+  // before we scroll.
+  useScrollToAnchor(
+    DAILY_CREDIT_LIMIT_ANCHOR_ID,
+    !limitQuery.isLoading && !summaryQuery.isLoading,
   );
 
   // `draft === null` means "not yet edited"; seed from the query below. Tracking
@@ -78,7 +101,7 @@ export function DailyCreditLimitCard() {
     return (
       <div data-testid="daily-credit-limit-card">
         <p className="text-body-medium-lighter text-[var(--content-tertiary)]">
-          Loading…
+          {t("dailyCreditLimitCard.loading")}
         </p>
       </div>
     );
@@ -87,7 +110,7 @@ export function DailyCreditLimitCard() {
     return (
       <div data-testid="daily-credit-limit-card">
         <Notice tone="error">
-          Failed to load daily credit limit settings.
+          {t("dailyCreditLimitCard.loadError")}
         </Notice>
       </div>
     );
@@ -103,6 +126,21 @@ export function DailyCreditLimitCard() {
   const summary = summaryQuery.data;
   const dailySpend = summary?.daily_spend_usd ?? config.current_day_spent_usd;
   const limitReached = summary?.daily_limit_reached === true;
+  // Prefer this endpoint's own view of the skip: saving a limit writes it back
+  // here synchronously, while the summary only catches up on its invalidation.
+  const limitSkipped =
+    config.daily_limit_snoozed === true ||
+    summary?.daily_limit_snoozed === true;
+  const resetPhrase = dailyResetTimePhrase();
+
+  // The backend requires a daily limit while automatic top-ups are on, so the
+  // clearing PUT is blocked here too. Fail open whenever that state is not
+  // known to be current: while the config is loading, and on any query error
+  // (an errored refetch keeps serving the previous value, which may describe
+  // an auto top-up the user has since disabled elsewhere). The server enforces
+  // the invariant on its own, so the cost of failing open is a rejected PUT.
+  const requiredByAutoTopUp =
+    autoTopUpQuery.data?.enabled === true && !autoTopUpQuery.isError;
 
   const onChange = (e: ChangeEvent<HTMLInputElement>) => {
     setDraft(e.target.value);
@@ -142,6 +180,12 @@ export function DailyCreditLimitCard() {
       setPendingEnable(true);
       return;
     }
+    // Only a saved limit is protected by the auto top-up dependency. An
+    // unsaved `pendingEnable` has nothing for the backend to keep, so the user
+    // can still take it back.
+    if (hasLimit && requiredByAutoTopUp) {
+      return;
+    }
     // Turning off: clear a saved limit; if it was only pending (never saved),
     // just drop the intent without hitting the API.
     setPendingEnable(false);
@@ -160,7 +204,16 @@ export function DailyCreditLimitCard() {
     persist(parseFloat(value.trim()).toFixed(2));
   };
 
-  const showGenericError = updateMutation.isError;
+  // A rejected clear comes back as a DRF field error explaining the auto
+  // top-up dependency; show it verbatim instead of the generic copy.
+  const serverLimitError = extractDrfFieldErrors(
+    updateMutation.error,
+  ).daily_credit_limit_usd;
+  const saveError =
+    serverLimitError ??
+    (updateMutation.isError
+      ? t("dailyCreditLimitCard.saveError")
+      : undefined);
   const visibleError = touched ? clientError : undefined;
 
   return (
@@ -171,10 +224,23 @@ export function DailyCreditLimitCard() {
           onChange={handleToggleChange}
           // Locked while a save is in flight: toggling off during a pending
           // enable would skip the clearing PUT, then the save's onSuccess
-          // would re-enable the limit against the user's last action.
-          disabled={updateMutation.isPending}
-          label="Set a daily credit limit"
+          // would re-enable the limit against the user's last action. Also
+          // locked once a saved limit is what automatic top-ups depend on,
+          // where the only available move is the one the backend rejects.
+          disabled={
+            updateMutation.isPending || (hasLimit && requiredByAutoTopUp)
+          }
+          label={t("dailyCreditLimitCard.toggleLabel")}
         />
+
+        {requiredByAutoTopUp && (
+          <p
+            className="text-body-small-default text-[var(--content-tertiary)]"
+            data-testid="daily-credit-limit-required-note"
+          >
+            {t("dailyCreditLimitCard.requiredNote")}
+          </p>
+        )}
 
         {enabled && (
           <>
@@ -184,8 +250,10 @@ export function DailyCreditLimitCard() {
                   type="number"
                   step="0.01"
                   min="1"
-                  label="Stop spending Vellum credits after"
-                  helperText="Per UTC day. Resets at midnight UTC."
+                  label={t("dailyCreditLimitCard.inputLabel")}
+                  helperText={t("dailyCreditLimitCard.helperText", {
+                    time: resetPhrase,
+                  })}
                   placeholder="0.00"
                   value={value}
                   onChange={onChange}
@@ -206,7 +274,7 @@ export function DailyCreditLimitCard() {
                   disabled={updateMutation.isPending}
                   data-testid="daily-credit-limit-save-button"
                 >
-                  Save
+                  {t("dailyCreditLimitCard.save")}
                 </Button>
               </div>
             </div>
@@ -216,34 +284,63 @@ export function DailyCreditLimitCard() {
                 className="text-body-small-default text-[var(--content-tertiary)]"
                 data-testid="daily-credit-limit-progress"
               >
-                {formatUsd(dailySpend)} of{" "}
-                {formatUsd(config.daily_credit_limit_usd)} spent today
+                {t("dailyCreditLimitCard.progress", {
+                  spent: formatUsd(dailySpend),
+                  limit: formatUsd(config.daily_credit_limit_usd),
+                })}
               </p>
+            )}
+
+            {limitSkipped && (
+              <>
+                <Notice
+                  tone="info"
+                  data-testid="daily-credit-limit-skipped"
+                  actions={
+                    <Button
+                      variant="outlined"
+                      size="compact"
+                      onClick={() => resumeMutation.mutate({})}
+                      disabled={resumeMutation.isPending}
+                      data-testid="daily-credit-limit-resume-button"
+                    >
+                      {t("dailyCreditLimitCard.resumeNow")}
+                    </Button>
+                  }
+                >
+                  {t("dailyCreditLimitCard.skippedNotice", {
+                    time: resetPhrase,
+                  })}
+                </Notice>
+                {resumeMutation.isError && (
+                  <Notice
+                    tone="error"
+                    data-testid="daily-credit-limit-resume-error"
+                  >
+                    {t("dailyCreditLimitCard.resumeError")}
+                  </Notice>
+                )}
+              </>
             )}
 
             {limitReached && (
               <Notice tone="warning" data-testid="daily-credit-limit-reached">
-                Today&apos;s Vellum credit spend has reached this limit.
-                Generation resumes after midnight UTC or when you raise the
-                limit.
+                {t("dailyCreditLimitCard.reachedNotice", {
+                  time: resetPhrase,
+                })}
               </Notice>
             )}
           </>
         )}
       </div>
 
-      <p className="mt-3 text-body-small-default text-[var(--content-tertiary)]">
-        Applies to Vellum credit spend only. Usage billed to your own provider
-        API keys isn&apos;t limited. Resets at midnight UTC.
-      </p>
-
-      {showGenericError && (
+      {saveError != null && (
         <Notice
           tone="error"
           className="mt-4"
           data-testid="daily-credit-limit-update-error"
         >
-          Failed to save daily credit limit. Please try again.
+          {saveError}
         </Notice>
       )}
     </div>

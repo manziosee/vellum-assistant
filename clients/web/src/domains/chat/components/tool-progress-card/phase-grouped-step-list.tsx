@@ -1,3 +1,4 @@
+import { useTranslation } from "@/i18n";
 /**
  * Phase-grouped step list for the expanded body of the unified tool-call
  * progress card. Collapses contiguous same-phase steps under a single
@@ -168,6 +169,7 @@ function PhaseDurationLabel({
   durationLabel: string;
   startedAt: number | null;
 }) {
+  const { t } = useTranslation("chat");
   const label = (
     <Typography
       variant="label-medium-default"
@@ -181,7 +183,7 @@ function PhaseDurationLabel({
   }
   return (
     <Tooltip
-      content={`Started at ${formatStartTime(startedAt)}`}
+      content={t("phaseGroupedStepList.startedAt", { time: formatStartTime(startedAt) })}
       side="top"
       align="end"
     >
@@ -527,7 +529,18 @@ function TimelineNodeIcon({
       />
     );
   }
-  return <ThreeDotIndicator data-testid={testId} className="shrink-0" />;
+  // 3px dots with a 2px gap measure 13px, matching the 14px `CheckCircle2`
+  // this swaps with almost exactly. The 8px default is ~30px wide and made the
+  // node jump in size the moment a step started running. Same sizing the
+  // subagent avatar badge uses.
+  return (
+    <ThreeDotIndicator
+      data-testid={testId}
+      className="shrink-0"
+      dotSize={3}
+      gap={2}
+    />
+  );
 }
 
 /**

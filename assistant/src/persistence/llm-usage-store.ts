@@ -10,7 +10,10 @@ import type {
 import { APP_VERSION } from "../version.js";
 import { getDb } from "./db-connection.js";
 import { rawAll } from "./raw-query.js";
-import { realUserTurnContentFilter } from "./real-user-turn-filter.js";
+import {
+  realUserTurnContentFilter,
+  realUserTurnContentFilterSql,
+} from "./real-user-turn-filter.js";
 import {
   buildScheduleAttributionSubquery,
   buildScheduleRunWindowExists,
@@ -258,6 +261,21 @@ export interface UnreportedUsageEvent extends UsageEvent {
    * Null when there's no parent conversation.
    */
   parentTurnIndex: number | null;
+  /**
+   * Role of the subagent that owns this LLM call's conversation, from
+   * `SUBAGENT_ROLE_REGISTRY`. Null for every LLM call that did not run inside
+   * a subagent conversation, and for subagent conversations created before
+   * migration 362 whose `subagents` row had already been disposed.
+   */
+  subagentRole: string | null;
+  /**
+   * How that subagent was spawned, one of the modes described on
+   * `SubagentSpawnMode` in `subagent/types.ts`. Orthogonal to `subagentRole`:
+   * the role selects the child's capabilities, the spawn mode selects its
+   * context inheritance and lifecycle. Null under the same conditions as
+   * `subagentRole`.
+   */
+  subagentSpawnMode: string | null;
 }
 
 export function queryUnreportedUsageEvents(
@@ -285,6 +303,9 @@ export function queryUnreportedUsageEvents(
   // branch from a turn far earlier than the fork's creation time, so
   // they anchor on the fork boundary message instead; child creation is
   // the fallback when the boundary message is absent.
+  // The turn-index subqueries below count user-role rows only. User rows are
+  // always written finalized (only assistant turns stream), so no completeness
+  // predicate is needed; do not copy this shape for assistant-row counts.
   const parentTurnCutoffSql = sql<number>`CASE
     WHEN ${conversations.parentConversationId} IS NOT NULL THEN ${conversations.createdAt}
     ELSE COALESCE(
@@ -357,6 +378,11 @@ export function queryUnreportedUsageEvents(
       // the cutoff (child creation for subagent spawns, fork boundary
       // message for retrospective forks). Same eligibility filter as
       // `turnIndex` above.
+      // Stamped on the conversation row at spawn (migration 362) rather than
+      // joined from `subagents`, whose rows are deleted on dispose while this
+      // watermark query can trail far behind after an ingest outage.
+      subagentRole: conversations.subagentRole,
+      subagentSpawnMode: conversations.subagentSpawnMode,
       parentTurnIndex: sql<number | null>`(
         CASE WHEN ${parentIdSql} IS NULL THEN NULL
         ELSE (
@@ -399,6 +425,8 @@ export function queryUnreportedUsageEvents(
     parentConversationId: row.parentConversationId,
     parentTurnIndex:
       row.parentTurnIndex === null ? null : Number(row.parentTurnIndex),
+    subagentRole: row.subagentRole,
+    subagentSpawnMode: row.subagentSpawnMode,
   }));
 }
 
@@ -857,8 +885,7 @@ export function getUsageGroupBreakdown(
                SELECT COUNT(*) FROM messages AS m2
                WHERE m2.conversation_id = e.conversation_id
                  AND m2.role = 'user'
-                 AND m2.content NOT LIKE '%"type":"tool\\_result"%' ESCAPE '\\'
-                 AND m2.content NOT LIKE '%"type":"web\\_search\\_tool\\_result"%' ESCAPE '\\'
+                 AND ${realUserTurnContentFilterSql("m2")}
              )
         END                                              AS turn_count
       FROM llm_usage_events e

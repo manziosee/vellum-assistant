@@ -38,6 +38,12 @@
  *     `plugins:list` tag via the canonical resource-sync publisher (enable and
  *     disable emit the SAME invalidation)
  *   - Threads `x-vellum-client-id` into the published event's `originClientId`
+ *   - Enable pokes the imperative plugin source reconcile, which activates a
+ *     plugin the boot scan skipped for its sentinel and converges its
+ *     schedules and MCP servers
+ *   - Disable pokes the plugin-declared schedule reconcile on a successful
+ *     toggle (and not on a failed one), so the plugin's rows disarm
+ *     immediately instead of at the reconciler's next backstop sweep
  *   - A broadcast failure does not fail a successful toggle (the publisher
  *     swallows hub errors)
  *   - Maps `InvalidPluginNameError` → BadRequestError (400)
@@ -106,6 +112,7 @@ import {
 } from "../../../cli/lib/uninstall-plugin.js";
 import {
   PluginMergeBaselineError,
+  PluginNotCuratedError,
   PluginNotUpgradableError,
   type PluginUpgradeResult,
   type UpgradePluginDeps,
@@ -249,6 +256,7 @@ const upgradeSpy = mock(
 
 mock.module("../../../cli/lib/upgrade-plugin.js", () => ({
   PluginMergeBaselineError,
+  PluginNotCuratedError,
   PluginNotUpgradableError,
   upgradePlugin: upgradeSpy,
 }));
@@ -309,6 +317,30 @@ mock.module("../../../cli/lib/toggle-plugin.js", () => ({
   PluginDirectoryNotFoundError,
   disablePlugin: disablePluginSpy,
   enablePlugin: enablePluginSpy,
+}));
+
+// Spy on the plugin-schedule reconcile so a toggle cannot silently go back
+// to poking it from the route. Enable and disable both await the source
+// reconcile, which converges schedules itself.
+const reconcilePluginSchedulesSpy = mock(() => Promise.resolve());
+
+mock.module("../../../schedule/plugin-schedule-reconciler.js", () => ({
+  reconcilePluginSchedules: reconcilePluginSchedulesSpy,
+}));
+
+// Spy on the imperative plugin source reconcile so the enable route's
+// activation poke is assertable without scanning a real plugins tree. Only
+// that one export is swapped; the rest of the module passes through real,
+// because other modules in this route's graph import their own bindings from
+// it.
+const reconcilePluginSourcesNowSpy = mock(() => Promise.resolve());
+
+const actualMtimeCache: typeof import("../../../plugins/mtime-cache.js") =
+  await import("../../../plugins/mtime-cache.js");
+
+mock.module("../../../plugins/mtime-cache.js", () => ({
+  ...actualMtimeCache,
+  reconcilePluginSourcesNow: reconcilePluginSourcesNowSpy,
 }));
 
 // Spy on broadcastMessage so we can assert the sync_changed invalidation the
@@ -1883,7 +1915,14 @@ function inspection(
     remoteError: overrides.remoteError ?? null,
     surfaces:
       overrides.surfaces === undefined
-        ? { skills: [], hooks: ["post-model-call"], tools: [] }
+        ? {
+            skills: [],
+            hooks: ["post-model-call"],
+            tools: [],
+            schedules: [
+              { name: "digest", cadence: "0 9 * * *", mode: "execute" },
+            ],
+          }
         : overrides.surfaces,
   };
 }
@@ -1911,6 +1950,26 @@ describe("GET /v1/plugins/:name/inspect", () => {
     expect(result).toEqual(view);
     // AND the name is forwarded to the lib (ref is never caller-supplied)
     expect(inspectSpy.mock.calls[0]?.[0]).toEqual({ name: "level-up" });
+  });
+
+  test("the inspect wire schema carries the schedules surface", async () => {
+    // GIVEN an inspection whose surfaces declare a schedule
+    inspectSpy.mockImplementation(async () => inspection());
+    const result = await invokeInspect({ pathParams: { name: "level-up" } });
+
+    // WHEN the handler result is parsed through the route's response schema
+    // (zod strips undeclared keys, so an omission would drop the field)
+    const route = PLUGINS_ROUTES.find(
+      (r) => r.operationId === "plugins_inspect",
+    )!;
+    const parsed = (
+      route.responseBody as { parse: (v: unknown) => PluginInspection }
+    ).parse(result);
+
+    // THEN the declared schedules survive the wire contract
+    expect(parsed.surfaces?.schedules).toEqual([
+      { name: "digest", cadence: "0 9 * * *", mode: "execute" },
+    ]);
   });
 
   test("a captured marketplace error is returned as 200 with remote-unavailable, not thrown", async () => {
@@ -2088,6 +2147,7 @@ describe("POST /v1/plugins/:name/upgrade", () => {
       name: "level-up",
       dryRun: false,
       strategy: undefined,
+      marketplaceOnly: false,
     });
   });
 
@@ -2109,6 +2169,7 @@ describe("POST /v1/plugins/:name/upgrade", () => {
       name: "level-up",
       dryRun: undefined,
       strategy: "ours",
+      marketplaceOnly: false,
     });
   });
 
@@ -2136,7 +2197,92 @@ describe("POST /v1/plugins/:name/upgrade", () => {
       name: "level-up",
       dryRun: undefined,
       strategy: "assistant",
+      marketplaceOnly: false,
     });
+  });
+
+  test("refuses a concurrent upgrade of the same plugin with ConflictError (409)", async () => {
+    // Two upgrades of one plugin derive the same staging path in this
+    // process, so the second would delete the first's tree mid-swap. It is
+    // refused instead \u2014 the monitor's auto-update sweep and a user clicking
+    // Upgrade can now land at the same moment.
+    let releaseFirst: () => void = () => {};
+    const firstStarted = Promise.withResolvers<void>();
+    upgradeSpy.mockImplementation(async () => {
+      firstStarted.resolve();
+      await new Promise<void>((resolve) => {
+        releaseFirst = resolve;
+      });
+      return upgradeResult();
+    });
+
+    const first = invokeUpgrade({ pathParams: { name: "level-up" } });
+    await firstStarted.promise;
+
+    await expect(
+      invokeUpgrade({ pathParams: { name: "level-up" } }),
+    ).rejects.toBeInstanceOf(ConflictError);
+
+    releaseFirst();
+    await expect(first).resolves.toMatchObject({ outcome: "upgraded" });
+
+    // The guard is released once the first settles, so the next one runs.
+    upgradeSpy.mockImplementation(async () => upgradeResult());
+    await expect(
+      invokeUpgrade({ pathParams: { name: "level-up" } }),
+    ).resolves.toMatchObject({ outcome: "upgraded" });
+  });
+
+  test("a different plugin is not blocked by an in-flight upgrade", async () => {
+    let releaseFirst: () => void = () => {};
+    const firstStarted = Promise.withResolvers<void>();
+    upgradeSpy.mockImplementation(async (opts) => {
+      if (opts.name === "level-up") {
+        firstStarted.resolve();
+        await new Promise<void>((resolve) => {
+          releaseFirst = resolve;
+        });
+      }
+      return upgradeResult({ name: opts.name });
+    });
+
+    const first = invokeUpgrade({ pathParams: { name: "level-up" } });
+    await firstStarted.promise;
+
+    await expect(
+      invokeUpgrade({ pathParams: { name: "other-plugin" } }),
+    ).resolves.toMatchObject({ name: "other-plugin" });
+
+    releaseFirst();
+    await first;
+  });
+
+  test("a dry run neither takes nor respects the in-flight guard", async () => {
+    // Dry runs return before the swap boundary, so they never stage.
+    let releaseFirst: () => void = () => {};
+    const firstStarted = Promise.withResolvers<void>();
+    upgradeSpy.mockImplementation(async (opts) => {
+      if (!opts.dryRun) {
+        firstStarted.resolve();
+        await new Promise<void>((resolve) => {
+          releaseFirst = resolve;
+        });
+      }
+      return upgradeResult();
+    });
+
+    const first = invokeUpgrade({ pathParams: { name: "level-up" } });
+    await firstStarted.promise;
+
+    await expect(
+      invokeUpgrade({
+        pathParams: { name: "level-up" },
+        body: { dryRun: true },
+      }),
+    ).resolves.toMatchObject({ outcome: "upgraded" });
+
+    releaseFirst();
+    await first;
   });
 
   test("PluginMergeBaselineError \u2192 ConflictError (409)", async () => {
@@ -2177,6 +2323,10 @@ describe("POST /v1/plugins/:name/upgrade", () => {
     expect(upgradeSpy.mock.calls[0]?.[0]).toEqual({
       name: "level-up",
       dryRun: undefined,
+      strategy: undefined,
+      // Unlike dryRun, an absent flag here is a definite "no": the untrusted
+      // direct path stays available unless a caller opts out of it.
+      marketplaceOnly: false,
     });
   });
 
@@ -2217,6 +2367,41 @@ describe("POST /v1/plugins/:name/upgrade", () => {
 
     await expect(
       invokeUpgrade({ pathParams: { name: "level-up" } }),
+    ).rejects.toBeInstanceOf(ConflictError);
+  });
+
+  test("marketplaceOnly is forwarded so the lib enforces it, not the caller", async () => {
+    // The lib re-inspects the catalog inside the call, so the flag has to
+    // travel with the request: a caller's own pre-check cannot bind a decision
+    // the lib makes afterwards.
+    upgradeSpy.mockImplementation(async () => upgradeResult());
+
+    await invokeUpgrade({
+      pathParams: { name: "level-up" },
+      body: { marketplaceOnly: true },
+    });
+
+    expect(upgradeSpy.mock.calls[0]?.[0]).toEqual({
+      name: "level-up",
+      dryRun: undefined,
+      strategy: undefined,
+      marketplaceOnly: true,
+    });
+  });
+
+  test("PluginNotCuratedError → ConflictError (409)", async () => {
+    // A marketplaceOnly caller asked about an install the catalog does not
+    // claim. Retrying changes nothing: only a human upgrading it without the
+    // flag can move it.
+    upgradeSpy.mockImplementation(async () => {
+      throw new PluginNotCuratedError("level-up");
+    });
+
+    await expect(
+      invokeUpgrade({
+        pathParams: { name: "level-up" },
+        body: { marketplaceOnly: true },
+      }),
     ).rejects.toBeInstanceOf(ConflictError);
   });
 
@@ -2406,12 +2591,16 @@ function toggleResult(
   };
 }
 
-function invokeEnable(args: RouteHandlerArgs = {}): { ok: boolean } {
-  return enableHandler(args) as { ok: boolean };
+async function invokeEnable(
+  args: RouteHandlerArgs = {},
+): Promise<{ ok: boolean }> {
+  return (await enableHandler(args)) as { ok: boolean };
 }
 
-function invokeDisable(args: RouteHandlerArgs = {}): { ok: boolean } {
-  return disableHandler(args) as { ok: boolean };
+async function invokeDisable(
+  args: RouteHandlerArgs = {},
+): Promise<{ ok: boolean }> {
+  return (await disableHandler(args)) as { ok: boolean };
 }
 
 /** Assert the spy received exactly one sync_changed carrying `plugins:list`. */
@@ -2426,22 +2615,51 @@ describe("POST /v1/plugins/:name/enable", () => {
   beforeEach(() => {
     enablePluginSpy.mockReset();
     broadcastMessageSpy.mockReset();
+    reconcilePluginSchedulesSpy.mockClear();
+    reconcilePluginSourcesNowSpy.mockClear();
   });
 
-  test("enables the plugin and broadcasts sync_changed(plugins:list)", () => {
+  test("awaits the source reconcile so a boot-disabled plugin activates before the route returns", async () => {
     enablePluginSpy.mockImplementation((name) => toggleResult(name, "enable"));
 
-    const result = invokeEnable({ pathParams: { name: "simple-memory" } });
+    await invokeEnable({ pathParams: { name: "simple-memory" } });
+
+    // The boot scan skipped this plugin for its sentinel, so clearing the
+    // sentinel only brings its hooks, tools, MCP servers and schedules up if
+    // the source reconcile runs. The route awaits it, so by the time the
+    // response lands the reconcile has completed; it converges the schedules
+    // itself, so the route does not poke them separately.
+    expect(reconcilePluginSourcesNowSpy).toHaveBeenCalledTimes(1);
+    expect(reconcilePluginSchedulesSpy).not.toHaveBeenCalled();
+  });
+
+  test("a failed toggle does not run the source reconcile", async () => {
+    enablePluginSpy.mockImplementation((name) => {
+      throw new PluginDirectoryNotFoundError(name);
+    });
+
+    await expect(
+      invokeEnable({ pathParams: { name: "ghost" } }),
+    ).rejects.toThrow(NotFoundError);
+    expect(reconcilePluginSourcesNowSpy).not.toHaveBeenCalled();
+  });
+
+  test("enables the plugin and broadcasts sync_changed(plugins:list)", async () => {
+    enablePluginSpy.mockImplementation((name) => toggleResult(name, "enable"));
+
+    const result = await invokeEnable({
+      pathParams: { name: "simple-memory" },
+    });
 
     expect(result).toEqual({ ok: true });
     expect(enablePluginSpy.mock.calls[0]?.[0]).toBe("simple-memory");
     expectPluginsListBroadcast();
   });
 
-  test("threads x-vellum-client-id into the published event's originClientId", () => {
+  test("threads x-vellum-client-id into the published event's originClientId", async () => {
     enablePluginSpy.mockImplementation((name) => toggleResult(name, "enable"));
 
-    invokeEnable({
+    await invokeEnable({
       pathParams: { name: "simple-memory" },
       headers: { "x-vellum-client-id": "client-abc" },
     });
@@ -2455,7 +2673,7 @@ describe("POST /v1/plugins/:name/enable", () => {
     });
   });
 
-  test("a broadcast failure does not fail a successful toggle", () => {
+  test("a broadcast failure does not fail a successful toggle", async () => {
     enablePluginSpy.mockImplementation((name) => toggleResult(name, "enable"));
     // The sentinel was already flipped; a hub throw AFTER that must not surface
     // as a 500 — the canonical publisher swallows broadcast errors.
@@ -2463,40 +2681,42 @@ describe("POST /v1/plugins/:name/enable", () => {
       throw new Error("hub unavailable");
     });
 
-    const result = invokeEnable({ pathParams: { name: "simple-memory" } });
+    const result = await invokeEnable({
+      pathParams: { name: "simple-memory" },
+    });
     expect(result).toEqual({ ok: true });
   });
 
-  test("PluginAlreadyInStateException → ConflictError (409), no broadcast", () => {
+  test("PluginAlreadyInStateException → ConflictError (409), no broadcast", async () => {
     enablePluginSpy.mockImplementation((name) => {
       throw new PluginAlreadyInStateException(name, "enable");
     });
 
-    expect(() =>
+    await expect(
       invokeEnable({ pathParams: { name: "simple-memory" } }),
-    ).toThrow(ConflictError);
+    ).rejects.toThrow(ConflictError);
     // A no-op toggle must not fan out a spurious invalidation.
     expect(broadcastMessageSpy).not.toHaveBeenCalled();
   });
 
-  test("PluginDirectoryNotFoundError → NotFoundError (404)", () => {
+  test("PluginDirectoryNotFoundError → NotFoundError (404)", async () => {
     enablePluginSpy.mockImplementation((name) => {
       throw new PluginDirectoryNotFoundError(name);
     });
 
-    expect(() => invokeEnable({ pathParams: { name: "ghost" } })).toThrow(
-      NotFoundError,
-    );
+    await expect(
+      invokeEnable({ pathParams: { name: "ghost" } }),
+    ).rejects.toThrow(NotFoundError);
   });
 
-  test("InvalidPluginNameError → BadRequestError (400)", () => {
+  test("InvalidPluginNameError → BadRequestError (400)", async () => {
     enablePluginSpy.mockImplementation(() => {
       throw new ToggleInvalidPluginNameError("../escape");
     });
 
-    expect(() => invokeEnable({ pathParams: { name: "../escape" } })).toThrow(
-      BadRequestError,
-    );
+    await expect(
+      invokeEnable({ pathParams: { name: "../escape" } }),
+    ).rejects.toThrow(BadRequestError);
   });
 });
 
@@ -2504,14 +2724,42 @@ describe("POST /v1/plugins/:name/disable", () => {
   beforeEach(() => {
     disablePluginSpy.mockReset();
     broadcastMessageSpy.mockReset();
+    reconcilePluginSchedulesSpy.mockClear();
+    reconcilePluginSourcesNowSpy.mockClear();
   });
 
-  test("disables the plugin and broadcasts sync_changed(plugins:list)", () => {
+  test("awaits the source reconcile so shutdown runs before the route returns", async () => {
     disablePluginSpy.mockImplementation((name) =>
       toggleResult(name, "disable"),
     );
 
-    const result = invokeDisable({ pathParams: { name: "simple-memory" } });
+    await invokeDisable({ pathParams: { name: "simple-memory" } });
+
+    // The sentinel hides tools at read time, but `init` already opened
+    // in-process work (a live subscribe, a poll worker). The source
+    // reconcile is what runs `shutdown`. It converges schedules itself, so
+    // the route does not poke them separately.
+    expect(reconcilePluginSourcesNowSpy).toHaveBeenCalledTimes(1);
+    expect(reconcilePluginSchedulesSpy).not.toHaveBeenCalled();
+  });
+
+  test("a failed toggle does not run the source reconcile", async () => {
+    disablePluginSpy.mockImplementation((name) => {
+      throw new PluginDirectoryNotFoundError(name);
+    });
+
+    await expect(
+      invokeDisable({ pathParams: { name: "ghost" } }),
+    ).rejects.toThrow(NotFoundError);
+    expect(reconcilePluginSourcesNowSpy).not.toHaveBeenCalled();
+  });
+
+  test("disables the plugin and broadcasts sync_changed(plugins:list)", async () => {
+    disablePluginSpy.mockImplementation((name) =>
+      toggleResult(name, "disable"),
+    );
+
+    const result = await invokeDisable({ pathParams: { name: "simple-memory" } });
 
     expect(result).toEqual({ ok: true });
     expect(disablePluginSpy.mock.calls[0]?.[0]).toBe("simple-memory");
@@ -2520,12 +2768,12 @@ describe("POST /v1/plugins/:name/disable", () => {
     expectPluginsListBroadcast();
   });
 
-  test("threads x-vellum-client-id into the published event's originClientId", () => {
+  test("threads x-vellum-client-id into the published event's originClientId", async () => {
     disablePluginSpy.mockImplementation((name) =>
       toggleResult(name, "disable"),
     );
 
-    invokeDisable({
+    await invokeDisable({
       pathParams: { name: "simple-memory" },
       headers: { "x-vellum-client-id": "client-xyz" },
     });
@@ -2537,35 +2785,35 @@ describe("POST /v1/plugins/:name/disable", () => {
     });
   });
 
-  test("PluginAlreadyInStateException → ConflictError (409), no broadcast", () => {
+  test("PluginAlreadyInStateException → ConflictError (409), no broadcast", async () => {
     disablePluginSpy.mockImplementation((name) => {
       throw new PluginAlreadyInStateException(name, "disable");
     });
 
-    expect(() =>
+    await expect(
       invokeDisable({ pathParams: { name: "simple-memory" } }),
-    ).toThrow(ConflictError);
+    ).rejects.toThrow(ConflictError);
     expect(broadcastMessageSpy).not.toHaveBeenCalled();
   });
 
-  test("PluginDirectoryNotFoundError → NotFoundError (404)", () => {
+  test("PluginDirectoryNotFoundError → NotFoundError (404)", async () => {
     disablePluginSpy.mockImplementation((name) => {
       throw new PluginDirectoryNotFoundError(name);
     });
 
-    expect(() => invokeDisable({ pathParams: { name: "ghost" } })).toThrow(
-      NotFoundError,
-    );
+    await expect(
+      invokeDisable({ pathParams: { name: "ghost" } }),
+    ).rejects.toThrow(NotFoundError);
   });
 
-  test("InvalidPluginNameError → BadRequestError (400)", () => {
+  test("InvalidPluginNameError → BadRequestError (400)", async () => {
     disablePluginSpy.mockImplementation(() => {
       throw new ToggleInvalidPluginNameError("../escape");
     });
 
-    expect(() => invokeDisable({ pathParams: { name: "../escape" } })).toThrow(
-      BadRequestError,
-    );
+    await expect(
+      invokeDisable({ pathParams: { name: "../escape" } }),
+    ).rejects.toThrow(BadRequestError);
   });
 });
 

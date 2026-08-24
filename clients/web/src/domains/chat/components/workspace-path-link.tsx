@@ -37,6 +37,7 @@ import {
   workspaceBasenameOf,
   workspaceDirOf,
 } from "@/domains/chat/utils/workspace-path-links";
+import { useTranslation } from "@/i18n";
 
 /**
  * Workspace contents change while a conversation is open (the assistant is
@@ -63,10 +64,10 @@ export interface WorkspacePathLinkProps {
   /** Active assistant whose workspace the path is resolved against. */
   assistantId?: string | null;
   /**
-   * Click handler shared with `vellum://` markdown links, so a resolved path
-   * opens the same file-action modal (Go to file / Download) as an explicitly
-   * linked file. Without it there is no affordance to offer and the span stays
-   * plain code.
+   * Where a click on a resolved path goes, given the file's `vellum://` href
+   * and its basename. The caller points this at the same destination an
+   * explicitly linked file reaches, so the two affordances behave alike.
+   * Without it there is no affordance to offer and the span stays plain code.
    */
   onOpen?: (href: string, linkText: string) => void;
 }
@@ -77,6 +78,7 @@ export function WorkspacePathLink({
   assistantId,
   onOpen,
 }: WorkspacePathLinkProps) {
+  const { t } = useTranslation("chat");
   const label = raw ?? path ?? "";
   // Platform-hosted requests carry a `Vellum-Organization-Id` header sourced
   // from the org store, which hydrates after auth. Firing before then is
@@ -134,7 +136,7 @@ export function WorkspacePathLink({
         onOpen(toVellumWorkspaceHref(path), workspaceBasenameOf(path))
       }
       className={`${MARKDOWN_INLINE_CODE_CLASS} cursor-pointer text-[var(--system-positive-strong)] underline decoration-dotted underline-offset-2 hover:opacity-80`}
-      title={`Open ${path}`}
+      title={t("workspacePathLink.openTitle", { path })}
     >
       {label}
     </button>

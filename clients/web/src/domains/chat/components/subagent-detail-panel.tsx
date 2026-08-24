@@ -1,11 +1,10 @@
 import {
   ArrowDownToLine,
-  ArrowLeft,
   ArrowUpFromLine,
   Bolt,
   ChevronDown,
+  ChevronLeft,
   ChevronRight,
-  X,
 } from "lucide-react";
 
 import {
@@ -20,6 +19,7 @@ import {
 import { motion, useReducedMotion } from "motion/react";
 
 import { AvatarRenderer } from "@/components/avatar-renderer";
+import { DetailShell } from "@/components/detail-shell";
 import {
   AnimatedMetricCard,
   formatNumber,
@@ -47,6 +47,7 @@ import { WebSearchDetailView } from "@/domains/chat/components/web-search/web-se
 import { useSubagentSteps } from "@/domains/chat/subagent-step-projection";
 import { useSubagentStepDetails } from "@/domains/chat/subagent-detail-projection";
 import type { ToolDetailPayload } from "@/stores/viewer-store";
+import { useTranslation } from "@/i18n";
 
 /**
  * The icon name for a nested step detail — the same glyph its timeline pill
@@ -96,6 +97,12 @@ export interface SubagentDetailPanelProps {
   onClose: () => void;
   onStop?: (subagentId: string) => void;
   onRequestDetail?: (subagentId: string) => void;
+  /**
+   * Assistant that owns the conversation this subagent was spawned from.
+   * Threaded to the step markdown (and the nested tool detail) so workspace
+   * file references resolve against the right workspace.
+   */
+  assistantId?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -107,7 +114,9 @@ export function SubagentDetailPanel({
   onClose,
   onStop,
   onRequestDetail,
+  assistantId,
 }: SubagentDetailPanelProps) {
+  const { t } = useTranslation("chat");
   const isRunning = isActiveStatus(entry.status);
   const reduce = useReducedMotion();
   const components = useBundledAvatarComponents();
@@ -262,94 +271,91 @@ export function SubagentDetailPanel({
   const headerTitle = activeDetail ? detailTitle : entry.label;
 
   return (
-    <div className="flex h-full flex-col overflow-hidden rounded-xl bg-[var(--surface-lift)]">
-      {/* Breadcrumb — only shown once a nested step detail is open; the
-          top-level subagent timeline has no breadcrumb. The subagent crumb is a
-          button that returns to the timeline (retaining expanded groups),
-          mirroring the header Back button; the step crumb is the current
-          (deepest) level. */}
-      {activeDetail && (
-        <div className="flex shrink-0 items-center gap-2 border-b border-[var(--border-hover)] px-5 py-3">
-          <button
-            type="button"
-            onClick={handleBack}
-            title={entry.label}
-            className="min-w-0 shrink cursor-pointer truncate text-left text-[var(--content-default)] hover:underline"
-          >
-            <Typography variant="body-small-default" as="span">
-              {entry.label}
+    <DetailShell
+      headerAbove={
+        // Breadcrumb: only shown once a nested step detail is open; the
+        // top-level subagent timeline has no breadcrumb. The subagent crumb is
+        // a button that returns to the timeline (retaining expanded groups),
+        // mirroring the header Back button; the step crumb is the current
+        // (deepest) level.
+        activeDetail && (
+          <div className="flex shrink-0 items-center gap-2 border-b border-[var(--border-hover)] px-5 py-3">
+            <Button
+              variant="link"
+              onClick={handleBack}
+              title={entry.label}
+              // inline-flex: the `link` variant is `display: inline`, which can't
+              // constrain the label for truncation. border-0: the button base
+              // carries a 1px transparent border the raw crumb never had, which
+              // would grow the breadcrumb row by 2px.
+              className="inline-flex min-w-0 shrink border-0 text-left text-[color:var(--content-default)]"
+            >
+              <Typography
+                variant="body-small-default"
+                as="span"
+                className="min-w-0 truncate"
+              >
+                {entry.label}
+              </Typography>
+            </Button>
+            <ChevronRight
+              className="h-2.5 w-2.5 shrink-0 text-[var(--content-tertiary)]"
+              aria-hidden
+            />
+            <Typography
+              variant="body-small-default"
+              as="span"
+              title={detailTitle}
+              className="min-w-0 shrink truncate text-[var(--content-secondary)]"
+            >
+              {detailTitle}
             </Typography>
-          </button>
-          <ChevronRight
-            className="h-2.5 w-2.5 shrink-0 text-[var(--content-tertiary)]"
-            aria-hidden
-          />
-          <Typography
-            variant="body-small-default"
-            as="span"
-            title={detailTitle}
-            className="min-w-0 shrink truncate text-[var(--content-secondary)]"
-          >
-            {detailTitle}
-          </Typography>
-        </div>
-      )}
-
-      {/* Header */}
-      <div className="flex shrink-0 items-center gap-3 border-b border-[var(--border-hover)] px-5 py-4">
-        {activeDetail && (
-          <Button
-            variant="outlined"
-            iconOnly={<ArrowLeft />}
-            onClick={handleBack}
-            aria-label="Back to timeline"
-            tooltip="Back"
-            className="shrink-0 rounded-lg"
-          />
-        )}
-        {activeDetail ? (
-          <NestedHeaderGlyph detail={activeDetail} />
-        ) : components ? (
-          <AvatarRenderer
-            components={components}
-            bodyShapeId={traits.bodyShape}
-            eyeStyleId={traits.eyeStyle}
-            colorId={traits.color}
-            size={32}
-          />
-        ) : (
-          <div style={{ width: 32, height: 32, flexShrink: 0 }} aria-hidden />
-        )}
-        <Typography
-          variant="title-medium"
-          title={headerTitle}
-          // leading-snug: title-medium is line-height:1, so truncate clips the descenders.
-          className="min-w-0 shrink truncate leading-snug text-[var(--content-default)]"
-        >
-          {headerTitle}
-        </Typography>
-        <StatusBadge status={entry.status} />
-        <span className="flex-1" />
-        {isRunning && onStop && (
+          </div>
+        )
+      }
+      icon={
+        <>
+          {activeDetail && (
+            <Button
+              variant="outlined"
+              iconOnly={<ChevronLeft />}
+              onClick={handleBack}
+              aria-label={t("subagentDetailPanel.backToTimelineAria")}
+              tooltip={t("subagentDetailPanel.backTooltip")}
+              className="shrink-0"
+            />
+          )}
+          {activeDetail ? (
+            <NestedHeaderGlyph detail={activeDetail} />
+          ) : components ? (
+            <AvatarRenderer
+              components={components}
+              bodyShapeId={traits.bodyShape}
+              eyeStyleId={traits.eyeStyle}
+              colorId={traits.color}
+              size={32}
+            />
+          ) : (
+            <div style={{ width: 32, height: 32, flexShrink: 0 }} aria-hidden />
+          )}
+        </>
+      }
+      title={headerTitle}
+      headerTrailing={<StatusBadge status={entry.status} />}
+      headerActions={
+        isRunning && onStop ? (
           <DetailPanelStopButton
             onStop={() => onStop(entry.subagentId)}
-            ariaLabel="Stop subagent"
+            ariaLabel={t("subagentDetailPanel.stopSubagentAria")}
           />
-        )}
-        <Button
-          variant="outlined"
-          iconOnly={<X />}
-          onClick={onClose}
-          aria-label="Close subagent detail"
-          tooltip="Close"
-          className="shrink-0 rounded-lg"
-        />
-      </div>
-
-      {/* Scrollable body — swaps to a step's nested detail when one is selected,
-          keeping the header above mounted in both views. */}
-      <div className="flex-1 overflow-y-auto px-5 py-5">
-        <motion.div
+        ) : undefined
+      }
+      closeLabel={t("subagentDetailPanel.closeDetail")}
+      onClose={onClose}
+    >
+      {/* Body: swaps to a step's nested detail when one is selected, keeping
+          the header above mounted in both views. */}
+      <motion.div
           key={activeDetail ? "detail" : "list"}
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
@@ -372,6 +378,7 @@ export function SubagentDetailPanel({
                 <ChatMarkdownMessage
                   content={activeDetail.thinkingText ?? ""}
                   hardLineBreaks
+                  assistantId={assistantId}
                 />
               ) : activeDetail.kind === "web_search" &&
                 activeDetail.status !== "error" ? (
@@ -382,7 +389,10 @@ export function SubagentDetailPanel({
               ) : activeDetail.toolName === "web_fetch" ? (
                 <WebFetchDetailView detail={activeDetail} />
               ) : (
-                <ToolDetailBody detail={activeDetail} />
+                <ToolDetailBody
+                  detail={activeDetail}
+                  assistantId={assistantId}
+                />
               )}
             </>
           ) : (
@@ -398,7 +408,7 @@ export function SubagentDetailPanel({
                   }
                   target={entry.inputTokens}
                   format={(n) => formatNumber(Math.round(n))}
-                  label="Input"
+                  label={t("subagentDetailPanel.input")}
                 />
                 <AnimatedMetricCard
                   icon={
@@ -409,7 +419,7 @@ export function SubagentDetailPanel({
                   }
                   target={entry.outputTokens}
                   format={(n) => formatNumber(Math.round(n))}
-                  label="Output"
+                  label={t("subagentDetailPanel.output")}
                 />
               </div>
 
@@ -421,7 +431,7 @@ export function SubagentDetailPanel({
                     as="h3"
                     className="mb-2 text-[var(--content-emphasised)]"
                   >
-                    Objective
+                    {t("subagentDetailPanel.objective")}
                   </Typography>
                   <Typography
                     ref={objectiveBodyRef}
@@ -432,7 +442,7 @@ export function SubagentDetailPanel({
                     // users can't reach the overflowed objective content.
                     tabIndex={objectiveExpanded ? 0 : undefined}
                     role={objectiveExpanded ? "region" : undefined}
-                    aria-label={objectiveExpanded ? "Objective" : undefined}
+                    aria-label={objectiveExpanded ? t("subagentDetailPanel.objective") : undefined}
                     className={`whitespace-pre-wrap break-words leading-relaxed text-[var(--content-default)] ${
                       objectiveExpanded
                         ? "max-h-[280px] overflow-y-auto"
@@ -442,21 +452,26 @@ export function SubagentDetailPanel({
                     {entry.objective}
                   </Typography>
                   {objectiveOverflows && (
-                    <button
-                      type="button"
+                    <Button
+                      variant="link"
                       onClick={() => setObjectiveExpanded((prev) => !prev)}
-                      className="mt-1.5 flex cursor-pointer items-center gap-1 text-[var(--content-secondary)] transition-colors hover:text-[var(--content-default)]"
+                      aria-expanded={objectiveExpanded}
+                      rightIcon={
+                        <ChevronDown
+                          className={`h-3.5 w-3.5 transition-transform ${
+                            objectiveExpanded ? "rotate-180" : ""
+                          }`}
+                          aria-hidden
+                        />
+                      }
+                      // no-underline: this is a disclosure toggle, not a link.
+                      // border-0: see the breadcrumb crumb above.
+                      className="mt-1.5 inline-flex gap-1 border-0 text-[color:var(--content-secondary)] hover:text-[color:var(--content-default)] hover:no-underline"
                     >
                       <Typography variant="label-small-default">
-                        {objectiveExpanded ? "Show less" : "Show more"}
+                        {objectiveExpanded ? t("subagentDetailPanel.showLess") : t("subagentDetailPanel.showMore")}
                       </Typography>
-                      <ChevronDown
-                        className={`h-3.5 w-3.5 transition-transform ${
-                          objectiveExpanded ? "rotate-180" : ""
-                        }`}
-                        aria-hidden
-                      />
-                    </button>
+                    </Button>
                   )}
                   <div className="mt-5 h-px w-full bg-[var(--border-hover)]" />
                 </div>
@@ -469,7 +484,7 @@ export function SubagentDetailPanel({
                   as="h3"
                   className="mb-4 text-[var(--content-emphasised)]"
                 >
-                  Timeline
+                  {t("subagentDetailPanel.timeline")}
                 </Typography>
                 {/*
                  * Key by subagent id so the timeline remounts on subagent switch,
@@ -505,14 +520,13 @@ export function SubagentDetailPanel({
                     variant="body-small-default"
                     className="py-4 text-center text-[var(--content-tertiary)]"
                   >
-                    No events yet
+                    {t("subagentDetailPanel.noEventsYet")}
                   </Typography>
                 )}
               </div>
             </>
           )}
         </motion.div>
-      </div>
-    </div>
+    </DetailShell>
   );
 }

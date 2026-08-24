@@ -10,37 +10,12 @@ import {
 
 export const pluginsHelp: CliCommandHelp = {
   name: "plugins",
-  description:
-    "List, search, install, and manage external plugins (`list` shows what is installed, `search` queries the marketplace)",
+  description: "List, search, install, and manage plugins.",
   helpText: `
-Examples:
-  $ assistant plugins install example
-  $ assistant plugins install example --force
-  $ assistant plugins install https://github.com/owner/repo
-  $ assistant plugins install https://github.com/owner/repo/tree/main/sub/path --name my-plugin
-  $ assistant plugins install example --ref my-feature-branch
-  $ assistant plugins versions example
-  $ assistant plugins versions example --json
-  $ assistant plugins install example --pin <sha> --force
-  $ assistant plugins list
-  $ assistant plugins list --json
-  $ assistant plugins list --all
-  $ assistant plugins list --all --json
-  $ assistant plugins inspect example
-  $ assistant plugins inspect example --json
-  $ assistant plugins diff example
-  $ assistant plugins diff example --json
-  $ assistant plugins upgrade example
-  $ assistant plugins upgrade example --dry-run
-  $ assistant plugins upgrade example --strategy ours
-  $ assistant plugins upgrade example --strategy theirs
-  $ assistant plugins upgrade example --strategy assistant
-  $ assistant plugins search example
-  $ assistant plugins search "^example"
-  $ assistant plugins search example --json
-  $ assistant plugins uninstall example
-  $ assistant plugins enable example
-  $ assistant plugins disable example`,
+Plugins are superpowers: installable extensions that add skills, tools, integrations,
+and so much more from the Vellum Community. When the user asks to set up,
+install, connect, or integrate a product, service, or app, run
+'assistant plugins search <name>' first before searching the web.`,
   subcommands: [
     {
       name: "install",
@@ -48,7 +23,11 @@ Examples:
       description:
         "Install a plugin by name from the Vellum platform (content is served as a verified tarball from the plugin's pinned commit), or directly from a GitHub URL (untrusted)",
       options: [
-        { flags: "--force", description: "Overwrite an existing install" },
+        {
+          flags: "--force",
+          description:
+            "Overwrite an existing install and skip the declared-schedules confirmation prompt",
+        },
         {
           flags: "--ref <ref>",
           description: `For a marketplace install, the manifest revision to read the pin from (default: ${DEFAULT_PLUGIN_REF}). For a GitHub URL, the git ref (branch/tag/SHA) to clone — states a slash-containing branch (e.g. feature/x) explicitly and skips the remote ref lookup a bare /tree/ URL otherwise does`,
@@ -70,6 +49,15 @@ Examples:
         },
       ],
       helpText: `
+A plugin that declares schedules (a schedules/ directory) has them listed
+during the install, and the install asks for confirmation before finalizing:
+schedules run automatically in the background once the plugin is installed.
+Pass --force to skip the prompt (required for non-interactive installs).
+
+A plugin that ships a setup skill (skills/setup/ or
+skills/<name>-setup/) prints a line after install telling the user to
+load that skill to finish setup.
+
 A GitHub URL (anything containing a slash) installs directly from that repo,
 bypassing the marketplace whitelist. Such a plugin is UNTRUSTED — it has not
 been reviewed and its hooks/tools run with full assistant access — so the
@@ -121,7 +109,7 @@ Examples:
       name: "inspect",
       args: "<name>",
       description:
-        "Show a plugin's local install metadata, the marketplace pin, whether an update is available, and the surfaces (skills, hooks, tools) it contributes",
+        "Show a plugin's local install metadata, the marketplace pin, whether an update is available, and the surfaces (skills, hooks, tools, schedules) it contributes",
       options: [
         {
           flags: "--json",
@@ -159,13 +147,31 @@ Examples:
       name: "search",
       args: "<query>",
       description:
-        "Search the plugins/marketplace.json catalog for plugin names matching <query> (case-insensitive regex)",
+        "Search the plugin marketplace. Query is a case-insensitive regex against plugin names",
       options: [
         {
           flags: "--json",
           description: "Emit machine-readable JSON instead of a table",
         },
       ],
+      helpText: `
+When to use:
+  First stop when the user asks to set up, install, connect, or integrate a
+  product, service, or app (for example "Setup <app> for me",
+  "connect this service"). Search here before searching the web.
+
+Arguments:
+  query    Case-insensitive regex matched against plugin names, not the full
+           user sentence. Use the product or plugin name. Anchors like
+           ^example work.
+
+If a match is found, install it with 'assistant plugins install <name>'.
+If nothing matches, try 'assistant skills search <query>', then web search.
+
+Examples:
+  $ assistant plugins search example
+  $ assistant plugins search "^example"
+  $ assistant plugins search example --json`,
     },
     {
       name: "publish",
@@ -245,6 +251,11 @@ $ assistant plugins publish --json`,
           flags: "--json",
           description: "Emit machine-readable JSON instead of a summary",
         },
+        {
+          flags: "--force",
+          description:
+            "Skip the declared-schedules confirmation prompt of a local upgrade (the assistant-applied path never prompts)",
+        },
       ],
       helpText: `
 A marketplace plugin upgrades to the curated pin. A plugin installed directly
@@ -252,6 +263,15 @@ from a GitHub URL (untrusted) upgrades against its recorded source: it re-fetche
 whatever its recorded ref resolves to now — a pinned commit SHA is immutable (a
 no-op), while a branch/tag/HEAD advances as upstream does — and re-materializes
 it verbatim, with no curated adapter overlay.
+
+With the assistant running, the upgrade is applied by it immediately, with no
+confirmation prompt: a schedule the new revision declares is armed by the
+assistant and surfaced as a notification, and the upgrade output lists the
+revision's declared schedules with any new ones marked. Only when the
+assistant is unreachable does the upgrade run locally instead; that path
+stages the new revision first, and a revision that declares schedules lists
+them and asks for confirmation before going live (--force skips that prompt,
+as for install).
 
 Examples:
   $ assistant plugins upgrade example

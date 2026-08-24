@@ -65,9 +65,7 @@ mock.module("../permissions/checker.js", () => ({
   isDynamicSkillLoadInvocation: () => dynamicSkillLoad,
   classifyRisk: async () => ({ level: "medium" }),
   check: async () => ({ decision: checkDecision, reason: "medium risk" }),
-  generateAllowlistOptions: () => [],
   generateScopeOptions: () => [],
-  getCachedAssessment: () => undefined,
 }));
 
 mock.module("../telemetry/tool-usage-store.js", () => ({
@@ -137,7 +135,7 @@ async function checkSkillLoad(skill: string) {
     skillLoadTool,
     makeBackgroundGuardianContext(),
     Date.now(),
-    () => undefined,
+    async () => undefined,
   );
 }
 
@@ -176,7 +174,7 @@ async function checkSkillLoadWith(
     skillLoadTool,
     context,
     Date.now(),
-    () => undefined,
+    async () => undefined,
   );
 }
 

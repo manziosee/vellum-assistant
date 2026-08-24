@@ -1,6 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 
-import { setDockBadge } from "@/runtime/dock";
+import {
+  getUnreadBadgeSurface,
+  setDockBadge,
+  supportsUnreadBadges,
+} from "@/runtime/dock";
+import { detectElectronHostOS } from "@/runtime/platform-detection";
 import {
   openSystemPermissionSettings,
   requestSystemPermission,
@@ -25,13 +30,14 @@ interface SystemPermissionRowMeta {
   sourceKind: SystemPermissionKind;
   label: string;
   description: string;
+  availableOnWindows?: boolean;
+  windowsDescription?: string;
 }
 
 interface LocalPermissionRowMeta {
   id: LocalPermissionRowId;
   type: "local";
   label: string;
-  description: string;
 }
 
 interface PermissionRowViewModel {
@@ -59,6 +65,7 @@ const SYSTEM_PERMISSION_ROWS: SystemPermissionRowMeta[] = [
     label: "Screen Recording",
     description:
       "Allows your assistant to capture screen context during computer-use tasks.",
+    availableOnWindows: true,
   },
   {
     id: "microphone",
@@ -67,6 +74,7 @@ const SYSTEM_PERMISSION_ROWS: SystemPermissionRowMeta[] = [
     label: "Microphone",
     description:
       "Allows your assistant to capture audio for voice input and recordings.",
+    availableOnWindows: true,
   },
   {
     id: "speechRecognition",
@@ -75,6 +83,9 @@ const SYSTEM_PERMISSION_ROWS: SystemPermissionRowMeta[] = [
     label: "Speech Recognition",
     description:
       "Allows your assistant to transcribe your speech into text on-device.",
+    availableOnWindows: true,
+    windowsDescription:
+      "Allows your assistant to transcribe your speech into text with Windows speech recognition.",
   },
   {
     id: "notifications",
@@ -83,6 +94,9 @@ const SYSTEM_PERMISSION_ROWS: SystemPermissionRowMeta[] = [
     label: "Notifications",
     description:
       "Allows your assistant to send macOS alerts for approvals, messages, and task updates.",
+    availableOnWindows: true,
+    windowsDescription:
+      "Allows your assistant to show Windows notifications for approvals, messages, and task updates.",
   },
 ];
 
@@ -91,8 +105,6 @@ const LOCAL_PERMISSION_ROWS: LocalPermissionRowMeta[] = [
     id: "notificationBadges",
     type: "local",
     label: "Notification Badges",
-    description:
-      "Allows your assistant to show unseen conversation counts on the Dock icon.",
   },
 ];
 
@@ -200,6 +212,15 @@ export function SystemPermissionsCard({
   const [notificationBadgesEnabled, setNotificationBadgesEnabled] =
     useNotificationBadgesEnabled();
 
+  const isWindowsHost = detectElectronHostOS() === "windows";
+  const visibleSystemRows = useMemo(
+    () =>
+      SYSTEM_PERMISSION_ROWS.filter(
+        (meta) => !isWindowsHost || meta.availableOnWindows,
+      ),
+    [isWindowsHost],
+  );
+
   const systemRowsById = useMemo(() => {
     const rows = new Map<
       SystemPermissionKind,
@@ -209,45 +230,58 @@ export function SystemPermissionsCard({
       return rows;
     }
 
-    for (const meta of SYSTEM_PERMISSION_ROWS) {
+    for (const meta of visibleSystemRows) {
       const item = state[meta.sourceKind];
-      if (item) {
+      if (item && item.status !== "not-applicable") {
         rows.set(meta.id, { meta, item });
       }
     }
 
     return rows;
-  }, [state]);
+  }, [state, visibleSystemRows]);
 
   const rows = useMemo<PermissionRowViewModel[]>(() => {
-    const systemRows = SYSTEM_PERMISSION_ROWS.map((meta) => {
-      const item = systemRowsById.get(meta.id)?.item;
-      if (!item) {
-        return null;
-      }
+    const systemRows = visibleSystemRows
+      .map((meta) => {
+        const item = systemRowsById.get(meta.id)?.item;
+        if (!item) {
+          return null;
+        }
 
-      return {
-        id: meta.id,
-        label: meta.label,
-        description: meta.description,
-        checked: item.status === "granted",
-        disabled: pendingKind === meta.id || item.status === "restricted",
-        ...(item.error ? { error: item.error } : {}),
-      };
-    }).filter(Boolean) as PermissionRowViewModel[];
+        return {
+          id: meta.id,
+          label: meta.label,
+          description:
+            isWindowsHost && meta.windowsDescription
+              ? meta.windowsDescription
+              : meta.description,
+          checked: item.status === "granted",
+          disabled: pendingKind === meta.id || item.status === "restricted",
+          ...(item.error ? { error: item.error } : {}),
+        };
+      })
+      .filter(Boolean) as PermissionRowViewModel[];
 
-    const localRows = LOCAL_PERMISSION_ROWS.map((meta) => ({
-      id: meta.id,
-      label: meta.label,
-      description: meta.description,
-      checked: notificationBadgesEnabled,
-      disabled: pendingKind === meta.id,
-    }));
+    const localRows = supportsUnreadBadges()
+      ? LOCAL_PERMISSION_ROWS.map((meta) => ({
+          id: meta.id,
+          label: meta.label,
+          description: `Allows your assistant to show unseen conversation counts on the ${getUnreadBadgeSurface()}.`,
+          checked: notificationBadgesEnabled,
+          disabled: pendingKind === meta.id,
+        }))
+      : [];
 
     return [...systemRows, ...localRows];
-  }, [notificationBadgesEnabled, pendingKind, systemRowsById]);
+  }, [
+    isWindowsHost,
+    notificationBadgesEnabled,
+    pendingKind,
+    systemRowsById,
+    visibleSystemRows,
+  ]);
 
-  if (!supported) {
+  if (!supported && rows.length === 0) {
     return null;
   }
 

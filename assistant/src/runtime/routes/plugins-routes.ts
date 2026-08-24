@@ -85,6 +85,7 @@ import {
 } from "../../cli/lib/uninstall-plugin.js";
 import {
   PluginMergeBaselineError,
+  PluginNotCuratedError,
   PluginNotUpgradableError,
   upgradePlugin,
 } from "../../cli/lib/upgrade-plugin.js";
@@ -525,6 +526,27 @@ const pluginSurfacesSchema = z
       .describe(
         "Registered tool names from `tools/<name>.{ts,js}` (filenames derived to tool names, e.g. `create-issue` \u2192 `create_issue`).",
       ),
+    schedules: z
+      .array(
+        z.object({
+          name: z
+            .string()
+            .describe("Schedule name: the declaration directory's name."),
+          cadence: z
+            .string()
+            .describe(
+              "Raw schedule `expression` string from the declaration's config.",
+            ),
+          mode: z
+            .enum(["execute", "script"])
+            .describe(
+              "`execute` for a markdown prompt entrypoint, `script` for `index.sh`.",
+            ),
+        }),
+      )
+      .describe(
+        "Schedules declared under `schedules/`, each a `<name>/` directory with `config.json` plus one entrypoint. Display surface only; files directly under `schedules/` and unsupported declarations are omitted.",
+      ),
   })
   .describe(
     "Surfaces the installed copy contributes, read from its on-disk tree.",
@@ -568,7 +590,7 @@ const pluginInspectResponseSchema = z.object({
   surfaces: pluginSurfacesSchema
     .nullable()
     .describe(
-      "Surfaces the installed copy contributes (skills, hooks, tools); null when the plugin is not installed.",
+      "Surfaces the installed copy contributes (skills, hooks, tools, schedules); null when the plugin is not installed.",
     ),
 });
 
@@ -584,6 +606,12 @@ const pluginUpgradeRequestSchema = z.object({
     .optional()
     .describe(
       "How to reconcile local edits with the pin. `overwrite` (default) discards local edits and re-installs the pin; `ours`/`theirs` three-way merge, resolving conflicting hunks toward the local edit or the pin respectively; `assistant` is not yet supported.",
+    ),
+  marketplaceOnly: z
+    .boolean()
+    .optional()
+    .describe(
+      "Refuse the upgrade (409) when the marketplace does not claim this plugin, instead of advancing it to whatever its recorded GitHub ref now resolves to. Set by unattended callers such as the automatic update sweep, for which running code no curator reviewed is never an acceptable outcome. Defaults to false.",
     ),
 });
 
@@ -1206,6 +1234,11 @@ async function handleInstallPlugin({ body = {}, headers }: RouteHandlerArgs) {
   // that introduced it through the plugin's reviewed pin history; an unreviewed
   // SHA is refused. Operators who need an unreviewed revision use the local
   // CLI's `assistant plugins install --pin <sha> --allow-unreviewed`.
+  //
+  // No `confirmStaged` consent gate: the daemon route is unattended by design
+  // (there is no interactive surface to prompt on). Declared schedules the
+  // install arms are surfaced to the user by the schedule reconciler's
+  // `schedule.declared` notification.
   try {
     // Validate the name up front — before any catalog/pin/network work — so a
     // malformed name (`../escape`) is a deterministic 400 rather than a 404/503
@@ -1400,6 +1433,34 @@ async function handleDiffPlugin({ pathParams = {} }: RouteHandlerArgs) {
 // Handler — upgrade
 // ---------------------------------------------------------------------------
 
+/**
+ * Install names with an upgrade past the staging boundary right now.
+ *
+ * An upgrade stages into `<plugins>/../.plugins-staging/<name>.upgrading.<pid>`
+ * and finishes with an `rm -rf` + rename over the live install. Two concurrent
+ * upgrades of the same plugin in this process derive the same staging path, so
+ * the second would delete the first's tree mid-flight and leave the install
+ * half-swapped. The upgrade is per-plugin mutable state with more than one
+ * caller (CLI, the web Upgrade button, and the monitor's auto-update sweep),
+ * so it is serialized per name: the second caller is refused rather than
+ * queued, since by the time it could run, the revision it wanted is already
+ * what the first caller installed.
+ *
+ * Dry runs never stage — they return before the swap boundary — so they
+ * neither take nor respect the guard.
+ */
+const upgradesInFlight = new Set<string>();
+
+/** An upgrade for this plugin is already running in this process. */
+class PluginUpgradeInProgressError extends Error {
+  constructor(pluginName: string) {
+    super(
+      `An upgrade for plugin "${pluginName}" is already in progress. Wait for it to finish before starting another.`,
+    );
+    this.name = "PluginUpgradeInProgressError";
+  }
+}
+
 async function handleUpgradePlugin({
   pathParams = {},
   body = {},
@@ -1411,6 +1472,11 @@ async function handleUpgradePlugin({
     typeof body.strategy === "string"
       ? (body.strategy as PluginUpgradeStrategy)
       : undefined;
+  // Enforced here, not just by whoever decided to call: `upgradePlugin` fetches
+  // the catalog itself, so an entry that vanishes between a caller's own check
+  // and this handler would otherwise reroute a curated upgrade onto the
+  // install's mutable recorded ref.
+  const marketplaceOnly = body.marketplaceOnly === true;
 
   // Like install, the upgrade target ref is the curated marketplace pin
   // (resolved inside `upgradePlugin` via `inspectPlugin`), never a
@@ -1427,10 +1493,24 @@ async function handleUpgradePlugin({
   // brings the on-disk version up, so the reconcile below must run even when
   // the swap itself failed (re-initializing the untouched old install).
   let deactivated = false;
+  // Name held by this request in `upgradesInFlight`, so `finally` releases
+  // exactly what it claimed (and nothing when the claim was refused).
+  let claimed: string | null = null;
   try {
     const name = sanitizePluginName(rawName);
+    if (!dryRun) {
+      if (upgradesInFlight.has(name)) {
+        throw new PluginUpgradeInProgressError(name);
+      }
+      upgradesInFlight.add(name);
+      claimed = name;
+    }
+    // No `confirmStaged` consent gate here: the daemon route is unattended by
+    // design (there is no interactive surface to prompt on). A schedule the
+    // upgraded revision adds is surfaced to the user by the schedule
+    // reconciler's `schedule.declared` notification when it arms.
     const result = await upgradePlugin(
-      { name, dryRun, strategy },
+      { name, dryRun, strategy, marketplaceOnly },
       {
         fetch: globalThis.fetch.bind(globalThis),
         // Tear the old version down BEFORE the staged tree replaces its
@@ -1476,6 +1556,11 @@ async function handleUpgradePlugin({
     if (err instanceof InvalidPluginNameError) {
       throw new BadRequestError(err.message);
     }
+    // A concurrent upgrade of the same plugin owns the staging path — a
+    // well-formed request that is not actionable until the first one lands.
+    if (err instanceof PluginUpgradeInProgressError) {
+      throw new ConflictError(err.message);
+    }
     if (err instanceof PluginNotInstalledError) {
       throw new NotFoundError(err.message);
     }
@@ -1493,6 +1578,12 @@ async function handleUpgradePlugin({
     // 409 marks the request as well-formed but not actionable in the current
     // state.
     if (err instanceof PluginNotUpgradableError) {
+      throw new ConflictError(err.message);
+    }
+    // A `marketplaceOnly` caller asked about an install the catalog does not
+    // claim. Retrying changes nothing; only a human upgrading it deliberately
+    // (without the flag) can move it, so 409 rather than a retryable 503.
+    if (err instanceof PluginNotCuratedError) {
       throw new ConflictError(err.message);
     }
     // A rate-limited or temporarily-down source (the plugin repo or the
@@ -1514,6 +1605,13 @@ async function handleUpgradePlugin({
     // changed is a cheap no-op.)
     if (deactivated) {
       await reconcilePluginSourcesNow();
+    }
+    // Released after the reconcile, not before: until the new version's
+    // `init` has run the plugin is still mid-swap, and a second upgrade
+    // starting there would stage against a tree this request is still
+    // bringing up.
+    if (claimed !== null) {
+      upgradesInFlight.delete(claimed);
     }
   }
 }
@@ -1550,24 +1648,45 @@ function mapTogglePluginError(err: unknown): RouteError {
  * names WHICH resource is stale, not the new value. The origin client id is
  * threaded through for self-echo suppression.
  */
-function handleEnablePlugin({ pathParams = {}, headers }: RouteHandlerArgs) {
+async function handleEnablePlugin({
+  pathParams = {},
+  headers,
+}: RouteHandlerArgs) {
   try {
     enablePlugin(pathParams.name ?? "");
-    publishPluginsChanged(getOriginClientId(headers));
-    return { ok: true };
   } catch (err) {
     throw mapTogglePluginError(err);
   }
+  // A plugin the boot scan skipped for its sentinel has no hooks, tools or
+  // MCP servers in the caches, so clearing the sentinel is not enough to
+  // bring it up. Run the same imperative source reconcile the install and
+  // upgrade routes use, which activates the plugin and then converges its
+  // schedules and MCP servers. Awaited, like the install route, so a client
+  // that lists tools right after enabling sees the plugin up; the reconcile
+  // contains its own failures, so a broken plugin cannot turn a successful
+  // enable into a route error. The invalidation publishes after it for the
+  // same reason: refetching clients should see the post-activation state.
+  await reconcilePluginSourcesNow();
+  publishPluginsChanged(getOriginClientId(headers));
+  return { ok: true };
 }
 
-function handleDisablePlugin({ pathParams = {}, headers }: RouteHandlerArgs) {
+async function handleDisablePlugin({
+  pathParams = {},
+  headers,
+}: RouteHandlerArgs) {
   try {
     disablePlugin(pathParams.name ?? "");
-    publishPluginsChanged(getOriginClientId(headers));
-    return { ok: true };
   } catch (err) {
     throw mapTogglePluginError(err);
   }
+  // Same poke enable uses. The sentinel hides tools and hooks at read time,
+  // but a plugin that already ran `init` still owns in-process work (a live
+  // gRPC subscribe, a poll worker). The source reconcile is what runs
+  // `shutdown` and drops that work before this route returns.
+  await reconcilePluginSourcesNow();
+  publishPluginsChanged(getOriginClientId(headers));
+  return { ok: true };
 }
 
 // ---------------------------------------------------------------------------
@@ -1934,7 +2053,7 @@ export const ROUTES: RouteDefinition[] = [
     },
     summary: "Upgrade a plugin to its source's current revision",
     description:
-      'Move an installed plugin to its source\'s current revision, re-materializing it under `<workspaceDir>/plugins/<name>/`. A marketplace plugin advances to the curated pin; a plugin installed directly from a GitHub URL (untrusted, not in the marketplace) advances to whatever its recorded ref now resolves to — a pinned SHA is immutable (a no-op), a branch/tag/HEAD moves as upstream does — re-materialized verbatim with no curated adapter overlay, exactly as the original untrusted install was. The target ref is never taken from the request (no caller-supplied ref), mirroring `plugins install`\'s curation boundary. A no-op (`outcome: "already-up-to-date"`) when the installed commit already equals the target; pass `dryRun` to preview the move (`outcome: "would-upgrade"`) without touching the install. Installs lacking provenance are re-pinned to the current SHA. The upgraded code is picked up live on the next read (no restart required). `strategy` controls how local edits are reconciled: `overwrite` (default) discards them and re-installs the target wholesale; `ours`/`theirs`/`assistant` perform a three-way merge against the re-materialized install commit, carrying non-conflicting edits from both sides forward and resolving conflicting hunks toward the local edit (`ours`) or the target (`theirs`), or writing git conflict markers into the file and reporting them in `conflicts`/`binaryConflicts` for the assistant to resolve (`assistant`). A merge strategy whose install-time baseline cannot be reconstructed returns 409. Mirrors the CLI\'s `assistant plugins upgrade <name> [--strategy <s>]`.',
+      'Move an installed plugin to its source\'s current revision, re-materializing it under `<workspaceDir>/plugins/<name>/`. A marketplace plugin advances to the curated pin; a plugin installed directly from a GitHub URL (untrusted, not in the marketplace) advances to whatever its recorded ref now resolves to — a pinned SHA is immutable (a no-op), a branch/tag/HEAD moves as upstream does — re-materialized verbatim with no curated adapter overlay, exactly as the original untrusted install was. The target ref is never taken from the request (no caller-supplied ref), mirroring `plugins install`\'s curation boundary. A no-op (`outcome: "already-up-to-date"`) when the installed commit already equals the target; pass `dryRun` to preview the move (`outcome: "would-upgrade"`) without touching the install. Installs lacking provenance are re-pinned to the current SHA. The upgraded code is picked up live on the next read (no restart required). `strategy` controls how local edits are reconciled: `overwrite` (default) discards them and re-installs the target wholesale; `ours`/`theirs`/`assistant` perform a three-way merge against the re-materialized install commit, carrying non-conflicting edits from both sides forward and resolving conflicting hunks toward the local edit (`ours`) or the target (`theirs`), or writing git conflict markers into the file and reporting them in `conflicts`/`binaryConflicts` for the assistant to resolve (`assistant`). A merge strategy whose install-time baseline cannot be reconstructed returns 409. Pass `marketplaceOnly` to refuse the untrusted direct path outright (409), which is what the unattended auto-update sweep does. Mirrors the CLI\'s `assistant plugins upgrade <name> [--strategy <s>]`.',
     tags: ["plugins"],
     pathParams: [
       {
@@ -1957,7 +2076,7 @@ export const ROUTES: RouteDefinition[] = [
       },
       "409": {
         description:
-          "The install has neither a marketplace entry nor a recorded GitHub source to advance to, or a merge strategy was requested whose install-time baseline cannot be reconstructed.",
+          "The install has neither a marketplace entry nor a recorded GitHub source to advance to, a `marketplaceOnly` upgrade was requested for an install the marketplace does not claim, or a merge strategy was requested whose install-time baseline cannot be reconstructed.",
       },
       "503": {
         description:
@@ -2011,7 +2130,7 @@ export const ROUTES: RouteDefinition[] = [
     },
     summary: "Disable a plugin",
     description:
-      "Disable a plugin in this workspace by dropping a `.disabled` sentinel, mirroring the CLI's `assistant plugins disable <name>`. The change is honored live at read time by every tool / injector / hook gate — no restart required. Broadcasts a `sync_changed` invalidation carrying the `plugins:list` tag so other clients refetch `GET /v1/plugins`. An already-disabled plugin returns 409; a user plugin with no directory returns 404 (default plugins are stubbed on demand via the `default-` prefix); a malformed name returns 400.",
+      "Disable a plugin in this workspace by dropping a `.disabled` sentinel, mirroring the CLI's `assistant plugins disable <name>`. Awaits the same source reconcile enable uses so the plugin's shutdown hook runs. Tools, injectors, and hook gates also honor the sentinel at read time. Broadcasts a `sync_changed` invalidation carrying the `plugins:list` tag so other clients refetch `GET /v1/plugins`. An already-disabled plugin returns 409; a user plugin with no directory returns 404 (default plugins are stubbed on demand via the `default-` prefix); a malformed name returns 400.",
     tags: ["plugins"],
     pathParams: [
       {

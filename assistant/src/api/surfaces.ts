@@ -121,6 +121,21 @@ export const CardSurfaceDataSchema = z.object({
 export type CardSurfaceData = z.infer<typeof CardSurfaceDataSchema>;
 
 /**
+ * Stringify+trim entries, drop blanks and non-scalars, and collapse an
+ * empty result to `undefined` so a schema treats it as "field absent".
+ */
+function cleanedStringEntries(items: unknown[]): string[] | undefined {
+  const cleaned = items
+    .map((item) =>
+      typeof item === "string" || typeof item === "number"
+        ? String(item).trim()
+        : "",
+    )
+    .filter((item) => item.length > 0);
+  return cleaned.length > 0 ? cleaned : undefined;
+}
+
+/**
  * Accepted MIME-type / extension patterns for a `file_upload` surface.
  *
  * The renderer consumes this as a `string[]` — it calls `.join`/`.some`/
@@ -137,14 +152,7 @@ const FileUploadAcceptedTypesSchema = z.preprocess((value) => {
       : Array.isArray(value)
         ? value
         : [];
-  const cleaned = items
-    .map((item) =>
-      typeof item === "string" || typeof item === "number"
-        ? String(item).trim()
-        : "",
-    )
-    .filter((item) => item.length > 0);
-  return cleaned.length > 0 ? cleaned : undefined;
+  return cleanedStringEntries(items);
 }, z.array(z.string()).optional());
 
 export const FileUploadSurfaceDataSchema = z.object({
@@ -238,6 +246,19 @@ export const ChoiceSurfaceDataSchema = z.object({
 });
 export type ChoiceSurfaceData = z.infer<typeof ChoiceSurfaceDataSchema>;
 
+/**
+ * Requested OAuth scopes for an `oauth_connect` surface.
+ *
+ * Unlike `FileUploadAcceptedTypesSchema`, a bare string is NOT split on
+ * commas: OAuth scopes are opaque URIs, so only arrays are accepted.
+ * Entries are stringified and trimmed, blanks are dropped, and an empty
+ * result or any non-array value collapses to `undefined` (use defaults).
+ */
+const RequestedScopesSchema = z.preprocess(
+  (value) => (Array.isArray(value) ? cleanedStringEntries(value) : undefined),
+  z.array(z.string()).optional(),
+);
+
 export const OAuthConnectSurfaceDataSchema = z.object({
   /** OAuth provider key from the managed provider catalog, e.g. "google". */
   providerKey: z
@@ -246,6 +267,13 @@ export const OAuthConnectSurfaceDataSchema = z.object({
       z.string(),
     )
     .catch(""),
+  /**
+   * Optional OAuth scopes to request for the managed connection. A full
+   * replacement set: when present, the platform uses exactly these scopes
+   * instead of its defaults (it does not merge). Omit to use the platform's
+   * default scopes for the provider.
+   */
+  requestedScopes: RequestedScopesSchema,
   /** Optional display label. The client falls back to the provider catalog. */
   displayName: tolerantString(),
   /** Optional helper text. The client falls back to the provider catalog. */
@@ -460,6 +488,11 @@ export const WorkResultItemSchema = z.object({
   status: tolerantString(),
   tone: WorkResultToneSchema.optional().catch(undefined),
   metadata: recordArray(WorkResultMetadataSchema).optional().catch(undefined),
+  /**
+   * Makes the item row a link. Clients follow an in-app path
+   * (`/assistant/skills/<skillId>?tab=history`) in place and open an http(s)
+   * URL externally; anything else renders as an unlinked row.
+   */
   href: tolerantString(),
 });
 export type WorkResultItem = z.infer<typeof WorkResultItemSchema>;
@@ -563,6 +596,7 @@ export const SURFACE_TYPES = [
   "skill_card",
   "call_summary",
   "visual",
+  "voice_picker",
 ] as const;
 
 export const SurfaceTypeSchema = z.enum(SURFACE_TYPES);
@@ -634,9 +668,10 @@ export type SurfaceData =
  * and serves verbatim but whose shape it does not model, which is why they
  * are absent from the renderable `SurfaceData` union: `channel_setup` (a
  * side-effect command forwarded to the setup panel), `task_preferences` (a
- * fixed grid that reads no data), and `skill_card` / `call_summary` (cards
- * the daemon appends to history directly — the memory retrospective and a
- * call summary — and whose data shape is owned by their client renderers).
+ * fixed grid that reads no data), `voice_picker` (a settings card that reads
+ * its own config), and `skill_card` / `call_summary` (cards the daemon appends
+ * to history directly, the memory retrospective and a call summary, whose
+ * data shape is owned by their client renderers).
  */
 export interface SurfaceDataByType {
   card: CardSurfaceData;
@@ -656,6 +691,7 @@ export interface SurfaceDataByType {
   skill_card: Record<string, unknown>;
   call_summary: Record<string, unknown>;
   visual: VisualSurfaceData;
+  voice_picker: Record<string, unknown>;
 }
 
 /** Any surface `data` payload, including the opaque (non-renderable) types. */
@@ -689,6 +725,7 @@ export const SURFACE_DATA_SCHEMAS: {
   skill_card: z.record(z.string(), z.unknown()),
   call_summary: z.record(z.string(), z.unknown()),
   visual: VisualSurfaceDataSchema,
+  voice_picker: z.record(z.string(), z.unknown()),
 };
 
 /**

@@ -23,11 +23,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, describe, expect, test } from "bun:test";
 
+import { getUserHooksFor } from "../hooks/registry.js";
 import {
   getCachedUserTools,
-  getUserHooksFor,
   resetPluginCacheForTests,
 } from "../plugins/mtime-cache.js";
+import { resetPluginRegistryForTests } from "../plugins/registry.js";
 import { loadUserPlugins } from "../plugins/user-loader.js";
 
 // Isolate every run under its own tempdir so parallel test files (and
@@ -71,6 +72,7 @@ function clearPluginsDir(): void {
 describe("user plugin loader", () => {
   beforeEach(() => {
     resetPluginCacheForTests();
+    resetPluginRegistryForTests();
     clearPluginsDir();
   });
 

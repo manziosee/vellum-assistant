@@ -16,7 +16,7 @@
     "build": "electron-vite build",
     "typecheck": "bunx tsc --noEmit",
     "test": "bun test",
-    "test:ci": "bun scripts/run-tests.ts",
+    "test:ci": "bun run --filter=@vellumai/electron-desktop test && bun scripts/run-tests.ts",
     "build:fetch-bun": "bash scripts/fetch-bun.sh",
     "build:web": "cd ../web && bun install && bun run openapi-ts && bun run build && cd ../macos && mkdir -p resources && rm -rf resources/web-dist && cp -R ../web/dist resources/web-dist",
     "pack": "bash scripts/pack.sh",
@@ -36,14 +36,15 @@
   },
   "dependencies": {
     "@sentry/electron": "7.13.0",
+    "@vellumai/electron-desktop": "workspace:*",
     "@vellumai/electron-utils": "workspace:*",
     "@vellumai/environments": "workspace:*",
     "@vellumai/ipc-contract": "workspace:*",
     "@vellumai/local-mode": "workspace:*",
+    "@vellumai/native-sidecar": "workspace:*",
     "electron-log": "5.4.4",
     "electron-store": "11.0.2",
     "electron-updater": "6.8.9",
-    "jszip": "3.10.1",
     "zod": "4.3.6"
   }
 }

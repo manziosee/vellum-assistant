@@ -52,6 +52,32 @@ export interface ChannelInfo {
 }
 
 /**
+ * Source that contributes a channel, in the `<kind>[:<id>]` form the tool
+ * catalog and process tree already use: `default` for one the assistant ships,
+ * `plugin:<name>` for one an installed plugin brings.
+ *
+ * Composed from the plugin's install directory rather than from anything it
+ * declares, so a manifest cannot claim to be another source or pass itself off
+ * as built in.
+ */
+export type ChannelSource = "default" | `plugin:${string}`;
+
+/**
+ * A channel as `/v1/channels/available` reports it: the display metadata plus
+ * where it came from.
+ *
+ * `id` widens to a string here because a plugin channel's id is its plugin
+ * name, which is not a member of the closed {@link ChannelId} union. The union
+ * still governs everything the assistant routes, verifies and applies
+ * admission policy to; `source` is what tells a client which kind it is
+ * holding, so nothing has to infer it from the id.
+ */
+export interface AvailableChannel extends Omit<ChannelInfo, "id"> {
+  id: string;
+  source: ChannelSource;
+}
+
+/**
  * Per-channel display metadata for the channels the gateway can currently
  * surface to clients. Add an entry here when surfacing a new channel via
  * `/v1/channels/available`. `Partial` because unsurfaced channels (e.g.
@@ -140,6 +166,7 @@ export const CHANNEL_METADATA: Partial<Record<ChannelId, ChannelInfo>> = {
 
 export const INTERFACE_IDS = [
   "macos",
+  "windows",
   "ios",
   "cli",
   "telegram",
@@ -155,6 +182,10 @@ export const INTERFACE_IDS = [
   // device/service callbacks). Non-interactive — permission prompts route
   // through the guardian system, not an interactive client — and non-host-proxy.
   "route",
+  // Turns a plugin-brought channel delivered through the gateway. One id for
+  // every plugin, matching the `plugin` channel; which plugin it was is in
+  // `sourceMetadata.plugin`.
+  "plugin",
 ] as const;
 
 export type InterfaceId = (typeof INTERFACE_IDS)[number];
@@ -207,7 +238,13 @@ export function parseInterfaceId(value: unknown): InterfaceId | null {
  * than polluting the interface vocabulary. Drives only the per-turn
  * `client_os` context line (e.g. app-builder mobile-first for `ios`/`android`).
  */
-export const CLIENT_OS_VALUES = ["web", "ios", "macos", "android"] as const;
+export const CLIENT_OS_VALUES = [
+  "web",
+  "ios",
+  "macos",
+  "windows",
+  "android",
+] as const;
 
 export type ClientOs = (typeof CLIENT_OS_VALUES)[number];
 
@@ -228,6 +265,7 @@ export function parseClientOs(value: unknown): ClientOs | null {
  */
 export const INTERACTIVE_INTERFACES: ReadonlySet<InterfaceId> = new Set([
   "macos",
+  "windows",
   "ios",
   "cli",
   "web",
@@ -238,9 +276,9 @@ export function isInteractiveInterface(id: InterfaceId): boolean {
 }
 
 /**
- * Host proxy capabilities that an interface can support. The macOS client
- * supports all of them; the chrome-extension interface only supports
- * host_browser (via the Chrome DevTools Protocol proxy).
+ * Host proxy capabilities that an interface can support. macOS supports all
+ * of them, Windows withholds app control, and chrome-extension supports only
+ * host_browser through the Chrome DevTools Protocol proxy.
  */
 export const HOST_PROXY_CAPABILITIES = [
   "host_bash",
@@ -254,29 +292,28 @@ export const HOST_PROXY_CAPABILITIES = [
 export type HostProxyCapability = (typeof HOST_PROXY_CAPABILITIES)[number];
 
 /**
- * Interfaces that support the full desktop host-proxy set (every
- * `HostProxyCapability` value). This is the capability-level identity used
- * by the discriminated transport metadata union and by the
+ * Interfaces that support desktop host-proxy tools. This identity is used by
+ * the discriminated transport metadata union and by the
  * `supportsHostProxy(id)` type predicate.
  *
  * Extend this literal type AND the `supportsHostProxy` implementation
- * below in lock-step when adding a new host-capable client (e.g. a native
- * Linux or Windows desktop).
+ * below in lock-step when adding a new host-capable client such as native
+ * Linux.
  */
-export type HostProxyInterfaceId = "macos";
+export type HostProxyInterfaceId = "macos" | "windows";
 
 /**
  * Whether the interface supports a host proxy capability.
  *
  * The no-arg form `supportsHostProxy(id)` asks "is this interface a desktop
- * host-proxy client?" — it returns `true` only for macOS and is the type
+ * host-proxy client?" It returns `true` for native desktop clients and is the
  * predicate that narrows `InterfaceId` to `HostProxyInterfaceId`. It returns
  * `false` for chrome-extension because chrome-extension only supports
  * `host_browser`, and the no-arg form is the gate that legacy desktop-only
  * call sites use (e.g. preactivating computer-use, restoring host proxies
- * in the drain queue). Callers that want to check a single capability —
+ * in the drain queue). Callers that want to check a single capability,
  * for example, to decide whether to keep `hostBrowserProxy` available for
- * chrome-extension — should pass the capability explicitly:
+ * chrome-extension, should pass the capability explicitly:
  * `supportsHostProxy(id, "host_browser")`.
  */
 export function supportsHostProxy(id: InterfaceId): id is HostProxyInterfaceId;
@@ -294,6 +331,9 @@ export function supportsHostProxy(
   // through to cdp-inspect/local via the CDP factory's candidate chain.
   if (id === "macos") {
     return true;
+  }
+  if (id === "windows") {
+    return capability == null || capability !== "host_app_control";
   }
   if (id === "chrome-extension" && capability === "host_browser") {
     return true;

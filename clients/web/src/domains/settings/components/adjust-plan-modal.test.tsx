@@ -4,7 +4,7 @@
  *
  * Strategy: mock the generated API SDK so mutations resolve without network
  * calls and we can capture the request bodies. React Query reads are pre-seeded
- * into the cache so they resolve synchronously. The credit-bundle Dropdown is
+ * into the cache so they resolve synchronously. The credit-bundle Select is
  * the design-library combobox (not a native <select>): open it via its trigger,
  * then click the option whose visible label matches.
  */
@@ -240,7 +240,7 @@ function renderModal(
   return { ...result, client };
 }
 
-function getDropdownTrigger(label: string): HTMLButtonElement {
+function getSelectTrigger(label: string): HTMLButtonElement {
   const trigger = document.querySelector<HTMLButtonElement>(
     `button[role="combobox"][aria-label="${label}"]`,
   );
@@ -250,12 +250,12 @@ function getDropdownTrigger(label: string): HTMLButtonElement {
   return trigger;
 }
 
-function openCreditDropdown(): void {
-  fireEvent.click(getDropdownTrigger("Credit bundle"));
+function openCreditSelect(): void {
+  fireEvent.click(getSelectTrigger("Credit bundle"));
 }
 
-function openMachineDropdown(): void {
-  fireEvent.click(getDropdownTrigger("Machine tier"));
+function openMachineSelect(): void {
+  fireEvent.click(getSelectTrigger("Machine tier"));
 }
 
 function clickOptionStartingWith(prefix: string): void {
@@ -307,8 +307,8 @@ describe("AdjustPlanModal credit bundle — upgrade", () => {
       proPlansResponse(CREDIT_TIERS),
     );
 
-    openCreditDropdown();
-    clickOption("50 credits — $50/mo");
+    openCreditSelect();
+    clickOption("50 credits - $50/mo");
 
     fireEvent.click(getByTestId("modal-upgrade-to-pro-button"));
 
@@ -352,7 +352,9 @@ describe("AdjustPlanModal upgrade — checkout intent stash", () => {
     // stashes for a hydrated list holding exactly one assistant.
     useResolvedAssistantsStore.setState({
       activeAssistantId: "a1",
-      assistants: [{ id: "a1", isLocal: false, isPlatformHosted: true }],
+      assistants: [
+        { id: "a1", isLocal: false, isPlatformHosted: true, isPaired: false },
+      ],
       assistantsHydrated: true,
     });
     client.setQueryData([...avatarQueryKey("a1"), true], {
@@ -407,8 +409,8 @@ describe("AdjustPlanModal credit bundle — change mode", () => {
       proPlansResponse(CREDIT_TIERS),
     );
 
-    openCreditDropdown();
-    clickOption("25 credits — $25/mo");
+    openCreditSelect();
+    clickOption("25 credits - $25/mo");
 
     fireEvent.click(getByTestId("modal-change-tier-button"));
 
@@ -428,8 +430,8 @@ describe("AdjustPlanModal credit bundle — change mode", () => {
       proPlansResponse(CREDIT_TIERS),
     );
 
-    openCreditDropdown();
-    clickOption("No credit bundle — $0/mo");
+    openCreditSelect();
+    clickOption("No credit bundle - $0/mo");
 
     fireEvent.click(getByTestId("modal-change-tier-button"));
 
@@ -562,7 +564,7 @@ describe("AdjustPlanModal credit bundle — unseeded sentinel", () => {
     });
 
     // Make an unrelated machine change so the CTA enables via that dimension.
-    openMachineDropdown();
+    openMachineSelect();
     clickOptionStartingWith("Large");
 
     fireEvent.click(getByTestId("modal-change-tier-button"));
@@ -598,8 +600,8 @@ describe("AdjustPlanModal credit bundle — unseeded sentinel", () => {
       }
     });
 
-    openCreditDropdown();
-    clickOption("No credit bundle — $0/mo");
+    openCreditSelect();
+    clickOption("No credit bundle - $0/mo");
 
     // Simulate a mid-modal refetch: re-seed by replacing the plans object so the
     // seeding effect re-runs with a fresh `proPlan` identity.
@@ -633,8 +635,8 @@ describe("AdjustPlanModal credit bundle — resize flow", () => {
       },
     );
 
-    openCreditDropdown();
-    clickOption("25 credits — $25/mo");
+    openCreditSelect();
+    clickOption("25 credits - $25/mo");
 
     fireEvent.click(getByTestId("modal-change-tier-button"));
 
@@ -659,7 +661,7 @@ describe("AdjustPlanModal credit bundle — resize flow", () => {
       },
     );
 
-    openMachineDropdown();
+    openMachineSelect();
     // Switching from the current "Small" tier to "Large" is an upgrade, which
     // fires immediately (no downgrade reconfirm) and opens the resize flow.
     clickOptionStartingWith("Large");
@@ -696,8 +698,8 @@ describe("AdjustPlanModal credit bundle — headline total", () => {
       throw new Error("base total not rendered yet");
     });
 
-    openCreditDropdown();
-    clickOption("50 credits — $50/mo");
+    openCreditSelect();
+    clickOption("50 credits - $50/mo");
 
     await waitFor(() => {
       if (getByTestId("modal-pro-price").textContent?.includes("$85/mo")) {
@@ -722,8 +724,8 @@ describe("AdjustPlanModal credit bundle — headline total", () => {
       throw new Error("current total not rendered yet");
     });
 
-    openCreditDropdown();
-    clickOption("25 credits — $25/mo");
+    openCreditSelect();
+    clickOption("25 credits - $25/mo");
 
     await waitFor(() => {
       const text = getByTestId("modal-pro-price").textContent ?? "";
@@ -863,8 +865,8 @@ const LARGE_MACHINE_ONBOARDING: OnboardingData = {
   selected_storage_gib: 10,
 };
 
-function openStorageDropdown(): void {
-  fireEvent.click(getDropdownTrigger("Storage tier"));
+function openStorageSelect(): void {
+  fireEvent.click(getSelectTrigger("Storage tier"));
 }
 
 describe("AdjustPlanModal — multi-dimension tier coordination", () => {
@@ -883,11 +885,11 @@ describe("AdjustPlanModal — multi-dimension tier coordination", () => {
     );
 
     // Downgrade machine: Large → Small
-    openMachineDropdown();
+    openMachineSelect();
     clickOptionStartingWith("Small");
 
     // Upgrade storage: 10 GiB → 20 GiB
-    openStorageDropdown();
+    openStorageSelect();
     clickOptionStartingWith("20 GB");
 
     // Machine downgrade opens the reconfirm modal first.
@@ -934,12 +936,12 @@ describe("AdjustPlanModal — multi-dimension tier coordination", () => {
     );
 
     // Upgrade machine: Small → Large
-    openMachineDropdown();
+    openMachineSelect();
     clickOptionStartingWith("Large");
 
     // Add a credit bundle
-    openCreditDropdown();
-    clickOption("25 credits — $25/mo");
+    openCreditSelect();
+    clickOption("25 credits - $25/mo");
 
     fireEvent.click(getByTestId("modal-change-tier-button"));
 
@@ -985,8 +987,8 @@ describe("AdjustPlanModal credit bundle — selector order", () => {
     machine: HTMLButtonElement;
   } {
     return {
-      credit: getDropdownTrigger("Credit bundle"),
-      machine: getDropdownTrigger("Machine tier"),
+      credit: getSelectTrigger("Credit bundle"),
+      machine: getSelectTrigger("Machine tier"),
     };
   }
 
@@ -1158,7 +1160,9 @@ describe("AdjustPlanModal current plan: name and real tier rows", () => {
     // else the catalog lists is an entitlement no tier encodes, so it has to
     // survive rather than be dropped by a client-side allowlist.
     const plans = realKeyedPlansResponse();
-    const pro = (plans.plans as unknown as { included_features: string[] }[])[1];
+    const pro = (
+      plans.plans as unknown as { included_features: string[] }[]
+    )[1];
     pro.included_features = [...pro.included_features, "Priority support"];
 
     renderModal(

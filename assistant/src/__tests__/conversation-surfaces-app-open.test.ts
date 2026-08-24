@@ -2,13 +2,17 @@ import { describe, expect, test } from "bun:test";
 
 import type { AssistantEvent } from "../api/index.js";
 import { DynamicPagePreviewSchema } from "../api/surfaces.js";
+import type { Conversation } from "../daemon/conversation.js";
 import {
   buildAppOpenPreview,
   createSurfaceMutex,
-  type SurfaceConversationContext,
   surfaceProxyResolver,
 } from "../daemon/conversation-surfaces.js";
 import type { SurfaceType } from "../daemon/message-protocol.js";
+import {
+  asConversation,
+  mockChannelCapabilities,
+} from "./helpers/mock-conversation.js";
 
 interface ContextOptions {
   hasNoClient?: boolean;
@@ -18,12 +22,14 @@ interface ContextOptions {
 function makeContext(
   sent: AssistantEvent[] = [],
   options: ContextOptions = {},
-): SurfaceConversationContext {
-  return {
+): Conversation {
+  return asConversation({
     conversationId: "session-1",
     hasNoClient: options.hasNoClient,
-    channelCapabilities: options.channelCapabilities,
-    sendToClient: (msg) => sent.push(msg),
+    channelCapabilities:
+      options.channelCapabilities &&
+      mockChannelCapabilities(options.channelCapabilities),
+    emit: (msg) => sent.push(msg),
     pendingSurfaceActions: new Map<string, { surfaceType: SurfaceType }>(),
     lastSurfaceAction: new Map<
       string,
@@ -39,7 +45,7 @@ function makeContext(
     getQueueDepth: () => 0,
     processMessage: async () => "ok",
     withSurface: createSurfaceMutex(),
-  };
+  });
 }
 
 describe("app_open render-capability gate", () => {

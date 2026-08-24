@@ -24,7 +24,6 @@ mock.module("../mcp-oauth-provider.js", () => ({
       _serverId: string,
       _serverUrl: string,
       _interactive: boolean,
-      _callbackTransport: string,
       options: { onAuthorizationUrl?: (url: string) => void } = {},
     ) {
       capturedOnAuthorizationUrl = options.onAuthorizationUrl;
@@ -68,7 +67,7 @@ mock.module("../../daemon/mcp-reload-service.js", () => ({
 
 mock.module("../../config/env-registry.js", () => ({
   getIsContainerized: () => false,
-  getWorkspaceDirOverride: () => undefined,
+  getWorkspaceDirOverride: () => process.env.VELLUM_WORKSPACE_DIR,
   // Imported by the real util/logger.js; ESM named-import validation
   // requires it even though the silent test logger never calls it.
   getDebugStdoutLogs: () => false,

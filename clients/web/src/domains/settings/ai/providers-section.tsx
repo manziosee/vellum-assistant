@@ -4,6 +4,7 @@ import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 
 import { Button } from "@vellumai/design-library/components/button";
+import { Skeleton } from "@vellumai/design-library/components/skeleton";
 import { Typography } from "@vellumai/design-library/components/typography";
 
 import { LanguageModelSection } from "@/domains/settings/ai/language-model-section";
@@ -15,6 +16,7 @@ import {
   inferenceProviderconnectionsGetOptions,
 } from "@/generated/daemon/@tanstack/react-query.gen";
 import { useSupportsDefaultProviderSettings } from "@/lib/backwards-compat/default-provider-settings";
+import { useTranslation } from "@/i18n";
 
 interface ProvidersSectionProps {
   assistantId: string;
@@ -42,6 +44,7 @@ export function ProvidersSection({
   onAddProvider,
   onConnectionDeleted,
 }: ProvidersSectionProps) {
+  const { t } = useTranslation("settings");
   const {
     data,
     isLoading,
@@ -80,25 +83,21 @@ export function ProvidersSection({
 
   return (
     <LanguageModelSection
-      title="Providers"
+      title={t("providersSection.title")}
       action={
         <Button
           variant="outlined"
-          size="compact"
           onClick={onAddProvider}
           leftIcon={<Plus />}
         >
-          Add Provider
+          {t("providersSection.addProvider")}
         </Button>
       }
     >
       {isLoading ? (
         <div className="space-y-2 py-2">
           {[1, 2, 3].map((i) => (
-            <div
-              key={i}
-              className="h-10 animate-pulse rounded-lg bg-[var(--surface-active)]"
-            />
+            <Skeleton key={i} className="h-10 rounded-lg" />
           ))}
         </div>
       ) : isError ? (
@@ -107,7 +106,7 @@ export function ProvidersSection({
           as="p"
           className="py-4 text-center text-(--system-negative-strong)"
         >
-          Failed to load providers. Please try again.
+          {t("providersSection.loadError")}
         </Typography>
       ) : connections.length === 0 ? (
         <Typography
@@ -115,7 +114,7 @@ export function ProvidersSection({
           as="p"
           className="py-4 text-center text-(--content-tertiary)"
         >
-          No providers yet. Add one to get started.
+          {t("providersSection.empty")}
         </Typography>
       ) : (
         connections.map((conn) => (

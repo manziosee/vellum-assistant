@@ -19,6 +19,7 @@ import {
   type SlackHistoryMessage,
 } from "./slack-web.js";
 import { isSlackDmChannel, isSlackMpimChannel } from "./channel.js";
+import type { ChannelConnectionHealth } from "../channels/types.js";
 import { parseSlackEnvelope } from "./envelope.js";
 import type { SlackEnvelopePayload, SlackInboundEvent } from "./envelope.js";
 import { classifySlackEvent } from "./classify-event.js";
@@ -30,6 +31,7 @@ import {
   normalizeSlackDirectMessage,
   normalizeSlackGroupDirectMessage,
   normalizeSlackChannelMessage,
+  isIgnoredSlackMessageSubtype,
 } from "./message-normalizer.js";
 import {
   normalizeSlackMessageEdit,
@@ -41,6 +43,13 @@ import {
   normalizeSlackReactionRemoved,
 } from "./reaction-normalizer.js";
 import { enrichNormalizedActor } from "./actor.js";
+import { resolveSlackChannelIsPrivate } from "./user-directory.js";
+import { SlackSocketLiveness } from "./socket-liveness.js";
+import {
+  defaultSchedule,
+  type CancelTimer,
+  type ScheduleFn,
+} from "../util/schedule.js";
 import type {
   SlackAppMentionEvent,
   SlackChannelMessageEvent,
@@ -81,11 +90,73 @@ type SlackAdmission = {
 };
 
 const BASE_BACKOFF_MS = 1_000;
-const MAX_BACKOFF_MS = 30_000;
+export const MAX_BACKOFF_MS = 30_000;
 const DEDUP_TTL_MS = 24 * 60 * 60 * 1_000;
 const DEDUP_CLEANUP_INTERVAL_MS = 60 * 60 * 1_000;
 const ACTIVE_THREAD_TTL_MS = 24 * 60 * 60 * 1_000;
+
+/**
+ * TTL for a thread root armed from the assistant's own top-level post.
+ *
+ * Deliberately shorter than {@link ACTIVE_THREAD_TTL_MS} because these roots
+ * are speculative: the assistant opens one on every heartbeat or triage turn
+ * and most are never replied to. Four hours covers a same-session or
+ * after-lunch reply while letting untouched roots lapse before the next day's
+ * posts compound on them.
+ *
+ * This bounds only roots nobody engaged with. The moment a human reply is
+ * admitted, `normalizeAndEmit` re-arms the thread through `trackThread` at the
+ * full inbound TTL, so a root that becomes a real conversation immediately
+ * gets the normal lifetime.
+ */
+const OUTBOUND_ROOT_THREAD_TTL_MS = 4 * 60 * 60 * 1_000;
+
+/**
+ * Message subtypes that still count as the assistant saying something a human
+ * can reply to, and so may arm a thread root.
+ *
+ * `classifySlackEvent` reports `kind: "message"` for bot-authored system
+ * subtypes too (`channel_join`, `channel_topic`, ...); those open no
+ * conversation and must not arm anything. `thread_broadcast` is absent because
+ * it always carries a `thread_ts` and therefore takes the thread-reply arm.
+ *
+ * `bot_message` is here because it is a real post, just attributed to an app
+ * rather than a user. Reaching this set at all means the self-filter already
+ * matched the event to our own `bot_id`, so another app's `bot_message` never
+ * gets this far.
+ */
+const ROOT_ARMING_SUBTYPES = new Set(["file_share", "bot_message"]);
+
+/**
+ * How often to retry `auth.test` while the bot identity is still incomplete.
+ *
+ * Identity is otherwise refreshed only when a WebSocket opens, and Slack
+ * Socket Mode holds a connection for around an hour, so an install that starts
+ * during a Slack blip would run that long on a persisted identity. That is
+ * survivable for the `user`-attributed shape (`botUserId` comes from the same
+ * persisted row) but leaves `botId` unresolved, and an own `bot_message` echo
+ * arriving in that window is not recognized as ours, so it arms no root. This
+ * bounds that window to roughly a minute without gating ingestion on identity,
+ * which would trade a narrow arming gap for a total Slack outage during any
+ * `auth.test` blip.
+ */
+const IDENTITY_RETRY_INTERVAL_MS = 60_000;
+
 const SLACK_RESOLVE_TIMEOUT_MS = 3_000;
+
+/**
+ * How long a fresh socket may sit between construction and `open` before it
+ * is treated as dead.
+ *
+ * The liveness watchdog only arms once a connection is established, so a
+ * handshake that stalls falls outside it: no `open`, no `close`, and no
+ * frames to time out on. That is the same unrecoverable shape as a half-open
+ * established socket, and it needs its own bound. Slack's edge completes the
+ * upgrade in well under a second, so 30s is far outside normal variance while
+ * still recovering in a fraction of the time the old code took (which was
+ * never).
+ */
+export const CONNECT_DEADLINE_MS = 30_000;
 
 /**
  * Reconnect catch-up bounds.
@@ -109,6 +180,61 @@ const SLACK_MUTE_COMMANDS = new Set(["detach", "mute"]);
 
 export type SlackThreadMode = "mention_only" | "mention_then_thread";
 
+/**
+ * The slice of a WebSocket this client drives, satisfiable by a fake.
+ *
+ * `ping()` and the `"pong"` event are real on Bun's client WebSocket but
+ * absent from `bun-types`, which declares ping/pong only on
+ * `ServerWebSocket`. That is a typings gap, not a runtime one. Naming the
+ * surface we actually use confines the gap to the single cast in
+ * {@link defaultCreateSocket} instead of scattering one across every
+ * listener, and it is what makes the connection lifecycle testable against a
+ * fake socket.
+ */
+export interface SlackSocketLike {
+  readonly readyState: number;
+  send(data: string): void;
+  close(code?: number, reason?: string): void;
+  ping(): void;
+  addEventListener(
+    type: "open" | "pong",
+    listener: () => void,
+    options?: { once?: boolean },
+  ): void;
+  addEventListener(
+    type: "message",
+    listener: (event: { data: unknown }) => void,
+    options?: { once?: boolean },
+  ): void;
+  addEventListener(
+    type: "close",
+    listener: (event: { code?: number; reason?: string }) => void,
+    options?: { once?: boolean },
+  ): void;
+  addEventListener(
+    type: "error",
+    listener: (event: unknown) => void,
+    options?: { once?: boolean },
+  ): void;
+}
+
+const defaultCreateSocket = (url: string): SlackSocketLike =>
+  // See SlackSocketLike: bun-types omits ping/pong on the client WebSocket
+  // even though Bun implements both, so the structural match cannot be
+  // checked here.
+  new WebSocket(url) as unknown as SlackSocketLike;
+
+/**
+ * Injectable collaborators. Production supplies none of these; tests replace
+ * the socket and the clock so the connection lifecycle can be driven without
+ * real time or a real Slack connection.
+ */
+export type SlackSocketModeDeps = {
+  createSocket?: (url: string) => SlackSocketLike;
+  schedule?: ScheduleFn;
+  now?: () => number;
+};
+
 export type SlackSocketModeConfig = {
   appToken: string;
   botToken: string;
@@ -122,6 +248,21 @@ export type SlackSocketModeConfig = {
    * startups load it without depending on a successful API call.
    */
   botUserId?: string;
+  /**
+   * Bot's own Slack `bot_id` (a `B…` app identity, distinct from the `U…`
+   * user id above). Slack attributes a post to one or the other depending on
+   * how it was sent: a plain `chat.postMessage` carries `user`, while a post
+   * with a `username` / `icon_*` override, or through an incoming webhook,
+   * arrives as `subtype: "bot_message"` with `bot_id` and no `user` at all.
+   * Holding both is what lets the self-filter recognize every shape of our
+   * own echo, and matching the exact id is what keeps *other* bots' posts
+   * from being mistaken for ours.
+   *
+   * Resolved alongside `botUserId` via `auth.test` and persisted with it.
+   * Optional: absent for a token whose `auth.test` predates this field, in
+   * which case the `bot_message` arm simply never matches (fail-closed).
+   */
+  botId?: string;
   /** Bot's display name, resolved at startup via auth.test. */
   botUsername?: string;
   /** Slack workspace/team name, resolved at startup via auth.test. */
@@ -171,26 +312,99 @@ function isSlackMuteCommand(text: string, botUserId?: string): boolean {
 export class SlackSocketModeClient {
   private config: SlackSocketModeConfig;
   private onEvent: (event: NormalizedSlackEvent) => void;
-  private ws: WebSocket | null = null;
+  private ws: SlackSocketLike | null = null;
   private connecting = false;
+  private readonly createSocket: (url: string) => SlackSocketLike;
+  private readonly schedule: ScheduleFn;
+  private readonly liveness: SlackSocketLiveness;
+  private cancelConnectDeadline: CancelTimer | null = null;
   private running = false;
   private readonly backoff = new ExponentialBackoff({
     baseDelayMs: BASE_BACKOFF_MS,
     maxDelayMs: MAX_BACKOFF_MS,
     jitter: { mode: "additive", ratio: 0.5 },
   });
-  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private reconnectTimer: CancelTimer | null = null;
   private dedupCleanupTimer: ReturnType<typeof setInterval> | null = null;
   private store: SlackStore;
   private emitQueues: Map<string, Promise<void>> | undefined = new Map();
+  /**
+   * Whether `auth.test` has answered authoritatively in this process. Gates
+   * the identity short-circuit: see `resolveBotIdentity`.
+   */
+  private identityResolvedFromApi = false;
+  private identityRetryTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     config: SlackSocketModeConfig,
     onEvent: (event: NormalizedSlackEvent) => void,
+    deps: SlackSocketModeDeps = {},
   ) {
     this.config = config;
     this.onEvent = onEvent;
     this.store = new SlackStore();
+    this.createSocket = deps.createSocket ?? defaultCreateSocket;
+    this.schedule = deps.schedule ?? defaultSchedule;
+    this.liveness = new SlackSocketLiveness({
+      schedule: this.schedule,
+      now: deps.now,
+      onRoundTrip: (roundTripMs) => {
+        // The pong deadline comes from Slack's SDK defaults, not our traffic;
+        // this is what lets it be re-derived from real measurements.
+        log.debug({ roundTripMs }, "Slack Socket Mode ping round trip");
+      },
+      onDead: (reason) => {
+        log.warn(
+          { reason },
+          "Slack Socket Mode connection is not answering pings, reconnecting",
+        );
+        // Not scheduleReconnect: a socket that fails a liveness probe may
+        // never emit a close event, so recovery must tear it down rather
+        // than wait to be told.
+        this.forceReconnect("liveness probe failed", "backoff");
+      },
+    });
+  }
+
+  /**
+   * Whether this client currently holds an open, live Socket Mode connection.
+   *
+   * `connected` reads the socket's own `readyState`, which on its own is a
+   * claim the transport cannot back up: a half-open socket reports `OPEN`
+   * indefinitely. It is trustworthy here only because the liveness watchdog
+   * bounds how long a socket can claim to be open while dead, to one probe
+   * interval plus one deadline. A change that removes that watchdog makes this
+   * getter unreliable.
+   *
+   * `lastLivenessAt` is the corroborating evidence, and is deliberately not
+   * part of the `connected` verdict: the first probe is a full interval after
+   * `open`, so every healthy reconnect has a window where no pong has landed
+   * yet. Gating on it would report a fresh connection as broken.
+   */
+  getConnectionHealth(): ChannelConnectionHealth {
+    return {
+      connected: this.ws?.readyState === WebSocket.OPEN,
+      lastLivenessAt: this.liveness.lastPongAt,
+    };
+  }
+
+  /**
+   * Drop the active socket along with every timer bound to its generation.
+   *
+   * Every path that abandons a socket must go through here. The liveness
+   * watchdog and the connect deadline are armed per generation, and a path
+   * that clears `this.ws` without stopping them leaves a timer aimed at a
+   * corpse. The `close` handler cannot clean up on their behalf, because its
+   * `this.ws === ws` identity guard is already false by the time the close
+   * lands. The orphaned probe then fires against the dead socket and forces a
+   * reconnect that tears down whatever healthy connection replaced it, which
+   * on Slack's routine rotation cadence is every rotation.
+   */
+  private abandonSocket(): void {
+    this.ws = null;
+    this.liveness.stop();
+    this.cancelConnectDeadline?.();
+    this.cancelConnectDeadline = null;
   }
 
   async start(): Promise<void> {
@@ -199,6 +413,10 @@ export class SlackSocketModeClient {
     this.startDedupCleanup();
 
     await this.resolveBotIdentity();
+    // A transient auth.test failure leaves identity incomplete; keep retrying
+    // on a timer so the gap is bounded by a minute rather than by the life of
+    // the Socket Mode connection.
+    this.scheduleIdentityRetry();
     await this.connect();
   }
 
@@ -222,8 +440,59 @@ export class SlackSocketModeClient {
    * token cannot self-heal. Server-side errors (internal_error, fatal_error)
    * are treated as transient and fall through to persistence.
    */
+  /**
+   * True while `auth.test` still has something to tell us. False once it has
+   * answered authoritatively in this process, or when the config already
+   * carries every identity field.
+   */
+  private identityNeedsResolution(): boolean {
+    if (this.identityResolvedFromApi) return false;
+    return !(
+      this.config.botUserId &&
+      this.config.botUsername &&
+      this.config.botId
+    );
+  }
+
+  /**
+   * Keep retrying identity resolution on a timer while it is incomplete.
+   *
+   * Without this the only retry is a WebSocket open, so a persisted-identity
+   * fallback survives for the life of a Socket Mode connection. See
+   * {@link IDENTITY_RETRY_INTERVAL_MS} for why this bounds the window rather
+   * than gating event processing on it.
+   */
+  private scheduleIdentityRetry(): void {
+    if (this.identityRetryTimer) {
+      clearTimeout(this.identityRetryTimer);
+      this.identityRetryTimer = null;
+    }
+    if (!this.running || !this.identityNeedsResolution()) {
+      return;
+    }
+    this.identityRetryTimer = setTimeout(() => {
+      this.identityRetryTimer = null;
+      void this.resolveBotIdentity()
+        .catch((err: unknown) => {
+          log.warn({ err }, "Slack identity retry failed");
+        })
+        .finally(() => {
+          this.scheduleIdentityRetry();
+        });
+    }, IDENTITY_RETRY_INTERVAL_MS);
+    // Never hold the process open for a retry.
+    this.identityRetryTimer.unref?.();
+  }
+
   private async resolveBotIdentity(): Promise<void> {
-    if (this.config.botUserId && this.config.botUsername) {
+    // Short-circuit on having had an authoritative answer, not on the fields
+    // being populated. Those differ exactly once: an install that upgrades
+    // during a Slack blip falls back to a persisted identity written before
+    // `botId` existed, so `botUserId` / `botUsername` are set while `botId` is
+    // not. Keying on presence would return here on every later reconnect and
+    // leave the `bot_message` self-filter disabled until a full restart, which
+    // reopens the echo gap for precisely the installs that hit a bad upgrade.
+    if (!this.identityNeedsResolution()) {
       return;
     }
 
@@ -239,6 +508,7 @@ export class SlackSocketModeClient {
         user_id?: string;
         user?: string;
         team?: string;
+        bot_id?: string;
       };
 
       if (!data.ok) {
@@ -273,15 +543,28 @@ export class SlackSocketModeClient {
         if (data.team) {
           this.config.teamName = data.team;
         }
+        if (data.bot_id) {
+          this.config.botId = data.bot_id;
+        }
         warnOnMissingSlackScopes(resp.headers.get("x-oauth-scopes") ?? "");
 
         // Persist for future startups.
         if (data.user_id) {
+          const metadata: Record<string, unknown> = {};
+          if (data.team) metadata.teamName = data.team;
+          if (data.bot_id) metadata.botId = data.bot_id;
           this.store.setBotIdentity({
             userId: data.user_id,
             username: data.user ?? null,
-            metadata: data.team ? { teamName: data.team } : null,
+            metadata: Object.keys(metadata).length > 0 ? metadata : null,
           });
+        }
+
+        // Only a resolution that actually yielded an identity counts as
+        // authoritative; an `ok` response without `user_id` taught us nothing
+        // and must not disable the retry.
+        if (data.user_id) {
+          this.identityResolvedFromApi = true;
         }
 
         log.info(
@@ -289,6 +572,7 @@ export class SlackSocketModeClient {
             botUserId: data.user_id,
             botUsername: data.user,
             teamName: data.team,
+            botId: data.bot_id,
           },
           "Resolved Slack bot identity via auth.test",
         );
@@ -313,8 +597,12 @@ export class SlackSocketModeClient {
     if (persisted) {
       this.config.botUserId = persisted.userId;
       this.config.botUsername = persisted.username ?? this.config.botUsername;
-      const meta = persisted.metadata as { teamName?: string } | null;
+      const meta = persisted.metadata as {
+        teamName?: string;
+        botId?: string;
+      } | null;
       this.config.teamName = meta?.teamName ?? this.config.teamName;
+      this.config.botId = meta?.botId ?? this.config.botId;
       log.info(
         {
           botUserId: persisted.userId,
@@ -338,8 +626,12 @@ export class SlackSocketModeClient {
     this.running = false;
     this.connecting = false;
     this.stopDedupCleanup();
+    if (this.identityRetryTimer) {
+      clearTimeout(this.identityRetryTimer);
+      this.identityRetryTimer = null;
+    }
     if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer();
       this.reconnectTimer = null;
     }
     if (this.ws) {
@@ -348,33 +640,56 @@ export class SlackSocketModeClient {
       } catch {
         // ignore close errors during shutdown
       }
-      this.ws = null;
     }
+    this.abandonSocket();
   }
 
   /**
-   * Force-close the current WebSocket and reconnect immediately.
-   * Used by the sleep/wake detector to recover from half-open connections
-   * that survive system sleep.
+   * Force-close the current WebSocket and reconnect.
+   *
+   * This is the recovery path for a connection that cannot be trusted to
+   * announce its own death: the sleep/wake detector's half-open sockets, a
+   * failed liveness probe, and a handshake that never completed. All three
+   * share the property that no close event may ever arrive, so recovery
+   * tears the socket down rather than waiting to be told.
    *
    * Waits for the old socket to fully close before connecting a new one
    * to prevent overlapping connections where stale message events could
    * be ACKed on the wrong socket.
+   *
+   * `retry` paces the replacement connection, and the two causes want
+   * opposite things:
+   *
+   * - `"immediate"` (the wake case): the network just came back, so clear the
+   *   backoff and reconnect now.
+   * - `"backoff"` (liveness and connect-deadline failures): route through
+   *   `scheduleReconnect` so the capped exponential delay actually applies.
+   *   Reconnecting directly would retry `apps.connections.open` on a fixed
+   *   cycle for as long as the failure lasts, which is exactly the wrong
+   *   behaviour during a Slack edge outage. `backoff` only escalates while
+   *   connections keep failing: a socket that reaches `open` resets it there.
    */
-  forceReconnect(): void {
-    if (!this.running) return;
+  forceReconnect(
+    reason = "sleep/wake recovery",
+    retry: "immediate" | "backoff" = "immediate",
+  ): void {
+    if (!this.running) {
+      return;
+    }
 
-    log.info("Force-reconnecting Slack Socket Mode (sleep/wake recovery)");
+    log.info({ reason, retry }, "Force-reconnecting Slack Socket Mode");
 
     if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer();
       this.reconnectTimer = null;
     }
 
-    this.backoff.reset();
+    if (retry === "immediate") {
+      this.backoff.reset();
+    }
 
     const oldWs = this.ws;
-    this.ws = null;
+    this.abandonSocket();
 
     // If a connect() call is already in-flight (awaiting getWebSocketUrl),
     // don't start another one — the in-flight attempt will complete and
@@ -394,10 +709,18 @@ export class SlackSocketModeClient {
       return;
     }
 
-    if (!oldWs || oldWs.readyState === WebSocket.CLOSED) {
+    const reconnect = () => {
+      if (retry === "backoff") {
+        this.scheduleReconnect();
+        return;
+      }
       this.connect().catch((err) => {
         log.error({ err }, "Force reconnect failed");
       });
+    };
+
+    if (!oldWs || oldWs.readyState === WebSocket.CLOSED) {
+      reconnect();
       return;
     }
 
@@ -409,16 +732,16 @@ export class SlackSocketModeClient {
     let settled = false;
 
     const proceed = () => {
-      if (settled) return;
+      if (settled) {
+        return;
+      }
       settled = true;
-      this.connect().catch((err) => {
-        log.error({ err }, "Force reconnect failed");
-      });
+      reconnect();
     };
 
     oldWs.addEventListener("close", proceed, { once: true });
 
-    setTimeout(() => {
+    this.schedule(() => {
       if (!settled) {
         log.warn(
           "Old Slack socket did not close within timeout, proceeding with reconnect",
@@ -630,39 +953,181 @@ export class SlackSocketModeClient {
   }
 
   /**
-   * Side-effect-only handler for the bot's own thread replies. The event
-   * itself is always dropped (the caller returns after this), but thread
-   * tracking is armed so follow-up human replies pass the active-thread
-   * filter.
+   * Extract the Slack `bot_id` an event is attributed to, mirroring
+   * `extractEventUser`'s per-kind field locations.
+   *
+   * Only messages carry one. A reaction is always attributed to a user even
+   * when an app adds it, so the reaction kinds have no `bot_id` to read.
    */
-  private maybeTrackBotOwnThreadReply(event: SlackInboundEvent): void {
+  private extractEventBotId(event: SlackInboundEvent): string | undefined {
+    const classified = classifySlackEvent(event);
+    if (!classified) {
+      return undefined;
+    }
+    switch (classified.kind) {
+      case "message_changed":
+        return classified.event.message?.bot_id;
+      case "message_deleted":
+        return classified.event.previous_message?.bot_id;
+      case "reaction_added":
+      case "reaction_removed":
+        return undefined;
+      default:
+        return classified.event.bot_id;
+    }
+  }
+
+  /**
+   * True when an event is the echo of something this assistant itself posted.
+   *
+   * Slack attributes a post to a user or to an app depending on how it was
+   * sent, and both shapes are ours:
+   *
+   *   - **`user` matches our bot user**: a plain `chat.postMessage` with a
+   *     bot token, which is what every current outbound path produces.
+   *   - **`bot_id` matches our app, with no `user`**: the `bot_message`
+   *     shape Slack emits for a post carrying a `username` / `icon_*`
+   *     override, sent through an incoming webhook, or made by a classic
+   *     app. Slack's own reference points current apps at `bot_id` /
+   *     `bot_profile` rather than this subtype, so it is the uncommon shape,
+   *     but it is the one that silently bypassed every self-filter.
+   *
+   * The `bot_id` arm is deliberately narrow. It requires an exact match
+   * against our resolved id and the absence of a `user`, so another app's
+   * posts are never mistaken for ours (which would arm roots in channels the
+   * assistant merely observes), and an unresolved `botId` matches nothing.
+   */
+  private isOwnBotEvent(event: SlackInboundEvent): boolean {
+    const eventUser = this.extractEventUser(event);
+    if (eventUser) {
+      return eventUser === this.config.botUserId;
+    }
+    const botId = this.config.botId;
+    if (!botId) {
+      return false;
+    }
+    return this.extractEventBotId(event) === botId;
+  }
+
+  /**
+   * Side-effect-only handler for the bot's own posts. The event itself is
+   * always dropped (the caller returns after this), but thread tracking is
+   * armed so follow-up human replies pass the active-thread filter.
+   *
+   * Two cases, because both open a conversation a human can reply into:
+   *
+   *   - **Thread reply** (`thread_ts` present): arms that thread at the full
+   *     TTL. The bot joining a thread is a participation signal as strong as
+   *     an inbound one.
+   *   - **Top-level post** (no `thread_ts`): arms the post's own `ts` as a
+   *     speculative thread root, at the shorter
+   *     {@link OUTBOUND_ROOT_THREAD_TTL_MS}. Without this a bot-initiated
+   *     conversation arms nothing at all and every reply under it is dropped
+   *     by the active-thread filter (LUM-2941).
+   *
+   * Keyed on the echo rather than on the sending code path, so it holds for
+   * every outbound route: the Slack skill's raw `chat.postMessage`, the
+   * messaging adapter, and the gateway's own posts alike. Both of Slack's
+   * attribution shapes reach here, because `isOwnBotEvent` matches our bot
+   * user *and* our `bot_id`.
+   *
+   * What remains is the inference itself: this reads the gateway's own
+   * outbound echo to decide that the assistant opened a conversation. Routing
+   * outbound through the gateway (LUM-2942) replaces it with registration at
+   * send time and makes this handler deletable.
+   */
+  private maybeTrackBotOwnPost(event: SlackInboundEvent): void {
     if (this.config.threadMode !== "mention_then_thread") {
       return;
     }
 
-    // Only a plain thread reply arms tracking. app_mentions, edits, deletes,
+    // Only a plain message arms tracking. app_mentions, edits, deletes,
     // and reactions do not.
     const classified = classifySlackEvent(event);
     if (!classified || classified.kind !== "message") {
       return;
     }
-    const { channel, thread_ts: threadTs } = classified.event;
-    if (!threadTs || !channel) {
+    const {
+      channel,
+      thread_ts: threadTs,
+      ts,
+      channel_type: channelType,
+      subtype,
+    } = classified.event;
+    if (!channel) {
       return;
     }
 
-    if (this.store.isThreadDetached(threadTs)) {
+    if (threadTs) {
+      if (this.store.isThreadDetached(threadTs)) {
+        log.info(
+          { channel, threadTs },
+          "Skipped tracking bot's own reply in explicitly muted thread",
+        );
+        return;
+      }
+      // Not `trackThread`: the assistant replying to itself is not human
+      // engagement, so it must not promote one of its own speculative roots
+      // into the catch-up fan-out. See `trackThreadAfterBotReply`.
+      this.store.trackThreadAfterBotReply(
+        threadTs,
+        channel,
+        ACTIVE_THREAD_TTL_MS,
+        OUTBOUND_ROOT_THREAD_TTL_MS,
+      );
       log.info(
         { channel, threadTs },
-        "Skipped tracking bot's own reply in explicitly muted thread",
+        "Tracked thread after bot's own thread reply",
       );
       return;
     }
 
-    this.store.trackThread(threadTs, channel, ACTIVE_THREAD_TTL_MS);
+    if (!ts) {
+      return;
+    }
+
+    // A system subtype (`channel_join` and friends) still classifies as
+    // `kind: "message"`, but the bot did not say anything repliable.
+    if (subtype !== undefined && !ROOT_ARMING_SUBTYPES.has(subtype)) {
+      return;
+    }
+
+    // A root buys admission only where admission is otherwise gated. DMs and
+    // group DMs already admit every message without a tracked thread, so a
+    // root there would add a row and change nothing.
+    //
+    // Read the payload's own discriminators rather than calling
+    // `isDirectLikeChannel`: its observed-kind cache fallback fires a
+    // background `conversations.info` for any channel whose kind is not
+    // cached, and `recordSlackChannelKind` only learns `im` / `mpim`, so an
+    // ordinary channel would warm on every post the assistant makes. Message
+    // events always carry `channel_type`, so the fallback buys nothing on this
+    // path. If one ever arrives without it, the worst case is one useless root
+    // row in a group DM until the TTL lapses, which admits nothing that was
+    // not already admitted there.
+    if (
+      isSlackDmChannel(channel, channelType) ||
+      isSlackMpimChannel(channelType)
+    ) {
+      return;
+    }
+
+    if (this.store.isThreadDetached(ts)) {
+      log.info(
+        { channel, threadTs: ts },
+        "Skipped arming bot's own post as a root in an explicitly muted thread",
+      );
+      return;
+    }
+
+    this.store.armSpeculativeThreadRoot(
+      ts,
+      channel,
+      OUTBOUND_ROOT_THREAD_TTL_MS,
+    );
     log.info(
-      { channel, threadTs },
-      "Tracked thread after bot's own thread reply",
+      { channel, threadTs: ts },
+      "Armed thread root after bot's own top-level post",
     );
   }
 
@@ -684,13 +1149,31 @@ export class SlackSocketModeClient {
     log.info("Connecting to Slack Socket Mode");
 
     try {
-      const ws = new WebSocket(wsUrl);
+      const ws = this.createSocket(wsUrl);
       this.ws = ws;
       this.connecting = false;
+
+      // A handshake that stalls produces neither `open` nor `close`, so the
+      // liveness watchdog (which only arms on `open`) never gets to see it.
+      // Bound that window explicitly; see CONNECT_DEADLINE_MS.
+      this.cancelConnectDeadline?.();
+      this.cancelConnectDeadline = this.schedule(() => {
+        this.cancelConnectDeadline = null;
+        if (this.ws !== ws) {
+          return;
+        }
+        log.warn(
+          "Slack Socket Mode socket did not open within the deadline, reconnecting",
+        );
+        this.forceReconnect("connect deadline exceeded", "backoff");
+      }, CONNECT_DEADLINE_MS);
 
       ws.addEventListener("open", () => {
         log.info("Slack Socket Mode connected");
         this.backoff.reset();
+        this.cancelConnectDeadline?.();
+        this.cancelConnectDeadline = null;
+        this.liveness.start(ws);
         // Retry bot identity resolution on every reconnect so a transient
         // auth.test failure at startup is self-healing. Once resolved, the
         // check in resolveBotIdentity short-circuits immediately (no await
@@ -714,6 +1197,10 @@ export class SlackSocketModeClient {
           });
       });
 
+      ws.addEventListener("pong", () => {
+        this.liveness.notePong();
+      });
+
       ws.addEventListener("message", (messageEvent) => {
         // Slack Socket Mode delivers text frames; ignore any non-string frame
         // rather than casting untrusted WebSocket data to `string`.
@@ -733,7 +1220,7 @@ export class SlackSocketModeClient {
         // forceReconnect nulls this.ws before initiating a new connection,
         // so a stale close event should be ignored.
         if (this.ws === ws) {
-          this.ws = null;
+          this.abandonSocket();
           this.scheduleReconnect();
         }
       });
@@ -746,7 +1233,7 @@ export class SlackSocketModeClient {
       });
     } catch (err) {
       log.error({ err }, "Failed to create WebSocket connection");
-      this.ws = null;
+      this.abandonSocket();
       this.connecting = false;
       this.scheduleReconnect();
     }
@@ -782,7 +1269,7 @@ export class SlackSocketModeClient {
     return data.url;
   }
 
-  private handleMessage(raw: string, originWs: WebSocket): void {
+  private handleMessage(raw: string, originWs: SlackSocketLike): void {
     const envelope = parseSlackEnvelope(raw);
     if (!envelope) {
       log.warn("Received non-JSON or malformed Socket Mode message");
@@ -809,7 +1296,7 @@ export class SlackSocketModeClient {
         } catch {
           // ignore
         }
-        this.ws = null;
+        this.abandonSocket();
         // Reconnect immediately (attempt 0 = minimal backoff)
         this.backoff.reset();
         this.scheduleReconnect();
@@ -897,12 +1384,11 @@ export class SlackSocketModeClient {
     // as inbound events (DM echoes, thread reply echoes, etc.). This is
     // the one structural filter point — every event with the bot as author
     // is dropped here, before any normalization or routing.
-    const eventUser = this.extractEventUser(event);
-    if (eventUser === botUserId) {
-      // Exception: the bot's own thread replies are used to arm thread
-      // tracking (so follow-up human replies are forwarded). This is a
-      // side effect only, the event itself is still dropped.
-      this.maybeTrackBotOwnThreadReply(event);
+    if (this.isOwnBotEvent(event)) {
+      // Exception: the bot's own posts are used to arm thread tracking (so
+      // follow-up human replies are forwarded). This is a side effect only,
+      // the event itself is still dropped.
+      this.maybeTrackBotOwnPost(event);
       return;
     }
 
@@ -1338,6 +1824,29 @@ export class SlackSocketModeClient {
       }
     }
 
+    // Resolve visibility when the id and event type could not settle it, for
+    // the same reason the actor is enriched above: this is a permission input
+    // and it has to be right before enforcement, not eventually.
+    //
+    // Only a bare `C` reaches here. It is a public channel or a modern
+    // multi-person IM, and nothing about the id distinguishes them, so a
+    // background warm would return the permissive answer on the first event
+    // and the correct one later. Bounded by the same timeout as the actor
+    // lookup, and an unanswered lookup stays unknown rather than public.
+    if (!normalized.event.source.conversationType && channelId) {
+      const isPrivate = await Promise.race([
+        resolveSlackChannelIsPrivate(channelId, this.config.botToken),
+        new Promise<undefined>((resolve) =>
+          setTimeout(resolve, SLACK_RESOLVE_TIMEOUT_MS),
+        ),
+      ]);
+      if (isPrivate !== undefined) {
+        normalized.event.source.conversationType = isPrivate
+          ? "private"
+          : "public";
+      }
+    }
+
     this.onEvent(normalized);
   }
 
@@ -1363,7 +1872,7 @@ export class SlackSocketModeClient {
    * (`triggerSlackThreadBackfillIfNeeded`, `tryBackfillSlackDmIfCold`)
    * will hydrate context once the next live event arrives.
    */
-  private async replayMissedEvents(ownerWs: WebSocket): Promise<void> {
+  private async replayMissedEvents(ownerWs: SlackSocketLike): Promise<void> {
     // Bail if a fresh forceReconnect has replaced the active socket
     // before the async work began. Without this gate, a stale generation
     // could fan out catch-up traffic that races with the new connection.
@@ -1429,6 +1938,11 @@ export class SlackSocketModeClient {
     );
 
     let recovered = 0;
+    // The fetch helpers report a failed call as an empty message list, so
+    // without this a total API failure and a genuinely empty window both log
+    // `recovered: 0`. This separates "nothing was missed" from "nothing was
+    // fetched".
+    let failedFetches = 0;
     const abort = new CatchupAbortSignal();
 
     // Channel/DM history fan-out. We use conversations.history rather than
@@ -1446,8 +1960,13 @@ export class SlackSocketModeClient {
           abort,
         });
         if (this.ws !== ownerWs) return;
+        if (!result.ok) {
+          failedFetches++;
+        }
         for (const msg of sortMessagesAscendingByTs(result.messages)) {
-          if (this.injectReplayMessage(channel, msg, botUserId)) recovered++;
+          if (this.injectReplayMessage(channel, msg, botUserId)) {
+            recovered++;
+          }
         }
       };
     });
@@ -1464,6 +1983,9 @@ export class SlackSocketModeClient {
           abort,
         });
         if (this.ws !== ownerWs) return;
+        if (!result.ok) {
+          failedFetches++;
+        }
         for (const msg of sortMessagesAscendingByTs(result.messages)) {
           // conversations.replies always returns the thread parent as the
           // first element regardless of `oldest` / `inclusive` — see
@@ -1473,8 +1995,12 @@ export class SlackSocketModeClient {
           // catch a same-day re-emission, but for long-lived active threads
           // (TTL refreshed past the dedup window) the dedup row could have
           // expired, so filter explicitly.
-          if (msg.ts === threadTs) continue;
-          if (this.injectReplayMessage(channelId, msg, botUserId)) recovered++;
+          if (msg.ts === threadTs) {
+            continue;
+          }
+          if (this.injectReplayMessage(channelId, msg, botUserId)) {
+            recovered++;
+          }
         }
       };
     });
@@ -1488,7 +2014,17 @@ export class SlackSocketModeClient {
       log.warn({ err }, "Slack reconnect catch-up encountered an error");
     }
 
-    log.info({ recovered, oldest }, "Slack reconnect catch-up complete");
+    if (failedFetches > 0) {
+      log.warn(
+        { failedFetches, recovered },
+        "Slack reconnect catch-up could not read every scoped conversation; " +
+          "messages in the failed ones were not recovered",
+      );
+    }
+    log.info(
+      { recovered, oldest, failedFetches },
+      "Slack reconnect catch-up complete",
+    );
   }
 
   /**
@@ -1510,19 +2046,14 @@ export class SlackSocketModeClient {
     // filter would already drop these and replaying them risks loops.
     if (msg.user === botUserId) return false;
     if (msg.bot_id) return false;
-    if (
-      msg.subtype &&
-      msg.subtype !== "thread_broadcast" &&
-      msg.subtype !== "file_share"
-    ) {
-      return false;
-    }
+    if (isIgnoredSlackMessageSubtype(msg.subtype)) return false;
 
     const mentionsBot = msg.text?.includes(`<@${botUserId}>`) ?? false;
     // `conversations.history`/`replies` carry no `channel_type`, so classify
     // DMs by the conversation ID prefix and group DMs from the observed-kind
-    // cache. The `"channel"` fallback below is therefore a guess, which is why
-    // `recordSlackChannelKind` refuses to learn from that value.
+    // cache. Anything else is unproven and stays unstamped rather than being
+    // guessed, so no consumer can mistake a replay's inference for something
+    // Slack said.
     const isDm = isSlackDmChannel(channel);
     const isGroupDm = !isDm && this.isGroupDmChannel(channel);
     // Slack only emits `app_mention` in non-DM channels, even when the bot is
@@ -1545,7 +2076,19 @@ export class SlackSocketModeClient {
       ts: msg.ts,
       thread_ts: msg.thread_ts,
       channel,
-      channel_type: isDm ? "im" : isGroupDm ? "mpim" : "channel",
+      // Only the proven types are stamped. `"channel"` would be a guess, and a
+      // guess must not read as proof: `slackConversationVisibility` treats an
+      // explicit `channel_type` as authoritative, so synthesizing one here
+      // would stamp a recovered private-channel message as public and skip the
+      // authoritative lookup that would have corrected it. Omitting it leaves
+      // the same signals a live thread reply has, which is a `G` prefix for a
+      // private room and a resolved lookup for an ambiguous `C`. This is the
+      // same reason `recordSlackChannelKind` refuses to learn from the value.
+      ...(isDm
+        ? { channel_type: "im" }
+        : isGroupDm
+          ? { channel_type: "mpim" }
+          : {}),
       team: msg.team,
       ...(msg.subtype ? { subtype: msg.subtype } : {}),
       ...(msg.files ? { files: msg.files } : {}),
@@ -1584,15 +2127,19 @@ export class SlackSocketModeClient {
   }
 
   private scheduleReconnect(): void {
-    if (!this.running) return;
-    if (this.reconnectTimer) return;
+    if (!this.running) {
+      return;
+    }
+    if (this.reconnectTimer) {
+      return;
+    }
 
     const attempt = this.backoff.attemptCount;
     const delay = this.backoff.nextDelayMs();
 
     log.info({ attempt, delayMs: delay }, "Scheduling Socket Mode reconnect");
 
-    this.reconnectTimer = setTimeout(() => {
+    this.reconnectTimer = this.schedule(() => {
       this.reconnectTimer = null;
       this.connect().catch((err) => {
         log.error({ err }, "Reconnect failed");
@@ -1817,6 +2364,7 @@ function sortMessagesAscendingByTs<T extends { ts?: string }>(
 export function createSlackSocketModeClient(
   config: SlackSocketModeConfig,
   onEvent: (event: NormalizedSlackEvent) => void,
+  deps?: SlackSocketModeDeps,
 ): SlackSocketModeClient {
-  return new SlackSocketModeClient(config, onEvent);
+  return new SlackSocketModeClient(config, onEvent, deps);
 }

@@ -26,7 +26,7 @@ Vellum assistant web app (chat, settings, library, docs).
 
 ```bash
 cd clients/web
-bun install
+bun install   # installs the whole workspace
 bun run openapi-ts  # generate API client (required before typecheck/dev)
 bun run dev         # Vite dev server on localhost:3000
 ```
@@ -206,14 +206,6 @@ splitting becomes worth its conventions; the React Router API used in
 day-to-day code (`<Link>`, `<Outlet>`, `useParams`, `useNavigate`) is
 the same in both modes, so switching later is a restructure rather
 than a rewrite.
-
-## Runtime/auth adapter seam
-
-[`src/runtime/auth-adapter.ts`](src/runtime/auth-adapter.ts) defines a
-typed `RuntimeAuthAdapter` interface (`ensureSession` +
-`getAuthHeader`) so the shell does not hard-code hosted Vellum login.
-Hosted, local, self-hosted, and Electron runtimes plug in via the same
-interface from their respective hosts.
 
 ## SSR/build-safe rendering
 

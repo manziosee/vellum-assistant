@@ -11,7 +11,8 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { useIsMobile } from "@/hooks/use-is-mobile";
+import { useTouchMobile } from "@/hooks/use-touch-mobile";
+import { useTranslation } from "@/i18n";
 import { credentialsRevealPost } from "@/generated/daemon/sdk.gen";
 import { copyToClipboard } from "@/lib/copy-to-clipboard";
 import { BottomSheet } from "@vellumai/design-library/components/bottom-sheet";
@@ -87,6 +88,7 @@ export function CredentialRow({
   onGenerateLink,
   onDelete,
 }: CredentialRowProps) {
+  const { t } = useTranslation("settings");
   const name = `${credential.service}:${credential.field}`;
   const [menuOpen, setMenuOpen] = useState(false);
   // Metadata line: the `service:field` (shown only when an alias is the
@@ -94,7 +96,9 @@ export function CredentialRow({
   const metadataParts = [
     credential.alias ? name : null,
     credential.createdAt
-      ? `added ${formatCreatedAt(credential.createdAt)}`
+      ? t("credentialRow.addedMetadata", {
+          date: formatCreatedAt(credential.createdAt),
+        })
       : null,
   ].filter((part): part is string => Boolean(part));
 
@@ -159,6 +163,7 @@ function CredentialValue({
   assistantId: string;
   credential: StoredCredential;
 }) {
+  const { t } = useTranslation("settings");
   const [revealed, setRevealed] = useState<string | null>(null);
   const [isRevealing, setIsRevealing] = useState(false);
   const [justCopied, setJustCopied] = useState(false);
@@ -210,21 +215,21 @@ function CredentialValue({
       }
     } catch {
       if (revealVersionRef.current === myVersion) {
-        toast.error(`Couldn't reveal ${name}.`);
+        toast.error(t("credentialRow.revealFailedToast", { name }));
       }
     } finally {
       if (revealVersionRef.current === myVersion) {
         setIsRevealing(false);
       }
     }
-  }, [assistantId, credential.service, credential.field, name]);
+  }, [assistantId, credential.service, credential.field, name, t]);
 
   const copy = useCallback(() => {
     if (revealed == null) {
       return;
     }
     copyToClipboard(revealed, {
-      errorMessage: "Couldn't copy. Reveal and copy manually.",
+      errorMessage: t("credentialRow.copyFailedToast"),
       onCopied: () => {
         setJustCopied(true);
         if (copiedTimer.current) {
@@ -236,7 +241,7 @@ function CredentialValue({
         );
       },
     });
-  }, [revealed]);
+  }, [revealed, t]);
 
   const isRevealed = revealed !== null;
 
@@ -259,9 +264,15 @@ function CredentialValue({
         onClick={() => (isRevealed ? hide() : void reveal())}
         disabled={isRevealing}
         aria-label={
-          isRevealed ? `Hide value for ${name}` : `Reveal value for ${name}`
+          isRevealed
+            ? t("credentialRow.hideValueAriaLabel", { name })
+            : t("credentialRow.revealValueAriaLabel", { name })
         }
-        title={isRevealed ? "Hide value" : "Click to reveal"}
+        title={
+          isRevealed
+            ? t("credentialRow.hideValueTitle")
+            : t("credentialRow.clickToRevealTitle")
+        }
         // Prevent session-replay (LogRocket) from recording the credential
         // value. The attribute is always present so the masked preview
         // (****last4) is also excluded, not just the revealed plaintext.
@@ -282,8 +293,8 @@ function CredentialValue({
           <button
             type="button"
             onClick={copy}
-            aria-label={`Copy value for ${name}`}
-            title="Copy value"
+            aria-label={t("credentialRow.copyValueAriaLabel", { name })}
+            title={t("credentialRow.copyValueTitle")}
             className="shrink-0 rounded-sm p-0.5 text-[var(--content-tertiary)] transition-colors hover:text-[var(--content-secondary)] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--border-focus)]"
           >
             {justCopied ? (
@@ -295,8 +306,8 @@ function CredentialValue({
           <button
             type="button"
             onClick={hide}
-            aria-label={`Hide value for ${name}`}
-            title="Hide value"
+            aria-label={t("credentialRow.hideValueAriaLabel", { name })}
+            title={t("credentialRow.hideValueTitle")}
             className="shrink-0 rounded-sm p-0.5 text-[var(--content-tertiary)] transition-colors hover:text-[var(--content-secondary)] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--border-focus)]"
           >
             <EyeOff className="h-3.5 w-3.5" aria-hidden />
@@ -306,8 +317,8 @@ function CredentialValue({
         <button
           type="button"
           onClick={() => void reveal()}
-          aria-label={`Reveal value for ${name}`}
-          title="Click to reveal"
+          aria-label={t("credentialRow.revealValueAriaLabel", { name })}
+          title={t("credentialRow.clickToRevealTitle")}
           className="shrink-0 rounded-sm p-0.5 text-[var(--content-tertiary)] transition-colors hover:text-[var(--content-secondary)] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[var(--border-focus)]"
         >
           <Eye className="h-3.5 w-3.5" aria-hidden />
@@ -318,13 +329,13 @@ function CredentialValue({
 }
 
 // ---------------------------------------------------------------------------
-// CredentialConfigureMenu — desktop popover / mobile bottom-sheet wrapper for
+// CredentialConfigureMenu: anchored popover / touch bottom-sheet wrapper for
 // the stored-credential "Configure" action menu. Unit-testable in isolation
 // (no parent mutations required), mirroring IntegrationConfigureMenu.
 // ---------------------------------------------------------------------------
 
 export interface CredentialConfigureMenuProps {
-  /** `service:field` of the credential — used as the mobile sheet title. */
+  /** `service:field` of the credential, used as the sheet title. */
   name: string;
   /** Whether the Configure menu is open (controlled). */
   open: boolean;
@@ -344,7 +355,8 @@ export function CredentialConfigureMenu({
   onGenerateLink,
   onDelete,
 }: CredentialConfigureMenuProps) {
-  const isMobile = useIsMobile();
+  const { t } = useTranslation("settings");
+  const isTouchMobile = useTouchMobile();
   const busy = generatingLink || deleting;
 
   const trigger = (
@@ -353,16 +365,16 @@ export function CredentialConfigureMenu({
       rightIcon={<ChevronDown />}
       aria-haspopup="menu"
       aria-expanded={open}
-      aria-label={`Configure ${name}`}
+      aria-label={t("credentialRow.configureAriaLabel", { name })}
       leftIcon={
         busy ? <Loader2 className="animate-spin" aria-hidden /> : undefined
       }
     >
-      Configure
+      {t("credentialRow.configureButton")}
     </Button>
   );
 
-  if (isMobile) {
+  if (isTouchMobile) {
     return (
       <BottomSheet.Root open={open} onOpenChange={onOpenChange}>
         <BottomSheet.Trigger asChild>{trigger}</BottomSheet.Trigger>
@@ -375,7 +387,7 @@ export function CredentialConfigureMenu({
           <BottomSheet.Body>
             <PanelItem
               icon={generatingLink ? Loader2 : Link2}
-              label="Generate link"
+              label={t("credentialRow.generateLinkLabel")}
               onSelect={() => {
                 if (busy) {
                   return;
@@ -386,7 +398,7 @@ export function CredentialConfigureMenu({
 
             <PanelItem
               icon={deleting ? Loader2 : Trash2}
-              label="Delete"
+              label={t("credentialRow.deleteLabel")}
               onSelect={() => {
                 if (busy) {
                   return;
@@ -424,7 +436,7 @@ export function CredentialConfigureMenu({
             )
           }
         >
-          Generate link
+          {t("credentialRow.generateLinkLabel")}
         </Button>
         <Button
           type="button"
@@ -441,7 +453,7 @@ export function CredentialConfigureMenu({
             )
           }
         >
-          Delete
+          {t("credentialRow.deleteLabel")}
         </Button>
       </Popover.Content>
     </Popover.Root>

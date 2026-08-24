@@ -52,6 +52,7 @@ import {
 } from "@/domains/chat/utils/stream-handlers/tool-call-handlers";
 import {
   handleUsageUpdate,
+  handleContextWindowUsage,
   handleCompactionCircuitOpen,
   handleCompactionCircuitClosed,
 } from "@/domains/chat/utils/stream-handlers/metadata-handlers";
@@ -72,6 +73,7 @@ import {
   handleAcpSessionUpdate,
   handleAcpSessionUsage,
   handleAcpSessionCompleted,
+  handleAcpAuthRequired,
   handleAcpSessionError,
 } from "@/domains/chat/utils/stream-handlers/acp-handlers";
 import {
@@ -362,6 +364,9 @@ export function useStreamEventHandler(
         case "usage_update":
           handleUsageUpdate(event, ctx);
           break;
+        case "context_window_usage":
+          handleContextWindowUsage(event, ctx);
+          break;
         // Per-call usage deltas. The top-level chat surface reads running
         // totals from `usage_update`; per-call deltas are only consumed by
         // subagent surfaces via the `subagent_event` envelope.
@@ -429,6 +434,9 @@ export function useStreamEventHandler(
         case "acp_session_error":
           handleAcpSessionError(event);
           break;
+        case "acp_auth_required":
+          handleAcpAuthRequired(event);
+          break;
 
         case "background_tool_started":
           handleBackgroundToolStarted(event);
@@ -455,8 +463,9 @@ export function useStreamEventHandler(
         // Cross-domain events handled by bus subscribers mounted in
         // RootLayout (useAssistantResourceSync, useConversationSync,
         // useNotificationIntentSync, useDocumentEditorSync, useBookmarksSync)
-        // or ChatPage-scoped hooks (useDiskPressureMonitor). The chat
-        // handler is intentionally a no-op for these.
+        // or ChatPage-scoped hooks (useDiskPressureMonitor,
+        // useResourcePressureMonitor). The chat handler is intentionally
+        // a no-op for these.
         case "bookmark.created":
         case "bookmark.deleted":
         case "sync_changed":
@@ -465,6 +474,7 @@ export function useStreamEventHandler(
         case "identity_changed":
         case "avatar_updated":
         case "disk_pressure_status_changed":
+        case "resource_pressure_status_changed":
         case "notification_intent":
         case "document_editor_show":
         case "document_editor_update":
@@ -502,6 +512,10 @@ export function useStreamEventHandler(
         case "schedule_conversation_created":
         case "heartbeat_alert":
         case "heartbeat_conversation_created":
+        // A watch session's retrospective finishing is drawn by the companion
+        // surface rather than in the transcript, and reaches it through
+        // `useWatchRetroSync` off the bus.
+        case "watch_retro_completed":
           break;
         // Host-proxy instructions targeting the desktop client / chrome
         // extension. The web chat handler is a no-op — host-proxy frames are

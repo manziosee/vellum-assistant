@@ -2,8 +2,8 @@
  * Unit tests for `detectClientOs`.
  *
  * The same `clients/web` bundle ships to a plain browser, the Capacitor mobile
- * shells, and the Electron macOS app, so the OS surface the assistant sees is
- * decided entirely at runtime. These tests pin each host → OS mapping and the
+ * shells, and the Electron desktop apps, so the OS surface is decided at
+ * runtime. These tests pin each host → OS mapping and the
  * precedence between overlapping signals.
  *
  * `isElectron()` and `isNativePlatform()` are mocked (the flavor.test.ts
@@ -14,6 +14,8 @@
 
 import { afterEach, describe, expect, mock, test } from "bun:test";
 import { cleanup, renderHook } from "@testing-library/react";
+
+import type { ElectronHostOS } from "@/runtime/platform-detection";
 
 let electron = false;
 let nativePlatform = false;
@@ -34,10 +36,13 @@ const {
   isNativeAndroid,
   isNativeIOS,
   isNativeMobile,
+  useIsAndroidWeb,
   useIsNativeIOS,
+  useIsNativeMobile,
 } = await import("@/runtime/platform-detection");
 
 const ORIGINAL_UA = navigator.userAgent;
+const ORIGINAL_PLATFORM = navigator.platform;
 const IPHONE_UA =
   "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) " +
   "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1";
@@ -52,18 +57,53 @@ function setUserAgent(ua: string): void {
   });
 }
 
+function setPlatform(platform: string): void {
+  Object.defineProperty(navigator, "platform", {
+    value: platform,
+    configurable: true,
+  });
+}
+
+function setElectronHost(hostOS?: ElectronHostOS): void {
+  electron = true;
+  (
+    window as unknown as {
+      vellum?: { platform: "electron"; hostOS?: ElectronHostOS };
+    }
+  ).vellum = {
+    platform: "electron",
+    ...(hostOS ? { hostOS } : {}),
+  };
+}
+
 afterEach(() => {
   cleanup();
   electron = false;
   nativePlatform = false;
   nativeOsPlatform = "web";
+  delete (window as unknown as { vellum?: unknown }).vellum;
   setUserAgent(ORIGINAL_UA);
+  setPlatform(ORIGINAL_PLATFORM);
 });
 
 describe("detectClientOs", () => {
-  test("returns 'macos' inside the Electron desktop shell", () => {
-    electron = true;
+  test("returns 'windows' inside the Windows Electron shell", () => {
+    setElectronHost("windows");
+    expect(detectClientOs()).toBe("windows");
+  });
+
+  test("returns 'macos' inside the macOS Electron shell", () => {
+    setElectronHost("macos");
     expect(detectClientOs()).toBe("macos");
+  });
+
+  test("uses the renderer platform for legacy Electron bridges", () => {
+    setElectronHost();
+    setPlatform("MacIntel");
+    expect(detectClientOs()).toBe("macos");
+
+    setPlatform("Win32");
+    expect(detectClientOs()).toBe("windows");
   });
 
   test("returns 'ios' inside the Capacitor iOS native shell", () => {
@@ -98,7 +138,7 @@ describe("detectClientOs", () => {
     // The Electron macOS shell also satisfies the iOS/native heuristics in
     // some configurations; `isElectron()` must win so macOS isn't reported
     // as iOS.
-    electron = true;
+    setElectronHost("macos");
     nativePlatform = true;
     setUserAgent(IPHONE_UA);
     expect(detectClientOs()).toBe("macos");
@@ -117,6 +157,24 @@ describe("useIsNativeIOS", () => {
   });
 });
 
+describe("useIsAndroidWeb", () => {
+  test("is true in an Android browser", () => {
+    setUserAgent(ANDROID_UA);
+    expect(renderHook(() => useIsAndroidWeb()).result.current).toBe(true);
+  });
+
+  test("is false inside the native Android shell", () => {
+    setUserAgent(ANDROID_UA);
+    nativePlatform = true;
+    nativeOsPlatform = "android";
+    expect(renderHook(() => useIsAndroidWeb()).result.current).toBe(false);
+  });
+
+  test("is false in a desktop browser", () => {
+    expect(renderHook(() => useIsAndroidWeb()).result.current).toBe(false);
+  });
+});
+
 describe("native mobile shell detection", () => {
   test("distinguishes the native iOS shell", () => {
     nativePlatform = true;
@@ -125,6 +183,7 @@ describe("native mobile shell detection", () => {
     expect(isNativeIOS()).toBe(true);
     expect(isNativeAndroid()).toBe(false);
     expect(isNativeMobile()).toBe(true);
+    expect(renderHook(() => useIsNativeMobile()).result.current).toBe(true);
   });
 
   test("distinguishes the native Android shell", () => {
@@ -134,6 +193,15 @@ describe("native mobile shell detection", () => {
     expect(isNativeIOS()).toBe(false);
     expect(isNativeAndroid()).toBe(true);
     expect(isNativeMobile()).toBe(true);
+    expect(renderHook(() => useIsNativeMobile()).result.current).toBe(true);
+  });
+
+  test("excludes other native platforms", () => {
+    nativePlatform = true;
+    nativeOsPlatform = "macos";
+
+    expect(isNativeMobile()).toBe(false);
+    expect(renderHook(() => useIsNativeMobile()).result.current).toBe(false);
   });
 
   test("does not treat mobile browsers as native shells", () => {

@@ -38,7 +38,12 @@ import { createSelectors } from "@/utils/create-selectors";
  * - `idle` — no session (or a finished one cleaned up).
  * - `connecting` — minting a token / opening the socket, before `ready`.
  * - `listening` — mic is capturing and streaming PCM to the server.
- * - `transcribing` — push-to-talk released; waiting on the final transcript.
+ * - `transcribing`: the user's utterance closed; waiting on the final
+ *   transcript. Set by server VAD's `utterance_end` in hands-free and by the
+ *   turn-boundary `ptt_release` frame in manual mode. Distinct from `thinking`
+ *   because it stamps end-of-speech latency and gates the
+ *   `utterance_discarded` return to `listening`, though the two share a label
+ *   (see {@link LIVE_VOICE_STATE_LABELS}).
  * - `thinking` — server is generating the assistant response.
  * - `speaking` — TTS audio is queued/playing.
  * - `ending` — graceful teardown in progress.
@@ -63,12 +68,20 @@ export type LiveVoiceSessionState =
  * streams into the thread transcript like text chat, so surfaces only carry a
  * small label. `idle`/`failed` map to an empty label — hosts unmount their
  * voice UI in those states.
+ *
+ * `transcribing` and `thinking` share one label (JARVIS-1559).
+ * `toVoiceAvatarVisual` collapses both phases to a single visual, so wording
+ * unique to `transcribing` puts two words for one phase on screen at once,
+ * across a window that is usually under a second and that offers the user
+ * nothing to act on. The pairing belongs in this table rather than in
+ * {@link liveVoiceSurfaceLabel}: the session pill and the composer's voice bar
+ * read the table directly, so it is the only layer every surface shares.
  */
 export const LIVE_VOICE_STATE_LABELS: Record<LiveVoiceSessionState, string> = {
   idle: "",
   connecting: "Connecting…",
   listening: "Listening…",
-  transcribing: "Transcribing…",
+  transcribing: "Thinking…",
   thinking: "Thinking…",
   speaking: "Speaking…",
   ending: "Ending…",
@@ -94,15 +107,24 @@ export function liveVoiceStateLabel(
 }
 
 /**
- * The label a *surface* shows for a session — {@link liveVoiceStateLabel} plus
- * the audio-aware `speaking` remap.
+ * The label a *surface* shows for a session: {@link liveVoiceStateLabel} plus
+ * the two remaps that keep the words true of what is actually happening.
  *
  * `speaking` stays set across a mid-turn tool run: the assistant spoke an ack,
  * then went silent while a tool runs. Announcing "Speaking…" while nothing is
  * audible is wrong for the room's caption, wrong for its screen-reader
  * announcement, and wrong for the Dynamic Island (JARVIS-1279). Every surface
- * that renders session activity calls this — the voice room and the iOS Live
- * Activity mirror — so the island always reads exactly what the room reads.
+ * that renders session activity calls this, the voice room and the iOS Live
+ * Activity mirror, so the island always reads exactly what the room reads.
+ *
+ * `listening` is the same problem through the microphone: the session holds
+ * that phase while the mic is muted, so the surface claims to be listening
+ * beside a mute button that says it is not. Muted is a state rather than an
+ * activity, so it takes no ellipsis where the phases do.
+ *
+ * Only `listening` is remapped. Muting the microphone does not make the
+ * assistant stop thinking or speaking, and relabelling those would trade one
+ * false statement for another.
  *
  * {@link liveVoiceStateLabel} stays the lower layer for callers that have no
  * audio signal to consult.
@@ -111,7 +133,11 @@ export function liveVoiceSurfaceLabel(
   state: LiveVoiceSessionState,
   reconnecting: boolean,
   assistantAudioActive: boolean,
+  muted: boolean,
 ): string {
+  if (state === "listening" && muted) {
+    return "Muted";
+  }
   return liveVoiceStateLabel(
     state === "speaking" && !assistantAudioActive ? "thinking" : state,
     reconnecting,
@@ -167,6 +193,19 @@ export interface LiveVoiceSessionControls {
     silenceThresholdMs?: number;
     bargeInMinSpeechMs?: number;
   }) => void;
+  /**
+   * Tell the session about a photo the user took mid-call, by the id its
+   * upload already returned. The daemon persists it into the conversation
+   * straight away, running no turn, so whatever the user says next sees it.
+   *
+   * Returns whether it reached the session. False during a reconnect gap,
+   * which the caller must surface: the photo is already uploaded and the
+   * shutter has already fired, so silence would read as success.
+   *
+   * Callers must gate on `useSupportsVoiceCamera`. See that hook for why an
+   * older assistant's rejection cannot be told apart from `update_config`'s.
+   */
+  attachImage: (attachmentId: string) => boolean;
 }
 
 /**
@@ -222,6 +261,8 @@ export interface LiveVoiceState {
    * Meaningful only while `state === "speaking"`.
    */
   assistantAudioActive: boolean;
+  /** True once microphone capture has started for the active session. */
+  microphoneActive: boolean;
   /**
    * True while the controller is retrying a dropped connection (attempt > 0),
    * so surfaces can distinguish it from the initial-connect `connecting`.
@@ -244,6 +285,16 @@ export interface LiveVoiceState {
    * (see {@link isLiveVoiceSessionOwnedBy}).
    */
   startedConversationId: string | null;
+  /**
+   * Bumped each time the assistant refuses a photo that the transport had
+   * already accepted. A counter rather than a flag or a payload because the
+   * room's only use is "another one just failed": consecutive rejections must
+   * each register, and there is nothing about a rejection worth carrying
+   * beyond the fact of it.
+   */
+  photoRejectedSeq: number;
+  /** Why the last photo was refused, for the room's wording. */
+  photoRejectedReason: "unsupported" | "failed" | null;
   /** Controls registered by the owning controller, `null` when no session. */
   controls: LiveVoiceSessionControls | null;
   /**
@@ -253,6 +304,49 @@ export interface LiveVoiceState {
    * registered.
    */
   starter: LiveVoiceSessionStarter | null;
+  /**
+   * Whether the first-run preferences card stands in for an entry, having
+   * intercepted one. Store-held rather than composer-local because every
+   * entry point can be intercepted, including the ones with no composer in
+   * them (the voice mode shortcut, the companion surface's Talk), and the
+   * card is drawn in one place for all of them.
+   */
+  firstRunCardOpen: boolean;
+  /**
+   * The daemon's "configure voice" copy from a `not-ready` readiness verdict,
+   * or `null`. Non-null means an entry was refused before the room opened;
+   * the composer renders it with a deep link to voice settings. Store-held
+   * for the same reason as {@link LiveVoiceState.firstRunCardOpen}.
+   */
+  configNotice: string | null;
+  /**
+   * One short line describing what the current turn is doing ("Reading a
+   * file"), or `""` when it is doing nothing nameable.
+   *
+   * **The wording is the daemon's**, delivered by the `activity` frame, not
+   * composed here. The iOS Live Activity is driven both by that socket and by
+   * an APNs push the daemon dispatches when this web layer is suspended; the
+   * two must carry identical content state, and only one of them can run web
+   * code. See `assistant/src/live-voice/activity-label.ts`.
+   *
+   * Turn-scoped: the daemon sends `""` when a turn stops working, and
+   * `reset()` clears it with everything else.
+   */
+  activityLabel: string;
+  /**
+   * The confirmation the current turn is blocked on, or `null` when it is not
+   * blocked on one.
+   *
+   * Delivered alongside {@link activityLabel} by the `activity` frame, because
+   * a wait is a thing the turn is "doing" and the two are one fact. It exists
+   * for surfaces outside the app — the iOS Live Activity's Approve/Deny
+   * buttons — which need an id to answer rather than a card to render; in the
+   * app the approval card is already on screen and owns its own request.
+   *
+   * Turn-scoped, and cleared the moment the decision stops being the user's to
+   * make, however it was made.
+   */
+  pendingApprovalRequestId: string | null;
   /** In-flight partial transcript of the user's current utterance. */
   partialTranscript: string;
   /** Last finalized user transcript. */
@@ -337,6 +431,21 @@ export interface LiveVoiceActions {
   setState: (state: LiveVoiceSessionState) => void;
   /** Record whether assistant TTS audio is currently queued/playing. */
   setAssistantAudioActive: (active: boolean) => void;
+  /** Record whether the active session has acquired the microphone. */
+  setMicrophoneActive: (active: boolean) => void;
+  /**
+   * Record what the current turn is doing, as the daemon worded it, and which
+   * confirmation it is blocked on if it is blocked on one.
+   *
+   * One setter for both because they arrive on one frame and describe one
+   * state: a turn that is waiting is not also running something, and letting
+   * the id be set independently would allow exactly the pair that cannot be
+   * true (a wait with no line, a line with a stale wait).
+   */
+  setActivityLabel: (
+    activityLabel: string,
+    pendingApprovalRequestId?: string | null,
+  ) => void;
   /** Set whether the controller is retrying a dropped connection. */
   setReconnecting: (reconnecting: boolean) => void;
   /**
@@ -353,10 +462,16 @@ export interface LiveVoiceActions {
    * frame. Leaves `startedConversationId` at its start-time value.
    */
   setConversationId: (conversationId: string) => void;
+  /** Record that the assistant refused a photo. See {@link photoRejectedSeq}. */
+  notePhotoRejected: (reason: "unsupported" | "failed") => void;
   /** Register (or clear) the owning controller's session controls. */
   setControls: (controls: LiveVoiceSessionControls | null) => void;
   /** Register (or clear) the mounted controller's session starter. */
   setStarter: (starter: LiveVoiceSessionStarter | null) => void;
+  /** Open or dismiss the first-run preferences card. */
+  setFirstRunCardOpen: (open: boolean) => void;
+  /** Publish or clear the pre-open "configure voice" notice. */
+  setConfigNotice: (notice: string | null) => void;
   setPartialTranscript: (text: string) => void;
   setFinalTranscript: (text: string) => void;
   /** Append a delta to the accumulated assistant transcript. */
@@ -491,11 +606,18 @@ export function isLiveVoiceSessionOwnedBy(
 /** Session-scoped fields restored by `reset()`. Excludes `starter` (mount-scoped). */
 const INITIAL_SESSION_STATE: Omit<LiveVoiceState, "starter"> = {
   state: "idle",
+  firstRunCardOpen: false,
+  configNotice: null,
   assistantAudioActive: false,
+  microphoneActive: false,
+  activityLabel: "",
+  pendingApprovalRequestId: null,
   reconnecting: false,
   assistantId: null,
   conversationId: null,
   startedConversationId: null,
+  photoRejectedSeq: 0,
+  photoRejectedReason: null,
   controls: null,
   partialTranscript: "",
   finalTranscript: "",
@@ -519,6 +641,9 @@ const useLiveVoiceStoreBase = create<LiveVoiceStore>()((set) => ({
   setState: (state) => set({ state }),
   setAssistantAudioActive: (assistantAudioActive) =>
     set({ assistantAudioActive }),
+  setMicrophoneActive: (microphoneActive) => set({ microphoneActive }),
+  setActivityLabel: (activityLabel, pendingApprovalRequestId = null) =>
+    set({ activityLabel, pendingApprovalRequestId }),
   setReconnecting: (reconnecting) => set({ reconnecting }),
   setSessionContext: (assistantId, conversationId) =>
     // A fresh session always opens with the mic live, even if the controller
@@ -531,8 +656,15 @@ const useLiveVoiceStoreBase = create<LiveVoiceStore>()((set) => ({
       outputMuted: false,
     }),
   setConversationId: (conversationId) => set({ conversationId }),
+  notePhotoRejected: (reason) =>
+    set((state) => ({
+      photoRejectedSeq: state.photoRejectedSeq + 1,
+      photoRejectedReason: reason,
+    })),
   setControls: (controls) => set({ controls }),
   setStarter: (starter) => set({ starter }),
+  setFirstRunCardOpen: (firstRunCardOpen) => set({ firstRunCardOpen }),
+  setConfigNotice: (configNotice) => set({ configNotice }),
   setPartialTranscript: (partialTranscript) => set({ partialTranscript }),
   setFinalTranscript: (finalTranscript) => set({ finalTranscript }),
   appendAssistantTranscript: (delta) =>
@@ -733,6 +865,19 @@ export function updateLiveVoiceSessionConfig(config: {
   bargeInMinSpeechMs?: number;
 }): void {
   useLiveVoiceStore.getState().controls?.updateConfig(config);
+}
+
+/**
+ * Hand the active session a photo the user took mid-call, by attachment id.
+ * Returns whether it reached the session: false when no session exists or the
+ * transport is mid-reconnect, which the caller must surface rather than treat
+ * as sent. Module-level for the same stable-identity reasons as
+ * {@link endLiveVoiceSession}.
+ */
+export function attachLiveVoiceImage(attachmentId: string): boolean {
+  return (
+    useLiveVoiceStore.getState().controls?.attachImage(attachmentId) ?? false
+  );
 }
 
 /**

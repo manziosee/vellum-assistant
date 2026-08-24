@@ -1,3 +1,4 @@
+import type { ResponseArtifact } from "@/domains/chat/transcript/response-artifacts";
 import {
   isAcpSpawnCall,
   isBackgroundBashCall,
@@ -80,6 +81,14 @@ export interface TranscriptMessageBodyProps {
   onWorkflowClick?: (runId: string) => void;
   /** Callback to abort/stop a running workflow from an inline card. */
   onStopWorkflow?: (runId: string) => void;
+  /**
+   * The assets this message's whole response touched (its documents and apps),
+   * resolved by `Transcript` (see `resolveResponseArtifacts`) and set only on
+   * the message that ends a completed response. Each one renders a card below
+   * the message body, so a response closes with one card per asset however many
+   * of its messages wrote to it.
+   */
+  responseArtifacts?: ResponseArtifact[];
   /**
    * True when this message belongs to the turn that is actively streaming.
    * Set by `LatestTurnRow` for the in-progress response cluster; history

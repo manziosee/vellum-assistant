@@ -26,25 +26,18 @@
  * - Plugins are never "registered" as a unit — we register their tools into
  *   the global tool registry.
  *
- * Tools are populated at boot by `loadUserPlugins()`; `getHooksFor` reads
- * hooks on every dispatch via {@link getUserHookEntriesFor}, which resolves
- * each hook through the hook loader on demand.
+ * Tools are populated at boot by `loadUserPlugins()`; hook dispatch reads
+ * discovered plugin names from this cache via {@link getDiscoveredUserPluginNames}
+ * and resolves each hook through the hook loader on demand.
  */
 
-import {
-  existsSync,
-  readdirSync,
-  readFileSync,
-  realpathSync,
-  statSync,
-} from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 import type { Logger } from "pino";
 
 import {
   clearPluginHooks,
-  collectUserHookEntries,
   evictHooksForOwner,
   hasWorkspaceHooks,
   type HookOwnerKind,
@@ -53,7 +46,7 @@ import {
   runShutdownHook,
   WORKSPACE_HOOKS_OWNER,
 } from "../hooks/hook-loader.js";
-import type { HookFunction, ShutdownReason } from "../plugin-api/types.js";
+import type { ShutdownReason } from "../plugin-api/types.js";
 import {
   registerPluginSecretPatterns,
   resetPluginSecretPatternsForTests,
@@ -72,6 +65,7 @@ import {
   listSurfaceDir,
   parsePluginManifest,
 } from "./external-plugin-loader.js";
+import { isInsidePluginRoot } from "./installed-plugin-dirs.js";
 import { snapshotPluginSource } from "./source-fingerprint.js";
 import type { PluginSourceVersion } from "./source-versions.js";
 import {
@@ -81,11 +75,7 @@ import {
   importWithTimeout,
   setSurfaceImportTimeout,
 } from "./surface-import.js";
-import type { HookEntry, PluginCredentialKeyPattern } from "./types.js";
-
-// Re-export for type compat — consumers that import HookFunction from
-// the mtime cache module still resolve.
-export type { HookFunction } from "./types.js";
+import type { PluginCredentialKeyPattern } from "./types.js";
 
 const log = getLogger("plugin-mtime-cache");
 
@@ -211,48 +201,32 @@ let lastVersions: Record<string, PluginSourceVersion> = {};
 /** In-flight reconcile — concurrent imperative pokes await it rather than racing. */
 let reconcileInFlight: Promise<void> | null = null;
 
-// ─── Hook reads ──────────────────────────────────────────────────────────────
+// ─── Discovery reads ─────────────────────────────────────────────────────────
 
 /**
- * Get all hooks for a given event name from user plugins and standalone
- * workspace hooks, from the hook loader's in-memory cache. Plugin hooks run
- * in install-date order, the workspace hook runs last.
- *
- * This is a pure cache read: it never scans disk, activates a plugin, or
- * runs `init`. Activation happens only at boot ({@link populateCacheAtBoot})
- * and through the imperative install/uninstall poke
- * ({@link reconcilePluginSourcesNow}) — both main-daemon paths — so a
- * sidecar process that dispatches hooks (a worker running conversation
- * turns) can never bring a plugin up in its own process.
- *
- * `effectiveEnabledPlugins` carries the per-chat plugin scope: when non-null,
- * user plugins outside the set are skipped (standalone workspace hooks always
- * run). `null`/omitted means no per-chat restriction.
+ * Plugin names currently in the discovery cache, in install-date order.
+ * Hook lookup in `hooks/registry.ts` walks this set; the cache itself does
+ * not resolve hooks.
  */
-export async function getUserHookEntriesFor<TCtx = unknown>(
-  hookName: string,
-  effectiveEnabledPlugins?: Set<string> | null,
-): Promise<HookEntry<TCtx>[]> {
-  return collectUserHookEntries<TCtx>(
-    hookName,
-    discoveredPluginDirs.values(),
-    effectiveEnabledPlugins,
-  );
+export function getDiscoveredUserPluginNames(): Iterable<string> {
+  return discoveredPluginDirs.values();
 }
 
 /**
- * {@link getUserHookEntriesFor} without owner attribution — returns just the
- * hook functions in the same order.
+ * True when this daemon process brought the plugin directory `dir` up:
+ * {@link bringUpPlugin} ran for it and its `init` was attempted. An `init` that
+ * threw still counts, because activation never aborts on init failure (see
+ * {@link activatePlugin}), and that is deliberate: an init-failed plugin's
+ * hooks and tools stay live, so its schedules must too. What membership
+ * excludes is a directory dropped in out-of-band that no boot scan and no
+ * reconcile pass has activated yet.
+ *
+ * The backing map is per-process, so a process that runs no plugin loader (the
+ * schedule worker, sidecar turn workers) reads `false` for every directory.
+ * Only code that provably runs in the main daemon may treat this as an answer.
  */
-export async function getUserHooksFor<TCtx = unknown>(
-  hookName: string,
-  effectiveEnabledPlugins?: Set<string> | null,
-): Promise<HookFunction<TCtx>[]> {
-  const entries = await getUserHookEntriesFor<TCtx>(
-    hookName,
-    effectiveEnabledPlugins,
-  );
-  return entries.map((e) => e.fn);
+export function isPluginDirActivated(dir: string): boolean {
+  return discoveredPluginDirs.has(dir);
 }
 
 // ─── Source-versions reconcile ───────────────────────────────────────────────
@@ -293,6 +267,30 @@ export async function reconcilePluginSourcesNow(): Promise<void> {
     } catch (err) {
       log.error({ err }, "imperative plugin reconcile failed");
     }
+    // Converge plugin-declared schedules against the plugin set this apply
+    // just settled, so install/uninstall/upgrade arm and disarm rows in the
+    // same poke. Imported lazily to keep the notification pipeline out of
+    // this module's static graph (sidecar workers import it for hook reads).
+    // Self-contained: never throws and checks DB readiness itself.
+    try {
+      const { reconcilePluginSchedules } =
+        await import("../schedule/plugin-schedule-reconciler.js");
+      await reconcilePluginSchedules();
+    } catch (err) {
+      log.error({ err }, "plugin schedule reconcile failed");
+    }
+    // Converge plugin-declared MCP servers the same way, so an install
+    // brings its `mcp.json` servers up and an uninstall/disable takes their
+    // connected clients and registered tools back down. Reloads only when
+    // the declared set actually moved. Lazily imported for the same reason
+    // as the schedule reconciler, and equally self-contained.
+    try {
+      const { reconcilePluginMcpServers } =
+        await import("../daemon/mcp-reload-service.js");
+      await reconcilePluginMcpServers();
+    } catch (err) {
+      log.error({ err }, "plugin MCP reconcile failed");
+    }
   })().finally(() => {
     reconcileInFlight = null;
   });
@@ -306,32 +304,26 @@ export async function reconcilePluginSourcesNow(): Promise<void> {
  * never dynamically imports code from outside the designated plugin roots,
  * regardless of what the collector walked.
  *
- * Uses `realpathSync` to resolve symlinks before the prefix check, so a
- * symlinked path that looks like it's under the plugins dir but points
- * elsewhere is rejected.
+ * Containment runs through {@link isInsidePluginRoot}, which resolves the
+ * candidate and the root, so a symlinked path that looks like it's under the
+ * plugins dir but points elsewhere is rejected while a plugins dir reached
+ * through a symlinked path component still accepts its own children.
  */
 function isAllowedPluginDir(
   dir: string,
   pluginsDir: string,
   hooksDir: string,
 ): boolean {
-  let resolved: string;
-  try {
-    resolved = realpathSync(dir);
-  } catch {
-    // Directory doesn't exist or is inaccessible — allow it through so
-    // bringUpPlugin/parsePluginManifest can log the normal failure. The
+  if (!existsSync(dir)) {
+    // Directory doesn't exist or is inaccessible: allow it through so
+    // bringUpPlugin/parsePluginManifest can log the normal failure, and so a
+    // directory that just went away still reaches its teardown branch. The
     // danger is importing code from an unexpected location, not a missing
     // directory.
     return true;
   }
-  const normalizedPluginsDir = pluginsDir + "/";
-  const normalizedHooksDir = hooksDir + "/";
   return (
-    resolved === pluginsDir ||
-    resolved.startsWith(normalizedPluginsDir) ||
-    resolved === hooksDir ||
-    resolved.startsWith(normalizedHooksDir)
+    isInsidePluginRoot(dir, pluginsDir) || isInsidePluginRoot(dir, hooksDir)
   );
 }
 
@@ -754,6 +746,17 @@ async function scanPlugins(): Promise<void> {
     } catch {
       continue;
     }
+    // Judge the entry by where it resolves. A symlinked plugin root pointing
+    // out of the plugins directory is not an install, and activating one at
+    // boot would run code that enumeration and the reload path both refuse to
+    // touch.
+    if (!isInsidePluginRoot(pluginDir, pluginsDir)) {
+      log.warn(
+        { pluginDir },
+        "plugin root resolves outside the plugins directory, skipping",
+      );
+      continue;
+    }
     if (!existsSync(join(pluginDir, "package.json"))) {
       continue;
     }
@@ -1068,7 +1071,7 @@ async function deactivatePlugin(
  * Called by `loadUserPlugins()` during daemon startup. After boot, the same
  * `activatePlugin`/`deactivatePlugin` reconciliation runs only through the
  * imperative poke ({@link reconcilePluginSourcesNow}) the install/uninstall/
- * enable/disable routes call, so plugin lifecycle stays confined to the main
+ * upgrade/enable routes call, so plugin lifecycle stays confined to the main
  * daemon — dispatch-time hook and tool reads never activate anything.
  */
 export async function populateCacheAtBoot(

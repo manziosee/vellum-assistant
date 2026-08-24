@@ -207,12 +207,100 @@ describe("POST inference/provider-connections (create)", () => {
       {
         body: {
           name: "managed-openai",
-          provider: "openai",
+          provider: "vellum",
           auth: { type: "platform" },
         },
       },
     )) as { auth: object };
     expect(result.auth).toEqual({ type: "platform" });
+  });
+
+  test("rejects platform auth on a real provider", async () => {
+    const err = await call(
+      findHandler("inference_provider_connections_create"),
+      {
+        body: {
+          name: "managed-openai",
+          provider: "openai",
+          auth: { type: "platform" },
+        },
+      },
+    ).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(BadRequestError);
+    expect((err as BadRequestError).message).toContain("platform");
+    expect((err as BadRequestError).message).toContain("vellum");
+  });
+
+  test("rejects a chatgpt identity row under a non-canonical name", async () => {
+    const err = await call(
+      findHandler("inference_provider_connections_create"),
+      {
+        body: {
+          name: "my-chatgpt",
+          provider: "chatgpt",
+          auth: { type: "oauth_subscription", credential: "credential/x" },
+        },
+      },
+    ).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(BadRequestError);
+    expect((err as BadRequestError).message).toContain("chatgpt-subscription");
+  });
+
+  test("rejects key auth on the chatgpt provider, derived or explicit", async () => {
+    for (const body of [
+      {
+        name: "chatgpt-subscription",
+        provider: "chatgpt",
+        auth: { type: "api_key", credential: "vault/x" },
+      },
+      // No explicit auth: derivation would fall through to api_key.
+      {
+        name: "chatgpt-subscription",
+        provider: "chatgpt",
+        credential: "vault/x",
+      },
+    ]) {
+      const err = await call(
+        findHandler("inference_provider_connections_create"),
+        { body },
+      ).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(BadRequestError);
+      expect((err as BadRequestError).message).toContain("sign-in");
+    }
+  });
+
+  test("rejects subscription auth on a non-chatgpt provider", async () => {
+    const err = await call(
+      findHandler("inference_provider_connections_create"),
+      {
+        body: {
+          name: "keyed-oauth",
+          provider: "openai",
+          auth: { type: "oauth_subscription", credential: "credential/x" },
+        },
+      },
+    ).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(BadRequestError);
+    expect((err as BadRequestError).message).toContain("chatgpt");
+  });
+
+  test("rejects key auth on the vellum provider", async () => {
+    const err = await call(
+      findHandler("inference_provider_connections_create"),
+      {
+        body: {
+          name: "keyed-vellum",
+          provider: "vellum",
+          auth: { type: "api_key", credential: "vault/vellum/key" },
+        },
+      },
+    ).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(BadRequestError);
+    expect((err as BadRequestError).message).toContain("vellum");
   });
 
   test("creates connection with none auth (e.g. ollama)", async () => {
@@ -225,8 +313,59 @@ describe("POST inference/provider-connections (create)", () => {
           auth: { type: "none" },
         },
       },
-    )) as { auth: object };
+    )) as { auth: object; baseUrl: string | null };
     expect(result.auth).toEqual({ type: "none" });
+    expect(result.baseUrl).toBeNull();
+  });
+
+  test("creates an ollama connection with an optional base_url", async () => {
+    const result = (await call(
+      findHandler("inference_provider_connections_create"),
+      {
+        body: {
+          name: "ollama-remote",
+          provider: "ollama",
+          auth: { type: "none" },
+          base_url: "http://192.168.1.50:11434/v1",
+        },
+      },
+    )) as { auth: object; baseUrl: string | null };
+    expect(result.auth).toEqual({ type: "none" });
+    expect(result.baseUrl).toBe("http://192.168.1.50:11434/v1");
+  });
+
+  test("updates an ollama connection base_url and can clear it", async () => {
+    await call(findHandler("inference_provider_connections_create"), {
+      body: {
+        name: "ollama-editable",
+        provider: "ollama",
+        auth: { type: "none" },
+      },
+    });
+
+    const updated = (await call(
+      findHandler("inference_provider_connections_update"),
+      {
+        pathParams: { name: "ollama-editable" },
+        body: {
+          auth: { type: "none" },
+          base_url: "http://127.0.0.1:11434/v1",
+        },
+      },
+    )) as { baseUrl: string | null };
+    expect(updated.baseUrl).toBe("http://127.0.0.1:11434/v1");
+
+    const cleared = (await call(
+      findHandler("inference_provider_connections_update"),
+      {
+        pathParams: { name: "ollama-editable" },
+        body: {
+          auth: { type: "none" },
+          base_url: null,
+        },
+      },
+    )) as { baseUrl: string | null };
+    expect(cleared.baseUrl).toBeNull();
   });
 
   test("derives api_key auth from provider + credential when auth is omitted", async () => {
@@ -363,7 +502,7 @@ describe("POST inference/provider-connections (create)", () => {
           models: [{ id: "my-model" }],
         },
       }),
-    ).rejects.toThrow(/belongs to a built-in provider/);
+    ).rejects.toThrow(/reserved as a provider id/);
 
     await call(findHandler("inference_provider_connections_create"), {
       body: {
@@ -424,6 +563,26 @@ describe("POST inference/provider-connections (create)", () => {
         body: { label: "OpenAI" },
       }),
     ).rejects.toThrow(/belongs to a built-in provider/);
+  });
+
+  test("attaches a failed endpoint_check when the custom base URL is unreachable", async () => {
+    // Port 1 is never listening, so the probe fails fast with a network error.
+    const result = (await call(
+      findHandler("inference_provider_connections_create"),
+      {
+        body: {
+          name: "probe-dead-endpoint",
+          provider: "openai-compatible",
+          auth: { type: "none" },
+          base_url: "http://127.0.0.1:1",
+          models: [{ id: "my-model" }],
+        },
+      },
+    )) as { endpoint_check?: { ok: boolean; resolved_url: string } };
+    expect(result.endpoint_check).toMatchObject({
+      ok: false,
+      resolved_url: "http://127.0.0.1:1/chat/completions",
+    });
   });
 
   test("derives none auth for openai-compatible without a credential", async () => {
@@ -504,7 +663,7 @@ describe("POST inference/provider-connections (create)", () => {
         body: {
           name: "dup-name",
           provider: "openai",
-          auth: { type: "platform" },
+          auth: { type: "api_key", credential: "vault/openai/key" },
         },
       }),
     ).rejects.toBeInstanceOf(ConflictError);
@@ -583,6 +742,131 @@ describe("PATCH inference/provider-connections/:name (update)", () => {
         body: { auth: { type: "platform" } },
       }),
     ).rejects.toBeInstanceOf(NotFoundError);
+  });
+
+  test("rejects switching a real provider's connection to platform auth", async () => {
+    seedConnection({
+      name: "byok-openai",
+      provider: "openai",
+      auth: { type: "api_key", credential: "vault/openai/key" },
+    });
+
+    const err = await call(
+      findHandler("inference_provider_connections_update"),
+      {
+        pathParams: { name: "byok-openai" },
+        body: { auth: { type: "platform" } },
+      },
+    ).catch((e: unknown) => e);
+
+    expect(err).toBeInstanceOf(BadRequestError);
+    expect((err as BadRequestError).message).toContain("platform");
+  });
+
+  // A persisted row whose provider and auth disagree stays editable: both the
+  // web editor and the CLI resend the stored auth on every edit, so the guard
+  // keys on an actual auth change rather than on the field being present.
+  test("allows editing a legacy mismatched row when the client resends the stored auth", async () => {
+    seedConnection({
+      name: "legacy-managed-openai",
+      provider: "openai",
+      auth: { type: "platform" },
+    });
+
+    const result = (await call(
+      findHandler("inference_provider_connections_update"),
+      {
+        pathParams: { name: "legacy-managed-openai" },
+        body: { auth: { type: "platform" }, label: "Legacy" },
+      },
+    )) as { label: string | null; auth: object };
+    expect(result.label).toBe("Legacy");
+    expect(result.auth).toEqual({ type: "platform" });
+  });
+
+  test("allows editing a legacy mismatched row when auth is omitted", async () => {
+    seedConnection({
+      name: "legacy-managed-gemini",
+      provider: "gemini",
+      auth: { type: "platform" },
+    });
+
+    const result = (await call(
+      findHandler("inference_provider_connections_update"),
+      {
+        pathParams: { name: "legacy-managed-gemini" },
+        body: { label: "Legacy" },
+      },
+    )) as { label: string | null };
+    expect(result.label).toBe("Legacy");
+  });
+
+  // The guard must not trap a legacy row in its mismatched state: an auth
+  // change that repairs the pairing is exactly what should be allowed.
+  // The canonical subscription row owns the "chatgpt" identity: writing
+  // subscription auth to it stamps the provider (the CLI login-chatgpt path
+  // PATCHes auth through this route on a row the identity migration
+  // deliberately skipped).
+  test("stamps the chatgpt identity when subscription auth lands on the canonical row", async () => {
+    seedConnection({
+      name: "chatgpt-subscription",
+      provider: "openai",
+      auth: { type: "api_key", credential: "vault/openai/key" },
+    });
+
+    const result = (await call(
+      findHandler("inference_provider_connections_update"),
+      {
+        pathParams: { name: "chatgpt-subscription" },
+        body: {
+          auth: {
+            type: "oauth_subscription",
+            credential: "credential/chatgpt/access_token",
+          },
+        },
+      },
+    )) as { provider: string; auth: { type: string } };
+    expect(result.provider).toBe("chatgpt");
+    expect(result.auth.type).toBe("oauth_subscription");
+  });
+
+  test("does not stamp the identity for non-subscription auth on that name", async () => {
+    seedConnection({
+      name: "chatgpt-subscription",
+      provider: "openai",
+      auth: { type: "api_key", credential: "vault/openai/key" },
+    });
+
+    const result = (await call(
+      findHandler("inference_provider_connections_update"),
+      {
+        pathParams: { name: "chatgpt-subscription" },
+        body: {
+          auth: { type: "api_key", credential: "vault/openai/other-key" },
+        },
+      },
+    )) as { provider: string };
+    expect(result.provider).toBe("openai");
+  });
+
+  test("allows repairing a legacy mismatched row with a valid auth change", async () => {
+    seedConnection({
+      name: "legacy-managed-anthropic",
+      provider: "anthropic",
+      auth: { type: "platform" },
+    });
+
+    const result = (await call(
+      findHandler("inference_provider_connections_update"),
+      {
+        pathParams: { name: "legacy-managed-anthropic" },
+        body: { auth: { type: "api_key", credential: "vault/anthropic/key" } },
+      },
+    )) as { auth: object };
+    expect(result.auth).toEqual({
+      type: "api_key",
+      credential: "vault/anthropic/key",
+    });
   });
 
   test("throws 400 when auth schema is invalid", async () => {
@@ -971,7 +1255,7 @@ describe("POST with label", () => {
         body: {
           name: "labeled-conn",
           provider: "anthropic",
-          auth: { type: "platform" },
+          auth: { type: "api_key", credential: "vault/anthropic/key" },
           label: "My Anthropic",
         },
       },
@@ -987,7 +1271,7 @@ describe("POST with label", () => {
         body: {
           name: "no-label-conn",
           provider: "openai",
-          auth: { type: "platform" },
+          auth: { type: "api_key", credential: "vault/openai/key" },
         },
       },
     )) as { label: string | null };
@@ -999,7 +1283,7 @@ describe("PATCH with label", () => {
   test("updates label to a string", async () => {
     seedConnection({
       name: "set-label",
-      provider: "openai",
+      provider: "vellum",
       auth: { type: "platform" },
     });
 
@@ -1016,7 +1300,7 @@ describe("PATCH with label", () => {
   test("clears label by setting it to null", async () => {
     seedConnection({
       name: "clear-label",
-      provider: "gemini",
+      provider: "vellum",
       auth: { type: "platform" },
     });
     // First set a label.
@@ -1038,7 +1322,7 @@ describe("PATCH with label", () => {
   test("rejects label: empty string with 400", async () => {
     seedConnection({
       name: "reject-empty",
-      provider: "anthropic",
+      provider: "vellum",
       auth: { type: "platform" },
     });
 
@@ -1168,7 +1452,7 @@ describe("Managed connection write protection", () => {
     test("allows PATCH with auth still set to platform (no-op auth change)", async () => {
       seedConnection({
         name: "vellum",
-        provider: "anthropic",
+        provider: "vellum",
         auth: { type: "platform" },
       });
 
@@ -1190,7 +1474,7 @@ describe("Managed connection write protection", () => {
     test("allows relabeling a managed connection", async () => {
       seedConnection({
         name: "vellum",
-        provider: "openai",
+        provider: "vellum",
         auth: { type: "platform" },
       });
 

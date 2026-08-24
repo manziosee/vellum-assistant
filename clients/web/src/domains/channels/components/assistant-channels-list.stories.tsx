@@ -1,8 +1,6 @@
 import type { Decorator, Meta, StoryObj } from "@storybook/react-vite";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { useLayoutEffect } from "react";
 
-import { useChannelAdapterSelectionStore } from "@/domains/channels/adapter-selection-store";
 import type { SetupChannelId } from "@/types/channel-types";
 
 import { AssistantChannelsList } from "./assistant-channels-list";
@@ -26,16 +24,25 @@ const withQueryClient: Decorator = (Story) => (
 );
 
 /**
- * Pin the master-detail selection for a story. The active adapter lives in a
- * module-level store that persists across story navigation, so each story
- * seeds it explicitly rather than inheriting the previously-viewed adapter.
+ * The app's two Channels routes: the bare tab, and an adapter named in the URL.
+ * Selection lives in the URL, so a story needs both patterns for the rail to
+ * move the selection the way it does in the app.
  */
-function withSelectedAdapter(adapter: SetupChannelId): Decorator {
-  return function SelectAdapter(Story) {
-    useLayoutEffect(() => {
-      useChannelAdapterSelectionStore.setState({ selectedAdapter: adapter });
-    }, []);
-    return <Story />;
+const CHANNELS_ROUTES = [
+  "/assistant/channels",
+  "/assistant/channels/:channelId",
+];
+
+/**
+ * Pin the master-detail selection for a story: it starts at the selected
+ * adapter's address rather than seeding state.
+ */
+function selectedAdapter(adapter: SetupChannelId) {
+  return {
+    router: {
+      initialEntries: [`/assistant/channels/${adapter}`],
+      paths: CHANNELS_ROUTES,
+    },
   };
 }
 
@@ -46,9 +53,14 @@ const meta: Meta<typeof AssistantChannelsList> = {
     assistantId: "assistant-1",
     assistantName: "Example Assistant",
     channels: [
-      { key: "slack", status: "ready", address: "@example-assistant" },
-      { key: "telegram", status: "not_configured" },
-      { key: "phone", status: "not_configured" },
+      {
+        key: "slack",
+        status: "ready",
+        configured: true,
+        address: "@example-assistant",
+      },
+      { key: "telegram", status: "not_configured", configured: false },
+      { key: "phone", status: "not_configured", configured: false },
     ],
     onSetup: () => {},
     onDisconnect: () => {},
@@ -80,7 +92,7 @@ type Story = StoryObj<typeof AssistantChannelsList>;
 
 /** Default: Slack selected, its consolidated connection card in the detail panel. */
 export const ChannelsTab: Story = {
-  decorators: [withSelectedAdapter("slack")],
+  parameters: selectedAdapter("slack"),
 };
 
 /**
@@ -90,7 +102,7 @@ export const ChannelsTab: Story = {
  * policy handler wired — its floors are managed per conversation type.
  */
 export const ChannelsTabSlackConnected: Story = {
-  decorators: [withSelectedAdapter("slack")],
+  parameters: selectedAdapter("slack"),
   args: {
     slackThreadMode: "mention_then_thread",
     onSlackThreadModeChange: () => {},
@@ -99,26 +111,44 @@ export const ChannelsTabSlackConnected: Story = {
   },
 };
 
+/**
+ * The pane this tab actually gets on a 768px window: the chat layout's sidebar
+ * and the page shell's padding leave roughly 470px, which is not enough for the
+ * adapter rail beside a detail panel. The rail moves behind the hamburger,
+ * decided on the pane rather than the window, so it does not matter that the
+ * window itself is wide. Storybook's own frame is the window here.
+ */
+export const ChannelsTabInNarrowPane: Story = {
+  parameters: selectedAdapter("slack"),
+  decorators: [
+    (Story) => (
+      <div style={{ width: 470 }}>
+        <Story />
+      </div>
+    ),
+  ],
+};
+
 /** Disconnected Slack: the setup wizard in the "Slack setup" card. */
 export const ChannelsTabSlackDisconnected: Story = {
-  decorators: [withSelectedAdapter("slack")],
+  parameters: selectedAdapter("slack"),
   args: {
     channels: [
-      { key: "slack", status: "not_configured" },
-      { key: "telegram", status: "not_configured" },
-      { key: "phone", status: "not_configured" },
+      { key: "slack", status: "not_configured", configured: false },
+      { key: "telegram", status: "not_configured", configured: false },
+      { key: "phone", status: "not_configured", configured: false },
     ],
   },
 };
 
 /** Disconnected Telegram: empty state with guided setup + manual escape hatch. */
 export const ChannelsTabTelegramDisconnected: Story = {
-  decorators: [withSelectedAdapter("telegram")],
+  parameters: selectedAdapter("telegram"),
 };
 
 /** Disconnected Phone: empty state with guided setup + manual escape hatch. */
 export const ChannelsTabPhoneDisconnected: Story = {
-  decorators: [withSelectedAdapter("phone")],
+  parameters: selectedAdapter("phone"),
 };
 
 /**
@@ -127,12 +157,22 @@ export const ChannelsTabPhoneDisconnected: Story = {
  * with Slack's connected card: the token field belongs to the connect flow.
  */
 export const ChannelsTabTelegramConnected: Story = {
-  decorators: [withSelectedAdapter("telegram")],
+  parameters: selectedAdapter("telegram"),
   args: {
     channels: [
-      { key: "slack", status: "ready", address: "@example-assistant" },
-      { key: "telegram", status: "ready", address: "@example_bot" },
-      { key: "phone", status: "not_configured" },
+      {
+        key: "slack",
+        status: "ready",
+        configured: true,
+        address: "@example-assistant",
+      },
+      {
+        key: "telegram",
+        status: "ready",
+        configured: true,
+        address: "@example_bot",
+      },
+      { key: "phone", status: "not_configured", configured: false },
     ],
     channelPolicies: { telegram: "trusted_contacts" },
     onChannelPolicyChange: () => {},
@@ -144,12 +184,17 @@ export const ChannelsTabTelegramConnected: Story = {
  * Twilio credential fields.
  */
 export const ChannelsTabPhoneConnected: Story = {
-  decorators: [withSelectedAdapter("phone")],
+  parameters: selectedAdapter("phone"),
   args: {
     channels: [
-      { key: "slack", status: "ready", address: "@example-assistant" },
-      { key: "telegram", status: "not_configured" },
-      { key: "phone", status: "ready", address: "+15550100" },
+      {
+        key: "slack",
+        status: "ready",
+        configured: true,
+        address: "@example-assistant",
+      },
+      { key: "telegram", status: "not_configured", configured: false },
+      { key: "phone", status: "ready", configured: true, address: "+15550100" },
     ],
     channelPolicies: { phone: "trusted_contacts" },
     onChannelPolicyChange: () => {},
@@ -161,6 +206,12 @@ export const ChannelsTabPhoneConnected: Story = {
  * lands on its manual credential form rather than the empty state.
  */
 export const ChannelsTabTelegramSetupHandoff: Story = {
+  parameters: {
+    router: {
+      initialEntries: ["/assistant/channels"],
+      paths: CHANNELS_ROUTES,
+    },
+  },
   args: {
     initialChannel: "telegram",
   },

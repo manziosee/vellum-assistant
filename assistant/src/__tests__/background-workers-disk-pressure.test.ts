@@ -61,7 +61,7 @@ mock.module("../persistence/conversation-crud.js", () => ({
   getConversationPersistedSeq: () => null,
   addMessage: mock(() => ({ id: "msg-1" })),
   archiveConversation: mock(() => true),
-  batchSetDisplayOrders: mock(() => {}),
+  batchSetConversationPlacement: mock(() => {}),
   createConversation: (opts: { conversationType: string }) => {
     createdConversations.push(opts);
     return { id: "conv-1", ...opts };
@@ -99,7 +99,7 @@ mock.module("../persistence/conversation-crud.js", () => ({
   parseConversation: (row: unknown) => row,
   provenanceFromTrustContext: () => ({ source: "user" }),
   relinkAttachments: mock(() => {}),
-  selectSlackMetaCandidateMetadata: () => null,
+  selectProviderMetaCandidateMetadata: () => null,
   setConversationOriginChannelIfUnset: mock(() => {}),
   setConversationOriginInterfaceIfUnset: mock(() => {}),
   setConversationInferenceProfile: mock(() => {}),

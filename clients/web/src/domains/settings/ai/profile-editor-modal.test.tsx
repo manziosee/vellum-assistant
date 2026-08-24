@@ -14,7 +14,10 @@
  *  - editing Name then selecting another model does NOT clobber Name/Key,
  *  - "+ Create new provider" mounts the inline ProviderCreateForm, and a
  *    successful create selects that provider + enables Save once a model is
- *    chosen.
+ *    chosen,
+ *  - every supported provider is offered, unconnected ones chipped with what
+ *    they still need and routed into the inline create form preselected,
+ *  - a rejected activation surfaces the server's own reason.
  */
 
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
@@ -26,6 +29,7 @@ import { createElement, type ReactNode } from "react";
 import { useAssistantLifecycleStore } from "@/assistant/lifecycle-store";
 import type { ProviderConnection } from "@/generated/daemon/types.gen";
 import * as sdkGen from "@/generated/daemon/sdk.gen";
+import { ApiError } from "@/utils/api-errors";
 
 // ---------------------------------------------------------------------------
 // Module mocks
@@ -141,8 +145,8 @@ function getSaveBtn(): HTMLButtonElement {
   return btn;
 }
 
-/** All Dropdown triggers (custom comboboxes) in document order. */
-function dropdownTriggers(): HTMLButtonElement[] {
+/** All Select triggers (custom comboboxes) in document order. */
+function selectTriggers(): HTMLButtonElement[] {
   return Array.from(
     document.querySelectorAll<HTMLButtonElement>('button[role="combobox"]'),
   );
@@ -175,6 +179,48 @@ function pickOption(trigger: HTMLButtonElement, wantedLabel: string): void {
   fireEvent.click(option);
 }
 
+/**
+ * The open listbox as `{ label, meta }` rows. `meta` is the right-aligned
+ * suffix chip ("Managed", "Custom", "Add API key", …), empty when absent.
+ */
+function optionRows(): { label: string; meta: string }[] {
+  return Array.from(
+    document.querySelectorAll<HTMLElement>('[role="option"]'),
+  ).map((o) => {
+    const label = optionLabel(o);
+    const full = (o.textContent ?? "").trim();
+    return { label, meta: full.slice(label.length).trim() };
+  });
+}
+
+/** Labels of the open listbox, in order. */
+function optionLabels(): string[] {
+  return optionRows().map((row) => row.label);
+}
+
+/** Meta chip on supported-but-unconnected, key-based provider rows. */
+const ADD_KEY_META = "Add API key";
+
+/**
+ * Every supported provider a platform-hosted assistant can connect by API key,
+ * in picker order. Ollama is absent (self-hosted only) and custom endpoints are
+ * reached through "+ Create new provider", so neither appears here.
+ */
+const UNCONNECTED_PROVIDER_LABELS = [
+  "Anthropic",
+  "OpenAI",
+  "Google Gemini",
+  "Fireworks",
+  "Together AI",
+  "OpenRouter",
+  "Vercel AI Gateway",
+  "MiniMax",
+  "Atlas Cloud",
+  "LiteLLM",
+  "Baseten",
+  "Poolside",
+];
+
 /** The create-mode Provider dropdown is labelled via `aria-labelledby`. */
 function providerTrigger(): HTMLButtonElement {
   const trigger = document.querySelector<HTMLButtonElement>(
@@ -184,6 +230,16 @@ function providerTrigger(): HTMLButtonElement {
     throw new Error("expected the Provider dropdown trigger");
   }
   return trigger;
+}
+
+/**
+ * The inline ProviderCreateForm's own Provider dropdown (`aria-label`), or
+ * null — the sub-form omits it when the outer picker preselected the provider.
+ */
+function createFormProviderTrigger(): HTMLButtonElement | null {
+  return document.querySelector<HTMLButtonElement>(
+    'button[role="combobox"][aria-label="Provider"]',
+  );
 }
 
 /** Selects a provider in the create-mode Provider dropdown, then a model in
@@ -197,7 +253,7 @@ function selectModel(label: string): void {
   // listbox contains the target model label. Probing each candidate keeps the
   // helper robust to the optional Connection dropdown appearing alongside it.
   const provTrigger = providerTrigger();
-  for (const trigger of dropdownTriggers()) {
+  for (const trigger of selectTriggers()) {
     if (trigger === provTrigger) {
       continue;
     }
@@ -240,6 +296,7 @@ function renderEdit(
   initialValues: Record<string, unknown>,
   onSave: (name: string, entry: unknown) => Promise<void> = () =>
     Promise.resolve(),
+  connections: ProviderConnection[] = [makeConnection("anthropic-personal")],
 ) {
   return render(
     <Wrapper>
@@ -249,7 +306,7 @@ function renderEdit(
         profileName={(initialValues.name as string) ?? "balanced"}
         initialValues={initialValues as never}
         existingNames={[(initialValues.name as string) ?? "balanced"]}
-        connections={[makeConnection("anthropic-personal")]}
+        connections={connections}
         assistantId={ASSISTANT_ID}
         onSave={onSave}
         onCancel={() => {}}
@@ -439,26 +496,37 @@ describe("ProfileEditorModal create mode — provider-first", () => {
     );
   });
 
-  test("first-run empty state shows only the create-new-provider option", () => {
+  test("first-run empty state offers every supported provider, each flagged as needing a key", () => {
+    // Nothing is connected yet, so every supported provider is listed as a
+    // "connect me" entry — a supported provider must never be invisible just
+    // because no connection exists for it (Google Gemini, in the report).
     renderCreate([]);
     fireEvent.click(providerTrigger());
-    const optionLabels = Array.from(
-      document.querySelectorAll<HTMLElement>('[role="option"]'),
-    ).map((o) => optionLabel(o));
-    expect(optionLabels).toEqual(["+ Create new provider"]);
+    expect(optionLabels()).toEqual([
+      ...UNCONNECTED_PROVIDER_LABELS,
+      "+ Create new provider",
+    ]);
+    expect(optionLabels()).toContain("Google Gemini");
+    // Each carries the chip naming what it still needs.
+    expect(
+      optionRows()
+        .filter((row) => row.label !== "+ Create new provider")
+        .every((row) => row.meta === ADD_KEY_META),
+    ).toBe(true);
   });
 
-  test("the Vellum-managed connection surfaces every managed-routable provider", () => {
+  test("the Vellum-managed connection leads, with the unconnected providers behind it", () => {
     // A platform-hosted user's only connection is the single provider-agnostic
-    // `vellum` connection. It must expand into the managed-routable providers
-    // so the picker isn't limited to "+ Create new provider".
+    // `vellum` connection. It leads the list as one entry (never the managed
+    // upstreams it routes to); BYOK providers follow as connect-me entries.
     renderCreate([makeConnection("vellum-managed", "vellum")]);
     fireEvent.click(providerTrigger());
-    const optionLabels = Array.from(
-      document.querySelectorAll<HTMLElement>('[role="option"]'),
-    ).map((o) => optionLabel(o));
-    // A single Vellum entry — never the managed upstreams it routes to.
-    expect(optionLabels).toEqual(["Vellum", "+ Create new provider"]);
+    expect(optionRows()[0]).toEqual({ label: "Vellum", meta: "Managed" });
+    expect(optionLabels()).toEqual([
+      "Vellum",
+      ...UNCONNECTED_PROVIDER_LABELS,
+      "+ Create new provider",
+    ]);
   });
 
   test("selecting Vellum saves the model's managed upstream bound to the vellum connection", async () => {
@@ -537,12 +605,16 @@ describe("ProfileEditorModal create mode — provider-first", () => {
     // Both endpoints are individual entries; no generic collapsed entry and
     // no second field.
     fireEvent.click(providerTrigger());
-    const optionLabels = Array.from(
-      document.querySelectorAll<HTMLElement>('[role="option"]'),
-    ).map((o) => optionLabel(o));
-    expect(optionLabels).toEqual([
+    expect(optionRows().slice(0, 2)).toEqual([
+      { label: "lm-studio", meta: "Custom" },
+      { label: "vllm-box", meta: "Custom" },
+    ]);
+    // The unconnected providers follow, and the create entry still closes the
+    // list — "OpenAI-compatible" is never offered as a bare protocol entry.
+    expect(optionLabels()).toEqual([
       "lm-studio",
       "vllm-box",
+      ...UNCONNECTED_PROVIDER_LABELS,
       "+ Create new provider",
     ]);
     fireEvent.click(
@@ -886,15 +958,20 @@ describe("ProfileEditorModal create mode — provider-first", () => {
     ).toBe(false);
   });
 
-  test("a BYOK connection surfaces its own provider", () => {
+  test("a BYOK connection surfaces its own provider, unchipped and listed once", () => {
     // A self-hosted user who entered an Anthropic API key gets an `anthropic`
-    // connection, which must surface Anthropic as a selectable provider.
+    // connection, which must surface Anthropic as a ready-to-use provider —
+    // leading the list, with no "needs a key" chip and no duplicate entry in
+    // the unconnected tail.
     renderCreate([makeConnection("anthropic-personal", "anthropic")]);
     fireEvent.click(providerTrigger());
-    const optionLabels = Array.from(
-      document.querySelectorAll<HTMLElement>('[role="option"]'),
-    ).map((o) => optionLabel(o));
-    expect(optionLabels).toEqual(["Anthropic", "+ Create new provider"]);
+    expect(optionRows()[0]).toEqual({ label: "Anthropic", meta: "" });
+    expect(optionLabels().filter((l) => l === "Anthropic")).toHaveLength(1);
+    expect(optionLabels()).toEqual([
+      "Anthropic",
+      ...UNCONNECTED_PROVIDER_LABELS.filter((l) => l !== "Anthropic"),
+      "+ Create new provider",
+    ]);
   });
 
   test("a provider unknown to the catalog shows an explicit empty-model state", () => {
@@ -907,7 +984,7 @@ describe("ProfileEditorModal create mode — provider-first", () => {
 
     // The Model dropdown trigger explains the empty list instead of showing
     // a bare "Select a model" placeholder over zero options...
-    const triggerLabels = dropdownTriggers().map((t) => t.textContent?.trim());
+    const triggerLabels = selectTriggers().map((t) => t.textContent?.trim());
     expect(triggerLabels).toContain("No models available");
     expect(triggerLabels).not.toContain("Select a model");
 
@@ -926,7 +1003,7 @@ describe("ProfileEditorModal create mode — provider-first", () => {
 
     selectProvider("Ollama");
 
-    const triggerLabels = dropdownTriggers().map((t) => t.textContent?.trim());
+    const triggerLabels = selectTriggers().map((t) => t.textContent?.trim());
     expect(triggerLabels).toContain("Select a model");
     expect(triggerLabels).not.toContain("No models available");
 
@@ -948,10 +1025,26 @@ describe("ProfileEditorModal create mode — provider-first", () => {
 
     fireEvent.click(providerTrigger());
 
-    const optionLabels = Array.from(
-      document.querySelectorAll<HTMLElement>('[role="option"]'),
-    ).map((o) => optionLabel(o));
-    expect(optionLabels).toEqual(["+ Create new provider"]);
+    // Neither as a connected entry (the connection exists but can't be reached
+    // from a platform-hosted assistant) nor as a connect-me entry.
+    expect(optionLabels()).not.toContain("Ollama");
+    expect(optionLabels()).toEqual([
+      ...UNCONNECTED_PROVIDER_LABELS,
+      "+ Create new provider",
+    ]);
+  });
+
+  test("a self-hosted assistant offers unconnected Ollama as a keyless set-up entry", () => {
+    // Ollama serves a local endpoint with no credential, so its chip must not
+    // promise an API key step it never asks for.
+    useAssistantLifecycleStore.setState({
+      assistantState: { kind: "self_hosted" },
+    });
+    renderCreate([]);
+
+    fireEvent.click(providerTrigger());
+
+    expect(optionRows()).toContainEqual({ label: "Ollama", meta: "Set up" });
   });
 
   test("+ Create new provider mounts ProviderCreateForm; successful create selects it and Save enables after a model", async () => {
@@ -981,6 +1074,108 @@ describe("ProfileEditorModal create mode — provider-first", () => {
     await waitFor(() => {
       expect(getSaveBtn().disabled).toBe(false);
     });
+  });
+
+  test("picking an unconnected provider opens the inline create form preselected on it", () => {
+    renderCreate([makeConnection("anthropic-personal", "anthropic")]);
+
+    selectProvider("Google Gemini");
+
+    // The sub-form is mounted with Gemini already fixed, so the user lands
+    // directly on the API-key field with no second Provider dropdown — the
+    // outer picker is the single place the provider reads.
+    expect(createFormProviderTrigger()).toBeNull();
+    expect(getInputByPlaceholder("Enter your API key")).toBeDefined();
+    expect(optionLabel(providerTrigger())).toBe("Google Gemini");
+  });
+
+  test("switching to another unconnected provider re-seeds the inline create form", () => {
+    renderCreate([]);
+
+    selectProvider("Google Gemini");
+    // Gemini's credential ref is seeded into the remounted sub-form.
+    expect(getInputByPlaceholder("Enter your API key")).toBeDefined();
+    expect(optionLabel(providerTrigger())).toBe("Google Gemini");
+
+    selectProvider("OpenRouter");
+    expect(getInputByPlaceholder("Enter your API key")).toBeDefined();
+    expect(optionLabel(providerTrigger())).toBe("OpenRouter");
+  });
+
+  test("the generic create-new-provider entry keeps the sub-form's own Provider dropdown", () => {
+    renderCreate([]);
+
+    selectProvider("+ Create new provider");
+
+    const trigger = createFormProviderTrigger();
+    expect(trigger).not.toBeNull();
+  });
+
+  test("connecting a preselected provider binds it and continues the profile flow", async () => {
+    createdConnection = makeConnection("gemini", "gemini");
+    const saveCalls: { name: string; entry: Record<string, unknown> }[] = [];
+    const onSave = (name: string, entry: unknown) => {
+      saveCalls.push({ name, entry: entry as Record<string, unknown> });
+      return Promise.resolve();
+    };
+    renderCreate([], onSave);
+
+    selectProvider("Google Gemini");
+    fireEvent.change(getInputByPlaceholder("Enter your API key"), {
+      target: { value: "test-key-123" },
+    });
+    fireEvent.click(getButton("Add"));
+
+    // The sub-form collapses and the new connection is bound to the profile.
+    await waitFor(() => {
+      expect(document.body.textContent).toContain(
+        "New provider connection will show up in the Providers section.",
+      );
+    });
+
+    selectModel("Gemini 3.6 Flash");
+    await waitFor(() => {
+      expect(getSaveBtn().disabled).toBe(false);
+    });
+    fireEvent.click(getSaveBtn());
+
+    await waitFor(() => {
+      expect(saveCalls.length).toBe(1);
+    });
+    expect(saveCalls[0].entry.provider).toBe("gemini");
+    expect(saveCalls[0].entry.provider_connection).toBe("gemini");
+  });
+
+  test("cancelling the inline create leaves the profile without a provider", () => {
+    renderCreate([]);
+
+    selectProvider("Google Gemini");
+    // The sub-form's own Cancel, not the modal footer's.
+    const inlineCancel = Array.from(
+      document.querySelectorAll<HTMLButtonElement>("button"),
+    ).find(
+      (b) =>
+        b.textContent?.trim() === "Cancel" &&
+        b.getAttribute("data-testid") !== "modal-cancel-btn",
+    );
+    fireEvent.click(inlineCancel!);
+
+    // No connection was created, so the profile must not be left bound to a
+    // route the daemon can't dispatch through — Save stays blocked.
+    expect(getSaveBtn().disabled).toBe(true);
+    expect(providerTrigger().textContent?.trim()).toBe("Select a provider…");
+  });
+
+  test("a connected provider is selected directly, without the create form", () => {
+    renderCreate([makeConnection("anthropic-personal", "anthropic")]);
+
+    selectProvider("Anthropic");
+
+    expect(
+      document.querySelector('input[placeholder="Enter your API key"]'),
+    ).toBeNull();
+    selectModel("Claude Opus 4.8");
+    expect(optionLabel(providerTrigger())).toBe("Anthropic");
   });
 
   test("inline-create then immediate save persists the new provider_connection (no race)", async () => {
@@ -1176,7 +1371,7 @@ describe("ProfileEditorModal edit mode — catalog-absent bound model", () => {
     // The Model trigger surfaces the bound id (no catalog/connection name
     // available, so it falls back to the raw id) rather than the empty
     // placeholder...
-    const triggerLabels = dropdownTriggers().map((t) => t.textContent?.trim());
+    const triggerLabels = selectTriggers().map((t) => t.textContent?.trim());
     expect(triggerLabels).toContain("openrouter/fusion");
     expect(triggerLabels).not.toContain("Select a model");
 
@@ -1223,7 +1418,7 @@ describe("ProfileEditorModal edit mode — catalog-absent bound model", () => {
 
     // Open each combobox; the Model dropdown must list the bound id so it can
     // be re-selected manually (the second reported surface of JARVIS-1180).
-    const optionLabels = dropdownTriggers().flatMap((trigger) => {
+    const optionLabels = selectTriggers().flatMap((trigger) => {
       fireEvent.click(trigger);
       const labels = Array.from(
         document.querySelectorAll<HTMLElement>('[role="option"]'),
@@ -1232,6 +1427,35 @@ describe("ProfileEditorModal edit mode — catalog-absent bound model", () => {
       return labels;
     });
     expect(optionLabels).toContain("openrouter/fusion");
+  });
+
+  test("renders a bound openai-compatible model the connection list omits, and keeps Save enabled", () => {
+    // An openai-compatible profile can be bound to a pass-through id
+    // (gateway alias, unrefreshed model) that the connection's returned
+    // list does not include. The Model field still shows that id, and
+    // Save stays enabled.
+    const lmStudio = {
+      ...makeConnection("lm-studio", "openai-compatible"),
+      models: [{ id: "llama-3.1", displayName: "Llama 3.1" }],
+    } as unknown as ProviderConnection;
+
+    renderEdit(
+      {
+        name: "local-llm",
+        label: "Local LLM",
+        provider: "openai-compatible",
+        model: "gateway-alias",
+        provider_connection: "lm-studio",
+        status: "active",
+      },
+      lmStudio,
+    );
+
+    const triggerLabels = selectTriggers().map((t) => t.textContent?.trim());
+    expect(triggerLabels).toContain("gateway-alias");
+    expect(triggerLabels).not.toContain("Select a model");
+    expect(document.body.textContent).not.toContain("Select a model.");
+    expect(getSaveBtn().disabled).toBe(false);
   });
 
   test("clears a catalog model the connection's subscription filters out, rather than offering it", async () => {
@@ -1265,15 +1489,15 @@ describe("ProfileEditorModal edit mode — catalog-absent bound model", () => {
     // The incompatible model is auto-cleared: the Model trigger falls back to the
     // placeholder and never surfaces "GPT-5.5 Pro".
     await waitFor(() => {
-      const labels = dropdownTriggers().map((t) => t.textContent?.trim());
+      const labels = selectTriggers().map((t) => t.textContent?.trim());
       expect(labels).toContain("Select a model");
     });
-    expect(dropdownTriggers().map((t) => t.textContent?.trim())).not.toContain(
+    expect(selectTriggers().map((t) => t.textContent?.trim())).not.toContain(
       "GPT-5.5 Pro",
     );
 
     // The dropdown offers the Codex-compatible models but not the filtered one.
-    const optionLabels = dropdownTriggers().flatMap((trigger) => {
+    const optionLabels = selectTriggers().flatMap((trigger) => {
       fireEvent.click(trigger);
       const labels = Array.from(
         document.querySelectorAll<HTMLElement>('[role="option"]'),
@@ -1326,7 +1550,7 @@ describe("ProfileEditorModal edit mode — catalog-absent bound model", () => {
     // WHEN the user picks the free-text option (the Model dropdown is the only
     // one offering it) and types an id absent from the catalog, then saves
     let pickedCustom = false;
-    for (const trigger of dropdownTriggers()) {
+    for (const trigger of selectTriggers()) {
       fireEvent.click(trigger);
       const customOption = Array.from(
         document.querySelectorAll<HTMLElement>('[role="option"]'),
@@ -1382,7 +1606,7 @@ describe("ProfileEditorModal edit mode — catalog-absent bound model", () => {
       subscriptionConnection,
     );
 
-    const optionLabels = dropdownTriggers().flatMap((trigger) => {
+    const optionLabels = selectTriggers().flatMap((trigger) => {
       fireEvent.click(trigger);
       const labels = Array.from(
         document.querySelectorAll<HTMLElement>('[role="option"]'),
@@ -1582,6 +1806,47 @@ describe("ProfileEditorModal — invariant managed profiles in view mode", () =>
     expect(saveCalls[0].options?.mode).toBe("merge");
   });
 
+  test("a rejected re-enable surfaces the server's reason verbatim", async () => {
+    // The daemon rejects activating a profile it can't dispatch through with a
+    // 400 naming what's missing. Generic retry copy would send the user round
+    // the same failing loop, so the server's message wins.
+    const onSave = () =>
+      Promise.reject(
+        new ApiError(400, 'No API key for provider "gemini". Add one first.'),
+      );
+
+    renderView({ ...invariantProfile, status: "disabled" }, onSave);
+
+    fireEvent.click(findSwitchByLabel("Active")!);
+    fireEvent.click(getSaveBtn());
+
+    await waitFor(() => {
+      expect(document.body.textContent).toContain(
+        'No API key for provider "gemini". Add one first.',
+      );
+    });
+    expect(document.body.textContent).not.toContain(
+      "Failed to save profile. Please try again.",
+    );
+  });
+
+  test("a non-400 failure keeps the generic retry copy", async () => {
+    // A 500 carries internal detail — the modal must not leak it.
+    const onSave = () => Promise.reject(new ApiError(500, "boom: db offline"));
+
+    renderView({ ...invariantProfile, status: "disabled" }, onSave);
+
+    fireEvent.click(findSwitchByLabel("Active")!);
+    fireEvent.click(getSaveBtn());
+
+    await waitFor(() => {
+      expect(document.body.textContent).toContain(
+        "Failed to save profile. Please try again.",
+      );
+    });
+    expect(document.body.textContent).not.toContain("boom: db offline");
+  });
+
   test("Save As New from an invariant profile yields a fully editable create form", () => {
     renderView(invariantProfile);
 
@@ -1598,5 +1863,379 @@ describe("ProfileEditorModal — invariant managed profiles in view mode", () =>
     expect(getInputByPlaceholder("e.g. Fast & Cheap").disabled).toBe(false);
     expect(getInputByPlaceholder("e.g. fast-cheap").disabled).toBe(false);
     expect(findSwitchByLabel("Active")).not.toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Why Save is disabled (LUM-3076)
+// ---------------------------------------------------------------------------
+
+describe("ProfileEditorModal: explains why Save is blocked", () => {
+  /**
+   * Field errors are announced, so assert on the alert rather than on page
+   * text: "Select a provider" is also the picker's placeholder, and matching
+   * that would pass with no error rendered at all.
+   */
+  function fieldErrors(): string[] {
+    return Array.from(
+      document.querySelectorAll<HTMLElement>('[role="alert"]'),
+    ).map((el) => el.textContent?.trim() ?? "");
+  }
+
+  test("a profile missing its provider says so on open", () => {
+    // The Profiles row for an unusable profile links here saying "Click to
+    // fix", so the reason has to be on screen before the user touches
+    // anything. A disabled Save with no message is the bug.
+    renderEdit({ name: "half-built", provider: "", model: "" });
+
+    expect(fieldErrors()).toContain("Select a provider");
+    expect(getSaveBtn().disabled).toBe(true);
+  });
+
+  test("a complete profile raises no field error", () => {
+    renderEdit({
+      name: "balanced",
+      provider: "anthropic",
+      model: "claude-opus-5",
+    });
+
+    expect(fieldErrors()).toEqual([]);
+  });
+
+  test("with no connections at all, the error is the way out", () => {
+    // The blocking reason and the fix are the same fact here. Passing the
+    // hint as helper text would hide it, since the field shows one message
+    // and the error wins, leaving the user staring at "Select a provider"
+    // above an empty list.
+    renderEdit({ name: "half-built" }, undefined, []);
+
+    expect(fieldErrors()).toContain(
+      "No provider connections. Open Providers to add one.",
+    );
+    expect(fieldErrors()).not.toContain("Select a provider");
+  });
+
+  test("a locked profile is not told to fix a field it cannot edit", () => {
+    // `invariant` forces read-only even in edit mode, so `effectiveMode` is
+    // still "edit" and the error would otherwise render above a disabled
+    // picker. Matches how `keyError` is already suppressed for these.
+    renderEdit({ name: "my-managed", invariant: true });
+
+    expect(fieldErrors()).toEqual([]);
+  });
+
+  test("an untouched create form does not scold the user for empty fields", () => {
+    // Everything is empty because the user just opened it, not because they
+    // did anything wrong.
+    renderCreate([makeConnection("anthropic")]);
+
+    expect(fieldErrors()).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Entries wire shape (version-gated): daemons at the entry-binding gate store
+// the binding IN the provider value and never receive provider_connection.
+// ---------------------------------------------------------------------------
+
+describe("entries wire shape", () => {
+  const anthropicWork = {
+    ...makeConnection("anthropic-work"),
+    label: "Work key",
+  } as unknown as ProviderConnection;
+  const anthropicPersonal = makeConnection("anthropic-personal");
+
+  async function gateOn() {
+    const { useAssistantIdentityStore } =
+      await import("@/stores/assistant-identity-store");
+    useAssistantIdentityStore
+      .getState()
+      .setIdentity("test-asst", "0.11.4", ASSISTANT_ID);
+    return useAssistantIdentityStore;
+  }
+
+  function collectSaves() {
+    const saveCalls: { name: string; entry: Record<string, unknown> }[] = [];
+    const onSave = (name: string, entry: unknown) => {
+      saveCalls.push({ name, entry: entry as Record<string, unknown> });
+      return Promise.resolve();
+    };
+    return { saveCalls, onSave };
+  }
+
+  test("a multi-key kind expands into labeled entry rows plus a default row", () => {
+    renderCreate([anthropicWork, anthropicPersonal]);
+    fireEvent.click(providerTrigger());
+    expect(optionRows().slice(0, 3)).toEqual([
+      { label: "Anthropic", meta: "Default" },
+      { label: "Work key", meta: "Anthropic" },
+      { label: "anthropic-personal", meta: "Anthropic" },
+    ]);
+  });
+
+  test("a single-key kind stays one bare row", () => {
+    renderCreate([anthropicPersonal]);
+    fireEvent.click(providerTrigger());
+    expect(optionRows()[0]).toEqual({ label: "Anthropic", meta: "" });
+  });
+
+  test("a gated assistant writes the picked entry name as the provider", async () => {
+    const store = await gateOn();
+    try {
+      const { saveCalls, onSave } = collectSaves();
+      renderCreate([anthropicWork, anthropicPersonal], onSave);
+
+      selectProvider("Work key");
+      selectModel("Claude Opus 4.8");
+
+      await waitFor(() => {
+        expect(getSaveBtn().disabled).toBe(false);
+      });
+      fireEvent.click(getSaveBtn());
+
+      await waitFor(() => {
+        expect(saveCalls.length).toBe(1);
+      });
+      expect(saveCalls[0].entry.provider).toBe("anthropic-work");
+      expect(saveCalls[0].entry.model).toBe("claude-opus-4-8");
+      expect(saveCalls[0].entry.provider_connection).toBeUndefined();
+    } finally {
+      store.getState().clearIdentity();
+    }
+  });
+
+  test("an ungated assistant writes the picked entry as the legacy binding", async () => {
+    const { saveCalls, onSave } = collectSaves();
+    renderCreate([anthropicWork, anthropicPersonal], onSave);
+
+    selectProvider("Work key");
+    selectModel("Claude Opus 4.8");
+
+    await waitFor(() => {
+      expect(getSaveBtn().disabled).toBe(false);
+    });
+    fireEvent.click(getSaveBtn());
+
+    await waitFor(() => {
+      expect(saveCalls.length).toBe(1);
+    });
+    expect(saveCalls[0].entry.provider).toBe("anthropic");
+    expect(saveCalls[0].entry.provider_connection).toBe("anthropic-work");
+  });
+
+  test("a gated single-key save writes the bare vendor and no binding", async () => {
+    const store = await gateOn();
+    try {
+      const { saveCalls, onSave } = collectSaves();
+      renderCreate([anthropicPersonal], onSave);
+
+      selectProvider("Anthropic");
+      selectModel("Claude Opus 4.8");
+
+      await waitFor(() => {
+        expect(getSaveBtn().disabled).toBe(false);
+      });
+      fireEvent.click(getSaveBtn());
+
+      await waitFor(() => {
+        expect(saveCalls.length).toBe(1);
+      });
+      // Bare vendor id = the kind's default entry; the auto-resolved
+      // explicit binding is a legacy-shape concern.
+      expect(saveCalls[0].entry.provider).toBe("anthropic");
+      expect(saveCalls[0].entry.provider_connection).toBeUndefined();
+    } finally {
+      store.getState().clearIdentity();
+    }
+  });
+
+  test("a gated endpoint save writes the endpoint name as the provider", async () => {
+    const store = await gateOn();
+    try {
+      const lmStudio = {
+        ...makeConnection("lm-studio", "openai-compatible"),
+        models: [{ id: "model-1", displayName: "Model 1" }],
+      } as unknown as ProviderConnection;
+      const { saveCalls, onSave } = collectSaves();
+      renderCreate([lmStudio], onSave);
+
+      selectProvider("lm-studio");
+      selectModel("Model 1");
+
+      await waitFor(() => {
+        expect(getSaveBtn().disabled).toBe(false);
+      });
+      fireEvent.click(getSaveBtn());
+
+      await waitFor(() => {
+        expect(saveCalls.length).toBe(1);
+      });
+      expect(saveCalls[0].entry.provider).toBe("lm-studio");
+      expect(saveCalls[0].entry.provider_connection).toBeUndefined();
+    } finally {
+      store.getState().clearIdentity();
+    }
+  });
+
+  test("a user row merely named vellum keeps the legacy shape under the gate", async () => {
+    const store = await gateOn();
+    try {
+      const userVellum = {
+        ...makeConnection("vellum"),
+        provider: "anthropic",
+      } as unknown as ProviderConnection;
+      const { saveCalls, onSave } = collectSaves();
+      renderCreate([userVellum], onSave);
+
+      selectProvider("Anthropic");
+      selectModel("Claude Opus 4.8");
+
+      await waitFor(() => {
+        expect(getSaveBtn().disabled).toBe(false);
+      });
+      fireEvent.click(getSaveBtn());
+
+      await waitFor(() => {
+        expect(saveCalls.length).toBe(1);
+      });
+      // "vellum" as a provider value would flip the profile to the managed
+      // identity, so the binding stays in the legacy field.
+      expect(saveCalls[0].entry.provider).toBe("anthropic");
+      expect(saveCalls[0].entry.provider_connection).toBe("vellum");
+    } finally {
+      store.getState().clearIdentity();
+    }
+  });
+
+  test("a vendor id is never read as an entry name, even when a row carries it", async () => {
+    // A row can carry its vendor's own name; opening a plain unbound
+    // profile must not pin it to that row.
+    const selfNamed = makeConnection("anthropic");
+    const { saveCalls, onSave } = collectSaves();
+    renderEdit(
+      {
+        name: "plain",
+        label: "Plain",
+        provider: "anthropic",
+        model: "claude-opus-4-8",
+      },
+      onSave,
+      [selfNamed, anthropicPersonal],
+    );
+
+    fireEvent.click(getSaveBtn());
+    await waitFor(() => {
+      expect(saveCalls.length).toBe(1);
+    });
+    expect(saveCalls[0].entry.provider).toBe("anthropic");
+    // Two siblings, so no auto-resolve: the profile stays unbound instead
+    // of quietly adopting the self-named row.
+    expect(saveCalls[0].entry.provider_connection).toBeNull();
+  });
+
+  test("an explicit pin to a self-named row keeps the legacy shape under the gate", async () => {
+    const store = await gateOn();
+    try {
+      // A row named exactly after its vendor cannot be written as an entry
+      // name (the daemon reads the bare id as "the kind's default entry"),
+      // so the explicit pin must stay in the legacy binding field.
+      const selfNamed = makeConnection("anthropic");
+      const { saveCalls, onSave } = collectSaves();
+      renderEdit(
+        {
+          name: "pinned",
+          label: "Pinned",
+          provider: "anthropic",
+          provider_connection: "anthropic",
+          model: "claude-opus-4-8",
+        },
+        onSave,
+        [selfNamed, anthropicPersonal],
+      );
+
+      fireEvent.click(getSaveBtn());
+      await waitFor(() => {
+        expect(saveCalls.length).toBe(1);
+      });
+      expect(saveCalls[0].entry.provider).toBe("anthropic");
+      expect(saveCalls[0].entry.provider_connection).toBe("anthropic");
+    } finally {
+      store.getState().clearIdentity();
+    }
+  });
+
+  test("a cross-kind identity binding shows the identity in the trigger", async () => {
+    const chatgptRow = {
+      ...makeConnection("chatgpt", "chatgpt"),
+      auth: { type: "oauth_subscription", credential: "credential/chatgpt" },
+    } as unknown as ProviderConnection;
+    renderEdit(
+      {
+        name: "codex",
+        label: "Codex",
+        provider: "openai",
+        provider_connection: "chatgpt",
+        model: "gpt-5.6-sol",
+      },
+      undefined,
+      [chatgptRow, makeConnection("openai-work", "openai")],
+    );
+
+    // The profile dispatches through the ChatGPT row, so the trigger names
+    // that route rather than bare OpenAI.
+    await waitFor(() => {
+      expect(providerTrigger().textContent).toContain("ChatGPT");
+    });
+  });
+
+  test("a stale binding among surviving siblings still labels the trigger", async () => {
+    renderEdit(
+      {
+        name: "stale",
+        label: "Stale",
+        provider: "anthropic",
+        provider_connection: "deleted-key",
+        model: "claude-opus-4-8",
+      },
+      undefined,
+      [anthropicWork, anthropicPersonal],
+    );
+
+    // The encoded value matches no option, so the trigger must fall back
+    // to the bare kind rather than the placeholder.
+    await waitFor(() => {
+      expect(providerTrigger().textContent).toContain("Anthropic");
+    });
+  });
+
+  test("a stored entry-name profile opens translated and round-trips", async () => {
+    const store = await gateOn();
+    try {
+      const { saveCalls, onSave } = collectSaves();
+      renderEdit(
+        {
+          name: "work",
+          label: "Work",
+          provider: "anthropic-work",
+          model: "claude-opus-4-8",
+        },
+        onSave,
+        [anthropicWork, anthropicPersonal],
+      );
+
+      // The trigger shows the entry row, not a raw entry name.
+      await waitFor(() => {
+        expect(providerTrigger().textContent).toContain("Work key");
+      });
+
+      fireEvent.click(getSaveBtn());
+      await waitFor(() => {
+        expect(saveCalls.length).toBe(1);
+      });
+      expect(saveCalls[0].entry.provider).toBe("anthropic-work");
+      expect(saveCalls[0].entry.provider_connection).toBeNull();
+    } finally {
+      store.getState().clearIdentity();
+    }
   });
 });

@@ -1,3 +1,4 @@
+import { Button, Typography } from "@vellumai/design-library";
 import type { LucideIcon } from "lucide-react";
 import { Loader2, Search, X } from "lucide-react";
 import {
@@ -19,11 +20,10 @@ import {
 } from "react";
 import { createPortal } from "react-dom";
 
-import { useIsMobile } from "@/hooks/use-is-mobile";
-import { useIsNativeIOS } from "@/runtime/platform-detection";
-import { Button, Typography } from "@vellumai/design-library";
-
 import { CommandPaletteItem } from "@/components/command-palette/command-palette-item";
+import { useIsMobile } from "@/hooks/use-is-mobile";
+import { useIsNativeMobile } from "@/runtime/platform-detection";
+import { usePointerCoarse } from "@/utils/pointer";
 
 // z-50 keeps the full-screen palette above the navigation drawer (fixed z-40
 // in chat-layout), which stays mounted underneath so dismissing search returns
@@ -101,7 +101,7 @@ interface MobileSheetProps {
 }
 
 /**
- * Full-screen sheet used by the iOS shell, sliding up on open and out on
+ * Full-screen sheet used by native mobile shells, sliding up on open and out on
  * close. It outlives `isOpen` for the length of the exit, and AnimatePresence
  * renders the exiting element with the props it was frozen at, so everything
  * that has to change the moment the exit starts reads `useIsPresent()`
@@ -113,7 +113,7 @@ const MobileSheet: FC<MobileSheetProps> = ({ onKeyDown, children }) => {
   const reduceMotion = useReducedMotion();
   const sheetRef = useRef<HTMLDivElement>(null);
 
-  // Blurring the search input starts the iOS keyboard dismissal in parallel
+  // Blurring the search input starts native keyboard dismissal in parallel
   // with the slide-out. Scoped to the sheet so focus that a close handler
   // moved elsewhere (the composer, after "New Conversation") survives.
   useLayoutEffect(() => {
@@ -159,9 +159,15 @@ const MobileSheet: FC<MobileSheetProps> = ({ onKeyDown, children }) => {
 /**
  * macOS Spotlight-style command palette overlay on desktop, swapping to a
  * full-area inline overlay on mobile (`max-width: 767px`). Dismissable by
- * Escape or backdrop click. Keyboard-shortcut hints (per-item and the ⌘K
- * badge) are suppressed on mobile since there is no physical keyboard to
- * invoke them.
+ * Escape or backdrop click.
+ *
+ * Two independent questions, two signals. How much room there is decides the
+ * container (`useIsMobile()`); whether a chord can be pressed at all decides
+ * the keyboard hints, per-item and the ⌘K cap (`usePointerCoarse()`). They come
+ * apart on shipped hardware in both directions: a tablet is roomy with no ⌘
+ * key, and a desktop window narrowed past the breakpoint still has the whole
+ * keyboard. See `docs/PLATFORM_ADAPTATION.md`, and `docs/CAPACITOR.md`
+ * § Keyboard-only affordances for why the pointer is the signal for the second.
  *
  * Accepts items/sections as props — no data fetching is performed internally.
  */
@@ -179,7 +185,11 @@ export const CommandPalette: FC<CommandPaletteProps> = ({
   surface = "overlay",
 }) => {
   const isMobile = useIsMobile();
-  const isNativeIOSShell = useIsNativeIOS();
+  const isNativeMobileShell = useIsNativeMobile();
+  // Subscribed rather than read once: the palette outlives any one pointer, so
+  // a convertible whose keyboard comes off has to stop advertising ⌘K without
+  // a reload, and a tablet docked into one has to start.
+  const pointerCoarse = usePointerCoarse();
   const overlayRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
@@ -217,9 +227,14 @@ export const CommandPalette: FC<CommandPaletteProps> = ({
 
   const isWindowSurface = surface === "window";
   const useMobileLayout = isMobile && !isWindowSurface;
-  // iOS shell only: the sheet stays mounted while closed so AnimatePresence
-  // can play the slide-out exit.
-  const animateMobileSheet = isNativeIOSShell && useMobileLayout;
+  // A soft keyboard offers no ⌘ and no chord, so on a coarse pointer every
+  // hint here names a gesture the device cannot make. Width would answer the
+  // wrong question: it hides the hints on a narrowed desktop window that can
+  // still press all of them, and shows them on a tablet that cannot press any.
+  const showKeyboardHints = !pointerCoarse;
+  // Native mobile shells keep the sheet mounted while AnimatePresence plays
+  // the slide-out exit.
+  const animateMobileSheet = isNativeMobileShell && useMobileLayout;
 
   if (!isOpen && !animateMobileSheet) {
     return null;
@@ -285,7 +300,7 @@ export const CommandPalette: FC<CommandPaletteProps> = ({
             tintColor="var(--content-tertiary)"
           />
         )
-      ) : useMobileLayout ? null : (
+      ) : showKeyboardHints ? (
         <kbd
           className={
             isWindowSurface
@@ -295,7 +310,7 @@ export const CommandPalette: FC<CommandPaletteProps> = ({
         >
           ⌘K
         </kbd>
-      )}
+      ) : null}
       {useMobileLayout ? (
         <Button
           variant="ghost"
@@ -355,7 +370,9 @@ export const CommandPalette: FC<CommandPaletteProps> = ({
                   subtitle={item.subtitle}
                   snippet={item.snippet}
                   highlightTokens={highlightTokens}
-                  shortcutHint={useMobileLayout ? undefined : item.shortcutHint}
+                  shortcutHint={
+                    showKeyboardHints ? item.shortcutHint : undefined
+                  }
                   isSelected={currentIndex === selectedIndex}
                   onClick={() => onItemSelect?.(item, currentIndex)}
                   surface={surface}

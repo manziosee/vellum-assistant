@@ -49,7 +49,7 @@ function sandboxPolicyFor(boundary: string): PathPolicy {
 // ===========================================================================
 
 describe("FileSystemOps symlink handling", () => {
-  test("read blocks symlink pointing outside boundary", () => {
+  test("read blocks symlink pointing outside boundary", async () => {
     const boundary = makeTempDir();
     const outside = makeTempDir();
     const outsideFile = join(outside, "secret.txt");
@@ -58,7 +58,7 @@ describe("FileSystemOps symlink handling", () => {
     symlinkSync(outsideFile, join(boundary, "link.txt"));
     const ops = new FileSystemOps(sandboxPolicyFor(boundary));
 
-    const result = ops.readFileSafe({ path: "link.txt" });
+    const result = await ops.readFileSafe({ path: "link.txt" });
     expect(result.ok).toBe(false);
     if (result.ok) {
       return;
@@ -66,14 +66,14 @@ describe("FileSystemOps symlink handling", () => {
     expect(result.error.code).toBe("PATH_OUT_OF_BOUNDS");
   });
 
-  test("read allows symlink within boundary", () => {
+  test("read allows symlink within boundary", async () => {
     const boundary = makeTempDir();
     const realFile = join(boundary, "real.txt");
     writeFileSync(realFile, "hello");
     symlinkSync(realFile, join(boundary, "link.txt"));
 
     const ops = new FileSystemOps(sandboxPolicyFor(boundary));
-    const result = ops.readFileSafe({ path: "link.txt" });
+    const result = await ops.readFileSafe({ path: "link.txt" });
     expect(result.ok).toBe(true);
     if (!result.ok) {
       return;
@@ -81,13 +81,13 @@ describe("FileSystemOps symlink handling", () => {
     expect(result.value.content).toContain("hello");
   });
 
-  test("write blocks creating file under symlinked dir pointing outside", () => {
+  test("write blocks creating file under symlinked dir pointing outside", async () => {
     const boundary = makeTempDir();
     const outside = makeTempDir();
     symlinkSync(outside, join(boundary, "link-dir"));
 
     const ops = new FileSystemOps(sandboxPolicyFor(boundary));
-    const result = ops.writeFileSafe({
+    const result = await ops.writeFileSafe({
       path: "link-dir/evil.txt",
       content: "bad",
     });
@@ -100,7 +100,7 @@ describe("FileSystemOps symlink handling", () => {
     expect(existsSync(join(outside, "evil.txt"))).toBe(false);
   });
 
-  test("edit blocks symlink pointing outside boundary", () => {
+  test("edit blocks symlink pointing outside boundary", async () => {
     const boundary = makeTempDir();
     const outside = makeTempDir();
     const outsideFile = join(outside, "target.txt");
@@ -108,7 +108,7 @@ describe("FileSystemOps symlink handling", () => {
     symlinkSync(outsideFile, join(boundary, "link.txt"));
 
     const ops = new FileSystemOps(sandboxPolicyFor(boundary));
-    const result = ops.editFileSafe({
+    const result = await ops.editFileSafe({
       path: "link.txt",
       oldString: "original",
       newString: "modified",
@@ -125,83 +125,90 @@ describe("FileSystemOps symlink handling", () => {
 });
 
 // ===========================================================================
-// FileSystemOps: read offset/limit edge cases
+// FileSystemOps: read character-window edge cases
 // ===========================================================================
 
-describe("FileSystemOps read offset/limit edge cases", () => {
-  test("offset beyond file length returns empty content", () => {
+describe("FileSystemOps read character-window edge cases", () => {
+  test("startIndex beyond file length returns empty content", async () => {
     const dir = makeTempDir();
     writeFileSync(join(dir, "short.txt"), "a\nb\nc");
     const ops = new FileSystemOps(sandboxPolicyFor(dir));
 
-    const result = ops.readFileSafe({ path: "short.txt", offset: 100 });
-    expect(result.ok).toBe(true);
-    if (!result.ok) {
-      return;
-    }
-    expect(result.value.content).toBe("");
-  });
-
-  test("limit of zero returns empty content", () => {
-    const dir = makeTempDir();
-    writeFileSync(join(dir, "file.txt"), "a\nb\nc");
-    const ops = new FileSystemOps(sandboxPolicyFor(dir));
-
-    const result = ops.readFileSafe({ path: "file.txt", limit: 0 });
-    expect(result.ok).toBe(true);
-    if (!result.ok) {
-      return;
-    }
-    expect(result.value.content).toBe("");
-  });
-
-  test("offset=1 reads from first line (1-indexed)", () => {
-    const dir = makeTempDir();
-    writeFileSync(join(dir, "file.txt"), "first\nsecond\nthird");
-    const ops = new FileSystemOps(sandboxPolicyFor(dir));
-
-    const result = ops.readFileSafe({ path: "file.txt", offset: 1, limit: 1 });
-    expect(result.ok).toBe(true);
-    if (!result.ok) {
-      return;
-    }
-    expect(result.value.content).toContain("first");
-    expect(result.value.content).not.toContain("second");
-  });
-
-  test("limit exceeding file length returns all remaining lines", () => {
-    const dir = makeTempDir();
-    writeFileSync(join(dir, "file.txt"), "a\nb");
-    const ops = new FileSystemOps(sandboxPolicyFor(dir));
-
-    const result = ops.readFileSafe({
-      path: "file.txt",
-      offset: 1,
-      limit: 1000,
+    const result = await ops.readFileSafe({
+      path: "short.txt",
+      startIndex: 100,
     });
     expect(result.ok).toBe(true);
     if (!result.ok) {
       return;
     }
-    expect(result.value.content).toContain("a");
-    expect(result.value.content).toContain("b");
+    expect(result.value.content).toBe("");
   });
 
-  test("read adds line numbers starting from offset", () => {
+  test("maxChars of zero returns empty content", async () => {
     const dir = makeTempDir();
-    writeFileSync(join(dir, "file.txt"), "a\nb\nc\nd\ne");
+    writeFileSync(join(dir, "file.txt"), "a\nb\nc");
     const ops = new FileSystemOps(sandboxPolicyFor(dir));
 
-    const result = ops.readFileSafe({ path: "file.txt", offset: 3, limit: 2 });
+    const result = await ops.readFileSafe({ path: "file.txt", maxChars: 0 });
     expect(result.ok).toBe(true);
     if (!result.ok) {
       return;
     }
-    // Lines should be numbered 3 and 4
-    expect(result.value.content).toContain("3");
-    expect(result.value.content).toContain("4");
-    expect(result.value.content).toContain("c");
-    expect(result.value.content).toContain("d");
+    expect(result.value.content).toBe("");
+  });
+
+  test("startIndex=0 reads from the first character (0-indexed)", async () => {
+    const dir = makeTempDir();
+    writeFileSync(join(dir, "file.txt"), "first\nsecond\nthird");
+    const ops = new FileSystemOps(sandboxPolicyFor(dir));
+
+    const result = await ops.readFileSafe({
+      path: "file.txt",
+      startIndex: 0,
+      maxChars: 5,
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+    const [body] = result.value.content.split("\n\n[Truncated:");
+    expect(body).toBe("first");
+  });
+
+  test("maxChars exceeding file length returns the rest of the file", async () => {
+    const dir = makeTempDir();
+    writeFileSync(join(dir, "file.txt"), "a\nb");
+    const ops = new FileSystemOps(sandboxPolicyFor(dir));
+
+    const result = await ops.readFileSafe({
+      path: "file.txt",
+      startIndex: 0,
+      maxChars: 1000,
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+    expect(result.value.content).toBe("a\nb");
+  });
+
+  test("the window starts at startIndex and carries no line numbers", async () => {
+    const dir = makeTempDir();
+    writeFileSync(join(dir, "file.txt"), "a\nb\nc\nd\ne");
+    const ops = new FileSystemOps(sandboxPolicyFor(dir));
+
+    const result = await ops.readFileSafe({
+      path: "file.txt",
+      startIndex: 4,
+      maxChars: 3,
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+    const [body] = result.value.content.split("\n\n[Truncated:");
+    expect(body).toBe("c\nd");
   });
 });
 
@@ -210,7 +217,7 @@ describe("FileSystemOps read offset/limit edge cases", () => {
 // ===========================================================================
 
 describe("FileSystemOps edit match methods", () => {
-  test("whitespace-normalized match succeeds", () => {
+  test("whitespace-normalized match succeeds", async () => {
     const dir = makeTempDir();
     writeFileSync(
       join(dir, "file.txt"),
@@ -218,7 +225,7 @@ describe("FileSystemOps edit match methods", () => {
     );
     const ops = new FileSystemOps(sandboxPolicyFor(dir));
 
-    const result = ops.editFileSafe({
+    const result = await ops.editFileSafe({
       path: "file.txt",
       oldString: "function foo() {\n  return 1;\n}",
       newString: "function bar() {\n  return 2;\n}",
@@ -233,12 +240,12 @@ describe("FileSystemOps edit match methods", () => {
     expect(result.value.newContent).toContain("bar");
   });
 
-  test("fuzzy match succeeds with near-match", () => {
+  test("fuzzy match succeeds with near-match", async () => {
     const dir = makeTempDir();
     writeFileSync(join(dir, "file.txt"), "function fooo() {\n  return 1;\n}\n");
     const ops = new FileSystemOps(sandboxPolicyFor(dir));
 
-    const result = ops.editFileSafe({
+    const result = await ops.editFileSafe({
       path: "file.txt",
       oldString: "function foo() {\n  return 1;\n}",
       newString: "function bar() {\n  return 2;\n}",
@@ -253,12 +260,12 @@ describe("FileSystemOps edit match methods", () => {
     expect(result.value.similarity).toBeLessThan(1);
   });
 
-  test("edit returns actualOld and actualNew for fuzzy match", () => {
+  test("edit returns actualOld and actualNew for fuzzy match", async () => {
     const dir = makeTempDir();
     writeFileSync(join(dir, "file.txt"), "function fooo() {\n  return 1;\n}\n");
     const ops = new FileSystemOps(sandboxPolicyFor(dir));
 
-    const result = ops.editFileSafe({
+    const result = await ops.editFileSafe({
       path: "file.txt",
       oldString: "function foo() {\n  return 1;\n}",
       newString: "function bar() {\n  return 2;\n}",
@@ -278,11 +285,14 @@ describe("FileSystemOps edit match methods", () => {
 // ===========================================================================
 
 describe("FileSystemOps write content tracking", () => {
-  test("new file has empty oldContent", () => {
+  test("new file has empty oldContent", async () => {
     const dir = makeTempDir();
     const ops = new FileSystemOps(sandboxPolicyFor(dir));
 
-    const result = ops.writeFileSafe({ path: "brand-new.txt", content: "new" });
+    const result = await ops.writeFileSafe({
+      path: "brand-new.txt",
+      content: "new",
+    });
     expect(result.ok).toBe(true);
     if (!result.ok) {
       return;
@@ -291,12 +301,12 @@ describe("FileSystemOps write content tracking", () => {
     expect(result.value.isNewFile).toBe(true);
   });
 
-  test("overwrite tracks oldContent and newContent", () => {
+  test("overwrite tracks oldContent and newContent", async () => {
     const dir = makeTempDir();
     writeFileSync(join(dir, "existing.txt"), "version 1");
     const ops = new FileSystemOps(sandboxPolicyFor(dir));
 
-    const result = ops.writeFileSafe({
+    const result = await ops.writeFileSafe({
       path: "existing.txt",
       content: "version 2",
     });
@@ -309,11 +319,14 @@ describe("FileSystemOps write content tracking", () => {
     expect(result.value.isNewFile).toBe(false);
   });
 
-  test("write returns resolved absolute path", () => {
+  test("write returns resolved absolute path", async () => {
     const dir = makeTempDir();
     const ops = new FileSystemOps(sandboxPolicyFor(dir));
 
-    const result = ops.writeFileSafe({ path: "output.txt", content: "data" });
+    const result = await ops.writeFileSafe({
+      path: "output.txt",
+      content: "data",
+    });
     expect(result.ok).toBe(true);
     if (!result.ok) {
       return;
@@ -395,11 +408,11 @@ describe("formatWriteSummary", () => {
 // ===========================================================================
 
 describe("FileSystemOps path traversal prevention", () => {
-  test("rejects absolute path outside boundary on read", () => {
+  test("rejects absolute path outside boundary on read", async () => {
     const dir = makeTempDir();
     const ops = new FileSystemOps(sandboxPolicyFor(dir));
 
-    const result = ops.readFileSafe({ path: "/etc/passwd" });
+    const result = await ops.readFileSafe({ path: "/etc/passwd" });
     expect(result.ok).toBe(false);
     if (result.ok) {
       return;
@@ -407,11 +420,11 @@ describe("FileSystemOps path traversal prevention", () => {
     expect(result.error.code).toBe("PATH_OUT_OF_BOUNDS");
   });
 
-  test("rejects absolute path outside boundary on write", () => {
+  test("rejects absolute path outside boundary on write", async () => {
     const dir = makeTempDir();
     const ops = new FileSystemOps(sandboxPolicyFor(dir));
 
-    const result = ops.writeFileSafe({
+    const result = await ops.writeFileSafe({
       path: "/tmp/evil-write.txt",
       content: "bad",
     });
@@ -422,11 +435,11 @@ describe("FileSystemOps path traversal prevention", () => {
     expect(result.error.code).toBe("PATH_OUT_OF_BOUNDS");
   });
 
-  test("rejects absolute path outside boundary on edit", () => {
+  test("rejects absolute path outside boundary on edit", async () => {
     const dir = makeTempDir();
     const ops = new FileSystemOps(sandboxPolicyFor(dir));
 
-    const result = ops.editFileSafe({
+    const result = await ops.editFileSafe({
       path: "/etc/hosts",
       oldString: "a",
       newString: "b",
@@ -439,12 +452,12 @@ describe("FileSystemOps path traversal prevention", () => {
     expect(result.error.code).toBe("PATH_OUT_OF_BOUNDS");
   });
 
-  test("rejects dot-dot traversal embedded in path on read", () => {
+  test("rejects dot-dot traversal embedded in path on read", async () => {
     const dir = makeTempDir();
     mkdirSync(join(dir, "sub"));
     const ops = new FileSystemOps(sandboxPolicyFor(dir));
 
-    const result = ops.readFileSafe({ path: "sub/../../etc/passwd" });
+    const result = await ops.readFileSafe({ path: "sub/../../etc/passwd" });
     expect(result.ok).toBe(false);
     if (result.ok) {
       return;
@@ -452,12 +465,12 @@ describe("FileSystemOps path traversal prevention", () => {
     expect(result.error.code).toBe("PATH_OUT_OF_BOUNDS");
   });
 
-  test("accepts absolute path inside boundary", () => {
+  test("accepts absolute path inside boundary", async () => {
     const dir = makeTempDir();
     writeFileSync(join(dir, "inside.txt"), "safe content");
     const ops = new FileSystemOps(sandboxPolicyFor(dir));
 
-    const result = ops.readFileSafe({ path: join(dir, "inside.txt") });
+    const result = await ops.readFileSafe({ path: join(dir, "inside.txt") });
     expect(result.ok).toBe(true);
     if (!result.ok) {
       return;
@@ -471,13 +484,13 @@ describe("FileSystemOps path traversal prevention", () => {
 // ===========================================================================
 
 describe("FileSystemOps binary file read", () => {
-  test("reads binary content as utf-8 without crashing", () => {
+  test("reads binary content as utf-8 without crashing", async () => {
     const dir = makeTempDir();
     const binaryContent = Buffer.from([0x00, 0xff, 0x89, 0x50, 0x4e, 0x47]);
     writeFileSync(join(dir, "binary.bin"), binaryContent);
     const ops = new FileSystemOps(sandboxPolicyFor(dir));
 
-    const result = ops.readFileSafe({ path: "binary.bin" });
+    const result = await ops.readFileSafe({ path: "binary.bin" });
     // Should succeed — the file is readable, even if content has replacement chars
     expect(result.ok).toBe(true);
   });
@@ -488,12 +501,12 @@ describe("FileSystemOps binary file read", () => {
 // ===========================================================================
 
 describe("FileSystemOps empty file operations", () => {
-  test("reads empty file successfully", () => {
+  test("reads empty file successfully", async () => {
     const dir = makeTempDir();
     writeFileSync(join(dir, "empty.txt"), "");
     const ops = new FileSystemOps(sandboxPolicyFor(dir));
 
-    const result = ops.readFileSafe({ path: "empty.txt" });
+    const result = await ops.readFileSafe({ path: "empty.txt" });
     expect(result.ok).toBe(true);
     if (!result.ok) {
       return;
@@ -502,11 +515,11 @@ describe("FileSystemOps empty file operations", () => {
     expect(result.value.content).toBeDefined();
   });
 
-  test("write empty content creates empty file", () => {
+  test("write empty content creates empty file", async () => {
     const dir = makeTempDir();
     const ops = new FileSystemOps(sandboxPolicyFor(dir));
 
-    const result = ops.writeFileSafe({ path: "empty.txt", content: "" });
+    const result = await ops.writeFileSafe({ path: "empty.txt", content: "" });
     expect(result.ok).toBe(true);
     if (!result.ok) {
       return;
@@ -515,12 +528,12 @@ describe("FileSystemOps empty file operations", () => {
     expect(readFileSync(join(dir, "empty.txt"), "utf-8")).toBe("");
   });
 
-  test("edit on empty file returns MATCH_NOT_FOUND", () => {
+  test("edit on empty file returns MATCH_NOT_FOUND", async () => {
     const dir = makeTempDir();
     writeFileSync(join(dir, "empty.txt"), "");
     const ops = new FileSystemOps(sandboxPolicyFor(dir));
 
-    const result = ops.editFileSafe({
+    const result = await ops.editFileSafe({
       path: "empty.txt",
       oldString: "something",
       newString: "else",
@@ -539,12 +552,12 @@ describe("FileSystemOps empty file operations", () => {
 // ===========================================================================
 
 describe("FileSystemOps /workspace path remapping", () => {
-  test("read remaps /workspace/ path to boundary", () => {
+  test("read remaps /workspace/ path to boundary", async () => {
     const dir = makeTempDir();
     writeFileSync(join(dir, "file.txt"), "workspace content");
     const ops = new FileSystemOps(sandboxPolicyFor(dir));
 
-    const result = ops.readFileSafe({ path: "/workspace/file.txt" });
+    const result = await ops.readFileSafe({ path: "/workspace/file.txt" });
     expect(result.ok).toBe(true);
     if (!result.ok) {
       return;
@@ -552,11 +565,11 @@ describe("FileSystemOps /workspace path remapping", () => {
     expect(result.value.content).toContain("workspace content");
   });
 
-  test("write remaps /workspace/ path to boundary", () => {
+  test("write remaps /workspace/ path to boundary", async () => {
     const dir = makeTempDir();
     const ops = new FileSystemOps(sandboxPolicyFor(dir));
 
-    const result = ops.writeFileSafe({
+    const result = await ops.writeFileSafe({
       path: "/workspace/new.txt",
       content: "remapped",
     });
@@ -568,12 +581,12 @@ describe("FileSystemOps /workspace path remapping", () => {
     expect(readFileSync(join(dir, "new.txt"), "utf-8")).toBe("remapped");
   });
 
-  test("edit remaps /workspace/ path to boundary", () => {
+  test("edit remaps /workspace/ path to boundary", async () => {
     const dir = makeTempDir();
     writeFileSync(join(dir, "file.txt"), "old content");
     const ops = new FileSystemOps(sandboxPolicyFor(dir));
 
-    const result = ops.editFileSafe({
+    const result = await ops.editFileSafe({
       path: "/workspace/file.txt",
       oldString: "old content",
       newString: "new content",
@@ -587,11 +600,13 @@ describe("FileSystemOps /workspace path remapping", () => {
     expect(readFileSync(join(dir, "file.txt"), "utf-8")).toBe("new content");
   });
 
-  test("/workspace traversal escape is blocked", () => {
+  test("/workspace traversal escape is blocked", async () => {
     const dir = makeTempDir();
     const ops = new FileSystemOps(sandboxPolicyFor(dir));
 
-    const result = ops.readFileSafe({ path: "/workspace/../../../etc/passwd" });
+    const result = await ops.readFileSafe({
+      path: "/workspace/../../../etc/passwd",
+    });
     expect(result.ok).toBe(false);
     if (result.ok) {
       return;
@@ -605,12 +620,12 @@ describe("FileSystemOps /workspace path remapping", () => {
 // ===========================================================================
 
 describe("FileSystemOps custom size limit", () => {
-  test("read rejects file exceeding custom limit", () => {
+  test("read rejects file exceeding custom limit", async () => {
     const dir = makeTempDir();
     writeFileSync(join(dir, "big.txt"), "x".repeat(500));
     const ops = new FileSystemOps(sandboxPolicyFor(dir), { sizeLimit: 100 });
 
-    const result = ops.readFileSafe({ path: "big.txt" });
+    const result = await ops.readFileSafe({ path: "big.txt" });
     expect(result.ok).toBe(false);
     if (result.ok) {
       return;
@@ -618,20 +633,20 @@ describe("FileSystemOps custom size limit", () => {
     expect(result.error.code).toBe("SIZE_LIMIT_EXCEEDED");
   });
 
-  test("read accepts file within custom limit", () => {
+  test("read accepts file within custom limit", async () => {
     const dir = makeTempDir();
     writeFileSync(join(dir, "small.txt"), "x".repeat(50));
     const ops = new FileSystemOps(sandboxPolicyFor(dir), { sizeLimit: 100 });
 
-    const result = ops.readFileSafe({ path: "small.txt" });
+    const result = await ops.readFileSafe({ path: "small.txt" });
     expect(result.ok).toBe(true);
   });
 
-  test("write rejects content exceeding custom limit", () => {
+  test("write rejects content exceeding custom limit", async () => {
     const dir = makeTempDir();
     const ops = new FileSystemOps(sandboxPolicyFor(dir), { sizeLimit: 100 });
 
-    const result = ops.writeFileSafe({
+    const result = await ops.writeFileSafe({
       path: "big.txt",
       content: "x".repeat(500),
     });
@@ -642,12 +657,12 @@ describe("FileSystemOps custom size limit", () => {
     expect(result.error.code).toBe("SIZE_LIMIT_EXCEEDED");
   });
 
-  test("edit rejects file exceeding custom limit", () => {
+  test("edit rejects file exceeding custom limit", async () => {
     const dir = makeTempDir();
     writeFileSync(join(dir, "big.txt"), "x".repeat(500));
     const ops = new FileSystemOps(sandboxPolicyFor(dir), { sizeLimit: 100 });
 
-    const result = ops.editFileSafe({
+    const result = await ops.editFileSafe({
       path: "big.txt",
       oldString: "x",
       newString: "y",
@@ -660,12 +675,12 @@ describe("FileSystemOps custom size limit", () => {
     expect(result.error.code).toBe("SIZE_LIMIT_EXCEEDED");
   });
 
-  test("no size limit when not specified (defaults to 100MB)", () => {
+  test("no size limit when not specified (defaults to 100MB)", async () => {
     const dir = makeTempDir();
     writeFileSync(join(dir, "file.txt"), "x".repeat(1000));
     const ops = new FileSystemOps(sandboxPolicyFor(dir));
 
-    const result = ops.readFileSafe({ path: "file.txt" });
+    const result = await ops.readFileSafe({ path: "file.txt" });
     expect(result.ok).toBe(true);
   });
 });

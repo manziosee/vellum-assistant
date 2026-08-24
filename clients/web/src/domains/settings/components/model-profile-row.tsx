@@ -1,23 +1,14 @@
 import { useQuery } from "@tanstack/react-query";
 import { useMemo } from "react";
 
-import {
-  configGetOptions,
-  configLlmCallsitesGetOptions,
-} from "@/generated/daemon/@tanstack/react-query.gen";
+import { configGetOptions } from "@/generated/daemon/@tanstack/react-query.gen";
+import { useCallSiteDefaultProfile } from "@/hooks/use-call-site-default-profile";
+import { useTranslation } from "@/i18n";
 import { extractUsageProfileMetadata } from "@/utils/profile-metadata";
 
 import type { ConfigGetResponse } from "@/generated/daemon/types.gen";
+import type { ResolvableCallSite } from "@/hooks/use-call-site-default-profile";
 import type { UsageProfileMetadataMap } from "@/utils/profile-metadata";
-
-export type ScheduleModelProfileCallSite =
-  | "mainAgent"
-  | "heartbeatAgent"
-  | "memoryV2Consolidation"
-  | "memoryRetrospective";
-
-const DEFAULT_MAIN_AGENT_PROFILE_LABEL = "Default (assistant's main model)";
-const CUSTOM_CALL_SITE_MODEL_LABEL = "Custom call-site model";
 
 type CallSiteOverride = NonNullable<
   NonNullable<NonNullable<ConfigGetResponse["llm"]>["callSites"]>[string]
@@ -30,35 +21,41 @@ function profileDisplayName(
   return metadata?.[profileKey]?.displayName ?? profileKey;
 }
 
-function callSiteOverrideLabel(
-  override: CallSiteOverride | null | undefined,
-  metadata: UsageProfileMetadataMap,
-) {
-  if (override == null) {
-    return undefined;
-  }
-  if (override.provider != null || override.model != null) {
-    return CUSTOM_CALL_SITE_MODEL_LABEL;
-  }
-  const profile = override.profile?.trim();
-  return profile
-    ? `Override (${profileDisplayName(profile, metadata)})`
-    : undefined;
-}
-
 export function ModelProfileRow({
   assistantId,
   pinnedProfile,
   defaultCallSite = "mainAgent",
-  fallbackLabel = DEFAULT_MAIN_AGENT_PROFILE_LABEL,
+  fallbackLabel,
   respectCallSiteOverride = false,
 }: {
   assistantId: string;
   pinnedProfile?: string | null;
-  defaultCallSite?: ScheduleModelProfileCallSite;
+  defaultCallSite?: ResolvableCallSite;
   fallbackLabel?: string;
   respectCallSiteOverride?: boolean;
 }) {
+  const { t } = useTranslation("settings");
+  const resolvedFallback =
+    fallbackLabel ?? t("modelProfileRow.defaultMainAgent");
+
+  const callSiteOverrideLabel = (
+    override: CallSiteOverride | null | undefined,
+    metadata: UsageProfileMetadataMap,
+  ) => {
+    if (override == null) {
+      return undefined;
+    }
+    if (override.provider != null || override.model != null) {
+      return t("modelProfileRow.customCallSiteModel");
+    }
+    const profile = override.profile?.trim();
+    return profile
+      ? t("modelProfileRow.override", {
+          name: profileDisplayName(profile, metadata),
+        })
+      : undefined;
+  };
+
   const shouldResolveDefault = pinnedProfile == null;
   const { data: daemonConfig } = useQuery({
     ...configGetOptions({ path: { assistant_id: assistantId } }),
@@ -69,11 +66,11 @@ export function ModelProfileRow({
     () => (daemonConfig ? extractUsageProfileMetadata(daemonConfig) : {}),
     [daemonConfig],
   );
-  const { data: callSiteCatalog } = useQuery({
-    ...configLlmCallsitesGetOptions({ path: { assistant_id: assistantId } }),
-    enabled: Boolean(assistantId) && shouldResolveDefault,
-    staleTime: 60_000,
-  });
+  const { label: defaultProfileLabel } = useCallSiteDefaultProfile(
+    assistantId,
+    defaultCallSite,
+    { enabled: shouldResolveDefault },
+  );
 
   const overrideLabel =
     shouldResolveDefault && respectCallSiteOverride
@@ -82,24 +79,23 @@ export function ModelProfileRow({
           profileMetadata,
         )
       : undefined;
-  const defaultProfile = shouldResolveDefault
-    ? callSiteCatalog?.callSites.find(
-        (callSite) => callSite.id === defaultCallSite,
-      )?.defaultProfile
-    : undefined;
   const profileLabel =
     pinnedProfile != null
       ? profileDisplayName(pinnedProfile, profileMetadata)
       : overrideLabel != null
         ? overrideLabel
-        : defaultProfile != null
-          ? `Default (${profileDisplayName(defaultProfile, profileMetadata)})`
-          : fallbackLabel;
+        : defaultProfileLabel != null
+          ? t("modelProfileRow.defaultNamed", { name: defaultProfileLabel })
+          : resolvedFallback;
 
   return (
-    <div className="flex items-center justify-between gap-4">
-      <span className="text-[var(--content-secondary)]">Model profile</span>
-      <span className="min-w-0 text-right">{profileLabel}</span>
+    <div className="flex min-h-6 items-center justify-between gap-4">
+      <span className="shrink-0 text-[var(--content-secondary)]">
+        {t("modelProfileRow.label")}
+      </span>
+      <span className="min-w-0 truncate text-right" title={profileLabel}>
+        {profileLabel}
+      </span>
     </div>
   );
 }

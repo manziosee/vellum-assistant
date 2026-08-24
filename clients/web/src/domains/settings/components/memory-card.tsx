@@ -3,17 +3,20 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useActiveAssistantId } from "@/assistant/use-active-assistant-id";
 import { DetailCard } from "@/components/detail-card";
 import { useAssistantWithHealthz } from "@/domains/settings/components/assistant-status-panel";
+import { MemoryRetrospectiveToggle } from "@/domains/settings/components/memory-retrospective-toggle";
 import { MemoryWorkerToggle } from "@/domains/settings/components/memory-worker-toggle";
 import {
   configGetOptions,
   configGetSetQueryData,
   useConfigPatchMutation,
 } from "@/generated/daemon/@tanstack/react-query.gen";
+import { useTranslation } from "@/i18n";
 import { captureError } from "@/lib/sentry/capture-error";
 import { toast } from "@vellumai/design-library/components/toast";
 import { Toggle } from "@vellumai/design-library/components/toggle";
 
 export function MemoryCard() {
+  const { t } = useTranslation("settings");
   const { healthz } = useAssistantWithHealthz();
   const assistantId = useActiveAssistantId();
   const queryClient = useQueryClient();
@@ -35,6 +38,12 @@ export function MemoryCard() {
     },
   });
   const memoryEnabled = config?.memory?.enabled !== false;
+  // The generated config type stops at `memory.retrospective` (the daemon's
+  // config response schema does not enumerate the block's fields), so the read
+  // is narrowed here. Absent means the schema default, which is on.
+  const retrospectiveEnabled =
+    (config?.memory?.retrospective as { enabled?: boolean } | undefined)
+      ?.enabled !== false;
 
   const handleMemoryToggle = async (enabled: boolean) => {
     try {
@@ -42,10 +51,14 @@ export function MemoryCard() {
         path: { assistant_id: assistantId },
         body: { memory: { enabled } },
       });
-      toast.success(enabled ? "Memory enabled." : "Memory disabled.");
+      toast.success(
+        enabled
+          ? t("memoryCard.enabledToast")
+          : t("memoryCard.disabledToast"),
+      );
     } catch (error) {
       captureError(error, { context: "settings-memory-toggle" });
-      toast.error("Failed to update memory setting.");
+      toast.error(t("memoryCard.updateFailedToast"));
     }
   };
 
@@ -55,18 +68,22 @@ export function MemoryCard() {
 
   return (
     <DetailCard
-      title="Memory"
-      subtitle="Let your assistant remember information from past conversations. Turning this off also pauses memory consolidation."
+      title={t("memoryCard.title")}
+      subtitle={t("memoryCard.subtitle")}
       accessory={
         <Toggle
           checked={memoryEnabled}
           onChange={(enabled) => void handleMemoryToggle(enabled)}
-          aria-label="Enable memory"
+          aria-label={t("memoryCard.enableAriaLabel")}
           disabled={configMutation.isPending}
         />
       }
       compactAccessory
     >
+      <MemoryRetrospectiveToggle
+        memoryEnabled={memoryEnabled}
+        retrospectiveEnabled={retrospectiveEnabled}
+      />
       <MemoryWorkerToggle memoryEnabled={memoryEnabled} />
     </DetailCard>
   );

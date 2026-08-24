@@ -4,8 +4,8 @@ import { useLockfileStore } from "@/stores/lockfile-store";
 import type { Lockfile, LockfileAssistant } from "@/runtime/local-mode-host";
 
 // The wrapper under test orchestrates the real connect primitive, so we drive
-// its external seams rather than the primitive itself: the guardian-token read
-// (which decides success/failure) and the wake repair call. Everything else in
+// its external seams rather than the primitive itself: the local guardian-token
+// read, the paired gateway proxy, and the wake repair call. Everything else in
 // the primitive (gateway token exchange, self-hosted connection write) is
 // stubbed to no-op so a successful prime resolves cleanly.
 const host = await import("@/runtime/local-mode-host");
@@ -142,6 +142,35 @@ describe("primeLocalGatewayConnectionWithRepair", () => {
     expect(fetchGuardianTokenHost).toHaveBeenCalledTimes(1);
   });
 
+  test("a repairable failure for a paired target never wakes and rethrows", async () => {
+    // Wake is cloud:"local"-only (it refuses paired entries), so a paired
+    // connect failure must propagate immediately instead of spawning a wake
+    // that is guaranteed to refuse.
+    process.env.VITE_PLATFORM_MODE = "";
+    const paired: LockfileAssistant = {
+      assistantId: "paired-a",
+      cloud: "paired",
+      runtimeUrl: "https://gw.example.com",
+    } as LockfileAssistant;
+    useLockfileStore.setState({
+      lockfile: { assistants: [paired], activeAssistant: "paired-a" },
+    });
+    localStorage.setItem("vellum:local:selected-assistant", "paired-a");
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = mock(
+      async () => new Response("token gone", { status: 404 }),
+    ) as unknown as typeof fetch;
+    const err = await primeLocalGatewayConnectionWithRepair()
+      .catch((e: unknown) => e)
+      .finally(() => {
+        globalThis.fetch = realFetch;
+      });
+
+    expect(err).toBeInstanceOf(GuardianTokenError);
+    expect(fetchGuardianTokenHost).not.toHaveBeenCalled();
+    expect(wakeLocalAssistantHost).not.toHaveBeenCalled();
+  });
+
   test("a non-repairable 403 surfaces immediately and never wakes", async () => {
     fetchGuardianTokenHost = mock(async () => {
       throw new GuardianTokenError(403, "forbidden");
@@ -232,6 +261,43 @@ describe("primeLocalGatewayConnectionWithRepair", () => {
     expect(err).toBeInstanceOf(GatewayTokenError);
     expect((err as InstanceType<typeof GatewayTokenError>).status).toBe(503);
     expect(wakeLocalAssistantHost).toHaveBeenCalledTimes(1);
+  });
+
+  test("rides out a post-wake guardian refresh 503, then reconnects", async () => {
+    // The reopen-the-app symptom: with the gateway down, refresh reports 503.
+    // Wake restarts the gateway, but the refresh that follows can still land
+    // before it answers. Riding that 5xx out keeps a plain reopen from
+    // dead-ending on the recovery dialog.
+    let fetches = 0;
+    fetchGuardianTokenHost = mock(async (_id: string) => {
+      fetches++;
+      if (fetches <= 2) {
+        throw new GuardianTokenError(503, "Assistant gateway is unreachable");
+      }
+      return "tok";
+    });
+
+    await primeLocalGatewayConnectionWithRepair();
+
+    expect(wakeLocalAssistantHost).toHaveBeenCalledTimes(1);
+    // One pre-wake fetch, one post-wake fetch ridden out, then the success.
+    expect(fetches).toBe(3);
+  });
+
+  test("a post-wake guardian 401 surfaces immediately as a spent credential", async () => {
+    fetchGuardianTokenHost = mock(async () => {
+      throw new GuardianTokenError(401, "Failed to refresh guardian token");
+    });
+
+    const err = await primeLocalGatewayConnectionWithRepair().catch(
+      (e: unknown) => e,
+    );
+
+    expect(err).toBeInstanceOf(GuardianTokenError);
+    expect((err as InstanceType<typeof GuardianTokenError>).status).toBe(401);
+    expect(wakeLocalAssistantHost).toHaveBeenCalledTimes(1);
+    // One pre-wake fetch plus one terminal post-wake fetch.
+    expect(fetchGuardianTokenHost).toHaveBeenCalledTimes(2);
   });
 });
 

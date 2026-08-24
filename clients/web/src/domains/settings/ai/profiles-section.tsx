@@ -13,6 +13,7 @@ import type {
   ConfigGetResponse,
   ProviderConnection,
 } from "@/generated/daemon/types.gen";
+import { useTranslation } from "@/i18n";
 
 interface ProfilesSectionProps {
   assistantId: string;
@@ -31,6 +32,14 @@ interface ProfilesSectionProps {
 }
 
 /**
+ * `useProfileActions` toasts (and, where warranted, reports) every failure
+ * before rethrowing so the delete flow can react. The fire-and-forget kebab
+ * actions have nothing left to do with the rejection, so they settle it here
+ * instead of leaving an unhandled one on the microtask queue.
+ */
+function alreadyReported(): void {}
+
+/**
  * The inline Profiles list of the V2 Language Model card (Figma
  * 7412:133358). Rows open the profile sidepanel; the kebab menu carries
  * Make Default / Enable / Disable / Delete.
@@ -44,6 +53,7 @@ export function ProfilesSection({
   onCreateProfile,
   onProfileDeleted,
 }: ProfilesSectionProps) {
+  const { t } = useTranslation("settings");
   const { entries } = useInferenceProfileList(assistantId, config);
   const actions = useProfileActions(assistantId);
   const deleteFlow = useProfileDeleteFlow(assistantId, config, {
@@ -55,18 +65,17 @@ export function ProfilesSection({
   return (
     <>
       <LanguageModelSection
-        title="Profiles"
+        title={t("profilesSection.title")}
         action={
           <Button
             variant="primary"
-            size="compact"
             onClick={onCreateProfile}
             leftIcon={<Plus />}
             // The create panel needs config for duplicate-key validation
             // and the profileOrder append - hold the door until it exists.
             disabled={config == null}
           >
-            Create Profile
+            {t("profilesSection.createProfile")}
           </Button>
         }
       >
@@ -81,7 +90,7 @@ export function ProfilesSection({
             as="p"
             className="py-4 text-center text-(--content-tertiary)"
           >
-            Loading profiles…
+            {t("profilesSection.loading")}
           </Typography>
         ) : entries.length === 0 ? (
           <Typography
@@ -89,7 +98,7 @@ export function ProfilesSection({
             as="p"
             className="py-4 text-center text-(--content-tertiary)"
           >
-            No profiles yet. Create one to get started.
+            {t("profilesSection.emptyState")}
           </Typography>
         ) : (
           entries.map((profile) => (
@@ -99,10 +108,15 @@ export function ProfilesSection({
               isActiveProfile={profile.name === activeProfile}
               selected={profile.name === selectedProfileName}
               connections={connections}
+              deletePending={deleteFlow.pendingDeleteName === profile.name}
               onOpen={() => onOpenProfile(profile.name)}
-              onMakeActive={() => void actions.makeActive(profile.name)}
+              onMakeActive={() =>
+                void actions.makeActive(profile.name).catch(alreadyReported)
+              }
               onSetStatus={(active) =>
-                void actions.setStatus(profile.name, active)
+                void actions
+                  .setStatus(profile.name, active)
+                  .catch(alreadyReported)
               }
               onDelete={() => deleteFlow.requestDelete(profile.name)}
             />

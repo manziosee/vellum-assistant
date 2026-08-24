@@ -27,6 +27,9 @@ mock.module("../registry.js", () => ({
 // ── Imports (after mocks) ───────────────────────────────────────────────────
 
 import { CODE_DEFAULT_PROFILE_ENTRIES } from "../../config/default-profile-catalog.js";
+import { getDb } from "../../persistence/db-connection.js";
+import { initializeDb } from "../../persistence/db-init.js";
+import { resetSubagentAttributionCacheForTests } from "../../usage/subagent-attribution.js";
 import { RetryProvider } from "../retry.js";
 import type {
   Message,
@@ -188,6 +191,70 @@ describe("RetryProvider — callSite resolution", () => {
     ).toBeUndefined();
   });
 
+  // Delegated-work attribution on the authoritative billing path. Every
+  // subagent variety shares `llm_call_site = "subagentSpawn"`, so these two
+  // orthogonal headers are what let rated usage be decomposed by variety.
+  test("forwards subagent role and spawn mode headers for a subagent conversation", async () => {
+    await initializeDb();
+    resetSubagentAttributionCacheForTests();
+    getDb().run(
+      `INSERT INTO conversations (id, conversation_type, created_at, updated_at, subagent_role, subagent_spawn_mode)
+       VALUES ('conv-retry-advisor', 'background', 1000, 1000, 'advisor', 'advisor_consult')`,
+    );
+    setLlmConfig({
+      callSites: { subagentSpawn: { provider: "openai", model: "gpt-sub" } },
+    });
+
+    let seen: SendMessageOptions | undefined;
+    const wrapped = new RetryProvider(
+      makeProvider("openai", (options) => {
+        seen = options;
+      }),
+      { forwardUsageAttributionHeaders: true },
+    );
+
+    await wrapped.sendMessage(DUMMY_MESSAGES, {
+      config: {
+        callSite: "subagentSpawn",
+        conversationId: "conv-retry-advisor",
+      },
+    });
+
+    const headers = (seen?.config as Record<string, unknown>)
+      .usageAttributionHeaders as Record<string, string>;
+    expect(headers["X-Vellum-Subagent-Role"]).toBe("advisor");
+    expect(headers["X-Vellum-Subagent-Spawn-Mode"]).toBe("advisor_consult");
+  });
+
+  test("omits subagent headers for a conversation that is not a subagent", async () => {
+    await initializeDb();
+    resetSubagentAttributionCacheForTests();
+    getDb().run(
+      `INSERT INTO conversations (id, conversation_type, created_at, updated_at)
+       VALUES ('conv-retry-plain', 'standard', 1000, 1000)`,
+    );
+    setLlmConfig({
+      callSites: { subagentSpawn: { provider: "openai", model: "gpt-sub" } },
+    });
+
+    let seen: SendMessageOptions | undefined;
+    const wrapped = new RetryProvider(
+      makeProvider("openai", (options) => {
+        seen = options;
+      }),
+      { forwardUsageAttributionHeaders: true },
+    );
+
+    await wrapped.sendMessage(DUMMY_MESSAGES, {
+      config: { callSite: "subagentSpawn", conversationId: "conv-retry-plain" },
+    });
+
+    const headers = (seen?.config as Record<string, unknown>)
+      .usageAttributionHeaders as Record<string, string>;
+    expect(headers["X-Vellum-Subagent-Role"]).toBeUndefined();
+    expect(headers["X-Vellum-Subagent-Spawn-Mode"]).toBeUndefined();
+  });
+
   test("omits attribution headers by default for direct provider transports", async () => {
     setLlmConfig({
       callSites: {
@@ -270,7 +337,7 @@ describe("RetryProvider — callSite resolution", () => {
     expect(config.max_tokens).toBe(expected.maxTokens as number);
   });
 
-  test("live-voice front-door call sites reach OpenAI with reasoning off", async () => {
+  test("latency-sensitive live-voice call sites reach OpenAI with reasoning off", async () => {
     // The `latency-optimized` pin's whole value is time-to-first-token, and on
     // an OpenAI upstream that depends entirely on disabled thinking being
     // encoded as `effort: "none"`. OpenAI-compatible APIs reason by default
@@ -284,7 +351,10 @@ describe("RetryProvider — callSite resolution", () => {
     setLlmConfig({});
 
     const expected = CODE_DEFAULT_PROFILE_ENTRIES["latency-optimized"];
-    for (const callSite of ["voiceFrontDoor", "voiceFrontDecision"] as const) {
+    for (const callSite of [
+      "voiceFrontDoor",
+      "voiceProgressNarration",
+    ] as const) {
       let seen: SendMessageOptions | undefined;
       const wrapped = new RetryProvider(
         makeProvider("openai", (options) => {
@@ -298,6 +368,26 @@ describe("RetryProvider — callSite resolution", () => {
       expect(config.model).toBe(expected.model as string);
       expect(config.effort).toBe("none");
     }
+  });
+
+  test("memory-v3 selection does not inherit high effort", async () => {
+    setLlmConfig({ defaultProvider: { provider: "anthropic" } });
+
+    let seen: SendMessageOptions | undefined;
+    const wrapped = new RetryProvider(
+      makeProvider("anthropic", (options) => {
+        seen = options;
+      }),
+    );
+
+    await wrapped.sendMessage(DUMMY_MESSAGES, {
+      config: { callSite: "memoryV3SelectL2" },
+    });
+
+    const config = seen?.config as Record<string, unknown>;
+    expect(config.effort).toBe("low");
+    expect(config.thinking).toEqual({ type: "disabled" });
+    expect(config.temperature).toBe(0);
   });
 
   test("propagates resolved effort/speed/temperature; omits server-side fields", async () => {

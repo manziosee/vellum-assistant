@@ -4,10 +4,9 @@
  * Extracted from conversation-runtime-assembly.ts to break circular
  * imports (memory/conversation-crud → daemon/conversation-runtime-assembly).
  */
-import type { ChannelConversationType } from "@vellumai/gateway-client";
 
 import { isHttpAuthDisabled } from "../config/env.js";
-import { shouldExposePersonalMemory } from "../plugins/defaults/memory/substrate/static-context.js";
+import { canSeePersonalMemory } from "../runtime/effective-capabilities.js";
 import type { TrustClass } from "../runtime/trust-class.js";
 import type { TrustContext } from "./trust-context-types.js";
 
@@ -67,48 +66,24 @@ export function resolveTrustClass(
  * Whether personal-memory content may be surfaced for the actor described by
  * `trustContext`: the gate admits guardian-class actors and internal/local
  * flows (including turns with no trust context), and blocks remote untrusted
- * actors — see {@link shouldExposePersonalMemory} for the rationale.
+ * actors.
  *
  * This is THE personal-memory trust gate. Every surface that exposes private
  * user content — the v2 dynamic/static `<memory>` layers, PKB context, NOW.md,
  * memory-v3 cards/spotlight, and the `loadFromDb` rehydration of persisted
  * memory blocks — must call this one helper so the exposure rule cannot drift
- * between copies. It folds in {@link resolveTrustClass} so the dev-bypass
- * (HTTP auth disabled → guardian) applies uniformly at every call site.
+ * between copies.
+ *
+ * The trust-context binding lives here; the policy itself is
+ * {@link canSeePersonalMemory}, alongside the other capability-plus-context
+ * compositions. This adapter folds in {@link resolveTrustClass} so the
+ * dev-bypass (HTTP auth disabled → guardian) applies uniformly at every call
+ * site.
  */
 export function isPersonalMemoryAllowed(
   trustContext: TrustContext | undefined,
 ): boolean {
-  return shouldExposePersonalMemory({
-    sourceChannel: trustContext?.sourceChannel,
-    isTrustedActor: resolveTrustClass(trustContext) === "guardian",
+  return canSeePersonalMemory({
+    trustClass: resolveTrustClass(trustContext),
   });
-}
-
-/**
- * Map a channel-native chat type (Telegram `private`/`group`/`supergroup`,
- * Slack `im`/`mpim`/`channel`) onto the permission-matrix conversation-type
- * axis. Slack's gateway normalizer forwards every non-DM as `"channel"`
- * without distinguishing public from private, so `"channel"` maps to
- * undefined — a permissive public-channel cell must not silently govern
- * private channels. The channel-type tier starts matching for Slack non-DMs
- * once the gateway forwards the distinct type.
- */
-export function mapChatTypeToConversationType(
-  chatType?: string,
-): ChannelConversationType | undefined {
-  switch (chatType) {
-    case "im": // Slack DM
-    case "private": // Telegram DM
-      return "dm";
-    // "mpim" is Slack's multi-party DM. The gateway normalizer currently
-    // collapses mpim into "channel", so this arm matches nothing from Slack
-    // today; it pins the correct mapping for the raw Slack vocabulary.
-    case "mpim":
-    case "group": // Telegram group
-    case "supergroup": // Telegram supergroup
-      return "private";
-    default:
-      return undefined;
-  }
 }

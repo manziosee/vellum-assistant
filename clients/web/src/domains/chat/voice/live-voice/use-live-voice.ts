@@ -585,6 +585,23 @@ export function useLiveVoice(
     [],
   );
 
+  /**
+   * Hand the running session a photo the user took mid-call. Returns whether
+   * it reached the transport.
+   *
+   * A photo taken during the reconnect gap is dropped rather than queued. The
+   * daemon persists a photo against the session it is told about, and a
+   * reconnect starts a fresh one, so holding the id across that gap would
+   * land the photo in the conversation long after the moment it belonged to.
+   * Dropping is therefore right, but it must be VISIBLE: the upload has
+   * already succeeded and the shutter has already fired, so returning nothing
+   * would leave the user believing the assistant can see something it cannot.
+   * The room reports the false and asks them to take it again.
+   */
+  const attachImage = useCallback((attachmentId: string): boolean => {
+    return sessionRef.current?.client.attachImage(attachmentId) ?? false;
+  }, []);
+
   const createPlayer = useCallback(
     () =>
       (optionsRef.current.createPlayer ?? (() => new LiveVoiceAudioPlayer()))(),
@@ -675,6 +692,7 @@ export function useLiveVoice(
         setMuted,
         setOutputMuted,
         updateConfig,
+        attachImage,
       });
 
       const opts = optionsRef.current;
@@ -906,6 +924,22 @@ export function useLiveVoice(
           s.clearAssistantTranscript();
           s.setState("thinking");
         }),
+        client.on("activity", (frame) => {
+          if (!live()) {
+            return;
+          }
+          // Stored verbatim. The daemon composes this wording precisely so
+          // that this driver and the APNs push carry the same string, and
+          // rewording it here would break the equality it exists to provide.
+          //
+          // A frame with no `approvalRequestId` clears the pending one rather
+          // than leaving it — the daemon retires a wait by sending the line
+          // without it, so treating absence as "unchanged" would strand the
+          // island's Approve/Deny buttons on a decision already made.
+          useLiveVoiceStore
+            .getState()
+            .setActivityLabel(frame.label, frame.approvalRequestId ?? null);
+        }),
         client.on("assistantTextDelta", (frame) => {
           if (!live() || frame.text.length === 0) {
             return;
@@ -1023,6 +1057,15 @@ export function useLiveVoice(
           }
           // Persisted; nothing user-visible to do here.
         }),
+        client.on("attachImageRejected", (rejected) => {
+          if (!live()) {
+            return;
+          }
+          // The assistant refused a photo the transport had already sent, so
+          // nothing downstream knows it is gone. Publishing it is what lets the
+          // room retract the thumbnail it has already shown as sent.
+          useLiveVoiceStore.getState().notePhotoRejected(rejected.reason);
+        }),
         client.on("busy", () => {
           if (!live()) {
             return;
@@ -1089,6 +1132,7 @@ export function useLiveVoice(
                 setMuted,
                 setOutputMuted,
                 updateConfig,
+                attachImage,
               });
               console.warn(
                 `live-voice: initial connect failed (${err.reason}); retrying ` +
@@ -1156,6 +1200,7 @@ export function useLiveVoice(
               setMuted,
               setOutputMuted,
               updateConfig,
+              attachImage,
             });
             console.warn(
               `live-voice: transport closed (code ${info.code}); reconnecting ` +
@@ -1207,6 +1252,7 @@ export function useLiveVoice(
       setMuted,
       setOutputMuted,
       updateConfig,
+      attachImage,
       createPlayer,
     ],
   );
@@ -1313,8 +1359,12 @@ function disposeSessionPrimitives(
 function beginCaptureStartup(session: SessionContext): void {
   const generation = session.generation;
   session.capturePromise = session.capture.start().then((result) => {
-    if (result.ok && session.generation !== generation) {
-      void session.capture.stop();
+    if (result.ok) {
+      if (session.generation !== generation) {
+        void session.capture.stop();
+      } else {
+        useLiveVoiceStore.getState().setMicrophoneActive(true);
+      }
     }
     return result;
   });

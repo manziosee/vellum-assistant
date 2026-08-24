@@ -10,32 +10,82 @@ import { captureError } from "@/lib/sentry/capture-error";
 
 import { useChatSessionStore } from "@/domains/chat/chat-session-store";
 import { useInteractionStore } from "@/domains/chat/interaction-store";
+import {
+  clearSubmissionFailure,
+  reportSubmissionFailure,
+  stillOwnsSubmission,
+} from "@/domains/chat/prompt-submission";
 import { useStreamStore } from "@/domains/chat/stream-store";
 import { submitQuestionResponse } from "@/domains/chat/api/interactions";
 import type { QuestionResponseEntry } from "@/domains/chat/api/event-types";
 
 /**
+ * Clear a question prompt the daemon has already discarded.
+ *
+ * A question POST comes back 404 ("No pending question interaction found for
+ * this requestId") when the server-side pending interaction is gone: the prompt
+ * timed out, the turn was aborted, a newer user message superseded it, or a
+ * daemon restart dropped it. This is terminal and non-retryable, because the
+ * answer is moot once the server has moved on. The matching
+ * `interaction_resolved` event that would normally retire the card can be
+ * missed entirely (the web / iOS SSE stream tears down on app background and
+ * has no replay), so the stale prompt lingers, leaving the user tapping options
+ * into the same 404.
+ *
+ * Retire the prompt without surfacing a blocking error so the user is never
+ * stranded. Mirrors `clearStaleConfirmation` in `confirmation-actions.ts`,
+ * minus its attention-key release: an attention key is only ever recorded for a
+ * pending secret or confirmation, never a question.
+ *
+ * Bails entirely when a newer prompt has taken over: clearing there would
+ * reopen the double-submit guard and erase a real failure the user needs to
+ * see. See {@link stillOwnsSubmission}.
+ */
+function clearStaleQuestion(requestId: string): void {
+  if (!stillOwnsSubmission("question", requestId)) {
+    return;
+  }
+  useInteractionStore.getState().dismissQuestionIfMatches(requestId);
+  // Before the release, which is what the clear's own door reads. Retiring
+  // this prompt first is what lets the door open when nothing replaced it.
+  clearSubmissionFailure("question", requestId);
+  useInteractionStore.getState().releaseSubmission("question", requestId);
+}
+
+/**
  * Submit the user's answers to a pending question prompt.
- * Guards against a new SSE-driven `question_request` arriving mid-flight
- * by comparing request IDs before clearing state.
+ *
+ * A new SSE-driven `question_request` can arrive mid-flight and be answered
+ * while this one is still on the wire, so every path that resumes after the
+ * POST goes through the doors in `prompt-submission.ts` before writing shared
+ * state. Everything before the POST runs synchronously, so ownership cannot
+ * change there.
  */
 export async function handleQuestionResponse(
   responses: QuestionResponseEntry[],
 ): Promise<void> {
-  const { pendingQuestion: snapshot, isSubmittingQuestion } =
+  const { pendingQuestion: snapshot, submittingByKind } =
     useInteractionStore.getState();
-  if (!snapshot || isSubmittingQuestion) {
+  // Guards double-submitting this prompt, not any prompt; see
+  // `prompt-submission.ts` for why that is not "anything in flight".
+  if (!snapshot || submittingByKind.question === snapshot.requestId) {
     return;
   }
-  useInteractionStore.getState().submitQuestionStart();
+  useInteractionStore
+    .getState()
+    .claimSubmission("question", snapshot.requestId);
   useChatSessionStore.getState().setError(null);
 
   const ctx = useStreamStore.getState().streamContext;
   if (!ctx) {
+    // No ownership check: this runs in the same synchronous block as the entry
+    // guard above, so no newer prompt can have arrived yet.
     useChatSessionStore
       .getState()
       .setError({ message: "No active session. Please try again." });
-    useInteractionStore.getState().submitQuestionEnd();
+    useInteractionStore
+      .getState()
+      .releaseSubmission("question", snapshot.requestId);
     return;
   }
 
@@ -46,24 +96,39 @@ export async function handleQuestionResponse(
       { kind: "submit", responses },
     );
     if (!result.ok) {
-      useChatSessionStore.getState().setError({ message: result.error });
-      useInteractionStore.getState().submitQuestionEnd();
+      if (result.status === 404) {
+        clearStaleQuestion(snapshot.requestId);
+        return;
+      }
+      // A retryable failure, so the card stays and the user is told, provided
+      // the prompt they are looking at is still this one.
+      reportSubmissionFailure("question", snapshot.requestId, result.error);
+      useInteractionStore
+        .getState()
+        .releaseSubmission("question", snapshot.requestId);
       return;
     }
-    if (
-      useInteractionStore.getState().pendingQuestion?.requestId ===
-      snapshot.requestId
-    ) {
-      useInteractionStore.getState().dismissQuestion();
-    } else {
-      useInteractionStore.getState().submitQuestionEnd();
-    }
-  } catch (err) {
-    captureError(err, { context: "submit_question_response" });
-    useChatSessionStore
+    // Success. Both writes name this request, so neither can reach a prompt or
+    // a submission that is not this one, and the card being gone already (its
+    // `interaction_resolved` having arrived first) needs no special case.
+    useInteractionStore.getState().dismissQuestionIfMatches(snapshot.requestId);
+    useInteractionStore
       .getState()
-      .setError({ message: "Failed to submit response. Please try again." });
-    useInteractionStore.getState().submitQuestionEnd();
+      .releaseSubmission("question", snapshot.requestId);
+  } catch (err) {
+    // Transport failure (network drop, abort, malformed response). Always
+    // recorded; only shown while its own prompt is the one on screen, so a
+    // dead request cannot explain itself over a question it does not belong
+    // to.
+    captureError(err, { context: "submit_question_response" });
+    reportSubmissionFailure(
+      "question",
+      snapshot.requestId,
+      "Failed to submit response. Please try again.",
+    );
+    useInteractionStore
+      .getState()
+      .releaseSubmission("question", snapshot.requestId);
   }
 }
 
@@ -73,10 +138,10 @@ export async function handleQuestionResponse(
  */
 export function handleDismissPendingQuestion(): void {
   const snapshot = useInteractionStore.getState().pendingQuestion;
-  useInteractionStore.getState().dismissQuestion();
   if (!snapshot) {
     return;
   }
+  useInteractionStore.getState().dismissQuestionIfMatches(snapshot.requestId);
   const ctx = useStreamStore.getState().streamContext;
   if (!ctx) {
     return;
@@ -85,7 +150,12 @@ export function handleDismissPendingQuestion(): void {
     kind: "close",
   })
     .then((result) => {
-      if (!result.ok) {
+      // A 404 on close is the expected outcome, not a failure: the card is
+      // being dismissed precisely because the user is done with it, and the
+      // daemon may already have settled the prompt itself (timeout, abort,
+      // supersession). Reporting it produced steady Sentry noise with no
+      // actionable signal. Every other status still reports.
+      if (!result.ok && result.status !== 404) {
         captureError(
           new Error(`question-response close failed: ${result.error}`),
           {

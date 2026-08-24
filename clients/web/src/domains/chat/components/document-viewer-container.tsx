@@ -1,9 +1,13 @@
+
+import { useTranslation } from "@/i18n";
 /**
  * Document viewer with integrated comment panel.
  *
  * Renders the document content using a Tiptap/ProseMirror editor and provides
  * a toggleable comment sidebar. Comment anchors, active highlights, and text
  * selection are wired via React props/callbacks (no iframe postMessage).
+ *
+ * One backing store: a document surface in the daemon's document database.
  */
 
 import {
@@ -11,6 +15,7 @@ import {
   useCallback,
   useEffect,
   useImperativeHandle,
+  useLayoutEffect,
   useRef,
   useState,
   type Ref,
@@ -31,8 +36,11 @@ import {
   createComment,
   fetchComments,
 } from "@/domains/chat/api/document-comments";
+import {
+  saveDocumentContent,
+  type DocumentSaveTarget,
+} from "@/domains/chat/api/document-save";
 import type { CommentAnchor } from "@/domains/chat/utils/tiptap-position-map";
-import { documentsPost } from "@/generated/daemon/sdk.gen";
 import type { DocumentsByIdCommentsPostResponse } from "@/generated/daemon/types.gen";
 import {
   DocumentCommentPanel,
@@ -56,17 +64,19 @@ export interface DocumentViewerContainerHandle {
   refreshComments: () => Promise<void>;
 }
 
+/** A document surface: autosave writes through the documents API. */
 export interface DocumentViewerContainerProps {
-  surfaceId: string;
+  source: "document";
   assistantId: string;
-  conversationId: string;
   documentName: string;
   content: string;
   onClose: () => void;
-  onExport?: () => void;
-  onSubmitFeedback?: () => void;
   /** Imperative handle ref for SSE-driven refresh triggers. */
   handleRef?: Ref<DocumentViewerContainerHandle>;
+  surfaceId: string;
+  conversationId: string;
+  onExport?: () => void;
+  onSubmitFeedback?: () => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -94,16 +104,26 @@ interface TextSelection {
 // ---------------------------------------------------------------------------
 
 export function DocumentViewerContainer({
-  surfaceId,
   assistantId,
-  conversationId,
   documentName,
   content,
   onClose,
+  handleRef,
+  surfaceId,
+  conversationId,
   onExport,
   onSubmitFeedback,
-  handleRef,
 }: DocumentViewerContainerProps) {
+  const { t } = useTranslation("chat");
+  // Where autosave writes.
+  const saveTarget: DocumentSaveTarget = {
+    source: "document",
+    assistantId,
+    surfaceId,
+    conversationId,
+    title: documentName,
+  };
+
   const [commentsPanelOpen, setCommentsPanelOpen] = useState(false);
   const [textSelection, setTextSelection] = useState<TextSelection | null>(
     null,
@@ -123,6 +143,34 @@ export function DocumentViewerContainer({
   const saveTimerRef = useRef<ReturnType<typeof setTimeout>>(null);
   const savedFadeRef = useRef<ReturnType<typeof setTimeout>>(null);
 
+  // The debounced save reads its destination through refs rather than the
+  // closure the keystroke created. The container is keyed per document, so a
+  // switch unmounts it with a save still pending, and a rename changes the
+  // title under a mounted one; both are cases where the value captured when
+  // the keystroke landed is no longer where the text belongs. The pending
+  // markdown rides along so the unmount flush below has something to write.
+  const saveTargetRef = useRef(saveTarget);
+  const pendingMarkdownRef = useRef<string | null>(null);
+  useLayoutEffect(() => {
+    saveTargetRef.current = saveTarget;
+  });
+
+  const flushPendingSave = useCallback(() => {
+    const markdown = pendingMarkdownRef.current;
+    if (markdown === null) {
+      return;
+    }
+    pendingMarkdownRef.current = null;
+    const target = saveTargetRef.current;
+    void saveDocumentContent(target, markdown).then(
+      () => {
+        setSaveStatus("saved");
+        savedFadeRef.current = setTimeout(() => setSaveStatus("idle"), 2000);
+      },
+      () => setSaveStatus("idle"),
+    );
+  }, []);
+
   const handleContentChange = useCallback(
     (markdown: string) => {
       if (saveTimerRef.current) {
@@ -131,35 +179,37 @@ export function DocumentViewerContainer({
       if (savedFadeRef.current) {
         clearTimeout(savedFadeRef.current);
       }
+      pendingMarkdownRef.current = markdown;
       setSaveStatus("saving");
       saveTimerRef.current = setTimeout(() => {
-        const wordCount = markdown
-          .trim()
-          .split(/\s+/)
-          .filter((w) => w.length > 0).length;
-        void documentsPost({
-          path: { assistant_id: assistantId },
-          body: {
-            surfaceId,
-            conversationId,
-            title: documentName,
-            content: markdown,
-            wordCount,
-          },
-          throwOnError: true,
-        }).then(
-          () => {
-            setSaveStatus("saved");
-            savedFadeRef.current = setTimeout(
-              () => setSaveStatus("idle"),
-              2000,
-            );
-          },
-          () => setSaveStatus("idle"),
-        );
+        saveTimerRef.current = null;
+        flushPendingSave();
       }, 1000);
     },
-    [assistantId, surfaceId, conversationId, documentName],
+    [flushPendingSave],
+  );
+
+  // A keyed remount takes the pending timer down with it, so an edit made in
+  // the last second before a document switch or a close would never reach the
+  // daemon. Fire it now instead: the refs still name the document being left,
+  // so the text lands where it was typed.
+  const flushPendingSaveRef = useRef(flushPendingSave);
+  useLayoutEffect(() => {
+    flushPendingSaveRef.current = flushPendingSave;
+  });
+  useEffect(
+    () => () => {
+      if (savedFadeRef.current) {
+        clearTimeout(savedFadeRef.current);
+        savedFadeRef.current = null;
+      }
+      if (saveTimerRef.current) {
+        clearTimeout(saveTimerRef.current);
+        saveTimerRef.current = null;
+        flushPendingSaveRef.current();
+      }
+    },
+    [],
   );
 
   // Clear inline comment state when panel closes (but keep text selection
@@ -325,7 +375,7 @@ export function DocumentViewerContainer({
               variant="label-small-default"
               className="text-[var(--content-tertiary)]"
             >
-              {saveStatus === "saving" ? "Saving…" : "Saved"}
+              {saveStatus === "saving" ? t("documentViewerContainer.saving") : t("documentViewerContainer.saved")}
             </Typography>
           </span>
         ) : null}
@@ -337,7 +387,7 @@ export function DocumentViewerContainer({
             leftIcon={<Download />}
             onClick={onExport}
           >
-            Export
+            {t("documentViewerContainer.export")}
           </Button>
         ) : null}
 
@@ -346,10 +396,10 @@ export function DocumentViewerContainer({
           size="compact"
           leftIcon={<MessageSquareText />}
           onClick={toggleComments}
-          aria-label={commentsPanelOpen ? "Close comments" : "Open comments"}
+          aria-label={commentsPanelOpen ? t("documentViewerContainer.closeCommentsAria") : t("documentViewerContainer.openCommentsAria")}
           aria-pressed={commentsPanelOpen}
         >
-          Comments
+          {t("documentViewerContainer.comments")}
         </Button>
 
         <Button
@@ -357,8 +407,8 @@ export function DocumentViewerContainer({
           size="compact"
           iconOnly={<X />}
           onClick={onClose}
-          aria-label="Close document"
-          tooltip="Close"
+          aria-label={t("documentViewerContainer.closeDocumentAria")}
+          tooltip={t("documentViewerContainer.close")}
         />
       </div>
 

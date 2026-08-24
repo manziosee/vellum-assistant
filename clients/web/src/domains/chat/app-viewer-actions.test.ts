@@ -1,6 +1,7 @@
-import { afterEach, describe, expect, it, mock } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 
 import { handleAppViewerAction } from "@/domains/chat/app-viewer-actions";
+import { stubViewportAxes } from "@/hooks/viewport-axes.test-helper";
 import { useConversationStore } from "@/stores/conversation-store";
 import { useViewerStore } from "@/stores/viewer-store";
 
@@ -10,7 +11,17 @@ function makeCtx(isMobile = false) {
   return { navigate: mock((_to: string) => {}), isMobile };
 }
 
+let restoreViewport: (() => void) | undefined;
+
+beforeEach(() => {
+  restoreViewport = stubViewportAxes({
+    narrow: false,
+    coarsePointer: false,
+  });
+});
+
 afterEach(() => {
+  restoreViewport?.();
   useViewerStore.getState().reset();
   useConversationStore.setState({
     activeConversationId: null,
@@ -121,13 +132,21 @@ describe("handleAppViewerAction — set_view", () => {
     expect(useViewerStore.getState().mainView).toBe("app");
   });
 
-  it("'split' is a no-op with no active conversation", () => {
+  it("'split' with no conversation starts one to put beside the app", () => {
     useConversationStore.setState({ activeConversationId: null });
     useViewerStore.setState({ mainView: "app", openedAppState: SAMPLE_APP });
+    const ctx = makeCtx(false);
 
-    handleAppViewerAction(makeCtx(false), "set_view", { view: "split" });
+    handleAppViewerAction(ctx, "set_view", { view: "split" });
 
-    expect(useViewerStore.getState().mainView).toBe("app");
+    const conversation = useConversationStore.getState();
+    const newId = conversation.activeConversationId;
+    expect(newId).toBeTruthy();
+    expect(conversation.draftConversationIds.has(newId!)).toBe(true);
+    expect(conversation.editingConversationId).toBe(newId);
+    expect(useViewerStore.getState().mainView).toBe("app-editing");
+    const [url] = ctx.navigate.mock.calls[0];
+    expect(url).toContain(`/assistant/conversations/${newId}`);
   });
 });
 
@@ -148,6 +167,24 @@ describe("handleAppViewerAction — open_conversation", () => {
     );
     // Must NOT contain a prompt param
     expect(ctx.navigate.mock.calls[0][0]).not.toContain("prompt=");
+  });
+
+  it("enters the side-by-side so the conversation is visible beside the app", () => {
+    useViewerStore.setState({
+      mainView: "app",
+      activeAppId: SAMPLE_APP.appId,
+      openedAppState: SAMPLE_APP,
+    });
+    const ctx = makeCtx();
+
+    handleAppViewerAction(ctx, "open_conversation", {
+      conversationId: "target-conv",
+    });
+
+    expect(useViewerStore.getState().mainView).toBe("app-editing");
+    expect(useConversationStore.getState().editingConversationId).toBe(
+      "target-conv",
+    );
   });
 
   it("is a no-op without a conversationId", () => {

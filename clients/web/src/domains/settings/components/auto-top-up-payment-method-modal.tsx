@@ -11,6 +11,7 @@ import { AlertCircle, Loader2 } from "lucide-react";
 import { useEffect, useMemo, useState, type FormEvent } from "react";
 
 import { organizationsBillingAutoTopUpSetupIntentCreateMutation } from "@/generated/api/@tanstack/react-query.gen";
+import { useTranslation } from "@/i18n";
 import { Button } from "@vellumai/design-library/components/button";
 import { Modal } from "@vellumai/design-library/components/modal";
 import { Notice } from "@vellumai/design-library/components/notice";
@@ -42,15 +43,35 @@ export interface AutoTopUpPaymentMethodModalProps {
   open: boolean;
   onClose: () => void;
   /**
-   * Called after `confirmSetup` succeeds. Owners use this to invalidate the
-   * auto-top-up config query so the saved-PM line and `has_payment_method`
-   * gate reflect the new card immediately.
+   * Called after `confirmSetup` succeeds, carrying the id of the SetupIntent
+   * that was just confirmed (null when it cannot be derived). Owners use this
+   * to refresh the auto-top-up config so the saved-PM line and
+   * `has_payment_method` gate reflect the new card immediately.
    *
    * May return a Promise; the modal awaits it before calling `onClose()` so
    * the parent re-renders against fresh data instead of briefly showing
    * stale payment-method copy after a successful save.
    */
-  onSavedOptimistic: () => void | Promise<void>;
+  onSavedOptimistic: (args: {
+    setupIntentId: string | null;
+  }) => void | Promise<void>;
+}
+
+/**
+ * A SetupIntent client secret is `<setup intent id>_secret_<random>`, so the
+ * id is everything before the `_secret` marker.
+ */
+function setupIntentIdFromClientSecret(
+  clientSecret: string | null,
+): string | null {
+  if (!clientSecret) {
+    return null;
+  }
+  const marker = clientSecret.indexOf("_secret");
+  if (marker <= 0) {
+    return null;
+  }
+  return clientSecret.slice(0, marker);
 }
 
 /**
@@ -74,13 +95,15 @@ export interface AutoTopUpPaymentMethodModalProps {
  *     in-page when the PM doesn't need 3DS, and otherwise redirects to
  *     `window.location.href` (so the user lands back on the current
  *     settings page).
- *  5. On success, toast + `onSavedOptimistic()` + `onClose()`.
+ *  5. On success, `onSavedOptimistic({ setupIntentId })`, then toast +
+ *     `onClose()` once the saved card has settled.
  */
 export function AutoTopUpPaymentMethodModal({
   open,
   onClose,
   onSavedOptimistic,
 }: AutoTopUpPaymentMethodModalProps) {
+  const { t } = useTranslation("settings");
   const setupIntentMutation = useMutation(
     organizationsBillingAutoTopUpSetupIntentCreateMutation(),
   );
@@ -124,7 +147,9 @@ export function AutoTopUpPaymentMethodModal({
     >
       <Modal.Content size="sm">
         <Modal.Header>
-          <Modal.Title>Save Payment Method</Modal.Title>
+          <Modal.Title>
+            {t("autoTopUpPaymentMethodModal.title")}
+          </Modal.Title>
         </Modal.Header>
         <Modal.Body className="min-h-[260px]">
           {!STRIPE_PK ? (
@@ -144,11 +169,11 @@ export function AutoTopUpPaymentMethodModal({
           ) : setupIntentMutation.isError ? (
             <div className="space-y-3" data-testid="auto-top-up-pm-modal-error">
               <Notice tone="error">
-                Failed to start card setup. Please try again.
+                {t("autoTopUpPaymentMethodModal.setupError")}
               </Notice>
               <div className="flex justify-end">
                 <Button variant="primary" onClick={() => createSetupIntent({})}>
-                  Try again
+                  {t("autoTopUpPaymentMethodModal.tryAgain")}
                 </Button>
               </div>
             </div>
@@ -162,12 +187,14 @@ export function AutoTopUpPaymentMethodModal({
             >
               <SetupCardForm
                 onSuccess={async () => {
-                  toast.success("Payment method saved.");
-                  // Await the parent's optimistic refetch before closing so
-                  // the next render reads fresh auto-top-up data. Without
-                  // the await, `onClose()` fires immediately and the user
-                  // briefly sees stale PM copy.
-                  await onSavedOptimistic();
+                  // Await the parent's follow-up before toasting or closing:
+                  // the toast must not claim success while the saved card is
+                  // still settling, and closing early would briefly show
+                  // stale PM copy.
+                  await onSavedOptimistic({
+                    setupIntentId: setupIntentIdFromClientSecret(clientSecret),
+                  });
+                  toast.success(t("autoTopUpPaymentMethodModal.savedToast"));
                   onClose();
                 }}
                 onCancel={onClose}
@@ -185,6 +212,7 @@ export function AutoTopUpPaymentMethodModal({
 // Fallback when VITE_STRIPE_PUBLISHABLE_KEY is not set at build time.
 
 function MissingStripeKeyNotice() {
+  const { t } = useTranslation("settings");
   useEffect(() => {
     console.warn(
       "[AutoTopUpPaymentMethodModal] VITE_STRIPE_PUBLISHABLE_KEY is not set; the payment-method modal cannot mount Stripe Elements.",
@@ -192,7 +220,7 @@ function MissingStripeKeyNotice() {
   }, []);
   return (
     <Notice tone="error">
-      Payment method setup is currently unavailable. Please try again later.
+      {t("autoTopUpPaymentMethodModal.unavailable")}
     </Notice>
   );
 }
@@ -210,6 +238,7 @@ function SetupCardForm({
   onSuccess: () => void | Promise<void>;
   onCancel: () => void;
 }) {
+  const { t } = useTranslation("settings");
   const stripe = useStripe();
   const elements = useElements();
   const [submitting, setSubmitting] = useState(false);
@@ -237,7 +266,10 @@ function SetupCardForm({
       });
 
       if (result.error) {
-        setError(result.error.message ?? "Failed to save payment method.");
+        setError(
+          result.error.message ??
+            t("autoTopUpPaymentMethodModal.confirmFailed"),
+        );
         return;
       }
       // Await `onSuccess` so the parent's cache invalidation completes
@@ -255,9 +287,7 @@ function SetupCardForm({
       <PaymentElement
         onReady={() => setElementReady(true)}
         onLoadError={() =>
-          setError(
-            "Failed to load the payment form. Please close and reopen this dialog.",
-          )
+          setError(t("autoTopUpPaymentMethodModal.paymentFormLoadError"))
         }
         options={{
           layout: { type: "tabs", defaultCollapsed: false },
@@ -281,9 +311,7 @@ function SetupCardForm({
       <AddressElement
         onReady={() => setAddressElementReady(true)}
         onLoadError={() =>
-          setError(
-            "Failed to load the billing address form. Please close and reopen this dialog.",
-          )
+          setError(t("autoTopUpPaymentMethodModal.addressFormLoadError"))
         }
         options={{
           mode: "billing",
@@ -306,7 +334,7 @@ function SetupCardForm({
           onClick={onCancel}
           disabled={submitting}
         >
-          Cancel
+          {t("autoTopUpPaymentMethodModal.cancel")}
         </Button>
         <Button
           variant="primary"
@@ -317,7 +345,7 @@ function SetupCardForm({
             submitting ? <Loader2 className="animate-spin" /> : undefined
           }
         >
-          Save
+          {t("autoTopUpPaymentMethodModal.save")}
         </Button>
       </div>
     </form>

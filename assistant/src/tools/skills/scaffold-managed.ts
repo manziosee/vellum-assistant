@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { SkillSource } from "../../config/skills.js";
 import { loadSkillCatalog } from "../../config/skills.js";
 import { refreshSkillCapabilityMemories } from "../../daemon/skill-memory-refresh.js";
+import { emitNotificationSignal } from "../../notifications/emit-signal.js";
 import { getConversation } from "../../persistence/conversation-crud.js";
 import { upsertSkillCardInsertJob } from "../../persistence/jobs-store.js";
 import { MEMORY_RETROSPECTIVE_ORIGIN } from "../../plugins/defaults/memory/memory-retrospective-constants.js";
@@ -27,10 +28,20 @@ function sanitizeFrontmatterValue(value: string): string {
 }
 
 /**
- * Validate + normalize an optional string-array input (sanitize, drop blanks,
- * dedupe). Returns `{ error }` on the first invalid element, or `{ value }`
- * holding the normalized array (undefined when empty). Shared by the
- * includes / activation_hints / avoid_when inputs so they behave identically.
+ * Self-correcting error for a scaffold call with no activation hints. Matches
+ * the shape of the schema validator's required-field error, which is what a
+ * call through the registered tool hits first; this covers direct callers and
+ * an explicit empty list, which the schema's presence check accepts.
+ */
+const MISSING_ACTIVATION_HINTS =
+  'activation_hints is required: pass 1-4 short trigger phrases stating the intent this skill serves (for example "user asks to deploy staging") so it can be found later by intent, not just by name.';
+
+/**
+ * Validate + normalize a string-array input (sanitize, drop blanks, dedupe).
+ * Returns `{ error }` on the first invalid element, or `{ value }` holding
+ * the normalized array (undefined when absent or empty). Shared by the
+ * includes / activation_hints / avoid_when inputs so they behave identically;
+ * whether an absent value is acceptable is the caller's call.
  * Each element goes through sanitizeFrontmatterValue: activation_hints /
  * avoid_when are concatenated verbatim into capability memory text (see
  * buildSkillContent), so an embedded newline could otherwise smuggle an extra
@@ -64,6 +75,72 @@ function normalizeOptionalStringArray(
     normalized.push(cleaned);
   }
   return { value: normalized.length > 0 ? normalized : undefined };
+}
+
+/**
+ * Tell the user that a background pass changed a skill they already have.
+ *
+ * A newly authored skill announces itself in the conversation through the
+ * `skill_card` surface; an update announces itself here instead. The pass
+ * runs in a background fork and rewrites the body of a skill the user may be
+ * relying on, and `createManagedSkill` writes through an atomic rename
+ * keeping no prior version, so the notification pipeline is what puts the
+ * change in the background feed alongside the other unattended work (sweeps,
+ * scheduled jobs, heartbeat), where a user already looks to see what the
+ * assistant did on its own.
+ *
+ * `sourceContextId` is a conversation id so the feed item's "Go to Convo"
+ * target resolves (see `home-feed-side-effect.ts`, which looks it up via
+ * `getConversation`): the source conversation when lineage resolved, else the
+ * run's own conversation. Deduped per skill per day, so a pass that refines
+ * the same skill repeatedly cannot flood the feed. Best-effort and
+ * non-blocking: the skill is already written, and a notification failure must
+ * never turn that into a tool error.
+ */
+function notifyBackgroundSkillUpdate(args: {
+  skillId: string;
+  name: string;
+  conversationId: string;
+}): void {
+  const day = new Date().toISOString().slice(0, 10);
+  void emitNotificationSignal({
+    // This emit is a tool executor's, not the scheduler's. The channel is
+    // provenance the pipeline reads: `home-feed-side-effect` derives
+    // `fromAssistant` from it, so labelling this "scheduler" would drop the
+    // item from the feed's assistant-initiated filter despite being exactly
+    // that.
+    sourceChannel: "assistant_tool",
+    sourceContextId: args.conversationId,
+    sourceEventName: "activity.complete",
+    dedupeKey: `skill-updated:${args.skillId}:${day}`,
+    contextPayload: {
+      // `summary` feeds the copy composer; `title`/`body` are the home feed's
+      // fallback when no channel copy was rendered. Without them a fully
+      // suppressed delivery (the intended shape for this signal: low urgency,
+      // background, no interruption) leaves the feed writer with no summary
+      // and it skips the item entirely, so the quiet case would surface
+      // nothing at all.
+      summary: `Updated the skill "${args.name}" from something learned in an earlier conversation.`,
+      // Named, not just "Skill updated": the feed sits several rows deep and
+      // a generic title is unscannable next to entries that name their
+      // subject (`Background job failed: memory.v2.sweep`). The word "Skill"
+      // stays because a bare skill name does not always read as one.
+      title: `Skill updated: ${args.name}`,
+      body: `Updated the skill "${args.name}" from something learned in an earlier conversation.`,
+      skillId: args.skillId,
+    },
+    attentionHints: {
+      requiresAction: false,
+      urgency: "low",
+      isAsyncBackground: true,
+      visibleInSourceNow: false,
+    },
+  }).catch((err: unknown) => {
+    log.warn(
+      { err, skillId: args.skillId },
+      "skill update notification failed; the skill write stands",
+    );
+  });
 }
 
 /**
@@ -117,9 +194,9 @@ export async function executeScaffoldManagedSkill(
     };
   }
 
-  // Validate and normalize the optional string-array inputs. `includes` lists
-  // child skill IDs; activation_hints / avoid_when become the skill's
-  // "Use when:" / "Avoid when:" retrieval signal in memory.
+  // Validate and normalize the string-array inputs. `includes` lists child
+  // skill IDs; activation_hints / avoid_when become the skill's "Use when:" /
+  // "Avoid when:" retrieval signal in memory.
   const includesResult = normalizeOptionalStringArray(
     input.includes,
     "includes",
@@ -137,6 +214,14 @@ export async function executeScaffoldManagedSkill(
     return { content: `Error: ${activationHintsResult.error}`, isError: true };
   }
   const activationHints = activationHintsResult.value;
+  // Hints are the skill's "Use when:" retrieval text, and scaffolding rewrites
+  // the whole SKILL.md, so a write without them leaves (or strips) none.
+  if (!activationHints) {
+    return {
+      content: `Error: ${MISSING_ACTIVATION_HINTS}`,
+      isError: true,
+    };
+  }
 
   const avoidWhenResult = normalizeOptionalStringArray(
     input.avoid_when,
@@ -353,6 +438,21 @@ export async function executeScaffoldManagedSkill(
       // recordWatchdogEvent already no-ops on opt-out and a missing
       // telemetry DB; anything past that is not worth surfacing here.
     }
+  }
+
+  // A background pass changed a skill that already existed. Creates announce
+  // themselves through the skill card below; updates announce themselves in
+  // the background activity feed. Covers an explicit `overwrite: true`
+  // refinement as well as any other background write onto a pre-existing
+  // skill.
+  const notifyConversationId =
+    sourceConversationId ?? retrospectiveConversationId;
+  if (fromRetrospective && managedSkillExistedBefore && notifyConversationId) {
+    notifyBackgroundSkillUpdate({
+      skillId: id,
+      name: normalizedName,
+      conversationId: notifyConversationId,
+    });
   }
 
   // Surface a genuine retrospective CREATE to the user as a skill card on the

@@ -11,10 +11,12 @@ import {
 } from "@/generated/daemon/@tanstack/react-query.gen";
 import { configPatch, credentialsSetPost } from "@/generated/daemon/sdk.gen";
 import { useDraftOverride } from "@/hooks/use-draft-override";
+import { useTranslation } from "@/i18n";
 import { useIsOrgReady } from "@/hooks/use-is-org-ready";
 import { isNativeDictationSupported } from "@/runtime/native-dictation-partials";
+import { detectElectronHostOS } from "@/runtime/platform-detection";
 import { getLocalSetting, setLocalSetting } from "@/utils/local-settings";
-import { Dropdown } from "@vellumai/design-library/components/dropdown";
+import { Select } from "@vellumai/design-library/components/select";
 import { Input } from "@vellumai/design-library/components/input";
 import { toast } from "@vellumai/design-library/components/toast";
 
@@ -30,7 +32,7 @@ import {
 } from "@/utils/local-settings-keys";
 import {
   MACOS_NATIVE_STT_PROVIDER_ID,
-  STT_PROVIDERS,
+  sttProvidersForHostOS,
 } from "@/lib/provider-catalogs";
 import { sttLanguageLabelForCode } from "@/lib/stt/language-catalog";
 import { SelectTriggerRow } from "@/components/speech/select-trigger-row";
@@ -116,13 +118,18 @@ export function SttProviderForm({
   const assistantId = assistantIdProp ?? activeAssistantId;
   const isOrgReady = useIsOrgReady();
   const queryClient = useQueryClient();
-  // Capability is fixed for the renderer's lifetime, so compute the offered
-  // list once: the native provider only exists inside the macOS Electron
-  // shell, where the helper's SFSpeechRecognizer bridge is wired.
-  const [providers] = useState(() =>
-    STT_PROVIDERS.filter(
-      (p) => !p.requiresNativeDictation || isNativeDictationSupported(),
-    ),
+  const { t } = useTranslation();
+  const providers = useMemo(
+    () =>
+      sttProvidersForHostOS(detectElectronHostOS(), {
+        displayName: t("sttProviderForm.windowsNativeDisplayName"),
+        subtitle: t("sttProviderForm.windowsNativeSubtitle"),
+        setupWarning: t("sttProviderForm.windowsNativeSetupWarning"),
+      }).filter(
+        (provider) =>
+          !provider.requiresNativeDictation || isNativeDictationSupported(),
+      ),
+    [t],
   );
   const defaultProviderId = DEFAULT_PROVIDER_ID;
 
@@ -372,7 +379,7 @@ export function SttProviderForm({
         <label className="block text-body-small-default text-[var(--content-tertiary)]">
           Provider
         </label>
-        <Dropdown
+        <Select
           value={draftProvider}
           onChange={setDraftProvider}
           options={providers.map((p) => ({
@@ -389,7 +396,7 @@ export function SttProviderForm({
             Spoken language
           </label>
           {/* A trigger row (current value + chevron) opening the shared
-              search-first picker: mirrors the Dropdown trigger's field
+              search-first picker: mirrors the Select trigger's field
               styling so the form reads uniformly, but opens a dialog. */}
           <SelectTriggerRow
             aria-label="Spoken language"

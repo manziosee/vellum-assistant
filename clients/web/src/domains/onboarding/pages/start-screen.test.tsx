@@ -9,7 +9,7 @@ mock.module("react-router", () => ({
 }));
 
 // Light passthroughs so the screen renders in happy-dom.
-mock.module("@/domains/onboarding/components/onboarding-layout", () => ({
+mock.module("@/components/onboarding-layout", () => ({
   OnboardingLayout: ({ children }: { children: React.ReactNode }) => children,
 }));
 mock.module("@vellumai/design-library/components/button", () => ({
@@ -28,11 +28,17 @@ describe("StartScreen", () => {
   beforeEach(() => navigateMock.mockClear());
   afterEach(cleanup);
 
+  // It REPLACES: the funnel is one history entry, so Back can never re-enter
+  // it once setup finishes (see `onboarding-navigation.ts`). This screen is
+  // reached only via Back in the first place, so a push here would put it
+  // straight back on the stack.
   test("the single CTA re-enters the funnel at the privacy screen", () => {
     render(<StartScreen />);
 
     fireEvent.click(screen.getByText("Create your assistant"));
 
-    expect(navigateMock).toHaveBeenCalledWith(routes.onboarding.privacy);
+    expect(navigateMock).toHaveBeenCalledWith(routes.onboarding.privacy, {
+      replace: true,
+    });
   });
 });

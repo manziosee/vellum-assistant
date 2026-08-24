@@ -103,12 +103,22 @@ mock.module("../daemon/conversation-store.js", () => ({
   },
 }));
 
+import { initializeDb } from "../persistence/db-init.js";
 import {
   getProviderRoutingSource,
   initializeProviders,
   listProviders,
 } from "../providers/registry.js";
-import { ROUTES } from "../runtime/routes/secret-routes.js";
+import {
+  notifyCesOfAssistantApiKeyUpdate,
+  ROUTES,
+} from "../runtime/routes/secret-routes.js";
+
+// A delete looks up the provider connections that resolve their auth through
+// the credential, so the inference schema has to exist. No connection is
+// created here: the refusal is covered by
+// runtime/routes/__tests__/credential-delete-in-use.test.ts.
+await initializeDb();
 
 const addRoute = ROUTES.find(
   (r) => r.method === "POST" && r.endpoint === "secrets",
@@ -174,6 +184,31 @@ describe("secret routes managed proxy registry sync", () => {
       expect(getProviderRoutingSource(provider)).toBe("managed-proxy");
     }
     expect(lastGeminiConstructorOpts).toBeDefined();
+  });
+
+  test("the CES key-update notification with no CES client logs a warning", async () => {
+    // When getCesClient() is undefined the push is skipped, but the skip must
+    // be logged, not dropped silently. Exercise the extracted helper directly
+    // with an injected logger.
+    const warns: string[] = [];
+    const fakeLogger = {
+      info: () => {},
+      warn: (a: unknown, b?: unknown) => {
+        warns.push(typeof a === "string" ? a : String(b));
+      },
+    };
+
+    await notifyCesOfAssistantApiKeyUpdate(
+      "ast-managed-key",
+      undefined,
+      fakeLogger as unknown as Parameters<
+        typeof notifyCesOfAssistantApiKeyUpdate
+      >[2],
+    );
+
+    expect(warns.some((m) => m.includes("no CES client is connected"))).toBe(
+      true,
+    );
   });
 
   test("provider API key writes notify live-conversation refresh listeners", async () => {

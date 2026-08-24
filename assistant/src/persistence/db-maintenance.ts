@@ -3,11 +3,13 @@ import { statSync } from "node:fs";
 import { getConfig } from "../config/loader.js";
 import { getLogger } from "../util/logger.js";
 import { getDbPath } from "../util/platform.js";
+import { sweepOrphanedWatchTimelineEntries } from "../watch/watch-timeline.js";
 import { pruneRuns } from "../workflows/journal-store.js";
 import { getMemoryCheckpoint, setMemoryCheckpoint } from "./checkpoints.js";
 import { getLastInteractiveUserMessageTimestamp } from "./conversation-crud.js";
 import { runAsyncSqlite } from "./db-async-query.js";
 import { getSqlite } from "./db-connection.js";
+import { PLANNER_OPTIMIZE_PRAGMA } from "./planner-statistics.js";
 
 const log = getLogger("db-maintenance");
 
@@ -80,11 +82,25 @@ async function runDbMaintenance(): Promise<void> {
     log.warn({ err }, "Workflow run pruning failed (non-fatal)");
   }
 
-  // Refresh the query planner's statistics. PRAGMA optimize is cheap; it is
-  // routed through the async path for consistency and to keep it off the main
-  // thread when the sqlite3 CLI backend is available.
+  // Reclaim watch-timeline entries whose conversation is gone. Their purge runs
+  // after the conversation row is already deleted and cannot be retried by the
+  // caller, and nothing cascades into the table, so a failed purge or a crash
+  // between the two writes would otherwise keep screenshots of the user's
+  // screen indefinitely. Bounded per pass and best-effort inside the sweep,
+  // which reports zero rather than throwing, so it needs no guard here.
+  const sweptWatchEntries = sweepOrphanedWatchTimelineEntries();
+  if (sweptWatchEntries > 0) {
+    log.info(
+      { sweptWatchEntries },
+      "Swept watch timeline entries for deleted conversations",
+    );
+  }
+
+  // Refresh the query planner's statistics (see PLANNER_OPTIMIZE_PRAGMA for
+  // what the mask buys here). Routed through the async path to keep it off the
+  // main thread when the sqlite3 CLI backend is available.
   const optimizeResult = await runAsyncSqlite(
-    "PRAGMA optimize",
+    PLANNER_OPTIMIZE_PRAGMA,
     "db-maintenance:optimize",
   );
   if (!optimizeResult.ok) {

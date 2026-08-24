@@ -31,6 +31,14 @@ mock.module("../../daemon/conversation-store.js", () => ({
   getOrCreateConversation: async () => fakeConversation,
 }));
 
+// Vision capability of the image pin's target profile. Install-dependent in
+// production (a BYO provider resolves the profile key through its own column
+// of the intent matrix), so it is scripted rather than read from a catalog.
+let pinProfileSupportsVision = true;
+mock.module("../../plugin-api/vision-support.js", () => ({
+  doesSupportVision: () => pinProfileSupportsVision,
+}));
+
 // Conversation-CRUD doubles for the teardown transcript-hygiene pass. The
 // real module is spread so every other export keeps its production behavior;
 // only the functions the hygiene pass (and discard) touch are recorded.
@@ -72,12 +80,19 @@ mock.module("../../persistence/conversation-crud.js", () => ({
 
 import { setConfig } from "../../__tests__/helpers/set-config.js";
 import { ABORT_WATCHDOG_MS } from "../../daemon/abort-watchdog.js";
+import { VOICE_ESCALATION_CONTINUATION_MESSAGE_KIND } from "../../plugin-api/constants.js";
 import { assistantEventHub } from "../../runtime/assistant-event-hub.js";
-import { CALL_OPENING_MARKER } from "../voice-control-protocol.js";
+import {
+  CALL_OPENING_MARKER,
+  ESCALATE_VERDICT_TOKEN,
+  HOLD_VERDICT_TOKEN,
+} from "../voice-control-protocol.js";
 import {
   cutFrontDoorContentAtVerdict,
+  preSpeechLanguageRuleFragment,
   startVoiceTurn,
   TOOL_RESULT_PREVIEW_MAX_CHARS,
+  type VoiceTurnOptions,
 } from "../voice-session-bridge.js";
 import {
   escalatedContinuationRule,
@@ -118,8 +133,15 @@ interface FakeConversation {
     requestId: string;
     metadata?: Record<string, unknown>;
   }) => Promise<{ id: string }>;
-  updateClient: (cb: unknown, reset?: boolean) => void;
+  workingDir: string;
+  addEventObserver: (observer: unknown) => () => void;
+  handleConfirmationResponse: (
+    requestId: string,
+    decision: string,
+    opts?: { decisionContext?: string },
+  ) => void;
   runAgentLoop: (...args: unknown[]) => Promise<void>;
+  getMessages: () => Array<{ role: string; content: unknown[] }>;
   abort: (reason?: unknown) => void;
   loadFromDb: () => Promise<void>;
   toolsDisabledDepth: number;
@@ -134,14 +156,24 @@ function makeFakeConversation(opts: {
   hasQueuedMessages?: () => boolean;
   /** Runs before each persist resolves; throw to script a persist failure. */
   onPersist?: (attempt: number) => void;
+  /** Workspace root; pass empty to model a missing boundary. */
+  workingDir?: string;
+  /** In-memory history the profile pin reads; undefined models a text-only call. */
+  messages?: Array<{ role: string; content: unknown[] }>;
 }) {
   const waitForIdleCalls: WaitForIdleCall[] = [];
+  const confirmationDecisions: Array<{ requestId: string; decision: string }> =
+    [];
+  let clientCallback: ((msg: unknown) => Promise<void>) | undefined;
   let persistCount = 0;
   let lastPersistOpts:
     | { content: string; requestId: string; metadata?: Record<string, unknown> }
     | undefined;
   const conversation: FakeConversation = {
     conversationId: "conv-voice-bridge-test",
+    // The workspace boundary the reach check compares paths against. A real
+    // conversation always has one; without it the approval gate fails closed.
+    workingDir: opts.workingDir ?? "/tmp/workspace-voice-bridge-test",
     callSessionId: undefined,
     forcePromptSideEffects: false,
     currentRequestId: undefined,
@@ -171,12 +203,21 @@ function makeFakeConversation(opts: {
       opts.onPersist?.(persistCount);
       return { id: `msg-${persistCount}` };
     },
-    // The install (reset falsy) / reset (reset true) pair marks a turn
-    // taking ownership of the conversation vs a turn's cleanup releasing it.
-    updateClient: (_cb, reset) => {
-      opts.events?.push(reset ? "client:reset" : "client:install");
+    // The install / reset pair marks a turn taking ownership of the
+    // conversation (observer registered) vs a turn's cleanup releasing it
+    // (the returned disposer invoked).
+    addEventObserver: (observer) => {
+      opts.events?.push("client:install");
+      clientCallback = observer as (msg: unknown) => Promise<void>;
+      return () => {
+        opts.events?.push("client:reset");
+      };
+    },
+    handleConfirmationResponse: (requestId, decision) => {
+      confirmationDecisions.push({ requestId, decision });
     },
     runAgentLoop: () => (opts.runAgentLoop ?? (async () => {}))(),
+    getMessages: () => opts.messages ?? [],
     abort: () => {},
     loadFromDb: async () => {
       opts.events?.push("loadFromDb");
@@ -186,6 +227,11 @@ function makeFakeConversation(opts: {
   return {
     conversation,
     waitForIdleCalls,
+    confirmationDecisions,
+    /** Deliver an event the way the conversation would, to the installed observer. */
+    emitToClient: async (msg: unknown) => {
+      await clientCallback?.(msg);
+    },
     persistCount: () => persistCount,
     lastPersistOpts: () => lastPersistOpts,
     setProcessingFlag: (value: boolean) => {
@@ -329,6 +375,10 @@ describe("startVoiceTurn escalation-continuation persistence", () => {
     // not merely echo-suppressed live.
     const fake = makeFakeConversation({ processing: false });
     fakeConversation = fake.conversation;
+    let runOptions: Record<string, unknown> | undefined;
+    fake.conversation.runAgentLoop = async (...args: unknown[]) => {
+      runOptions = args[2] as Record<string, unknown>;
+    };
 
     await startVoiceTurn({
       ...makeTurnOptions(),
@@ -341,7 +391,11 @@ describe("startVoiceTurn escalation-continuation persistence", () => {
     expect(fake.lastPersistOpts()?.metadata).toEqual({
       voiceSessionTurn: true,
       hidden: true,
+      messageKind: VOICE_ESCALATION_CONTINUATION_MESSAGE_KIND,
     });
+    expect(runOptions?.messageKind).toBe(
+      VOICE_ESCALATION_CONTINUATION_MESSAGE_KIND,
+    );
   });
 
   test("the opener prompt is persisted un-hidden (unchanged)", async () => {
@@ -353,6 +407,56 @@ describe("startVoiceTurn escalation-continuation persistence", () => {
     expect(fake.lastPersistOpts()?.metadata).toEqual({
       voiceSessionTurn: true,
     });
+  });
+
+  test("a live-voice turn persists its session attribution under metadata.client", async () => {
+    const fake = makeFakeConversation({ processing: false });
+    fakeConversation = fake.conversation;
+
+    await startVoiceTurn({
+      ...makeTurnOptions(),
+      voiceTelemetry: { sessionId: "session-123", client: "ios" },
+    });
+
+    // `turn-events-store` projects `$.client` onto `TurnTelemetryEvent.client`,
+    // so this bag is what makes a voice turn countable per client and joinable
+    // to its session's funnel rows. The platform goes in `os`, the same key
+    // the HTTP send path fills, so voice turns sit in the column existing turn
+    // analytics already read.
+    expect(fake.lastPersistOpts()?.metadata).toEqual({
+      voiceSessionTurn: true,
+      client: {
+        voice: true,
+        voice_session_id: "session-123",
+        os: "ios",
+      },
+    });
+  });
+
+  test("omits the client key when the session reported no originating client", async () => {
+    const fake = makeFakeConversation({ processing: false });
+    fakeConversation = fake.conversation;
+
+    await startVoiceTurn({
+      ...makeTurnOptions(),
+      voiceTelemetry: { sessionId: "session-123" },
+    });
+
+    expect(fake.lastPersistOpts()?.metadata).toEqual({
+      voiceSessionTurn: true,
+      client: { voice: true, voice_session_id: "session-123" },
+    });
+  });
+
+  test("a phone turn carries no client bag", async () => {
+    const fake = makeFakeConversation({ processing: false });
+    fakeConversation = fake.conversation;
+
+    await startVoiceTurn(makeTurnOptions());
+
+    // Only live-voice sessions pass `voiceTelemetry`; a phone call has no
+    // live-voice session id to attribute a turn to.
+    expect(fake.lastPersistOpts()?.metadata).not.toHaveProperty("client");
   });
 });
 
@@ -422,24 +526,24 @@ describe("startVoiceTurn hiddenSyntheticPrompt", () => {
   });
 });
 
+// The turn installs its resolved control prompt, then cleanup resets it to
+// null, so capture every applied value and read the installed (non-null) one.
+function captureInstalledPrompt(): () => string | undefined {
+  const fake = makeFakeConversation({ processing: false });
+  fakeConversation = fake.conversation;
+  const applied: Array<string | null> = [];
+  fake.conversation.setVoiceCallControlPrompt = (prompt) => {
+    applied.push(prompt);
+  };
+  return () => applied.find((p): p is string => typeof p === "string");
+}
+
 describe("startVoiceTurn triage-and-escalate control prompt", () => {
   // Live-voice supplies its own voiceControlPrompt, bypassing
   // buildVoiceCallControlPrompt where the routing-leg rule is normally injected.
   // The rule must still be appended, or the front-door model never learns the
   // verdict protocol and can't hold or hand off.
   const LIVE_VOICE_PROMPT = "You are speaking in a local live voice session.";
-
-  // The turn installs its resolved control prompt, then cleanup resets it to
-  // null — so capture every applied value and read the installed (non-null) one.
-  function captureInstalledPrompt(): () => string | undefined {
-    const fake = makeFakeConversation({ processing: false });
-    fakeConversation = fake.conversation;
-    const applied: Array<string | null> = [];
-    fake.conversation.setVoiceCallControlPrompt = (prompt) => {
-      applied.push(prompt);
-    };
-    return () => applied.find((p): p is string => typeof p === "string");
-  }
 
   test("appends the front-door decision rule to a caller-supplied prompt", async () => {
     const installed = captureInstalledPrompt();
@@ -484,10 +588,79 @@ describe("startVoiceTurn triage-and-escalate control prompt", () => {
   });
 });
 
+describe("default call protocol numbered rules", () => {
+  // With no caller-supplied voiceControlPrompt the bridge builds the numbered
+  // CALL PROTOCOL RULES itself. Pin the speak-the-caller's-language rule and
+  // keep the numbering gapless so no rule silently shadows another.
+  test("teaches speaking the caller's language as its own numbered rule", async () => {
+    const installed = captureInstalledPrompt();
+    await startVoiceTurn(makeTurnOptions());
+    expect(installed()).toContain(
+      "12. Speak the caller's language: reply in the language of the caller's most recent actual speech, and follow them if they switch languages mid-call. Synthetic user turns (parenthetical markers like the call-connected and verification-completed notices) are not caller speech and never set the language. Before the caller has spoken, such as on the opening greeting turn, use the language the Task context implies, if any; otherwise default to English.",
+    );
+  });
+
+  test("the language rule excludes synthetic turns and covers pre-speech turns", async () => {
+    // Outbound calls open with the English "(call connected ...)" sentinel as
+    // the latest user-role turn, and the verification-complete sentinel does
+    // the same mid-call. Neither is caller speech, so neither may pull a
+    // Spanish or Japanese Task into an English opener.
+    const installed = captureInstalledPrompt();
+    await startVoiceTurn(makeTurnOptions());
+    const prompt = installed()!;
+    expect(prompt).toContain("most recent actual speech");
+    expect(prompt).toContain("not caller speech and never set the language");
+    expect(prompt).toContain(
+      "use the language the Task context implies, if any; otherwise default to English",
+    );
+  });
+
+  test("a monolingual listening language becomes the pre-speech fallback", () => {
+    // An assistant pinned to services.stt.language = "es" on a provider that
+    // honors the pin (deepgram, vellum) is already transcribing Spanish, so
+    // the opener must not default to English. The default test config runs
+    // the auto-detect branch ("multi"), so the pinned branch is covered at
+    // the fragment level.
+    expect(preSpeechLanguageRuleFragment("es", "deepgram")).toContain(
+      'configured listening language ("es")',
+    );
+    expect(preSpeechLanguageRuleFragment("es", "vellum")).toContain(
+      "default to English only when neither gives a language",
+    );
+    for (const autoDetect of ["multi", "", "  ", undefined]) {
+      expect(preSpeechLanguageRuleFragment(autoDetect, "deepgram")).toBe(
+        "use the language the Task context implies, if any; otherwise default to English",
+      );
+    }
+  });
+
+  test("a language pin on an auto-detecting provider keeps the English fallback", () => {
+    // google-gemini and openai-whisper ignore services.stt.language entirely
+    // (languageSelection: "auto"), so a persisted "es" pin must not force a
+    // Spanish greeting the transcriber will not honor.
+    for (const provider of ["google-gemini", "openai-whisper", undefined]) {
+      expect(preSpeechLanguageRuleFragment("es", provider)).toBe(
+        "use the language the Task context implies, if any; otherwise default to English",
+      );
+    }
+  });
+
+  test("rule numbers stay sequential from 0, including the routing rule", async () => {
+    const installed = captureInstalledPrompt();
+    await startVoiceTurn({ ...makeTurnOptions(), routingLeg: "escalated" });
+    const numbers = [...installed()!.matchAll(/^(\d+)\. /gm)].map((match) =>
+      Number(match[1]),
+    );
+    expect(numbers.length).toBeGreaterThan(12);
+    expect(numbers).toEqual(numbers.map((_, index) => index));
+  });
+});
+
 describe("startVoiceTurn channel capabilities", () => {
-  // Voice calls are non-interactive: the bridge forces supportsDynamicUi off
-  // for every voice turn so ui-surface tools never reach the model mid-call,
-  // while leaving the rest of the channel's resolved capabilities intact.
+  // Whether a call can show a surface is a property of its channel, not of
+  // calls in general, so the bridge applies no voice-specific override: a
+  // phone call has no screen and resolves false on its own, while a live-voice
+  // call is a screen the user is holding and resolves true.
 
   // The turn installs its capabilities, then cleanup resets them to null — so
   // capture every applied value and read the installed (non-null) one.
@@ -507,7 +680,7 @@ describe("startVoiceTurn channel capabilities", () => {
       );
   }
 
-  test("a vellum/macos (live-voice) turn forces supportsDynamicUi off, other fields untouched", async () => {
+  test("a vellum/macos (live-voice) turn keeps its channel's dynamic UI", async () => {
     const installed = captureInstalledCapabilities();
     await startVoiceTurn({
       ...makeTurnOptions(),
@@ -515,19 +688,171 @@ describe("startVoiceTurn channel capabilities", () => {
       userMessageInterface: "macos",
     });
     const caps = installed();
-    expect(caps?.supportsDynamicUi).toBe(false);
-    // The override is surgical: live-voice keeps identifying as vellum/macos.
+    expect(caps?.supportsDynamicUi).toBe(true);
+    // Nothing else about the channel is rewritten either.
     expect(caps?.dashboardCapable).toBe(true);
     expect(caps?.supportsVoiceInput).toBe(true);
     expect(caps?.clientOS).toBe("macos");
   });
 
-  test("phone defaults (no channel overrides) also yield supportsDynamicUi false", async () => {
+  // The case the removed override existed for, still covered: a phone call has
+  // no screen to show a surface on, and says so through its channel.
+  test("phone defaults yield supportsDynamicUi false", async () => {
     const installed = captureInstalledCapabilities();
     await startVoiceTurn(makeTurnOptions());
     const caps = installed();
     expect(caps?.channel).toBe("phone");
     expect(caps?.supportsDynamicUi).toBe(false);
+  });
+});
+
+describe("startVoiceTurn guardian approvals", () => {
+  function confirmationRequest(
+    toolName: string,
+    executionTarget?: "sandbox" | "host",
+    input: Record<string, unknown> = {},
+  ) {
+    return {
+      type: "confirmation_request",
+      requestId: "req-1",
+      toolName,
+      input,
+      riskLevel: "medium",
+      allowlistOptions: [],
+      scopeOptions: [],
+      ...(executionTarget !== undefined ? { executionTarget } : {}),
+    };
+  }
+
+  async function runVoiceTurn(
+    overrides: Partial<VoiceTurnOptions>,
+    conversationOpts: { workingDir?: string } = {},
+  ) {
+    const fake = makeFakeConversation({
+      processing: false,
+      ...conversationOpts,
+    });
+    fakeConversation = fake.conversation;
+    const pendingAnnounced: string[] = [];
+    await startVoiceTurn({
+      ...makeTurnOptions(),
+      trustContext: { trustClass: "guardian" },
+      onApprovalPending: (requestId: string) => {
+        pendingAnnounced.push(requestId);
+      },
+      ...overrides,
+    } as VoiceTurnOptions);
+    return { ...fake, pendingAnnounced };
+  }
+
+  // A live-voice call has a screen, so a tool that reaches the workspace or
+  // the host is put to the user rather than decided for them. This is the hole
+  // it closes: a guardian call used to allow every confirmation outright.
+  test("leaves a sensitive tool pending for the user to answer", async () => {
+    const fake = await runVoiceTurn({
+      userMessageChannel: "vellum",
+      userMessageInterface: "macos",
+    });
+
+    await fake.emitToClient(confirmationRequest("bash", "host"));
+
+    expect(fake.confirmationDecisions).toEqual([]);
+    // The card renders in the app, and the call covers the app, so a pending
+    // decision has to be announced or the turn just goes quiet.
+    expect(fake.pendingAnnounced).toEqual(["req-1"]);
+  });
+
+  // The tools that read or render were never the reason approval exists, and
+  // gating them would interrupt the conversation constantly.
+  test("still allows a tool with no sensitive reach", async () => {
+    const fake = await runVoiceTurn({
+      userMessageChannel: "vellum",
+      userMessageInterface: "macos",
+    });
+
+    await fake.emitToClient(confirmationRequest("ui_show", "sandbox"));
+
+    expect(fake.confirmationDecisions).toEqual([
+      { requestId: "req-1", decision: "allow" },
+    ]);
+    // Nothing is waiting, so nothing interrupts the call.
+    expect(fake.pendingAnnounced).toEqual([]);
+  });
+
+  // There is no screen on a phone call, so a prompt there is a question nobody
+  // can answer.
+  test("a phone call keeps allowing sensitive tools outright", async () => {
+    const fake = await runVoiceTurn({ userMessageChannel: "phone" });
+
+    await fake.emitToClient(confirmationRequest("bash", "host"));
+
+    expect(fake.confirmationDecisions).toEqual([
+      { requestId: "req-1", decision: "allow" },
+    ]);
+  });
+
+  // The escape this gate exists to catch: a *sandbox* file tool pointed
+  // outside the workspace reaches the host filesystem on a non-containerized
+  // install. The reach check can only see that when it is given the workspace
+  // boundary; without it this read of a host file classifies as `none` and
+  // lands on the auto-allow.
+  test("an out-of-workspace path prompts even on a sandbox target", async () => {
+    const fake = await runVoiceTurn(
+      { userMessageChannel: "vellum", userMessageInterface: "macos" },
+      { workingDir: "/tmp/workspace-voice-bridge-test" },
+    );
+
+    await fake.emitToClient(
+      confirmationRequest("file_read", "sandbox", { path: "/etc/hosts" }),
+    );
+
+    expect(fake.confirmationDecisions).toEqual([]);
+  });
+
+  // A path inside the workspace is the ordinary case, and gating it would
+  // interrupt the conversation for every file the assistant touches.
+  test("an in-workspace read is still allowed outright", async () => {
+    const fake = await runVoiceTurn(
+      { userMessageChannel: "vellum", userMessageInterface: "macos" },
+      { workingDir: "/tmp/workspace-voice-bridge-test" },
+    );
+
+    await fake.emitToClient(
+      confirmationRequest("file_read", "sandbox", {
+        path: "/tmp/workspace-voice-bridge-test/notes.md",
+      }),
+    );
+
+    expect(fake.confirmationDecisions).toEqual([
+      { requestId: "req-1", decision: "allow" },
+    ]);
+  });
+
+  // With no boundary there is no way to tell an ordinary write from an escape,
+  // and the safe reading of "cannot tell" is "ask".
+  test("a missing workspace boundary fails closed", async () => {
+    const fake = await runVoiceTurn(
+      { userMessageChannel: "vellum", userMessageInterface: "macos" },
+      { workingDir: "" },
+    );
+
+    await fake.emitToClient(confirmationRequest("ui_show", "sandbox"));
+
+    expect(fake.confirmationDecisions).toEqual([]);
+  });
+
+  // Requests from the proxy and network prompters carry no target. Unknown
+  // reads as the more consequential of the two: a prompt the user did not need
+  // costs less than an unreviewed action on their machine.
+  test("prompts when the execution target is unknown", async () => {
+    const fake = await runVoiceTurn({
+      userMessageChannel: "vellum",
+      userMessageInterface: "macos",
+    });
+
+    await fake.emitToClient(confirmationRequest("bash"));
+
+    expect(fake.confirmationDecisions).toEqual([]);
   });
 });
 
@@ -665,7 +990,7 @@ describe("startVoiceTurn prior-turn teardown barrier", () => {
     expect(events).toEqual(["persist", "client:install"]);
 
     // Turn 2 arrives during the teardown window: it must not persist or
-    // install its client callback until turn 1's cleanup has run.
+    // install its event observer until turn 1's cleanup has run.
     const turn2 = startVoiceTurn(
       makeTurnOptions(undefined, "conv-teardown-order"),
     );
@@ -1403,6 +1728,174 @@ describe("cutFrontDoorContentAtVerdict", () => {
   });
 });
 
+/**
+ * The front-door leg's raw stream is a control plane: its leading tokens are
+ * the routing verdict, not speech. The hub broadcast (web / passive devices)
+ * must never carry those tokens, and must still carry every word of real
+ * assistant content: an over-broad filter would leave the shared transcript
+ * silent or truncated, which is worse than the leak it fixes.
+ */
+describe("front-door hub stream gate", () => {
+  beforeEach(resetCrudLog);
+
+  /**
+   * Conversation whose scripted agent loop announces a reserved row, streams
+   * `deltas` in order, then ends the leg with `finalEvent`.
+   */
+  function makeStreamingConversation(
+    deltas: string[],
+    finalEvent:
+      | "message_complete"
+      | "generation_cancelled" = "message_complete",
+  ): void {
+    const fake = makeFakeConversation({ processing: false });
+    fake.conversation.runAgentLoop = async (...args: unknown[]) => {
+      const { onEvent } = args[2] as { onEvent: (msg: unknown) => void };
+      onEvent({
+        type: "assistant_turn_start",
+        messageId: "assistant-row-1",
+        conversationId: "conv-voice-bridge-test",
+      });
+      for (const text of deltas) {
+        onEvent({
+          type: "assistant_text_delta",
+          text,
+          messageId: "assistant-row-1",
+          conversationId: "conv-voice-bridge-test",
+        });
+      }
+      onEvent({
+        type: finalEvent,
+        ...(finalEvent === "message_complete"
+          ? { messageId: "assistant-row-1" }
+          : {}),
+        conversationId: "conv-voice-bridge-test",
+      });
+    };
+    fakeConversation = fake.conversation;
+  }
+
+  /** The text of every `assistant_text_delta` `turn` publishes to the hub. */
+  async function collectBroadcastText(
+    turn: () => Promise<unknown>,
+  ): Promise<string[]> {
+    const texts: string[] = [];
+    const subscription = assistantEventHub.subscribe({
+      type: "process",
+      filter: { conversationId: "conv-voice-bridge-test" },
+      callback: (event) => {
+        const msg = event.message as { type: string; text?: string };
+        if (msg.type === "assistant_text_delta") {
+          texts.push(msg.text ?? "");
+        }
+      },
+    });
+    try {
+      await turn();
+      // The hub publishes off a promise chain, so every broadcast costs a
+      // few microtask hops before it reaches a subscriber.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await flushMicrotasks();
+    } finally {
+      subscription.dispose();
+    }
+    return texts;
+  }
+
+  test("an escalating leg broadcasts only the capped bridge, never the verdict token", async () => {
+    makeStreamingConversation([
+      "[1]",
+      " Let me check your calendar.",
+      " weak answer past the cap",
+    ]);
+
+    const texts = await collectBroadcastText(() =>
+      startVoiceTurn({ ...makeTurnOptions(), routingLeg: "front-door" }),
+    );
+
+    expect(texts).toEqual(["Let me check your calendar."]);
+    expect(texts.join("")).not.toContain(ESCALATE_VERDICT_TOKEN);
+  });
+
+  test("a front-door answer reaches the hub in full", async () => {
+    makeStreamingConversation(["It is ", "Tuesday", ", and it is sunny."]);
+
+    const texts = await collectBroadcastText(() =>
+      startVoiceTurn({ ...makeTurnOptions(), routingLeg: "front-door" }),
+    );
+
+    expect(texts.join("")).toBe("It is Tuesday, and it is sunny.");
+  });
+
+  test("an answer that merely opens with a bracket is released in full", async () => {
+    // "[" alone could still become the escalate token, so the gate holds it;
+    // the next delta disproves the token and the whole prefix must come out.
+    makeStreamingConversation(["[", "A] is the option to pick."]);
+
+    const texts = await collectBroadcastText(() =>
+      startVoiceTurn({ ...makeTurnOptions(), routingLeg: "front-door" }),
+    );
+
+    expect(texts.join("")).toBe("[A] is the option to pick.");
+  });
+
+  test("a hold verdict broadcasts nothing", async () => {
+    makeStreamingConversation([HOLD_VERDICT_TOKEN]);
+
+    const texts = await collectBroadcastText(() =>
+      startVoiceTurn({
+        ...makeTurnOptions(),
+        routingLeg: "front-door",
+        unifiedVerdict: true,
+      }),
+    );
+
+    expect(texts).toEqual([]);
+  });
+
+  test("a leg that completes mid-bridge broadcasts what it handed off with", async () => {
+    makeStreamingConversation(["[1] Let me check"]);
+
+    const texts = await collectBroadcastText(() =>
+      startVoiceTurn({ ...makeTurnOptions(), routingLeg: "front-door" }),
+    );
+
+    expect(texts).toEqual(["Let me check"]);
+  });
+
+  test("a leg cancelled mid-bridge never hands off, so it broadcasts nothing", async () => {
+    makeStreamingConversation(["[1] Let me check"], "generation_cancelled");
+
+    const texts = await collectBroadcastText(() =>
+      startVoiceTurn({ ...makeTurnOptions(), routingLeg: "front-door" }),
+    );
+
+    expect(texts).toEqual([]);
+  });
+
+  test("the escalated continuation streams to the hub untouched", async () => {
+    // The leg that produces the real answer is never gated: its deltas are
+    // assistant speech from the first token.
+    makeStreamingConversation(["Your next meeting ", "is at four."]);
+
+    const texts = await collectBroadcastText(() =>
+      startVoiceTurn({ ...makeTurnOptions(), routingLeg: "escalated" }),
+    );
+
+    expect(texts).toEqual(["Your next meeting ", "is at four."]);
+  });
+
+  test("an un-routed voice leg streams to the hub untouched", async () => {
+    makeStreamingConversation(["[1] not a verdict here"]);
+
+    const texts = await collectBroadcastText(() =>
+      startVoiceTurn(makeTurnOptions()),
+    );
+
+    expect(texts).toEqual(["[1] not a verdict here"]);
+  });
+});
+
 describe("transcript hygiene (teardown pass)", () => {
   beforeEach(resetCrudLog);
 
@@ -1682,5 +2175,107 @@ describe("transcript hygiene (teardown pass)", () => {
     await flushMicrotasks();
 
     expect(crudLog.deletes).toContain("assistant-row-1");
+  });
+});
+
+describe("startVoiceTurn image-bearing profile pin", () => {
+  /** A persisted user message carrying a photo taken mid-call. */
+  const PHOTO_HISTORY = [
+    { role: "user", content: [{ type: "text", text: "here's a photo:" }] },
+    {
+      role: "user",
+      content: [
+        { type: "text", text: "here's a photo:" },
+        { type: "image", source: { type: "base64", data: "abc" } },
+      ],
+    },
+  ];
+
+  beforeEach(() => {
+    pinProfileSupportsVision = true;
+  });
+
+  async function runOptionsFor(opts: {
+    messages?: Array<{ role: string; content: unknown[] }>;
+    turn?: Record<string, unknown>;
+  }): Promise<Record<string, unknown>> {
+    const fake = makeFakeConversation({
+      processing: false,
+      ...(opts.messages ? { messages: opts.messages } : {}),
+    });
+    fakeConversation = fake.conversation;
+    let runOptions: Record<string, unknown> = {};
+    fake.conversation.runAgentLoop = async (...args: unknown[]) => {
+      runOptions = args[2] as Record<string, unknown>;
+    };
+    await startVoiceTurn({ ...makeTurnOptions(), ...(opts.turn ?? {}) });
+    return runOptions;
+  }
+
+  test("a text-only call keeps the call-site profile", async () => {
+    const runOptions = await runOptionsFor({});
+
+    expect(runOptions.overrideProfile).toBeUndefined();
+    expect(runOptions.forceOverrideProfile).toBeUndefined();
+  });
+
+  test("an image in history pins the image-capable profile", async () => {
+    // `callAgent`'s balanced profile carries no guarantee that its model takes
+    // an image, and a model that rejects one fails the whole leg.
+    const runOptions = await runOptionsFor({ messages: PHOTO_HISTORY });
+
+    expect(runOptions.overrideProfile).toBe("latency-optimized");
+    // callAgent is not `mainAgent`, so an unforced override would sit below
+    // the call-site profile and never apply.
+    expect(runOptions.forceOverrideProfile).toBe(true);
+  });
+
+  test("an image nested in a tool result counts too", async () => {
+    const runOptions = await runOptionsFor({
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              contentBlocks: [{ type: "image", source: { data: "abc" } }],
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(runOptions.overrideProfile).toBe("latency-optimized");
+  });
+
+  test("a front-door leg is left alone — its own call site pins it", async () => {
+    const runOptions = await runOptionsFor({
+      messages: PHOTO_HISTORY,
+      turn: { routingLeg: "front-door" },
+    });
+
+    expect(runOptions.overrideProfile).toBeUndefined();
+    expect(runOptions.callSite).toBe("voiceFrontDoor");
+  });
+
+  test("no pin when the pin target can't take an image either", async () => {
+    // Fireworks: `latency-optimized` resolves to a text-only model while
+    // `balanced` is vision-capable, so pinning would break the very turn the
+    // pin exists to save.
+    pinProfileSupportsVision = false;
+
+    const runOptions = await runOptionsFor({ messages: PHOTO_HISTORY });
+
+    expect(runOptions.overrideProfile).toBeUndefined();
+    expect(runOptions.forceOverrideProfile).toBeUndefined();
+  });
+
+  test("an explicit routing pin wins over the image pin", async () => {
+    const runOptions = await runOptionsFor({
+      messages: PHOTO_HISTORY,
+      turn: { overrideProfile: "quality-optimized" },
+    });
+
+    expect(runOptions.overrideProfile).toBe("quality-optimized");
   });
 });

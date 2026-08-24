@@ -109,7 +109,7 @@ export function SkillsReferenceSubagentContent() {
                     &ldquo;Dig into why this build keeps failing&rdquo;
                   </td>
                   <td className="px-3 py-2">
-                    Delegates to an investigator for root-cause analysis
+                    Delegates to a researcher for root-cause analysis
                   </td>
                 </tr>
                 <tr>
@@ -195,8 +195,8 @@ export function SkillsReferenceSubagentContent() {
                     Synchronously (your assistant waits for its answer)
                   </td>
                   <td className="px-3 py-2">
-                    Inherits your full context; runs on a more capable model and
-                    returns guidance
+                    A written brief from your assistant; runs on a more capable
+                    model and returns guidance
                   </td>
                 </tr>
               </tbody>
@@ -216,9 +216,14 @@ export function SkillsReferenceSubagentContent() {
             <li>
               <strong>Advisor.</strong> A one-shot, read-only second opinion,
               and the one kind your assistant reaches for on its own judgment:
-              to pressure-test a plan, when it&apos;s stuck, or as a final check
-              before calling a task done. It has no tools; it reasons from your
-              context and replies with focused guidance.
+              to pressure-test a plan on a consequential or ambiguous task, or
+              when it&apos;s stuck. Routine work skips the consult, so
+              you&apos;re not paying for sign-off on the obvious. It reasons
+              from a brief your assistant writes it (the task, the plan, the
+              evidence gathered so far, and the question) and can read and
+              search the files in your workspace to check a fact, then replies
+              with focused guidance. It never changes anything, and it cannot
+              see your conversations.
             </li>
           </ul>
         </section>
@@ -229,15 +234,21 @@ export function SkillsReferenceSubagentContent() {
           </SectionHeading>
           <p className="mb-4 text-zinc-600">
             Every subagent runs with a role that determines which tools it can
-            touch. Your assistant picks the most restrictive role that can still
-            do the job, which keeps each worker&apos;s blast radius small.
+            touch. There are three, and your assistant picks between them with
+            two questions: does the task need to change anything, and does your
+            assistant need the answer before it can carry on? It picks the most
+            restrictive role that can still do the job, which keeps each
+            worker&apos;s blast radius small.
           </p>
-          <div className="mb-0 overflow-x-auto">
+          <div className="mb-4 overflow-x-auto">
             <table className="min-w-full text-sm">
               <thead>
                 <tr className="bg-zinc-50">
                   <th className="px-4 py-2 text-left text-sm font-medium text-zinc-500">
                     Role
+                  </th>
+                  <th className="px-4 py-2 text-left text-sm font-medium text-zinc-500">
+                    Tools
                   </th>
                   <th className="px-4 py-2 text-left text-sm font-medium text-zinc-500">
                     Best for
@@ -250,34 +261,25 @@ export function SkillsReferenceSubagentContent() {
                     <strong>Researcher</strong>
                   </td>
                   <td className="px-3 py-2">
-                    Web and document research, reading and gathering information
-                    (read-only)
+                    Read-only: web search, reading and searching files, and
+                    recall
+                  </td>
+                  <td className="px-3 py-2">
+                    Web and document research, codebase exploration, planning,
+                    root-cause analysis and debugging
                   </td>
                 </tr>
                 <tr>
                   <td className="px-3 py-2">
-                    <strong>Coder</strong>
+                    <strong>Builder</strong>
+                  </td>
+                  <td className="px-3 py-2">
+                    Everything your assistant can reach, including writing
+                    files, running commands, and your connected apps
                   </td>
                   <td className="px-3 py-2">
                     Writing and editing files, running commands, build and test
-                    work
-                  </td>
-                </tr>
-                <tr>
-                  <td className="px-3 py-2">
-                    <strong>Planner</strong>
-                  </td>
-                  <td className="px-3 py-2">
-                    Analysis, planning, and synthesizing information (read-only)
-                  </td>
-                </tr>
-                <tr>
-                  <td className="px-3 py-2">
-                    <strong>Investigator</strong>
-                  </td>
-                  <td className="px-3 py-2">
-                    Root-cause analysis and debugging; returns a compact
-                    findings report (read-only)
+                    work, anything that has to change something
                   </td>
                 </tr>
                 <tr>
@@ -285,21 +287,43 @@ export function SkillsReferenceSubagentContent() {
                     <strong>Advisor</strong>
                   </td>
                   <td className="px-3 py-2">
-                    A no-tools, one-shot strategic review
-                  </td>
-                </tr>
-                <tr>
-                  <td className="px-3 py-2">
-                    <strong>General</strong>
+                    Read-only fact checking: reading and searching the files in
+                    your workspace
                   </td>
                   <td className="px-3 py-2">
-                    Unrestricted access, used only when a task genuinely needs
-                    it
+                    A one-shot strategic review that your assistant waits on
                   </td>
                 </tr>
               </tbody>
             </table>
           </div>
+          <ul className="mb-0 list-disc space-y-2 pl-6 text-zinc-600">
+            <li>
+              <strong>Older names still work.</strong> Planner and investigator
+              run as a researcher; coder and general run as a builder. The
+              result names the role that actually ran.
+            </li>
+            <li>
+              <strong>Anything else becomes a persona.</strong> Ask for a role
+              that isn&apos;t one of the three (&ldquo;a staff security
+              engineer&rdquo;) and the subagent runs read-only as a researcher
+              with that description shaping how it approaches the task. An
+              invented role never quietly gains the ability to change things.
+            </li>
+            <li>
+              <strong>No role named.</strong> A subagent spawned without a role
+              runs as a builder, with the same tools your assistant has.
+            </li>
+            <li>
+              <strong>Checking work is a researcher job.</strong> Ask whether
+              something is really done (&ldquo;verify every item on that
+              list&rdquo;) and your assistant sends a read-only researcher that
+              answers pass or fail per item with the evidence behind each call,
+              and says so plainly when the evidence isn&apos;t there. Checking
+              is mechanical, so it runs on a cheaper model than an open-ended
+              investigation would.
+            </li>
+          </ul>
         </section>
 
         <section id="working-with-subagents" className="mt-12">
@@ -357,8 +381,10 @@ export function SkillsReferenceSubagentContent() {
             </li>
             <li>
               <strong>Model selection.</strong> A subagent can run under a
-              specific model profile. By default it inherits the one your
-              conversation is using.
+              specific model profile. By default it uses its own, not the one
+              your conversation is set to, so switching models mid-chat does not
+              change what your delegated work costs. Checking work runs on a
+              cheaper model.
             </li>
             <li>
               <strong>Status tracking.</strong> Pending, running, completed,
@@ -387,9 +413,10 @@ export function SkillsReferenceSubagentContent() {
               task needs to know what you&apos;ve been discussing.
             </li>
             <li>
-              <strong>Smaller is better.</strong> A few focused subagents finish
-              faster and fail more gracefully than one large general-purpose
-              one.
+              <strong>Delegation scales with the task.</strong> Quick lookups
+              happen inline in your conversation; a subagent is for extensive
+              work, like a deep research sweep or an investigation that would
+              otherwise flood the chat. Most tasks need zero or one.
             </li>
             <li>
               <strong>No need to poll.</strong> Your assistant is notified

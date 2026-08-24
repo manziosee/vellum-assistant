@@ -21,16 +21,29 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 
-import { resolveCallSiteConfig } from "../config/llm-resolver.js";
+import {
+  resolveCallSiteConfig,
+  resolveCallSiteConfigWithProfile,
+} from "../config/llm-resolver.js";
 import { getConfig } from "../config/loader.js";
 import { getDb } from "../persistence/db-connection.js";
+import {
+  ProviderError,
+  type ProviderRouteAttribution,
+} from "../util/errors.js";
 import { getLogger } from "../util/logger.js";
 import {
   describeSubscriptionModelIncompatibility,
   isConnectionCompatibleWithModel,
 } from "./connection-model-compat.js";
 import {
+  connectionProviderKind,
   ConnectionResolutionError,
+  dispatchProviderResolvable,
+  expectedVendorProvider,
+  isManagedConnectionRoute,
+  resolveEntryConnectionName,
+  resolveEntryProviderKind,
   resolveRoutingIdentity,
   tryResolveProviderForConnectionName,
 } from "./connection-resolution.js";
@@ -46,6 +59,14 @@ import type {
 } from "./types.js";
 
 const log = getLogger("providers/call-site-routing");
+
+interface SelectedProviderRoute {
+  provider: Provider;
+  connectionName?: string;
+  profileName?: string;
+  isManagedRoute?: boolean;
+}
+
 export class CallSiteRoutingProvider implements Provider {
   public readonly tokenEstimationProvider?: string;
   // Forward native web-search capability so it survives the wrapper chain
@@ -96,9 +117,10 @@ export class CallSiteRoutingProvider implements Provider {
      */
     private readonly resolveByConnection: (
       connectionName: string,
-      expectedProvider: string,
+      expectedProvider: string | undefined,
       model: string | undefined,
     ) => Promise<Provider | null>,
+    private readonly defaultRouteAttribution?: ProviderRouteAttribution,
   ) {
     this.tokenEstimationProvider = defaultProvider.tokenEstimationProvider;
     this.supportsNativeWebSearch = defaultProvider.supportsNativeWebSearch;
@@ -112,11 +134,30 @@ export class CallSiteRoutingProvider implements Provider {
     messages: Message[],
     options?: SendMessageOptions,
   ): Promise<ProviderResponse> {
-    const target = await this.selectProvider(options);
+    const selectedRoute = await this.selectProvider(options);
+    const target = selectedRoute.provider;
     const isRouted = target !== this.defaultProvider;
 
     const doSend = async (): Promise<ProviderResponse> => {
-      const response = await target.sendMessage(messages, options);
+      let response: ProviderResponse;
+      try {
+        response = await target.sendMessage(messages, options);
+      } catch (error) {
+        if (error instanceof ProviderError) {
+          error.attachRouteAttribution({
+            ...(selectedRoute.connectionName
+              ? { connectionName: selectedRoute.connectionName }
+              : {}),
+            ...(selectedRoute.profileName
+              ? { profileName: selectedRoute.profileName }
+              : {}),
+            ...(selectedRoute.isManagedRoute !== undefined
+              ? { isManagedRoute: selectedRoute.isManagedRoute }
+              : {}),
+          });
+        }
+        throw error;
+      }
       // Also stamp actualProvider on the response so that handleUsage
       // (which reads event.actualProvider, not provider.name) attributes
       // the call to the right provider.
@@ -167,9 +208,17 @@ export class CallSiteRoutingProvider implements Provider {
       forceOverrideProfile: options?.config?.forceOverrideProfile,
       selectionSeed: options?.config?.selectionSeed,
     });
+    // Capability follows the same row dispatch selects: an explicit
+    // provider_connection wins, then an entry-name label's row, then the
+    // resolved provider itself. Kept in this order so a label paired with a
+    // conflicting connection cannot enable a capability the dispatched
+    // transport lacks.
+    const routedKind = resolved.provider_connection
+      ? connectionProviderKind(resolved.provider_connection, resolved.model)
+      : resolveEntryProviderKind(resolved.provider, resolved.model);
     return shouldUseNativeWebSearch(
       getConfig(),
-      resolved.provider,
+      routedKind ?? resolved.provider,
       resolved.model,
     );
   }
@@ -199,10 +248,10 @@ export class CallSiteRoutingProvider implements Provider {
    */
   private async selectProvider(
     options?: SendMessageOptions,
-  ): Promise<Provider> {
+  ): Promise<SelectedProviderRoute> {
     const callSite = options?.config?.callSite;
     if (!callSite) {
-      return this.defaultProvider;
+      return this.defaultRoute();
     }
 
     const overrideProfile = options?.config?.overrideProfile;
@@ -213,11 +262,16 @@ export class CallSiteRoutingProvider implements Provider {
     // request params.
     const forceOverrideProfile = options?.config?.forceOverrideProfile;
     const selectionSeed = options?.config?.selectionSeed;
-    const resolved = resolveCallSiteConfig(callSite, getConfig().llm, {
-      overrideProfile,
-      forceOverrideProfile,
-      selectionSeed,
-    });
+    const { config: resolved, profileName } = resolveCallSiteConfigWithProfile(
+      callSite,
+      getConfig().llm,
+      {
+        overrideProfile,
+        forceOverrideProfile,
+        selectionSeed,
+        isResolvableProvider: dispatchProviderResolvable,
+      },
+    );
 
     let connectionName = resolved.provider_connection;
 
@@ -231,6 +285,16 @@ export class CallSiteRoutingProvider implements Provider {
         resolved.provider,
         resolved.model,
       )?.connectionName;
+    }
+
+    // An entry-name provider IS the connection name: the label points at a
+    // row, and the row's own provider drives dispatch, so no expected
+    // provider is threaded (the label is not a vendor).
+    const entryRoute = connectionName
+      ? null
+      : resolveEntryConnectionName(resolved.provider);
+    if (entryRoute) {
+      connectionName = entryRoute;
     }
 
     // When no connection is set, auto-resolve one for the resolved provider —
@@ -261,19 +325,36 @@ export class CallSiteRoutingProvider implements Provider {
     }
 
     if (connectionName) {
+      // The vendor guard covers both the entry route and a config carrying
+      // an entry label alongside an explicit provider_connection: a label
+      // that is not a vendor never threads into the row-equality check.
       const connectionProvider = await this.resolveByConnection(
         connectionName,
-        resolved.provider,
+        expectedVendorProvider(resolved.provider, resolved.model),
         resolved.model,
       );
       if (connectionProvider) {
+        const actualRoute = {
+          connectionName:
+            connectionProvider.routeAttribution?.connectionName ??
+            connectionName,
+          isManagedRoute:
+            connectionProvider.routeAttribution?.isManagedRoute ??
+            isManagedConnectionRoute(connectionName),
+        };
         // The connection whose credential the call authenticates with is only
         // known here, and diagnostics for a failed request are unactionable
         // without it ("which key was this?"). Recorded once the adapter exists,
         // so a connection that fell back to the default transport is not
         // reported as the one that signed the request.
-        recordProviderRequestDiagnostics({ connection_name: connectionName });
-        return connectionProvider;
+        recordProviderRequestDiagnostics({
+          connection_name: actualRoute.connectionName,
+        });
+        return {
+          provider: connectionProvider,
+          ...actualRoute,
+          ...(profileName ? { profileName } : {}),
+        };
       }
       // Soft credential failure: the routed connection yielded no usable
       // adapter and dispatch is landing on the default transport, which may
@@ -289,11 +370,11 @@ export class CallSiteRoutingProvider implements Provider {
         },
         "Routed connection yielded no adapter — falling back to the default transport",
       );
-      return this.defaultProvider;
+      return this.defaultRoute(profileName);
     }
 
     if (resolved.provider === this.defaultProvider.name) {
-      return this.defaultProvider;
+      return this.defaultRoute(profileName);
     }
 
     if (autoResolveCandidates) {
@@ -316,6 +397,14 @@ export class CallSiteRoutingProvider implements Provider {
       "missing_connection",
       `call-site "${callSite}" resolves to provider "${resolved.provider}" but no provider_connection is set — alternate-provider routing requires a connection`,
     );
+  }
+
+  private defaultRoute(profileName?: string): SelectedProviderRoute {
+    return {
+      provider: this.defaultProvider,
+      ...this.defaultRouteAttribution,
+      ...(profileName ? { profileName } : {}),
+    };
   }
 }
 
@@ -341,5 +430,6 @@ export function wrapWithCallSiteRouting(
         expectedProvider,
         model,
       ),
+    base.routeAttribution,
   );
 }

@@ -21,6 +21,7 @@ import { CodeBlock } from "@/domains/chat/components/tool-detail-panel";
 import { SiteFavicon } from "@/domains/chat/components/web-search/site-favicon";
 import { extractDomain } from "@/domains/chat/utils/web-search-result-text";
 import type { ToolDetailPayload } from "@/stores/viewer-store";
+import { useTranslation } from "@/i18n";
 
 const CONTENT_MARKER = "\nContent:\n";
 
@@ -144,7 +145,10 @@ function SourceCard({ url, status }: { url: string; status: string | null }) {
   );
 }
 
-export function WebFetchDetailView({ detail }: { detail: ToolDetailPayload }) {
+export function WebFetchDetailView({
+  detail,
+}: { detail: ToolDetailPayload }) {
+  const { t } = useTranslation("chat");
   const [showRaw, setShowRaw] = useState(false);
   const fallbackUrl =
     typeof detail.input?.url === "string" ? detail.input.url : undefined;
@@ -155,7 +159,7 @@ export function WebFetchDetailView({ detail }: { detail: ToolDetailPayload }) {
 
   // A failed fetch has no parseable body — show the raw error verbatim.
   if (detail.status === "error") {
-    return <CodeBlock text={detail.result ?? "Fetch failed."} />;
+    return <CodeBlock text={detail.result ?? t("webFetchDetailView.fetchFailed")} />;
   }
 
   return (
@@ -184,7 +188,7 @@ export function WebFetchDetailView({ detail }: { detail: ToolDetailPayload }) {
             as="h3"
             className="text-[var(--content-emphasised)]"
           >
-            {showRaw ? "Raw result" : "Content"}
+            {showRaw ? t("webFetchDetailView.rawResult") : t("webFetchDetailView.content")}
           </Typography>
           {detail.result && (
             <button
@@ -193,7 +197,7 @@ export function WebFetchDetailView({ detail }: { detail: ToolDetailPayload }) {
               className="cursor-pointer text-[var(--content-secondary)] transition-colors hover:text-[var(--content-default)]"
             >
               <Typography variant="label-small-default" as="span">
-                {showRaw ? "View extracted" : "View raw"}
+                {showRaw ? t("webFetchDetailView.viewExtracted") : t("webFetchDetailView.viewRaw")}
               </Typography>
             </button>
           )}
@@ -201,6 +205,13 @@ export function WebFetchDetailView({ detail }: { detail: ToolDetailPayload }) {
         {showRaw ? (
           <CodeBlock text={detail.result ?? ""} />
         ) : parsed.content ? (
+          // Deliberately NO `assistantId`: this is text extracted from a
+          // remote page, the least-trusted content in the app. Passing one
+          // would let a fetched page's `![](vellum://workspace/…)` reference
+          // pull local workspace bytes into the panel and render them as if
+          // the page had supplied them. Local-file references keep degrading
+          // to an inert card here; a remote page has no business naming a
+          // file in the user's workspace.
           <ChatMarkdownMessage content={parsed.content} />
         ) : (
           <Typography
@@ -208,8 +219,8 @@ export function WebFetchDetailView({ detail }: { detail: ToolDetailPayload }) {
             className="text-[var(--content-tertiary)]"
           >
             {detail.status === "running"
-              ? "Fetching…"
-              : "No content extracted."}
+              ? t("webFetchDetailView.fetching")
+              : t("webFetchDetailView.noContent")}
           </Typography>
         )}
       </div>

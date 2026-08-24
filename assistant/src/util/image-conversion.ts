@@ -13,7 +13,6 @@
  * conversions of the same image (or daemon restarts) skip the sips call.
  */
 
-import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   closeSync,
@@ -23,6 +22,7 @@ import {
   readdirSync,
   readFileSync,
   readSync,
+  renameSync,
   statSync,
   unlinkSync,
   writeFileSync,
@@ -43,26 +43,151 @@ function getCacheDir(): string {
   return join(tmpdir(), "vellum-optimized-images");
 }
 
+/**
+ * Structural completeness check for a JPEG payload: SOI marker (FF D8) at the
+ * head and EOI marker (FF D9) at the tail. Every cache entry and every sips
+ * output is a JPEG, so a payload failing this is truncated or empty (the
+ * signature of a torn cache write) and must never reach a provider, which
+ * rejects it with a 400 that wedges the conversation (the corrupt block is
+ * resent on every subsequent turn).
+ */
+export function isCompleteJpeg(bytes: Uint8Array): boolean {
+  return (
+    bytes.length >= 4 &&
+    bytes[0] === 0xff &&
+    bytes[1] === 0xd8 &&
+    bytes[bytes.length - 2] === 0xff &&
+    bytes[bytes.length - 1] === 0xd9
+  );
+}
+
+/**
+ * Structural JPEG truncation check for payloads of arbitrary origin: walk the
+ * marker segments from SOI and report whether a terminal EOI is reached.
+ * Unlike {@link isCompleteJpeg} (exact tail framing, for sips output and
+ * cache entries, which always end on EOI), this tolerates encoders that
+ * append padding or metadata after the EOI.
+ *
+ * A raw byte search for FF D9 is not enough: length-delimited APP/COM
+ * segments (an EXIF thumbnail is itself a complete embedded JPEG) may contain
+ * FF D9, so a truncated file with an intact metadata prefix would pass.
+ * Walking segment boundaries skips those payloads entirely; only an EOI at
+ * the top level of the marker stream counts. Entropy-coded scan data is
+ * traversed byte-wise, where FF is stuffed as FF 00 and restart markers
+ * (D0-D7) continue the scan, so a marker byte there is unambiguous.
+ *
+ * The EOI only counts after at least one frame header (SOF) and one scan
+ * (SOS) have been seen: a degenerate payload such as bare SOI+EOI carries no
+ * image data and providers reject it.
+ */
+export function hasValidJpegStructure(bytes: Uint8Array): boolean {
+  if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) {
+    return false;
+  }
+  let sawFrame = false;
+  let sawScan = false;
+  let i = 2;
+  while (i + 1 < bytes.length) {
+    if (bytes[i] !== 0xff) {
+      return false;
+    }
+    // FF fill bytes before a marker are legal padding.
+    let j = i + 1;
+    while (j < bytes.length && bytes[j] === 0xff) {
+      j++;
+    }
+    if (j >= bytes.length) {
+      return false;
+    }
+    const marker = bytes[j];
+    i = j + 1;
+    if (marker === 0xd9) {
+      return sawFrame && sawScan;
+    }
+    // SOF0-SOF15 occupy C0-CF, excluding DHT (C4), JPG (C8), and DAC (CC).
+    if (
+      marker >= 0xc0 &&
+      marker <= 0xcf &&
+      marker !== 0xc4 &&
+      marker !== 0xc8 &&
+      marker !== 0xcc
+    ) {
+      sawFrame = true;
+    }
+    // Standalone markers carry no length field: repeated SOI, TEM, RST0-7.
+    if (
+      marker === 0xd8 ||
+      marker === 0x01 ||
+      (marker >= 0xd0 && marker <= 0xd7)
+    ) {
+      continue;
+    }
+    if (i + 1 >= bytes.length) {
+      return false;
+    }
+    const segmentLength = (bytes[i] << 8) | bytes[i + 1];
+    if (segmentLength < 2) {
+      return false;
+    }
+    i += segmentLength;
+    if (marker === 0xda) {
+      sawScan = true;
+      // SOS: entropy-coded data follows the header. Scan to the next real
+      // marker; FF 00 (stuffed data byte) and FF D0-D7 (restart) stay inside
+      // the scan.
+      while (i + 1 < bytes.length) {
+        if (
+          bytes[i] === 0xff &&
+          bytes[i + 1] !== 0x00 &&
+          !(bytes[i + 1] >= 0xd0 && bytes[i + 1] <= 0xd7)
+        ) {
+          break;
+        }
+        i++;
+      }
+    }
+  }
+  return false;
+}
+
 function readFromCache(key: string): Buffer | null {
+  const cachePath = join(getCacheDir(), `${key}.jpg`);
   try {
-    const cachePath = join(getCacheDir(), `${key}.jpg`);
     if (!existsSync(cachePath)) {
       return null;
     }
-    return readFileSync(cachePath) as Buffer;
+    const bytes = readFileSync(cachePath) as Buffer;
+    if (!isCompleteJpeg(bytes)) {
+      // Poisoned entry (torn write, disk full, etc.): drop it so the caller
+      // re-converts and re-caches.
+      unlinkSync(cachePath);
+      return null;
+    }
+    return bytes;
   } catch {
     return null;
   }
 }
 
 function writeToCache(key: string, convertedBytes: Buffer): void {
+  const dir = getCacheDir();
+  // Write-then-rename so concurrent readers (the cache dir is shared across
+  // daemon processes) never observe a partially written entry; rename within
+  // the same directory is atomic. The pid+uuid suffix keeps concurrent
+  // writers of the same key off each other's temp file.
+  const tmpPath = join(dir, `${key}.${process.pid}-${uuid().slice(0, 8)}.tmp`);
   try {
-    const dir = getCacheDir();
     mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, `${key}.jpg`), convertedBytes);
+    writeFileSync(tmpPath, convertedBytes);
+    renameSync(tmpPath, join(dir, `${key}.jpg`));
     evictIfNeeded(dir);
   } catch {
     // Cache write failure is non-fatal.
+    try {
+      unlinkSync(tmpPath);
+    } catch {
+      /* ignore */
+    }
   }
 }
 
@@ -101,10 +226,10 @@ export interface ConvertToJpegOptions {
   quality?: number;
 }
 
-function runSips(
+async function runSips(
   inputBytes: Uint8Array,
   options: ConvertToJpegOptions,
-): Buffer | null {
+): Promise<Buffer | null> {
   const stamp = `${Date.now()}-${uuid().slice(0, 8)}`;
   const srcPath = join(tmpdir(), `vellum-img-opt-${stamp}-src`);
   const outPath = join(tmpdir(), `vellum-img-opt-${stamp}-out.jpg`);
@@ -133,8 +258,23 @@ function runSips(
       "--out",
       outPath,
     );
-    execFileSync("sips", args, { stdio: "pipe", timeout: 15_000 });
-    return readFileSync(outPath) as Buffer;
+    const proc = Bun.spawn(["sips", ...args], {
+      stdout: "ignore",
+      stderr: "ignore",
+      timeout: 15_000,
+    });
+    await proc.exited;
+    if (proc.exitCode !== 0) {
+      return null;
+    }
+    const out = readFileSync(outPath) as Buffer;
+    // A zero-exit sips can still leave a truncated file (disk full, timeout
+    // kill racing the write). Returning it would poison the cache and every
+    // downstream provider call. Treat it as a failed conversion instead.
+    if (!isCompleteJpeg(out)) {
+      return null;
+    }
+    return out;
   } catch {
     return null;
   } finally {
@@ -155,10 +295,10 @@ function runSips(
  * Convert an image to JPEG, optionally downscaling. Returns null when
  * conversion is unavailable (non-macOS) or fails; callers keep the original.
  */
-export function convertImageToJpeg(
+export async function convertImageToJpeg(
   bytes: Uint8Array,
   options: ConvertToJpegOptions = {},
-): Buffer | null {
+): Promise<Buffer | null> {
   const hash = createHash("sha256").update(bytes).digest("hex").slice(0, 16);
   // Options qualify the key so full-resolution storage conversions and
   // resized transport conversions of the same source never collide.
@@ -173,7 +313,7 @@ export function convertImageToJpeg(
     return cached;
   }
 
-  const converted = runSips(bytes, options);
+  const converted = await runSips(bytes, options);
   if (!converted) {
     return null;
   }
@@ -199,14 +339,22 @@ const HEIF_FTYP_BRANDS = new Set([
   "msf1",
 ]);
 
-/**
- * Content-based HEIF/HEIC detection. MIME metadata is unreliable here:
- * Chromium reports an empty `file.type` for `.heic`, which clients coerce to
- * `application/octet-stream`.
- */
-export function isHeifImage(bytes: Uint8Array): boolean {
+// Brands whose canonical MIME is `image/heic`; the remaining HEIF brands
+// (`heif`, `mif1`, `msf1`) are `image/heif`.
+const HEIC_FTYP_BRANDS = new Set([
+  "heic",
+  "heix",
+  "hevc",
+  "hevx",
+  "heim",
+  "heis",
+  "hevm",
+  "hevs",
+]);
+
+function heifFtypBrand(bytes: Uint8Array): string | null {
   if (bytes.length < 12) {
-    return false;
+    return null;
   }
   // ISO BMFF layout: bytes 4-8 are "ftyp", bytes 8-12 the major brand.
   if (
@@ -215,7 +363,7 @@ export function isHeifImage(bytes: Uint8Array): boolean {
     bytes[6] !== 0x79 || // y
     bytes[7] !== 0x70 // p
   ) {
-    return false;
+    return null;
   }
   const brand = String.fromCharCode(
     bytes[8]!,
@@ -223,7 +371,30 @@ export function isHeifImage(bytes: Uint8Array): boolean {
     bytes[10]!,
     bytes[11]!,
   );
-  return HEIF_FTYP_BRANDS.has(brand);
+  return HEIF_FTYP_BRANDS.has(brand) ? brand : null;
+}
+
+/**
+ * Content-based HEIF/HEIC detection. MIME metadata is unreliable here:
+ * Chromium reports an empty `file.type` for `.heic`, which clients coerce to
+ * `application/octet-stream`.
+ */
+export function isHeifImage(bytes: Uint8Array): boolean {
+  return heifFtypBrand(bytes) !== null;
+}
+
+/**
+ * Canonical HEIF MIME type for bytes whose container brand names one, and null
+ * for everything else. For providers that read HEIF directly and key on the
+ * declared media type (Gemini accepts `image/heic` and `image/heif`:
+ * https://ai.google.dev/gemini-api/docs/image-understanding).
+ */
+export function heifImageMimeType(bytes: Uint8Array): string | null {
+  const brand = heifFtypBrand(bytes);
+  if (!brand) {
+    return null;
+  }
+  return HEIC_FTYP_BRANDS.has(brand) ? "image/heic" : "image/heif";
 }
 
 /**
@@ -346,12 +517,12 @@ export interface NormalizedImageBytes {
  * {@link jpegFilenameFor} when `converted` is true — a MIME-only correction
  * sets `converted: false` and keeps the filename.
  */
-export function normalizeImageBytes(
+export async function normalizeImageBytes(
   mimeType: string,
   bytes: Uint8Array,
-): NormalizedImageBytes {
+): Promise<NormalizedImageBytes> {
   if (isHeifImage(bytes)) {
-    const converted = convertImageToJpeg(bytes, {
+    const converted = await convertImageToJpeg(bytes, {
       quality: STORAGE_JPEG_QUALITY,
     });
     if (!converted) {
@@ -376,14 +547,14 @@ export interface NormalizedImageBase64 {
  * Base64 variant of {@link normalizeImageBytes}. Sniffs the decoded head
  * first so non-HEIF payloads skip the full decode.
  */
-export function normalizeImageBase64(
+export async function normalizeImageBase64(
   mimeType: string,
   dataBase64: string,
-): NormalizedImageBase64 {
+): Promise<NormalizedImageBase64> {
   // 16 base64 chars decode to the 12 bytes the ftyp/signature sniffs need.
   const head = Buffer.from(dataBase64.slice(0, 16), "base64");
   if (isHeifImage(head)) {
-    const normalized = normalizeImageBytes(
+    const normalized = await normalizeImageBytes(
       mimeType,
       Buffer.from(dataBase64, "base64"),
     );

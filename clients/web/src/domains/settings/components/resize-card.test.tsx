@@ -13,6 +13,7 @@ import type { SubscriptionResponse } from "@/generated/api/types.gen";
 let nativeAndroid = false;
 
 mock.module("@/runtime/platform-detection", () => ({
+  isNativeAndroid: () => nativeAndroid,
   useIsNativeAndroid: () => nativeAndroid,
 }));
 
@@ -31,6 +32,7 @@ function subscription(planId: SubscriptionResponse["plan_id"]): SubscriptionResp
     plan_id: planId,
     status: "active",
     renewal_date: null,
+    current_period_start: null,
     current_period_end: null,
     cancel_at_period_end: false,
     cancel_at: null,

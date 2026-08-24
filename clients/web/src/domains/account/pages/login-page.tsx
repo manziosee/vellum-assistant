@@ -1,39 +1,37 @@
 import { useState } from "react";
-import { Link, useLocation } from "react-router";
+import { useLocation } from "react-router";
 
+import { useTranslation } from "@/i18n";
 import { NativeSplash } from "@/components/native-splash";
-import { AuthWaitSpinner } from "@/domains/account/components/auth-wait-spinner";
 import {
-  DarkLoginShell,
-  LoginCard,
-  LoginErrorText,
-  LoginHeading,
-} from "@/domains/account/components/login-shell";
+  AuthWelcomeScreen,
+  WelcomeScreenShell,
+} from "@/components/auth-welcome-screen";
+import { AuthWaitSpinner } from "@/domains/account/components/auth-wait-spinner";
+import { LoginErrorText } from "@/domains/account/components/login-shell";
 import { useReturnToShortCircuit } from "@/domains/account/hooks/use-return-to-short-circuit";
 import {
-  PROVIDER_ID,
-  buildProviderCallbackUrl,
-} from "@/domains/account/login-flow";
+  isUserCancelledAuthError,
+  nativeAuthErrorDetail,
+  AUTH_ERROR_COMMUNITY_LINK,
+  nativeAuthErrorKey,
+} from "@/domains/account/native-auth-error";
 import { withPreservedAttribution } from "@/domains/account/social-auth";
-import {
-  startAuthFlow,
-  startNativeLogin,
-  useIsNativePlatform,
-} from "@/runtime/native-auth";
+import { captureError } from "@/lib/sentry/capture-error";
+import { startNativeLogin, useIsNativePlatform } from "@/runtime/native-auth";
 import { routes } from "@/utils/routes";
 import { Button } from "@vellumai/design-library";
-
-const AUTH_ERROR_MESSAGES: Record<string, string> = {
-  signup_closed:
-    "Sign-ups are currently closed. Visit vellum.ai/community to request access.",
-};
 
 /**
  * Capacitor native login: single "Sign in" button inside NativeSplash.
  * Opens the platform browser auth surface with no provider hint; WorkOS
  * AuthKit handles Apple / Google / email selection.
+ *
+ * Kept apart from the shared welcome screen the browser gets: the splash is
+ * the native app's own launch surface, sized to the device's safe areas.
  */
 function NativeLoginForm({ returnTo }: { returnTo: string | null }) {
+  const { t } = useTranslation("account");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
@@ -43,31 +41,21 @@ function NativeLoginForm({ returnTo }: { returnTo: string | null }) {
     try {
       await startNativeLogin({ returnTo: returnTo ?? null });
     } catch (err) {
-      const errorCode =
-        err && typeof err === "object" && "code" in err ? err.code : undefined;
-      if (errorCode === "USER_CANCELLED") {
+      if (isUserCancelledAuthError(err)) {
         setLoading(false);
         return;
       }
-      if (errorCode === "AUTH_ERROR") {
-        const errorKey =
-          err &&
-          typeof err === "object" &&
-          "data" in err &&
-          err.data &&
-          typeof err.data === "object" &&
-          "authError" in err.data &&
-          typeof err.data.authError === "string"
-            ? err.data.authError
-            : undefined;
-        setErrorMessage(
-          (errorKey && AUTH_ERROR_MESSAGES[errorKey]) ??
-            "Something went wrong. Please try again.",
-        );
-      } else {
-        console.error("[native-auth] auth flow failed:", err);
-        setErrorMessage("Something went wrong. Please try again.");
-      }
+      // Report every real failure, classified or not. This is the screen the
+      // "I tried to log in and it errored right away" reports come from, and
+      // until now the classified branch logged nothing at all — so the reports
+      // arrived with no trace of which refusal the platform issued.
+      captureError(err, {
+        context: "native_login",
+        tags: { authError: nativeAuthErrorDetail(err) ?? "unclassified" },
+      });
+      setErrorMessage(
+        t(nativeAuthErrorKey(err), { community: AUTH_ERROR_COMMUNITY_LINK }),
+      );
       setLoading(false);
     }
   };
@@ -92,7 +80,7 @@ function NativeLoginForm({ returnTo }: { returnTo: string | null }) {
           disabled={loading}
           className="max-w-[300px]"
         >
-          Sign in
+          {t("loginPage.signIn")}
         </Button>
       </div>
     </NativeSplash>
@@ -100,14 +88,14 @@ function NativeLoginForm({ returnTo }: { returnTo: string | null }) {
 }
 
 /**
- * Web / Electron login: a single CTA that hands off to WorkOS AuthKit (which
- * hosts the provider + email/password selection). Wrapped in a forced-dark
- * theme context (the web login screen is always dark per Figma).
+ * Web / Electron login: the same welcome screen `/assistant/welcome` shows,
+ * which is what this is the platform-mode counterpart of. The log-in button
+ * and the AuthKit handoff behind it come from `AuthWelcomeScreen`; the only
+ * thing this build decides is what sits beside it — signup rather than local
+ * mode's route past the account.
  */
 function WebLoginForm({ returnTo }: { returnTo: string | null }) {
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
-  const callbackUrl = buildProviderCallbackUrl(returnTo);
+  const { t } = useTranslation("account");
   // Keep URL-borne attribution alive across the pivot to signup.
   const { search } = useLocation();
   const signUpHref = withPreservedAttribution(
@@ -117,48 +105,15 @@ function WebLoginForm({ returnTo }: { returnTo: string | null }) {
     search,
   );
 
-  const handleContinue = async () => {
-    setErrorMessage(null);
-    setLoading(true);
-    try {
-      await startAuthFlow(PROVIDER_ID, callbackUrl, { returnTo });
-    } catch (err) {
-      console.error("[web-login] auth flow failed:", err);
-      setErrorMessage("Something went wrong. Please try again.");
-      setLoading(false);
-    }
-  };
-
   return (
-    <DarkLoginShell>
-      <LoginCard>
-        <LoginHeading>Sign in to Vellum</LoginHeading>
-        {errorMessage && <LoginErrorText>{errorMessage}</LoginErrorText>}
-        <div className="flex flex-col items-center gap-3">
-          <Button
-            type="button"
-            variant="primary"
-            fullWidth
-            onClick={() => void handleContinue()}
-            disabled={loading}
-            className="max-w-[300px]"
-          >
-            Continue
-          </Button>
-        </div>
-        <p className="text-body-small-default flex justify-center gap-1">
-          <span className="text-[var(--content-secondary)]">
-            Don&apos;t have an account?
-          </span>
-          <Link
-            to={signUpHref}
-            className="font-medium text-[var(--content-emphasised)] hover:underline"
-          >
-            Sign up
-          </Link>
-        </p>
-      </LoginCard>
-    </DarkLoginShell>
+    <AuthWelcomeScreen
+      returnTo={returnTo}
+      errorContext="web_login"
+      // `/account/*` renders outside `RootLayout`, so this screen supplies the
+      // viewport height the layout sizes against.
+      fillsViewport
+      secondary={{ label: t("loginPage.signUp"), href: signUpHref }}
+    />
   );
 }
 
@@ -180,9 +135,9 @@ export function LoginPage() {
     return isNative ? (
       <NativeSplash />
     ) : (
-      <DarkLoginShell>
+      <WelcomeScreenShell fillsViewport>
         <AuthWaitSpinner />
-      </DarkLoginShell>
+      </WelcomeScreenShell>
     );
   }
   if (shortCircuit.kind === "redirect") {

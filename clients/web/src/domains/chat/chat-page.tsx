@@ -19,6 +19,11 @@ import { useAssistantLifecycleStore } from "@/assistant/lifecycle-store";
 import { useResolvedAssistantsStore } from "@/stores/resolved-assistants-store";
 import { useConversationListQuery } from "@/hooks/conversation-queries";
 import { useIsSessionInitializing } from "@/stores/auth-store";
+import {
+  markBoot,
+  markBootBlocked,
+  type BootBlockedReason,
+} from "@/lib/telemetry/boot-telemetry";
 import { useClientFeatureFlagStore } from "@/stores/client-feature-flag-store";
 import { Button } from "@vellumai/design-library";
 
@@ -27,8 +32,10 @@ import { CleanupScreen } from "@/domains/chat/components/cleanup-screen";
 import { SelfHostedScreen } from "@/domains/chat/components/self-hosted-screen";
 import { SetupScreen } from "@/domains/chat/components/setup-screen";
 import { useStuckConnecting } from "@/domains/chat/hooks/use-stuck-connecting";
+import { useTranslation } from "@/i18n";
 
 export function ChatPage() {
+  const { t } = useTranslation("chat");
   const isSessionInitializing = useIsSessionInitializing();
   const assistantState = useAssistantLifecycleStore.use.assistantState();
   const assistantId = useResolvedAssistantsStore.use.activeAssistantId();
@@ -68,6 +75,48 @@ export function ChatPage() {
     lifecycleService.retryAssistant();
   }, [resetStuckConnecting]);
 
+  // Boot telemetry terminal outcome, or `null` while the page is still
+  // resolving. A boot in flight must be neither a success nor a failure until
+  // it settles, and "still resolving" deliberately covers more than the
+  // "Connecting…" placeholder: `initializing` (first-run setup),
+  // `cleaning_up` (teardown), and a `transient` lifecycle error all recover
+  // into chat on their own, so reporting them as terminal would count the same
+  // first-run boot in both the numerator and the denominator of the success
+  // rate. If one of them never clears, the boot-telemetry deadline reports the
+  // waterfall as unsettled, which is the accurate signal.
+  const selfHostedBlocked =
+    assistantState.kind === "self_hosted" &&
+    (!selfHostedChatEnabled || conversationListIsError);
+  // `connectingStuck` is only terminal while the page is STILL connecting.
+  // `useStuckConnecting` clears its flag from an effect, so on the commit where
+  // `connectingReason` flips to null the flag is briefly still true; reading it
+  // unconditionally filed every recovered boot as a permanent failure, and the
+  // retry button did the same. That contradicted the rule one line down, where
+  // states the app recovers from leave the boot unsettled rather than failing
+  // it. A boot that took 30s and then worked is slow, and the marks say so; it
+  // is not a boot that never got there.
+  const bootOutcome: BootBlockedReason | "interactive" | null =
+    connectingStuck && connectingReason !== null
+      ? "stuck_connecting"
+      : assistantState.kind === "error" && !assistantState.transient
+        ? "lifecycle_error"
+        : selfHostedBlocked
+          ? "self_hosted_unavailable"
+          : shouldRenderChat
+            ? "interactive"
+            : null;
+
+  useEffect(() => {
+    if (bootOutcome === null) {
+      return;
+    }
+    if (bootOutcome === "interactive") {
+      markBoot("chat_interactive");
+      return;
+    }
+    markBootBlocked(bootOutcome);
+  }, [bootOutcome]);
+
   const lastConnectingReasonRef = useRef<string | null>(null);
   useEffect(() => {
     if (connectingReason === null) {
@@ -95,18 +144,17 @@ export function ChatPage() {
       return (
         <div className="flex h-full flex-col items-center justify-center gap-4 p-8 text-center">
           <p className="text-[var(--text-secondary)]">
-            Still connecting to your assistant — something seems stuck. Try
-            again, or refresh the page if this keeps happening.
+            {t("chatPage.connectingStuck")}
           </p>
           <Button variant="primary" onClick={retryStuckConnecting}>
-            Try again
+            {t("chatPage.tryAgain")}
           </Button>
         </div>
       );
     }
     return (
       <div className="flex h-full items-center justify-center">
-        <p className="text-[var(--text-secondary)]">Connecting…</p>
+        <p className="text-[var(--text-secondary)]">{t("chatPage.connecting")}</p>
       </div>
     );
   }
@@ -121,7 +169,7 @@ export function ChatPage() {
       <div className="flex h-full flex-col items-center justify-center gap-4 p-8 text-center">
         <p className="text-[var(--text-secondary)]">{assistantState.message}</p>
         <Button variant="primary" onClick={retryAssistant}>
-          {assistantState.transient ? "Retry now" : "Try again"}
+          {assistantState.transient ? t("chatPage.retryNow") : t("chatPage.tryAgain")}
         </Button>
       </div>
     );
@@ -150,11 +198,10 @@ export function ChatPage() {
     return (
       <div className="flex h-full flex-col items-center justify-center gap-4 p-8 text-center">
         <p className="text-[var(--text-secondary)]">
-          Couldn&apos;t reach your self-hosted assistant. Make sure your
-          assistant is running, then try again.
+          {t("chatPage.selfHostedUnreachable")}
         </p>
         <Button variant="primary" onClick={refetchConversationList}>
-          Try again
+          {t("chatPage.tryAgain")}
         </Button>
       </div>
     );

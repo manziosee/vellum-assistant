@@ -26,6 +26,7 @@ import {
   type ResearchFact,
 } from "@/domains/chat/onboarding-research/research-facts";
 import { SourceFavicon } from "@/domains/chat/onboarding-research/source-favicon";
+import { useTranslation } from "@/i18n";
 
 export interface ResearchFactItem {
   fact: ResearchFact;
@@ -75,6 +76,7 @@ function ClaimRow({
   onRestore: () => void;
   resolveFavicon: (domain: string) => string;
 }) {
+  const { t } = useTranslation("chat");
   const [expanded, setExpanded] = useState(false);
   const [popoverOpen, setPopoverOpen] = useState(false);
   const badge = confidenceBadge(fact.confidence);
@@ -84,7 +86,11 @@ function ClaimRow({
 
   return (
     <li
-      className={`group flex flex-col rounded-lg border border-[var(--border-base)] bg-[var(--surface-lift)] transition-opacity ${
+      data-reveal-row=""
+      /* A removed fact holds its remove control open: it is the control that
+         reverses the removal, so it has to be there without a hover. */
+      data-reveal-hold={removed ? "" : undefined}
+      className={`flex flex-col rounded-lg border border-[var(--border-base)] bg-[var(--surface-lift)] transition-opacity ${
         removed ? "opacity-50" : ""
       }`}
       style={{ animation: "fadeInUp 0.35s ease-out both" }}
@@ -118,18 +124,17 @@ function ClaimRow({
           <Popover.Trigger asChild>
             <button
               type="button"
-              aria-label={removed ? "Edit removal" : "Remove"}
+              aria-label={removed ? t("researchFactsCard.editRemovalAria") : t("researchFactsCard.removeAria")}
               onClick={(e) => e.stopPropagation()}
-              className={`ml-auto shrink-0 cursor-pointer text-[var(--content-tertiary)] transition-opacity hover:text-[var(--content-default)] focus-visible:opacity-100 ${
-                removed ? "opacity-100" : "opacity-0 group-hover:opacity-100"
-              }`}
+              data-reveal=""
+              className="ml-auto shrink-0 cursor-pointer text-[var(--content-tertiary)] hover:text-[var(--content-default)]"
             >
               <Ban className="size-[18px]" />
             </button>
           </Popover.Trigger>
           <Popover.Content align="end" className="flex w-52 flex-col gap-0.5">
             <p className="px-2 pb-1 pt-1 text-label-small-default text-[var(--content-tertiary)]">
-              Why remove this?
+              {t("researchFactsCard.whyRemove")}
             </p>
             {REASONS.map((reason) => (
               <button
@@ -152,7 +157,7 @@ function ClaimRow({
               }}
               className="mt-0.5 rounded-md border-t border-[var(--border-base)] px-2 pt-2 pb-1 text-left text-sm text-[var(--content-secondary)] transition-colors hover:text-[var(--content-default)]"
             >
-              Keep it
+              {t("researchFactsCard.keepIt")}
             </button>
           </Popover.Content>
         </Popover.Root>
@@ -161,7 +166,7 @@ function ClaimRow({
       {expanded && canExpand ? (
         <div className="flex flex-col gap-1.5 border-t border-[var(--border-base)] px-4 py-2.5">
           <span className="text-label-small-default uppercase tracking-wide text-[var(--content-tertiary)]">
-            Sources
+            {t("researchFactsCard.sources")}
           </span>
           {links.map(({ domain, url }) => (
             <a

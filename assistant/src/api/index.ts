@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { AcpAuthRequiredEventSchema } from "./events/acp-auth-required.js";
 import { AcpSessionCompletedEventSchema } from "./events/acp-session-completed.js";
 import { AcpSessionErrorEventSchema } from "./events/acp-session-error.js";
 import { AcpSessionSpawnedEventSchema } from "./events/acp-session-spawned.js";
@@ -25,6 +26,7 @@ import { ConfirmationStateChangedEventSchema } from "./events/confirmation-state
 import { ContactRequestEventSchema } from "./events/contact-request.js";
 import { ContactsChangedEventSchema } from "./events/contacts-changed.js";
 import { ContextCompactedEventSchema } from "./events/context-compacted.js";
+import { ContextWindowUsageEventSchema } from "./events/context-window-usage.js";
 import { ConversationErrorEventSchema } from "./events/conversation-error.js";
 import { ConversationInferenceProfileUpdatedEventSchema } from "./events/conversation-inference-profile-updated.js";
 import { ConversationListInvalidatedEventSchema } from "./events/conversation-list-invalidated.js";
@@ -100,6 +102,7 @@ import {
   RecordingStopEventSchema,
 } from "./events/recording.js";
 import { RelationshipStateUpdatedEventSchema } from "./events/relationship-state-updated.js";
+import { ResourcePressureStatusChangedEventSchema } from "./events/resource-pressure-status-changed.js";
 import { ScheduleConversationCreatedEventSchema } from "./events/schedule-conversation-created.js";
 import { SecretRequestEventSchema } from "./events/secret-request.js";
 import { ServiceGroupUpdateCompleteEventSchema } from "./events/service-group-update-complete.js";
@@ -126,6 +129,7 @@ import { UISurfaceUpdateEventSchema } from "./events/ui-surface-update.js";
 import { UsageProgressEventSchema } from "./events/usage-progress.js";
 import { UsageUpdateEventSchema } from "./events/usage-update.js";
 import { UserMessageEchoEventSchema } from "./events/user-message-echo.js";
+import { WatchRetroCompletedEventSchema } from "./events/watch-retro-completed.js";
 import { WorkflowCompletedEventSchema } from "./events/workflow-completed.js";
 import { WorkflowLeafFinishedEventSchema } from "./events/workflow-leaf-finished.js";
 import { WorkflowLeafStartedEventSchema } from "./events/workflow-leaf-started.js";
@@ -133,14 +137,36 @@ import { WorkflowProgressEventSchema } from "./events/workflow-progress.js";
 import { WorkflowStartedEventSchema } from "./events/workflow-started.js";
 
 export {
+  APP_MUTATION_TOOL_NAMES,
+  APP_MUTATION_TOOLS,
+  type AppMutationTool,
+} from "./constants/app-tools.js";
+export {
   CALL_SITE_COMPACTION_AGENT,
   CALL_SITE_SYNTHETIC_AGENT_ERROR_MESSAGE,
 } from "./constants/call-sites.js";
+export {
+  DOCUMENT_EDIT_TOOL_NAMES,
+  DOCUMENT_MUTATION_TOOL_NAMES,
+  DOCUMENT_MUTATION_TOOLS,
+  type DocumentMutationTool,
+  REOPENABLE_DOCUMENT_MUTATION_TOOL_NAMES,
+} from "./constants/document-tools.js";
+export {
+  MIN_INPUT_RESERVE_TOKENS,
+  type ProfileConfigIssue,
+  validateInferenceProfileConfig,
+} from "./constants/profile-config-validation.js";
 export {
   SSE_REPLAY_RING_AGE_LIMIT_MS,
   SSE_REPLAY_RING_COUNT_LIMIT,
 } from "./constants/sse-replay.js";
 export { DEFAULT_TOOL_EXECUTION_TIMEOUT_SEC } from "./constants/tool-execution.js";
+export {
+  ACP_CLAUDE_AUTH_REQUIRED_CODE,
+  type AcpAuthRequiredEvent,
+  AcpAuthRequiredEventSchema,
+} from "./events/acp-auth-required.js";
 export {
   type AcpSessionCompletedEvent,
   AcpSessionCompletedEventSchema,
@@ -271,6 +297,10 @@ export {
   type ContextCompactedEvent,
   ContextCompactedEventSchema,
 } from "./events/context-compacted.js";
+export {
+  type ContextWindowUsageEvent,
+  ContextWindowUsageEventSchema,
+} from "./events/context-window-usage.js";
 export {
   type ConversationErrorCode,
   ConversationErrorCodeSchema,
@@ -489,6 +519,12 @@ export {
   PlatformDisconnectedEventSchema,
 } from "./events/platform-disconnected.js";
 export {
+  type AnsweredQuestion,
+  type AnsweredQuestionResponse,
+  AnsweredQuestionResponseSchema,
+  AnsweredQuestionSchema,
+} from "./events/question-answered.js";
+export {
   type QuestionEntry,
   QuestionEntrySchema,
   type QuestionOption,
@@ -512,6 +548,14 @@ export {
   type RelationshipStateUpdatedEvent,
   RelationshipStateUpdatedEventSchema,
 } from "./events/relationship-state-updated.js";
+export {
+  type ResourcePressureState,
+  ResourcePressureStateSchema,
+  type ResourcePressureStatus,
+  type ResourcePressureStatusChangedEvent,
+  ResourcePressureStatusChangedEventSchema,
+  ResourcePressureStatusSchema,
+} from "./events/resource-pressure-status-changed.js";
 export {
   type ScheduleConversationCreatedEvent,
   ScheduleConversationCreatedEventSchema,
@@ -638,6 +682,10 @@ export {
   type UserMessageEchoEvent,
   UserMessageEchoEventSchema,
 } from "./events/user-message-echo.js";
+export {
+  type WatchRetroCompletedEvent,
+  WatchRetroCompletedEventSchema,
+} from "./events/watch-retro-completed.js";
 export {
   type WorkflowCompletedEvent,
   WorkflowCompletedEventSchema,
@@ -779,6 +827,10 @@ export {
   MemoryV3SelectionRowSchema,
 } from "./responses/memory-v3-selection-log.js";
 export {
+  type ResourcePressureStatusResponse,
+  ResourcePressureStatusResponseSchema,
+} from "./responses/resource-pressure-status.js";
+export {
   type SubagentDetailEvent,
   SubagentDetailEventSchema,
   type SubagentDetailResponse,
@@ -877,6 +929,7 @@ export {
  * migration recipe.
  */
 export const AssistantEventSchema = z.discriminatedUnion("type", [
+  AcpAuthRequiredEventSchema,
   AcpSessionCompletedEventSchema,
   AcpSessionErrorEventSchema,
   AcpSessionSpawnedEventSchema,
@@ -902,6 +955,7 @@ export const AssistantEventSchema = z.discriminatedUnion("type", [
   ContactRequestEventSchema,
   ContactsChangedEventSchema,
   ContextCompactedEventSchema,
+  ContextWindowUsageEventSchema,
   ConversationErrorEventSchema,
   ConversationInferenceProfileUpdatedEventSchema,
   ConversationListInvalidatedEventSchema,
@@ -961,6 +1015,7 @@ export const AssistantEventSchema = z.discriminatedUnion("type", [
   RecordingStartEventSchema,
   RecordingStopEventSchema,
   RelationshipStateUpdatedEventSchema,
+  ResourcePressureStatusChangedEventSchema,
   ScheduleConversationCreatedEventSchema,
   SecretRequestEventSchema,
   ServiceGroupUpdateCompleteEventSchema,
@@ -987,6 +1042,7 @@ export const AssistantEventSchema = z.discriminatedUnion("type", [
   UsageProgressEventSchema,
   UsageUpdateEventSchema,
   UserMessageEchoEventSchema,
+  WatchRetroCompletedEventSchema,
   WorkflowCompletedEventSchema,
   WorkflowLeafFinishedEventSchema,
   WorkflowLeafStartedEventSchema,

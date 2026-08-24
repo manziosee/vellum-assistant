@@ -2,9 +2,12 @@ import { useQuery } from "@tanstack/react-query";
 import { Tabs } from "@vellumai/design-library/components/tabs";
 import { Input } from "@vellumai/design-library/components/input";
 import { Notice } from "@vellumai/design-library/components/notice";
-import { Popover } from "@vellumai/design-library/components/popover";
+import {
+  Select,
+  type SelectOption,
+} from "@vellumai/design-library/components/select";
 import { toast } from "@vellumai/design-library/components/toast";
-import { ChevronDown, Loader2, Search, Sparkles } from "lucide-react";
+import { Loader2, Search, Sparkles } from "lucide-react";
 import { Suspense, useEffect, useMemo, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router";
 
@@ -18,6 +21,7 @@ import { oauthProvidersGetOptions } from "@/generated/daemon/@tanstack/react-que
 import { usePlatformAssistantId } from "@/hooks/use-platform-assistant-id";
 import { usePlatformGate } from "@/hooks/use-platform-gate";
 import { captureError } from "@/lib/sentry/capture-error";
+import { Trans, useTranslation } from "@/i18n";
 import { getLocalSetting, setLocalSetting } from "@/utils/local-settings";
 import { routes } from "@/utils/routes";
 
@@ -26,11 +30,69 @@ const BANNER_STORAGE_KEY = "vellum:integrations:bannerDismissed";
 type IntegrationFilter = "all" | "enabled" | "not-enabled";
 type IntegrationsTab = "oauth" | "mcp";
 
-const FILTER_OPTIONS: Array<{ value: IntegrationFilter; label: string }> = [
-  { value: "all", label: "All" },
-  { value: "enabled", label: "Enabled" },
-  { value: "not-enabled", label: "Not Enabled" },
-];
+type SettingsTranslate = ReturnType<typeof useTranslation<"settings">>["t"];
+
+function oauthErrorMessage(
+  t: SettingsTranslate,
+  code: string,
+): string | undefined {
+  const messages: Record<string, string> = {
+    denied: t("integrationsPage.oauthErrorDenied"),
+    state_invalid: t("integrationsPage.oauthErrorStateInvalid"),
+    state_expired: t("integrationsPage.oauthErrorStateExpired"),
+    exchange_failed: t("integrationsPage.oauthErrorExchangeFailed"),
+    identity_failed: t("integrationsPage.oauthErrorIdentityFailed"),
+  };
+  return messages[code];
+}
+
+function emptyStateTitle(
+  t: SettingsTranslate,
+  searchText: string,
+  selectedFilter: IntegrationFilter,
+): string {
+  if (searchText.trim()) {
+    return t("integrationsPage.emptySearchTitle");
+  }
+  switch (selectedFilter) {
+    case "enabled":
+      return t("integrationsPage.emptyEnabledTitle");
+    case "not-enabled":
+      return t("integrationsPage.emptyAllEnabledTitle");
+    default:
+      return t("integrationsPage.emptyDefaultTitle");
+  }
+}
+
+function emptyStateSubtitle(
+  t: SettingsTranslate,
+  searchText: string,
+  selectedFilter: IntegrationFilter,
+): string {
+  if (searchText.trim()) {
+    return t("integrationsPage.emptySearchSubtitle", {
+      query: searchText.trim(),
+    });
+  }
+  switch (selectedFilter) {
+    case "enabled":
+      return t("integrationsPage.emptyEnabledSubtitle");
+    case "not-enabled":
+      return t("integrationsPage.emptyNotEnabledSubtitle");
+    default:
+      return t("integrationsPage.emptyDefaultSubtitle");
+  }
+}
+
+/** Filter values in display order, each with the catalog key for its label. */
+const FILTER_OPTION_KEYS = [
+  { value: "all", labelKey: "integrationsPage.filterAll" },
+  { value: "enabled", labelKey: "integrationsPage.filterEnabled" },
+  { value: "not-enabled", labelKey: "integrationsPage.filterNotEnabled" },
+] as const satisfies ReadonlyArray<{
+  value: IntegrationFilter;
+  labelKey: string;
+}>;
 
 function connectionForProvider(
   connections: OAuthConnection[] | undefined,
@@ -44,6 +106,7 @@ function parseIntegrationsTab(value: string | null): IntegrationsTab {
 }
 
 function IntegrationsPanelInner() {
+  const { t } = useTranslation("settings");
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
   const platformGate = usePlatformGate();
@@ -54,7 +117,6 @@ function IntegrationsPanelInner() {
   const [searchText, setSearchText] = useState("");
   const [selectedFilter, setSelectedFilter] =
     useState<IntegrationFilter>("all");
-  const [filterMenuOpen, setFilterMenuOpen] = useState(false);
 
   const [bannerDismissed, setBannerDismissed] = useState(true);
   const [selectedProviderKey, setSelectedProviderKey] = useState<string | null>(
@@ -129,28 +191,21 @@ function IntegrationsPanelInner() {
     if (oauthStatus === "connected") {
       toast.success(
         providerLabel
-          ? `${providerLabel} account connected successfully.`
-          : "Account connected successfully.",
+          ? t("integrationsPage.accountConnectedToast", { providerLabel })
+          : t("integrationsPage.accountConnectedToastGeneric"),
       );
     } else if (oauthStatus === "error") {
       const code = searchParams.get("oauth_code") ?? "unknown";
-      const messages: Record<string, string> = {
-        denied: "Authorization was denied. Please try again.",
-        state_invalid: "Authorization state was invalid. Please try again.",
-        state_expired: "Authorization expired. Please try again.",
-        exchange_failed: "Failed to complete authorization. Please try again.",
-        identity_failed: "Failed to verify account identity. Please try again.",
-      };
       toast.error(
-        messages[code] ??
+        oauthErrorMessage(t, code) ??
           (providerLabel
-            ? `Failed to connect ${providerLabel}.`
-            : "Failed to connect. Please try again."),
+            ? t("integrationsPage.connectFailedToast", { providerLabel })
+            : t("integrationsPage.connectFailedToastGeneric")),
       );
     }
 
     navigate(routes.settings.integrations, { replace: true });
-  }, [searchParams, navigate]);
+  }, [searchParams, navigate, t]);
 
   const managedProviders = useMemo(
     () => providers?.filter((p) => p.supports_managed_mode) ?? [],
@@ -203,36 +258,9 @@ function IntegrationsPanelInner() {
     providersLoading ||
     connectionsLoading ||
     platformAssistantIdLoading;
-  const selectedFilterLabel =
-    FILTER_OPTIONS.find((o) => o.value === selectedFilter)?.label ?? "All";
 
-  const emptyStateTitle = (() => {
-    if (searchText.trim()) {
-      return "No integrations matched";
-    }
-    switch (selectedFilter) {
-      case "enabled":
-        return "No Enabled Integrations";
-      case "not-enabled":
-        return "All Integrations Are Enabled";
-      default:
-        return "No Integrations Available";
-    }
-  })();
-
-  const emptyStateSubtitle = (() => {
-    if (searchText.trim()) {
-      return `No integrations matched "${searchText.trim()}"`;
-    }
-    switch (selectedFilter) {
-      case "enabled":
-        return "Connect an integration to get started.";
-      case "not-enabled":
-        return "All available integrations have been connected.";
-      default:
-        return "Check your connection and try again.";
-    }
-  })();
+  const emptyTitle = emptyStateTitle(t, searchText, selectedFilter);
+  const emptySubtitle = emptyStateSubtitle(t, searchText, selectedFilter);
 
   const selectedProvider = useMemo(
     () =>
@@ -243,6 +271,13 @@ function IntegrationsPanelInner() {
         : null,
     [managedProviders, selectedProviderKey],
   );
+
+  const filterOptions: ReadonlyArray<SelectOption<IntegrationFilter>> =
+    FILTER_OPTION_KEYS.map(({ value, labelKey }) => ({
+      value,
+      label: t(labelKey),
+    }));
+
   return (
     <div className="space-y-4">
       {!bannerDismissed && (
@@ -251,8 +286,13 @@ function IntegrationsPanelInner() {
           icon={<Sparkles className="h-3.5 w-3.5" />}
           onDismiss={dismissBanner}
         >
-          <span className="text-body-medium-default">Tip:</span> You can enable
-          integrations by mentioning them in chat.
+          <Trans
+            ns="settings"
+            i18nKey="integrationsPage.tipBanner"
+            components={{
+              tip: <span className="text-body-medium-default" />,
+            }}
+          />
         </Notice>
       )}
 
@@ -261,79 +301,44 @@ function IntegrationsPanelInner() {
           type="text"
           value={searchText}
           onChange={(e) => setSearchText(e.target.value)}
-          placeholder="Search Integrations"
-          aria-label="Search integrations"
+          placeholder={t("integrationsPage.searchPlaceholder")}
+          aria-label={t("integrationsPage.searchAriaLabel")}
           leftIcon={<Search className="h-3.5 w-3.5" aria-hidden />}
           fullWidth
           wrapperClassName="flex-1"
         />
-        <Popover.Root open={filterMenuOpen} onOpenChange={setFilterMenuOpen}>
-          <Popover.Trigger asChild>
-            <button
-              type="button"
-              aria-haspopup="listbox"
-              aria-expanded={filterMenuOpen}
-              className="flex w-36 cursor-pointer items-center justify-between gap-2 rounded-md border border-[var(--border-element)] bg-[var(--surface-lift)] px-3 py-1.5 text-body-medium-lighter text-[var(--content-default)] transition-colors hover:bg-[var(--ghost-hover)]"
-            >
-              <span>{selectedFilterLabel}</span>
-              <ChevronDown className="h-3.5 w-3.5" />
-            </button>
-          </Popover.Trigger>
-          <Popover.Content
-            align="end"
-            sideOffset={4}
-            className="w-36 overflow-hidden p-0"
-          >
-            <div role="listbox">
-              {FILTER_OPTIONS.map((option) => {
-                const active = option.value === selectedFilter;
-                return (
-                  <button
-                    key={option.value}
-                    type="button"
-                    role="option"
-                    aria-selected={active}
-                    onClick={() => {
-                      setSelectedFilter(option.value);
-                      setFilterMenuOpen(false);
-                    }}
-                    className={`flex w-full cursor-pointer items-center px-3 py-1.5 text-left hover:bg-[var(--ghost-hover)] ${
-                      active
-                        ? "text-body-medium-default text-[var(--content-default)]"
-                        : "text-body-medium-lighter text-[var(--content-default)]"
-                    }`}
-                  >
-                    {option.label}
-                  </button>
-                );
-              })}
-            </div>
-          </Popover.Content>
-        </Popover.Root>
+        <Select<IntegrationFilter>
+          options={filterOptions}
+          value={selectedFilter}
+          onChange={setSelectedFilter}
+          aria-label={t("integrationsPage.filterAriaLabel")}
+          menuAlign="end"
+          className="w-36 shrink-0"
+        />
       </div>
 
       <div>
         {loading ? (
           <div className="flex items-center gap-2 py-6 text-body-medium-lighter text-[var(--content-tertiary)]">
             <Loader2 className="h-4 w-4 animate-spin" />
-            <span>Loading...</span>
+            <span>{t("integrationsPage.loading")}</span>
           </div>
         ) : providersError ? (
           <p className="text-body-medium-lighter text-[var(--content-tertiary)]">
-            Failed to load integrations. Please try again.
+            {t("integrationsPage.loadFailed")}
           </p>
         ) : !assistant ? (
           <p className="text-body-medium-lighter text-[var(--content-tertiary)]">
-            No assistant found. Hatch an assistant to connect integrations.
+            {t("integrationsPage.noAssistant")}
           </p>
         ) : filteredProviders.length === 0 ? (
           <div className="flex flex-col items-center gap-2 rounded-lg border border-dashed border-[var(--border-element)] px-4 py-12 text-center">
             <Search className="h-6 w-6 text-[var(--content-disabled)]" />
             <p className="text-body-medium-default text-[var(--content-default)]">
-              {emptyStateTitle}
+              {emptyTitle}
             </p>
             <p className="text-body-small-default text-[var(--content-tertiary)]">
-              {emptyStateSubtitle}
+              {emptySubtitle}
             </p>
           </div>
         ) : (
@@ -379,6 +384,7 @@ function IntegrationsPanelInner() {
 }
 
 export function IntegrationsPage() {
+  const { t } = useTranslation("settings");
   const [searchParams, setSearchParams] = useSearchParams();
   const activeTab = parseIntegrationsTab(searchParams.get("tab"));
 
@@ -397,8 +403,10 @@ export function IntegrationsPage() {
     <div className="space-y-6">
       <Tabs.Root value={activeTab} onValueChange={handleTabChange}>
         <Tabs.List>
-          <Tabs.Trigger value="oauth">OAuth</Tabs.Trigger>
-          <Tabs.Trigger value="mcp">MCP</Tabs.Trigger>
+          <Tabs.Trigger value="oauth">
+            {t("integrationsPage.tabOAuth")}
+          </Tabs.Trigger>
+          <Tabs.Trigger value="mcp">{t("integrationsPage.tabMcp")}</Tabs.Trigger>
         </Tabs.List>
         <Tabs.Panel value="oauth" className="pt-4">
           <Suspense>

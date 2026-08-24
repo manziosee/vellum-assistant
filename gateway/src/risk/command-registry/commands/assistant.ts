@@ -104,6 +104,7 @@ const ASSISTANT_SUPPORTED_COMMAND_PATHS = [
   "conversations defer list",
   "conversations defer cancel",
   "conversations list",
+  "conversations search",
   "conversations new",
   "conversations rename",
   "conversations export",
@@ -174,6 +175,7 @@ const ASSISTANT_SUPPORTED_COMMAND_PATHS = [
   "mcp remove",
   "memory",
   "memory ingest",
+  "memory validate",
   "memory nodes",
   "memory nodes stats",
   "memory nodes list",
@@ -198,6 +200,7 @@ const ASSISTANT_SUPPORTED_COMMAND_PATHS = [
   "memory v3 backfill-sections",
   "memory v3 eval",
   "memory v3 eval-tally",
+  "memory v3 gate-stats",
   "memory retrospective",
   "memory retrospective run",
   "memory retrospective list",
@@ -672,6 +675,11 @@ const riskOverrides: AssistantRiskOverride[] = [
     reason: "Enqueues recompute of persisted activation state",
   },
   {
+    path: "memory validate",
+    risk: "low",
+    reason: "Read-only diagnostic walk over concept pages and links",
+  },
+  {
     path: "memory v2 validate",
     risk: "low",
     reason: "Read-only diagnostic walk over concept pages and edges",
@@ -717,6 +725,12 @@ const riskOverrides: AssistantRiskOverride[] = [
     risk: "medium",
     reason:
       "Daemon handler is read-only, but the CLI writes the tally result to a user-supplied path when --out is provided; classifying medium so file-write invocations are not auto-approved as read-only",
+  },
+  {
+    path: "memory v3 gate-stats",
+    risk: "low",
+    reason:
+      "Read-only telemetry diagnostic: queries the local SQLite telemetry outbox and prints gate pass-rate stats; no writes, no daemon required",
   },
   {
     path: "memory retrospective run",

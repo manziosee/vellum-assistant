@@ -8,7 +8,8 @@ import {
   useAssistantsOauthDisconnectByConnectionCreateMutation,
 } from "@/generated/api/@tanstack/react-query.gen";
 import type { OAuthConnection } from "@/generated/api/types.gen";
-import { useIsMobile } from "@/hooks/use-is-mobile";
+import { useTouchMobile } from "@/hooks/use-touch-mobile";
+import { useTranslation } from "@/i18n";
 import { BottomSheet } from "@vellumai/design-library/components/bottom-sheet";
 import { Button } from "@vellumai/design-library/components/button";
 import { Card } from "@vellumai/design-library/components/card";
@@ -52,12 +53,12 @@ export function IntegrationRow({
   platformGate,
   onConfigure,
 }: IntegrationRowProps) {
+  const { t } = useTranslation("settings");
   const queryClient = useQueryClient();
   const isConnected = Boolean(connection?.connected);
 
   const [menuOpen, setMenuOpen] = useState(false);
   const [confirmDisableOpen, setConfirmDisableOpen] = useState(false);
-  const isMobile = useIsMobile();
 
   const connectionsQueryKey = assistantsOauthConnectionsListQueryKey({
     path: { assistant_id: platformAssistantId },
@@ -68,7 +69,9 @@ export function IntegrationRow({
   const disconnectOAuth =
     useAssistantsOauthDisconnectByConnectionCreateMutation({
       onSuccess(_data, variables) {
-        toast.success(`${displayName} account disconnected.`);
+        toast.success(
+          t("integrationRow.disconnectedToast", { name: displayName }),
+        );
         const connectionId = variables.path.connection_id;
         assistantsOauthConnectionsListSetQueryData(
           queryClient,
@@ -81,7 +84,7 @@ export function IntegrationRow({
         const detail = extractErrorMessage(
           error,
           undefined,
-          `Failed to disconnect ${displayName} account.`,
+          t("integrationRow.disconnectFailedToast", { name: displayName }),
         );
         toast.error(detail);
       },
@@ -139,7 +142,6 @@ export function IntegrationRow({
                   handleDisable();
                 }}
                 disablePending={disconnectOAuth.isPending}
-                isMobile={isMobile}
               />
             </div>
           ) : (
@@ -148,16 +150,16 @@ export function IntegrationRow({
               onClick={onConfigure}
               className="shrink-0"
             >
-              Enable
+              {t("integrationRow.enable")}
             </Button>
           )}
         </Card.Body>
       </Card.Root>
       <ConfirmDialog
         open={confirmDisableOpen}
-        title={`Disconnect ${displayName}?`}
-        message={`Disconnect your ${displayName} account? You can reconnect it later.`}
-        confirmLabel="Disconnect"
+        title={t("integrationRow.disconnectTitle", { name: displayName })}
+        message={t("integrationRow.disconnectMessage", { name: displayName })}
+        confirmLabel={t("integrationRow.disconnect")}
         destructive
         onConfirm={confirmDisable}
         onCancel={() => setConfirmDisableOpen(false)}
@@ -167,7 +169,7 @@ export function IntegrationRow({
 }
 
 // ---------------------------------------------------------------------------
-// IntegrationConfigureMenu — desktop popover / mobile bottom-sheet wrapper
+// IntegrationConfigureMenu: anchored popover / touch bottom-sheet wrapper
 // for the connected-integration "Configure" action menu. Extracted so the
 // branch can be unit-tested without standing up the parent's mutations.
 // ---------------------------------------------------------------------------
@@ -179,8 +181,6 @@ export interface IntegrationConfigureMenuProps {
   onEditConnections: () => void;
   onDisable: () => void;
   disablePending: boolean;
-  /** Branch hint — production callers pass `useIsMobile()`. */
-  isMobile: boolean;
 }
 
 export function IntegrationConfigureMenu({
@@ -190,9 +190,11 @@ export function IntegrationConfigureMenu({
   onEditConnections,
   onDisable,
   disablePending,
-  isMobile,
 }: IntegrationConfigureMenuProps) {
-  if (isMobile) {
+  const { t } = useTranslation("settings");
+  const isTouchMobile = useTouchMobile();
+
+  if (isTouchMobile) {
     return (
       <BottomSheet.Root open={open} onOpenChange={onOpenChange}>
         <BottomSheet.Trigger asChild>
@@ -202,7 +204,7 @@ export function IntegrationConfigureMenu({
             aria-haspopup="menu"
             aria-expanded={open}
           >
-            Configure
+            {t("integrationRow.configure")}
           </Button>
         </BottomSheet.Trigger>
         <BottomSheet.Content>
@@ -214,12 +216,12 @@ export function IntegrationConfigureMenu({
           <BottomSheet.Body>
             <PanelItem
               icon={Pencil}
-              label="Edit connections"
+              label={t("integrationRow.editConnections")}
               onSelect={onEditConnections}
             />
             <PanelItem
               icon={disablePending ? Loader2 : XCircle}
-              label="Disable"
+              label={t("integrationRow.disable")}
               onSelect={() => {
                 if (disablePending) {
                   return;
@@ -241,7 +243,7 @@ export function IntegrationConfigureMenu({
           aria-haspopup="menu"
           aria-expanded={open}
         >
-          Configure
+          {t("integrationRow.configure")}
         </Button>
       </Popover.Trigger>
       <Popover.Content
@@ -258,7 +260,7 @@ export function IntegrationConfigureMenu({
           className="w-full justify-start rounded-none"
           leftIcon={<Pencil aria-hidden />}
         >
-          Edit connections
+          {t("integrationRow.editConnections")}
         </Button>
         <Button
           type="button"
@@ -275,7 +277,7 @@ export function IntegrationConfigureMenu({
             )
           }
         >
-          Disable
+          {t("integrationRow.disable")}
         </Button>
       </Popover.Content>
     </Popover.Root>

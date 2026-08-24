@@ -7,9 +7,10 @@ import { MemoryRouter } from "react-router";
 import type { SidebarItem } from "@/components/sidebar-tree";
 
 let assistantFlags: Record<string, boolean> = {};
-let clientFlags: Record<string, boolean> = {};
 let supportsBookmarks = false;
+let canUseInternalActions = true;
 let supportsCredentials = false;
+let nativeAndroid = false;
 
 mock.module("@/stores/assistant-feature-flag-store", () => {
   const store = () => null;
@@ -19,17 +20,12 @@ mock.module("@/stores/assistant-feature-flag-store", () => {
   return { useAssistantFeatureFlagStore: store };
 });
 
-mock.module("@/stores/client-feature-flag-store", () => {
-  const store = () => null;
-  store.use = {
-    platformNotifications: () => clientFlags.platformNotifications ?? false,
-    accountMfa: () => clientFlags.accountMfa ?? false,
-  };
-  return { useClientFeatureFlagStore: store };
-});
-
 mock.module("@/lib/backwards-compat/use-supports-bookmarks", () => ({
   useSupportsBookmarks: () => supportsBookmarks,
+}));
+
+mock.module("@/lib/auth/internal-thread-actions", () => ({
+  useCanUseInternalThreadActions: () => canUseInternalActions,
 }));
 
 mock.module("@/lib/backwards-compat/use-supports-credentials-settings", () => ({
@@ -64,6 +60,10 @@ mock.module("@/runtime/is-electron", () => ({
   isElectron: () => true,
 }));
 
+mock.module("@/runtime/platform-detection", () => ({
+  useIsNativeAndroid: () => nativeAndroid,
+}));
+
 mock.module("@/components/sidebar-shell", () => ({
   SidebarShell: ({
     sidebar,
@@ -96,9 +96,10 @@ const { SettingsLayout } = await import("./settings-layout");
 afterEach(() => {
   cleanup();
   assistantFlags = {};
-  clientFlags = {};
   supportsBookmarks = false;
   supportsCredentials = false;
+  canUseInternalActions = true;
+  nativeAndroid = false;
 });
 
 describe("SettingsLayout", () => {
@@ -114,7 +115,6 @@ describe("SettingsLayout", () => {
   });
 
   test("never renders a Security entry — two-factor auth lives on General", () => {
-    clientFlags = { accountMfa: true };
     render(
       <MemoryRouter initialEntries={["/assistant/settings"]}>
         <SettingsLayout />
@@ -142,6 +142,19 @@ describe("SettingsLayout", () => {
     expect(screen.getByRole("link", { name: "Bookmarks" })).not.toBeNull();
   });
 
+  test("hides Bookmarks for sessions outside the internal gate", () => {
+    // Bookmarks are internal-only: a supporting assistant is not enough on
+    // its own.
+    supportsBookmarks = true;
+    canUseInternalActions = false;
+    render(
+      <MemoryRouter initialEntries={["/assistant/settings"]}>
+        <SettingsLayout />
+      </MemoryRouter>,
+    );
+    expect(screen.queryByRole("link", { name: "Bookmarks" })).toBeNull();
+  });
+
   test("renders Credentials only when the assistant serves the credentials routes", () => {
     render(
       <MemoryRouter initialEntries={["/assistant/settings"]}>
@@ -158,5 +171,23 @@ describe("SettingsLayout", () => {
       </MemoryRouter>,
     );
     expect(screen.getByRole("link", { name: "Credentials" })).not.toBeNull();
+  });
+
+  test("renders Notifications only in the native Android app", () => {
+    render(
+      <MemoryRouter initialEntries={["/assistant/settings"]}>
+        <SettingsLayout />
+      </MemoryRouter>,
+    );
+    expect(screen.queryByRole("link", { name: "Notifications" })).toBeNull();
+    cleanup();
+
+    nativeAndroid = true;
+    render(
+      <MemoryRouter initialEntries={["/assistant/settings"]}>
+        <SettingsLayout />
+      </MemoryRouter>,
+    );
+    expect(screen.getByRole("link", { name: "Notifications" })).not.toBeNull();
   });
 });

@@ -1,6 +1,6 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { X } from "lucide-react";
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import {
   assistantsOauthConnectionsListOptions,
@@ -9,12 +9,18 @@ import {
   useAssistantsOauthDisconnectByConnectionCreateMutation,
 } from "@/generated/api/@tanstack/react-query.gen";
 import type { OAuthConnection } from "@/generated/api/types.gen";
+import { useTranslation } from "@/i18n";
 import { Button } from "@vellumai/design-library/components/button";
 import { ConfirmDialog } from "@vellumai/design-library/components/confirm-dialog";
+import {
+  SegmentControl,
+  type SegmentControlItem,
+} from "@vellumai/design-library/components/segment-control";
 import { toast } from "@vellumai/design-library/components/toast";
 
 import { IntegrationIcon } from "@/components/integrations/integration-icon";
 import { PlatformLoginNotice } from "@/components/platform-login-notice";
+import { useBodyScrollLock } from "@/hooks/use-body-scroll-lock";
 import { useOAuthConnect } from "@/hooks/use-oauth-connect";
 import type { PlatformGateState } from "@/hooks/use-platform-gate";
 import { useActiveAssistantIsPlatformHosted } from "@/hooks/use-platform-gate";
@@ -52,12 +58,21 @@ export function IntegrationDetailModal({
   platformGate,
   onClose,
 }: IntegrationDetailModalProps) {
+  const { t } = useTranslation("settings");
   const queryClient = useQueryClient();
   const managedAvailable = platformGate === "full";
   const isPlatformHosted = useActiveAssistantIsPlatformHosted();
   const yourOwnAvailable = !isPlatformHosted;
   const [activeTab, setActiveTab] = useState<ModalTab>(
     platformGate === "gated" && yourOwnAvailable ? "your-own" : "managed",
+  );
+
+  const modeSegments: SegmentControlItem<ModalTab>[] = useMemo(
+    () => [
+      { value: "managed", label: t("integrationDetailModal.managedTab") },
+      { value: "your-own", label: t("integrationDetailModal.yourOwnTab") },
+    ],
+    [t],
   );
 
   useEffect(() => {
@@ -103,7 +118,9 @@ export function IntegrationDetailModal({
   const disconnectOAuth =
     useAssistantsOauthDisconnectByConnectionCreateMutation({
       onSuccess(_data, variables) {
-        toast.success(`${displayName} account disconnected.`);
+        toast.success(
+          t("integrationDetailModal.disconnectedToast", { name: displayName }),
+        );
         const connectionId = variables.path.connection_id;
         assistantsOauthConnectionsListSetQueryData(
           queryClient,
@@ -117,14 +134,18 @@ export function IntegrationDetailModal({
         const detail = extractErrorMessage(
           error,
           undefined,
-          `Failed to disconnect ${displayName} account.`,
+          t("integrationDetailModal.disconnectFailedToast", {
+            name: displayName,
+          }),
         );
         toast.error(detail);
         setPendingDisconnectId(null);
       },
     });
 
-  // Modal: Escape key + body scroll lock
+  useBodyScrollLock();
+
+  // Modal: Escape key
   useEffect(() => {
     const handleKey = (event: KeyboardEvent) => {
       if (event.key === "Escape" && !event.defaultPrevented) {
@@ -133,11 +154,8 @@ export function IntegrationDetailModal({
       }
     };
     document.addEventListener("keydown", handleKey);
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
     return () => {
       document.removeEventListener("keydown", handleKey);
-      document.body.style.overflow = previousOverflow;
     };
   }, [onClose]);
 
@@ -157,9 +175,16 @@ export function IntegrationDetailModal({
     });
   };
 
+  const accountLabel =
+    connectionPendingDisconnect?.account_label ??
+    t("integrationDetailModal.accountFallback", { name: displayName });
+
   const subtitle = description
-    ? `Configure ${displayName} OAuth for ${description}`
-    : `Configure ${displayName} OAuth`;
+    ? t("integrationDetailModal.subtitleWithDescription", {
+        name: displayName,
+        description,
+      })
+    : t("integrationDetailModal.subtitle", { name: displayName });
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
@@ -182,7 +207,7 @@ export function IntegrationDetailModal({
                 id="integration-modal-title"
                 className="text-title-small text-[var(--content-default)]"
               >
-                {displayName} OAuth
+                {t("integrationDetailModal.title", { name: displayName })}
               </h2>
               <p className="text-body-small-default text-[var(--content-tertiary)]">
                 {subtitle}
@@ -193,37 +218,25 @@ export function IntegrationDetailModal({
             variant="ghost"
             size="compact"
             iconOnly={<X />}
-            aria-label="Close"
+            aria-label={t("integrationDetailModal.close")}
             onClick={onClose}
           />
         </div>
 
         <div className="space-y-4 px-5 py-4">
           {platformGate !== "gated" && yourOwnAvailable && (
-            <div
-              role="tablist"
-              aria-label="OAuth mode"
-              className="flex w-full rounded-md border border-[var(--border-base)] bg-[var(--surface-base)] p-0.5 dark:border-[var(--border-base)] dark:bg-[var(--surface-base)]/40"
-            >
-              <TabButton
-                active={activeTab === "managed"}
-                onClick={() => setActiveTab("managed")}
-              >
-                Managed
-              </TabButton>
-              <TabButton
-                active={activeTab === "your-own"}
-                onClick={() => setActiveTab("your-own")}
-              >
-                Your Own
-              </TabButton>
-            </div>
+            <SegmentControl
+              ariaLabel={t("integrationDetailModal.oauthModeAriaLabel")}
+              items={modeSegments}
+              value={activeTab}
+              onChange={setActiveTab}
+            />
           )}
 
           {activeTab === "managed" && platformGate !== "gated" ? (
             platformGate === "disabled" ? (
               <PlatformLoginNotice>
-                Log in to the Vellum platform to manage OAuth connections.
+                {t("integrationDetailModal.loginNotice")}
               </PlatformLoginNotice>
             ) : (
               <ManagedTab
@@ -254,49 +267,27 @@ export function IntegrationDetailModal({
 
         <div className="flex justify-end border-t border-[var(--border-base)] px-5 py-3 dark:border-[var(--border-base)]">
           <Button variant="outlined" size="compact" onClick={onClose}>
-            Confirm
+            {t("integrationDetailModal.confirm")}
           </Button>
         </div>
       </div>
       <ConfirmDialog
         open={connectionPendingDisconnect !== null}
-        title={`Disconnect ${displayName}?`}
+        title={t("integrationDetailModal.disconnectTitle", {
+          name: displayName,
+        })}
         message={
           connectionPendingDisconnect
-            ? `Disconnect ${connectionPendingDisconnect.account_label ?? `${displayName} Account`}? You can reconnect later.`
+            ? t("integrationDetailModal.disconnectMessage", {
+                account: accountLabel,
+              })
             : ""
         }
-        confirmLabel="Disconnect"
+        confirmLabel={t("integrationDetailModal.disconnect")}
         destructive
         onConfirm={confirmDisconnect}
         onCancel={() => setConnectionPendingDisconnect(null)}
       />
     </div>
-  );
-}
-
-function TabButton({
-  active,
-  onClick,
-  children,
-}: {
-  active: boolean;
-  onClick: () => void;
-  children: ReactNode;
-}) {
-  return (
-    <button
-      type="button"
-      role="tab"
-      aria-selected={active}
-      onClick={onClick}
-      className={`flex-1 cursor-pointer rounded-[5px] px-3 py-1.5 text-body-medium-default transition-colors ${
-        active
-          ? "bg-white text-[var(--content-default)] shadow-sm dark:bg-[var(--surface-lift)] dark:text-[var(--content-default)]"
-          : "text-[var(--content-secondary)] hover:text-[var(--content-default)] dark:text-[var(--content-disabled)] dark:hover:text-[var(--content-default)]"
-      }`}
-    >
-      {children}
-    </button>
   );
 }

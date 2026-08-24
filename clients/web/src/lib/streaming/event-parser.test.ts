@@ -1506,6 +1506,39 @@ describe("parseAssistantEvent", () => {
     });
   });
 
+  // The announcement a stopped watch session is waiting on. It reaches the
+  // surface through the bus rather than the chat handler, so parsing is the
+  // whole of what the stream owes it.
+  test("parses watch_retro_completed (not unknown)", () => {
+    const event = parseEvent({
+      type: "watch_retro_completed",
+      sessionId: "sess-1",
+      conversationId: "conv-1",
+      reportReady: true,
+    });
+    expect(event).toEqual({
+      type: "watch_retro_completed",
+      sessionId: "sess-1",
+      conversationId: "conv-1",
+      reportReady: true,
+    });
+  });
+
+  // Whether there is anything to read is the whole of the decision the surface
+  // makes on receipt, so an announcement without it is not one.
+  test("returns unknown watch_retro_completed when reportReady is missing", () => {
+    const data = {
+      type: "watch_retro_completed",
+      sessionId: "sess-1",
+      conversationId: "conv-1",
+    };
+    expect(parseEvent(data)).toMatchObject({
+      type: "unknown",
+      rawType: "watch_retro_completed",
+      data,
+    });
+  });
+
   test("returns unknown open_conversation event when conversationId is missing", () => {
     const data = { type: "open_conversation", focus: true };
     const event = parseEvent(data);
@@ -2358,6 +2391,54 @@ describe("parseAssistantEvent", () => {
         totalOutputTokens: 50,
         estimatedCost: 0.0021,
         model: "claude-sonnet-4",
+      });
+    });
+  });
+
+  describe("context_window_usage", () => {
+    test("parses context_window_usage with all required fields", () => {
+      const event = parseEvent({
+        type: "context_window_usage",
+        conversationId: "conv-1",
+        tokens: 18000,
+        maxTokens: 200000,
+      });
+      expect(event).toEqual({
+        type: "context_window_usage",
+        conversationId: "conv-1",
+        tokens: 18000,
+        maxTokens: 200000,
+      });
+    });
+
+    test("returns unknown when a required field is missing", () => {
+      const data = {
+        type: "context_window_usage",
+        conversationId: "conv-1",
+        tokens: 18000,
+      };
+      const event = parseEvent(data);
+      expect(event).toEqual({
+        type: "unknown",
+        rawType: "context_window_usage",
+        data,
+        conversationId: "conv-1",
+      });
+    });
+
+    test("strips unknown top-level fields", () => {
+      const event = parseEvent({
+        type: "context_window_usage",
+        conversationId: "conv-1",
+        tokens: 18000,
+        maxTokens: 200000,
+        fillRatio: 0.09,
+      });
+      expect(event).toEqual({
+        type: "context_window_usage",
+        conversationId: "conv-1",
+        tokens: 18000,
+        maxTokens: 200000,
       });
     });
   });

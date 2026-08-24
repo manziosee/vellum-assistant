@@ -1,14 +1,17 @@
-import { CheckCircle } from "lucide-react";
 import type { ReactNode } from "react";
 
 import { Button } from "@vellumai/design-library/components/button";
 import { Card } from "@vellumai/design-library/components/card";
-import { Tag } from "@vellumai/design-library/components/tag";
 import { Typography } from "@vellumai/design-library/components/typography";
 
+import { useTranslation } from "@/i18n";
+import type { AssistantChannelState } from "@/types/channel-types";
+
+import { ChannelHealthTag } from "./channel-health-tag";
 import { publicAsset } from "@/utils/public-asset";
 
 interface SlackConnectionCardProps {
+  health?: AssistantChannelState["health"];
   /** The assistant's Slack @handle, when known. */
   slackHandle?: string;
   /** Disconnect in flight; disables the button and swaps its label. */
@@ -27,10 +30,12 @@ interface SlackConnectionCardProps {
  */
 export function SlackConnectionCard({
   slackHandle,
+  health,
   disconnectPending = false,
   onDisconnect,
   children,
 }: SlackConnectionCardProps) {
+  const { t } = useTranslation("channels");
   return (
     <Card.Root>
       <Card.Header>
@@ -45,9 +50,7 @@ export function SlackConnectionCard({
               {slackHandle}
             </Typography>
           ) : null}
-          <Tag tone="positive" leftIcon={<CheckCircle />}>
-            Connected
-          </Tag>
+          <ChannelHealthTag health={health} />
           <div className="ml-auto">
             <Button
               type="button"
@@ -55,7 +58,9 @@ export function SlackConnectionCard({
               onClick={onDisconnect}
               disabled={!onDisconnect || disconnectPending}
             >
-              {disconnectPending ? "Disconnecting…" : "Disconnect"}
+              {disconnectPending
+                ? t("connectionCard.disconnecting")
+                : t("connectionCard.disconnect")}
             </Button>
           </div>
         </div>

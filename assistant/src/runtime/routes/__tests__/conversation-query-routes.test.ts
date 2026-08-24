@@ -1427,7 +1427,7 @@ describe("custom profile write normalization (complete overrides)", () => {
   });
 });
 
-describe("call-site override tuning backfill", () => {
+describe("call-site override writes stay sparse", () => {
   const configPatchRoute = ROUTES.find(
     (r) => r.operationId === "config_patch",
   )!;
@@ -1444,7 +1444,11 @@ describe("call-site override tuning backfill", () => {
     seedRawConfig();
   });
 
-  test("PATCH creating a bare { profile } entry backfills shipped tuning", async () => {
+  // The resolver layers `CALL_SITE_DEFAULTS` under the workspace entry, so a
+  // written entry carries only what the user chose. Copying shipped tuning in
+  // here would freeze a snapshot that later changes to call-site-defaults.ts
+  // could never reach.
+  test("a bare { profile } entry is written verbatim, without shipped tuning", async () => {
     await configPatchRoute.handler({
       body: {
         llm: {
@@ -1457,14 +1461,14 @@ describe("call-site override tuning backfill", () => {
     });
     const memoryRouter = savedCallSites().memoryRouter!;
     expect(memoryRouter.profile).toBe("mine");
-    expect(memoryRouter.contextWindow).toEqual({ maxInputTokens: 1_000_000 });
+    expect("contextWindow" in memoryRouter).toBe(false);
     const commitMessage = savedCallSites().commitMessage!;
     expect(commitMessage.profile).toBe("mine");
-    expect(commitMessage.maxTokens).toBe(120);
-    expect(commitMessage.effort).toBe("low");
+    expect("maxTokens" in commitMessage).toBe(false);
+    expect("effort" in commitMessage).toBe(false);
   });
 
-  test("explicit patch values win over shipped tuning on a new entry", async () => {
+  test("explicit patch values are still written", async () => {
     await configPatchRoute.handler({
       body: {
         llm: {
@@ -1474,10 +1478,11 @@ describe("call-site override tuning backfill", () => {
     });
     const saved = savedCallSites().commitMessage!;
     expect(saved.maxTokens).toBe(500);
-    expect(saved.temperature).toBe(0.2);
+    // Not copied from the shipped default: the resolver supplies it.
+    expect("temperature" in saved).toBe(false);
   });
 
-  test("existing entries are never backfilled — customization is preserved", async () => {
+  test("an existing entry's own customization is preserved", async () => {
     rawConfigFixture = {
       llm: { callSites: { recall: { profile: "old", maxTokens: 200 } } },
     };
@@ -1494,10 +1499,9 @@ describe("call-site override tuning backfill", () => {
     const saved = savedCallSites().recall!;
     expect(saved.profile).toBe("mine");
     expect(saved.maxTokens).toBe(200);
-    expect(saved.disableCache).toBeUndefined();
   });
 
-  test("deleting an entry (null) is untouched by the backfill", async () => {
+  test("deleting an entry (null) removes it", async () => {
     rawConfigFixture = {
       llm: { callSites: { recall: { profile: "old" } } },
     };
@@ -1681,6 +1685,17 @@ describe("config invariant flag enrichment", () => {
     expect(profiles.custom!).not.toHaveProperty("invariant");
   });
 
+  test("every managed default is invariant on the wire, Speed included", async () => {
+    // The clients drive their read-only lock off this flag, so a default that
+    // resolves from the catalog with no workspace stub must still carry it.
+    const body = await configGetRoute.handler({});
+    const profiles = wireProfiles(body);
+
+    for (const name of ["balanced", "quality-optimized", "latency-optimized"]) {
+      expect(profiles[name]!.invariant).toBe(true);
+    }
+  });
+
   test("PATCH /v1/config stamps the flag on the response but never persists it", async () => {
     const body = await configPatchRoute.handler({
       body: { memory: { enabled: true } },
@@ -1695,5 +1710,137 @@ describe("config invariant flag enrichment", () => {
     for (const profile of Object.values(savedProfiles!)) {
       expect(profile).not.toHaveProperty("invariant");
     }
+  });
+});
+
+describe("provider membership at the write choke point", () => {
+  const configPatchRoute = ROUTES.find(
+    (r) => r.operationId === "config_patch",
+  )!;
+
+  test("a pre-existing unknown provider does not block unrelated writes", async () => {
+    // Read tolerance means a stored entry-name provider is legal on disk;
+    // re-validating it on every write would make all later settings saves
+    // fail with no in-product repair path.
+    rawConfigFixture = {
+      llm: {
+        profiles: {
+          work: {
+            source: "user",
+            provider: "anthropic-work",
+            model: "claude-opus-4-8",
+          },
+        },
+      },
+    };
+    seedRawConfig();
+
+    await configPatchRoute.handler({
+      body: { llm: { callSites: { mainAgent: { maxTokens: 2048 } } } },
+    });
+
+    const llm = loadRawConfig().llm as {
+      callSites?: Record<string, { maxTokens?: number }>;
+      profiles?: Record<string, { provider?: string }>;
+    };
+    expect(llm.callSites?.mainAgent?.maxTokens).toBe(2048);
+    expect(llm.profiles?.work?.provider).toBe("anthropic-work");
+  });
+
+  test("introducing an unknown provider is rejected", async () => {
+    rawConfigFixture = { llm: {} };
+    seedRawConfig();
+
+    await expect(
+      configPatchRoute.handler({
+        body: {
+          llm: {
+            profiles: {
+              rogue: { source: "user", provider: "not-a-provider", model: "m" },
+            },
+          },
+        },
+      }),
+    ).rejects.toThrow(/Invalid provider/);
+  });
+});
+
+describe("ingress URL writes through the generic config routes", () => {
+  const configPatchRoute = ROUTES.find(
+    (r) => r.operationId === "config_patch",
+  )!;
+  const configSetRoute = ROUTES.find((r) => r.operationId === "config_set")!;
+
+  const TUNNEL_URL = "https://assistant-1.example.ts.net";
+  const OTHER_URL = "https://assistant-2.example.ts.net";
+  const LAST_TUNNEL = { provider: "tailscale", publicBaseUrl: TUNNEL_URL };
+
+  const savedIngress = () =>
+    (loadRawConfig().ingress ?? {}) as Record<string, unknown>;
+
+  beforeEach(() => {
+    // `assistant config set ingress.publicBaseUrl <url>` is what the webhook
+    // diagnostics tell users to run when their tunnel address changed, so it
+    // has to leave the same clean state the settings route does.
+    rawConfigFixture = {
+      ingress: {
+        publicBaseUrl: TUNNEL_URL,
+        assistantId: "assistant-1",
+        lastTunnel: LAST_TUNNEL,
+      },
+    };
+    seedRawConfig();
+  });
+
+  test("a config_set retarget drops the tunnel records", async () => {
+    await configSetRoute.handler({
+      body: { path: "ingress.publicBaseUrl", value: OTHER_URL },
+    });
+
+    const ingress = savedIngress();
+    expect(ingress.publicBaseUrl).toBe(OTHER_URL);
+    expect(ingress.assistantId).toBeUndefined();
+    expect(ingress.lastTunnel).toBeUndefined();
+  });
+
+  test("a config_set of the same URL keeps them", async () => {
+    await configSetRoute.handler({
+      body: { path: "ingress.publicBaseUrl", value: `${TUNNEL_URL}/` },
+    });
+
+    const ingress = savedIngress();
+    expect(ingress.assistantId).toBe("assistant-1");
+    expect(ingress.lastTunnel).toEqual(LAST_TUNNEL);
+  });
+
+  test("a config_set of another ingress key keeps them", async () => {
+    await configSetRoute.handler({
+      body: { path: "ingress.enabled", value: false },
+    });
+
+    const ingress = savedIngress();
+    expect(ingress.assistantId).toBe("assistant-1");
+    expect(ingress.lastTunnel).toEqual(LAST_TUNNEL);
+  });
+
+  test("a config_patch retarget drops the tunnel records", async () => {
+    await configPatchRoute.handler({
+      body: { ingress: { publicBaseUrl: OTHER_URL } },
+    });
+
+    const ingress = savedIngress();
+    expect(ingress.publicBaseUrl).toBe(OTHER_URL);
+    expect(ingress.assistantId).toBeUndefined();
+    expect(ingress.lastTunnel).toBeUndefined();
+  });
+
+  test("a config_patch that leaves the URL alone keeps them", async () => {
+    await configPatchRoute.handler({
+      body: { ingress: { enabled: false } },
+    });
+
+    const ingress = savedIngress();
+    expect(ingress.assistantId).toBe("assistant-1");
+    expect(ingress.lastTunnel).toEqual(LAST_TUNNEL);
   });
 });

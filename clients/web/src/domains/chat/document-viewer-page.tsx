@@ -1,3 +1,5 @@
+
+import { useTranslation } from "@/i18n";
 /**
  * Route component for viewing a single document with comment integration.
  *
@@ -21,6 +23,7 @@ import {
   documentsByIdPdfGet,
 } from "@/generated/daemon/sdk.gen";
 import { useBusSubscription } from "@/hooks/use-bus-subscription";
+import { createDraftConversationId } from "@/domains/chat/utils/conversation-selection";
 import { useViewerStore } from "@/stores/viewer-store";
 import type { DocumentContent } from "@/types/document-types";
 import {
@@ -33,12 +36,14 @@ import {
   type DocumentViewerContainerHandle,
 } from "./components/document-viewer-container";
 import { useDocumentCommentEvents } from "./hooks/use-document-comment-events";
+import { useUnseenDocumentChangesStore } from "./unseen-document-changes-store";
 
 // ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
 
 export function DocumentViewerPage() {
+  const { t } = useTranslation("chat");
   const { surfaceId } = useParams<{ surfaceId: string }>();
   const navigate = useNavigate();
   const { pathname } = useLocation();
@@ -75,6 +80,11 @@ export function DocumentViewerPage() {
           return;
         }
         setDoc(result);
+        // This route is a second way into a document, separate from the
+        // in-chat viewer, so it clears the unseen record itself.
+        useUnseenDocumentChangesStore
+          .getState()
+          .clearDocumentEverywhere(surfaceId);
       } catch {
         if (!cancelled) {
           setError("Failed to load document.");
@@ -132,9 +142,7 @@ export function DocumentViewerPage() {
     const conversationId =
       doc.conversationId ||
       getEditChatConversationId(assistantId, surfaceId) ||
-      (typeof globalThis.crypto?.randomUUID === "function"
-        ? globalThis.crypto.randomUUID()
-        : `draft-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+      createDraftConversationId();
 
     setEditChatConversationId(assistantId, surfaceId, conversationId);
 
@@ -152,6 +160,7 @@ export function DocumentViewerPage() {
 
     useViewerStore.getState().openDocument();
     useViewerStore.getState().setLoadedDocument({
+      source: "document",
       surfaceId: doc.surfaceId,
       conversationId,
       documentName: doc.title,
@@ -208,7 +217,7 @@ export function DocumentViewerPage() {
           variant="body-small-default"
           className="text-[var(--content-tertiary)]"
         >
-          {error ?? "Document not found."}
+          {error ?? t("documentViewerPage.notFound")}
         </Typography>
       </div>
     );
@@ -217,6 +226,7 @@ export function DocumentViewerPage() {
   return (
     <div ref={swipeContainerRef} className="flex min-h-0 flex-1 flex-col">
       <DocumentViewerContainer
+        source="document"
         surfaceId={doc.surfaceId}
         assistantId={assistantId}
         conversationId={doc.conversationId}

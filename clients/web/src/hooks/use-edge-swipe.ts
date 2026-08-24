@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useRef } from "react";
 
 import { haptic } from "@/utils/haptics";
+import { ownsCaretDrag } from "@/utils/caret-surface";
 import { isPointerCoarse } from "@/utils/pointer";
 
 // ---------------------------------------------------------------------------
@@ -43,8 +44,12 @@ const VERTICAL_ESCAPE_RATIO = 0.7;
 /** Minimum travel (px) on either axis before the gesture direction is decided. */
 const DEADZONE_PX = 10;
 
-/** Damping applied to drag distance past the commit threshold. */
-const OVERDRAG_DAMPING = 0.3;
+/**
+ * Damping applied to drag distance past the commit threshold. Half speed, so
+ * the page keeps visibly following the finger past the commit point while
+ * still bounding how much empty background a long drag exposes behind it.
+ */
+const OVERDRAG_DAMPING = 0.5;
 
 // ---------------------------------------------------------------------------
 // Pure geometry helpers (framework-agnostic, unit-tested in isolation)
@@ -81,14 +86,13 @@ export function activationZonePx(viewportWidth: number): number {
  * a row's gaps, attachments, and action affordances.
  */
 export function ownsHorizontalTextDrag(target: EventTarget | null): boolean {
+  if (ownsCaretDrag(target)) {
+    return true;
+  }
   if (!(target instanceof Element)) {
     return false;
   }
-  return (
-    target.closest(
-      'input, textarea, select, [contenteditable]:not([contenteditable="false"]), [data-message-text]',
-    ) !== null
-  );
+  return target.closest("[data-message-text]") !== null;
 }
 
 /**

@@ -83,7 +83,6 @@ export interface SubagentEntry {
   error?: string;
   inputTokens: number;
   outputTokens: number;
-  totalCost: number;
   spawnedAt: number;
   events: SubagentTimelineEvent[];
   /** The subagent's own conversation ID, used to fetch detail data. */
@@ -122,7 +121,10 @@ export interface SubagentEntry {
    * True once a detail fetch for this entry has completed at least once:
    * success, empty, or failure. Until then, a terminal entry with no events is
    * presumed to have an unloaded timeline and renders as loading rather than
-   * "0 steps".
+   * "0 steps". Cleared by `changeStatus` when a still-eventless entry goes
+   * terminal: a mid-run fetch that settled empty says nothing about the final
+   * timeline, and leaving the flag set would stop the card's render-driven
+   * fetch (`useSubagentCardData`) from ever asking for it.
    */
   detailSettled?: boolean;
 }
@@ -211,7 +213,6 @@ export interface SubagentActions {
      */
     inputTokens?: number;
     outputTokens?: number;
-    totalCost?: number;
   }) => void;
 
   changeStatus: (params: {
@@ -220,7 +221,6 @@ export interface SubagentActions {
     error?: string;
     inputTokens?: number;
     outputTokens?: number;
-    totalCost?: number;
   }) => void;
 
   /**
@@ -257,7 +257,6 @@ export interface SubagentActions {
     parentToolUseId?: string;
     inputTokens?: number;
     outputTokens?: number;
-    totalCost?: number;
   }) => void;
 
   receiveEvent: (params: {
@@ -272,7 +271,6 @@ export interface SubagentActions {
     objective?: string;
     inputTokens?: number;
     outputTokens?: number;
-    totalCost?: number;
     events: SubagentTimelineEvent[];
     /** Backfills a stub entry's placeholder label (0.11.0+ daemons). */
     label?: string;
@@ -344,7 +342,6 @@ export interface SubagentActions {
     subagentId: string;
     inputTokens: number;
     outputTokens: number;
-    estimatedCost: number;
   }) => void;
 
   /**
@@ -357,18 +354,6 @@ export interface SubagentActions {
     assistantId: string,
     subagentId: string,
   ) => Promise<void>;
-
-  /**
-   * Fetch detail for every subagent in a spawn group, the handful the user
-   * just expanded, so their terminal cards can replace the loading state with
-   * their real timeline. Reads the active assistant from
-   * `useResolvedAssistantsStore` (same pattern as `abortSubagent` /
-   * `requestSubagentReconcile`). Fire-and-forget: `fetchDetailIfNeeded` dedups
-   * via `fetchedAt` and bails when events already exist, so calling it for
-   * already-loaded or still-active ids is a safe no-op. No-op when there's no
-   * active assistant.
-   */
-  fetchGroupDetail: (subagentIds: string[]) => void;
 
   /**
    * Rebuild this conversation's subagent rows from the daemon's live
@@ -691,7 +676,6 @@ function applyReconciledSubagent(
         error: info.error,
         inputTokens: info.usage?.inputTokens,
         outputTokens: info.usage?.outputTokens,
-        totalCost: info.usage?.estimatedCost,
       });
     }
     store.backfillIdentity({
@@ -722,7 +706,6 @@ function applyReconciledSubagent(
     parentToolUseId: info.parentToolUseId,
     inputTokens: info.usage?.inputTokens,
     outputTokens: info.usage?.outputTokens,
-    totalCost: info.usage?.estimatedCost,
   });
 }
 
@@ -829,7 +812,6 @@ const useSubagentStoreBase = create<SubagentStore>()((set, get) => ({
       error: params.error,
       inputTokens: params.inputTokens ?? 0,
       outputTokens: params.outputTokens ?? 0,
-      totalCost: params.totalCost ?? 0,
       spawnedAt: params.timestamp,
       events: [],
       conversationId: params.conversationId,
@@ -859,9 +841,7 @@ const useSubagentStoreBase = create<SubagentStore>()((set, get) => ({
     // final, so a straggling `usage_progress` must not add to them.
     if (
       !isActiveStatus(entry.status) &&
-      (params.inputTokens != null ||
-        params.outputTokens != null ||
-        params.totalCost != null)
+      (params.inputTokens != null || params.outputTokens != null)
     ) {
       get().terminalUsageIds.add(params.subagentId);
     }
@@ -896,7 +876,6 @@ const useSubagentStoreBase = create<SubagentStore>()((set, get) => ({
       parentToolUseId: params.parentToolUseId,
       inputTokens: params.inputTokens,
       outputTokens: params.outputTokens,
-      totalCost: params.totalCost,
     });
 
     // Only a live row can have its backfill overtaken by streamed events, and
@@ -930,11 +909,24 @@ const useSubagentStoreBase = create<SubagentStore>()((set, get) => ({
       return;
     }
 
+    // A fetch that settled empty while the run was live answered "no events
+    // YET", not "no events ever". Re-arm the settled flag on the transition to
+    // terminal so the card's render-driven fetch asks again for the final
+    // timeline. Bounded: the transition fires once, and the re-fetch stamps
+    // `detailSettled` back regardless of outcome.
+    const detailSettled =
+      isActiveStatus(existing.status) &&
+      !isActiveStatus(params.status) &&
+      existing.events.length === 0
+        ? false
+        : existing.detailSettled;
+
     set({
       byId: {
         ...byId,
         [params.subagentId]: {
           ...existing,
+          detailSettled,
           status: params.status,
           error: params.error ?? existing.error,
           // Preserve the accumulated usage when a status event carries
@@ -945,7 +937,6 @@ const useSubagentStoreBase = create<SubagentStore>()((set, get) => ({
           // tally — only the zero-on-abort case falls back to `existing`.
           inputTokens: params.inputTokens || existing.inputTokens,
           outputTokens: params.outputTokens || existing.outputTokens,
-          totalCost: params.totalCost || existing.totalCost,
         },
       },
     });
@@ -955,9 +946,7 @@ const useSubagentStoreBase = create<SubagentStore>()((set, get) => ({
     // alongside the terminal status event.
     if (
       !isActiveStatus(params.status) &&
-      (params.inputTokens != null ||
-        params.outputTokens != null ||
-        params.totalCost != null)
+      (params.inputTokens != null || params.outputTokens != null)
     ) {
       get().terminalUsageIds.add(params.subagentId);
     }
@@ -1107,7 +1096,6 @@ const useSubagentStoreBase = create<SubagentStore>()((set, get) => ({
           objective: params.objective ?? existing.objective,
           inputTokens: params.inputTokens ?? existing.inputTokens,
           outputTokens: params.outputTokens ?? existing.outputTokens,
-          totalCost: params.totalCost ?? existing.totalCost,
           events:
             params.events.length > 0 && existing.events.length === 0
               ? params.events
@@ -1258,7 +1246,6 @@ const useSubagentStoreBase = create<SubagentStore>()((set, get) => ({
           ...existing,
           inputTokens: existing.inputTokens + params.inputTokens,
           outputTokens: existing.outputTokens + params.outputTokens,
-          totalCost: existing.totalCost + params.estimatedCost,
         },
       },
     });
@@ -1344,22 +1331,11 @@ const useSubagentStoreBase = create<SubagentStore>()((set, get) => ({
       objective: detail.objective,
       inputTokens: detail.usage?.inputTokens,
       outputTokens: detail.usage?.outputTokens,
-      totalCost: detail.usage?.estimatedCost,
       events,
       label: detail.label,
       parentToolUseId: detail.parentToolUseId,
       conversationId: detail.conversationId,
     });
-  },
-
-  fetchGroupDetail: (subagentIds) => {
-    const assistantId = useResolvedAssistantsStore.getState().activeAssistantId;
-    if (!assistantId) {
-      return;
-    }
-    for (const id of subagentIds) {
-      void get().fetchDetailIfNeeded(assistantId, id);
-    }
   },
 
   reconcileFromDaemon: (

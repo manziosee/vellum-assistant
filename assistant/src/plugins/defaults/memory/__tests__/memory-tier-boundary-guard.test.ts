@@ -151,7 +151,6 @@ const HOST_TIER_IMPORT_ALLOWLIST: readonly HostTierImportExemption[] = [
   { path: "src/daemon/embedding-reconcile.ts", tiers: ["substrate", "v3"] },
   { path: "src/daemon/skill-memory-refresh.ts", tiers: ["substrate"] },
   { path: "src/daemon/tool-side-effects.ts", tiers: ["substrate"] },
-  { path: "src/daemon/trust-context.ts", tiers: ["substrate"] },
   { path: "src/persistence/steps.ts", tiers: ["v1"] },
   { path: "src/runtime/routes/consolidation-routes.ts", tiers: ["substrate"] },
   {
@@ -196,7 +195,7 @@ interface TierKeyExemption {
  *   shape.
  * - `telemetry/config-setting-snapshot.ts` (both) — reports both tier keys
  *   as-is.
- * - the six named migrations — append-only history that rewrites or reads the
+ * - the named migrations: append-only history that rewrites or reads the
  *   historical tier keys it was written for. Listed per file, not per
  *   directory: a future migration reading a tier key is a new decision and
  *   gets challenged like any other.
@@ -256,6 +255,10 @@ const TIER_KEY_READ_ALLOWLIST: readonly TierKeyExemption[] = [
   {
     path: "src/workspace/migrations/135-copy-substrate-tunables.ts",
     keys: ["substrate", "v2"],
+  },
+  {
+    path: "src/workspace/migrations/140-repair-seed-pinned-memory-v3-live.ts",
+    keys: ["v3"],
   },
 ];
 

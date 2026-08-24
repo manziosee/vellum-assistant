@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, mock, test } from "bun:test";
 import { cleanup, render, screen } from "@testing-library/react";
 
+import { viewportAxesStub } from "@/hooks/viewport-axes.test-helper";
+
 const isMobileRef = { value: false };
-const nativeIOSRef = { value: false };
+const nativeMobileRef = { value: false };
 
 mock.module("@/hooks/use-is-mobile", () => ({
   useIsMobile: () => isMobileRef.value,
@@ -10,7 +12,7 @@ mock.module("@/hooks/use-is-mobile", () => ({
 }));
 
 mock.module("@/runtime/platform-detection", () => ({
-  useIsNativeIOS: () => nativeIOSRef.value,
+  useIsNativeMobile: () => nativeMobileRef.value,
 }));
 
 const { CommandPalette } =
@@ -19,7 +21,7 @@ const { CommandPalette } =
 afterEach(() => {
   cleanup();
   isMobileRef.value = false;
-  nativeIOSRef.value = false;
+  nativeMobileRef.value = false;
 });
 
 const SECTIONS = [
@@ -30,7 +32,19 @@ const SECTIONS = [
   },
 ];
 
-function paletteElement(isOpen: boolean) {
+/** The same Actions row, carrying a chord hint the app really ships. */
+const HINTED_SECTIONS = [
+  {
+    id: "actions",
+    label: "Actions",
+    items: [
+      { id: "new", title: "New Conversation", shortcutHint: "⌘⇧O" },
+      { id: "library", title: "Library" },
+    ],
+  },
+];
+
+function paletteElement(isOpen: boolean, sections = SECTIONS) {
   return (
     <CommandPalette
       isOpen={isOpen}
@@ -38,7 +52,7 @@ function paletteElement(isOpen: boolean) {
       query=""
       onQueryChange={() => undefined}
       selectedIndex={0}
-      sections={SECTIONS}
+      sections={sections}
       onKeyDown={() => undefined}
     />
   );
@@ -46,6 +60,27 @@ function paletteElement(isOpen: boolean) {
 
 function renderPalette(isOpen: boolean) {
   return render(paletteElement(isOpen));
+}
+
+function renderHintedPalette() {
+  return render(paletteElement(true, HINTED_SECTIONS));
+}
+
+/**
+ * Every keyboard hint the palette renders: the ⌘K cap in the search row and
+ * the per-item chord hints. Counted rather than probed for presence, so a
+ * regression that drops one of the two still fails.
+ */
+function keyboardHints(): string[] {
+  const dialog = screen.getByRole("dialog");
+  const caps = Array.from(dialog.querySelectorAll("kbd")).map(
+    (el) => el.textContent ?? "",
+  );
+  const itemHints = Array.from(dialog.querySelectorAll("span"))
+    .filter((el) => el.children.length === 0)
+    .map((el) => el.textContent ?? "")
+    .filter((text) => text.startsWith("⌘"));
+  return [...caps, ...itemHints];
 }
 
 describe("CommandPalette", () => {
@@ -237,18 +272,18 @@ describe("CommandPalette", () => {
     expect(highlight?.textContent).toBe("alpha");
   });
 
-  test("renders nothing while closed outside the iOS shell", () => {
+  test("renders nothing while closed outside native mobile shells", () => {
     isMobileRef.value = true;
-    nativeIOSRef.value = false;
+    nativeMobileRef.value = false;
 
     renderPalette(false);
 
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
-  test("unmounts the sheet synchronously on close outside the iOS shell", () => {
+  test("unmounts the sheet synchronously on close outside native mobile shells", () => {
     isMobileRef.value = true;
-    nativeIOSRef.value = false;
+    nativeMobileRef.value = false;
 
     const { rerender } = renderPalette(true);
     expect(screen.getByRole("dialog", { name: "Search" })).toBeTruthy();
@@ -258,9 +293,9 @@ describe("CommandPalette", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
-  test("keeps the sheet in the DOM after close in the iOS shell", () => {
+  test("keeps the sheet in the DOM after close in native mobile shells", () => {
     isMobileRef.value = true;
-    nativeIOSRef.value = true;
+    nativeMobileRef.value = true;
 
     const { rerender } = renderPalette(true);
     expect(screen.getByRole("dialog", { name: "Search" })).toBeTruthy();
@@ -274,7 +309,7 @@ describe("CommandPalette", () => {
 
   test("stops taking taps and announcing itself while the exit plays", () => {
     isMobileRef.value = true;
-    nativeIOSRef.value = true;
+    nativeMobileRef.value = true;
 
     const { rerender } = renderPalette(true);
     const sheet = screen.getByRole("dialog", { name: "Search" });
@@ -293,7 +328,7 @@ describe("CommandPalette", () => {
 
   test("releases focus held inside the sheet when the exit starts", () => {
     isMobileRef.value = true;
-    nativeIOSRef.value = true;
+    nativeMobileRef.value = true;
 
     const { rerender } = renderPalette(true);
     const input = screen.getByRole("textbox", { name: "Search" });
@@ -302,13 +337,13 @@ describe("CommandPalette", () => {
 
     rerender(paletteElement(false));
 
-    // Blurring here starts the iOS keyboard dismissal alongside the slide-out.
+    // Blurring starts keyboard dismissal alongside the slide-out.
     expect(document.activeElement).not.toBe(input);
   });
 
   test("leaves focus outside the sheet alone when the exit starts", () => {
     isMobileRef.value = true;
-    nativeIOSRef.value = true;
+    nativeMobileRef.value = true;
 
     const composer = document.createElement("textarea");
     document.body.appendChild(composer);
@@ -323,13 +358,71 @@ describe("CommandPalette", () => {
     composer.remove();
   });
 
-  test("renders the mobile sheet affordances in the iOS shell", () => {
+  test("renders the mobile sheet affordances in native mobile shells", () => {
     isMobileRef.value = true;
-    nativeIOSRef.value = true;
+    nativeMobileRef.value = true;
 
     renderPalette(true);
 
     expect(screen.getByRole("dialog", { name: "Search" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Close search" })).toBeTruthy();
+  });
+});
+
+/**
+ * The container is the window-size question and the keyboard hints are the
+ * input-capability one, so the cases that matter are the two where the axes
+ * disagree: a roomy tablet, and a desktop window narrowed past the breakpoint.
+ * See `docs/PLATFORM_ADAPTATION.md`.
+ */
+describe("CommandPalette keyboard hints", () => {
+  const viewport = viewportAxesStub();
+
+  afterEach(() => {
+    viewport.restore();
+  });
+
+  test("shows the ⌘K cap and every chord hint under a mouse", () => {
+    viewport.set({ narrow: false, coarsePointer: false });
+    isMobileRef.value = false;
+
+    renderHintedPalette();
+
+    expect(keyboardHints()).toEqual(["⌘K", "⌘⇧O"]);
+  });
+
+  test("keeps the hints on a narrow window that still has a keyboard", () => {
+    // A desktop browser window narrowed past 767px, an Electron window
+    // resized, macOS tiling: compact, but every chord still fires.
+    viewport.set({ narrow: true, coarsePointer: false });
+    isMobileRef.value = true;
+
+    renderHintedPalette();
+
+    expect(screen.getByRole("dialog", { name: "Search" })).toBeTruthy();
+    expect(keyboardHints()).toEqual(["⌘K", "⌘⇧O"]);
+  });
+
+  test("drops the hints on a roomy touch device that cannot press them", () => {
+    // A tablet in either orientation, or a phone in landscape: no ⌘ on a soft
+    // keyboard, so every hint here names a gesture the device cannot make.
+    viewport.set({ narrow: false, coarsePointer: true });
+    isMobileRef.value = false;
+
+    renderHintedPalette();
+
+    expect(
+      screen.getByRole("dialog", { name: "Command palette" }),
+    ).toBeTruthy();
+    expect(keyboardHints()).toEqual([]);
+  });
+
+  test("drops the hints on a phone", () => {
+    viewport.set({ narrow: true, coarsePointer: true });
+    isMobileRef.value = true;
+
+    renderHintedPalette();
+
+    expect(keyboardHints()).toEqual([]);
   });
 });

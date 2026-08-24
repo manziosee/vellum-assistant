@@ -2,6 +2,7 @@ import { Check, Copy } from "lucide-react";
 import type { ReactNode } from "react";
 
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
+import { useTranslation } from "@/i18n";
 import { Button } from "@vellumai/design-library";
 
 interface CopyButtonProps {
@@ -19,7 +20,10 @@ export function CopyButton({
   ariaLabel,
   className,
 }: CopyButtonProps): ReactNode {
-  const { copy, copied } = useCopyToClipboard();
+  const { t } = useTranslation("chat");
+  const { copy, copied } = useCopyToClipboard({
+    errorMessage: t("copyButton.copyFailed"),
+  });
 
   return (
     <Button
@@ -27,7 +31,7 @@ export function CopyButton({
       size="compact"
       iconOnly={copied ? <Check aria-hidden /> : <Copy aria-hidden />}
       tintColor={copied ? "var(--system-positive-strong)" : undefined}
-      aria-label={copied ? "Copied" : ariaLabel}
+      aria-label={copied ? t("copyButton.copied") : ariaLabel}
       className={className}
       onClick={() => copy(text)}
     />

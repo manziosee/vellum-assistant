@@ -22,6 +22,47 @@ export function formatAttachmentSize(bytes: number): string {
   return `${formatted} ${units[unitIndex]}`;
 }
 
+/**
+ * Filename extensions that name an image, for files that arrive without a type.
+ *
+ * Deliberately wider than the resize whitelist in `attachment-image-resize`.
+ * That set answers whether a canvas can downscale a file, which is why it
+ * leaves out animated gif and vector svg; those are images all the same, and a
+ * caller asking whether to treat a file as an image at all needs both.
+ */
+const IMAGE_EXTENSIONS = new Set([
+  "png",
+  "jpg",
+  "jpeg",
+  "gif",
+  "webp",
+  "svg",
+  "avif",
+  "bmp",
+  "heic",
+  "heif",
+  "tif",
+  "tiff",
+]);
+
+/**
+ * Whether an attachment is an image, by its type where it has one and by its
+ * filename where it does not.
+ *
+ * A native picker hands back whatever type the provider published, and an
+ * Android provider that publishes none leaves it empty, so `photo.jpg` can
+ * arrive typeless. The filename is what settles those, and it is consulted for
+ * a file whose type names something generic too, so an image labelled
+ * `application/octet-stream` still reads as one.
+ */
+export function isImageAttachment(file: Pick<File, "name" | "type">): boolean {
+  if (file.type.trim().toLowerCase().startsWith("image/")) {
+    return true;
+  }
+  const extension = file.name.split(".").pop()?.trim().toLowerCase();
+  return extension ? IMAGE_EXTENSIONS.has(extension) : false;
+}
+
 export type AttachmentIconKind =
   | "image"
   | "video"
@@ -138,7 +179,9 @@ export function estimateBase64Bytes(base64: string): number {
  * Decode a base64 data URI into a Uint8Array. Returns null if the URI does
  * not contain a recognizable `;base64,` segment.
  */
-export function dataUriToUint8Array(dataUri: string): Uint8Array | null {
+export function dataUriToUint8Array(
+  dataUri: string,
+): Uint8Array<ArrayBuffer> | null {
   const match = dataUri.match(/;base64,(.*)$/);
   if (!match?.[1]) {
     return null;

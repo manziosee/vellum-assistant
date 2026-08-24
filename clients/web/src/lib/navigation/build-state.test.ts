@@ -121,12 +121,23 @@ describe("buildNavigationState — hasPlatformHostedAssistant", () => {
   const ORG_A = "org-a";
   const ORG_B = "org-b";
 
-  const local = { id: "local-1", isLocal: true, isPlatformHosted: false };
-  const docker = { id: "docker-1", isLocal: false, isPlatformHosted: false };
+  const local = {
+    id: "local-1",
+    isLocal: true,
+    isPlatformHosted: false,
+    isPaired: false,
+  };
+  const docker = {
+    id: "docker-1",
+    isLocal: false,
+    isPlatformHosted: false,
+    isPaired: false,
+  };
   const managedInOrgA = {
     id: "managed-a",
     isLocal: false,
     isPlatformHosted: true,
+    isPaired: false,
     organizationId: ORG_A,
   };
   // API-sourced entries carry no org — the platform list is already org-scoped.
@@ -134,6 +145,7 @@ describe("buildNavigationState — hasPlatformHostedAssistant", () => {
     id: "managed-api",
     isLocal: false,
     isPlatformHosted: true,
+    isPaired: false,
   };
 
   test("false with nothing resolved", () => {
@@ -186,5 +198,41 @@ describe("buildNavigationState — hasPlatformHostedAssistant", () => {
     useOrganizationStore.setState({ persistedOrganizationId: ORG_B });
 
     expect(buildNavigationState().hasPlatformHostedAssistant).toBe(false);
+  });
+});
+
+describe("buildNavigationState — alreadyOnboarded", () => {
+  test("false when no assistant is a week old", () => {
+    useResolvedAssistantsStore.setState({
+      assistants: [
+        {
+          id: "asst-fresh",
+          hatchedAt: new Date().toISOString(),
+          isLocal: false,
+          isPlatformHosted: true,
+          isPaired: false,
+        },
+      ],
+    });
+
+    expect(buildNavigationState().alreadyOnboarded).toBe(false);
+  });
+
+  test("true when any assistant was hatched at least a week ago", () => {
+    useResolvedAssistantsStore.setState({
+      assistants: [
+        {
+          id: "asst-old",
+          hatchedAt: new Date(
+            Date.now() - 8 * 24 * 60 * 60 * 1000,
+          ).toISOString(),
+          isLocal: false,
+          isPlatformHosted: true,
+          isPaired: false,
+        },
+      ],
+    });
+
+    expect(buildNavigationState().alreadyOnboarded).toBe(true);
   });
 });

@@ -27,13 +27,17 @@
  * shows no route depends on it.
  *
  * Modules are lazily loaded on first request and cached by file path +
- * mtime. When a file changes on disk, the next request reloads it via
- * Bun's dynamic `import()` with a cache-busting query parameter. A request
- * whose file does not exist 404s — nothing is registered ahead of time.
+ * mtime. When a file changes on disk, the next request evicts the whole
+ * source tree that file belongs to (plugin root, or the workspace
+ * `routes/` directory) and re-imports the entry. Cache-busting only the
+ * entry file would re-bind it to stale helpers still in Bun's registry.
+ * A request whose file does not exist 404s. Nothing is registered ahead
+ * of time.
  */
 
 import { statSync } from "node:fs";
 
+import { runInPluginContext } from "../../plugins/plugin-execution-context.js";
 import { isRouteHostEnabled } from "../../routes/control.js";
 import {
   RouteHostClient,
@@ -47,6 +51,12 @@ import {
   type UserRouteContext,
 } from "./deprecated-route-context.js";
 import {
+  evictRouteSourceTree,
+  importRouteModule,
+  routeSourceRoot,
+} from "./user-route-import.js";
+import {
+  pluginNameForRoutePath,
   resolveHandlerFile,
   resolveRouteLocation,
 } from "./user-route-resolution.js";
@@ -134,7 +144,7 @@ export class UserRouteDispatcher {
       ? resolveHandlerFile(location.routesDir, location.subPath)
       : null;
 
-    if (!filePath) {
+    if (!location || !filePath) {
       return httpError(
         "NOT_FOUND",
         `No route handler found for /x/${routePath}`,
@@ -142,11 +152,36 @@ export class UserRouteDispatcher {
       );
     }
 
+    // A plugin's own routes execute as that plugin, so the host APIs a handler
+    // reaches scope to it exactly as they do inside its hooks and tools. Both
+    // execution paths carry it: in-thread here, and the route host through the
+    // invoke params it marks its own execution with.
+    const pluginName = pluginNameForRoutePath(routePath);
+
     if (isRouteHostEnabled()) {
-      return this.dispatchViaHost(filePath, routePath, request);
+      return this.dispatchViaHost(filePath, routePath, request, pluginName);
     }
 
-    const mod = await this.loadModule(filePath);
+    // The context covers module evaluation, not just the handler call. A route
+    // module can reach a scoped host API at import time (a top-level `await`),
+    // and that import happens once per mtime, so a load left outside the
+    // context would take the unscoped branch and never be re-run scoped.
+    const serve = () =>
+      this.serveInThread(filePath, location.routesDir, routePath, request);
+    return pluginName ? runInPluginContext(pluginName, serve) : serve();
+  }
+
+  /**
+   * Load the handler module and run the method's handler in this thread.
+   * Called inside the owning plugin's execution context, when the route has one.
+   */
+  private async serveInThread(
+    filePath: string,
+    routesDir: string,
+    routePath: string,
+    request: Request,
+  ): Promise<Response> {
+    const mod = await this.loadModule(filePath, routesDir);
     const method = request.method as HttpMethod;
     const handler = mod.handlers[method];
 
@@ -172,6 +207,7 @@ export class UserRouteDispatcher {
     filePath: string,
     routePath: string,
     request: Request,
+    pluginName: string | undefined,
   ): Promise<Response> {
     const mtimeMs = statSync(filePath).mtimeMs;
 
@@ -193,6 +229,7 @@ export class UserRouteDispatcher {
           method: request.method,
           url: request.url,
           headers,
+          pluginName,
         },
         body,
       );
@@ -231,11 +268,15 @@ export class UserRouteDispatcher {
   /**
    * Load a handler module, using the mtime-based cache when possible.
    *
-   * On cache miss or stale mtime, the module is re-imported via Bun's
-   * dynamic `import()` with a cache-busting query parameter derived
-   * from the file's current mtime.
+   * On cache miss or stale mtime, every source file in the handler's tree
+   * is evicted first so a new entry cannot import a helper that is still
+   * the pre-upgrade module. Then the entry is re-imported with an mtime
+   * query parameter.
    */
-  private async loadModule(filePath: string): Promise<CachedModule> {
+  private async loadModule(
+    filePath: string,
+    routesDir: string,
+  ): Promise<CachedModule> {
     const stat = statSync(filePath);
     const mtimeMs = stat.mtimeMs;
 
@@ -244,11 +285,11 @@ export class UserRouteDispatcher {
       return cached;
     }
 
-    // Cache-bust Bun's module cache by appending mtime as a query param.
-    const mod = (await import(`${filePath}?t=${mtimeMs}`)) as Record<
-      string,
-      unknown
-    >;
+    const sourceRoot = routeSourceRoot(routesDir);
+    evictRouteSourceTree(sourceRoot);
+    this.dropCachedModulesUnder(sourceRoot);
+
+    const mod = await importRouteModule(filePath);
 
     const handlers: Partial<Record<HttpMethod, RouteHandler>> = {};
     for (const method of HTTP_METHODS) {
@@ -269,6 +310,19 @@ export class UserRouteDispatcher {
     );
 
     return entry;
+  }
+
+  /**
+   * Drop every cached handler under `sourceRoot`. Sibling routes must not
+   * keep closures over the helpers we just evicted.
+   */
+  private dropCachedModulesUnder(sourceRoot: string): void {
+    const prefix = sourceRoot.endsWith("/") ? sourceRoot : `${sourceRoot}/`;
+    for (const path of this.moduleCache.keys()) {
+      if (path === sourceRoot || path.startsWith(prefix)) {
+        this.moduleCache.delete(path);
+      }
+    }
   }
 
   /**

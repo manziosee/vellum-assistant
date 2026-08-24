@@ -28,6 +28,12 @@ mock.module("@/hooks/use-is-mobile", () => ({
   MOBILE_MEDIA_QUERY: "(max-width: 767px)",
 }));
 
+let mockIsTouchMobile = false;
+mock.module("@/hooks/use-touch-mobile", () => ({
+  useTouchMobile: () => mockIsTouchMobile,
+  TOUCH_MOBILE_MEDIA_QUERY: "(width < 48rem) and (pointer: coarse)",
+}));
+
 // ---------------------------------------------------------------------------
 // Design-library mocks for static-markup inspection of the Radix menu /
 // bottom-sheet surfaces. The Radix primitives wrap floating-ui portals that
@@ -120,18 +126,23 @@ const ButtonMock = ({
 const TypographyMock = ({ children, ...rest }: Record<string, unknown>) =>
   createElement("span", rest, children as ReactNode);
 
+// `mock.module` replaces the module process-wide, so the stub also carries
+// the `toast` export other modules pull from this entry point. Without it,
+// any test file loaded after this one fails to resolve it.
 mock.module("@vellumai/design-library", () => ({
   Menu: MenuMock,
   BottomSheet: BottomSheetMock,
   PanelItem: PanelItemMock,
   Button: ButtonMock,
   Typography: TypographyMock,
+  toast: { success: () => {}, error: () => {} },
 }));
 
 const { AppNavBar } = await import("@/components/app-nav-bar");
 
 beforeEach(() => {
   mockIsMobile = false;
+  mockIsTouchMobile = false;
 });
 
 afterEach(() => {
@@ -168,6 +179,60 @@ describe("AppNavBar fullscreen toggle", () => {
 
     fireEvent.click(button as HTMLButtonElement);
     expect(onToggleFullscreen).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Desktop left-hand edit affordance
+// ---------------------------------------------------------------------------
+
+describe("AppNavBar desktop edit affordance", () => {
+  test("renders the Edit label when the chat panel is closed", () => {
+    const html = renderToStaticMarkup(
+      <AppNavBar appName="My App" onClose={() => {}} onEdit={() => {}} />,
+    );
+    expect(html).toContain(">Edit<");
+    expect(html).not.toContain("lucide-expand");
+  });
+
+  test("names the expand button for screen readers", () => {
+    // `iconOnly` glyphs render inside an `aria-hidden` span and the tooltip
+    // does not name the trigger, so an icon-only control needs its own label
+    // or it reads as an unnamed button.
+    render(
+      <AppNavBar
+        appName="My App"
+        onClose={() => {}}
+        onEdit={() => {}}
+        isEditing
+      />,
+    );
+
+    const expandButton = document
+      .querySelector("svg.lucide-expand")
+      ?.closest("button");
+    expect(expandButton?.getAttribute("aria-label")).toBe("Expand app");
+    // The always-present close control shares the same affordance.
+    const closeButton = document
+      .querySelector("svg.lucide-x")
+      ?.closest("button");
+    expect(closeButton?.getAttribute("aria-label")).toBe("Close");
+  });
+
+  test("swaps to an expand icon while the chat panel is open", () => {
+    const onEdit = mock(() => {});
+    render(
+      <AppNavBar appName="My App" onClose={() => {}} onEdit={onEdit} isEditing />,
+    );
+
+    expect(document.body.textContent).not.toContain("Close chat");
+    const expandButton = document
+      .querySelector("svg.lucide-expand")
+      ?.closest("button");
+    expect(expandButton).not.toBeNull();
+
+    fireEvent.click(expandButton as HTMLButtonElement);
+    expect(onEdit).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -236,8 +301,8 @@ describe("AppNavBar share + deploy", () => {
     expect(html).toContain("Deploy to Vercel");
   });
 
-  test("the dropdown menu lists Share and Deploy to Vercel (mobile, BottomSheet)", () => {
-    mockIsMobile = true;
+  test("the dropdown menu lists Share and Deploy to Vercel (touch, BottomSheet)", () => {
+    mockIsTouchMobile = true;
     const html = renderToStaticMarkup(
       <AppNavBar
         appName="My App"
@@ -310,5 +375,111 @@ describe("AppNavBar share + deploy", () => {
     );
     expect(html).toContain("disabled");
     expect(html).toContain("lucide-loader");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Already-deployed state
+//
+// Once an app has an active Vercel deployment the affordance stops offering a
+// first-time deploy: it reports the deployment and hands the link back, with
+// redeploying moved to its own entry.
+// ---------------------------------------------------------------------------
+
+describe("AppNavBar deployed state", () => {
+  const DEPLOYED_URL = "https://my-app.vercel.app";
+
+  test("reports the deployment and offers Redeploy instead of Deploy (desktop)", () => {
+    mockIsMobile = false;
+    const html = renderToStaticMarkup(
+      <AppNavBar
+        appName="My App"
+        onClose={() => {}}
+        onShare={() => {}}
+        onDeploy={() => {}}
+        deployedUrl={DEPLOYED_URL}
+        onCopyDeployedLink={() => {}}
+      />,
+    );
+    expect(html).toContain(">Deployed to Vercel<");
+    expect(html).toContain(">Redeploy<");
+    expect(html).not.toContain(">Deploy to Vercel<");
+  });
+
+  test("shows the deployed URL in the touch sheet", () => {
+    mockIsTouchMobile = true;
+    const html = renderToStaticMarkup(
+      <AppNavBar
+        appName="My App"
+        onClose={() => {}}
+        onShare={() => {}}
+        onDeploy={() => {}}
+        deployedUrl={DEPLOYED_URL}
+        onCopyDeployedLink={() => {}}
+      />,
+    );
+    expect(html).toContain("Deployed to Vercel");
+    expect(html).toContain(DEPLOYED_URL);
+    expect(html).toContain("Redeploy");
+    expect(html).not.toContain("Publish as a static page");
+  });
+
+  test("falls back to the deploy entry when no link can be handed back", () => {
+    mockIsMobile = false;
+    const html = renderToStaticMarkup(
+      <AppNavBar
+        appName="My App"
+        onClose={() => {}}
+        onShare={() => {}}
+        onDeploy={() => {}}
+        deployedUrl={DEPLOYED_URL}
+      />,
+    );
+    expect(html).toContain(">Deploy to Vercel<");
+    expect(html).not.toContain(">Deployed to Vercel<");
+  });
+
+  test("the standalone deploy button copies the link once deployed", () => {
+    mockIsMobile = false;
+    const onCopyDeployedLink = mock(() => {});
+    const onDeploy = mock(() => {});
+    render(
+      <AppNavBar
+        appName="My App"
+        onClose={() => {}}
+        onDeploy={onDeploy}
+        deployedUrl={DEPLOYED_URL}
+        onCopyDeployedLink={onCopyDeployedLink}
+      />,
+    );
+
+    const copyButton = document.querySelector(
+      '[aria-label="Deployed to Vercel, copy link"]',
+    );
+    expect(copyButton).not.toBeNull();
+
+    fireEvent.click(copyButton as HTMLButtonElement);
+    expect(onCopyDeployedLink).toHaveBeenCalledTimes(1);
+    expect(onDeploy).not.toHaveBeenCalled();
+  });
+
+  test("the standalone deploy button still deploys when nothing is published", () => {
+    mockIsMobile = false;
+    const onDeploy = mock(() => {});
+    render(
+      <AppNavBar
+        appName="My App"
+        onClose={() => {}}
+        onDeploy={onDeploy}
+        deployedUrl={null}
+        onCopyDeployedLink={() => {}}
+      />,
+    );
+
+    const deployButton = document.querySelector('[aria-label="Deploy"]');
+    expect(deployButton).not.toBeNull();
+
+    fireEvent.click(deployButton as HTMLButtonElement);
+    expect(onDeploy).toHaveBeenCalledTimes(1);
   });
 });

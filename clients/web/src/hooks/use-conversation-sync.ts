@@ -35,9 +35,13 @@ import { createConcurrencyLimiter } from "@/utils/concurrency-limiter";
 import { useBusSubscription } from "@/hooks/use-bus-subscription";
 import { groupsGetQueryKey } from "@/generated/daemon/@tanstack/react-query.gen";
 import {
-  archivedConversationsQueryKey,
-  originChannelListPrefix,
+  sidebarSectionsQueryKey,
+  unreadConversationCountQueryKey,
 } from "@/utils/conversation-list-fetchers";
+import {
+  conversationListQueryFilter,
+  isArchivedFilter,
+} from "@/utils/conversation-list-keys";
 import { getClientId } from "@/lib/telemetry/client-identity";
 import {
   parseConversationSyncTag,
@@ -78,14 +82,21 @@ export function useConversationSync(
 ): void {
   const queryClient = useQueryClient();
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const unreadCountTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
 
-  // Clear pending debounce when the assistant changes or deactivates
+  // Clear pending debounces when the assistant changes or deactivates
   // so stale callbacks never fire with an old assistantId.
   useEffect(() => {
     return () => {
       if (debounceTimerRef.current) {
         clearTimeout(debounceTimerRef.current);
         debounceTimerRef.current = null;
+      }
+      if (unreadCountTimerRef.current) {
+        clearTimeout(unreadCountTimerRef.current);
+        unreadCountTimerRef.current = null;
       }
     };
   }, [assistantId, isAssistantActive]);
@@ -110,6 +121,7 @@ export function useConversationSync(
           assistantId,
           queryClient,
           debounceTimerRef,
+          unreadCountTimerRef,
         );
         return;
 
@@ -152,18 +164,42 @@ const limitedRefreshConversationRow = createConcurrencyLimiter(
   MAX_CONCURRENT_ROW_REFRESHES,
 );
 
+/**
+ * Run `task` after {@link CONVERSATION_LIST_DEBOUNCE_MS}, replacing whatever
+ * run is already pending on `timerRef`.
+ *
+ * Every scheduler here collapses a burst: sync signals arrive one per
+ * conversation (a bulk mark-read on another client emits hundreds), and each
+ * burst should cost one refetch rather than one per event.
+ */
+function scheduleDebounced(
+  timerRef: MutableRefObject<ReturnType<typeof setTimeout> | null>,
+  task: () => void,
+): void {
+  if (timerRef.current) {
+    clearTimeout(timerRef.current);
+  }
+  timerRef.current = setTimeout(() => {
+    timerRef.current = null;
+    task();
+  }, CONVERSATION_LIST_DEBOUNCE_MS);
+}
+
 function scheduleConversationListRefetch(
   queryClient: ReturnType<typeof useQueryClient>,
   assistantId: string,
   debounceTimerRef: MutableRefObject<ReturnType<typeof setTimeout> | null>,
 ): void {
-  if (debounceTimerRef.current) {
-    clearTimeout(debounceTimerRef.current);
-  }
-  debounceTimerRef.current = setTimeout(() => {
-    debounceTimerRef.current = null;
-    // One first-page GET per populated list bucket — never a full
-    // paginated drain (see refreshConversationListWindows).
+  scheduleDebounced(debounceTimerRef, () => {
+    // One first-page GET per populated list cache, including every
+    // per-section cache, never a full paginated drain (see
+    // refreshConversationListWindows). Sections must NOT be prefix-
+    // invalidated here instead: a section refetches by draining all of its
+    // pages, so that costs a full drain per mounted section per signal,
+    // which is the exact cost this window refresh exists to avoid. The
+    // helper itself invalidates the caches it cannot merge (tracked but
+    // holding no data, e.g. a failed first fetch), so a signal is still
+    // the retry path for a section stranded on its derived fallback.
     void refreshConversationListWindows(queryClient, assistantId).catch(
       (err: unknown) => {
         captureError(err, {
@@ -173,21 +209,53 @@ function scheduleConversationListRefetch(
         });
       },
     );
-    // Non-paginated caches (archived, origin-channel) use plain
-    // invalidation — they refetch only while their observer is mounted.
-    // Groups are a single unpaginated GET.
-    void queryClient.invalidateQueries({
-      queryKey: archivedConversationsQueryKey(assistantId),
-    });
-    void queryClient.invalidateQueries({
-      queryKey: originChannelListPrefix(assistantId),
-    });
+    // The archived lists stay on plain invalidation: they order by
+    // `archivedAt` while the window refresh merges on a recency axis, and
+    // they are mounted only while the archive view is open, so invalidation
+    // refetches nothing until then. Groups are a single unpaginated GET.
+    void queryClient.invalidateQueries(
+      conversationListQueryFilter(assistantId, isArchivedFilter),
+    );
     void queryClient.invalidateQueries({
       queryKey: groupsGetQueryKey({
         path: { assistant_id: assistantId ?? "" },
       }),
     });
-  }, CONVERSATION_LIST_DEBOUNCE_MS);
+    void queryClient.invalidateQueries({
+      queryKey: unreadConversationCountQueryKey(assistantId),
+    });
+    // Section existence and badge counts change with the list shape; the
+    // index is one cheap GET, so it rides the same debounced signal.
+    void queryClient.invalidateQueries({
+      queryKey: sidebarSectionsQueryKey(assistantId),
+    });
+  });
+}
+
+/**
+ * Debounced invalidation of the server-side unread-count cache.
+ *
+ * Seen-state changes and newly landed assistant replies surface as
+ * per-conversation `conversation:<id>:metadata` tags without a
+ * `conversationsList` umbrella tag, so the count must refetch on metadata
+ * signals too. It runs on its own timer so a burst of metadata tags does not
+ * keep pushing back the list refresh (and vice versa).
+ */
+function scheduleUnreadCountRefetch(
+  queryClient: ReturnType<typeof useQueryClient>,
+  assistantId: string,
+  timerRef: MutableRefObject<ReturnType<typeof setTimeout> | null>,
+): void {
+  scheduleDebounced(timerRef, () => {
+    void queryClient.invalidateQueries({
+      queryKey: unreadConversationCountQueryKey(assistantId),
+    });
+    // Seen-state changes move per-section unread, and the index carries
+    // those badges, so it refetches on the same metadata-driven timer.
+    void queryClient.invalidateQueries({
+      queryKey: sidebarSectionsQueryKey(assistantId),
+    });
+  });
 }
 
 function handleConversationSyncTags(
@@ -195,6 +263,7 @@ function handleConversationSyncTags(
   assistantId: string,
   queryClient: ReturnType<typeof useQueryClient>,
   debounceTimerRef: MutableRefObject<ReturnType<typeof setTimeout> | null>,
+  unreadCountTimerRef: MutableRefObject<ReturnType<typeof setTimeout> | null>,
 ): void {
   for (const tag of event.tags) {
     if (tag === SYNC_TAGS.conversationsList) {
@@ -211,6 +280,11 @@ function handleConversationSyncTags(
       // work for fields the UI tolerates going slightly stale.
       const parsed = parseConversationSyncTag(tag);
       if (parsed?.resource === "metadata") {
+        scheduleUnreadCountRefetch(
+          queryClient,
+          assistantId,
+          unreadCountTimerRef,
+        );
         void limitedRefreshConversationRow(
           queryClient,
           assistantId,

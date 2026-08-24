@@ -1,34 +1,55 @@
 import "./env-seed";
 
-import { app, net, protocol, shell } from "electron";
+import { app, net, protocol, session, shell } from "electron";
 import fs from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import path from "node:path";
 
 import { resolveAppProtocolPath } from "@vellumai/electron-utils/app-protocol";
-import { resolveLocalConfigFromEnv } from "@vellumai/local-mode";
-import { z } from "zod";
+import { VELLUMAPP_PROTOCOL } from "@vellumai/electron-desktop/bundle-platform";
+import { getDeviceId } from "@vellumai/electron-desktop/device-id";
+import {
+  authorizePairedGatewayForwardPlan,
+  executeGatewayForwardPlan,
+  planGatewayForward,
+  planPairedGatewayForward,
+  type GatewayForwardFetcher,
+} from "@vellumai/electron-desktop/gateway-forward";
+import { getPairedGuardianAccessToken } from "@vellumai/electron-desktop/local-mode";
+import { getWatchedLockfileSnapshot } from "@vellumai/electron-desktop/lockfile-watcher";
+import {
+  executePlatformForwardPlan,
+  planPlatformForward,
+} from "@vellumai/electron-desktop/platform-forward";
+import {
+  pairedGatewayTargetsFromLockfile,
+  readAllowedGatewayPorts,
+  readPairedGatewayTargets,
+  resolveLocalConfigFromEnv,
+  resolveLockfilePaths,
+} from "@vellumai/local-mode";
 
-import { APP_PROTOCOL } from "./app-config";
-import { handle, handleSync } from "./ipc";
+import {
+  APP_PROTOCOL,
+  WINDOWS_RELEASE_INFO,
+  usesAppProtocolRenderer,
+} from "./app-config";
+import { resolveAllowedOrigin } from "./app-origin.client";
+import { provisionCliForCurrentUser } from "./cli-path-flow";
+import { installMainFeatures } from "./features";
+import { handleSync } from "./ipc.client";
 import log from "./logger";
-import { ensureVisible, installMainWindow } from "./main-window";
-import { hardenedWebPreferences } from "./windows";
+import { ensureVisible } from "./main-window";
+import { installPairedGatewayRequestGuard } from "./paired-gateway-request-guard";
+import { installWebContentsSecurity } from "./windows.client";
 
 /**
- * Minimal Windows shell for the Vellum Assistant.
- *
- * This is the bootstrap skeleton: a hardened BrowserWindow loading the
- * clients/web renderer (Vite dev server in dev, `app://` static serving of
- * `resources/web-dist` in packaged builds) plus the smallest IPC surface
- * the renderer needs to boot. The renderer's runtime wrappers
- * (`clients/web/src/runtime/`) feature-detect each bridge namespace, so the
- * partial preload bridge degrades to web behavior everywhere else.
- *
- * Not ported from the macOS client yet (see `clients/macos/src/main/` for the
- * reference implementations): gateway/platform request forwarding for
- * packaged builds, native auth, deep links, tray, auto-update, CSP,
- * notifications, hotkeys, local-mode IPC, window-state persistence.
+ * Windows shell for the Vellum Assistant: a hardened BrowserWindow loading
+ * the clients/web renderer (Vite dev server in dev, `app://` static serving
+ * of `resources/web-dist` in packaged builds). Every desktop capability is a
+ * module under `./features/`, composed through the capability registry once
+ * the app is ready; `docs/parity-matrix.md` maps them to their macOS
+ * counterparts.
  */
 
 // Dev-only: override the package `name` (`@vellumai/windows`) so
@@ -40,22 +61,17 @@ import { hardenedWebPreferences } from "./windows";
 if (!app.isPackaged) {
   app.setName("Vellum Electron Windows");
 }
-const isDev = !app.isPackaged;
 
 // Packaged builds all share the same package.json `name`, so Electron
 // resolves `app.getPath("userData")` to the same directory for every
 // environment. Append an environment suffix for non-production builds so
 // dev/staging/production installs can run side-by-side; production keeps the
 // original path for backwards compatibility.
-declare const __VELLUM_ENVIRONMENT__: string;
+const releaseChannel = WINDOWS_RELEASE_INFO.releaseChannel;
 if (app.isPackaged) {
-  const env =
-    typeof __VELLUM_ENVIRONMENT__ === "string"
-      ? __VELLUM_ENVIRONMENT__
-      : "production";
-  if (env !== "production") {
+  if (releaseChannel !== "production") {
     const base = app.getPath("userData");
-    app.setPath("userData", `${base}-${env}`);
+    app.setPath("userData", `${base}-${releaseChannel}`);
   }
 }
 
@@ -81,6 +97,16 @@ protocol.registerSchemesAsPrivileged([
       corsEnabled: true,
     },
   },
+  {
+    scheme: VELLUMAPP_PROTOCOL,
+    privileges: {
+      standard: true,
+      secure: true,
+      supportFetchAPI: true,
+      stream: true,
+      corsEnabled: true,
+    },
+  },
 ]);
 
 // Serve clients/web/dist/ as static files via `app://vellum.ai/...`. Route-like
@@ -93,11 +119,6 @@ protocol.registerSchemesAsPrivileged([
 // live directly under `rendererRoot`; the mount prefix is stripped before
 // path resolution.
 //
-// TODO(windows): port the gateway (`/assistant/__gateway/{port}/*`) and
-// platform (`/v1/*`, `/_allauth/*`, `/accounts/*`) request forwarding from
-// `clients/macos/src/main/index.ts` so packaged builds can reach local
-// gateways and the cloud platform. Until then only dev runs (where the Vite
-// dev server proxies both) are fully functional.
 const RENDERER_MOUNT = "/assistant";
 
 const resolveRendererRoot = (): string => {
@@ -112,8 +133,52 @@ const resolveRendererRoot = (): string => {
 const registerAppProtocol = (): void => {
   const rendererRoot = resolveRendererRoot();
   const indexHtml = path.join(rendererRoot, "index.html");
+  const lockfilePaths = resolveLockfilePaths(process.env);
+  const getAllowedGatewayPorts = (): Set<number> =>
+    readAllowedGatewayPorts(lockfilePaths);
+  // Prefer the watcher's in-memory snapshot so paired requests never read
+  // disk; the direct read covers only the window before the watcher installs.
+  const getPairedGatewayTargets = (): Map<string, string> => {
+    const watched = getWatchedLockfileSnapshot();
+    return watched
+      ? pairedGatewayTargetsFromLockfile(watched)
+      : readPairedGatewayTargets(lockfilePaths);
+  };
 
   protocol.handle(APP_PROTOCOL, async (request) => {
+    // The renderer addresses local gateways at the same `app://` origin via
+    // `/assistant/__gateway/{port}/*`. Forward those to loopback here so the
+    // secure renderer never touches an insecure `http://127.0.0.1` origin
+    // directly; the lockfile allowlist is the security boundary. Mirrors the
+    // Vite dev-server proxy (`clients/web/vite-plugin-local-mode.ts`).
+    const proxied = await forwardGatewayRequest(
+      request,
+      getAllowedGatewayPorts,
+    );
+    if (proxied) {
+      return proxied;
+    }
+
+    // Paired remote gateways ride the same-origin path too, via
+    // `/assistant/__gateway-paired/{assistantId}/*`; the WebRequest guard
+    // admits only trusted app frames, and the lockfile's paired entries
+    // allowlist the remote targets.
+    const pairedProxied = await forwardPairedGatewayRequest(
+      request,
+      getPairedGatewayTargets,
+    );
+    if (pairedProxied) {
+      return pairedProxied;
+    }
+
+    const platformProxied = await forwardPlatformRequest(
+      request,
+      resolvedConfig.platformUrl,
+    );
+    if (platformProxied) {
+      return platformProxied;
+    }
+
     const result = resolveAppProtocolPath(
       rendererRoot,
       request.url,
@@ -144,8 +209,7 @@ const fileExists = async (candidate: string): Promise<boolean> => {
 };
 
 // Synchronous config snapshot the preload reads at startup and exposes to the
-// renderer as `window.__VELLUM_CONFIG__`. `deviceId` is null until the
-// device-id store is ported from the macOS client.
+// renderer as `window.__VELLUM_CONFIG__`.
 const resolvedConfig = resolveLocalConfigFromEnv(process.env);
 handleSync("vellum:config:get", () => ({
   webUrl: resolvedConfig.webUrl,
@@ -154,29 +218,64 @@ handleSync("vellum:config:get", () => ({
     ["true", "1"].includes(
       (process.env.VELLUM_DISABLE_PLATFORM ?? "").toLowerCase(),
     ) || undefined,
-  deviceId: null,
+  deviceId: getDeviceId(),
 }));
 
-const WEBSITE = "https://vellum.ai";
+const gatewayForwardFetcher: GatewayForwardFetcher = (url, init) =>
+  net.fetch(url, init);
 
-// Injected by `electron.vite.config.ts` at build time.
-declare const __VELLUM_BUILD_SHA__: string;
+/**
+ * Forward a gateway data-plane request (`/assistant/__gateway/{port}/*`) to
+ * the local gateway on loopback, or return `null` when the URL is not a
+ * gateway request. `net.fetch` runs in main, so the renderer only ever talks
+ * to its own secure `app://` origin.
+ */
+const forwardGatewayRequest = async (
+  request: GlobalRequest,
+  getAllowedPorts: () => Set<number>,
+): Promise<Response | null> =>
+  executeGatewayForwardPlan(
+    planGatewayForward(request, getAllowedPorts),
+    request,
+    gatewayForwardFetcher,
+  );
 
-const installAppInfoIpc = (): void => {
-  handle("vellum:app:versionInfo", z.tuple([]), () => ({
-    appName: app.getName(),
-    version: app.getVersion(),
-    commitSha:
-      typeof __VELLUM_BUILD_SHA__ === "string" ? __VELLUM_BUILD_SHA__ : "unknown",
-    copyright: `© ${new Date().getFullYear()} Vellum AI`,
-    website: WEBSITE,
-  }));
+/**
+ * Forward a paired-gateway request (`/assistant/__gateway-paired/{id}/*`) to
+ * the remote gateway an imported pairing recorded as its `runtimeUrl`, or
+ * return `null` when the URL is not a paired-gateway request.
+ */
+const forwardPairedGatewayRequest = async (
+  request: GlobalRequest,
+  getTargets: () => Map<string, string>,
+): Promise<Response | null> => {
+  const plan = await authorizePairedGatewayForwardPlan(
+    planPairedGatewayForward(request, getTargets),
+    getPairedGuardianAccessToken,
+  );
+  return executeGatewayForwardPlan(plan, request, gatewayForwardFetcher);
+};
 
-  // The renderer is sandboxed - `shell.openExternal` only works from main.
-  // The target is a fixed constant, never a renderer-supplied URL, so there's
-  // no open-redirect surface here.
-  handle("vellum:app:openWebsite", z.tuple([]), () =>
-    shell.openExternal(WEBSITE),
+const forwardPlatformRequest = async (
+  request: GlobalRequest,
+  platformUrl: string,
+): Promise<Response | null> => {
+  const plan = planPlatformForward(request, platformUrl, {
+    allowedOrigin: resolveAllowedOrigin(),
+  });
+  const target = plan.kind === "forward" ? `${plan.method} ${plan.url}` : "";
+  return executePlatformForwardPlan(
+    plan,
+    request,
+    (url, init) => net.fetch(url, init),
+    {
+      onError: (error, attempt) => {
+        log.error(
+          `[platform-forward] net.fetch failed (attempt ${attempt + 1}) for ${target}:`,
+          error,
+        );
+      },
+    },
   );
 };
 
@@ -187,93 +286,47 @@ const installAppInfoIpc = (): void => {
 app
   .whenReady()
   .then(() => {
-    if (!isDev) {
+    log.info("[app] ready");
+    if (usesAppProtocolRenderer(app.isPackaged)) {
       registerAppProtocol();
+      installPairedGatewayRequestGuard();
     }
-    installAppInfoIpc();
-    installMainWindow();
+    if (app.isPackaged && process.platform === "win32") {
+      try {
+        const result = provisionCliForCurrentUser({
+          userDataDir: app.getPath("userData"),
+          resourcesDir: process.resourcesPath,
+          localAppData:
+            process.env.LOCALAPPDATA ??
+            path.join(app.getPath("home"), "AppData", "Local"),
+          releaseChannel,
+          version: app.getVersion(),
+        });
+        if (["foreign", "shadowed"].includes(result.launcherState)) {
+          log.warn(`[cli] Windows launcher is ${result.launcherState}`);
+        }
+      } catch (error) {
+        log.error("[cli] Failed to provision the Windows CLI:", error);
+      }
+    }
+    installMainFeatures();
   })
   .catch((err: unknown) => {
     log.error("[app] whenReady setup failed:", err);
   });
 
 app.on("second-instance", () => {
-  // TODO(windows): deep links arrive via second-instance argv on Windows.
-  // Port `extractDeepLinkFromArgv` from `clients/macos/src/main/deep-links.ts`
-  // when the `vellum://` protocol registration lands here.
   ensureVisible();
 });
 
-app.on("web-contents-created", (_event, contents) => {
-  // Mirror renderer console output (info and up) into the main log file.
-  // The packaged app has no devtools, so without this the renderer's
-  // diagnostics are invisible in the field; `vellum.log` is the only
-  // artifact a debugging session can read.
-  contents.on("console-message", (event) => {
-    if (event.level === "debug") {
-      return;
-    }
-    const line = `[renderer wc=${contents.id}] ${event.message}`;
-    if (event.level === "error") {
-      log.error(line);
-    } else if (event.level === "warning") {
-      log.warn(line);
-    } else {
-      log.info(line);
-    }
-  });
-
-  contents.setWindowOpenHandler(({ url, disposition }) => {
-    if (disposition === "new-window" && url === "about:blank") {
-      return {
-        action: "allow",
-        overrideBrowserWindowOptions: {
-          webPreferences: {
-            ...hardenedWebPreferences(),
-            preload: undefined,
-          },
-        },
-      };
-    }
-
-    // Only http(s) is ever opened - file:, javascript:, custom schemes are
-    // denied with no fallback.
-    let parsed: URL;
-    try {
-      parsed = new URL(url);
-    } catch {
-      return { action: "deny" };
-    }
-    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
-      return { action: "deny" };
-    }
-
-    // Programmatic popups (`window.open(url, name, features)` with size
-    // hints) come through as `new-window` disposition. The web app's OAuth /
-    // connect flows rely on the returned popup handle for postMessage
-    // callbacks, so allow these as in-app child windows that inherit the
-    // hardened webPreferences from the parent (preload intentionally
-    // omitted - these are OAuth/connect popups, not Vellum-bridge surfaces).
-    if (disposition === "new-window") {
-      return {
-        action: "allow",
-        overrideBrowserWindowOptions: {
-          webPreferences: {
-            ...hardenedWebPreferences(),
-            preload: undefined,
-          },
-        },
-      };
-    }
-
-    // Plain target=_blank link clicks → system browser.
-    void shell.openExternal(url);
-    return { action: "deny" };
-  });
+app.on("window-all-closed", () => {
+  // Keep the notification-area tray available to reopen the window.
 });
 
-// Unlike macOS, a Windows app with no windows has no dock/menu-bar presence
-// to keep it alive, so quit outright. Revisit when the tray is ported.
-app.on("window-all-closed", () => {
-  app.quit();
+app.on("web-contents-created", (_event, contents) => {
+  installWebContentsSecurity(contents, {
+    cookies: () => session.defaultSession.cookies,
+    logger: log,
+    openExternal: (url) => shell.openExternal(url),
+  });
 });

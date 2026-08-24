@@ -15,6 +15,7 @@ import { LazyBoundary } from "@/components/lazy-boundary";
 import { ChatMarkdownMessage } from "@/domains/chat/components/chat-markdown-message";
 import { SurfaceContainer } from "@/domains/chat/components/surfaces/surface-container";
 import { cn } from "@/utils/misc";
+import { useTranslation } from "@/i18n";
 
 // Weather card has its own data-shape parsing and forecast UI that is only
 // rendered when a card surface advertises a weather template. Defer loading
@@ -43,6 +44,12 @@ interface CardSurfaceProps {
     actionId: string,
     data?: Record<string, unknown>,
   ) => void | Promise<void>;
+  /**
+   * Assistant that owns the conversation this surface belongs to. Lets
+   * workspace file references in the card body resolve against its workspace
+   * instead of degrading to an inert file card.
+   */
+  assistantId?: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -184,6 +191,7 @@ function TaskProgressBar({
 }: {
   templateData: Record<string, unknown>;
 }) {
+  const { t } = useTranslation("chat");
   const completed = Number(templateData.completed ?? 0);
   const total = Number(templateData.total ?? 0);
   const percent = total > 0 ? Math.round((completed / total) * 100) : 0;
@@ -192,7 +200,7 @@ function TaskProgressBar({
     <div className="mt-3">
       <div className="mb-1 flex items-center justify-between text-body-small-default text-[var(--content-quiet)]">
         <span>
-          {completed} / {total} tasks
+          {t("cardSurface.tasksProgress", { completed, total })}
         </span>
         <span>{percent}%</span>
       </div>
@@ -264,7 +272,11 @@ function TaskStepList({
 // Main component
 // ---------------------------------------------------------------------------
 
-export function CardSurface({ surface, onAction }: CardSurfaceProps) {
+export function CardSurface({
+  surface,
+  onAction,
+  assistantId,
+}: CardSurfaceProps) {
   // The wire keeps surface `data` opaque; narrow it with the canonical schema
   // (every field optional, so a real card never fails to parse) rather than an
   // unchecked cast or a re-declared local interface.
@@ -318,6 +330,7 @@ export function CardSurface({ surface, onAction }: CardSurfaceProps) {
     <ChatMarkdownMessage
       content={data.body ?? ""}
       className="mt-2 text-body-medium-lighter text-[var(--content-tertiary)]"
+      assistantId={assistantId}
     />
   );
 

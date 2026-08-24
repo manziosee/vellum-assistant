@@ -18,6 +18,12 @@ import {
   PLACEHOLDER_EMPTY_TURN,
 } from "../placeholder-sentinels.js";
 import { recordProviderRequestDiagnostics } from "../request-diagnostics.js";
+import {
+  analyzeServerToolPairing,
+  isServerToolUseBlock,
+  isWebSearchToolResultBlock,
+  type ServerToolPairing,
+} from "../server-tool-pairing.js";
 import { createStreamTimeout } from "../stream-timeout.js";
 import type {
   ContentBlock,
@@ -40,6 +46,18 @@ const log = getLogger("anthropic-client");
 
 /** Validation-specific timeout (10s) so a stalled network doesn't block key submission. */
 const VALIDATION_TIMEOUT_MS = 10_000;
+
+/**
+ * Cap on `pause_turn` continuations within one `sendMessage` call. The API
+ * pauses a long-running server-tool turn (e.g. web search) with
+ * `stop_reason: "pause_turn"`; the client resumes it by re-sending the paused
+ * assistant content as-is. The cap bounds pathological pause loops; web
+ * search allows `max_uses: 5` per turn, so 6 leaves headroom for one pause
+ * per search. On cap-out the response is returned as-is and the deferred-tail
+ * preservation in `analyzeServerToolPairing` keeps any unresolved
+ * `server_tool_use` blocks intact for a later request.
+ */
+export const MAX_PAUSE_TURN_CONTINUATIONS = 6;
 
 /**
  * Detect Anthropic's `prompt_too_long` context-overflow signal.
@@ -489,73 +507,54 @@ function normalizeFollowingUserContent(
   };
 }
 
-/** Type-guard for server_tool_use blocks. */
-function isServerToolUseBlock(
-  block: unknown,
-): block is { type: "server_tool_use"; id: string; name: string } {
-  return (
-    typeof block === "object" &&
-    block != null &&
-    (block as { type: string }).type === "server_tool_use"
-  );
-}
-
-/** Type-guard for web_search_tool_result blocks. */
-function isWebSearchToolResultBlock(block: unknown): block is {
-  type: "web_search_tool_result";
-  tool_use_id: string;
-  content: unknown;
-} {
-  return (
-    typeof block === "object" &&
-    block != null &&
-    (block as { type: string }).type === "web_search_tool_result"
-  );
-}
-
 /**
- * Repair orphaned server-side tool blocks within assistant messages. Server-
- * side tools (e.g. web_search) are self-paired: the assistant message should
- * contain both server_tool_use and its matching web_search_tool_result. Either
- * side can go missing — a partial stream may drop the result, or a downstream
- * step (history reload, message split, compaction) may drop the use block.
- * Both cases trigger an Anthropic 400 on the next request, so this function
- * handles both directions:
+ * Repair orphaned server-side tool blocks within assistant messages, using the
+ * cross-message pairing from {@link analyzeServerToolPairing}. A pair can go
+ * missing on either side: a partial stream may drop the result, or a
+ * downstream step (history reload, message split, compaction) may drop the use
+ * block. Both cases trigger an Anthropic 400 on the next request, so this
+ * function handles both directions:
  *
- *   - server_tool_use without paired result: inject a synthetic error result.
- *   - web_search_tool_result without paired server_tool_use: downgrade to a
+ *   - server_tool_use without a paired result: inject a synthetic error
+ *     result.
+ *   - web_search_tool_result without a paired server_tool_use: downgrade to a
  *     text block describing what was found so the model retains context.
+ *
+ * Deferred use blocks (see {@link ServerToolPairing.deferredUseIds}) are not
+ * orphans: they are left intact so the provider executes the search on this
+ * request instead of seeing a synthetic failure.
  */
 function repairOrphanedServerToolBlocks(
   messages: Anthropic.MessageParam[],
+  pairing: ServerToolPairing,
 ): Anthropic.MessageParam[] {
+  if (pairing.deferredUseIds.size > 0) {
+    log.info(
+      { deferredIds: Array.from(pairing.deferredUseIds) },
+      "Preserving deferred server_tool_use blocks for provider-side execution",
+    );
+  }
   return messages.map((msg) => {
     if (msg.role !== "assistant") {
       return msg;
     }
     const content = Array.isArray(msg.content) ? msg.content : [];
 
-    const serverToolUseIds = new Set<string>();
-    const webSearchResultIds = new Set<string>();
-    for (const block of content) {
-      if (isServerToolUseBlock(block)) {
-        serverToolUseIds.add(block.id);
-      }
-      if (isWebSearchToolResultBlock(block)) {
-        webSearchResultIds.add(block.tool_use_id);
-      }
-    }
-
     const orphanServerToolUseIds = new Set<string>();
-    for (const id of serverToolUseIds) {
-      if (!webSearchResultIds.has(id)) {
-        orphanServerToolUseIds.add(id);
-      }
-    }
     const orphanWebSearchResultIds = new Set<string>();
-    for (const id of webSearchResultIds) {
-      if (!serverToolUseIds.has(id)) {
-        orphanWebSearchResultIds.add(id);
+    for (const block of content) {
+      if (
+        isServerToolUseBlock(block) &&
+        !pairing.resolvedPairIds.has(block.id) &&
+        !pairing.deferredUseIds.has(block.id)
+      ) {
+        orphanServerToolUseIds.add(block.id);
+      }
+      if (
+        isWebSearchToolResultBlock(block) &&
+        !pairing.resolvedPairIds.has(block.tool_use_id)
+      ) {
+        orphanWebSearchResultIds.add(block.tool_use_id);
       }
     }
 
@@ -709,8 +708,17 @@ function findActiveToolUseContinuationStart(
 
 function ensureToolPairing(
   messages: Anthropic.MessageParam[],
+  pairing: ServerToolPairing,
 ): Anthropic.MessageParam[] {
   const result: Anthropic.MessageParam[] = [];
+
+  // Messages carrying a deferred or cross-message-paired server tool block
+  // must go out verbatim: the provider pairs and executes these blocks across
+  // messages itself, and reordering or splitting them breaks that pairing.
+  const verbatimIds = new Set([
+    ...pairing.deferredUseIds,
+    ...pairing.crossMessageIds,
+  ]);
 
   let i = 0;
   while (i < messages.length) {
@@ -724,8 +732,23 @@ function ensureToolPairing(
 
     const content = Array.isArray(msg.content) ? msg.content : [];
 
+    const hasVerbatimServerBlock =
+      verbatimIds.size > 0 &&
+      content.some(
+        (block) =>
+          (isServerToolUseBlock(block) && verbatimIds.has(block.id)) ||
+          (isWebSearchToolResultBlock(block) &&
+            verbatimIds.has(block.tool_use_id)),
+      );
+
     const { pairedContent, carryoverContent, toolUseIds } =
-      splitAssistantForToolPairing(content);
+      hasVerbatimServerBlock
+        ? {
+            pairedContent: content,
+            carryoverContent: [] as Anthropic.ContentBlockParam[],
+            toolUseIds: getOrderedToolUseIds(content),
+          }
+        : splitAssistantForToolPairing(content);
 
     if (toolUseIds.length === 0) {
       result.push(msg);
@@ -976,7 +999,7 @@ export class AnthropicProvider implements Provider {
     // edge LB, NAT idle) — only the latter should be retried.
     let innerTimeoutSignal: AbortSignal | undefined;
     try {
-      sentMessages = this.buildSentMessages(messages);
+      sentMessages = await this.buildSentMessages(messages);
       const {
         effort,
         speed,
@@ -1169,7 +1192,10 @@ export class AnthropicProvider implements Provider {
         }
         return -1;
       };
-      const applyCacheControlToLastBlock = (msgIdx: number): void => {
+      const applyCacheControlToLastBlock = (
+        msgIdx: number,
+        control: typeof cacheControl | typeof tailCacheControl = cacheControl,
+      ): void => {
         const content = msgs[msgIdx].content;
         if (!Array.isArray(content) || content.length === 0) {
           return;
@@ -1177,27 +1203,30 @@ export class AnthropicProvider implements Provider {
         const lastBlock = content[content.length - 1];
         if (typeof lastBlock !== "string") {
           (lastBlock as unknown as Record<string, unknown>).cache_control =
-            cacheControl;
+            control;
         }
       };
       const turnStartIdx = findUserTextMsgIdx(msgs.length - 1);
-      // When the latest user message is volatile (`mutableLatestUserMessage`)
-      // and it is itself the turn-start (first-of-turn, no tool-use loop yet),
-      // skip the long-TTL anchor here — it would land on per-turn-varying
-      // content and never hit again. The previous-turn anchor below becomes the
-      // primary stable breakpoint. During tool-use loops (`turnStartIdx <
-      // msgs.length - 1`) the turn-start block is fixed within the turn, so
-      // behavior is unchanged. Independent from `disableTurnStartCache`, which
-      // expresses a different intent (one-shot callers with no future hit).
-      const skipVolatileTurnStartAnchor =
-        mutableLatestUserMessage && turnStartIdx === msgs.length - 1;
-      if (
-        turnStartIdx >= 0 &&
-        !disableCache &&
-        !disableTurnStartCache &&
-        !skipVolatileTurnStartAnchor
-      ) {
-        applyCacheControlToLastBlock(turnStartIdx);
+      // Turn-start anchor. A volatile turn start (`mutableLatestUserMessage`:
+      // the message carries a per-turn block that will not recur next turn)
+      // takes the SHORT TTL instead of the long one. The long TTL would buy
+      // nothing: the bytes change next turn, so that entry can never be read
+      // across turns, and the only reads it can serve are this turn's tool-loop
+      // iterations, which the short TTL already serves, refreshing on each
+      // hit. Marking the same boundary at two different TTLs across a turn
+      // bills two writes for one reusable prefix, the long one at the higher
+      // write multiplier.
+      //
+      // The signal is turn-scoped, not request-scoped: it describes the
+      // turn-starting user message, so it holds for every request in the turn
+      // and the TTL chosen here stays consistent as the tool loop advances.
+      // `disableTurnStartCache` is independent: it expresses a different
+      // intent (one-shot callers with no future hit).
+      if (turnStartIdx >= 0 && !disableCache && !disableTurnStartCache) {
+        applyCacheControlToLastBlock(
+          turnStartIdx,
+          mutableLatestUserMessage ? tailCacheControl : cacheControl,
+        );
       }
 
       // Previous-turn anchor: when this request is the first of a new turn
@@ -1223,26 +1252,19 @@ export class AnthropicProvider implements Provider {
 
       // Advancing tail: place a short-lived 5m cache breakpoint on the last
       // block of the last message. This caches the growing tail cheaply
-      // without conflicting with the 1h breakpoints above. It fires during
-      // tool-use loops (the tail falls after the turn-starting user message)
-      // and also on a first-of-turn request whose volatile turn-start anchor
-      // was skipped while a previous-turn anchor exists: there the latest
-      // message would otherwise carry no breakpoint, so the next request's
-      // anchor can land far ahead of the previous-turn anchor and Anthropic's
-      // ~20-block cache lookback can't bridge the gap — forcing a full
-      // re-creation of the prefix. The 5m breakpoint gives the next call an
-      // exact, reachable boundary; cross-turn it expires harmlessly. The
-      // first-of-turn bridge lands on the turn-start block, so it honors
-      // `disableTurnStartCache` like the long-TTL anchor above. Skip
+      // without conflicting with the long-TTL breakpoints above. It fires
+      // during tool-use loops, where the tail falls after the turn-starting
+      // user message: without it the next iteration's anchor can land far
+      // ahead of the last written boundary and Anthropic's ~20-block cache
+      // lookback can't bridge the gap, forcing a full re-creation of the
+      // prefix. On a first-of-turn request the tail IS the turn-start message,
+      // which the anchor above already marks, so no bridge is needed. Skip
       // thinking/redacted_thinking blocks — Anthropic doesn't allow
       // cache_control on those types.
       if (
         !disableCache &&
         turnStartIdx >= 0 &&
-        (turnStartIdx < sentMessages.length - 1 ||
-          (skipVolatileTurnStartAnchor &&
-            turnStartIdx > 0 &&
-            !disableTurnStartCache))
+        turnStartIdx < sentMessages.length - 1
       ) {
         const lastMsg = sentMessages[sentMessages.length - 1];
         if (Array.isArray(lastMsg.content) && lastMsg.content.length > 0) {
@@ -1272,10 +1294,11 @@ export class AnthropicProvider implements Provider {
       // system is a single block or absent) + at most two message anchors
       // ≤ 4 — Anthropic's per-request cap. The two message anchors are
       // turn-start + prev-turn-anchor (first-of-turn), turn-start + tail
-      // (tool-use loop), or prev-turn-anchor + tail (first-of-turn with the
+      // (tool-use loop), prev-turn-anchor + tail (first-of-turn with the
       // volatile turn-start anchor skipped — the freed turn-start slot covers
-      // the tail). At most two message-level breakpoints are placed, so the
-      // total can't drift past 4.
+      // the tail), or the tail alone (volatile first turn, where no
+      // previous turn exists to anchor). At most two message-level
+      // breakpoints are placed, so the total can't drift past 4.
 
       // Strip orphaned UTF-16 surrogates so the Anthropic JSON parser never
       // sees invalid strings produced by upstream surrogate-splitting `.slice()` calls.
@@ -1346,6 +1369,10 @@ export class AnthropicProvider implements Provider {
       }
 
       let response: Anthropic.Message;
+      // Paused segments accumulated by the `pause_turn` continuation loop,
+      // in stream order, excluding the final response. Empty for the normal
+      // single-request case.
+      const pausedSegments: Anthropic.Message[] = [];
       try {
         recordProviderRequestDiagnostics({ model_id: params.model });
         const requestHeaders = {
@@ -1358,284 +1385,359 @@ export class AnthropicProvider implements Provider {
             ? { headers: requestHeaders }
             : {}),
         };
-        const stream: UnifiedStream = useFastMode
-          ? (this.client.beta.messages.stream(
-              {
-                ...(params as Record<string, unknown>),
-                speed: "fast" as const,
-                betas,
-              } as Anthropic.Beta.Messages.MessageCreateParamsNonStreaming &
-                Anthropic.Beta.Messages.MessageCreateParamsStreaming,
-              requestOptions,
-            ) as unknown as UnifiedStream)
-          : betas.length > 0
+        // Issue one streaming request and return its final message. A local
+        // helper so `pause_turn` continuations get fresh listener state per
+        // request (content shadow, text sentinel buffer, tool-input
+        // accumulators) instead of inheriting a prior segment's buffers.
+        const streamOnce = async (
+          streamParams: Anthropic.MessageStreamParams,
+        ): Promise<Anthropic.Message> => {
+          const stream: UnifiedStream = useFastMode
             ? (this.client.beta.messages.stream(
                 {
-                  ...(params as Record<string, unknown>),
+                  ...(streamParams as Record<string, unknown>),
+                  speed: "fast" as const,
                   betas,
                 } as Anthropic.Beta.Messages.MessageCreateParamsNonStreaming &
                   Anthropic.Beta.Messages.MessageCreateParamsStreaming,
                 requestOptions,
               ) as unknown as UnifiedStream)
-            : (this.client.messages.stream(
-                params,
-                requestOptions,
-              ) as unknown as UnifiedStream);
+            : betas.length > 0
+              ? (this.client.beta.messages.stream(
+                  {
+                    ...(streamParams as Record<string, unknown>),
+                    betas,
+                  } as Anthropic.Beta.Messages.MessageCreateParamsNonStreaming &
+                    Anthropic.Beta.Messages.MessageCreateParamsStreaming,
+                  requestOptions,
+                ) as unknown as UnifiedStream)
+              : (this.client.messages.stream(
+                  streamParams,
+                  requestOptions,
+                ) as unknown as UnifiedStream);
 
-        // Shadow the streamed content blocks so a mid-stream SDK accumulator
-        // failure on malformed tool-argument JSON can be salvaged instead of
-        // discarding the whole response (see StreamContentShadow).
-        const contentShadow = new StreamContentShadow();
+          // Shadow the streamed content blocks so a mid-stream SDK accumulator
+          // failure on malformed tool-argument JSON can be salvaged instead of
+          // discarding the whole response (see StreamContentShadow).
+          const contentShadow = new StreamContentShadow();
 
-        // Buffer streaming text until it's clear the accumulated text isn't
-        // going to form a placeholder sentinel. Sentinels are injected into
-        // outbound requests for role alternation and are sometimes echoed by
-        // the model — including an echo whose `\x00` guard arrived as a leading
-        // space — so the prefix and completion checks normalize edge whitespace
-        // and control bytes (the same normalization cleanAssistantContent and
-        // the display serializer use). Holding back partial prefixes keeps them
-        // off the live UI before they are stripped at completion. The buffer
-        // resets on every content_block_start.
-        let textBuffer = "";
+          // Buffer streaming text until it's clear the accumulated text isn't
+          // going to form a placeholder sentinel. Sentinels are injected into
+          // outbound requests for role alternation and are sometimes echoed by
+          // the model — including an echo whose `\x00` guard arrived as a leading
+          // space — so the prefix and completion checks normalize edge whitespace
+          // and control bytes (the same normalization cleanAssistantContent and
+          // the display serializer use). Holding back partial prefixes keeps them
+          // off the live UI before they are stripped at completion. The buffer
+          // resets on every content_block_start.
+          let textBuffer = "";
 
-        stream.on("text", (text) => {
-          textBuffer += text;
-          if (couldBePlaceholderSentinelPrefix(textBuffer)) {
-            return;
-          }
-          onEvent?.({ type: "text_delta", text: textBuffer });
-          textBuffer = "";
-        });
-
-        stream.on("thinking", (thinking) => {
-          onEvent?.({ type: "thinking_delta", thinking });
-        });
-
-        // Track which tool is currently streaming so we can attribute inputJson deltas.
-        let currentStreamingToolName: string | undefined;
-        let currentStreamingToolUseId: string | undefined;
-        let accumulatedInputJson = "";
-        let lastInputJsonEmitMs = 0;
-        let pendingInputJsonFlush: ReturnType<typeof setTimeout> | undefined;
-
-        // Anthropic streams `server_tool_use` block input via `input_json_delta`
-        // events (the block's own `input` field is `{}` at content_block_start).
-        // We accumulate the JSON separately from regular `tool_use` blocks so
-        // the daemon can read the resolved query when the paired
-        // `web_search_tool_result` arrives — without this, downstream activity
-        // metadata sees an empty query.
-        let currentServerToolUseId: string | undefined;
-        let accumulatedServerToolInputJson = "";
-        const resolvedServerToolInputs = new Map<
-          string,
-          Record<string, unknown>
-        >();
-
-        stream.on("streamEvent", (event) => {
-          contentShadow.handleEvent(event as ShadowStreamEvent);
-          // Reset the text sentinel buffer at each content-block boundary.
-          // A new block starts fresh; at the end of a block, flush any
-          // buffered text that is NOT a complete sentinel, and drop it if
-          // it is one.
-          if (event.type === "content_block_start") {
-            textBuffer = "";
-          }
-          if (
-            event.type === "content_block_start" &&
-            event.content_block.type === "tool_use"
-          ) {
-            currentStreamingToolName = event.content_block.name;
-            currentStreamingToolUseId = event.content_block.id;
-            accumulatedInputJson = "";
-            lastInputJsonEmitMs = 0;
-            onEvent?.({
-              type: "tool_use_preview_start",
-              toolUseId: event.content_block.id,
-              toolName: event.content_block.name,
-            });
-          }
-          if (
-            event.type === "content_block_start" &&
-            event.content_block.type === "server_tool_use"
-          ) {
-            currentServerToolUseId = event.content_block.id;
-            accumulatedServerToolInputJson = "";
-            onEvent?.({
-              type: "server_tool_start",
-              name: event.content_block.name,
-              toolUseId: event.content_block.id,
-              input:
-                (event.content_block as { input?: Record<string, unknown> })
-                  .input ?? {},
-            });
-          }
-          if (
-            event.type === "content_block_start" &&
-            event.content_block.type === "web_search_tool_result"
-          ) {
-            const block = event.content_block as {
-              tool_use_id: string;
-              content?:
-                | { type: "web_search_tool_result_error"; error_code?: string }
-                | unknown[];
-            };
-            const isError =
-              !Array.isArray(block.content) &&
-              block.content?.type === "web_search_tool_result_error";
-            const errorCode =
-              isError && !Array.isArray(block.content)
-                ? block.content?.error_code
-                : undefined;
-            const resolvedInput = resolvedServerToolInputs.get(
-              block.tool_use_id,
-            );
-            resolvedServerToolInputs.delete(block.tool_use_id);
-            onEvent?.({
-              type: "server_tool_complete",
-              toolUseId: block.tool_use_id,
-              isError: !!isError,
-              ...(Array.isArray(block.content)
-                ? { content: block.content }
-                : {}),
-              ...(resolvedInput ? { resolvedInput } : {}),
-              ...(errorCode ? { errorCode } : {}),
-            });
-          }
-          if (event.type === "content_block_stop") {
-            if (pendingInputJsonFlush) {
-              clearTimeout(pendingInputJsonFlush);
-              pendingInputJsonFlush = undefined;
+          stream.on("text", (text) => {
+            textBuffer += text;
+            if (couldBePlaceholderSentinelPrefix(textBuffer)) {
+              return;
             }
-            if (currentStreamingToolName && accumulatedInputJson) {
+            onEvent?.({ type: "text_delta", text: textBuffer });
+            textBuffer = "";
+          });
+
+          stream.on("thinking", (thinking) => {
+            onEvent?.({ type: "thinking_delta", thinking });
+          });
+
+          // Track which tool is currently streaming so we can attribute inputJson deltas.
+          let currentStreamingToolName: string | undefined;
+          let currentStreamingToolUseId: string | undefined;
+          let accumulatedInputJson = "";
+          let lastInputJsonEmitMs = 0;
+          let pendingInputJsonFlush: ReturnType<typeof setTimeout> | undefined;
+
+          // Anthropic streams `server_tool_use` block input via `input_json_delta`
+          // events (the block's own `input` field is `{}` at content_block_start).
+          // We accumulate the JSON separately from regular `tool_use` blocks so
+          // the daemon can read the resolved query when the paired
+          // `web_search_tool_result` arrives — without this, downstream activity
+          // metadata sees an empty query.
+          let currentServerToolUseId: string | undefined;
+          let accumulatedServerToolInputJson = "";
+          const resolvedServerToolInputs = new Map<
+            string,
+            Record<string, unknown>
+          >();
+
+          stream.on("streamEvent", (event) => {
+            contentShadow.handleEvent(event as ShadowStreamEvent);
+            // Reset the text sentinel buffer at each content-block boundary.
+            // A new block starts fresh; at the end of a block, flush any
+            // buffered text that is NOT a complete sentinel, and drop it if
+            // it is one.
+            if (event.type === "content_block_start") {
+              textBuffer = "";
+            }
+            if (
+              event.type === "content_block_start" &&
+              event.content_block.type === "tool_use"
+            ) {
+              currentStreamingToolName = event.content_block.name;
+              currentStreamingToolUseId = event.content_block.id;
+              accumulatedInputJson = "";
+              lastInputJsonEmitMs = 0;
+              onEvent?.({
+                type: "tool_use_preview_start",
+                toolUseId: event.content_block.id,
+                toolName: event.content_block.name,
+              });
+            }
+            if (
+              event.type === "content_block_start" &&
+              event.content_block.type === "server_tool_use"
+            ) {
+              currentServerToolUseId = event.content_block.id;
+              accumulatedServerToolInputJson = "";
+              onEvent?.({
+                type: "server_tool_start",
+                name: event.content_block.name,
+                toolUseId: event.content_block.id,
+                input:
+                  (event.content_block as { input?: Record<string, unknown> })
+                    .input ?? {},
+              });
+            }
+            if (
+              event.type === "content_block_start" &&
+              event.content_block.type === "web_search_tool_result"
+            ) {
+              const block = event.content_block as {
+                tool_use_id: string;
+                content?:
+                  | {
+                      type: "web_search_tool_result_error";
+                      error_code?: string;
+                    }
+                  | unknown[];
+              };
+              const isError =
+                !Array.isArray(block.content) &&
+                block.content?.type === "web_search_tool_result_error";
+              const errorCode =
+                isError && !Array.isArray(block.content)
+                  ? block.content?.error_code
+                  : undefined;
+              const resolvedInput = resolvedServerToolInputs.get(
+                block.tool_use_id,
+              );
+              resolvedServerToolInputs.delete(block.tool_use_id);
+              onEvent?.({
+                type: "server_tool_complete",
+                toolUseId: block.tool_use_id,
+                isError: !!isError,
+                ...(Array.isArray(block.content)
+                  ? { content: block.content }
+                  : {}),
+                ...(resolvedInput ? { resolvedInput } : {}),
+                ...(errorCode ? { errorCode } : {}),
+              });
+            }
+            if (event.type === "content_block_stop") {
+              if (pendingInputJsonFlush) {
+                clearTimeout(pendingInputJsonFlush);
+                pendingInputJsonFlush = undefined;
+              }
+              if (currentStreamingToolName && accumulatedInputJson) {
+                onEvent?.({
+                  type: "input_json_delta",
+                  toolName: currentStreamingToolName,
+                  toolUseId: currentStreamingToolUseId!,
+                  accumulatedJson: accumulatedInputJson,
+                });
+              }
+              currentStreamingToolName = undefined;
+              currentStreamingToolUseId = undefined;
+              accumulatedInputJson = "";
+              // Finalize the resolved input for a `server_tool_use` block (e.g.
+              // the actual web-search query) so the paired `web_search_tool_result`
+              // emits `server_tool_complete` with `resolvedInput` populated.
+              if (currentServerToolUseId && accumulatedServerToolInputJson) {
+                try {
+                  const parsed = JSON.parse(accumulatedServerToolInputJson);
+                  if (parsed && typeof parsed === "object") {
+                    resolvedServerToolInputs.set(
+                      currentServerToolUseId,
+                      parsed as Record<string, unknown>,
+                    );
+                  }
+                } catch {
+                  // Malformed partial JSON — drop silently; downstream falls
+                  // back to whatever was captured at server_tool_start.
+                }
+              }
+              currentServerToolUseId = undefined;
+              accumulatedServerToolInputJson = "";
+              // Flush residual text buffer unless it is a sentinel.
+              if (
+                textBuffer.length > 0 &&
+                !isPlaceholderSentinelText(textBuffer)
+              ) {
+                onEvent?.({ type: "text_delta", text: textBuffer });
+              }
+              textBuffer = "";
+            }
+          });
+
+          stream.on("inputJson", (partialJson) => {
+            if (currentServerToolUseId) {
+              // Server-tool input (e.g. `web_search` query) — accumulate without
+              // emitting `input_json_delta`; the daemon only consumes the
+              // finalized value from `server_tool_complete.resolvedInput`.
+              accumulatedServerToolInputJson += partialJson;
+              return;
+            }
+            if (!currentStreamingToolName) {
+              return;
+            }
+            accumulatedInputJson += partialJson;
+            const now = Date.now();
+            if (now - lastInputJsonEmitMs >= 150) {
+              lastInputJsonEmitMs = now;
+              if (pendingInputJsonFlush) {
+                clearTimeout(pendingInputJsonFlush);
+                pendingInputJsonFlush = undefined;
+              }
               onEvent?.({
                 type: "input_json_delta",
                 toolName: currentStreamingToolName,
                 toolUseId: currentStreamingToolUseId!,
                 accumulatedJson: accumulatedInputJson,
               });
-            }
-            currentStreamingToolName = undefined;
-            currentStreamingToolUseId = undefined;
-            accumulatedInputJson = "";
-            // Finalize the resolved input for a `server_tool_use` block (e.g.
-            // the actual web-search query) so the paired `web_search_tool_result`
-            // emits `server_tool_complete` with `resolvedInput` populated.
-            if (currentServerToolUseId && accumulatedServerToolInputJson) {
-              try {
-                const parsed = JSON.parse(accumulatedServerToolInputJson);
-                if (parsed && typeof parsed === "object") {
-                  resolvedServerToolInputs.set(
-                    currentServerToolUseId,
-                    parsed as Record<string, unknown>,
-                  );
+            } else if (!pendingInputJsonFlush) {
+              const toolName = currentStreamingToolName;
+              const toolUseId = currentStreamingToolUseId!;
+              pendingInputJsonFlush = setTimeout(() => {
+                pendingInputJsonFlush = undefined;
+                lastInputJsonEmitMs = Date.now();
+                if (currentStreamingToolName === toolName) {
+                  onEvent?.({
+                    type: "input_json_delta",
+                    toolName,
+                    toolUseId,
+                    accumulatedJson: accumulatedInputJson,
+                  });
                 }
-              } catch {
-                // Malformed partial JSON — drop silently; downstream falls
-                // back to whatever was captured at server_tool_start.
-              }
+              }, 150);
             }
-            currentServerToolUseId = undefined;
-            accumulatedServerToolInputJson = "";
-            // Flush residual text buffer unless it is a sentinel.
-            if (
-              textBuffer.length > 0 &&
-              !isPlaceholderSentinelText(textBuffer)
-            ) {
-              onEvent?.({ type: "text_delta", text: textBuffer });
-            }
-            textBuffer = "";
-          }
-        });
+          });
 
-        stream.on("inputJson", (partialJson) => {
-          if (currentServerToolUseId) {
-            // Server-tool input (e.g. `web_search` query) — accumulate without
-            // emitting `input_json_delta`; the daemon only consumes the
-            // finalized value from `server_tool_complete.resolvedInput`.
-            accumulatedServerToolInputJson += partialJson;
-            return;
-          }
-          if (!currentStreamingToolName) {
-            return;
-          }
-          accumulatedInputJson += partialJson;
-          const now = Date.now();
-          if (now - lastInputJsonEmitMs >= 150) {
-            lastInputJsonEmitMs = now;
-            if (pendingInputJsonFlush) {
-              clearTimeout(pendingInputJsonFlush);
-              pendingInputJsonFlush = undefined;
+          try {
+            return await stream.finalMessage();
+          } catch (error) {
+            // The SDK rejects finalMessage() the moment a tool_use block's
+            // argument JSON stops parsing, discarding everything it streamed.
+            // Salvage the observed prefix instead: completed blocks plus the
+            // malformed call wrapped under `_raw`, which the tool layer bounces
+            // back to the model as an error tool_result so it can self-correct
+            // in the next iteration. Any other rejection rethrows untouched.
+            const salvaged = contentShadow.salvage(error);
+            if (salvaged === undefined) {
+              throw error;
             }
-            onEvent?.({
-              type: "input_json_delta",
-              toolName: currentStreamingToolName,
-              toolUseId: currentStreamingToolUseId!,
-              accumulatedJson: accumulatedInputJson,
-            });
-          } else if (!pendingInputJsonFlush) {
-            const toolName = currentStreamingToolName;
-            const toolUseId = currentStreamingToolUseId!;
-            pendingInputJsonFlush = setTimeout(() => {
-              pendingInputJsonFlush = undefined;
-              lastInputJsonEmitMs = Date.now();
-              if (currentStreamingToolName === toolName) {
-                onEvent?.({
-                  type: "input_json_delta",
-                  toolName,
-                  toolUseId,
-                  accumulatedJson: accumulatedInputJson,
-                });
-              }
-            }, 150);
+            log.warn(
+              {
+                model: streamParams.model,
+                toolName: salvaged.toolName,
+                rawArgsLength: salvaged.rawArgsLength,
+              },
+              "Salvaged stream with unparseable tool-call arguments; returning _raw-wrapped tool call",
+            );
+            return {
+              ...salvaged.message,
+              model: streamParams.model,
+            } as unknown as Anthropic.Message;
           }
-        });
+        };
 
-        try {
-          response = await stream.finalMessage();
-        } catch (error) {
-          // The SDK rejects finalMessage() the moment a tool_use block's
-          // argument JSON stops parsing, discarding everything it streamed.
-          // Salvage the observed prefix instead: completed blocks plus the
-          // malformed call wrapped under `_raw`, which the tool layer bounces
-          // back to the model as an error tool_result so it can self-correct
-          // in the next iteration. Any other rejection rethrows untouched.
-          const salvaged = contentShadow.salvage(error);
-          if (salvaged === undefined) {
-            throw error;
-          }
-          log.warn(
+        response = await streamOnce(params);
+
+        // `pause_turn`: the API paused a long-running server-tool turn (e.g.
+        // web search) mid-execution. The documented resume flow is to re-send
+        // the paused assistant content as-is in a follow-up request; the
+        // model then continues the same turn. Each paused segment is kept so
+        // the returned response carries the full turn's content and summed
+        // usage. On cap-out the paused response returns as-is — downstream
+        // deferred-tail preservation keeps its unresolved `server_tool_use`
+        // blocks intact.
+        while (
+          response.stop_reason === "pause_turn" &&
+          pausedSegments.length < MAX_PAUSE_TURN_CONTINUATIONS
+        ) {
+          pausedSegments.push(response);
+          log.info(
             {
               model: params.model,
-              toolName: salvaged.toolName,
-              rawArgsLength: salvaged.rawArgsLength,
+              continuation: pausedSegments.length,
+              contentBlocks: response.content.length,
             },
-            "Salvaged stream with unparseable tool-call arguments; returning _raw-wrapped tool call",
+            "Anthropic pause_turn — re-sending paused assistant content to resume the turn",
           );
-          response = {
-            ...salvaged.message,
-            model: params.model,
-          } as unknown as Anthropic.Message;
+          params = {
+            ...params,
+            messages: [
+              ...params.messages,
+              { role: "assistant" as const, content: response.content },
+            ],
+          };
+          // Keep the 400-diagnostics dump in the catch block accurate for
+          // continuation requests.
+          sentMessages = params.messages;
+          response = await streamOnce(params);
+        }
+        if (response.stop_reason === "pause_turn") {
+          log.warn(
+            { model: params.model, continuations: pausedSegments.length },
+            "Anthropic pause_turn continuation cap reached; returning paused response as-is",
+          );
         }
       } finally {
         cleanupTimeout();
       }
 
+      // A paused turn spans several billed requests: the assistant content is
+      // every paused segment's content followed by the final response's, and
+      // usage sums across all of them. With no paused segments this reduces
+      // to the single response.
+      const segments = [...pausedSegments, response];
+      const sumOptional = (
+        values: Array<number | null | undefined>,
+      ): number | undefined =>
+        values.some((v) => typeof v === "number")
+          ? values.reduce<number>((acc, v) => acc + (v ?? 0), 0)
+          : undefined;
       return {
-        content: response.content.map((block) =>
-          this.fromAnthropicBlock(block),
-        ),
+        content: segments
+          .flatMap((segment) => segment.content)
+          .map((block) => this.fromAnthropicBlock(block)),
         model: response.model,
         resolvedEndpoint: this.client.baseURL,
         usage: {
-          inputTokens:
-            response.usage.input_tokens +
-            (response.usage.cache_creation_input_tokens ?? 0) +
-            (response.usage.cache_read_input_tokens ?? 0),
-          outputTokens: response.usage.output_tokens,
-          cacheCreationInputTokens:
-            response.usage.cache_creation_input_tokens ?? undefined,
-          cacheReadInputTokens:
-            response.usage.cache_read_input_tokens ?? undefined,
+          inputTokens: segments.reduce(
+            (acc, segment) =>
+              acc +
+              segment.usage.input_tokens +
+              (segment.usage.cache_creation_input_tokens ?? 0) +
+              (segment.usage.cache_read_input_tokens ?? 0),
+            0,
+          ),
+          outputTokens: segments.reduce(
+            (acc, segment) => acc + segment.usage.output_tokens,
+            0,
+          ),
+          cacheCreationInputTokens: sumOptional(
+            segments.map(
+              (segment) => segment.usage.cache_creation_input_tokens,
+            ),
+          ),
+          cacheReadInputTokens: sumOptional(
+            segments.map((segment) => segment.usage.cache_read_input_tokens),
+          ),
         },
         stopReason: response.stop_reason ?? "unknown",
         rawRequest: params,
@@ -1801,7 +1903,7 @@ export class AnthropicProvider implements Provider {
     systemPrompt: string,
     tools?: ToolDefinition[],
   ): Promise<number> {
-    const sentMessages = this.buildSentMessages(messages);
+    const sentMessages = await this.buildSentMessages(messages);
 
     const system = systemPrompt
       ? systemPrompt
@@ -1837,10 +1939,12 @@ export class AnthropicProvider implements Provider {
    * `cache_control` breakpoints (which don't affect token counts) are the
    * only thing layered on top in `sendMessage`.
    */
-  private buildSentMessages(messages: Message[]): Anthropic.MessageParam[] {
+  private async buildSentMessages(
+    messages: Message[],
+  ): Promise<Anthropic.MessageParam[]> {
     // Swap any persisted attachment references back to inline base64 before
     // serializing, so the block transforms below can read `source.data`.
-    messages = resolveMediaReferences(messages);
+    messages = await resolveMediaReferences(messages);
     const formatted = messages
       .map((m) => {
         // Track whether an unknown block was dropped during filtering
@@ -2014,7 +2118,11 @@ export class AnthropicProvider implements Provider {
       formatted[i] = { ...msg, content: stripped };
     }
 
-    return ensureToolPairing(repairOrphanedServerToolBlocks(formatted));
+    const serverToolPairing = analyzeServerToolPairing(formatted);
+    return ensureToolPairing(
+      repairOrphanedServerToolBlocks(formatted, serverToolPairing),
+      serverToolPairing,
+    );
   }
 
   /**

@@ -26,6 +26,7 @@ export {
   AttachmentMetadataSchema,
   ChannelDeliveryResultSchema,
   ChannelReplyPayloadSchema,
+  MessageAudienceSchema,
   PermissionRequestDetailsSchema,
   SlackStreamOpSchema,
   SlackStreamTaskSchema,
@@ -37,6 +38,7 @@ export type {
   AttachmentMetadata,
   ChannelDeliveryResult,
   ChannelReplyPayload,
+  MessageAudience,
   PermissionRequestDetails,
   SlackStreamOp,
   SlackStreamTask,
@@ -71,6 +73,8 @@ export {
   isAdmissionPolicy,
   isAdmissionPolicyExemptChannel,
   isAdmissionPolicyHiddenChannel,
+  meetsAdmissionFloor,
+  TRUST_CLASS_RANK,
 } from "./admission-policy-contract.js";
 
 export type { AdmissionPolicy } from "./admission-policy-contract.js";
@@ -157,6 +161,8 @@ export {
   hashVerificationSecret,
   IdentityBindingStatusSchema,
   ResolveBootstrapSessionIpcParamsSchema,
+  bindsSameIdentity,
+  boundIdentity,
   RevokePendingSessionsIpcParamsSchema,
   SessionLookupIpcResponseSchema,
   SessionMutationIpcResponseSchema,
@@ -172,6 +178,7 @@ export {
 
 export type {
   BindSessionIdentityIpcParams,
+  BoundIdentity,
   CountRecentSendsIpcParams,
   CountRecentSendsIpcResponse,
   CreateInboundSessionIpcParams,
@@ -183,6 +190,7 @@ export type {
   FindActiveSessionIpcParams,
   GetPendingSessionIpcParams,
   IdentityBindingStatus,
+  IdentityBoundSession,
   ResolveBootstrapSessionIpcParams,
   RevokePendingSessionsIpcParams,
   SessionLookupIpcResponse,

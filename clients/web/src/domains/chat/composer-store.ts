@@ -31,6 +31,7 @@ import {
   prepareImageAttachmentForUpload,
 } from "@/domains/chat/components/chat-attachments/attachment-image-resize";
 import { fetchAttachmentContentBlob } from "@/domains/chat/components/chat-attachments/download-attachment";
+import { sniffBlobMimeType } from "@/domains/chat/utils/mime-sniff";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -145,7 +146,20 @@ function uploadLimitLabel(file: File): string {
   return isAutoResizableImage(file) ? "100 MB" : "50 MB";
 }
 
-function canQueueFile(file: File): boolean {
+/**
+ * Whether an attachment is small enough to queue.
+ *
+ * Not a flat cap: an image this store will downscale on the way up is allowed
+ * a larger source than one it has to send as-is.
+ *
+ * Takes the fields rather than a `File` so a caller holding only a picker's
+ * metadata can ask the same question before it has any bytes. The native
+ * pickers do exactly that, and read a file only once this has passed, so the
+ * two paths cannot drift into reading what the store would then reject.
+ */
+export function canQueueFile(
+  file: Pick<File, "name" | "type" | "size">,
+): boolean {
   if (file.size <= MAX_ATTACHMENT_BYTES) {
     return true;
   }
@@ -153,6 +167,35 @@ function canQueueFile(file: File): boolean {
     isAutoResizableImage(file) &&
     file.size <= IMAGE_AUTO_RESIZE_SOURCE_LIMIT_BYTES
   );
+}
+
+/** Chip error for an image whose bytes are not an image at all. */
+const UNREADABLE_IMAGE_ERROR =
+  "This image can't be sent: the file appears to be corrupt or in an unsupported format.";
+
+/**
+ * Whether a file declared as an image holds bytes no image decoder can read.
+ *
+ * The declared type comes from the filename extension, so it is a claim, and
+ * the bytes are what the model provider actually judges: an unreadable payload
+ * costs the whole turn, since an OpenAI-compatible endpoint answers HTTP 400
+ * for the entire request ("The image data you provided does not represent a
+ * valid image"), taking every other image in the message down with it.
+ *
+ * Only a payload matching no known signature is refused here, not every payload
+ * outside the four formats providers accept (PNG, JPEG, GIF, WebP): a HEIC
+ * photo from an iPhone is none of the four and still attaches successfully,
+ * because the assistant transcodes it to JPEG on the way into the attachment
+ * store. Bytes that name nothing have no such route, so this is the subset that
+ * is knowably unsendable from the browser. The provider send boundary is the
+ * authoritative gate for the rest, and names the file in the transcript when it
+ * drops one.
+ */
+async function isUnreadableImage(file: File): Promise<boolean> {
+  if (!file.type.toLowerCase().startsWith("image/")) {
+    return false;
+  }
+  return (await sniffBlobMimeType(file)) === null;
 }
 
 /** Extract the trailing path segment for the chip label, stripping any trailing separator. */
@@ -418,6 +461,10 @@ const useComposerStoreBase = create<ComposerStore>()((set, get) => ({
 
           const uploadFile =
             prepared.status === "failed" ? file : prepared.file;
+          if (await isUnreadableImage(uploadFile)) {
+            markFailed(set, pending.localId, UNREADABLE_IMAGE_ERROR);
+            return;
+          }
           if (uploadFile.size > MAX_ATTACHMENT_BYTES) {
             markFailed(
               set,

@@ -32,8 +32,16 @@
  *       text stay on the ephemeral trio above.
  *   - Invokes the agent loop with all conversation tools available unless
  *     the caller provides an explicit `allowedTools` scope.
- *   - No tool calls AND no assistant text → silent no-op (nothing persisted,
- *     nothing emitted). Returns `{ invoked: true, producedToolCalls: false }`.
+ *   - No tool calls AND no assistant text on a clean model-driven stop →
+ *     silent no-op (nothing persisted, nothing emitted). Returns
+ *     `{ invoked: true, producedToolCalls: false }`. When the no-output run
+ *     instead ended on a non-clean terminal exit (the loop swallowed a
+ *     provider rejection, unhandled throw, or cancellation into a graceful
+ *     no-output stop), returns `{ invoked: false, reason: "run_error" }` so
+ *     state-advancing callers retry instead of recording a phantom pass.
+ *     Callers that pass `requireUsableOutput: true` additionally get
+ *     `{ invoked: false, reason: "no_output" }` for the clean-stop empty
+ *     reply instead of the silent no-op.
  *   - Tool calls produced → normal tool execution runs (the conversation's
  *     `AgentLoop` has its tool executor already wired). Returns
  *     `{ invoked: true, producedToolCalls: true }`.
@@ -64,6 +72,7 @@
 
 import type {
   AgentEvent,
+  AgentLoopExitReason,
   CheckpointDecision,
   CheckpointInfo,
 } from "../agent/loop.js";
@@ -77,6 +86,7 @@ import { getConfig } from "../config/loader.js";
 import type { LLMCallSite } from "../config/schemas/llm.js";
 import { conversationSupportsDynamicUi } from "../daemon/channel-ui-capability.js";
 import type { Conversation } from "../daemon/conversation.js";
+import type { QueueDrainReason } from "../daemon/conversation-queue-manager.js";
 import { recordUsage } from "../daemon/conversation-usage.js";
 import { getDiskPressureStatus } from "../daemon/disk-pressure-guard.js";
 import {
@@ -175,6 +185,28 @@ function buildBackgroundEventText(
 const OVER_WINDOW_REJECTION_LOG_MESSAGE =
   "agent-wake: provider rejected the input as over-window with auto-compaction suppressed; failing the wake";
 
+/**
+ * Terminal `agent_loop_exit` reasons under which a no-output run is a
+ * legitimate silent no-op: the loop reached a real model reply (or a
+ * model-driven stop) and the model simply produced nothing worth emitting.
+ * Every other reason on a no-output run means the pass never committed
+ * usable output, so the wake must report `invoked: false` instead of a
+ * phantom success: `error` (the loop's catch swallowed a provider rejection
+ * or an unhandled throw into a graceful no-output stop), the `aborted_*`
+ * family (cancellation before any output), the overflow terminals, and
+ * `max_tokens_reached` (the output budget was exhausted, e.g. by hidden
+ * thinking, before any visible text or executable tool call landed; a
+ * truncated response that DID produce output takes the normal path and
+ * never reaches this check). Membership is an allowlist deliberately: a
+ * future exit reason defaults to the failure side, which state-advancing
+ * callers recover from by retrying, rather than the data-loss side.
+ */
+const CLEAN_NO_OUTPUT_EXIT_REASONS: ReadonlySet<AgentLoopExitReason> = new Set([
+  "no_tool_calls",
+  "yield_to_user",
+  "checkpoint_handoff",
+]);
+
 export interface WakeOptions {
   conversationId: string;
   hint: string;
@@ -264,6 +296,23 @@ export interface WakeOptions {
    */
   suppressWakeSurface?: boolean;
   /**
+   * Treat a run that commits NO usable output (no executable tool call, no
+   * visible assistant text) as a failure even when the loop's terminal exit
+   * was a clean model-driven stop, e.g. an HTTP-200 reply with an empty
+   * content array or thinking-only output. Default false: generic
+   * opportunity wakes (meet chat, scheduled nudges) legitimately let the
+   * model decide to stay silent, and their silent no-op stays
+   * `invoked: true`.
+   *
+   * Set by state-advancing callers whose trigger is consumed on success and
+   * whose contract requires committed output: the fork-based memory
+   * retrospective advances its processed-message watermark and GCs the
+   * prior retrospective on `invoked: true`, so for it an empty reply is a
+   * failed pass to retry, never a success (LUM-3013). Runs whose output
+   * already went live (checkpoint fired / tail persisted) are unaffected.
+   */
+  requireUsableOutput?: boolean;
+  /**
    * Optional exact tool allowlist for this wake. Used by internal maintenance
    * jobs that need the assistant's judgment but must not execute arbitrary
    * side-effect tools. Enforcement depends on `toolGateMode`: in `"wire"`
@@ -311,7 +360,7 @@ export interface WakeOptions {
    * the conversation belongs to. Used by fork-based memory retrospectives to
    * render the SOURCE conversation's persona sections — both for review
    * quality and for byte-parity with the source's cached system-prompt
-   * prefix. May also pin `hasNoClient` for the prompt build (see
+   * prefix. May also pin presence for the prompt build (see
    * {@link SystemPromptPersonaOverride}). Prompt-build selection only; trust
    * class and approval semantics are governed solely by `trustContext`.
    */
@@ -351,14 +400,14 @@ export interface WakeOptions {
    */
   cronRunId?: string;
   /**
-   * Run the woken turn clientless: pin `hasNoClient = true` for the duration of
-   * the agent-loop run (restored after). Wakes bypass the orchestrator's
-   * turn-start interactivity setup, so a wake on a conversation with no client
-   * attached otherwise derives `isInteractive: true` (the default
-   * `hasNoClient = false`). Pinning it makes `conversation-tool-setup` derive
-   * `isInteractive: false`, which `policy-context` maps to `background`
-   * (guardian) / `headless` (unknown) — so a side-effecting tool that would
-   * prompt is denied instead of stalling on a client that isn't there.
+   * Run the woken turn clientless: pin the per-turn presence
+   * (`currentTurnIsNonInteractive = true`, which `hasNoClient` reads) for the
+   * duration of the agent-loop run (restored after). Wakes bypass the
+   * orchestrator's turn-start interactivity setup, so the pin is what makes
+   * `conversation-tool-setup` derive `isInteractive: false`, which
+   * `policy-context` maps to `background` (guardian) / `headless` (unknown),
+   * so a side-effecting tool that would prompt is denied instead of stalling
+   * on a client that isn't there.
    */
   clientless?: boolean;
 }
@@ -383,16 +432,27 @@ export type WakeSkipReason =
    */
   | "context_overflow"
   /**
-   * The agent loop threw before producing ANY output — no checkpoint fired
-   * and no tail message was emitted or persisted (typically a provider
-   * failure on the run's first LLM call). The wake did no work, so callers
-   * that treat `invoked: true` as "the pass ran" (e.g. the memory
+   * The agent loop terminated abnormally before producing ANY output: either
+   * it threw before a checkpoint fired or a tail message was persisted, or it
+   * swallowed a terminal failure (provider rejection, unhandled throw,
+   * cancellation) into a graceful no-output stop whose `agent_loop_exit`
+   * reason is not a clean model-driven one (typically a provider failure on
+   * the run's first LLM call, e.g. rejected input). The wake did no work, so
+   * callers that treat `invoked: true` as "the pass ran" (e.g. the memory
    * retrospective, which advances its processed-message watermark and
    * finalizes on success) must see a retryable failure rather than a
-   * silent no-op. A throw AFTER output went live keeps `invoked: true` —
+   * silent no-op. A throw AFTER output went live keeps `invoked: true`:
    * side effects have already landed and the run must not read as skipped.
    */
-  | "run_error";
+  | "run_error"
+  /**
+   * The run ended cleanly but committed no usable output (no executable tool
+   * call, no visible assistant text: e.g. an HTTP-200 reply with an empty
+   * content array, or thinking-only output) and the caller passed
+   * `requireUsableOutput: true`. Only possible on such wakes; without the
+   * flag the same run is a silent no-op with `invoked: true`.
+   */
+  | "no_output";
 
 export interface WakeResult {
   invoked: boolean;
@@ -472,6 +532,47 @@ async function defaultResolveTarget(
       "agent-wake: failed to hydrate conversation",
     );
     return null;
+  }
+}
+
+// ── Queue drain kick ──────────────────────────────────────────────────
+
+/**
+ * The queue-drain surface the wake kicks on its way out.
+ *
+ * The hook is optional because the wake runs against whatever
+ * {@link WakeDeps.resolveTarget} hands it, which in tests is a partial
+ * conversation double. Production `Conversation` always provides it.
+ */
+interface WakeDrainTarget {
+  kickDrainQueue?: (
+    reason?: QueueDrainReason,
+    origin?: string,
+  ) => Promise<void>;
+}
+
+/**
+ * Drain the target's message queue once the wake has released the
+ * conversation.
+ *
+ * `Conversation.kickDrainQueue` retries a failed drain once and notifies the
+ * queued senders when the retry also fails, so a stalled wake-tail drain is
+ * visible instead of silently stranding the queue, and it never rejects. An
+ * injected target can still omit the hook or reject from it, and neither may
+ * fail the wake, whose own work is already complete by this point.
+ */
+async function kickWakeDrainQueue(
+  conversation: WakeDrainTarget,
+  origin: string,
+  logContext: { conversationId: string; source: string },
+): Promise<void> {
+  try {
+    await conversation.kickDrainQueue?.("loop_complete", origin);
+  } catch (err) {
+    log.warn(
+      { ...logContext, err },
+      "agent-wake: kickDrainQueue threw; continuing",
+    );
   }
 }
 
@@ -617,9 +718,9 @@ export async function wakeAgentForOpportunity(
   return runWakeSingleFlight(conversationId, async () => {
     // Snapshot the conversation's resting trust before the resolver runs, so
     // it can be restored after. The resolver leaves the wake's trust on the
-    // conversation, and a following no-trust wake would otherwise read it via
-    // tool setup's `currentTurnTrustContext ?? trustContext` fallback. Null
-    // when the conversation isn't resident yet (a fresh hydrate or a fork).
+    // conversation, and a following no-trust wake would otherwise pick it up
+    // from the resting trust its consumers fall back to. Null when the
+    // conversation isn't resident yet (a fresh hydrate or a fork).
     let priorPersistentTrust: TrustContext | null = null;
     if (opts.trustContext) {
       const { findConversation } =
@@ -754,7 +855,7 @@ export async function wakeAgentForOpportunity(
     // Apply the caller's persona override for the duration of the run. The
     // prompt is built once before `agentLoop.run()` (via
     // `conversation.buildCurrentSystemPrompt()`), which reads this field;
-    // cleared (below, before drainQueue) so a queued user turn never builds
+    // cleared (below, before the queue drain) so a queued user turn never builds
     // its prompt under the wake's override. Assigned only AFTER the
     // profile/config reads above — those can throw, and they run before the
     // try/finally that clears the override, so an earlier assignment would
@@ -942,6 +1043,14 @@ export async function wakeAgentForOpportunity(
     // job. Capture the signal here so the wake can fail deterministically
     // instead (`reason: "context_overflow"`).
     let suppressedContextOverflow = false;
+    // Terminal exit reason captured from the loop's `agent_loop_exit` event.
+    // `agentLoop.run()`'s returned `exitReason` only distinguishes checkpoint
+    // handoffs, so this event is the wake's only view of HOW the loop ended.
+    // Read by the no-output branch below to tell a genuine silent no-op
+    // (model produced nothing) from a swallowed terminal failure (the loop's
+    // catch turns provider rejections and unhandled throws into a graceful
+    // no-output stop instead of rethrowing).
+    let terminalExitReason: AgentLoopExitReason | null = null;
     const persistLog = (record: PendingLog): void => {
       try {
         recordRequestLog(
@@ -1072,6 +1181,7 @@ export async function wakeAgentForOpportunity(
       // reason is stashed and applied in `goLive` after pendingLogs are
       // persisted, preserving the same ordering guarantee.
       if (event.type === "agent_loop_exit") {
+        terminalExitReason = event.reason;
         if (mode === "buffering") {
           pendingExitReason = event.reason;
         } else {
@@ -1264,6 +1374,13 @@ export async function wakeAgentForOpportunity(
     // finally's error log names the reported outcome so the line matches
     // what the caller actually saw.
     let reportedRunErrorAsFailure = false;
+    // Set when a no-output run was reported as `invoked: false`, either
+    // because it ended on a non-clean terminal exit reason ("run_error") or
+    // because the caller requires usable output ("no_output"). The failure
+    // site logs its own dedicated warn line; the finally skips its generic
+    // "silent no-op" line for these paths so a failed wake never reads as a
+    // successful empty one.
+    let reportedSwallowedStopAsFailure = false;
     // Shared failure path for an over-window condition on a
     // compaction-suppressed wake (reached from the pre-flight estimate, from
     // the run's catch when the rejection escaped as a throw, or post-run when
@@ -1336,12 +1453,19 @@ export async function wakeAgentForOpportunity(
       // user turn or a later background read never inherits the wake's stamps.
       const priorCallSite = conversation.currentCallSite;
       const priorTurnOverrideProfile = conversation.currentTurnOverrideProfile;
-      const priorHasNoClient = conversation.hasNoClient;
+      const priorTurnCronRunId = conversation.currentTurnCronRunId;
+      const priorTurnIsNonInteractive =
+        conversation.currentTurnIsNonInteractive;
       const priorTurnTrust = conversation.currentTurnTrustContext;
       conversation.currentCallSite = callSite;
       conversation.currentTurnOverrideProfile = overrideProfile;
+      // Same reason as the stamps above: a wake triggered by a schedule firing
+      // delegates work to subagents whose usage must attribute to that firing.
+      conversation.currentTurnCronRunId = opts.cronRunId ?? null;
       if (opts.clientless) {
-        conversation.hasNoClient = true;
+        // Presence is per-turn state; a clientless wake declares no human is
+        // present for the duration of its dispatch.
+        conversation.currentTurnIsNonInteractive = true;
       }
       // Per-turn guardian elevation for the wake's tools, set after the pre-run
       // reads so a pre-run failure can't leak it; restored in the finally.
@@ -1428,7 +1552,8 @@ export async function wakeAgentForOpportunity(
         // at the start of the next normal turn regardless.)
         conversation.currentCallSite = priorCallSite;
         conversation.currentTurnOverrideProfile = priorTurnOverrideProfile;
-        conversation.hasNoClient = priorHasNoClient;
+        conversation.currentTurnCronRunId = priorTurnCronRunId;
+        conversation.currentTurnIsNonInteractive = priorTurnIsNonInteractive;
         conversation.currentTurnTrustContext = priorTurnTrust;
       }
 
@@ -1444,7 +1569,7 @@ export async function wakeAgentForOpportunity(
       // Run completed cleanly. The canonical user-turn pattern
       // (conversation-agent-loop.ts:1860, 2106-2126) updates
       // `ctx.messages` first, then clears the flag via `ctx.setProcessing(false)`, then
-      // calls `ctx.drainQueue(...)`. We mirror that order so a message
+      // calls `ctx.kickDrainQueue(...)`. We mirror that order so a message
       // queued during the wake dequeues against an already-updated
       // history — otherwise `drainSingleMessage` reads `ctx.messages`
       // mid-tail and writes a DB row that lands out of chronological
@@ -1464,10 +1589,58 @@ export async function wakeAgentForOpportunity(
       const producedOutput = producedToolCalls || hasVisibleText;
 
       if (!producedOutput || tailMessages.length === 0) {
+        // No output. Whether that reads as success depends on WHY the loop
+        // stopped: the loop's catch swallows provider rejections, unhandled
+        // throws, and cancellation into a graceful no-output stop instead of
+        // rethrowing, and reporting that as a successful silent no-op lets
+        // state-advancing callers (the memory retrospective watermark, the
+        // scheduler's success feed) permanently consume their trigger on a
+        // pass that never ran. Gate on the terminal exit reason: a clean
+        // model-driven stop is a real silent no-op; anything else fails the
+        // wake so the caller retries.
+        // The went-live guard mirrors the throw path above: once a
+        // checkpoint fired or a tail message was persisted, side effects
+        // have already landed and the run must keep `invoked: true` even if
+        // the returned history's tail slice reads empty (the loop's
+        // deep-repair and recovery-hook paths rebase `history`, which can
+        // misalign the wake's external tail indexes).
+        const nothingWentLive =
+          mode === "buffering" && persistedTailIndex === 0;
+        if (
+          nothingWentLive &&
+          terminalExitReason !== null &&
+          !CLEAN_NO_OUTPUT_EXIT_REASONS.has(terminalExitReason)
+        ) {
+          reportedSwallowedStopAsFailure = true;
+          log.warn(
+            { conversationId, source, exitReason: terminalExitReason },
+            "agent-wake: agent loop ended with no output on a non-clean exit; reported as run_error",
+          );
+          return {
+            invoked: false,
+            producedToolCalls: false,
+            reason: "run_error" as const,
+          };
+        }
+        // Clean stop with no usable output. For callers that consume a
+        // trigger on success (requireUsableOutput), an empty reply is a
+        // failed pass to retry, not a success to record.
+        if (nothingWentLive && opts.requireUsableOutput === true) {
+          reportedSwallowedStopAsFailure = true;
+          log.warn(
+            { conversationId, source, exitReason: terminalExitReason },
+            "agent-wake: agent loop committed no usable output and the caller requires it; reported as no_output",
+          );
+          return {
+            invoked: false,
+            producedToolCalls: false,
+            reason: "no_output" as const,
+          };
+        }
         // Silent no-op: drop buffered events, push nothing, persist
         // nothing, emit nothing. (No checkpoint fired during the run
         // since checkpoints only fire after tool turns and there were
-        // none.) The finally still runs drainQueue so a racy queued
+        // none.) The finally still kicks the queue drain so a racy queued
         // message isn't stranded.
         return { invoked: true, producedToolCalls: false };
       }
@@ -1498,25 +1671,21 @@ export async function wakeAgentForOpportunity(
           "agent-wake: setProcessing(false) threw; continuing",
         );
       }
-      try {
-        await conversation.drainQueue();
-      } catch (err) {
-        log.warn(
-          { conversationId, source, err },
-          "agent-wake: drainQueue threw; continuing",
-        );
-      }
+      await kickWakeDrainQueue(conversation, "agent_wake_tail", {
+        conversationId,
+        source,
+      });
       drainedInTry = true;
 
       return { invoked: true, producedToolCalls };
     } finally {
       // Put the conversation's resting trust back on every exit path.
       restorePersistentWakeTrust();
-      // The success path (above) already called setProcessing(false)
-      // + drainQueue after tail persist. This catch-all handles the
-      // error and early-return paths where no tail was produced — those
-      // exit the try body before reaching the drain block, so
-      // `drainedInTry` is still false.
+      // The success path (above) already called setProcessing(false) and
+      // kicked the queue drain after tail persist. This catch-all handles the
+      // error and early-return paths where no tail was produced: those exit
+      // the try body before reaching the drain block, so `drainedInTry` is
+      // still false.
       if (!drainedInTry) {
         restoreWakeAllowedTools();
         clearWakePersonaOverride();
@@ -1528,19 +1697,15 @@ export async function wakeAgentForOpportunity(
             "agent-wake: setProcessing(false) threw; continuing",
           );
         }
-        try {
-          await conversation.drainQueue();
-        } catch (err) {
-          log.warn(
-            { conversationId, source, err },
-            "agent-wake: drainQueue threw; continuing",
-          );
-        }
+        await kickWakeDrainQueue(conversation, "agent_wake_cleanup", {
+          conversationId,
+          source,
+        });
       }
 
       const durationMs = nowFn() - startedAt;
       const suppressWakeSurface = opts.suppressWakeSurface === true;
-      if (failedContextOverflow) {
+      if (failedContextOverflow || reportedSwallowedStopAsFailure) {
         // Already logged its own dedicated warn line at the failure site;
         // a generic "silent no-op" line here would misclassify a failed
         // wake as a successful empty one.

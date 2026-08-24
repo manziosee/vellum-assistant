@@ -2,9 +2,12 @@ import { useQuery } from "@tanstack/react-query";
 import { CheckCircle, Phone, Send } from "lucide-react";
 import { useMemo, useState } from "react";
 
+import { Trans, useTranslation } from "@/i18n";
+
 import { Button, Input, Typography } from "@vellumai/design-library";
 
 import { SlackSetupWizard } from "@/components/slack-setup-wizard";
+import { TelegramSetupWizard } from "@/components/telegram-setup-wizard";
 import { DetailShell } from "@/components/detail-shell";
 import { channelsReadinessGetOptions } from "@/generated/daemon/@tanstack/react-query.gen";
 import { useSaveSlackConfig } from "@/hooks/use-save-slack-config";
@@ -21,37 +24,37 @@ interface ChannelSetupPanelProps {
   onClose: () => void;
 }
 
-const CHANNEL_META: Record<
-  ChannelSetupType,
-  { label: string; connectedMessage: string }
-> = {
-  slack: {
-    label: "Slack",
-    connectedMessage: "Your assistant is ready to receive messages on Slack.",
-  },
-  telegram: {
-    label: "Telegram",
-    connectedMessage:
-      "Your assistant is ready to receive messages on Telegram.",
-  },
-  phone: {
-    label: "Phone",
-    connectedMessage: "Your assistant is ready for phone calls via Twilio.",
-  },
+const CHANNEL_BRAND_LABEL: Record<ChannelSetupType, string | null> = {
+  slack: "Slack",
+  telegram: "Telegram",
+  phone: null,
 };
 
 export function ChannelSetupPanel({
   payload,
   onClose,
 }: ChannelSetupPanelProps) {
-  const meta = CHANNEL_META[payload.channel];
+  const { t } = useTranslation("chat");
+  const channelLabel =
+    CHANNEL_BRAND_LABEL[payload.channel] ?? t("channelSetupPanel.phoneLabel");
+  const connectedMessage =
+    payload.channel === "slack"
+      ? t("channelSetupPanel.slackConnected")
+      : payload.channel === "telegram"
+        ? t("channelSetupPanel.telegramConnected")
+        : t("channelSetupPanel.phoneConnected");
 
   const saveSlack = useSaveSlackConfig({
     assistantId: payload.assistantId,
     onSuccess: onClose,
   });
+  // Closing on success is what hands off to the assistant: the drawer closing
+  // is what emits the wizard-closed notification the telegram-setup skill
+  // waits on. Slack already does this; leaving Telegram open made its handoff
+  // depend on the user knowing to close the panel themselves.
   const saveTelegram = useSaveTelegramConfig({
     assistantId: payload.assistantId,
+    onSuccess: onClose,
   });
   const saveTwilio = useSaveTwilioCredentials({
     assistantId: payload.assistantId,
@@ -89,8 +92,12 @@ export function ChannelSetupPanel({
     <DetailShell
       icon={channelIcon}
       Glyph={channelGlyph}
-      title={isConnected ? `${meta.label} settings` : `${meta.label} setup`}
-      closeLabel="Close setup panel"
+      title={
+        isConnected
+          ? t("channelSetupPanel.settingsTitle", { channel: channelLabel })
+          : t("channelSetupPanel.setupTitle", { channel: channelLabel })
+      }
+      closeLabel={t("channelSetupPanel.closeSetupAria")}
       onClose={onClose}
     >
       {isConnected ? (
@@ -100,16 +107,16 @@ export function ChannelSetupPanel({
             variant="title-small"
             className="text-[color:var(--content-strong)]"
           >
-            {meta.label} is connected
+            {t("channelSetupPanel.connectedHeading", { channel: channelLabel })}
           </Typography>
           <Typography
             variant="body-small-default"
             className="text-[color:var(--content-subtle)]"
           >
-            {meta.connectedMessage}
+            {connectedMessage}
           </Typography>
           <Button variant="outlined" size="compact" onClick={onClose}>
-            Close
+            {t("channelSetupPanel.close")}
           </Button>
         </div>
       ) : payload.channel === "slack" ? (
@@ -122,9 +129,10 @@ export function ChannelSetupPanel({
           saveError={saveSlack.error?.message ?? null}
         />
       ) : payload.channel === "telegram" ? (
-        <TelegramCredentialForm
-          status={saveTelegram.status}
-          error={saveTelegram.error?.message ?? null}
+        <TelegramSetupWizard
+          assistantName={payload.assistantName}
+          saveStatus={saveTelegram.status}
+          saveError={saveTelegram.error?.message ?? null}
           onSave={(botToken) => saveTelegram.mutate(botToken)}
         />
       ) : payload.channel === "phone" ? (
@@ -137,78 +145,6 @@ export function ChannelSetupPanel({
         />
       ) : null}
     </DetailShell>
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Telegram credential form
-// ---------------------------------------------------------------------------
-
-interface TelegramCredentialFormProps {
-  status: "idle" | "pending" | "success" | "error";
-  error: string | null;
-  onSave: (botToken: string) => void;
-}
-
-function TelegramCredentialForm({
-  status,
-  error,
-  onSave,
-}: TelegramCredentialFormProps) {
-  const [botToken, setBotToken] = useState("");
-
-  return (
-    <div className="flex flex-col gap-4 px-4 py-3">
-      <Typography
-        variant="body-small-default"
-        className="text-[color:var(--content-secondary)]"
-      >
-        Enter the bot token from{" "}
-        <a
-          href="https://t.me/BotFather"
-          target="_blank"
-          rel="noopener noreferrer"
-          className="text-[color:var(--content-link)] hover:underline"
-        >
-          @BotFather
-        </a>
-        . After saving, return to the chat — your assistant will finish
-        configuring the webhook and bot commands.
-      </Typography>
-      <Input
-        label="Bot Token"
-        type="password"
-        value={botToken}
-        onChange={(e) => setBotToken(e.target.value)}
-        placeholder="123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
-        disabled={status === "pending"}
-        fullWidth
-      />
-      {status === "error" && error ? (
-        <Typography
-          variant="body-small-default"
-          className="text-[color:var(--system-negative-strong)]"
-        >
-          {error}
-        </Typography>
-      ) : null}
-      {status === "success" ? (
-        <Typography
-          variant="body-small-default"
-          className="text-[color:var(--content-positive)]"
-        >
-          Credentials saved. Return to the chat to finish setup.
-        </Typography>
-      ) : null}
-      <div>
-        <Button
-          onClick={() => onSave(botToken)}
-          disabled={!botToken.trim() || status === "pending"}
-        >
-          {status === "pending" ? "Saving…" : "Save"}
-        </Button>
-      </div>
-    </div>
   );
 }
 
@@ -227,6 +163,7 @@ function TwilioCredentialForm({
   error,
   onSave,
 }: TwilioCredentialFormProps) {
+  const { t } = useTranslation("chat");
   const [accountSid, setAccountSid] = useState("");
   const [authToken, setAuthToken] = useState("");
 
@@ -236,33 +173,36 @@ function TwilioCredentialForm({
         variant="body-small-default"
         className="text-[color:var(--content-secondary)]"
       >
-        Enter your Twilio credentials from the{" "}
-        <a
-          href="https://console.twilio.com"
-          target="_blank"
-          rel="noopener noreferrer"
-          className="text-[color:var(--content-link)] hover:underline"
-        >
-          Twilio Console
-        </a>
-        . After saving, return to the chat — your assistant will finish
-        configuring your phone number and webhooks.
+        <Trans
+          ns="chat"
+          i18nKey="channelSetupPanel.twilioIntro"
+          components={{
+            consoleLink: (
+              <a
+                href="https://console.twilio.com"
+                target="_blank"
+                rel="noopener noreferrer"
+                className="text-[color:var(--content-link)] hover:underline"
+              />
+            ),
+          }}
+        />
       </Typography>
       <Input
-        label="Account SID"
+        label={t("channelSetupPanel.accountSid")}
         type="text"
         value={accountSid}
         onChange={(e) => setAccountSid(e.target.value)}
-        placeholder="ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+        placeholder={t("channelSetupPanel.accountSidPlaceholder")}
         disabled={status === "pending"}
         fullWidth
       />
       <Input
-        label="Auth Token"
+        label={t("channelSetupPanel.authToken")}
         type="password"
         value={authToken}
         onChange={(e) => setAuthToken(e.target.value)}
-        placeholder="Twilio auth token"
+        placeholder={t("channelSetupPanel.authTokenPlaceholder")}
         disabled={status === "pending"}
         fullWidth
       />
@@ -279,7 +219,7 @@ function TwilioCredentialForm({
           variant="body-small-default"
           className="text-[color:var(--content-positive)]"
         >
-          Credentials saved. Return to the chat to finish setup.
+          {t("channelSetupPanel.credentialsSaved")}
         </Typography>
       ) : null}
       <div>
@@ -289,7 +229,7 @@ function TwilioCredentialForm({
             !accountSid.trim() || !authToken.trim() || status === "pending"
           }
         >
-          {status === "pending" ? "Saving…" : "Save"}
+          {status === "pending" ? t("channelSetupPanel.saving") : t("channelSetupPanel.save")}
         </Button>
       </div>
     </div>

@@ -10,6 +10,7 @@ import {
   isTextInsertionPermissionError,
 } from "@/domains/chat/utils/chat";
 import { Button, Notice } from "@vellumai/design-library";
+import { useTranslation } from "@/i18n";
 
 /**
  * Orchestration banner stack rendered above the chat composer's form (in
@@ -47,6 +48,12 @@ export interface ComposerNoticesProps {
    * derived from runtime metrics owned by the page.
    */
   diskPressureBanner?: ReactNode | null;
+
+  /**
+   * Pre-rendered resource-pressure banner from the chat page, or `null`
+   * when resource pressure is inactive or yielding to disk pressure.
+   */
+  resourcePressureBanner?: ReactNode | null;
 
   /**
    * Pre-rendered provider-billing banner, or `null` when no billing
@@ -87,6 +94,7 @@ export function ComposerNotices({
   onOpenMicSettings,
   onOpenTextInsertionSettings,
   diskPressureBanner,
+  resourcePressureBanner,
   billingBannerSlot,
   showMissingApiKeyBanner,
   onOpenAiSettings,
@@ -98,6 +106,7 @@ export function ComposerNotices({
   assistantId,
   onMaintenanceExited,
 }: ComposerNoticesProps) {
+  const { t } = useTranslation("chat");
   return (
     <>
       {voiceError && (
@@ -112,7 +121,7 @@ export function ComposerNotices({
                   size="compact"
                   onClick={onRetryMicPermission}
                 >
-                  Allow Microphone
+                  {t("composerNotices.allowMicrophone")}
                 </Button>
               ) : isMicPermissionPermanentError(voiceError) &&
                 onOpenMicSettings ? (
@@ -123,7 +132,7 @@ export function ComposerNotices({
                     void onOpenMicSettings();
                   }}
                 >
-                  Open Settings
+                  {t("composerNotices.openSettings")}
                 </Button>
               ) : isTextInsertionPermissionError(voiceError) &&
                 onOpenTextInsertionSettings ? (
@@ -134,7 +143,7 @@ export function ComposerNotices({
                     void onOpenTextInsertionSettings();
                   }}
                 >
-                  Open Settings
+                  {t("composerNotices.openSettings")}
                 </Button>
               ) : undefined
             }
@@ -143,9 +152,11 @@ export function ComposerNotices({
           </Notice>
         </div>
       )}
-      {diskPressureBanner ? (
-        <div className="mb-2">{diskPressureBanner}</div>
-      ) : null}
+      {/* Rendered bare: each slot is always a truthy element and decides for
+          itself whether it has a banner, so a wrapper here would stand in the
+          stack even when it renders nothing. Each brings its own spacing. */}
+      {diskPressureBanner}
+      {resourcePressureBanner}
       {billingBannerSlot}
       {showMissingApiKeyBanner && (
         <div className="mb-2">

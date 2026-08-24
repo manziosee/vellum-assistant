@@ -1,8 +1,11 @@
 import {
   isLocalClient,
   getLocalGatewayUrl,
+  getPairedGatewayUrl,
+  getSelectedAssistant,
   isRemoteGatewayMode,
 } from "@/lib/local-mode";
+import { getSelfHostedIngressUrl } from "@/lib/self-hosted/connection";
 import type { LockfileAssistant } from "@/runtime/local-mode-host";
 
 /**
@@ -60,11 +63,30 @@ export function isGatewayAuthEnabled(): boolean {
   if (isRemoteGatewayMode()) {
     return true;
   }
-  return isLocalClient() && getLocalGatewayUrl() != null;
+  if (!isLocalClient()) {
+    return false;
+  }
+  return (
+    getLocalGatewayUrl() != null ||
+    getPairedGatewayUrl(getSelectedAssistant()) != null
+  );
 }
 
 export function isGatewayAuthMode(): boolean {
-  return isGatewayAuthEnabled() && getGatewayToken() !== null;
+  if (!isGatewayAuthEnabled()) {
+    return false;
+  }
+  if (!isRemoteGatewayMode()) {
+    const selectedAssistant = getSelectedAssistant();
+    const pairedGatewayUrl = getPairedGatewayUrl(selectedAssistant);
+    if (pairedGatewayUrl != null) {
+      return (
+        getSelfHostedIngressUrl() ===
+        `${window.location.origin}${pairedGatewayUrl}`
+      );
+    }
+  }
+  return getGatewayToken() !== null;
 }
 
 function isTokenExpired(expiresAt: number): boolean {
@@ -122,6 +144,28 @@ export function getGatewayToken(): string | null {
   return null;
 }
 
+/**
+ * Install a gateway-minted actor bearer in the in-memory and localStorage
+ * slots used by `getGatewayToken()`. Paired guardian credentials never enter
+ * this module; their trusted host proxy owns acquisition and injection.
+ */
+export function seedGatewayToken(params: {
+  token: string;
+  expiresAtEpochSeconds: number;
+  source: string;
+}): void {
+  try {
+    localStorage.setItem(LS_TOKEN_KEY, params.token);
+    localStorage.setItem(LS_EXPIRES_KEY, String(params.expiresAtEpochSeconds));
+    localStorage.setItem(LS_TOKEN_SOURCE_KEY, params.source);
+  } catch {
+    // localStorage unavailable
+  }
+  cachedToken = params.token;
+  cachedExpiresAt = params.expiresAtEpochSeconds;
+  cachedTokenSource = params.source;
+}
+
 async function acquireGatewayToken(
   tokenUrl?: string,
   guardianToken?: string,
@@ -142,22 +186,28 @@ async function acquireGatewayToken(
     token: string;
     expiresAt: number;
   };
-  try {
-    localStorage.setItem(LS_TOKEN_KEY, token);
-    localStorage.setItem(LS_EXPIRES_KEY, String(expiresAt));
-    localStorage.setItem(LS_TOKEN_SOURCE_KEY, url);
-  } catch {
-    // localStorage unavailable
-  }
-  cachedToken = token;
-  cachedExpiresAt = expiresAt;
-  cachedTokenSource = url;
+  seedGatewayToken({ token, expiresAtEpochSeconds: expiresAt, source: url });
   return token;
+}
+
+/**
+ * Options for {@link ensureGatewayToken}.
+ *
+ * `forceMint` skips the cached token and mints a fresh one even when the
+ * cache holds an unexpired value. Callers use it when the gateway has
+ * rejected the cached token (its expiry is local bookkeeping; a rotated
+ * signing key rejects it early). The cached token stays in place until
+ * the mint seeds its replacement, so `getGatewayToken()` never reads null
+ * mid-mint and predicates such as `isGatewayAuthMode()` hold steady.
+ */
+export interface EnsureGatewayTokenOptions {
+  forceMint?: boolean;
 }
 
 export async function ensureGatewayToken(
   tokenUrl?: string,
   guardianToken?: string,
+  { forceMint = false }: EnsureGatewayTokenOptions = {},
 ): Promise<string> {
   const source = tokenUrl ?? "/auth/token";
   const storedSource =
@@ -167,9 +217,11 @@ export async function ensureGatewayToken(
   if (storedSource && storedSource !== source) {
     clearGatewayToken();
   }
-  const existing = getGatewayToken();
-  if (existing) {
-    return existing;
+  if (!forceMint) {
+    const existing = getGatewayToken();
+    if (existing) {
+      return existing;
+    }
   }
   return acquireGatewayToken(tokenUrl, guardianToken);
 }

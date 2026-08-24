@@ -1,9 +1,15 @@
 import { useQuery } from "@tanstack/react-query";
 import { AlertTriangle } from "lucide-react";
-import { useCallback, useMemo, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  type ReactNode,
+} from "react";
 import { Link, useNavigate, useSearchParams } from "react-router";
 
-import { Dropdown } from "@vellumai/design-library";
+import { Select } from "@vellumai/design-library/components/select";
 
 import { buildCallSiteMetadataMap } from "@/domains/settings/billing/usage/call-site-metadata";
 import {
@@ -41,12 +47,12 @@ import {
   shouldFallbackUsageGroupBy,
   shouldFetchUsageSeries,
   shouldRetryUsageGroupQuery,
-  trendTitle,
   USAGE_GROUP_BY_OPTIONS,
   type UsageSearchParamsUpdate,
 } from "@/domains/settings/billing/usage/usage-tab-state";
 import type {
   UsageBreakdownResponse,
+  UsageGranularity,
   UsageGroupBreakdown,
   UsageGroupBy,
   UsageTimeRange,
@@ -63,6 +69,7 @@ import {
   schedulesGetQueryKey,
 } from "@/generated/daemon/@tanstack/react-query.gen";
 import { PromptLaunchButton } from "@/components/prompt-launch-button";
+import { useTranslation } from "@/i18n";
 import { navigateToConversation } from "@/utils/conversation-navigation";
 import { isModifiedLinkClick } from "@/utils/link-click";
 import { extractUsageProfileMetadata } from "@/utils/profile-metadata";
@@ -74,19 +81,54 @@ interface UsageTabProps {
   assistantId: string;
 }
 
+type SettingsTranslate = ReturnType<typeof useTranslation<"settings">>["t"];
+
 type UsageBreakdownState = {
   groupBy: UsageGroupBy;
   response: UsageBreakdownResponse;
 };
 
-const RANGE_OPTIONS: { value: UsageTimeRange; label: string }[] = [
-  { value: "today", label: "Today" },
-  { value: "yesterday", label: "Yesterday" },
-  { value: "7d", label: "Last 7 days" },
-  { value: "30d", label: "Last 30 days" },
-  { value: "90d", label: "Last 90 days" },
-  { value: "all", label: "All time" },
-];
+const USAGE_RANGE_KEYS: Record<UsageTimeRange, "usageTab.rangeToday" | "usageTab.rangeYesterday" | "usageTab.range7d" | "usageTab.range30d" | "usageTab.range90d" | "usageTab.rangeAll"> = {
+  today: "usageTab.rangeToday",
+  yesterday: "usageTab.rangeYesterday",
+  "7d": "usageTab.range7d",
+  "30d": "usageTab.range30d",
+  "90d": "usageTab.range90d",
+  all: "usageTab.rangeAll",
+};
+
+const USAGE_GROUP_BY_KEYS: Record<UsageGroupBy, "usageTab.groupByTask" | "usageTab.groupByProfile" | "usageTab.groupByModel" | "usageTab.groupByProvider" | "usageTab.groupByActor" | "usageTab.groupByConversation" | "usageTab.groupBySchedule"> = {
+  task: "usageTab.groupByTask",
+  profile: "usageTab.groupByProfile",
+  model: "usageTab.groupByModel",
+  provider: "usageTab.groupByProvider",
+  actor: "usageTab.groupByActor",
+  conversation: "usageTab.groupByConversation",
+  schedule: "usageTab.groupBySchedule",
+};
+
+function usageGroupLabel(t: SettingsTranslate, groupBy: UsageGroupBy): string {
+  return t(USAGE_GROUP_BY_KEYS[groupBy]);
+}
+
+function usageTrendTitle(
+  t: SettingsTranslate,
+  rangeGranularity: UsageGranularity,
+  groupBy?: UsageGroupBy,
+): string {
+  const prefix =
+    rangeGranularity === "hourly"
+      ? t("usageTab.hourlyTrend")
+      : t("usageTab.dailyTrend");
+  if (!groupBy || groupBy === "conversation") {
+    return prefix;
+  }
+
+  const group = usageGroupLabel(t, groupBy);
+  return rangeGranularity === "hourly"
+    ? t("usageTab.hourlyTrendBy", { group })
+    : t("usageTab.dailyTrendBy", { group });
+}
 
 const PROFILE_METADATA_STALE_TIME_MS = 5 * 60 * 1000;
 const COST_ANALYSIS_PROMPT = [
@@ -103,6 +145,7 @@ const COST_OPTIMIZATION_PROMPT = [
 ].join(" ");
 
 export function UsageTab({ assistantId }: UsageTabProps) {
+  const { t } = useTranslation("settings");
   const [searchParams, setSearchParams] = useSearchParams();
   const { range, groupBy, scheduleId } = useMemo(
     () => readUsageUrlState(searchParams),
@@ -199,6 +242,21 @@ export function UsageTab({ assistantId }: UsageTabProps) {
   });
 
   const effectiveGroupBy = breakdownQuery.data?.groupBy ?? groupBy;
+
+  // The breakdown query falls back to a supported grouping when this gateway
+  // rejects the requested one, so `effectiveGroupBy` is what the page is
+  // actually showing. Adopt it into the URL: leaving the two apart means the
+  // address bar keeps asking for a grouping this gateway cannot serve, and
+  // every load pays the rejected request again. Converges in one pass, since
+  // the fallback grouping is by definition one the gateway supports.
+  useEffect(() => {
+    if (effectiveGroupBy !== groupBy) {
+      updateUsageSearchParams({
+        groupBy: effectiveGroupBy,
+        scheduleId: effectiveGroupBy === "schedule" ? undefined : null,
+      });
+    }
+  }, [effectiveGroupBy, groupBy, updateUsageSearchParams]);
   const seriesGroupBy = shouldFetchUsageSeries(effectiveGroupBy)
     ? effectiveGroupBy
     : undefined;
@@ -353,14 +411,14 @@ export function UsageTab({ assistantId }: UsageTabProps) {
       return undefined;
     }
 
-    return buildSelectedScheduleLegendItems(schedulesQuery.data, scheduleId);
-  }, [effectiveGroupBy, scheduleId, schedulesQuery.data]);
+    return buildSelectedScheduleLegendItems(
+      schedulesQuery.data,
+      scheduleId,
+      t,
+    );
+  }, [effectiveGroupBy, scheduleId, schedulesQuery.data, t]);
 
   const handleGroupByChange = (nextGroupBy: UsageGroupBy) => {
-    if (nextGroupBy === groupBy && effectiveGroupBy !== groupBy) {
-      void breakdownQuery.refetch();
-      void seriesQuery.refetch();
-    }
     updateUsageSearchParams({
       groupBy: nextGroupBy,
       scheduleId: nextGroupBy === "schedule" ? undefined : null,
@@ -374,14 +432,14 @@ export function UsageTab({ assistantId }: UsageTabProps) {
           className="text-title-small"
           style={{ color: "var(--content-default)" }}
         >
-          Usage
+          {t("usageTab.title")}
         </h3>
         <div className="flex flex-wrap items-center justify-end gap-2">
           <TimeRangeStrip range={range} onChange={handleRangeChange} />
         </div>
       </div>
 
-      <section aria-label="Totals">
+      <section aria-label={t("usageTab.totalsAriaLabel")}>
         <QueryState
           query={totalsQuery}
           skeleton={<TotalsSkeleton />}
@@ -389,14 +447,14 @@ export function UsageTab({ assistantId }: UsageTabProps) {
         />
       </section>
 
-      <Section title="Inference Usage">
+      <Section title={t("usageTab.inferenceUsageTitle")}>
         <div className="flex flex-col gap-3">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <h4
               className="text-body-medium-default"
               style={{ color: "var(--content-default)" }}
             >
-              {trendTitle(effectiveGranularity, trendGroupBy)}
+              {usageTrendTitle(t, effectiveGranularity, trendGroupBy)}
             </h4>
             <div className="flex flex-wrap items-center justify-end gap-2">
               <GroupByPicker
@@ -429,6 +487,7 @@ export function UsageTab({ assistantId }: UsageTabProps) {
 function buildSelectedScheduleLegendItems(
   schedules: readonly Pick<AssistantSchedule, "id" | "name">[] | undefined,
   selectedScheduleId: string,
+  t: SettingsTranslate,
 ): UsageTrendChartLegendItem[] {
   const knownSchedules = schedules ?? [];
   const hasSelectedSchedule = knownSchedules.some(
@@ -440,7 +499,9 @@ function buildSelectedScheduleLegendItems(
       : [
           {
             id: selectedScheduleId,
-            label: unknownScheduleLabel(selectedScheduleId),
+            label: t("usageTab.unknownSchedule", {
+              scheduleId: selectedScheduleId,
+            }),
           },
         ]),
     ...knownSchedules.map((schedule) => ({
@@ -457,11 +518,9 @@ function buildSelectedScheduleLegendItems(
   }));
 }
 
-function unknownScheduleLabel(scheduleId: string) {
-  return `Unknown schedule (${scheduleId})`;
-}
-
 function CostAssistantSection() {
+  const { t } = useTranslation("settings");
+
   return (
     <div className="flex flex-col gap-3">
       <div
@@ -472,15 +531,15 @@ function CostAssistantSection() {
         }}
       />
       <Section
-        title="Cost assistant"
-        subtitle="Review recent spend and tune model profile choices."
+        title={t("usageTab.costAssistantTitle")}
+        subtitle={t("usageTab.costAssistantSubtitle")}
       >
         <div className="flex flex-col gap-2 rounded-md px-3 py-3 sm:flex-row sm:items-center">
           <PromptLaunchButton prompt={COST_ANALYSIS_PROMPT}>
-            Analyze costs with assistant
+            {t("usageTab.analyzeCostsButton")}
           </PromptLaunchButton>
           <PromptLaunchButton prompt={COST_OPTIMIZATION_PROMPT} variant="ghost">
-            Optimize settings
+            {t("usageTab.optimizeSettingsButton")}
           </PromptLaunchButton>
         </div>
       </Section>
@@ -495,15 +554,22 @@ function TimeRangeStrip({
   range: UsageTimeRange;
   onChange: (range: UsageTimeRange) => void;
 }) {
+  const { t } = useTranslation("settings");
+  const rangeOptions = (
+    Object.entries(USAGE_RANGE_KEYS) as Array<
+      [UsageTimeRange, (typeof USAGE_RANGE_KEYS)[UsageTimeRange]]
+    >
+  ).map(([value, key]) => ({
+    value,
+    label: t(key),
+  }));
+
   return (
     <div className="flex items-center">
-      <Dropdown<UsageTimeRange>
+      <Select<UsageTimeRange>
         value={range}
         onChange={onChange}
-        options={RANGE_OPTIONS.map((option) => ({
-          value: option.value,
-          label: option.label,
-        }))}
+        options={rangeOptions}
       />
     </div>
   );
@@ -563,6 +629,8 @@ function QueryState<T>({
   skeleton: ReactNode;
   render: (data: T) => ReactNode;
 }) {
+  const { t } = useTranslation("settings");
+
   if (query.isLoading) {
     return <>{skeleton}</>;
   }
@@ -570,7 +638,7 @@ function QueryState<T>({
     const message =
       query.error instanceof Error
         ? query.error.message
-        : "Failed to load usage.";
+        : t("usageTab.failedToLoadUsage");
     return <ErrorRow message={message} onRetry={() => query.refetch()} />;
   }
   if (!query.data) {
@@ -580,6 +648,8 @@ function QueryState<T>({
 }
 
 function TotalsGrid({ totals }: { totals: UsageTotals }) {
+  const { t } = useTranslation("settings");
+
   return (
     <div className="flex flex-col gap-4">
       <div className="flex flex-wrap items-baseline justify-between gap-4">
@@ -598,7 +668,7 @@ function TotalsGrid({ totals }: { totals: UsageTotals }) {
             className="text-body-small-default"
             style={{ color: "var(--content-secondary)" }}
           >
-            Cost
+            {t("usageTab.costLabel")}
           </span>
         </div>
         <div className="flex flex-col gap-1">
@@ -612,26 +682,26 @@ function TotalsGrid({ totals }: { totals: UsageTotals }) {
             className="text-body-small-default"
             style={{ color: "var(--content-secondary)" }}
           >
-            LLM Calls
+            {t("usageTab.llmCallsLabel")}
           </span>
         </div>
       </div>
 
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
         <SecondaryMetric
-          label="Direct Input Tokens"
+          label={t("usageTab.directInputTokensLabel")}
           value={formatTokens(totals.totalInputTokens)}
         />
         <SecondaryMetric
-          label="Output Tokens"
+          label={t("usageTab.outputTokensLabel")}
           value={formatTokens(totals.totalOutputTokens)}
         />
         <SecondaryMetric
-          label="Cache Created"
+          label={t("usageTab.cacheCreatedLabel")}
           value={formatTokens(totals.totalCacheCreationTokens)}
         />
         <SecondaryMetric
-          label="Cache Read"
+          label={t("usageTab.cacheReadLabel")}
           value={formatTokens(totals.totalCacheReadTokens)}
         />
       </div>
@@ -702,16 +772,18 @@ function GroupByPicker({
   value: UsageGroupBy;
   onChange: (value: UsageGroupBy) => void;
 }) {
+  const { t } = useTranslation("settings");
+
   return (
     <div className="flex items-center">
-      <Dropdown<UsageGroupBy>
+      <Select<UsageGroupBy>
         value={value}
         onChange={onChange}
         menuAlign="end"
         menuMinWidth={196}
         options={USAGE_GROUP_BY_OPTIONS.map((option) => ({
           value: option.value,
-          label: option.label,
+          label: usageGroupLabel(t, option.value),
         }))}
       />
     </div>
@@ -727,6 +799,7 @@ function BreakdownSection({
   query: QueryStateValue<UsageBreakdownState>;
   groups: UsageGroupBreakdown[] | undefined;
 }) {
+  const { t } = useTranslation("settings");
   const [visibleColumns, setVisibleColumns] = useState<
     Set<BreakdownOptionalColumn>
   >(new Set());
@@ -744,21 +817,21 @@ function BreakdownSection({
   };
 
   return (
-    <Section title="Breakdown">
+    <Section title={t("usageTab.breakdownTitle")}>
       <div className="flex flex-col gap-3">
         <div className="flex flex-wrap items-center gap-2">
           <ColumnToggle
-            label="% of total"
+            label={t("usageTab.percentOfTotalLabel")}
             active={visibleColumns.has("pct")}
             onClick={() => toggleColumn("pct")}
           />
           <ColumnToggle
-            label="Tokens"
+            label={t("usageTab.tokensLabel")}
             active={visibleColumns.has("tokens")}
             onClick={() => toggleColumn("tokens")}
           />
           <ColumnToggle
-            label="Turns"
+            label={t("usageTab.turnsLabel")}
             active={visibleColumns.has("turns")}
             onClick={() => toggleColumn("turns")}
           />
@@ -821,13 +894,14 @@ function BreakdownTable({
   showTokens: boolean;
   showTurns: boolean;
 }) {
+  const { t } = useTranslation("settings");
   const navigate = useNavigate();
 
   if (groups.length === 0) {
     return (
       <EmptyState
-        title="No breakdown data"
-        subtitle="No usage recorded for this grouping"
+        title={t("usageTab.noBreakdownDataTitle")}
+        subtitle={t("usageTab.noBreakdownDataSubtitle")}
       />
     );
   }
@@ -843,14 +917,14 @@ function BreakdownTable({
               className="px-3 py-2.5 text-left text-label-medium-default"
               style={{ color: "var(--content-tertiary)" }}
             >
-              Group
+              {t("usageTab.groupColumnLabel")}
             </th>
             {showTokens ? (
               <th
                 className="px-3 py-2.5 text-left text-label-medium-default"
                 style={{ color: "var(--content-tertiary)", width: "35%" }}
               >
-                Tokens
+                {t("usageTab.tokensLabel")}
               </th>
             ) : null}
             {showTurns ? (
@@ -858,7 +932,7 @@ function BreakdownTable({
                 className="px-3 py-2.5 text-right text-label-medium-default"
                 style={{ color: "var(--content-tertiary)", width: "72px" }}
               >
-                Turns
+                {t("usageTab.turnsLabel")}
               </th>
             ) : null}
             {showPct ? (
@@ -873,7 +947,7 @@ function BreakdownTable({
               className="px-3 py-2.5 text-right text-label-medium-default"
               style={{ color: "var(--content-tertiary)", width: "100px" }}
             >
-              Cost
+              {t("usageTab.costLabel")}
             </th>
           </tr>
         </thead>
@@ -1059,6 +1133,8 @@ function ErrorRow({
   message: string;
   onRetry?: () => void;
 }) {
+  const { t } = useTranslation("settings");
+
   return (
     <div className="flex flex-col gap-2 py-2">
       <div className="flex items-start gap-2">
@@ -1084,7 +1160,7 @@ function ErrorRow({
             color: "var(--content-default)",
           }}
         >
-          Retry
+          {t("usageTab.retry")}
         </button>
       ) : null}
     </div>

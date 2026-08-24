@@ -18,7 +18,15 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { formatRememberEntry } from "../graph/tool-handlers.js";
+import {
+  formatRememberEntry,
+  matchBufferEntryStart,
+} from "../buffer-format.js";
+import {
+  extractWikilinkTargets,
+  WIKILINK_REGEX,
+  wikilinkTarget,
+} from "../substrate/page-links.js";
 import type { MemoryGraphEdge, MemoryGraphNode } from "./types.js";
 
 /** Node id prefix marking a pending buffer entry (id = prefix + text hash). */
@@ -36,21 +44,9 @@ const MAX_PENDING_NODES = 200;
 
 const PENDING_LABEL_MAX_CHARS = 60;
 
-/**
- * Matches a real entry start: `- [Mon D, h:mm AM/PM] fact`, the exact shape
- * `formatRememberEntry` writes. The timestamp must be present and
- * timestamp-shaped — a bullet with other bracketed text (e.g. a `- [ ]`
- * checklist item inside a multiline fact) is a continuation, not an entry.
- */
-const BUFFER_ENTRY_REGEX =
-  /^-\s+\[[A-Z][a-z]{2}\s+\d{1,2},\s+\d{1,2}:\d{2}\s+[AP]M\]\s*(.*)$/;
-
 /** Lenient fallback for hand-written buffers: a plain bullet with no
  * timestamped entry seen yet still counts as an entry of its own. */
 const PLAIN_BULLET_REGEX = /^-\s+(.+)$/;
-
-/** Matches `[[slug]]` / `[[slug|label]]` wikilinks inside an entry. */
-const WIKILINK_REGEX = /\[\[([^[\]|]+)(?:\|[^\]]*)?\]\]/g;
 
 export interface PendingBufferEntry {
   /** Stable node id (`buffer:` + content hash, deduped within one parse). */
@@ -102,10 +98,12 @@ export function parseBufferEntries(content: string): PendingBufferEntry[] {
 
   for (const rawLine of content.split("\n")) {
     const line = rawLine.trimEnd();
-    const entryStart = BUFFER_ENTRY_REGEX.exec(line.trim());
+    // Matched against the untrimmed line: an indented entry-shaped bullet is
+    // body text inside the fact above it, not a fact of its own.
+    const entryStart = matchBufferEntryStart(line);
     if (entryStart) {
       flush();
-      current = [entryStart[1]!.trim()];
+      current = [entryStart.text];
       continue;
     }
     if (current !== null) {
@@ -120,13 +118,7 @@ export function parseBufferEntries(content: string): PendingBufferEntry[] {
   flush();
 
   for (const text of texts) {
-    const slugs: string[] = [];
-    for (const link of text.matchAll(WIKILINK_REGEX)) {
-      const slug = link[1]!.trim();
-      if (slug && !slugs.includes(slug)) {
-        slugs.push(slug);
-      }
-    }
+    const slugs = [...new Set(extractWikilinkTargets(text))];
 
     const hash = hashText(text);
     const count = (seen.get(hash) ?? 0) + 1;
@@ -148,8 +140,9 @@ export function parseBufferEntries(content: string): PendingBufferEntry[] {
 function pendingLabel(text: string): string {
   const firstLine = text.split("\n", 1)[0] ?? text;
   const plain = firstLine
-    .replace(WIKILINK_REGEX, (_match, slug: string) => {
-      return slug.trim().split("/").pop() ?? slug;
+    .replace(WIKILINK_REGEX, (_match, inner: string) => {
+      const slug = wikilinkTarget(inner);
+      return slug.split("/").pop() || slug;
     })
     .trim();
   if (plain.length <= PENDING_LABEL_MAX_CHARS) {

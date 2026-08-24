@@ -21,6 +21,7 @@ import {
   skillsGetOptions,
   workspaceTreeGetOptions,
 } from "@/generated/daemon/@tanstack/react-query.gen";
+import { useTranslation } from "@/i18n";
 import { installedPluginsQueryOptions } from "@/lib/installed-plugins-query";
 import { fetchSchedules } from "@/utils/schedules";
 
@@ -36,12 +37,19 @@ export interface SchedulePreview {
 export interface IdentitySectionStat {
   /** Hero numeral, rendered display-size on the card. */
   value?: number;
-  /** Small unit label under the hero numeral ("installed", "people"). */
+  /**
+   * Small unit label under the hero numeral ("installed", "people"). Names
+   * the unit only; the card supplies the number.
+   */
   label?: string;
-  /** Plain one-liner for sections without a countable stat. */
+  /**
+   * The stat as one complete line ("34 memories", "Nothing scheduled yet").
+   * The mini tile renders this alone, so a countable stat carries it too,
+   * as a whole ICU message rather than the numeral and unit joined by hand.
+   */
   text?: string;
-  /** Persisted personality slider values, plotted as a radar chart. */
-  radar?: Record<string, number>;
+  /** Persisted personality slider values, drawn as the signature mark. */
+  signature?: Record<string, number>;
   /** Upcoming enabled schedules (soonest first) + how many were cut. */
   schedules?: { items: SchedulePreview[]; more: number };
 }
@@ -51,19 +59,21 @@ const STATS_STALE_MS = 60_000;
 
 const SCHEDULE_PREVIEW_COUNT = 3;
 
-function pluralLabel(n: number, singular: string, pluralForm: string): string {
-  return n === 1 ? singular : pluralForm;
-}
-
 interface UseIdentitySectionStatsOptions {
   /** Skip the plugin fetch on assistants without the plugin routes. */
   supportsPlugins: boolean;
+  /**
+   * Skip the reads behind cards the native mobile shells don't render
+   * (see `NATIVE_MOBILE_HIDDEN_KEYS` in `components/identity-sections.ts`).
+   */
+  isNativeMobile: boolean;
 }
 
 export function useIdentitySectionStats(
   assistantId: string,
-  { supportsPlugins }: UseIdentitySectionStatsOptions,
+  { supportsPlugins, isNativeMobile }: UseIdentitySectionStatsOptions,
 ): Record<string, IdentitySectionStat | undefined> {
+  const { t } = useTranslation("intelligence");
   const path = { assistant_id: assistantId };
   const common = { staleTime: STATS_STALE_MS, retry: false, enabled: true };
 
@@ -94,6 +104,7 @@ export function useIdentitySectionStats(
     ...workspaceTreeGetOptions({ path }),
     select: (data) => data.entries.length,
     ...common,
+    enabled: !isNativeMobile,
   });
   const contacts = useQuery({
     ...contactsGetOptions({ path }),
@@ -129,7 +140,7 @@ export function useIdentitySectionStats(
     ...common,
   });
   // Shares the personality page's query key, so applying an update there
-  // refreshes the card's radar too.
+  // refreshes the card's signature too.
   const sliders = useQuery({
     queryKey: personalitySlidersQueryKey(assistantId),
     queryFn: () => fetchPersonalitySliders(assistantId),
@@ -140,72 +151,93 @@ export function useIdentitySectionStats(
     personality: {
       // `null` means the sidecar was never persisted (onboarded before it
       // was saved, or never touched the sliders) — fall back to the
-      // all-centered neutral shape instead of a blank card. `undefined`
+      // all-centered flat line instead of a blank card. `undefined`
       // covers still-loading and read errors, which stay a no-stat card so a
-      // transient failure never overwrites saved dials with a neutral radar.
-      radar:
+      // transient failure never overwrites saved dials with a neutral mark.
+      signature:
         sliders.data !== undefined
           ? completeSliderValues(sliders.data ?? {})
           : undefined,
     },
-    // Skills and plugins share the merged My Superpowers card; the stat
-    // names both kinds (interpunct-separated) so a plugin never hides
-    // inside a bare count. The plugin half appears once its query resolves
-    // — on assistants without the plugin surface it never does, and the
-    // stat stays skills-only.
+    // Skills and plugins share the merged Superpowers card, and the tile
+    // states them as one total rather than two counts. Until the plugin
+    // query resolves, and forever on assistants without the plugin surface,
+    // that total would understate itself, so the stat stays skills-only.
     superpowers:
       skills.data !== undefined
         ? {
-            text: [
-              `${skills.data} ${pluralLabel(skills.data, "skill", "skills")}`,
-              ...(plugins.data !== undefined
-                ? [
-                    `${plugins.data} ${pluralLabel(plugins.data, "plugin", "plugins")}`,
-                  ]
-                : []),
-            ].join(" · "),
+            text:
+              plugins.data !== undefined
+                ? t("useIdentitySectionStats.skillAndPluginCount", {
+                    count: skills.data + plugins.data,
+                  })
+                : t("useIdentitySectionStats.skillCount", {
+                    count: skills.data,
+                  }),
           }
         : undefined,
-    // Apps and documents share the Library card; like the superpowers stat,
-    // both kinds are named (interpunct-separated) once their reads resolve.
+    // Apps and documents share the Library card and read as one total, on
+    // the same terms as the superpowers stat above: apps alone until the
+    // document read resolves.
     library:
       apps.data !== undefined
         ? {
-            text: [
-              `${apps.data} ${pluralLabel(apps.data, "app", "apps")}`,
-              ...(documents.data !== undefined
-                ? [
-                    `${documents.data} ${pluralLabel(documents.data, "doc", "docs")}`,
-                  ]
-                : []),
-            ].join(" · "),
+            text:
+              documents.data !== undefined
+                ? t("useIdentitySectionStats.appAndDocCount", {
+                    count: apps.data + documents.data,
+                  })
+                : t("useIdentitySectionStats.appCount", { count: apps.data }),
           }
         : undefined,
     workspace:
       workspace.data !== undefined
         ? {
             value: workspace.data,
-            label: pluralLabel(workspace.data, "item", "items"),
+            label: t("useIdentitySectionStats.itemLabel", {
+              count: workspace.data,
+            }),
+            text: t("useIdentitySectionStats.itemCount", {
+              count: workspace.data,
+            }),
           }
         : undefined,
     contacts:
       contacts.data !== undefined
         ? {
             value: contacts.data,
-            label: pluralLabel(contacts.data, "person", "people"),
+            label: t("useIdentitySectionStats.personLabel", {
+              count: contacts.data,
+            }),
+            text: t("useIdentitySectionStats.personCount", {
+              count: contacts.data,
+            }),
           }
         : undefined,
     channels:
       channels.data !== undefined
-        ? { value: channels.data, label: "connected" }
+        ? {
+            value: channels.data,
+            label: t("useIdentitySectionStats.connectedLabel", {
+              count: channels.data,
+            }),
+            text: t("useIdentitySectionStats.connectedCount", {
+              count: channels.data,
+            }),
+          }
         : undefined,
     schedules:
       schedules.data !== undefined
         ? schedules.data.count === 0
-          ? { text: "Nothing scheduled yet" }
+          ? { text: t("useIdentitySectionStats.noSchedulesText") }
           : {
               value: schedules.data.count,
-              label: "active",
+              label: t("useIdentitySectionStats.activeLabel", {
+                count: schedules.data.count,
+              }),
+              text: t("useIdentitySectionStats.activeCount", {
+                count: schedules.data.count,
+              }),
               schedules: {
                 items: schedules.data.items,
                 more: schedules.data.count - schedules.data.items.length,

@@ -28,7 +28,7 @@ For assistant architecture deep dives, see [`ARCHITECTURE.md`](ARCHITECTURE.md) 
 
 ```bash
 cd assistant
-bun install
+bun install   # installs the whole workspace
 cp .env.example .env
 # Edit .env with your API keys
 ```
@@ -76,7 +76,7 @@ bun run src/index.ts                # interactive CLI session
 | `vellum sleep`                                     | Stop assistant + gateway processes               |
 | `vellum ps`                                        | List assistants and per-assistant process status |
 | `assistant`                                        | Launch interactive CLI session                   |
-| `assistant conversations list\|new\|export\|clear` | Manage conversations                             |
+| `assistant conversations list\|search\|new\|export\|clear` | Manage conversations                             |
 | `assistant config set\|get\|list`                  | Manage configuration                             |
 | `assistant keys set\|list\|delete`                 | Manage API keys in secure storage                |
 | `assistant trust list\|add\|update\|remove`        | Manage trust rules                               |

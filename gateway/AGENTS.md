@@ -90,6 +90,18 @@ Trust/guardian decisions must be keyed on `actorExternalId` only — never fall 
 
 Physical DB column names (`externalUserId`, `externalChatId`) are unchanged; the rename is at the API/type layer only.
 
+**Provider words that are not our words.** A Discord **guild** is what Discord's
+own UI calls a **server**; the word survives only in its API (`guild_id`, the
+`guilds` OAuth scope). Use it when naming what the API returns, and use
+"server" in anything a person reads: UI copy, setup instructions, error
+messages, notification text. The same rule covers any provider term its own
+product does not show users.
+
+`guild_id` also carries meaning past naming. Discord ingress reads its absence
+as "this is a DM" (`discord/admit.ts`), so a parse that collapses a malformed
+value to `undefined` would admit a public channel through the DM branch. Read
+the comments there before changing how the field is parsed.
+
 ## Module Organization
 
 Organize gateway code **by concern, not by technical layer** — group by what code _does_, not what it _is_. This mirrors the web client's rule (`clients/web/docs/CONVENTIONS.md` → "Organize by domain, not technical layer"), which is the fuller treatment of the shared principles; the gateway-specific shape:
@@ -104,6 +116,43 @@ Organize gateway code **by concern, not by technical layer** — group by what c
 - **Split by concern, not by line count** — but a file that has grown to span multiple concerns (past a few hundred lines) is the signal to extract, not to keep appending.
 
 The `slack/` module is the worked example of this shape.
+
+## Long-Lived Channel Transports Own Their Liveness
+
+A channel that holds a persistent socket (Discord Gateway, Slack Socket Mode)
+must be able to conclude on its own that its connection is dead, and recover,
+without waiting for a close event. A half-open socket, the shape a NAT rebind
+or a vanished peer leaves behind, reports itself `OPEN` indefinitely and fires
+nothing at all: no message, no error, no close. Recovery that waits to be told
+never runs.
+
+Three things are required, and a transport missing any one of them has a
+silent multi-hour outage in it:
+
+- **A liveness signal the transport generates itself.** Inbound quiet proves
+  nothing, because a quiet workspace and a dead socket are indistinguishable.
+  Discord rides its protocol heartbeat and tracks the ACK
+  (`discord/heartbeat.ts`). Slack Socket Mode has no application-level
+  heartbeat, so it probes the transport directly with a WebSocket ping frame
+  and requires a pong (`slack/socket-liveness.ts`). Prefer a probe you send
+  over a timeout you wait out.
+- **A bound on the pre-established window.** A handshake that stalls produces
+  neither `open` nor `close`, so it falls outside any watchdog that arms on a
+  live connection. See `HELLO_DEADLINE_MS` (Discord) and
+  `CONNECT_DEADLINE_MS` (Slack).
+- **Teardown that does not wait on a close event.** Recovery closes the dead
+  socket and proceeds on a timer whether or not the close ever lands. See
+  `killAndRecover` (Discord) and `forceReconnect` (Slack).
+
+Derive every threshold from something measured, and record the derivation in
+the constant's docstring. A number chosen to feel safe against expected
+traffic will be wrong: Socket Mode connections were assumed to rotate about
+hourly, and were then observed rotating several hours apart, which is exactly
+the kind of assumption an inbound-silence threshold would have been built on.
+
+The process-wide `SleepWakeDetector` is not a substitute for any of this. It
+fires only when the whole process was suspended, so it misses every connection
+that dies while the gateway is healthy and logging normally.
 
 ## Channel Trust Classification & Admission Policy
 

@@ -27,6 +27,7 @@
  */
 
 import { getLogger } from "./logging.js";
+import { MEMORY_RETROSPECTIVE_NO_FINDINGS_TEXT } from "./memory-retrospective-constants.js";
 import { getWorkspaceDir } from "./paths.js";
 import { loadPromptOverride } from "./prompt-override.js";
 
@@ -42,6 +43,13 @@ function neutralizeSentinels(s: string): string {
     "<\u200B/already_remembered>",
   );
 }
+
+/**
+ * The sentence mandating the exact no-findings reply. Built from
+ * {@link MEMORY_RETROSPECTIVE_NO_FINDINGS_TEXT} so the instruction and the
+ * finalizer's acceptance check can never drift apart.
+ */
+const NO_FINDINGS_MANDATE = `If nothing new is worth saving, reply with exactly "${MEMORY_RETROSPECTIVE_NO_FINDINGS_TEXT}" and stop.`;
 
 /**
  * Bundled fork-instruction template. Exported so tests (and any future
@@ -63,7 +71,7 @@ Two dedup sources to skip:
 1. Anything semantically captured in <already_remembered> above (from prior retrospective passes).
 2. Anything you already called \`remember\` on inline within your review window — those appear as \`tool_use\` blocks with \`name: "remember"\` in your history.
 
-For everything else in your review window, use the \`remember\` tool on facts, plans, decisions, preferences, names, dates, felt moments, corrections, commitments, or anything else concrete and worth carrying forward. When several facts are worth saving, pass them all as an array to a single \`remember\` call rather than calling it once per fact. If nothing new is worth saving, say "Nothing new to save." and stop.
+For everything else in your review window, use the \`remember\` tool on facts, plans, decisions, preferences, names, dates, felt moments, corrections, commitments, or anything else concrete and worth carrying forward. When several facts are worth saving, pass them all as an array to a single \`remember\` call rather than calling it once per fact. ${NO_FINDINGS_MANDATE}
 {{SKILL_AUTHORING_SECTION}}`;
 
 /** Placeholder names recognized in the bundled template and overrides. */
@@ -140,7 +148,9 @@ export interface ForkInstructionArgs {
  * override resolves to a usable file (bounded to a regular file under 1 MiB by
  * the shared {@link loadPromptOverride}), else the bundled
  * {@link RETROSPECTIVE_INSTRUCTION_TEMPLATE}; both get the same placeholder
- * substitution.
+ * substitution. An override additionally gets the no-findings mandate
+ * appended after its body: the exact-reply sentinel is the finalizer's
+ * advancement contract, so it holds regardless of what the override says.
  */
 export function buildForkInstruction({
   windowStartTimestamp,
@@ -175,7 +185,7 @@ export function buildForkInstruction({
     label: "retrospective prompt",
   });
 
-  return substituteInstructionParts(
+  const rendered = substituteInstructionParts(
     override ?? RETROSPECTIVE_INSTRUCTION_TEMPLATE,
     {
       AVAILABLE_TOOLS_LINE: availableToolsLine,
@@ -186,6 +196,16 @@ export function buildForkInstruction({
         : "",
     },
   );
+  if (override == null) {
+    return rendered;
+  }
+  // The finalizer recognizes a no-findings review only by the exact
+  // MEMORY_RETROSPECTIVE_NO_FINDINGS_TEXT reply, so the mandate is part of
+  // the advancement contract, not prompt styling: an override body that
+  // drops it would leave every no-findings window permanently retryable.
+  // Appended outside the override so a custom prompt cannot break the
+  // contract.
+  return `${rendered}\n\n${NO_FINDINGS_MANDATE}`;
 }
 
 /**
@@ -203,7 +223,7 @@ If your review window contains a PROCEDURE you actually carried out — a sequen
 
 When you do capture a procedure:
 
-1. Deduplicate against existing skills first. Call \`find_similar_skills\` with a short description of the procedure's goal. Each hit carries a \`source\` (bundled, managed, plugin, workspace, or extra), and a managed hit also carries \`author\` (\`"assistant"\` if you authored it, \`"user"\` if a person did, omitted if untagged). You may only overwrite or refine a skill YOU authored — a hit with \`source: "managed"\` AND \`author: "assistant"\`. ANY other hit means the procedure is ALREADY COVERED: a non-managed source (bundled, plugin, workspace, or extra), OR a managed skill that is NOT \`author: "assistant"\` (a person wrote it, or it is untagged). For an ALREADY COVERED hit do not \`overwrite\` it, do not shadow it by creating a skill with its \`skill_id\`, and do not create a near-duplicate — skip it. Only when a returned skill is one of your own (\`source: "managed"\`, \`author: "assistant"\`) and is the SAME procedure, UPDATE it: call \`scaffold_managed_skill\` with that \`skill_id\` and \`overwrite: true\`, rewriting the body from what you actually observed in the trace. Only CREATE a new skill (fresh \`skill_id\`) when no existing skill of any source covers the procedure. Bias strongly toward reusing or refining your own skills over spawning near-duplicates.
+1. Deduplicate against existing skills first. Call \`find_similar_skills\` with the procedure's goal as its \`goal\` argument. Each hit carries a \`source\` (bundled, managed, plugin, workspace, or extra), and a managed hit also carries \`author\` (\`"assistant"\` if you authored it, \`"user"\` if a person did, omitted if untagged). You may only overwrite or refine a skill YOU authored — a hit with \`source: "managed"\` AND \`author: "assistant"\`. ANY other hit means the procedure is ALREADY COVERED: a non-managed source (bundled, plugin, workspace, or extra), OR a managed skill that is NOT \`author: "assistant"\` (a person wrote it, or it is untagged). For an ALREADY COVERED hit do not \`overwrite\` it, do not shadow it by creating a skill with its \`skill_id\`, and do not create a near-duplicate — skip it. Only when a returned skill is one of your own (\`source: "managed"\`, \`author: "assistant"\`) and is the SAME procedure, UPDATE it: call \`scaffold_managed_skill\` with that \`skill_id\` and \`overwrite: true\`, rewriting \`body_markdown\` from what you actually observed in the trace. Only CREATE a new skill (fresh \`skill_id\`) when no existing skill of any source covers the procedure. Bias strongly toward reusing or refining your own skills over spawning near-duplicates.
 
 2. Capture procedure-scoped knowledge alongside the body. Failure modes, gotchas, and cached values you observed in the trace (error signatures and how you recovered, preconditions, IDs/paths/endpoints that held steady) belong in companion files passed via \`scaffold_managed_skill\`'s \`files\` input (for example \`references/failure-modes.md\`), and the SKILL.md body should reference them so a future load surfaces them.
 

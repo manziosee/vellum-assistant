@@ -18,6 +18,7 @@
  *   3. Register the client in `ADAPTER_FACTORIES` below.
  */
 
+import { normalizeCredentialRef } from "../../security/credential-key.js";
 import { AnthropicProvider } from "../anthropic/client.js";
 import { AtlasCloudProvider } from "../atlascloud/client.js";
 import { BasetenProvider } from "../baseten/client.js";
@@ -34,9 +35,13 @@ import { RetryProvider } from "../retry.js";
 import { TogetherProvider } from "../together/client.js";
 import type { Provider } from "../types.js";
 import { UsageTrackingProvider } from "../usage-tracking.js";
+import { isVellumManagedConnection } from "../vellum-model-routing.js";
 import { VercelAIGatewayProvider } from "../vercel-ai-gateway/client.js";
 import type { ResolvedAuth } from "./auth.js";
 import type { ProviderConnection } from "./auth.js";
+import { effectiveConnectionAuth } from "./auth.js";
+import { MissingCredentialGuardProvider } from "./missing-credential-guard.js";
+import { resolveAuth } from "./resolve-auth.js";
 
 /** Unified construction opts. Adapters ignore fields they don't consume. */
 export interface AdapterCreateOpts {
@@ -93,12 +98,13 @@ const ADAPTER_FACTORIES: Record<string, AdapterFactory> = {
       // Gemini routes managed proxies through `managedBaseUrl`, not `baseURL`.
       ...(baseURL ? { managedBaseUrl: baseURL } : {}),
     }),
-  ollama: ({ apiKey, model, streamTimeoutMs }) =>
+  ollama: ({ apiKey, model, streamTimeoutMs, baseURL }) =>
     new OllamaProvider(model, {
       // Empty string means keyless — Ollama's client treats undefined as
       // "no key provided" and defaults its internal placeholder.
       apiKey: apiKey || undefined,
       streamTimeoutMs,
+      ...(baseURL ? { baseURL } : {}),
     }),
   fireworks: ({ apiKey, model, streamTimeoutMs, baseURL }) =>
     new FireworksProvider(apiKey, model, {
@@ -127,6 +133,13 @@ const ADAPTER_FACTORIES: Record<string, AdapterFactory> = {
       providerName: "litellm",
       providerLabel: "LiteLLM",
       streamTimeoutMs,
+      // Replay thinking as `reasoning_content` so DeepSeek-compatible
+      // thinking-mode upstreams accept follow-up requests that include tools.
+      assistantReasoningField: "reasoning_content",
+      // Generic OpenAI-compat proxies may front a strict backend (vLLM,
+      // DeepSeek, Portkey). Backfill empty assistant turns so the request
+      // satisfies `content or tool_calls must be set`.
+      backfillEmptyAssistantContent: true,
       ...(baseURL ? { baseURL } : {}),
     }),
   // Keyless openai-compatible endpoints (e.g. LM Studio) ignore the key; the
@@ -136,6 +149,17 @@ const ADAPTER_FACTORIES: Record<string, AdapterFactory> = {
       providerName: "openai-compatible",
       providerLabel: "OpenAI-compatible",
       streamTimeoutMs,
+      // Replay thinking as `reasoning_content` so DeepSeek-compatible
+      // thinking-mode endpoints accept follow-up requests that include tools.
+      assistantReasoningField: "reasoning_content",
+      // Custom endpoints (Portkey, vLLM, LM Studio, DeepSeek-compat) often
+      // reject `{ role: "assistant", content: null }` after a Stop mid-stream
+      // or a reasoning-only turn. Same guard as OpenRouter and Vercel AI
+      // Gateway.
+      backfillEmptyAssistantContent: true,
+      // Custom OpenAI-compatible endpoints may front strict reasoning
+      // models (DeepSeek thinking) that 400 on any explicit tool_choice.
+      omitToolChoiceWhenReasoning: true,
       ...(baseURL ? { baseURL } : {}),
     }),
   minimax: ({ apiKey, model, streamTimeoutMs }) =>
@@ -227,6 +251,87 @@ export function createAdapterFromConnection(
   },
 ): Provider | null {
   const provider = opts.provider ?? connection.provider;
+  const adapter = buildConnectionAdapter(connection, resolvedAuth, opts);
+  if (!adapter) {
+    return null;
+  }
+
+  /**
+   * Re-read the managed credential after an auth rejection and rebuild the
+   * adapter around it, so a key rotated out-of-band is picked up without a
+   * restart. Returns `null` when the store hands back the same credential
+   * that just failed — otherwise a proxy 401 from any other cause (platform
+   * auth degraded, revoked account) would make every request pay a second
+   * doomed upstream call forever.
+   */
+  function makeCredentialRefresher(): () => Promise<Provider | null> {
+    let lastAuth = JSON.stringify(resolvedAuth);
+    return async (): Promise<Provider | null> => {
+      const refreshedAuth = await resolveAuth(
+        effectiveConnectionAuth(connection),
+        provider,
+        { baseUrl: connection.baseUrl },
+      );
+      if (!refreshedAuth.ok) {
+        return null;
+      }
+      const nextAuth = JSON.stringify(refreshedAuth.resolved);
+      if (nextAuth === lastAuth) {
+        return null;
+      }
+      lastAuth = nextAuth;
+      return buildConnectionAdapter(connection, refreshedAuth.resolved, opts);
+    };
+  }
+
+  // Usage-attribution headers (`X-Vellum-*`) are only meaningful when the
+  // request is routed through the Vellum-managed proxy. They carry billing
+  // metadata for our own backend. Forwarding them to a third-party endpoint
+  // would leak internal Vellum metadata, so gate on the managed connection
+  // identity, the only route that flows through our proxy.
+  const isManagedProxy = isVellumManagedConnection(connection);
+  const effectiveAuth = effectiveConnectionAuth(connection);
+  const tracked = new UsageTrackingProvider(
+    new RetryProvider(adapter, {
+      forwardUsageAttributionHeaders: isManagedProxy,
+      credentialSource: isManagedProxy
+        ? "vellum-managed"
+        : effectiveAuth.type === "api_key"
+          ? "byok"
+          : effectiveAuth.type === "oauth_subscription"
+            ? "oauth-subscription"
+            : effectiveAuth.type === "none"
+              ? "no-auth"
+              : undefined,
+      connectionName: connection.name,
+      ...(isManagedProxy
+        ? { refreshCredentialProvider: makeCredentialRefresher() }
+        : {}),
+    }),
+  );
+
+  // A credential-backed connection can lose its key between construction and
+  // dispatch. Some upstreams answer that with 200 + empty content rather than
+  // a 401, which would otherwise land as a blank assistant turn.
+  return "credential" in effectiveAuth
+    ? new MissingCredentialGuardProvider(tracked, {
+        name: connection.name,
+        credentialAccount: normalizeCredentialRef(effectiveAuth.credential),
+      })
+    : tracked;
+}
+
+function buildConnectionAdapter(
+  connection: ProviderConnection,
+  resolvedAuth: ResolvedAuth,
+  opts: {
+    model: string;
+    streamTimeoutMs?: number;
+    useNativeWebSearch?: boolean;
+    provider?: string;
+  },
+): Provider | null {
+  const provider = opts.provider ?? connection.provider;
   const entry = PROVIDER_CATALOG.find((e) => e.id === provider);
   if (!entry) {
     return null;
@@ -251,7 +356,8 @@ export function createAdapterFromConnection(
       : undefined;
 
   const codexSubscription =
-    connection.auth.type === "oauth_subscription" && provider === "openai";
+    effectiveConnectionAuth(connection).type === "oauth_subscription" &&
+    provider === "openai";
 
   const adapter = buildProviderAdapter(provider, {
     apiKey,
@@ -264,16 +370,5 @@ export function createAdapterFromConnection(
   if (!adapter) {
     return null;
   }
-
-  // Usage-attribution headers (`X-Vellum-*`) are only meaningful when the
-  // request is routed through the Vellum-managed proxy — they carry billing
-  // metadata for our own backend. Forwarding them to a third-party endpoint
-  // would leak internal Vellum metadata, so gate on the auth type:
-  // `platform` is the only auth that flows through our proxy.
-  const isManagedProxy = connection.auth.type === "platform";
-  return new UsageTrackingProvider(
-    new RetryProvider(adapter, {
-      forwardUsageAttributionHeaders: isManagedProxy,
-    }),
-  );
+  return adapter;
 }

@@ -149,7 +149,6 @@ describe("spawnSubagent", () => {
     expect(entry.isFork).toBe(false);
     expect(entry.inputTokens).toBe(0);
     expect(entry.outputTokens).toBe(0);
-    expect(entry.totalCost).toBe(0);
     expect(entry.spawnedAt).toBe(NOW);
     expect(entry.events).toEqual([]);
   });
@@ -357,12 +356,10 @@ describe("changeStatus", () => {
       status: "completed",
       inputTokens: 1500,
       outputTokens: 500,
-      totalCost: 0.003,
     });
 
     expect(getState().byId["sa-1"]!.inputTokens).toBe(1500);
     expect(getState().byId["sa-1"]!.outputTokens).toBe(500);
-    expect(getState().byId["sa-1"]!.totalCost).toBe(0.003);
   });
 
   it("preserves existing values when optional fields are omitted", () => {
@@ -378,7 +375,6 @@ describe("changeStatus", () => {
       status: "running",
       inputTokens: 100,
       outputTokens: 50,
-      totalCost: 0.001,
     });
 
     getState().changeStatus({
@@ -390,7 +386,6 @@ describe("changeStatus", () => {
     expect(entry.status).toBe("completed");
     expect(entry.inputTokens).toBe(100);
     expect(entry.outputTokens).toBe(50);
-    expect(entry.totalCost).toBe(0.001);
   });
 
   it("preserves accumulated tokens when an abort ships zero usage", () => {
@@ -409,7 +404,6 @@ describe("changeStatus", () => {
       status: "running",
       inputTokens: 1200,
       outputTokens: 340,
-      totalCost: 0.002,
     });
 
     getState().changeStatus({
@@ -417,14 +411,12 @@ describe("changeStatus", () => {
       status: "aborted",
       inputTokens: 0,
       outputTokens: 0,
-      totalCost: 0,
     });
 
     const entry = getState().byId["sa-1"]!;
     expect(entry.status).toBe("aborted");
     expect(entry.inputTokens).toBe(1200);
     expect(entry.outputTokens).toBe(340);
-    expect(entry.totalCost).toBe(0.002);
   });
 
   it("still applies a real non-zero terminal total over the running tally", () => {
@@ -440,7 +432,6 @@ describe("changeStatus", () => {
       status: "running",
       inputTokens: 1200,
       outputTokens: 340,
-      totalCost: 0.002,
     });
 
     // Completion ships the authoritative final totals — non-zero, so they
@@ -450,13 +441,11 @@ describe("changeStatus", () => {
       status: "completed",
       inputTokens: 1500,
       outputTokens: 500,
-      totalCost: 0.003,
     });
 
     const entry = getState().byId["sa-1"]!;
     expect(entry.inputTokens).toBe(1500);
     expect(entry.outputTokens).toBe(500);
-    expect(entry.totalCost).toBe(0.003);
   });
 
   it("silently ignores unknown subagent ID", () => {
@@ -1059,19 +1048,16 @@ describe("updateUsage", () => {
       subagentId: "sa-1",
       inputTokens: 100,
       outputTokens: 50,
-      estimatedCost: 0.001,
     });
     getState().updateUsage({
       subagentId: "sa-1",
       inputTokens: 200,
       outputTokens: 75,
-      estimatedCost: 0.002,
     });
 
     const entry = getState().byId["sa-1"]!;
     expect(entry.inputTokens).toBe(300);
     expect(entry.outputTokens).toBe(125);
-    expect(entry.totalCost).toBeCloseTo(0.003);
   });
 
   it("skips updates after terminal status with usage", () => {
@@ -1086,7 +1072,6 @@ describe("updateUsage", () => {
       subagentId: "sa-1",
       inputTokens: 100,
       outputTokens: 50,
-      estimatedCost: 0.001,
     });
 
     // Terminal status with final usage data
@@ -1095,7 +1080,6 @@ describe("updateUsage", () => {
       status: "completed",
       inputTokens: 500,
       outputTokens: 200,
-      totalCost: 0.005,
     });
 
     // This should be ignored — terminal guard
@@ -1103,13 +1087,11 @@ describe("updateUsage", () => {
       subagentId: "sa-1",
       inputTokens: 9999,
       outputTokens: 9999,
-      estimatedCost: 99.99,
     });
 
     const entry = getState().byId["sa-1"]!;
     expect(entry.inputTokens).toBe(500);
     expect(entry.outputTokens).toBe(200);
-    expect(entry.totalCost).toBe(0.005);
   });
 
   it("no-ops for unknown subagentId", () => {
@@ -1118,7 +1100,6 @@ describe("updateUsage", () => {
       subagentId: "sa-nonexistent",
       inputTokens: 100,
       outputTokens: 50,
-      estimatedCost: 0.001,
     });
 
     expect(getState().byId).toEqual(before);
@@ -1940,102 +1921,75 @@ describe("fetchDetailIfNeeded detailSettled", () => {
 
     expect(getState().byId["sa-1"]).toBeUndefined();
   });
-});
 
-// ---------------------------------------------------------------------------
-// fetchGroupDetail
-// ---------------------------------------------------------------------------
-
-describe("fetchGroupDetail", () => {
-  function spawnAddressable(id: string) {
-    getState().spawnSubagent({
-      subagentId: id,
-      label: "Agent",
-      objective: "",
-      status: "completed",
-      conversationId: `conv-${id}`,
-      timestamp: NOW,
-    });
-  }
-
-  it("fetches once per addressable unfetched id in the group", async () => {
-    useResolvedAssistantsStore.getState().setActiveAssistantId("assistant-1");
-    spawnAddressable("sa-1");
-    spawnAddressable("sa-2");
-
-    getState().fetchGroupDetail(["sa-1", "sa-2"]);
-    // Fire-and-forget: let the queued fetches settle.
-    await Promise.resolve();
-    await Promise.resolve();
-
-    expect(fetchSubagentDetail).toHaveBeenCalledTimes(2);
-    expect(fetchSubagentDetail).toHaveBeenCalledWith(
-      "assistant-1",
-      "sa-1",
-      "conv-sa-1",
-    );
-    expect(fetchSubagentDetail).toHaveBeenCalledWith(
-      "assistant-1",
-      "sa-2",
-      "conv-sa-2",
-    );
-  });
-
-  it("is a no-op when there is no active assistant", async () => {
-    // beforeEach leaves the active assistant null.
-    spawnAddressable("sa-1");
-
-    getState().fetchGroupDetail(["sa-1"]);
-    await Promise.resolve();
-
-    expect(fetchSubagentDetail).not.toHaveBeenCalled();
-  });
-
-  it("skips ids that already have events", async () => {
-    useResolvedAssistantsStore.getState().setActiveAssistantId("assistant-1");
+  it("re-arms an empty mid-run settle when the run goes terminal, so the fetch retries", async () => {
+    // A fetch that settles empty while the run is LIVE answers "no events
+    // yet", not "no events ever". If the run then finishes without streaming
+    // its events here, the terminal transition must clear `detailSettled` so
+    // the render-driven fetch asks again; otherwise the card rests on
+    // "Finished, 0 steps" with the real timeline permanently unfetched.
     getState().spawnSubagent({
       subagentId: "sa-1",
       label: "Agent",
       objective: "",
+      status: "running",
+      conversationId: "conv-child",
+      timestamp: NOW,
+    });
+    fetchSubagentDetail.mockResolvedValueOnce({
+      status: "running",
+      events: [],
+    } as never);
+    await getState().fetchDetailIfNeeded("assistant-1", "sa-1");
+    expect(getState().byId["sa-1"]?.detailSettled).toBe(true);
+
+    getState().changeStatus({ subagentId: "sa-1", status: "completed" });
+    expect(getState().byId["sa-1"]?.detailSettled).toBe(false);
+
+    // The retry actually goes out and lands the final timeline.
+    fetchSubagentDetail.mockResolvedValueOnce({
       status: "completed",
-      conversationId: "conv-sa-1",
-      timestamp: NOW,
-    });
-    // Give it a timeline so `fetchDetailIfNeeded` bails.
-    getState().receiveEvent({
-      subagentId: "sa-1",
-      event: { type: "assistant_text_delta", content: "hi" } as never,
-      timestamp: NOW,
-    });
-
-    getState().fetchGroupDetail(["sa-1"]);
-    await Promise.resolve();
-
-    expect(fetchSubagentDetail).not.toHaveBeenCalled();
+      events: [{ type: "text", content: "done" }],
+    } as never);
+    await getState().fetchDetailIfNeeded("assistant-1", "sa-1");
+    const entry = getState().byId["sa-1"]!;
+    expect(entry.detailSettled).toBe(true);
+    expect(entry.events.length).toBeGreaterThan(0);
   });
 
-  it("skips a non-addressable id (no conversation id) but still fetches its peers", async () => {
-    useResolvedAssistantsStore.getState().setActiveAssistantId("assistant-1");
-    // sa-1 has no conversationId and no parentConversationId → unaddressable.
+  it("keeps a settled flag across the terminal transition when events exist", async () => {
     getState().spawnSubagent({
       subagentId: "sa-1",
       label: "Agent",
       objective: "",
-      status: "completed",
+      status: "running",
+      conversationId: "conv-child",
       timestamp: NOW,
     });
-    spawnAddressable("sa-2");
+    fetchSubagentDetail.mockResolvedValueOnce({
+      status: "running",
+      events: [{ type: "text", content: "hello" }],
+    } as never);
+    await getState().fetchDetailIfNeeded("assistant-1", "sa-1");
 
-    getState().fetchGroupDetail(["sa-1", "sa-2"]);
-    await Promise.resolve();
-    await Promise.resolve();
+    getState().changeStatus({ subagentId: "sa-1", status: "completed" });
 
-    expect(fetchSubagentDetail).toHaveBeenCalledTimes(1);
-    expect(fetchSubagentDetail).toHaveBeenCalledWith(
-      "assistant-1",
-      "sa-2",
-      "conv-sa-2",
-    );
+    expect(getState().byId["sa-1"]?.detailSettled).toBe(true);
+  });
+
+  it("keeps a settled flag on a terminal-to-terminal status apply", async () => {
+    // A reconcile snapshot re-applying a terminal status must not re-arm the
+    // flag: only the live-to-terminal transition invalidates an empty settle.
+    spawnTerminal("sa-1");
+    fetchSubagentDetail.mockResolvedValueOnce({
+      status: "completed",
+      events: [],
+    } as never);
+    await getState().fetchDetailIfNeeded("assistant-1", "sa-1");
+
+    getState().changeStatus({ subagentId: "sa-1", status: "failed" });
+
+    expect(getState().byId["sa-1"]?.detailSettled).toBe(true);
   });
 });
 
@@ -2580,7 +2534,6 @@ describe("reconcileFromDaemon", () => {
       subagentId: "sa-1",
       inputTokens: 100,
       outputTokens: 20,
-      estimatedCost: 0.001,
     });
     reconcileReply = {
       ok: true,
@@ -2604,7 +2557,6 @@ describe("reconcileFromDaemon", () => {
     expect(entry?.error).toBe("provider timed out");
     expect(entry?.inputTokens).toBe(1200);
     expect(entry?.outputTokens).toBe(340);
-    expect(entry?.totalCost).toBe(0.021);
     expect(entry?.events).toHaveLength(1);
   });
 
@@ -2621,7 +2573,6 @@ describe("reconcileFromDaemon", () => {
       subagentId: "sa-1",
       inputTokens: 100,
       outputTokens: 20,
-      estimatedCost: 0.001,
     });
     reconcileReply = {
       ok: true,
@@ -2634,7 +2585,6 @@ describe("reconcileFromDaemon", () => {
     expect(entry?.status).toBe("completed");
     expect(entry?.inputTokens).toBe(100);
     expect(entry?.outputTokens).toBe(20);
-    expect(entry?.totalCost).toBe(0.001);
     expect(entry?.error).toBeUndefined();
   });
 
@@ -2662,7 +2612,6 @@ describe("reconcileFromDaemon", () => {
     expect(entry?.error).toBe("provider timed out");
     expect(entry?.inputTokens).toBe(900);
     expect(entry?.outputTokens).toBe(120);
-    expect(entry?.totalCost).toBe(0.014);
   });
 
   it("discards a snapshot that lands after the store was reset", async () => {

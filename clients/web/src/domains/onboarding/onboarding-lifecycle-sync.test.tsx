@@ -99,7 +99,7 @@ mock.module("@/utils/avatar-svg-compositor", () => ({
   composeSvg: () => "<svg />",
 }));
 
-mock.module("@/domains/onboarding/components/onboarding-layout", () => ({
+mock.module("@/components/onboarding-layout", () => ({
   OnboardingLayout: ({ children }: { children: ReactNode }) => (
     <div>{children}</div>
   ),
@@ -187,6 +187,7 @@ mock.module("@/lib/local-mode", () => ({
   primeLocalGatewayConnection: async () => {},
   primeLocalGatewayConnectionWithRepair: async () => {},
   getLocalGatewayUrl: () => localGatewayUrlValue,
+  getPairedGatewayUrl: () => undefined,
   // Mirrors the real probe against the mocked gateway URL, so tests that stub
   // `globalThis.fetch` keep driving the readyz loop the same way.
   probeLocalGatewayReady: async () => {

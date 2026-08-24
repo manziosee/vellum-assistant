@@ -26,7 +26,6 @@
 import { execFile } from "node:child_process";
 import {
   copyFileSync,
-  cpSync,
   existsSync,
   mkdirSync,
   readdirSync,
@@ -40,7 +39,12 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import { promisify } from "node:util";
 
-import { PRESERVED_ENTRIES } from "../../plugins/plugin-tree-walk.js";
+import {
+  copyPreservedUserState,
+  isPluginUserStateEntry,
+  PRESERVED_ENTRIES,
+  stripPreservedUserState,
+} from "../../plugins/plugin-tree-walk.js";
 import { ensureBun } from "../../util/bun-runtime.js";
 import { getWorkspacePluginsDir } from "../../util/platform.js";
 import type { FetchLike } from "./fetch-like.js";
@@ -154,6 +158,20 @@ export interface InstallPluginOptions {
   readonly trustedSource?: PluginFetchSource;
 }
 
+/**
+ * Consent gate invoked after the plugin tree is fully staged and before it is
+ * finalized (dependencies installed, provenance recorded, swapped live). The
+ * caller inspects the staged tree to see what the plugin declares (e.g.
+ * schedules) and asks the user. Returning `false` aborts the install: the
+ * staging directory is removed, nothing is swapped, and
+ * {@link PluginInstallDeclinedError} is thrown.
+ */
+export type ConfirmStagedInstall = (staged: {
+  readonly name: string;
+  /** Absolute path of the fully materialized staging directory. */
+  readonly stagingDir: string;
+}) => Promise<boolean>;
+
 /** Dependencies injected by the caller. */
 export interface InstallPluginDeps {
   /** HTTP client. Production callers pass `globalThis.fetch.bind(globalThis)`. */
@@ -168,6 +186,8 @@ export interface InstallPluginDeps {
   readonly runInstallDeps?: DependencyInstaller;
   /** Forwarded to {@link finalizeStagedInstall}; see {@link FinalizeStagedInstallParams.beforeSwap}. */
   readonly beforeSwap?: () => Promise<void>;
+  /** Consent gate between staging and finalize; see {@link ConfirmStagedInstall}. */
+  readonly confirmStaged?: ConfirmStagedInstall;
 }
 
 /** Successful install result. */
@@ -211,6 +231,19 @@ export class PluginPostinstallError extends Error {
   ) {
     super(`Postinstall adapter for "${pluginName}" failed: ${detail}`);
     this.name = "PluginPostinstallError";
+  }
+}
+
+/**
+ * The caller's {@link ConfirmStagedInstall} gate declined the staged install.
+ * Nothing was installed and the staging directory was removed. The caller that
+ * supplied the gate owns the user-facing messaging, so this error signals the
+ * outcome rather than something to report as a failure.
+ */
+export class PluginInstallDeclinedError extends Error {
+  constructor(pluginName: string) {
+    super(`Install of "${pluginName}" was declined.`);
+    this.name = "PluginInstallDeclinedError";
   }
 }
 
@@ -503,6 +536,8 @@ export async function installPlugin(
     throw new PluginNotFoundError(name, ref, sourceLabel(effectiveSource));
   }
 
+  await confirmStagedOrAbort(name, stagingDir, deps.confirmStaged);
+
   await finalizeStagedInstall(stagingDir, {
     name,
     source: effectiveSource,
@@ -515,6 +550,36 @@ export async function installPlugin(
   });
 
   return { name, target, fileCount, ref, commit, committedAt };
+}
+
+/**
+ * Run the caller's {@link ConfirmStagedInstall} gate over the staged tree. A
+ * decline (or a gate that throws) removes the staging directory so no partial
+ * install is left behind; a decline then surfaces as
+ * {@link PluginInstallDeclinedError}. A no-op when no gate was supplied.
+ *
+ * Shared by {@link installPlugin} and the platform-endpoint install so both
+ * abort a declined install the same way.
+ */
+export async function confirmStagedOrAbort(
+  name: string,
+  stagingDir: string,
+  confirmStaged: ConfirmStagedInstall | undefined,
+): Promise<void> {
+  if (!confirmStaged) {
+    return;
+  }
+  let confirmed = false;
+  try {
+    confirmed = await confirmStaged({ name, stagingDir });
+  } finally {
+    if (!confirmed) {
+      rmSync(stagingDir, { recursive: true, force: true });
+    }
+  }
+  if (!confirmed) {
+    throw new PluginInstallDeclinedError(name);
+  }
 }
 
 /** Inputs for {@link finalizeStagedInstall}. */
@@ -626,27 +691,13 @@ export async function finalizeStagedInstall(
     }
   }
 
-  // Copy preserved entries (config.json, data/, .disabled) from the existing
-  // install into the staging dir before the swap so user-owned state survives
-  // upgrades and reinstalls. Without this, the rm+rename below would destroy
-  // user config and runtime data.
+  // User-owned state (config.json, data/, .disabled) is not plugin source.
+  // Drop any copy the pin materialized into staging, then copy the live
+  // install's bytes over so an upgrade cannot reset user config to pin
+  // defaults. Without the live copy, the rm+rename below would destroy it.
+  stripPreservedUserState(stagingDir);
   if (existsSync(target)) {
-    for (const entry of PRESERVED_ENTRIES) {
-      if (entry === INSTALL_META_FILENAME) {
-        continue;
-      } // sidecar is rewritten above
-      const src = join(target, entry);
-      if (!existsSync(src)) {
-        continue;
-      }
-      const dest = join(stagingDir, entry);
-      const stat = statSync(src);
-      if (stat.isDirectory()) {
-        cpSync(src, dest, { recursive: true });
-      } else {
-        copyFileSync(src, dest);
-      }
-    }
+    copyPreservedUserState(target, stagingDir);
     rmSync(target, { recursive: true, force: true });
   }
   renameSync(stagingDir, target);
@@ -1226,7 +1277,8 @@ function pluginPostinstallEnv(bun: string): NodeJS.ProcessEnv {
 
 /**
  * Recursively copy regular files from `srcRoot` into `destDir`, skipping the
- * top-level `.git` directory, a top-level `bunfig.toml` (see below), and any
+ * top-level `.git` directory, a top-level `bunfig.toml` (see below), top-level
+ * user-state entries (`config.json`, `data/`, `.disabled`), and any
  * symlinks. Returns the file count.
  */
 function copyTreeSkippingGit(srcRoot: string, destDir: string): number {
@@ -1237,6 +1289,12 @@ function copyTreeSkippingGit(srcRoot: string, destDir: string): number {
       // Drop git metadata and symlinks: the loader follows neither, and a
       // symlink could otherwise point outside the staging tree.
       if (relDir === "" && entry.name === ".git") {
+        continue;
+      }
+      // Runtime-owned state is not plugin source. A pin that ships
+      // `config.json` or `data/` must not land in the staged tree, or an
+      // upgrade would reset user config to whatever the revision committed.
+      if (relDir === "" && isPluginUserStateEntry(entry.name)) {
         continue;
       }
       // Drop a top-level `bunfig.toml`. The adapter postinstall runs `bun` with
@@ -1651,6 +1709,7 @@ async function copyDir(
   ref: string,
   destDir: string,
   fetchFn: FetchLike,
+  atPluginRoot = true,
 ): Promise<number> {
   const entries = await listDir(owner, repo, apiPath, ref, fetchFn);
   if (entries === null) {
@@ -1664,11 +1723,24 @@ async function copyDir(
       continue;
     }
     assertSafeFilename("entry name", entry.name);
+    // Adapter stubs overlay the plugin root. User-state names at that root
+    // are host-owned, not adapter input.
+    if (atPluginRoot && isPluginUserStateEntry(entry.name)) {
+      continue;
+    }
 
     if (entry.type === "dir") {
       const subDest = join(destDir, entry.name);
       mkdirSync(subDest, { recursive: true });
-      count += await copyDir(owner, repo, entry.path, ref, subDest, fetchFn);
+      count += await copyDir(
+        owner,
+        repo,
+        entry.path,
+        ref,
+        subDest,
+        fetchFn,
+        false,
+      );
       continue;
     }
 

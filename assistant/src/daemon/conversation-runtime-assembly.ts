@@ -13,6 +13,7 @@ import {
   getAppDirPath,
   listAppFiles,
   resolveAppDir,
+  resolveAppSource,
 } from "../apps/app-store.js";
 import { type ChannelId, parseInterfaceId } from "../channels/types.js";
 import { resolveDefaultProfileForProvider } from "../config/default-profile-catalog.js";
@@ -43,6 +44,7 @@ import {
   type RenderedSlackTranscriptMessage,
   renderSlackTranscriptWithProvenance,
 } from "../messaging/providers/slack/render-transcript.js";
+import { isGuardianCardRow } from "../notifications/approval-card-data.js";
 import {
   getMessages as defaultGetMessages,
   type MessageRow,
@@ -433,6 +435,59 @@ export function buildActiveDocuments(conversationId: string): Array<{
     : null;
 }
 
+/**
+ * Resolves the app the client reported as on-screen into the summary the
+ * `unified-turn-context` injector renders as the `visible_app:` line. Returns
+ * `null` when no app is in view or the id no longer resolves to an app (e.g.
+ * it was deleted while open).
+ *
+ * Resolution goes through `resolveAppSource` rather than `getApp` so both id
+ * shapes the viewer can hold are covered: workspace apps (opaque id) and
+ * plugin-bundled apps (`plugins~<plugin>~<app>`), which the apps list and open
+ * routes serve alongside them. Plugin apps carry their owning plugin so the
+ * rendered line can say the source belongs to a plugin rather than reading as
+ * an ordinary sandbox app to rewrite.
+ *
+ * Both identifiers come back: a workspace app's `appId` is an opaque UUID and
+ * the readable handle is its `slug` (the directory stem, frozen at creation).
+ * The app tools key off the id, so the line carries it for tool calls and the
+ * slug for everything a human or the model would recognize.
+ *
+ * The resolved directory is not part of the returned shape. A workspace app's
+ * files are reachable by joining the workspace `Root:` from the `<workspace>`
+ * block with the app-builder skill's `data/apps/<slug>/` layout and the slug
+ * above. A plugin-bundled app's files sit outside that layout and belong to
+ * the plugin, which the provenance clause marks as not the assistant's to
+ * rewrite, so no path is offered for them either.
+ */
+export function buildVisibleAppContext(appId: string | undefined): {
+  appId: string;
+  name: string;
+  slug: string;
+  pluginName?: string;
+} | null {
+  if (!appId) {
+    return null;
+  }
+  try {
+    const source = resolveAppSource(appId);
+    if (!source) {
+      return null;
+    }
+    return {
+      appId: source.id,
+      name: source.name,
+      slug: source.dirName,
+      ...(source.origin.kind === "plugin"
+        ? { pluginName: source.origin.pluginName }
+        : {}),
+    };
+  } catch {
+    // Malformed id (traversal-shaped, empty): treat as no app in view.
+    return null;
+  }
+}
+
 const MAX_CONTEXT_LENGTH = 100_000;
 
 function truncateHtml(html: string, budget: number): string {
@@ -466,7 +521,7 @@ function injectActiveSurfaceContext(
       "RULES FOR WORKSPACE MODIFICATION:",
       `1. Use \`file_edit\` to make surgical changes to app files. The file path is \`${getAppDirPath(ctx.appId)}/<path>\`.`,
       "2. Use `file_write` to create new files or rewrite files.",
-      "3. Use `file_read` to read any file with line numbers before editing.",
+      "3. Use `file_read` to read any file before editing, and `code_search` when you need a line reference.",
       "4. Use `bash ls` to see all files in the app directory.",
       `5. Call \`app_refresh\` with app_id "${ctx.appId}" ONCE after all changes are complete.`,
       "6. NEVER respond with only text — the user expects a visual update.",
@@ -1459,10 +1514,16 @@ export function loadSlackChronologicalContext(
     allRows,
     options.trustClass,
   );
+  // Applied after the compaction boundary, never before it: that filter
+  // indexes into the row list when no watermark is set, so dropping rows
+  // earlier would shift what it cuts. Same rule and same ordering constraint
+  // as `Conversation.loadFromDb` -- Slack builds the provider history from
+  // rows rather than `this.messages`, so a rule applied only there would
+  // exempt this channel entirely.
   const rows = filterRowsAfterSlackCompactionBoundary(
     messageRowsToSlackTranscriptRows(scopedRows),
     options,
-  );
+  ).filter((row) => !isGuardianCardRow(row.content));
   return assembleSlackChronologicalContext(rows, capabilities, {
     contextSummary: resolveCapabilities(options.trustClass).canAccessMemory
       ? options.contextSummary
@@ -2190,11 +2251,18 @@ export async function applyRuntimeInjections(
     : undefined;
   // OS surface reported by the client, independent of the transport interface
   // above. Drives the per-turn `client_os:` line so the model knows whether it
-  // is talking to the web, iOS, or macOS app (all sharing the `"web"`
+  // is talking to a browser, mobile, or desktop app (all sharing the `"web"`
   // transport interface). Read the frozen per-turn snapshot (not the live
   // `clientOs`) so a queued message from another surface can't perturb the
-  // in-flight turn — same anti-race pattern as `clientTimezone`.
+  // in-flight turn, using the same anti-race pattern as `clientTimezone`.
   const clientOs = liveConversation?.currentTurnClientOs ?? undefined;
+  // The app the client has on screen (app viewer or the app-editing split),
+  // resolved to its name and source directory so the assistant can act on it
+  // without asking the user which app they mean. Frozen per turn like
+  // `clientOs` for the same anti-race reason.
+  const visibleApp = buildVisibleAppContext(
+    liveConversation?.currentTurnVisibleAppId,
+  );
   const channelName = liveConversation
     ? (liveConversation.currentTurnChannelContext?.userMessageChannel ??
       liveConversation.originChannel ??
@@ -2258,7 +2326,7 @@ export async function applyRuntimeInjections(
   // folded into the summary are excluded.
   const slackActiveThreadFocusBlock = channelCapabilities
     ? loadSlackActiveThreadFocusBlock(conversationId, channelCapabilities, {
-        trustClass: liveConversation?.trustContext?.trustClass,
+        trustClass: liveConversation?.getTrustContext()?.trustClass,
         contextCompactedMessageCount:
           liveConversation?.contextCompactedMessageCount,
         slackContextCompactionWatermarkTs:
@@ -2276,7 +2344,7 @@ export async function applyRuntimeInjections(
   // boundary without the orchestrator threading a snapshot in.
   const slackChronologicalMessages = channelCapabilities
     ? loadSlackChronologicalMessages(conversationId, channelCapabilities, {
-        trustClass: liveConversation?.trustContext?.trustClass,
+        trustClass: liveConversation?.getTrustContext()?.trustClass,
         contextSummary: liveConversation?.contextSummary,
         contextCompactedMessageCount:
           liveConversation?.contextCompactedMessageCount,
@@ -2304,6 +2372,7 @@ export async function applyRuntimeInjections(
     timestamp,
     interfaceName,
     clientOs,
+    visibleApp,
     channelName,
     actorContext: options.actorContext,
     configuredUserTimezone,
@@ -2318,8 +2387,7 @@ export async function applyRuntimeInjections(
     turnIndex: options.turnIndex ?? liveConversation?.turnCount ?? 0,
     trust:
       options.trust ??
-      liveConversation?.currentTurnTrustContext ??
-      liveConversation?.trustContext ??
+      liveConversation?.getTurnOrRestingTrust() ??
       fallbackTurnTrust(channelCapabilities),
     callSite: options.callSite ?? liveConversation?.currentCallSite,
     ...injectionInputs,

@@ -21,6 +21,7 @@ import { formatAttachmentSize } from "@/domains/chat/components/chat-attachments
 import { useGallerySwipe } from "@/domains/chat/components/chat-attachments/use-gallery-swipe";
 import { useEdgeSwipeArbiterStore } from "@/stores/edge-swipe-arbiter-store";
 import type { DisplayAttachment } from "@/types/attachment-types";
+import { useTranslation } from "@/i18n";
 
 // File extensions routed to the inline text preview even when the upstream
 // MIME type is generic (e.g. application/octet-stream).
@@ -107,6 +108,7 @@ export const AttachmentPreviewModal: FC<AttachmentPreviewModalProps> = ({
   const registerBackOwner = useEdgeSwipeArbiterStore.use.registerBackOwner();
   const unregisterBackOwner =
     useEdgeSwipeArbiterStore.use.unregisterBackOwner();
+  const { t } = useTranslation("chat");
   useEffect(() => {
     if (!open) {
       return;
@@ -360,11 +362,11 @@ export const AttachmentPreviewModal: FC<AttachmentPreviewModalProps> = ({
           leftIcon={<Download />}
           onClick={handleDownload}
           disabled={!effectiveUrl}
-          aria-label={`Download ${attachment.filename}`}
+          aria-label={t("attachmentPreviewModal.downloadAria", { filename: attachment.filename })}
           className="mt-4 text-white/70 hover:bg-white/10 hover:text-white max-md:bg-transparent"
           tintColor="currentColor"
         >
-          Download
+          {t("attachmentPreviewModal.downloadLabel")}
         </Button>
       </div>
     );
@@ -375,7 +377,7 @@ export const AttachmentPreviewModal: FC<AttachmentPreviewModalProps> = ({
       ref={overlayRef}
       role="dialog"
       aria-modal="true"
-      aria-label={`Preview of ${attachment.filename}`}
+      aria-label={t("attachmentPreviewModal.previewAria", { filename: attachment.filename })}
       // Focusable so the overlay can hold keyboard focus for the arrow-key
       // handler; the ring is suppressed since the dialog is the whole screen.
       tabIndex={-1}
@@ -395,9 +397,16 @@ export const AttachmentPreviewModal: FC<AttachmentPreviewModalProps> = ({
       {/* Top chrome: file size (left), filename (center), download + close
           (right). Absolute children anchor to the overlay's padding box, so the
           parent's safe-area paddingTop does not offset them — the bar carries
-          the top inset itself to clear the notch/status bar. */}
+          the top inset itself to clear the notch/status bar.
+
+          The bar spans the full width above the preview, so it stays
+          click-through except for its own controls: on a short viewport the
+          preview's top edge reaches under it, and an opaque bar would eat
+          clicks on whatever the preview renders there (a link in a scrolled
+          text preview, for instance). Same treatment as the gallery chevrons
+          below. */}
       <div
-        className="absolute inset-x-0 top-0 z-10 flex items-center gap-3 px-4"
+        className="pointer-events-none absolute inset-x-0 top-0 z-10 flex items-center gap-3 px-4"
         style={{
           paddingTop:
             "calc(var(--safe-area-inset-top, env(safe-area-inset-top, 0px)) + 1rem)",
@@ -405,7 +414,7 @@ export const AttachmentPreviewModal: FC<AttachmentPreviewModalProps> = ({
       >
         <Typography
           variant="body-small-default"
-          className="w-11 shrink-0 truncate text-white/50"
+          className="pointer-events-auto w-11 shrink-0 truncate text-white/50"
         >
           {formatAttachmentSize(attachment.sizeBytes)}
         </Typography>
@@ -414,16 +423,20 @@ export const AttachmentPreviewModal: FC<AttachmentPreviewModalProps> = ({
           variant="body-medium-lighter"
           className="min-w-0 flex-1 truncate text-center text-white/90"
         >
-          {attachment.filename}
+          {/* The centred label is only as wide as its text, but its flex track
+              spans the whole middle of the bar. Take pointer events on the text
+              itself so it stays selectable and inert, and leave the empty track
+              either side click-through to whatever sits beneath. */}
+          <span className="pointer-events-auto">{attachment.filename}</span>
         </Typography>
-        <div className="flex shrink-0 items-center gap-2">
+        <div className="pointer-events-auto flex shrink-0 items-center gap-2">
           <Button
             variant="ghost"
             iconOnly={<Download />}
             expandOnMobile={false}
             onClick={handleDownload}
             disabled={!effectiveUrl}
-            aria-label={`Download ${attachment.filename}`}
+            aria-label={t("attachmentPreviewModal.downloadAria", { filename: attachment.filename })}
             className="h-11 w-11 rounded-full bg-white/10 text-white/70 hover:bg-white/20 hover:text-white"
             tintColor="currentColor"
           />
@@ -432,7 +445,7 @@ export const AttachmentPreviewModal: FC<AttachmentPreviewModalProps> = ({
             iconOnly={<X />}
             expandOnMobile={false}
             onClick={onClose}
-            aria-label="Close preview"
+            aria-label={t("attachmentPreviewModal.closePreviewAria")}
             className="h-11 w-11 rounded-full bg-white/10 text-white/70 hover:bg-white/20 hover:text-white"
             tintColor="currentColor"
           />
@@ -446,7 +459,7 @@ export const AttachmentPreviewModal: FC<AttachmentPreviewModalProps> = ({
             iconOnly={<ChevronLeft />}
             expandOnMobile={false}
             onClick={goToPrev}
-            aria-label="Previous attachment"
+            aria-label={t("attachmentPreviewModal.previousAttachmentAria")}
             className="pointer-events-auto h-11 w-11 rounded-full bg-white/10 text-white/70 hover:bg-white/20 hover:text-white"
             tintColor="currentColor"
           />
@@ -455,7 +468,7 @@ export const AttachmentPreviewModal: FC<AttachmentPreviewModalProps> = ({
             iconOnly={<ChevronRight />}
             expandOnMobile={false}
             onClick={goToNext}
-            aria-label="Next attachment"
+            aria-label={t("attachmentPreviewModal.nextAttachmentAria")}
             className="pointer-events-auto h-11 w-11 rounded-full bg-white/10 text-white/70 hover:bg-white/20 hover:text-white"
             tintColor="currentColor"
           />

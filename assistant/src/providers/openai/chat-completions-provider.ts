@@ -5,6 +5,7 @@ import { isAbortReason } from "../../util/abort-reasons.js";
 import { ProviderError, type ProviderErrorReason } from "../../util/errors.js";
 import { getLogger } from "../../util/logger.js";
 import { extractRetryAfterMs } from "../../util/retry.js";
+import { partialTagSuffix as sharedPartialTagSuffix } from "../../util/think-tag-stream.js";
 import { escapeXmlAttr } from "../../util/xml.js";
 import {
   base64Source,
@@ -46,6 +47,7 @@ import {
   OPENAI_COMPAT_MAX_INLINE_AUDIO_BYTES,
   openAIInputAudioFormat,
 } from "./input-audio.js";
+import { serializeToolResult } from "./orphaned-tool-result.js";
 
 /**
  * Detect OpenAI-compatible context-overflow signals on an `OpenAI.APIError`.
@@ -83,7 +85,17 @@ export function detectOpenAICompatibleContextOverflow(
     /context.?length.?exceeded|context.?window.?exceeded|prompt.?is.?too.?long|prompt_too_long|input.?too.?long|too.?many.?(?:input.?)?tokens|maximum.?context/i.test(
       message,
     );
-  if (!codeMatches && !messageMatches) {
+  // string_above_max_length is OpenAI's generic oversized-string validation
+  // code, so only treat it as overflow when the error points at a message
+  // content part (e.g. "Invalid 'input[191].content[1].text': string too
+  // long" — OpenAI's per-part 10 MiB cap). The overflow ladder can shrink
+  // message content (media stubbing collapses a file's extracted_text to a
+  // preview) but cannot fix other oversized fields like tool definitions.
+  const oversizedContentPart =
+    /string.?too.?long|string_above_max_length/i.test(
+      `${code ?? ""} ${message}`,
+    ) && /\b(?:input|messages)\[\d+\]\.content/i.test(message);
+  if (!codeMatches && !messageMatches && !oversizedContentPart) {
     return null;
   }
   // OpenAI-compatible providers rarely report usable token counts; best-effort extract.
@@ -150,14 +162,19 @@ export interface OpenAIChatCompletionsProviderOptions {
   parseThinkTags?: boolean;
   /** Wire field used to replay prior assistant thinking on multi-turn requests.
    *  DeepSeek/Fireworks use `"reasoning_content"`; OpenRouter uses `"reasoning"`.
-   *  When unset, thinking blocks are dropped from outbound assistant messages. */
+   *  When unset, thinking blocks are dropped from outbound assistant messages.
+   *  When set, the field is included only if there is thinking to replay, so a
+   *  standard Chat Completions endpoint does not see an extra key on ordinary
+   *  tool-call turns. DeepSeek thinking mode that requires the field even when
+   *  empty is handled by a one-shot retry. */
   assistantReasoningField?: "reasoning" | "reasoning_content";
   /** Backfill a non-empty placeholder for assistant turns that would otherwise
    *  serialize with neither `content` nor `tool_calls` (e.g. reasoning-only
-   *  turns). Off by default; enabled for OpenRouter, whose downstream providers
-   *  (e.g. DeepSeek) reject such messages with `Invalid assistant message:
-   *  content or tool_calls must be set`. See {@link
-   *  EMPTY_ASSISTANT_TURN_PLACEHOLDER}. */
+   *  turns, or a Stop mid-stream before any text). Off by default; enabled for
+   *  OpenRouter, Vercel AI Gateway, LiteLLM, and custom `openai-compatible`
+   *  endpoints, whose downstream providers (e.g. DeepSeek, vLLM, Portkey)
+   *  reject such messages with `Invalid assistant message: content or
+   *  tool_calls must be set`. See {@link EMPTY_ASSISTANT_TURN_PLACEHOLDER}. */
   backfillEmptyAssistantContent?: boolean;
   /** Present object-typed tool params to the model as JSON-string params and
    *  decode them back to objects on the response. Works around models whose
@@ -165,6 +182,13 @@ export interface OpenAIChatCompletionsProviderOptions {
    *  with minimax-m3 on Fireworks). Off by default; scalars/arrays unaffected.
    *  See {@link coerceObjectParamsToJsonString}. */
   coerceObjectArgsToJsonString?: boolean;
+  /** Drop `tool_choice` when thinking/reasoning is on the wire. Strict
+   *  OpenAI-compatible reasoning upstreams (DeepSeek thinking mode) reject any
+   *  explicit `tool_choice` with `Thinking mode does not support this
+   *  tool_choice`. Off by default so catalog providers that honor the combo
+   *  (Fireworks, Together) keep sending `none` / forced choices. Enabled for
+   *  the generic `openai-compatible` adapter, whose upstream is unknown. */
+  omitToolChoiceWhenReasoning?: boolean;
 }
 
 const log = getLogger("chat-completions");
@@ -207,12 +231,29 @@ export function clampReasoningEffort(
     : value;
 }
 
+/** Human-readable text from an OpenAI-compatible error, including wrapped
+ *  upstream detail (OpenRouter `metadata.raw`). Used by the one-shot
+ *  compatibility retries so a generic SDK wrapper message cannot hide the
+ *  real reason. */
+function openaiCompatErrorHaystack(error: unknown): string {
+  return error instanceof OpenAI.APIError
+    ? normalizedErrorText(normalizeOpenAIAPIError(error))
+    : error instanceof Error
+      ? error.message
+      : String(error);
+}
+
+function isClientErrorStatus(error: unknown): boolean {
+  const status = (error as { status?: unknown }).status;
+  return typeof status === "number" && status >= 400 && status < 500;
+}
+
 /**
  * True when the request carried an explicit reasoning opt-out (`"none"` sent
  * as flat `reasoning_effort` or nested `reasoning.effort`) and the provider
  * rejected it with a 4xx that names the reasoning field. Reasoning-only
  * models (e.g. DeepSeek R1) reject the opt-out rather than ignore it; that
- * one case is worth a single retry with the reasoning params stripped —
+ * one case is worth a single retry with the reasoning params stripped:
  * model-default reasoning beats a hard failure.
  */
 function isReasoningOptOutRejection(error: unknown, params: unknown): boolean {
@@ -228,22 +269,217 @@ function isReasoningOptOutRejection(error: unknown, params: unknown): boolean {
   if (!optedOut) {
     return false;
   }
-  const status = (error as { status?: unknown }).status;
-  if (typeof status !== "number" || status < 400 || status >= 500) {
+  if (!isClientErrorStatus(error)) {
     return false;
   }
-  // OpenRouter wraps upstream 4xxs in a generic "Provider returned error" and
-  // stashes the real reason under `metadata.raw`, which `normalizeOpenAIAPIError`
-  // promotes into the normalized fields. Scan those, not just `error.message` —
-  // otherwise the wrapped reasoning rejection is missed and this one-shot
-  // fallback never fires.
-  const haystack =
-    error instanceof OpenAI.APIError
-      ? normalizedErrorText(normalizeOpenAIAPIError(error))
-      : error instanceof Error
-        ? error.message
-        : String(error);
-  return /reasoning/i.test(haystack);
+  return /reasoning/i.test(openaiCompatErrorHaystack(error));
+}
+
+/**
+ * True when thinking/reasoning is active on the outbound chat-completions
+ * body: a non-`"none"` `reasoning_effort`, a nested `reasoning.effort`, or
+ * `reasoning.enabled: true` (OpenRouter / Vercel AI Gateway).
+ */
+export function isThinkingEnabledOnWire(params: unknown): boolean {
+  const p = params as {
+    reasoning_effort?: unknown;
+    reasoning?: { effort?: unknown; enabled?: unknown } | null;
+  };
+  const nested = p.reasoning;
+  if (nested && typeof nested === "object") {
+    if (nested.enabled === true) {
+      return true;
+    }
+    if (typeof nested.effort === "string" && nested.effort !== "none") {
+      return true;
+    }
+  }
+  return (
+    typeof p.reasoning_effort === "string" && p.reasoning_effort !== "none"
+  );
+}
+
+/**
+ * True when the request sent an explicit `tool_choice` and the provider
+ * rejected it because thinking/reasoning mode forbids that parameter.
+ * DeepSeek thinking mode 400s with `Thinking mode does not support this
+ * tool_choice` for any explicit value, including `"auto"` and `"none"`.
+ * One retry without `tool_choice` lets the same provider succeed instead of
+ * failing over to a different backend.
+ */
+function isThinkingModeToolChoiceRejection(
+  error: unknown,
+  params: unknown,
+): boolean {
+  const p = params as { tool_choice?: unknown };
+  if (p.tool_choice === undefined) {
+    return false;
+  }
+  if (!isClientErrorStatus(error)) {
+    return false;
+  }
+  return /does not support this tool_choice/i.test(
+    openaiCompatErrorHaystack(error),
+  );
+}
+
+type AssistantReasoningExtras = {
+  reasoning?: string;
+  reasoning_content?: string;
+};
+
+function assistantReasoningExtras(
+  msg: OpenAI.Chat.Completions.ChatCompletionMessageParam,
+): AssistantReasoningExtras | null {
+  if (msg.role !== "assistant") {
+    return null;
+  }
+  return msg as OpenAI.Chat.Completions.ChatCompletionAssistantMessageParam &
+    AssistantReasoningExtras;
+}
+
+function paramsMessages(
+  params: unknown,
+): OpenAI.Chat.Completions.ChatCompletionMessageParam[] | undefined {
+  const messages = (params as { messages?: unknown }).messages;
+  return Array.isArray(messages)
+    ? (messages as OpenAI.Chat.Completions.ChatCompletionMessageParam[])
+    : undefined;
+}
+
+function messagesCarryAssistantReasoningField(params: unknown): boolean {
+  const messages = paramsMessages(params);
+  if (!messages) {
+    return false;
+  }
+  return messages.some((msg) => {
+    const extra = assistantReasoningExtras(msg);
+    return (
+      extra !== null &&
+      (extra.reasoning !== undefined || extra.reasoning_content !== undefined)
+    );
+  });
+}
+
+function assistantMessagesNeedReasoningContentBackfill(
+  params: unknown,
+): boolean {
+  const messages = paramsMessages(params);
+  if (!messages) {
+    return false;
+  }
+  return messages.some((msg) => {
+    const extra = assistantReasoningExtras(msg);
+    return (
+      extra !== null &&
+      extra.reasoning_content === undefined &&
+      extra.reasoning === undefined
+    );
+  });
+}
+
+function stripAssistantReasoningFields(params: unknown): boolean {
+  const messages = paramsMessages(params);
+  if (!messages) {
+    return false;
+  }
+  let stripped = false;
+  for (const msg of messages) {
+    const extra = assistantReasoningExtras(msg);
+    if (extra === null) {
+      continue;
+    }
+    if (extra.reasoning_content !== undefined) {
+      delete extra.reasoning_content;
+      stripped = true;
+    }
+    if (extra.reasoning !== undefined) {
+      delete extra.reasoning;
+      stripped = true;
+    }
+  }
+  return stripped;
+}
+
+function backfillEmptyReasoningContent(params: unknown): boolean {
+  const messages = paramsMessages(params);
+  if (!messages) {
+    return false;
+  }
+  let added = false;
+  for (const msg of messages) {
+    const extra = assistantReasoningExtras(msg);
+    if (extra === null) {
+      continue;
+    }
+    if (
+      extra.reasoning_content !== undefined ||
+      extra.reasoning !== undefined
+    ) {
+      continue;
+    }
+    extra.reasoning_content = "";
+    added = true;
+  }
+  return added;
+}
+
+function haystackNamesAssistantReasoningField(haystack: string): boolean {
+  if (/reasoning_content/i.test(haystack)) {
+    return true;
+  }
+  return /\breasoning\b/i.test(haystack) && !/reasoning_effort/i.test(haystack);
+}
+
+/**
+ * True when thinking-mode requires `reasoning_content` on subsequent
+ * assistant messages and this request omitted it. DeepSeek 400s with
+ * `The reasoning_content in the thinking mode must be passed back to the API`.
+ * One retry with an empty string on those assistant messages satisfies the
+ * presence check without putting the extra key on every custom-endpoint turn.
+ */
+function isMissingReasoningContentRejection(
+  error: unknown,
+  params: unknown,
+): boolean {
+  if (!isClientErrorStatus(error)) {
+    return false;
+  }
+  const haystack = openaiCompatErrorHaystack(error);
+  if (
+    !/reasoning_content/i.test(haystack) ||
+    !/must be passed back/i.test(haystack)
+  ) {
+    return false;
+  }
+  return assistantMessagesNeedReasoningContentBackfill(params);
+}
+
+/**
+ * True when the request included an assistant `reasoning` / `reasoning_content`
+ * extra and the provider rejected it as an unknown message property. One retry
+ * without those extras lets a strict Chat Completions schema succeed.
+ */
+function isUnknownAssistantReasoningFieldRejection(
+  error: unknown,
+  params: unknown,
+): boolean {
+  if (!isClientErrorStatus(error)) {
+    return false;
+  }
+  if (!messagesCarryAssistantReasoningField(params)) {
+    return false;
+  }
+  const haystack = openaiCompatErrorHaystack(error);
+  if (/must be passed back/i.test(haystack)) {
+    return false;
+  }
+  if (!haystackNamesAssistantReasoningField(haystack)) {
+    return false;
+  }
+  return /unknown|unexpected|unrecognized|additional propert|extra (?:field|property)|not (?:a )?valid|invalid (?:argument|parameter|field|property)/i.test(
+    haystack,
+  );
 }
 
 /**
@@ -292,13 +528,11 @@ const OPENAI_SUPPORTED_IMAGE_TYPES = new Set([
   "image/webp",
 ]);
 
+// Think-tag scanning primitives are shared with the TTS reasoning filter
+// (util/think-tag-stream.ts) so the two stream parsers cannot drift. This
+// provider keeps its exact historical behavior: case-sensitive, <think> only.
 function partialTagSuffix(text: string, tag: string): number {
-  for (let len = Math.min(text.length, tag.length - 1); len > 0; len--) {
-    if (text.endsWith(tag.substring(0, len))) {
-      return len;
-    }
-  }
-  return 0;
+  return sharedPartialTagSuffix(text, [tag], false);
 }
 
 /**
@@ -324,6 +558,7 @@ export class OpenAIChatCompletionsProvider implements Provider {
     | undefined;
   private backfillEmptyAssistantContent: boolean;
   private coerceObjectArgsToJsonString: boolean;
+  private omitToolChoiceWhenReasoning: boolean;
 
   constructor(
     apiKey: string,
@@ -353,6 +588,8 @@ export class OpenAIChatCompletionsProvider implements Provider {
       options.backfillEmptyAssistantContent ?? false;
     this.coerceObjectArgsToJsonString =
       options.coerceObjectArgsToJsonString ?? false;
+    this.omitToolChoiceWhenReasoning =
+      options.omitToolChoiceWhenReasoning ?? false;
   }
 
   get defaultModel(): string {
@@ -382,7 +619,7 @@ export class OpenAIChatCompletionsProvider implements Provider {
     const coercedObjectKeys = new Map<string, string[]>();
 
     try {
-      const openaiMessages = this.toOpenAIMessages(
+      const openaiMessages = await this.toOpenAIMessages(
         messages,
         systemPrompt,
         modelSupportsAudioInput(modelOverride ?? this.model),
@@ -459,11 +696,23 @@ export class OpenAIChatCompletionsProvider implements Provider {
 
         // Honor a caller-supplied tool_choice (e.g. `{ type: "none" }` to force
         // a text-only answer, or `{ type: "tool", name }` for a forced call).
-        // Only meaningful when tools are present — OpenAI rejects a named or
+        // Only meaningful when tools are present: OpenAI rejects a named or
         // "required" choice with no tools.
+        //
+        // Strict reasoning upstreams (DeepSeek thinking mode) reject any
+        // explicit tool_choice, including `"auto"` (the API default when tools
+        // are present) and `"none"`. Omit `"auto"` whenever thinking is on the
+        // wire. Catalog providers that honor `none` / forced choices still
+        // receive them; the generic openai-compatible adapter drops every
+        // explicit value in thinking mode via `omitToolChoiceWhenReasoning`.
         const toolChoice = mapNeutralToolChoice(configObj?.tool_choice);
         if (toolChoice !== undefined) {
-          params.tool_choice = toolChoice;
+          const thinkingOn = isThinkingEnabledOnWire(params);
+          const skipAutoDefault = thinkingOn && toolChoice === "auto";
+          const skipAllChoices = thinkingOn && this.omitToolChoiceWhenReasoning;
+          if (!skipAutoDefault && !skipAllChoices) {
+            params.tool_choice = toolChoice;
+          }
         }
       }
 
@@ -563,20 +812,54 @@ export class OpenAIChatCompletionsProvider implements Provider {
         try {
           stream = await createStream();
         } catch (error) {
-          if (!isReasoningOptOutRejection(error, params)) {
+          if (isReasoningOptOutRejection(error, params)) {
+            log.warn(
+              {
+                provider: this.name,
+                model: modelOverride ?? this.model,
+                error: error instanceof Error ? error.message : String(error),
+              },
+              "Model rejected the explicit reasoning opt-out; retrying without reasoning params",
+            );
+            delete params.reasoning_effort;
+            delete (params as unknown as Record<string, unknown>).reasoning;
+            stream = await createStream();
+          } else if (isThinkingModeToolChoiceRejection(error, params)) {
+            log.warn(
+              {
+                provider: this.name,
+                model: modelOverride ?? this.model,
+                error: error instanceof Error ? error.message : String(error),
+              },
+              "Upstream rejected tool_choice in thinking mode; retrying without tool_choice",
+            );
+            delete params.tool_choice;
+            stream = await createStream();
+          } else if (isMissingReasoningContentRejection(error, params)) {
+            log.warn(
+              {
+                provider: this.name,
+                model: modelOverride ?? this.model,
+                error: error instanceof Error ? error.message : String(error),
+              },
+              "Upstream requires reasoning_content round-trip; retrying with empty field on assistant messages",
+            );
+            backfillEmptyReasoningContent(params);
+            stream = await createStream();
+          } else if (isUnknownAssistantReasoningFieldRejection(error, params)) {
+            log.warn(
+              {
+                provider: this.name,
+                model: modelOverride ?? this.model,
+                error: error instanceof Error ? error.message : String(error),
+              },
+              "Upstream rejected assistant reasoning field; retrying without it",
+            );
+            stripAssistantReasoningFields(params);
+            stream = await createStream();
+          } else {
             throw error;
           }
-          log.warn(
-            {
-              provider: this.name,
-              model: modelOverride ?? this.model,
-              error: error instanceof Error ? error.message : String(error),
-            },
-            "Model rejected the explicit reasoning opt-out; retrying without reasoning params",
-          );
-          delete params.reasoning_effort;
-          delete (params as unknown as Record<string, unknown>).reasoning;
-          stream = await createStream();
         }
 
         for await (const chunk of stream) {
@@ -863,7 +1146,10 @@ export class OpenAIChatCompletionsProvider implements Provider {
           );
         }
         const retryAfterMs = extractRetryAfterMs(error.headers);
+        // `cause` keeps the SDK error's errno-bearing chain reachable for
+        // network-shape classification (`isRetryableNetworkError` walks it).
         const errorOptions: {
+          cause?: unknown;
           retryAfterMs?: number;
           abortReason?: unknown;
           apiErrorCode?: string;
@@ -872,7 +1158,7 @@ export class OpenAIChatCompletionsProvider implements Provider {
           requestId?: string;
           rawBody?: string;
           reason?: ProviderErrorReason;
-        } = {};
+        } = { cause: error };
         if (retryAfterMs !== undefined) {
           errorOptions.retryAfterMs = retryAfterMs;
         }
@@ -901,7 +1187,7 @@ export class OpenAIChatCompletionsProvider implements Provider {
           formattedMessage,
           this.name,
           error.status,
-          Object.keys(errorOptions).length > 0 ? errorOptions : undefined,
+          errorOptions,
         );
       }
       throw new ProviderError(
@@ -939,14 +1225,14 @@ export class OpenAIChatCompletionsProvider implements Provider {
   }
 
   /** Convert neutral messages + system prompt to OpenAI message format. */
-  private toOpenAIMessages(
+  private async toOpenAIMessages(
     messages: Message[],
     systemPrompt?: string,
     audioInputEnabled = false,
-  ): OpenAI.Chat.Completions.ChatCompletionMessageParam[] {
+  ): Promise<OpenAI.Chat.Completions.ChatCompletionMessageParam[]> {
     // Swap any persisted attachment references back to inline base64 before
     // serializing, so the block transforms below can read `source.data`.
-    messages = resolveMediaReferences(messages);
+    messages = await resolveMediaReferences(messages);
     const result: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [];
 
     if (systemPrompt) {
@@ -956,9 +1242,19 @@ export class OpenAIChatCompletionsProvider implements Provider {
       });
     }
 
+    // Tool-call ids emitted in assistant messages earlier in this request.
+    // The API rejects a tool-role message whose `tool_call_id` has no
+    // preceding assistant `tool_calls` entry, so tool results are only
+    // serialized as tool messages when their call was emitted first
+    // (backward matches only).
+    const emittedToolCallIds = new Set<string>();
     for (const msg of messages) {
       if (msg.role === "assistant") {
-        result.push(this.toOpenAIAssistantMessage(msg));
+        const assistantMessage = this.toOpenAIAssistantMessage(msg);
+        for (const toolCall of assistantMessage.tool_calls ?? []) {
+          emittedToolCallIds.add(toolCall.id);
+        }
+        result.push(assistantMessage);
       } else {
         // User messages may contain tool_result blocks mixed with text/image
         const toolResults = msg.content.filter(
@@ -975,46 +1271,51 @@ export class OpenAIChatCompletionsProvider implements Provider {
         // Emit tool results as separate tool-role messages
         // OpenAI's API only supports string content in tool messages, so media
         // from contentBlocks is collected and injected as a user message below.
+        // A tool_result whose id has no preceding assistant tool call in this
+        // request is orphaned; its content is degraded into the user message
+        // instead of being sent as a rejectable tool message.
         const toolResultMedia: ContentBlock[] = [];
+        const orphanedResultBlocks: ContentBlock[] = [];
         for (const tr of toolResults) {
-          let textContent = tr.content;
-          if (tr.contentBlocks && tr.contentBlocks.length > 0) {
-            const extraText = tr.contentBlocks
-              .filter(
-                (cb): cb is Extract<ContentBlock, { type: "text" }> =>
-                  cb.type === "text",
+          // Media this transport can carry: images always, plus inline audio
+          // when the model accepts it. The text payload and the orphan
+          // decision are the shared cross-transport rule.
+          for (const cb of tr.contentBlocks ?? []) {
+            if (cb.type === "image") {
+              toolResultMedia.push(cb);
+            } else if (
+              audioInputEnabled &&
+              cb.type === "file" &&
+              isOpenAICompatInlineAudio(
+                cb.source.media_type,
+                mediaSourceByteLength(cb.source),
               )
-              .map((cb) => cb.text);
-            if (extraText.length > 0) {
-              textContent = textContent + "\n" + extraText.join("\n");
+            ) {
+              toolResultMedia.push(cb);
             }
-            for (const cb of tr.contentBlocks) {
-              if (cb.type === "image") {
-                toolResultMedia.push(cb);
-              } else if (
-                audioInputEnabled &&
-                cb.type === "file" &&
-                isOpenAICompatInlineAudio(
-                  cb.source.media_type,
-                  mediaSourceByteLength(cb.source),
-                )
-              ) {
-                toolResultMedia.push(cb);
-              }
-            }
+          }
+          const serialized = serializeToolResult(tr, emittedToolCallIds);
+          if (serialized.kind === "orphaned") {
+            orphanedResultBlocks.push(serialized.block);
+            continue;
           }
           result.push({
             role: "tool",
             tool_call_id: tr.tool_use_id,
-            content: tr.is_error ? `[ERROR] ${textContent}` : textContent,
+            content: serialized.payload,
           });
         }
 
-        // Emit remaining content + any tool result media as a user message.
-        // Media from tool results (e.g. browser_screenshot, audio a tool read)
-        // must go in a user message because OpenAI-compatible APIs don't
-        // support media parts in tool messages.
-        const userContent = [...otherBlocks, ...toolResultMedia];
+        // Emit remaining content, degraded orphaned results, and any tool
+        // result media as a user message. Media from tool results (e.g.
+        // browser_screenshot, audio a tool read) must go in a user message
+        // because OpenAI-compatible APIs don't support media parts in tool
+        // messages.
+        const userContent = [
+          ...otherBlocks,
+          ...orphanedResultBlocks,
+          ...toolResultMedia,
+        ];
         if (userContent.length > 0) {
           result.push(this.toOpenAIUserMessage(userContent, audioInputEnabled));
         }
@@ -1070,6 +1371,14 @@ export class OpenAIChatCompletionsProvider implements Provider {
         content: textParts.length > 0 ? textParts.join("") : null,
       };
 
+    if (toolCalls.length > 0) {
+      result.tool_calls = toolCalls;
+    }
+
+    // Include the configured wire field only when there is thinking to replay.
+    // Ordinary tool-call turns omit it so a strict Chat Completions schema
+    // does not reject an extra key. Empty-field presence for DeepSeek is a
+    // one-shot retry, not the default serialization.
     if (reasoningParts.length > 0 && this.assistantReasoningField) {
       (
         result as OpenAI.Chat.Completions.ChatCompletionAssistantMessageParam & {
@@ -1079,15 +1388,13 @@ export class OpenAIChatCompletionsProvider implements Provider {
       )[this.assistantReasoningField] = reasoningParts.join("");
     }
 
-    if (toolCalls.length > 0) {
-      result.tool_calls = toolCalls;
-    }
-
     // An assistant message must carry `content` or `tool_calls`. A turn with
-    // neither (e.g. reasoning-only) would serialize to null/empty content with
-    // no tool calls, which strict OpenAI-compatible backends reject. Reasoning
-    // lives in a separate field and does not satisfy this constraint. Scoped to
-    // providers that need it (OpenRouter) via `backfillEmptyAssistantContent`.
+    // neither (e.g. reasoning-only, or a Stop before any text) would serialize
+    // to null/empty content with no tool calls, which strict OpenAI-compatible
+    // backends reject. Reasoning lives in a separate field and does not
+    // satisfy this constraint. Scoped to providers that need it (OpenRouter,
+    // Vercel AI Gateway, LiteLLM, openai-compatible) via
+    // `backfillEmptyAssistantContent`.
     if (
       this.backfillEmptyAssistantContent &&
       !result.tool_calls &&

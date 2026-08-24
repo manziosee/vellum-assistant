@@ -31,6 +31,7 @@ import {
   useState,
 } from "react";
 
+import { markBoot } from "@/lib/telemetry/boot-telemetry";
 import { useAcpRunRehydration } from "@/domains/chat/hooks/use-acp-run-rehydration";
 import { useBackgroundTaskRehydration } from "@/domains/chat/hooks/use-background-task-rehydration";
 import { useChatUIState } from "@/domains/chat/hooks/use-chat-ui-state";
@@ -40,7 +41,11 @@ import { useChatEmptyState } from "@/domains/chat/hooks/use-chat-empty-state";
 import { useComposerSubmit } from "@/domains/chat/hooks/use-composer-submit";
 import { useDraftSecretDetection } from "@/domains/chat/hooks/use-draft-secret-detection";
 import type { SendChatMessageOptions } from "@/domains/chat/hooks/use-send-message";
-import { DiskPressureBannerSlot } from "@/domains/chat/components/disk-pressure-banner-slot";
+import {
+  DiskPressureBannerSlot,
+  useDiskPressureBannerVisibility,
+} from "@/domains/chat/components/disk-pressure-banner-slot";
+import { ResourcePressureBannerSlot } from "@/domains/chat/components/resource-pressure-banner-slot";
 import { useRuleEditorBridge } from "@/domains/chat/hooks/use-rule-editor-bridge";
 import { useChatBannerSlots } from "@/domains/chat/hooks/use-chat-banner-slots";
 import { QuoteReplyBubble } from "@/domains/chat/components/quote-reply-bubble";
@@ -48,13 +53,17 @@ import { TextSelectionPopover } from "@/domains/chat/components/text-selection-p
 import { useNativeQuoteReply } from "@/domains/chat/hooks/use-native-quote-reply";
 import { useQuoteReplyStore } from "@/domains/chat/quote-reply-store";
 import { isChannelConversation } from "@/domains/chat/utils/conversation-channel";
+import { resolveComposerPlaceholder } from "@/domains/chat/utils/composer-placeholder";
 import { isPopoutWindow } from "@/runtime/popout-window";
 
 import { useChatSessionStore } from "@/domains/chat/chat-session-store";
+import { isImageAttachment } from "@/domains/chat/components/chat-attachments/utils";
 import { useChatAttachmentDropZone } from "@/domains/chat/components/chat-attachments/use-chat-attachment-drop-zone";
 import { useVisionAttachmentGate } from "@/lib/backwards-compat/vision-attachment-gate";
 import { useSupportsNewChatPlugins } from "@/lib/backwards-compat/use-supports-new-chat-plugins";
 import { recordCommit } from "@/lib/commit-pressure";
+import { copyToClipboard } from "@/lib/copy-to-clipboard";
+import { useSwitchPaintMeasurement } from "@/lib/telemetry/switch-telemetry";
 import { NewChatPluginsSection } from "@/domains/chat/components/new-chat-plugins/new-chat-plugins-section";
 import { useComposerStore } from "@/domains/chat/composer-store";
 import { ActiveProcessOverlay } from "@/domains/chat/process-registry/active-process-overlay";
@@ -72,11 +81,12 @@ import { ChatBody } from "@/domains/chat/components/chat-body";
 import { ChatComposer } from "@/domains/chat/components/chat-composer/chat-composer";
 import { ChatRuleEditorModal } from "@/domains/chat/components/chat-rule-editor-modal";
 import { ComposerNotices } from "@/domains/chat/components/composer-notices";
+import { OrphanedHistoryNotice } from "@/domains/chat/components/orphaned-history-notice";
 import { ComposerSecretNotice } from "@/domains/chat/components/composer-secret-notice";
 import { ComposerSettingsMenu } from "@/domains/chat/components/composer-settings-menu";
 import { ContextWindowIndicator } from "@/domains/chat/components/context-window-indicator";
-import { CreditsExhaustedBanner } from "@/domains/chat/components/credits-exhausted-banner";
 import { DailyLimitBanner } from "@/domains/chat/components/daily-limit-banner";
+import { LowBalanceBanner } from "@/domains/chat/components/low-balance-banner";
 import { MicPermissionPrimer } from "@/domains/chat/components/mic-permission-primer";
 import { OnboardingChoiceCard } from "@/domains/chat/components/onboarding-choice-card";
 import { ProviderBillingBanner } from "@/domains/chat/components/provider-billing-banner";
@@ -86,6 +96,7 @@ import { SuggestionDetailPanel } from "@/domains/chat/components/suggestion-deta
 import type { DetectedSecret } from "@vellumai/service-contracts/secret-detection";
 import type { ThreadSuggestion } from "@/domains/chat/suggestions/types";
 import { useIsMobile } from "@/hooks/use-is-mobile";
+import { useTranslation } from "@/i18n";
 import { BottomSheet } from "@vellumai/design-library";
 import { useEditMessage } from "@/domains/chat/hooks/use-edit-message";
 import { useOnboardingChoice } from "@/domains/chat/hooks/use-onboarding-choice";
@@ -101,25 +112,20 @@ import {
   WEB_FOLDER_DROP_ERROR,
 } from "@/domains/chat/components/chat-attachments/handle-folder-drop";
 import { Button } from "@vellumai/design-library";
-import { Link, useLocation, useNavigate } from "react-router";
+import { Link, useLocation, useNavigate, useParams } from "react-router";
 import {
   getChatBillingBannerDecision,
   isManagedCredentialChatError,
+  resolveComposerBillingBanner,
   shouldShowGenericChatErrorNotice,
 } from "@/domains/chat/utils/error-classification";
 import { openUrlInPopupOrTab } from "@/domains/chat/utils/oauth-popup-links";
-import { resolveCreditPaywallCta } from "@/domains/chat/utils/credit-paywall-cta";
-import {
-  isBillingCtaUpgradeArm,
-  useBillingCtaExperimentArm,
-} from "@/hooks/use-billing-cta-experiment";
-import { useIsFreePlan } from "@/hooks/use-is-free-plan";
+import { useBillingBalanceStatus } from "@/hooks/use-billing-balance-status";
 import { useInteractionStore } from "@/domains/chat/interaction-store";
 import type {
   DisplayAttachment,
   DisplayMessage,
 } from "@/domains/chat/types/types";
-import { useAssistantFeatureFlagStore } from "@/stores/assistant-feature-flag-store";
 import type { TranscriptItem } from "@/domains/chat/transcript/types";
 import type { HistoryPaginationResult } from "@/domains/chat/transcript/use-history-pagination";
 import type { UIContext } from "@/domains/chat/turn-selectors";
@@ -135,6 +141,7 @@ import { lifecycleService } from "@/assistant/lifecycle-service";
 import { useAssistantLifecycleStore } from "@/assistant/lifecycle-store";
 
 import type { UseDiskPressureMonitorResult } from "@/assistant/use-disk-pressure-monitor";
+import type { UseResourcePressureMonitorResult } from "@/assistant/use-resource-pressure-monitor";
 import { useAppNudges } from "@/domains/chat/hooks/use-app-nudges";
 import { useGhostTextSuggestion } from "@/domains/chat/hooks/use-ghost-text-suggestion";
 import {
@@ -154,7 +161,20 @@ import { useConversationListQuery } from "@/hooks/conversation-queries";
 import { useAssistantAvatar } from "@/hooks/use-assistant-avatar";
 import { useAssistantIdentityStore } from "@/stores/assistant-identity-store";
 import { useClientFeatureFlagStore } from "@/stores/client-feature-flag-store";
+import { shouldMintNewChatDraft } from "@/domains/chat/utils/conversation-selection";
+import { isNativeMobile } from "@/runtime/platform-detection";
 import { useConversationStore } from "@/stores/conversation-store";
+import { paneState } from "@/stores/pane-state";
+import { useDoctorHandoffStore } from "@/stores/doctor-handoff-store";
+import { useLowBalanceBannerStore } from "@/stores/low-balance-banner-store";
+
+/**
+ * Self-hosted recovery for a rejected assistant API key. Mirrors the hint the
+ * daemon returns from its own auth route (`runtime/routes/auth-routes.ts`) —
+ * keep the two in step.
+ */
+const REPROVISION_ASSISTANT_KEY_COMMAND =
+  "assistant keys set credential/vellum/assistant_api_key <key>";
 
 // ---------------------------------------------------------------------------
 // Props — only values that cannot be owned locally
@@ -175,7 +195,9 @@ export interface ChatMainPanelProps {
   handleEditQueueTail: () => void;
 
   // Conversation secondary actions (orchestration dependency)
-  handleForkConversation: (throughMessageId: string) => Promise<void>;
+  /** Forks through a message. Omitted unless the viewer passes the
+   *  staff + `fork-from-message` gate, which hides the hover action. */
+  handleForkConversation?: (throughMessageId: string) => Promise<void>;
   /** Opens the "Summarize up to here" confirm dialog for a message. */
   onSummarizeUpToHere?: (messageId: string) => void;
   /** Opens the "Retry" confirm dialog for the latest assistant turn. */
@@ -189,9 +211,11 @@ export interface ChatMainPanelProps {
   // avoid duplicate polling intervals and bus subscriptions)
   diskPressure: UseDiskPressureMonitorResult;
 
+  // Resource pressure (single instance, same reasoning as disk pressure)
+  resourcePressure: UseResourcePressureMonitorResult;
+
   // Upward signals to ActiveChatView local state
   setRefreshEpoch: Dispatch<SetStateAction<number>>;
-  setShowAddCreditsModal: Dispatch<SetStateAction<boolean>>;
 
   // Shared refs (owned by ActiveChatView for debug API / keydown handler)
   inputRef: RefObject<HTMLTextAreaElement | null>;
@@ -205,9 +229,6 @@ export interface ChatMainPanelProps {
   didOnboarding: boolean;
   onboardingConversationId: string | null;
 }
-
-/** @deprecated Use {@link ChatMainPanelProps} — kept as a re-export for migration. */
-export type ChatRouteContentProps = ChatMainPanelProps;
 
 /**
  * Builds the registry-driven row of active background-process overlays.
@@ -274,8 +295,8 @@ export function ChatMainPanel({
   handleInspectMessage,
   historyPagination,
   diskPressure,
+  resourcePressure,
   setRefreshEpoch,
-  setShowAddCreditsModal,
   inputRef,
   sanitizedMessagesRef,
   transcriptItemsRef,
@@ -287,6 +308,7 @@ export function ChatMainPanel({
 }: ChatMainPanelProps) {
   const location = useLocation();
   const navigate = useNavigate();
+  const { t } = useTranslation("chat");
   // A pop-out renders no header and no status banner, which changes both what
   // chrome is available and which kinds the overlay row has to carry.
   const isPopout = isPopoutWindow(location.search);
@@ -344,7 +366,35 @@ export function ChatMainPanel({
   const messages = useTranscriptMessages();
   const error = useChatSessionStore.use.error();
   const notice = useChatSessionStore.use.notice();
-  const isLoadingHistory = useChatSessionStore.use.isLoadingHistory();
+  // A client-minted draft has no server row, so there is no history to wait
+  // for and no transcript skeleton to show. Derived during render rather than
+  // lowered from an effect: the store seeds `isLoadingHistory` true, so an
+  // effect would only clear it after the first commit had already painted the
+  // skeleton, which is the flash this is here to prevent.
+  //
+  // The cold-launch frame needs the same answer one step earlier. A native
+  // shell renders once with nothing selected, before the bootstrap effect
+  // mints the draft, so there is no id to look up yet. Asking the bootstrap's
+  // own predicate whether a draft is what it is about to select covers that
+  // frame, and keeps the two from drifting apart. Every other context (web,
+  // and a native deep link that names a conversation) answers false and keeps
+  // the skeleton, which is correct: those really are resolving which
+  // conversation to load, and the web path waits on the conversation list to
+  // do it.
+  const rawIsLoadingHistory = useChatSessionStore.use.isLoadingHistory();
+  const draftConversationIds = useConversationStore.use.draftConversationIds();
+  const { conversationId: urlConversationId } = useParams<{
+    conversationId: string;
+  }>();
+  const awaitingColdStartDraft = shouldMintNewChatDraft({
+    platformStartsInNewChat: isNativeMobile(),
+    urlConversationId: urlConversationId ?? null,
+    currentConversationId: activeConversationId,
+  });
+  const isLoadingHistory =
+    rawIsLoadingHistory &&
+    !awaitingColdStartDraft &&
+    !(activeConversationId && draftConversationIds.has(activeConversationId));
   const contextWindowUsage = useChatSessionStore.use.contextWindowUsage();
   const compactionCircuitOpenUntil =
     useChatSessionStore.use.compactionCircuitOpenUntil();
@@ -437,12 +487,8 @@ export function ChatMainPanel({
     void navigate(routes.settings.ai);
   }, [navigate]);
 
-  const pushToBillingSettings = useCallback(() => {
-    void navigate(routes.settings.usageBilling);
-  }, [navigate]);
-
-  const pushToPlansTakeover = useCallback(() => {
-    void navigate(routes.plans);
+  const pushToDailyLimitSettings = useCallback(() => {
+    void navigate(routes.settings.usageBillingDailyLimit);
   }, [navigate]);
 
   const checkAssistant = useCallback(
@@ -467,10 +513,13 @@ export function ChatMainPanel({
     [],
   );
 
-  const handleForkConversationCallback = useCallback(
-    (messageId: string) => {
-      void handleForkConversation(messageId);
-    },
+  const handleForkConversationCallback = useMemo(
+    () =>
+      handleForkConversation
+        ? (messageId: string) => {
+            void handleForkConversation(messageId);
+          }
+        : undefined,
     [handleForkConversation],
   );
 
@@ -501,10 +550,32 @@ export function ChatMainPanel({
 
   // Commit counter for the chat-route subtree. Deliberately dependency-less:
   // it has to run on every commit to measure how tightly they are packed,
-  // which is what `Maximum update depth exceeded` actually reacts to. Records
-  // nothing but two integers — see `lib/commit-pressure.ts`.
-  useEffect(() => {
+  // which is what `Maximum update depth exceeded` actually reacts to. A layout
+  // effect rather than a passive one, so the commit is recorded before
+  // ResizeObserver, rAF, and timer callbacks can fire: an instrumented update
+  // landing in that window would otherwise be consumed as attribution of the
+  // commit that just finished instead of the commit it causes. Records nothing
+  // but a few integers; see `lib/commit-pressure.ts`.
+  useLayoutEffect(() => {
     recordCommit();
+  });
+
+  // Closes the switch measurement `switchToConversation` opened. That action
+  // blanks the snapshot and sets `isLoadingHistory` in one commit, so the first
+  // render that is not an empty loading transcript is the incoming
+  // conversation's first paint. It runs from an ancestor effect
+  // (`ActiveChatView`), which React commits after this one, so the render that
+  // first carries the new id finds no pending window and measures nothing.
+  // A history fetch that errored with nothing on screen reads exactly like an
+  // instant empty conversation, so it has to veto the paint; an error that
+  // still has a painted transcript behind it (a failed older page, a failed
+  // background refetch) does not.
+  const historyLoadFailed = historyPagination.isError && messages.length === 0;
+  useSwitchPaintMeasurement({
+    conversationId: activeConversationId,
+    historyLoadFailed,
+    transcriptPainted: !(isLoadingHistory && messages.length === 0),
+    hadHistory: messages.length > 0,
   });
 
   // Clear staged quotes and dismiss the reply bubble when the active
@@ -522,11 +593,6 @@ export function ChatMainPanel({
     () => void sendMessage("/clean"),
     [sendMessage],
   );
-
-  // -------------------------------------------------------------------------
-  // Feature flags
-  // -------------------------------------------------------------------------
-  const queueSteering = useAssistantFeatureFlagStore.use.queueSteering();
 
   // -------------------------------------------------------------------------
   // Draft secret detection: owns the composer warning's matches/dismissal
@@ -618,12 +684,32 @@ export function ChatMainPanel({
   // -------------------------------------------------------------------------
   // Transcript data (sanitise + build items)
   // -------------------------------------------------------------------------
+  // Single balance-status read shared by every proactive billing surface in
+  // this component: the transcript's tail card, the empty state's card, and
+  // the low-balance composer banner. The active conversation is passed so
+  // the BYOK suppression respects a per-conversation managed profile pin. A
+  // client-minted draft has no server row to look up (the lookup would 404
+  // and needlessly fail the gate open); its effective profile lives in the
+  // composer stash, so that is threaded instead.
+  const pendingDraftProfiles = useConversationStore.use.pendingDraftProfiles();
+  const activeDraftId =
+    activeConversationId && draftConversationIds.has(activeConversationId)
+      ? activeConversationId
+      : null;
+  const balanceStatus = useBillingBalanceStatus({
+    conversationId: activeDraftId ? null : activeConversationId,
+    draftProfile: activeDraftId
+      ? (pendingDraftProfiles.get(activeDraftId) ?? null)
+      : null,
+  });
+
   const { sanitizedMessages, transcriptItems } = useTranscriptData({
     messages,
     showThinking,
     turnActive: isAssistantBusy,
     thinkingLabel,
     showOnboardingChoice,
+    creditsExhausted: balanceStatus.isExhausted,
   });
 
   // --- Ref writes (connect hook outputs to ActiveChatView's debug refs) ---
@@ -650,6 +736,18 @@ export function ChatMainPanel({
     status: diskPressure.status,
   });
   const diskPressureInputDisabled = diskPressureChatBlockReason !== null;
+
+  // First meaningful transcript paint: the exact condition under which
+  // `ChatScrollArea` stops rendering `<ChatSkeleton />`. On the new-conversation
+  // draft there is no history to wait for, so this lands immediately; on an
+  // existing conversation it is the history fetch. `markBoot` is first-write-wins,
+  // so later conversation switches within the page load do not overwrite it.
+  const transcriptPainted = !(isLoadingHistory && messages.length === 0);
+  useEffect(() => {
+    if (transcriptPainted) {
+      markBoot("transcript_painted");
+    }
+  }, [transcriptPainted]);
 
   const typingDisabled =
     isLoadingHistory ||
@@ -687,7 +785,48 @@ export function ChatMainPanel({
     assistantState.kind === "active" && !assistantState.isLocal;
   const doctorAction = showDoctorAction ? (
     <Button asChild variant="outlined" size="compact">
-      <Link to={`${routes.settings.debug}?tab=doctor`}>Go to Doctor</Link>
+      <Link to={`${routes.settings.debug}?tab=doctor`}>
+        {t("chatRouteContent.goToDoctor")}
+      </Link>
+    </Button>
+  ) : undefined;
+
+  // The assistant API key is provisioned by the platform, so unlike a rejected
+  // personal key there is nothing for the user to fix in Settings. Recovery
+  // differs by how the assistant is hosted, so the banner offers one of two
+  // actions rather than a single link:
+  //
+  //   platform-hosted → the Doctor, which can re-issue the key. The request is
+  //     parked in the same one-shot store `/doctor <message>` uses, so the
+  //     panel auto-starts a session already on topic, not on a blank prompt.
+  //   self-hosted → the Doctor tab doesn't exist (it is platform-hosted only),
+  //     but `assistant keys set` does. Copying the command is the whole fix, so
+  //     the banner hands it over rather than leaving the user with no action.
+  const reprovisionAssistantKeyAction = showDoctorAction ? (
+    <Button asChild variant="outlined" size="compact">
+      <Link
+        to={`${routes.settings.debug}?tab=doctor`}
+        onClick={() =>
+          useDoctorHandoffStore
+            .getState()
+            .setPendingPrompt("Help me re-provision my assistant's API key")
+        }
+      >
+        {t("chatRouteContent.askTheDoctor")}
+      </Link>
+    </Button>
+  ) : assistantState.kind === "active" ? (
+    <Button
+      variant="outlined"
+      size="compact"
+      onClick={() =>
+        copyToClipboard(REPROVISION_ASSISTANT_KEY_COMMAND, {
+          successMessage: "Command copied. Run it where the assistant runs.",
+          errorMessage: "Couldn't copy the command.",
+        })
+      }
+    >
+      {t("chatRouteContent.copyCliFix")}
     </Button>
   ) : undefined;
 
@@ -708,7 +847,7 @@ export function ChatMainPanel({
           }
         }}
       >
-        Open page
+        {t("chatRouteContent.openPage")}
       </Button>
     ) : undefined;
 
@@ -720,7 +859,10 @@ export function ChatMainPanel({
           actions:
             buildOpenUrlAction(error.actionUrl, () =>
               useChatSessionStore.getState().setError(null),
-            ) ?? doctorAction,
+            ) ??
+            (isManagedCredentialChatError(error)
+              ? reprovisionAssistantKeyAction
+              : doctorAction),
         }
       : null;
   const hasGenericChatError = genericChatError !== null;
@@ -733,7 +875,9 @@ export function ChatMainPanel({
             buildOpenUrlAction(notice.actionUrl, () =>
               useChatSessionStore.getState().setNotice(null),
             ) ??
-            (isManagedCredentialChatError(notice) ? doctorAction : undefined),
+            (isManagedCredentialChatError(notice)
+              ? reprovisionAssistantKeyAction
+              : undefined),
         }
       : null;
   const genericChatBanner = genericChatError ?? genericChatNotice;
@@ -777,7 +921,6 @@ export function ChatMainPanel({
   // mid-load), its profile lives in the composer stash, not on a server row —
   // feed it in so attachment/vision gating reflects the profile the first
   // message will actually use rather than the global default.
-  const pendingDraftProfiles = useConversationStore.use.pendingDraftProfiles();
   const activeDraftProfile =
     !activeConversation && activeConversationId
       ? (pendingDraftProfiles.get(activeConversationId) ?? undefined)
@@ -800,12 +943,12 @@ export function ChatMainPanel({
   // Attachment drop zone
   // -------------------------------------------------------------------------
   const handleDroppedFiles = useCallback(
-    (files: FileList | File[]) => {
+    (files: FileList | File[]): File[] => {
       const arr = Array.from(files);
       const allowed =
         !visionGateActive || activeModelSupportsVision
           ? arr
-          : arr.filter((f) => !f.type.startsWith("image/"));
+          : arr.filter((f) => !isImageAttachment(f));
       if (allowed.length < arr.length) {
         useComposerStore.setState({
           attachmentLastError:
@@ -815,6 +958,10 @@ export function ChatMainPanel({
       if (allowed.length > 0) {
         addChatAttachmentFiles(allowed);
       }
+      // What a caller reading one file at a time needs to know: an image
+      // dropped here is never held, so it should not count against whatever
+      // budget that caller is keeping.
+      return allowed;
     },
     [addChatAttachmentFiles, activeModelSupportsVision, visionGateActive],
   );
@@ -987,11 +1134,35 @@ export function ChatMainPanel({
   // -------------------------------------------------------------------------
   // Disk pressure banner (localStorage-backed dismiss/suppress)
   // -------------------------------------------------------------------------
+  // One visibility instance is shared between the slot and the precedence
+  // gate below, so the gate tracks what the slot actually renders even when
+  // a dismissal's storage write fails and no cross-instance notification
+  // fires.
+  const diskPressureVisibility = useDiskPressureBannerVisibility(
+    diskPressure,
+    assistantId,
+  );
+  const diskPressureBannerVisible = diskPressureVisibility.visibleMode !== null;
   const diskPressureBannerSlot = (
     <DiskPressureBannerSlot
       diskPressure={diskPressure}
+      visibility={diskPressureVisibility}
+      assistantStateKind={assistantState.kind}
+    />
+  );
+
+  // -------------------------------------------------------------------------
+  // Resource pressure banner (localStorage-backed dismiss/cooldown)
+  // -------------------------------------------------------------------------
+  // The slot stays mounted even while yielding to the disk banner so its
+  // in-memory dismissal fallback (for failed storage writes) survives the
+  // disk episode; it hides its own output via `hidden`.
+  const resourcePressureBannerSlot = (
+    <ResourcePressureBannerSlot
+      resourcePressure={resourcePressure}
       assistantId={assistantId}
       assistantStateKind={assistantState.kind}
+      hidden={diskPressureBannerVisible}
     />
   );
 
@@ -1003,6 +1174,7 @@ export function ChatMainPanel({
     startersSlot,
     belowFoldSlot,
     dockStartersToBottom,
+    startersDockCollapsed,
     renderAvatar,
     emptyStatePlaceholder,
     composerPeekSlot,
@@ -1014,6 +1186,7 @@ export function ChatMainPanel({
     mainView,
     openedAppState,
     isAssistantBusy,
+    showCreditsUpsell: balanceStatus.isExhausted,
     onSelectStarter: handleSelectStarter,
     onSelectSuggestion: newThreadSuggestionsEnabled
       ? setSelectedSuggestion
@@ -1030,8 +1203,24 @@ export function ChatMainPanel({
     onCancelAllQueued: handleCancelAllQueued,
     onSteerMessage: handleSteerMessage,
     onEditQueueTail: handleEditQueueTail,
-    queueSteering,
   });
+
+  // A conversation whose branch parent was deleted renders its own messages
+  // and nothing before them. Composed into the banner slot rather than
+  // replacing it, and kept undefined when there is nothing to show, because
+  // `ChatBody` decides whether to render the banner container from whether
+  // this node exists.
+  const orphanedHistoryBanner =
+    activeConversation?.historyOrphaned === true ? (
+      <OrphanedHistoryNotice />
+    ) : null;
+  const mainBannerWithNotices =
+    orphanedHistoryBanner || mainBannerSlot ? (
+      <>
+        {orphanedHistoryBanner}
+        {mainBannerSlot}
+      </>
+    ) : undefined;
 
   // -------------------------------------------------------------------------
   // Billing composer banner
@@ -1041,13 +1230,17 @@ export function ChatMainPanel({
   const billingBannerDecision =
     errorBillingBannerDecision ?? noticeBillingBannerDecision;
 
-  // Credit-paywall CTA: single CTA gated by experiment arm + plan. Only fetch
-  // the subscription when the credit paywall is actually shown.
-  const billingCtaArm = useBillingCtaExperimentArm();
-  const isFreePlan = useIsFreePlan(billingBannerDecision === "managed_credits");
-  const creditPaywallMode = resolveCreditPaywallCta({
-    isUpgradeArm: isBillingCtaUpgradeArm(billingCtaArm),
-    isFreePlan,
+  const lowBalanceBannerDismissed = useLowBalanceBannerStore.use.dismissed();
+  const composerBillingBanner = resolveComposerBillingBanner({
+    billingBannerDecision,
+    isLowBalance: balanceStatus.isLowBalance,
+    dismissed: lowBalanceBannerDismissed,
+    // State-driven, so the banner is already up when the user returns to an
+    // app whose daily cap was reached by background turns.
+    dailyLimitReached: balanceStatus.dailyLimitReached,
+    // A skip clears the banner even when the error that raised it is still the
+    // last thing that happened on this conversation.
+    dailyLimitSnoozed: balanceStatus.dailyLimitSnoozed,
   });
 
   // -------------------------------------------------------------------------
@@ -1088,17 +1281,36 @@ export function ChatMainPanel({
 
   const cmdEnterMode = cmdEnterToSend.useValue();
 
+  // Whether the surface each settings menu owns is open. The mobile composer
+  // floats those two triggers above its card and hides them when focus leaves,
+  // and opening one takes focus out of the composer, so it needs the open state
+  // to hold the row in place underneath the sheet. Each menu reports `false` on
+  // its way out, so a presentation swap that unmounts an open one clears the
+  // flag it set.
+  const [accessSheetOpen, setAccessSheetOpen] = useState(false);
+  const [profileSheetOpen, setProfileSheetOpen] = useState(false);
+  const settingsSheetOpen = accessSheetOpen || profileSheetOpen;
+
+  const composerAssistantName = assistantName?.trim();
+  const composerPlaceholder = resolveComposerPlaceholder({
+    isEmptyConversation,
+    emptyStatePlaceholder,
+    assistantPlaceholder:
+      isMobile && composerAssistantName
+        ? t("chatComposer.askAssistantPlaceholder", {
+            assistantName: composerAssistantName,
+          })
+        : null,
+    defaultPlaceholder: "What would you like to do?",
+  });
+
   // Explicit props (no spread bundle): the contract is visible here, and the
   // composer self-sources its own store state, so nothing high-frequency is
   // threaded through. `ChatBody` renders this node as-is.
   const composerNode = (
     <ChatComposer
       cmdEnterMode={cmdEnterMode}
-      placeholder={
-        isEmptyConversation
-          ? emptyStatePlaceholder
-          : "What would you like to do?"
-      }
+      placeholder={composerPlaceholder}
       onSubmit={handleFormSubmit}
       inputRef={inputRef}
       typingDisabled={typingDisabled}
@@ -1125,16 +1337,15 @@ export function ChatMainPanel({
       onCancelEdit={isEditing ? handleCancelEdit : undefined}
       textareaMaxHeightPx={isEmptyConversation ? 320 : undefined}
       suggestion={suggestion}
-      hasBillingBanner={
-        billingBannerDecision !== null &&
-        billingBannerDecision !== "managed_credits"
-      }
+      hasBillingBanner={composerBillingBanner !== null}
+      settingsSheetOpen={settingsSheetOpen}
       thresholdPickerSlot={
         assistantId ? (
           <ComposerSettingsMenu
             assistantId={assistantId}
             conversationId={activeConversation?.conversationId}
             segments="access"
+            onOpenChange={setAccessSheetOpen}
           />
         ) : undefined
       }
@@ -1144,6 +1355,7 @@ export function ChatMainPanel({
             assistantId={assistantId}
             conversationId={activeConversation?.conversationId}
             segments="profile"
+            onOpenChange={setProfileSheetOpen}
           />
         ) : undefined
       }
@@ -1187,19 +1399,22 @@ export function ChatMainPanel({
             onOpenMicSettings={handleOpenMicSettings}
             onOpenTextInsertionSettings={handleOpenTextInsertionSettings}
             billingBannerSlot={
-              billingBannerDecision === "daily_limit" ? (
-                <DailyLimitBanner onAdjustLimit={pushToBillingSettings} />
-              ) : billingBannerDecision === "managed_credits" ? (
-                <CreditsExhaustedBanner
-                  mode={creditPaywallMode}
-                  onAddCredits={() => setShowAddCreditsModal(true)}
-                  onUpgrade={pushToPlansTakeover}
-                />
-              ) : billingBannerDecision === "provider_billing" ? (
+              composerBillingBanner === "daily_limit" ? (
+                <DailyLimitBanner onAdjustLimit={pushToDailyLimitSettings} />
+              ) : composerBillingBanner === "provider_billing" ? (
                 <ProviderBillingBanner onOpenSettings={pushToAiSettings} />
+              ) : composerBillingBanner === "low_balance" ? (
+                <LowBalanceBanner />
               ) : null
             }
             diskPressureBanner={diskPressureBannerSlot}
+            // A storage warning is actionable-critical and must not stack
+            // with or compete against an upsell banner, so the resource
+            // slot yields whenever the disk-pressure banner is actually
+            // visible. Acknowledgement-required and cleanup modes are never
+            // dismissible, so disk always wins there; a dismissed or
+            // suppressed warning hands the space to the resource banner.
+            resourcePressureBanner={resourcePressureBannerSlot}
             showMissingApiKeyBanner={error?.code === "PROVIDER_NOT_CONFIGURED"}
             onOpenAiSettings={pushToAiSettings}
             onDismissApiKeyError={handleDismissApiKeyError}
@@ -1237,19 +1452,23 @@ export function ChatMainPanel({
   // -------------------------------------------------------------------------
   const editingConversationId =
     useConversationStore.use.editingConversationId();
-  const isSidePanel =
-    mainView === "app-editing" && !!openedAppState && !!editingConversationId;
+  const paneArrangement = paneState({
+    mainView,
+    appId: openedAppState?.appId ?? null,
+    conversationId: activeConversationId,
+    boundConversationId: editingConversationId,
+    isAppMinimized,
+  }).presentation;
+  const isSidePanel = paneArrangement === "side";
   const variant = isSidePanel ? "side-panel" : "main";
 
-  // Mobile-only: while the app overlay is minimized to its bottom strip, the
-  // strip covers the bottom of the chat. Reserve its height so the composer
-  // sits above it. The guard mirrors the strip's mount condition — the strip
-  // renders only while `mainView === "app"`, and navigation can leave
-  // `isAppMinimized`/`openedAppState` set after it unmounts. The strip peeks
-  // `--app-strip-h` above the safe area, and the chat shell already pads for
-  // the safe area itself, so only the strip height needs reserving.
+  // Mobile-only: while the app is parked to its bottom strip, the strip covers
+  // the bottom of the chat, so its height is reserved to keep the composer
+  // above it. The strip peeks `--app-strip-h` above the safe area, and the
+  // chat shell already pads for the safe area itself, so only the strip height
+  // needs reserving.
   const appStripBottomInset =
-    isMobile && mainView === "app" && isAppMinimized && openedAppState
+    isMobile && paneArrangement === "bottom"
       ? "var(--app-strip-h, 64px)"
       : undefined;
 
@@ -1277,11 +1496,12 @@ export function ChatMainPanel({
       onRetryRefresh={handleRetryRefreshFromPill}
       genericChatError={genericChatBanner}
       onDismissChatError={handleDismissChatError}
-      bannerSlot={isSidePanel ? undefined : mainBannerSlot}
+      bannerSlot={isSidePanel ? undefined : mainBannerWithNotices}
       queuedDrawerSlot={isSidePanel ? undefined : mainQueuedDrawerSlot}
       startersSlot={startersSlot}
       belowFoldSlot={belowFoldSlot}
       dockStartersToBottom={dockStartersToBottom}
+      startersDockCollapsed={startersDockCollapsed}
       activeProcessOverlaysSlot={
         hasActiveProcess ? activeProcessOverlays : undefined
       }
@@ -1345,7 +1565,8 @@ export function ChatMainPanel({
           >
             <BottomSheet.Header className="sr-only">
               <BottomSheet.Title>
-                {selectedSuggestion?.detail.heading ?? "Suggestion"}
+                {selectedSuggestion?.detail.heading ??
+                  t("chatRouteContent.suggestionFallback")}
               </BottomSheet.Title>
             </BottomSheet.Header>
             {suggestionDetailPanel}
@@ -1388,6 +1609,3 @@ export function ChatMainPanel({
     </>
   );
 }
-
-/** @deprecated Use {@link ChatMainPanel} — kept for migration. */
-export const ChatRouteContent = ChatMainPanel;

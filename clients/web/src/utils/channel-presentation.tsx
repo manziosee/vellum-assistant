@@ -16,14 +16,24 @@
 import { createElement } from "react";
 import {
   Bot,
+  CheckCircle,
+  CircleDashed,
   Hash,
   Mail,
   MessageCircle,
   MessageSquare,
   Phone,
+  RefreshCw,
   Send,
+  Smartphone,
+  Video,
   type LucideIcon,
 } from "lucide-react";
+
+import type { TagTone } from "@vellumai/design-library/components/tag";
+
+import { useTranslation } from "@/i18n";
+import type { AssistantChannelState } from "@/types/channel-types";
 
 const CHANNEL_LABELS: Record<string, string> = {
   slack: "Slack",
@@ -44,6 +54,49 @@ const CHANNEL_ICONS: Record<string, LucideIcon> = {
   email: Mail,
   a2a: Bot,
 };
+
+/**
+ * How a channel's operational health reads: which icon and words report it,
+ * and the tone a design-library Tag would wear.
+ *
+ * Shared because two surfaces render the same verdict inside different
+ * chrome. The Channels tab draws it as a Tag; the Contacts row draws it as
+ * the inverted pill its sibling rows already use, so it cannot simply
+ * borrow that component. Only the chrome differs, and a second copy of the
+ * mapping is what would let one surface start saying something the other
+ * does not.
+ *
+ * Absent health reads as connected: the channel measures nothing
+ * operational, so there is no outage to report.
+ */
+const HEALTH_BADGES = {
+  ok: {
+    icon: CheckCircle,
+    labelKey: "connectionCard.connected",
+    tone: "positive",
+  },
+  failing: {
+    icon: RefreshCw,
+    labelKey: "connectionCard.reconnecting",
+    tone: "warning",
+  },
+  unknown: {
+    icon: CircleDashed,
+    labelKey: "connectionCard.statusUnavailable",
+    tone: "neutral",
+  },
+} as const satisfies Record<
+  "ok" | "failing" | "unknown",
+  { icon: LucideIcon; labelKey: string; tone: TagTone }
+>;
+
+export function useChannelHealthBadge(
+  health: AssistantChannelState["health"],
+): { Icon: LucideIcon; label: string; tone: TagTone } {
+  const { t } = useTranslation("channels");
+  const { icon, labelKey, tone } = HEALTH_BADGES[health ?? "ok"];
+  return { Icon: icon, label: t(labelKey), tone };
+}
 
 /**
  * Human label for a channel id. Falls back to a Title-Cased version of the
@@ -100,6 +153,48 @@ export function ChannelIcon({
   className?: string;
 }) {
   return createElement(getChannelIcon(channelId), {
+    className,
+    "aria-hidden": true,
+  });
+}
+
+/**
+ * Lucide icons a plugin channel may name in its `channels/channel.json`.
+ *
+ * A fixed map rather than a lookup over the whole `lucide-react` namespace:
+ * resolving by name dynamically means importing every icon lucide ships, and
+ * a settings rail is not worth that bundle. The declared name still travels
+ * in the API for clients that can resolve it without the same cost.
+ *
+ * An unrecognised name falls back rather than failing. A plugin whose icon is
+ * missing here renders as a generic channel, which is a smaller problem than
+ * a blank row, and the fix is one entry.
+ */
+const PLUGIN_CHANNEL_ICONS: Record<string, LucideIcon> = {
+  bot: Bot,
+  hash: Hash,
+  mail: Mail,
+  "message-circle": MessageCircle,
+  "message-square": MessageSquare,
+  phone: Phone,
+  send: Send,
+  smartphone: Smartphone,
+  video: Video,
+};
+
+/**
+ * Renders a plugin channel's declared glyph. Same static-component treatment
+ * as {@link ChannelIcon}: the component is chosen from a module-level map
+ * rather than constructed during render.
+ */
+export function PluginChannelIcon({
+  icon,
+  className,
+}: {
+  icon: string | null | undefined;
+  className?: string;
+}) {
+  return createElement((icon && PLUGIN_CHANNEL_ICONS[icon]) || MessageSquare, {
     className,
     "aria-hidden": true,
   });

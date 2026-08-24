@@ -7,14 +7,15 @@
  * **State managed:**
  * - `mainView` — which top-level panel is displayed
  * - `activeAppId` / `openedAppState` — app viewer
- * - `openedDocumentState` — document viewer
+ * - `activeDocumentTarget` / `openedDocumentState` — document viewer, holding
+ *   a document surface or a read-only preview of a workspace file
  * - `isAppMinimized` — mobile-only: app viewer minimized
  * - `intelligenceTab` — sub-tab inside the intelligence panel
- * - `assetsRefreshKey` — counter bumped to force asset re-fetches
  * - `viewBeforeDocument` / `viewBeforeSubagentDetail` / `viewBeforeToolDetail` / `viewBeforeWorkflowDetail` / `viewBeforeAcpRunDetail` — previous view for restoration
  * - `activeSubagentId` — subagent detail panel
  * - `activeToolDetail` — tool-call detail drawer payload
  * - `activeActivitySteps` — activity-steps side panel payload (a group's full timeline)
+ * - `activeMessageFiles` - message-files side panel payload (one message's attachments)
  * - `activeWorkflowRunId` — workflow detail panel
  * - `activeAcpRunId` — ACP run detail panel
  * - `activeBackgroundTaskId` — background-task detail panel
@@ -32,11 +33,16 @@ import type { SetupChannelId } from "@/types/channel-types";
 import type { ProcessKind } from "@/domains/chat/process-registry/types";
 import type { ChatMessageToolCall } from "@/domains/chat/api/event-types";
 import type { ToolCallCardItem } from "@/domains/chat/utils/tool-call-card-utils";
+import type { DisplayAttachment } from "@/types/attachment-types";
+
 import { appsByIdOpenPost, documentsByIdGet } from "@/generated/daemon/sdk.gen";
 import { primeAppHtmlCache } from "@/utils/app-html-cache";
+import { workspaceBasenameOf } from "@/domains/chat/utils/workspace-path-links";
+import { useUnseenDocumentChangesStore } from "@/domains/chat/unseen-document-changes-store";
 
 import type { WebSearchResultItem } from "@/assistant/web-activity-types";
 import { createSelectors } from "@/utils/create-selectors";
+import { isAppMainView } from "@/stores/pane-state";
 
 /** Views that overlay the main content and track a "back" destination. */
 type OverlayView =
@@ -44,6 +50,7 @@ type OverlayView =
   | "subagent-detail"
   | "tool-detail"
   | "activity-steps"
+  | "message-files"
   | "workflow-detail"
   | "acp-run-detail"
   | "background-task-detail"
@@ -115,6 +122,7 @@ function resolveViewBefore(
     | "viewBeforeSubagentDetail"
     | "viewBeforeToolDetail"
     | "viewBeforeActivitySteps"
+    | "viewBeforeMessageFiles"
     | "viewBeforeWorkflowDetail"
     | "viewBeforeAcpRunDetail"
     | "viewBeforeBackgroundTaskDetail"
@@ -127,6 +135,7 @@ function resolveViewBefore(
     mv === "subagent-detail" ||
     mv === "tool-detail" ||
     mv === "activity-steps" ||
+    mv === "message-files" ||
     mv === "workflow-detail" ||
     mv === "acp-run-detail" ||
     mv === "background-task-detail" ||
@@ -150,6 +159,7 @@ export type MainView =
   | "subagent-detail"
   | "tool-detail"
   | "activity-steps"
+  | "message-files"
   | "workflow-detail"
   | "acp-run-detail"
   | "background-task-detail"
@@ -165,11 +175,82 @@ export interface OpenedAppState {
   html: string;
 }
 
-export interface OpenedDocumentState {
+/**
+ * A document surface stored in the daemon's document database. Edits are saved
+ * through the documents API and carry the document-id affordances (comments,
+ * PDF export, feedback).
+ */
+export interface OpenedDbDocumentState {
+  source: "document";
   surfaceId: string;
   conversationId: string;
   documentName: string;
   content: string;
+}
+
+/**
+ * Workspace file formats the drawer renders read-only, without an editor.
+ * `unsupported` is the catch-all: the drawer opens for every file type, and a
+ * format no reader covers shows the file's identity plus the two ways out
+ * (open in the workspace, download) rather than refusing to open at all.
+ */
+export type WorkspaceFilePreviewKind =
+  | "csv"
+  | "markdown"
+  | "text"
+  | "pdf"
+  | "image"
+  | "audio"
+  | "video"
+  | "unsupported";
+
+/**
+ * A workspace file shown read-only in the drawer. Nothing is editable, so this
+ * variant carries no content: the preview component reads the bytes from the
+ * query cache, which stays the single owner of that server data.
+ */
+export interface OpenedWorkspaceFilePreviewState {
+  source: "workspace-file-preview";
+  workspacePath: string;
+  documentName: string;
+  previewKind: WorkspaceFilePreviewKind;
+}
+
+/**
+ * What the document viewer is showing. The `source` discriminant decides
+ * whether edits save anywhere: a document surface autosaves through the
+ * documents API, and a preview saves nowhere.
+ */
+export type OpenedDocumentState =
+  | OpenedDbDocumentState
+  | OpenedWorkspaceFilePreviewState;
+
+/**
+ * The document the viewer is loading or showing, tracked so a load that
+ * resolves after the user moved on can detect that it is stale. One union
+ * rather than a surface-id field plus a path field, so "showing a file while a
+ * surface id is active" cannot be represented.
+ */
+export type DocumentTarget =
+  | { source: "document"; surfaceId: string }
+  | { source: "workspace-file-preview"; workspacePath: string };
+
+/** Whether two document targets address the same document. */
+export function sameDocumentTarget(
+  a: DocumentTarget | null,
+  b: DocumentTarget,
+): boolean {
+  if (a === null || a.source !== b.source) {
+    return false;
+  }
+  if (a.source === "document" && b.source === "document") {
+    return a.surfaceId === b.surfaceId;
+  }
+  return (
+    a.source === "workspace-file-preview" &&
+    b.source === "workspace-file-preview" &&
+    a.workspacePath === b.workspacePath
+  );
 }
 
 export type ChannelSetupType = SetupChannelId;
@@ -275,6 +356,27 @@ export function sameActivityStepsTarget(
   return a.toolCalls[0]?.id === b.toolCalls[0]?.id;
 }
 
+/**
+ * Payload for the message-files side panel: every attachment on one
+ * transcript message. The open panel re-derives live attachments from the
+ * transcript by `messageId`; the embedded `attachments` array is the
+ * open-time snapshot, used when that message is no longer in the loaded
+ * transcript (paged out by history windowing).
+ */
+export interface MessageFilesPayload {
+  messageId: string;
+  attachments: DisplayAttachment[];
+  assistantId?: string | null;
+}
+
+/** Whether two message-files payloads address the same transcript message. */
+export function sameMessageFilesTarget(
+  a: MessageFilesPayload,
+  b: MessageFilesPayload,
+): boolean {
+  return a.messageId === b.messageId;
+}
+
 /** The identity fields a thinking drawer target is matched on. */
 type ThinkingTarget = Pick<
   ToolDetailPayload,
@@ -312,11 +414,10 @@ export interface ViewerState {
   mainView: MainView;
   activeAppId: string | null;
   openedAppState: OpenedAppState | null;
-  activeDocumentSurfaceId: string | null;
+  activeDocumentTarget: DocumentTarget | null;
   openedDocumentState: OpenedDocumentState | null;
   isAppMinimized: boolean;
   intelligenceTab: IntelligenceTab;
-  assetsRefreshKey: number;
   viewBeforeDocument: Exclude<MainView, OverlayView>;
   activeSubagentId: string | null;
   viewBeforeSubagentDetail: Exclude<MainView, OverlayView>;
@@ -324,6 +425,8 @@ export interface ViewerState {
   viewBeforeToolDetail: Exclude<MainView, OverlayView>;
   activeActivitySteps: ActivityStepsPayload | null;
   viewBeforeActivitySteps: Exclude<MainView, OverlayView>;
+  activeMessageFiles: MessageFilesPayload | null;
+  viewBeforeMessageFiles: Exclude<MainView, OverlayView>;
   activeWorkflowRunId: string | null;
   viewBeforeWorkflowDetail: Exclude<MainView, OverlayView>;
   activeAcpRunId: string | null;
@@ -423,6 +526,26 @@ export interface ViewerActions {
   toggleActivitySteps: (payload: ActivityStepsPayload) => void;
   closeActivitySteps: () => void;
 
+  // --- Message files panel ---
+  openMessageFiles: (payload: MessageFilesPayload) => void;
+  /**
+   * Open the files panel for `payload`, or close it when the panel is already
+   * showing the SAME message. Powers the overflow tile, where clicking the
+   * already-open tile dismisses the panel.
+   */
+  toggleMessageFiles: (payload: MessageFilesPayload) => void;
+  closeMessageFiles: () => void;
+
+  /**
+   * Drop the payloads of the panels whose content is scoped to one
+   * conversation's transcript. Called on conversation switch: overlay
+   * panels are dismissed when the viewer returns to chat, and holding
+   * their payloads keeps the previous conversation's data alive -
+   * `activeMessageFiles` in particular retains decoded attachment blob/data
+   * URLs. Leaves `mainView` alone; this is a memory concern, not navigation.
+   */
+  clearTranscriptPanelPayloads: () => void;
+
   // --- Channel setup ---
   openChannelSetup: (payload: ChannelSetupPayload) => void;
   closeChannelSetup: () => void;
@@ -433,6 +556,15 @@ export interface ViewerActions {
     assistantId: string,
     documentSurfaceId: string,
   ) => Promise<void>;
+  /**
+   * Open a workspace file read-only in the document drawer. Synchronous: the
+   * preview owns its own bytes through the query cache, so the store records
+   * only which file is on show.
+   */
+  openWorkspaceFilePreview: (
+    workspacePath: string,
+    previewKind: WorkspaceFilePreviewKind,
+  ) => void;
   setLoadedDocument: (document: OpenedDocumentState) => void;
   updateDocumentContent: (
     surfaceId: string,
@@ -441,9 +573,6 @@ export interface ViewerActions {
   ) => void;
   handleDocumentLoadFailed: () => void;
   closeDocument: () => void;
-
-  // --- Assets ---
-  refreshAssets: () => void;
 
   // --- Reset ---
   reset: () => void;
@@ -459,11 +588,10 @@ const INITIAL_STATE: ViewerState = {
   mainView: "chat",
   activeAppId: null,
   openedAppState: null,
-  activeDocumentSurfaceId: null,
+  activeDocumentTarget: null,
   openedDocumentState: null,
   isAppMinimized: false,
   intelligenceTab: "identity",
-  assetsRefreshKey: 0,
   viewBeforeDocument: "chat",
   activeSubagentId: null,
   viewBeforeSubagentDetail: "chat",
@@ -471,6 +599,8 @@ const INITIAL_STATE: ViewerState = {
   viewBeforeToolDetail: "chat",
   activeActivitySteps: null,
   viewBeforeActivitySteps: "chat",
+  activeMessageFiles: null,
+  viewBeforeMessageFiles: "chat",
   activeWorkflowRunId: null,
   viewBeforeWorkflowDetail: "chat",
   activeAcpRunId: null,
@@ -589,10 +719,7 @@ const useViewerStoreBase = create<ViewerStore>()((set, get) => ({
 
   handleAppUnpinned: (appId) => {
     const state = get();
-    if (
-      state.activeAppId !== appId ||
-      (state.mainView !== "app" && state.mainView !== "app-editing")
-    ) {
+    if (state.activeAppId !== appId || !isAppMainView(state.mainView)) {
       return false;
     }
     get().closeApp();
@@ -741,6 +868,9 @@ const useViewerStoreBase = create<ViewerStore>()((set, get) => ({
       case "activity-steps":
         get().closeActivitySteps();
         return true;
+      case "message-files":
+        get().closeMessageFiles();
+        return true;
       case "workflow-detail":
         get().closeWorkflowDetail();
         return true;
@@ -859,6 +989,48 @@ const useViewerStoreBase = create<ViewerStore>()((set, get) => ({
     });
   },
 
+  // --- Message files panel ---
+
+  openMessageFiles: (payload) => {
+    set({
+      mainView: "message-files",
+      activeMessageFiles: payload,
+      viewBeforeMessageFiles: resolveViewBefore(
+        get(),
+        "viewBeforeMessageFiles",
+      ),
+    });
+  },
+
+  toggleMessageFiles: (payload) => {
+    const state = get();
+    const active = state.activeMessageFiles;
+    const isSameTarget =
+      state.mainView === "message-files" &&
+      active != null &&
+      sameMessageFilesTarget(active, payload);
+    if (isSameTarget) {
+      get().closeMessageFiles();
+    } else {
+      get().openMessageFiles(payload);
+    }
+  },
+
+  closeMessageFiles: () => {
+    set({
+      mainView: get().viewBeforeMessageFiles,
+      activeMessageFiles: null,
+    });
+  },
+
+  clearTranscriptPanelPayloads: () => {
+    set({
+      activeMessageFiles: null,
+      activeActivitySteps: null,
+      activeToolDetail: null,
+    });
+  },
+
   // --- Document viewer ---
 
   openDocument: () => {
@@ -871,9 +1043,13 @@ const useViewerStoreBase = create<ViewerStore>()((set, get) => ({
 
   loadDocument: async (assistantId, documentSurfaceId) => {
     const viewBeforeDocument = resolveViewBefore(get(), "viewBeforeDocument");
+    const target: DocumentTarget = {
+      source: "document",
+      surfaceId: documentSurfaceId,
+    };
     set({
       mainView: "document",
-      activeDocumentSurfaceId: documentSurfaceId,
+      activeDocumentTarget: target,
       openedDocumentState: null,
       viewBeforeDocument,
     });
@@ -882,35 +1058,53 @@ const useViewerStoreBase = create<ViewerStore>()((set, get) => ({
         path: { assistant_id: assistantId, id: documentSurfaceId },
         throwOnError: true,
       });
-      if (get().activeDocumentSurfaceId !== documentSurfaceId) {
+      if (!sameDocumentTarget(get().activeDocumentTarget, target)) {
         return;
       }
       if (!result) {
         set({
           mainView: viewBeforeDocument,
-          activeDocumentSurfaceId: null,
+          activeDocumentTarget: null,
           openedDocumentState: null,
         });
         return;
       }
       set({
         openedDocumentState: {
+          source: "document",
           surfaceId: result.surfaceId,
           conversationId: result.conversationId,
           documentName: result.title ?? "Untitled",
           content: result.content ?? "",
         },
       });
+      useUnseenDocumentChangesStore
+        .getState()
+        .clearDocumentEverywhere(result.surfaceId);
     } catch {
-      if (get().activeDocumentSurfaceId !== documentSurfaceId) {
+      if (!sameDocumentTarget(get().activeDocumentTarget, target)) {
         return;
       }
       set({
         mainView: viewBeforeDocument,
-        activeDocumentSurfaceId: null,
+        activeDocumentTarget: null,
         openedDocumentState: null,
       });
     }
+  },
+
+  openWorkspaceFilePreview: (workspacePath, previewKind) => {
+    set({
+      mainView: "document",
+      activeDocumentTarget: { source: "workspace-file-preview", workspacePath },
+      openedDocumentState: {
+        source: "workspace-file-preview",
+        workspacePath,
+        documentName: workspaceBasenameOf(workspacePath),
+        previewKind,
+      },
+      viewBeforeDocument: resolveViewBefore(get(), "viewBeforeDocument"),
+    });
   },
 
   setLoadedDocument: (document) => {
@@ -918,14 +1112,12 @@ const useViewerStoreBase = create<ViewerStore>()((set, get) => ({
   },
 
   updateDocumentContent: (surfaceId, content, mode) => {
-    const state = get();
-    if (
-      !state.openedDocumentState ||
-      state.openedDocumentState.surfaceId !== surfaceId
-    ) {
+    const prev = get().openedDocumentState;
+    // Streamed edits address a document surface, so they never apply to a
+    // read-only preview.
+    if (!prev || prev.source !== "document" || prev.surfaceId !== surfaceId) {
       return;
     }
-    const prev = state.openedDocumentState;
     const newContent = mode === "append" ? prev.content + content : content;
     set({ openedDocumentState: { ...prev, content: newContent } });
   },
@@ -933,7 +1125,7 @@ const useViewerStoreBase = create<ViewerStore>()((set, get) => ({
   handleDocumentLoadFailed: () => {
     set({
       mainView: get().viewBeforeDocument,
-      activeDocumentSurfaceId: null,
+      activeDocumentTarget: null,
       openedDocumentState: null,
     });
   },
@@ -941,15 +1133,9 @@ const useViewerStoreBase = create<ViewerStore>()((set, get) => ({
   closeDocument: () => {
     set({
       mainView: get().viewBeforeDocument,
-      activeDocumentSurfaceId: null,
+      activeDocumentTarget: null,
       openedDocumentState: null,
     });
-  },
-
-  // --- Assets ---
-
-  refreshAssets: () => {
-    set({ assetsRefreshKey: get().assetsRefreshKey + 1 });
   },
 
   // --- Reset ---

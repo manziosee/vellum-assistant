@@ -1,4 +1,4 @@
-import { execFile, spawn, spawnSync } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -413,18 +413,19 @@ export class WorkspaceGitService {
    * open, we leave it alone. If no process holds it, it's stale (crashed
    * process) and safe to remove.
    */
-  private cleanStaleLockFile(): void {
+  private async cleanStaleLockFile(): Promise<void> {
     const lockPath = join(this.workspaceDir, ".git", "index.lock");
     if (!existsSync(lockPath)) {
       return;
     }
 
     try {
-      const result = spawnSync("lsof", ["-t", lockPath], {
+      // lsof exits non-zero when no process holds the file, which rejects the
+      // promise and falls through to removal below.
+      const { stdout } = await execFileAsync("lsof", ["-t", lockPath], {
         timeout: 3000,
-        stdio: ["ignore", "pipe", "ignore"],
       });
-      if (result.status === 0 && result.stdout?.length > 0) {
+      if (stdout.length > 0) {
         log.debug("index.lock held by an active process, skipping removal");
         return;
       }
@@ -490,7 +491,7 @@ export class WorkspaceGitService {
 
           // Clean up stale lock files before any git operations.
           if (existsSync(gitDir)) {
-            this.cleanStaleLockFile();
+            await this.cleanStaleLockFile();
           }
 
           if (existsSync(gitDir)) {
@@ -657,7 +658,7 @@ export class WorkspaceGitService {
     await this.ensureInitialized();
 
     await this.mutex.withLock(async () => {
-      this.cleanStaleLockFile();
+      await this.cleanStaleLockFile();
 
       // Stage all changes (minus oversized files)
       await this.stageAllLocked();
@@ -734,7 +735,7 @@ export class WorkspaceGitService {
 
     try {
       const result = await this.mutex.withLock(async () => {
-        this.cleanStaleLockFile();
+        await this.cleanStaleLockFile();
 
         // Re-check breaker under lock: a queued call that started before the
         // breaker opened should not proceed with expensive git work now that
@@ -1992,6 +1993,29 @@ export class WorkspaceGitService {
   }
 
   /**
+   * Run a read-only git command WITHOUT initializing the repository.
+   *
+   * `runReadOnlyGit` is read-only in the sense that its git command does not
+   * write, but it still awaits `ensureInitialized()`, which will create the
+   * repository, write `.gitignore` and the hooks directory, make the initial
+   * commit, and schedule a history compaction when the workspace is not yet a
+   * repo. That makes it unusable from an HTTP GET, which
+   * `src/runtime/AGENTS.md` requires to be side-effect-free.
+   *
+   * This variant skips initialization entirely and throws when the workspace
+   * is not a repository, so a caller that merely wants to *observe* history
+   * can degrade instead of bringing a repo into existence.
+   */
+  async runReadOnlyGitWithoutInit(
+    args: string[],
+  ): Promise<{ stdout: string; stderr: string }> {
+    if (!existsSync(join(this.workspaceDir, ".git"))) {
+      throw new Error("Workspace is not a git repository");
+    }
+    return this.execGit(args);
+  }
+
+  /**
    * Run a sequence of git commands atomically under the workspace mutex.
    * Use this for write operations that need serialization with other
    * git mutations (e.g. checkout + commit).
@@ -2003,7 +2027,7 @@ export class WorkspaceGitService {
   ): Promise<void> {
     await this.ensureInitialized();
     await this.mutex.withLock(async () => {
-      this.cleanStaleLockFile();
+      await this.cleanStaleLockFile();
       await fn((args) => {
         // Intercept commit commands to enforce hook hardening.
         if (args[0] === "commit") {

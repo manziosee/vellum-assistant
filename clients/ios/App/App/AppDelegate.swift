@@ -11,13 +11,21 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         // here as well as through `application(_:open:)`. Persist the origin
         // now, synchronously, so the bridge boots straight to it — by the time
         // the `open:` call lands, `instanceDescriptor()` may already have run.
-        if let url = launchOptions?[.url] as? URL, !handleConnectDeepLink(url) {
-            // Every *other* custom-scheme launch URL — a `voice` link from an
-            // App Intent, the Live Activity, or Safari — is stashed as a
-            // *backstop*, not as the delivery. See `launchURL` for why it is
-            // both kept and deduped.
-            launchURL = url
-            pendingVoiceCommandURL = url
+        // A launch URL came from outside the process, so it may not carry the
+        // in-process provenance marker; strip before storing so the dedupe
+        // below compares like with like, and drop a URL that cannot be
+        // stripped. See `CommandURLProvenance`.
+        if let rawURL = launchOptions?[.url] as? URL,
+           let url = CommandURLProvenance.stripped(rawURL) {
+            if !handleConnectDeepLink(url) {
+                // Every *other* custom-scheme launch URL (a `voice` or `thread`
+                // link from the Live Activity or Safari; App Intents never
+                // arrive this way, they run in-process) is stashed as a
+                // *backstop*, not as the delivery. See `launchURL` for why it
+                // is both kept and deduped.
+                launchURL = url
+                pendingCommandURL = url
+            }
         }
         return true
     }
@@ -41,7 +49,15 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         VoiceLiveActivityPlugin.endRunningActivityBeforeTermination()
     }
 
-    func application(_ app: UIApplication, open url: URL, options: [UIApplication.OpenURLOptionsKey: Any] = [:]) -> Bool {
+    func application(_ app: UIApplication, open rawURL: URL, options: [UIApplication.OpenURLOptionsKey: Any] = [:]) -> Bool {
+        // This and `launchOptions[.url]` are the only two ways a custom-scheme
+        // URL enters from outside the process, so this is where an external
+        // open loses any claim to intent provenance, and where one that cannot
+        // be stripped is refused rather than forwarded. See
+        // `CommandURLProvenance`.
+        guard let url = CommandURLProvenance.stripped(rawURL) else {
+            return false
+        }
         if handleConnectDeepLink(url) {
             return true
         }
@@ -90,12 +106,12 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     /// ready.
     private var pendingConnectPairURL: URL?
 
-    /// Handle `<scheme>://connect?url=<https-base>&code=<device-code>` — the
-    /// custom-scheme QR path that pairs the shell to a self-hosted assistant. The
-    /// `url` parameter is the server base (host, optionally with a path prefix
-    /// like `/assistant-123` for Velay-style hosting); it is both persisted and
-    /// the value the pair-page URL is derived from, so there is one source of
-    /// truth.
+    /// Handle `<scheme>://connect?url=<https-base>&code=<device-code>` (with an
+    /// optional `name=<label>`), the custom-scheme QR path that pairs the shell
+    /// to a self-hosted assistant. The `url` parameter is the server base (host,
+    /// optionally with a path prefix like `/assistant-123` for Velay-style
+    /// hosting); it is both persisted and the value the pair-page URL is derived
+    /// from, so there is one source of truth.
     ///
     /// One handler serves both entry points: a warm open via
     /// `application(_:open:)` and a cold launch via `launchOptions[.url]`. The
@@ -120,6 +136,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         }
 
         SelfHostedServer.store(connect.base)
+        SelfHostedServer.append(url: connect.base, name: connect.name)
         pendingConnectPairURL = connect.pairURL
         deliverPendingConnectNavigation()
         return true
@@ -140,10 +157,15 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         webView.load(URLRequest(url: pairURL))
     }
 
-    /// Parse `<scheme>://connect?url=&code=` into the validated https server base
-    /// and the pair-page URL to load. Returns `nil` for a malformed or non-https
-    /// link.
-    private static func parseConnectDeepLink(_ url: URL) -> (base: URL, pairURL: URL)? {
+    /// Parse `<scheme>://connect?url=&code=` into the validated https server
+    /// base, the pair-page URL to load, and the optional `name` label for the
+    /// remembered-server list. Returns `nil` for a malformed or non-https link.
+    ///
+    /// `name` alone tolerates form encoding: a raw `+` (a space from a sender
+    /// that form-encoded the query) decodes to a space, while an encoded
+    /// `%2B` stays a literal plus. `url` and `code` are machine-generated and
+    /// never form-encoded, so they take the strict percent decode.
+    private static func parseConnectDeepLink(_ url: URL) -> (base: URL, pairURL: URL, name: String?)? {
         guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
               let serverParam = components.queryItems?.first(where: { $0.name == "url" })?.value,
               let code = components.queryItems?.first(where: { $0.name == "code" })?.value,
@@ -153,7 +175,11 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         else {
             return nil
         }
-        return (base, pairURL)
+        let name = components.percentEncodedQueryItems?
+            .first(where: { $0.name == "name" })?.value?
+            .replacingOccurrences(of: "+", with: "%20")
+            .removingPercentEncoding
+        return (base, pairURL, name)
     }
 
     /// Build the standalone SPA pairing route that completes the pre-approved
@@ -174,13 +200,13 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
         return components.url
     }
 
-    // MARK: - Voice command deep links
+    // MARK: - Command deep links
 
-    /// A `<scheme>://voice?mode=…` command (or any other non-`connect` launch
-    /// URL) waiting for the bridge web view to come up, mirroring
-    /// `pendingConnectPairURL` above. Only the most recent one is kept — a
-    /// superseded command is stale by definition.
-    private var pendingVoiceCommandURL: URL?
+    /// A `<scheme>://voice?mode=…` or `<scheme>://thread/…` command (or any
+    /// other non-`connect` launch URL) waiting for the bridge web view to
+    /// come up, mirroring `pendingConnectPairURL` above. Only the most recent
+    /// one is kept: a superseded command is stale by definition.
+    private var pendingCommandURL: URL?
 
     /// The URL this process was launched with (`launchOptions[.url]`), while it
     /// is still eligible to arrive a second time through
@@ -243,23 +269,28 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
             return false
         }
         launchURL = nil
-        pendingVoiceCommandURL = nil
+        pendingCommandURL = nil
         return false
     }
 
-    /// Hand a voice command to the web layer, deferring until the bridge web
+    /// Hand a command URL to the web layer, deferring until the bridge web
     /// view exists.
     ///
-    /// Called by the App Intents (`StartVoiceModeIntent` /
-    /// `StartNewVoiceConversationIntent`), which run in-process and therefore
-    /// never pass through `application(_:open:)`, and by the terminated-launch
-    /// path in `didFinishLaunchingWithOptions`.
-    func deliverVoiceCommand(_ url: URL) {
-        pendingVoiceCommandURL = url
-        deliverPendingVoiceCommand()
+    /// Called only by the App Intents (the voice intents via
+    /// `VoiceModeDeepLink.route()`, `SendMessageToChatIntent` via
+    /// `ThreadDeepLink.route()`), which run in-process and therefore never
+    /// pass through `application(_:open:)`. That exclusivity is load-bearing:
+    /// it is what lets this method vouch for the URL by adding the provenance
+    /// marker the external entry points strip (see `CommandURLProvenance`).
+    /// Do not route anything that arrived from outside the process through
+    /// here; the terminated-launch path in `didFinishLaunchingWithOptions`
+    /// deliberately stashes into `pendingCommandURL` directly instead.
+    func deliverCommandURL(_ url: URL) {
+        pendingCommandURL = CommandURLProvenance.marked(url)
+        deliverPendingCommandURL()
     }
 
-    /// Replay a stashed voice command once the bridge web view is live. Safe to
+    /// Replay a stashed command once the bridge web view is live. Safe to
     /// call before the view controller exists (a cold launch defers to the first
     /// `viewDidAppear`) and idempotent once delivered.
     ///
@@ -272,13 +303,13 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     ///
     /// Exactly one delivery of a launch URL, whichever route wins the race —
     /// see ``launchURL``.
-    func deliverPendingVoiceCommand() {
-        guard let url = pendingVoiceCommandURL,
+    func deliverPendingCommandURL() {
+        guard let url = pendingCommandURL,
               currentBridgeViewController()?.webView != nil
         else {
             return
         }
-        pendingVoiceCommandURL = nil
+        pendingCommandURL = nil
         if url == launchURL {
             launchURLWasReplayed = true
         }

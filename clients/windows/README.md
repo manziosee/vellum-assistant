@@ -1,38 +1,76 @@
 # Vellum Assistant - Windows (Electron)
 
-Bootstrap skeleton for the Windows desktop client. Like `clients/macos`, this is
-an Electron shell around the `clients/web` renderer: in dev it loads the Vite dev
-server (or vel's edge proxy when `vel up` is running), and in packaged builds
-it serves a bundled `resources/web-dist` over a privileged `app://` protocol.
+The Windows desktop client. Like `clients/macos`, this is an Electron shell
+around the `clients/web` renderer: in dev it loads the Vite dev server (or
+vel's edge proxy when `vel up` is running), and in packaged builds it serves a
+bundled `resources/web-dist` over a privileged `app://` protocol.
 
-## What works today
+## Layout
 
-- Hardened main window (context isolation, sandbox, single creation seam in
-  `src/main/windows.ts`) loading the assistant web UI.
-- Same-origin navigation guard; external links open in the default browser;
-  OAuth-style `window.open` popups allowed with the hardened baseline.
-- Sender-validated IPC seam (`src/main/ipc.ts`) with a minimal bridge:
-  `window.vellum.app` (version info, open website), `window.vellum.commands`,
-  `mainWindow.ensureVisible`, plus the `__VELLUM_CONFIG__` /
-  `__VELLUM_FLAG_OVERRIDES__` globals. Namespaces the renderer dereferences
-  unguarded when `platform` is `"electron"` (`power`, `deepLinks`, `dock`,
-  `menu`, `localMode`, `mainWindow.setOnboarding`) ship as documented no-op
-  stubs; the rest are feature-detected by the renderer's runtime wrappers and
-  degrade to web behavior until ported.
-- Packaged static serving of the renderer with path-traversal protection
-  (`src/main/app-protocol.ts`), single-instance lock, per-environment
-  `userData` separation, `electron-log` file logging.
-- `electron-builder` NSIS installer target (`bun run pack`).
+- `src/main/index.ts` boots the hardened shell (single-instance lock,
+  per-environment `userData`, `app://` serving with path-traversal protection,
+  platform API forwarding) and then composes `src/main/features/*`.
+- `src/main/features/*` and `src/preload/features/*` are capability modules
+  installed through the registries in `@vellumai/electron-desktop`. Every
+  `.ts` file in those directories is picked up automatically; a new capability
+  is a new file, never an edit to `index.ts`.
+- `src/preload/core-capabilities.ts` is the always-present core of
+  `window.vellum`; `src/preload/bridge-parity.test.ts` holds the composed
+  bridge to the full `VellumBridge` contract against the macOS preload.
+- `native/Vellum.WindowsHelper` is the same-user, non-elevated JSON-RPC helper
+  behind UI Automation observation, verified input, dictation, toasts, and
+  text insertion (security model in `native/README.md`).
+  `native/Vellum.PreviewHandler` is the Explorer preview and thumbnail handler
+  for `.vellum` bundles.
+- [`docs/parity-matrix.md`](docs/parity-matrix.md) maps every bridge key and
+  main-process capability to its Windows module, its macOS counterpart, and the
+  test or packaged smoke that covers it, and lists the macOS concepts with no
+  Windows equivalent.
 
-## Not ported yet (see `clients/macos/src/main/` for reference implementations)
+## Permissions and helper security
 
-- Gateway (`/assistant/__gateway/{port}/*`) and platform (`/v1/*`,
-  `/_allauth/*`, `/accounts/*`) request forwarding. Packaged builds can't
-  reach local gateways or the cloud platform until this lands; dev runs are
-  unaffected because the Vite dev server proxies both.
-- Native auth / OAuth sign-in chain, deep links (`vellum://`), tray,
-  notifications, auto-update, CSP, hotkeys, local-mode IPC (hatch/wake/
-  retire), window-state persistence, device id, frameless title bar.
+Windows has no Accessibility, Input Monitoring, or Automation permission
+model; those rows are hidden on a Windows host. Microphone and screen access
+report the Windows privacy settings, and `permissions.openSettings` deep-links
+to the `ms-settings:` page for the kinds a user can change. The helper never
+requests elevation: capabilities return unavailable when the target is
+elevated or protected.
+
+## Packaged CLI provisioning
+
+Packaged Windows startup installs the bundled CLI runtime for the current user:
+
+- The immutable payload is read from `resources/cli-runtime` and copied to
+  `<Electron userData>/cli/<version>`.
+- `<Electron userData>/cli/install-state.json` records the current runtime and
+  one valid fallback. Reusing an older installed version preserves the prior
+  current version as the fallback.
+- A small owned launcher is installed under `%LOCALAPPDATA%\Vellum\bin` and
+  delegates to the selected versioned runtime. Non-production channels use
+  separate launcher directories. A launcher without the Vellum ownership
+  marker is left untouched.
+- Long-lived assistant, gateway, and worker executables remain in the
+  versioned runtime. Provisioning and uninstall never replace or remove those
+  executables while they may be running.
+- The versioned runtime includes the web SPA used by the web client and remote
+  web ingress.
+- The launcher directory is added to `HKCU\Environment\Path`. The app broadcasts
+  the environment change to the Windows shell after a successful write.
+- Machine PATH entries are evaluated before user entries. If another
+  `vellum.exe` wins resolution, startup records the launcher as shadowed.
+
+`vellum retire` stages assistant data before archiving it. On Windows the
+background archive uses PowerShell and the built-in `tar.exe`; other platforms
+use the existing POSIX archive process.
+
+## Updates and troubleshooting
+
+Packaged builds poll the channel-, platform-, and architecture-isolated feed
+`https://storage.googleapis.com/vellum-ai-<env>-releases/win-electron/<arch>/`
+through `electron-updater`, download in the background, and install on quit
+(`src/main/auto-update.ts`). Main-process logs land in `vellum.log` under
+`%APPDATA%\<product name>\logs`; the helper's state and restart action are on
+`window.vellum.helper`, and the tray menu offers a restart.
 
 ## Development
 
@@ -44,6 +82,18 @@ Probes for `vel up` at `localhost:3000` and attaches to it, or falls back to
 standalone mode (spawns `clients/web`'s Vite on :5173, shell only, no
 backends). Scripts assume a POSIX shell; on Windows use Git Bash (or WSL).
 
+To test local web changes against the deployed dev platform without starting
+Vite or opening a local development port, run this from PowerShell:
+
+```powershell
+$env:VELLUM_ENVIRONMENT="dev"
+$env:VELLUM_DEV_URL="https://dev-assistant.vellum.ai/assistant"
+bun run dev:electron-local-web
+```
+
+This builds the local `clients/web` source, serves it from Electron's
+`app://` origin, and forwards platform API requests to `dev-assistant`.
+
 ## Packaging
 
 ```bash
@@ -51,11 +101,51 @@ bun run build:web   # builds clients/web into resources/web-dist
 bun run pack        # electron-vite build + electron-builder --win (NSIS)
 ```
 
-Unsigned; code signing and publishing are not wired up yet.
+Local and CI packs are unsigned. `bun run pack` skips the Explorer preview
+handler, which `.github/workflows/windows-package-smoke.yaml` builds before
+packaging and then install-, launch-, and uninstall-tests.
+
+## Release
+
+`.github/workflows/release-windows.yaml` is the reusable release: both
+`dev-release.yaml` and `release.yml` call it with `{ environment, version }`
+behind the `WINDOWS_{DEV,STAGING,PRODUCTION}_RELEASE_ENABLED` variables, so
+each channel stays off until its variable is set. Per
+architecture (x64 on `windows-2025`, arm64 on the `windows-11-vs2026-arm`
+preview runner) it stamps the version, builds the helper, preview handler,
+CLI runtime, and renderer, packages and signs through `electron-builder`,
+verifies every manifest binary and the installer with
+`Get-AuthenticodeSignature`, and publishes to the
+`vellum-ai-<env>-releases/win-electron/<arch>/` feed: installer and blockmap
+first, then the `<env>.yml` channel manifest.
+
+The executable, installer, and uninstaller use the environment-specific icon
+from `build-resources/icons/<environment>/icon.ico`, matching the local, dev,
+staging, and production desktop identities.
+
+Signing is provider-neutral and an explicit gate on each GitHub environment
+(`electron-builder.config.cjs`, `WINDOWS_SIGNING_PROVIDER`):
+
+- `pfx`: `WINDOWS_SIGNING_PFX_BASE64` + `WINDOWS_SIGNING_PFX_PASSWORD` secrets.
+- `azure-trusted-signing`: `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` /
+  `AZURE_CLIENT_SECRET` secrets plus `AZURE_TRUSTED_SIGNING_ENDPOINT`,
+  `AZURE_TRUSTED_SIGNING_ACCOUNT`, `AZURE_TRUSTED_SIGNING_PROFILE`, and
+  `WINDOWS_SIGNING_PUBLISHER_NAME` variables.
+- `command`: a `WINDOWS_SIGN_COMMAND` secret holding any signing CLI
+  invocation with a `{file}` placeholder, plus `WINDOWS_SIGNING_PUBLISHER_NAME`
+  so the updater can verify downloaded installers.
+
+Production also requires `SENTRY_DSN_WINDOWS` and `SENTRY_AUTH_TOKEN` secrets
+plus the `SENTRY_PROJECT_WINDOWS` variable. The DSN serves both the main
+process and the renderer (baked in as `VITE_SENTRY_DSN_WINDOWS`, which the
+shared web bundle selects on a Windows host), and the token and project enable
+renderer source-map uploads. Non-production builds
+warn and continue when Sentry is not configured. `WINDOWS_SIGNING_TIMESTAMP_URL`
+is optional. Unsigned Windows releases are never published.
 
 ## Checks
 
 ```bash
 bun run typecheck
-bun test
+bun run test:ci
 ```

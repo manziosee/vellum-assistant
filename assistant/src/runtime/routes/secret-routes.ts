@@ -58,7 +58,16 @@ import {
 } from "../../tools/credentials/metadata-store.js";
 import { getLogger } from "../../util/logger.js";
 import { ACTOR_PRINCIPALS } from "../auth/route-policy.js";
-import { BadRequestError, InternalError, NotFoundError } from "./errors.js";
+import {
+  assertCredentialNotInUse,
+  invalidateConnectionsAfterCredentialDelete,
+} from "./credential-in-use.js";
+import {
+  BadRequestError,
+  InternalError,
+  NotFoundError,
+  RouteError,
+} from "./errors.js";
 import type { RouteDefinition, RouteHandlerArgs } from "./types.js";
 
 const log = getLogger("runtime-http");
@@ -108,7 +117,7 @@ async function queueApiKeyPropagation(
           getPlatformAssistantId() || undefined,
         );
         log.info(
-          "Pushed queued assistant API key to CES after handshake completed",
+          "Notified CES of the queued assistant API key after handshake completed (ack only; CES reads the durable value from the credential store)",
         );
       } catch (err) {
         log.warn(
@@ -122,6 +131,44 @@ async function queueApiKeyPropagation(
   log.warn(
     "Timed out waiting for CES client to become ready — API key was not propagated",
   );
+}
+
+/**
+ * Notify CES that the assistant API key changed. This is advisory: the key is
+ * durably stored in the credential vault and CES reads it from there. When no
+ * CES client is connected the notification is skipped, but the skip is logged
+ * rather than dropped silently. Exported for direct testing.
+ */
+export async function notifyCesOfAssistantApiKeyUpdate(
+  value: string,
+  cesClient: CesClient | undefined,
+  logger: Pick<ReturnType<typeof getLogger>, "info" | "warn"> = log,
+): Promise<void> {
+  const generation = ++apiKeyGeneration;
+  if (!cesClient) {
+    logger.warn(
+      "Assistant API key updated but no CES client is connected; skipping the CES key-update notification (advisory only; CES reads the durable value from the credential store)",
+    );
+    return;
+  }
+  if (cesClient.isReady()) {
+    try {
+      await cesClient.updateAssistantApiKey(
+        value,
+        getPlatformAssistantId() || undefined,
+      );
+      logger.info(
+        "Notified CES of the updated assistant API key (ack only; CES reads the durable value from the credential store)",
+      );
+    } catch (err) {
+      logger.warn(
+        { error: err instanceof Error ? err.message : String(err) },
+        "Failed to notify CES of the assistant API key update (non-fatal)",
+      );
+    }
+    return;
+  }
+  void queueApiKeyPropagation(cesClient, value, generation);
 }
 
 // ---------------------------------------------------------------------------
@@ -381,28 +428,7 @@ async function handleAddSecret({ body }: RouteHandlerArgs) {
         // pages unseeded until restart. Detached — must not block the response.
         void maybeReseedCapabilitiesAfterManagedCredential(getConfig());
         if (service === "vellum" && field === "assistant_api_key") {
-          const generation = ++apiKeyGeneration;
-          const cesClient = getCesClient();
-          if (cesClient) {
-            if (cesClient.isReady()) {
-              try {
-                await cesClient.updateAssistantApiKey(
-                  value,
-                  getPlatformAssistantId() || undefined,
-                );
-                log.info(
-                  "Pushed assistant API key to CES after managed proxy credential update",
-                );
-              } catch (err) {
-                log.warn(
-                  { error: err instanceof Error ? err.message : String(err) },
-                  "Failed to push assistant API key to CES (non-fatal)",
-                );
-              }
-            } else {
-              void queueApiKeyPropagation(cesClient, value, generation);
-            }
-          }
+          await notifyCesOfAssistantApiKeyUpdate(value, getCesClient());
         }
       }
       if (
@@ -533,7 +559,11 @@ async function handleDeleteSecret({ body }: RouteHandlerArgs) {
     throw new BadRequestError("Request body is required");
   }
 
-  const { type, name } = body as { type?: string; name?: string };
+  const { type, name, force } = body as {
+    type?: string;
+    name?: string;
+    force?: boolean;
+  };
 
   if (!type || typeof type !== "string") {
     throw new BadRequestError("type is required");
@@ -566,6 +596,13 @@ async function handleDeleteSecret({ body }: RouteHandlerArgs) {
           throw new NotFoundError(`API key not found: ${name}`);
         }
       }
+      // Provider connections reference the namespaced account, so the in-use
+      // check keys off `credKey`: the bare pre-migration account is never a
+      // connection's `resolve_auth` target.
+      const affectedConnections = assertCredentialNotInUse(
+        credKey,
+        force === true,
+      );
       // Delete from both locations. During a migration overlap both may exist;
       // ignore "not-found" since one location may already be empty.
       const credDeleteResult = await deleteSecureKeyAsync(credKey);
@@ -581,6 +618,7 @@ async function handleDeleteSecret({ body }: RouteHandlerArgs) {
         );
       }
       await refreshProvidersAfterSecretChange();
+      invalidateConnectionsAfterCredentialDelete(affectedConnections);
       log.info({ provider: name }, "API key deleted via HTTP");
       return { success: true, type, name };
     }
@@ -600,6 +638,7 @@ async function handleDeleteSecret({ body }: RouteHandlerArgs) {
       if (existing === undefined) {
         throw new NotFoundError(`Credential not found: ${name}`);
       }
+      const affectedConnections = assertCredentialNotInUse(key, force === true);
       const deleteResult = await deleteSecureKeyAsync(key);
       if (deleteResult === "error") {
         throw new InternalError(
@@ -622,6 +661,7 @@ async function handleDeleteSecret({ body }: RouteHandlerArgs) {
       if (isManagedProxyCredential(service, field)) {
         await refreshProvidersAfterSecretChange();
       }
+      invalidateConnectionsAfterCredentialDelete(affectedConnections);
       log.info({ service, field }, "Credential deleted via HTTP");
       return { success: true, type, name };
     }
@@ -630,11 +670,10 @@ async function handleDeleteSecret({ body }: RouteHandlerArgs) {
       `Unknown secret type: ${type}. Valid types: api_key, credential`,
     );
   } catch (err) {
-    if (
-      err instanceof BadRequestError ||
-      err instanceof InternalError ||
-      err instanceof NotFoundError
-    ) {
+    // Every RouteError is already a deliberate client-facing outcome (including
+    // CREDENTIAL_IN_USE); re-wrapping one as a 500 would hide its code, status,
+    // and details from the caller.
+    if (err instanceof RouteError) {
       throw err;
     }
     const message = err instanceof Error ? err.message : String(err);
@@ -756,8 +795,14 @@ export const ROUTES: RouteDefinition[] = [
     }),
     responseBody: z.object({
       success: z.boolean(),
-      type: z.string(),
-      name: z.string(),
+      type: z.string().optional(),
+      name: z.string().optional(),
+      error: z
+        .string()
+        .optional()
+        .describe(
+          "Why the secret was not stored (e.g. provider-side API key validation failed). Present only when success is false.",
+        ),
     }),
     handler: handleAddSecret,
   },
@@ -770,11 +815,20 @@ export const ROUTES: RouteDefinition[] = [
       allowedPrincipalTypes: ACTOR_PRINCIPALS,
     },
     summary: "Delete a secret",
-    description: "Remove a secret from the credential vault by name.",
+    description:
+      "Remove a secret from the credential vault by name. Refused with " +
+      "CREDENTIAL_IN_USE while an LLM provider connection resolves its auth " +
+      "through the credential, unless `force` is set.",
     tags: ["secrets"],
     requestBody: z.object({
       type: z.string().describe("Secret type: 'api_key' or 'credential'"),
       name: z.string().describe("Name of the secret to delete"),
+      force: z
+        .boolean()
+        .optional()
+        .describe(
+          "Delete even when provider connections depend on the credential",
+        ),
     }),
     responseBody: z.object({
       success: z.boolean(),

@@ -8,6 +8,7 @@ import { useMemo, useState } from "react";
 
 import { ChatMarkdownMessage } from "@/domains/chat/components/chat-markdown-message";
 import type { Surface } from "@/domains/chat/types/types";
+import { useTranslation } from "@/i18n";
 
 interface ChoiceSurfaceProps {
   surface: Surface;
@@ -16,6 +17,12 @@ interface ChoiceSurfaceProps {
     actionId: string,
     data?: Record<string, unknown>,
   ) => void;
+  /**
+   * Assistant that owns the conversation this surface belongs to. Lets
+   * workspace file references in the description resolve against its
+   * workspace instead of degrading to an inert file card.
+   */
+  assistantId?: string | null;
 }
 
 function buildInitialSelectedIds(
@@ -44,7 +51,12 @@ function buildChoicePayload(option: ChoiceOption): Record<string, unknown> {
   };
 }
 
-export function ChoiceSurface({ surface, onAction }: ChoiceSurfaceProps) {
+export function ChoiceSurface({
+  surface,
+  onAction,
+  assistantId,
+}: ChoiceSurfaceProps) {
+  const { t } = useTranslation("chat");
   // The wire keeps surface `data` opaque; narrow it with the canonical schema
   // (tolerant, so a real payload never fails to parse) rather than an
   // unchecked cast or a re-declared local interface.
@@ -138,6 +150,7 @@ export function ChoiceSurface({ surface, onAction }: ChoiceSurfaceProps) {
         <ChatMarkdownMessage
           content={data.description}
           className="mt-1 text-body-medium-lighter text-[var(--content-quiet)]"
+          assistantId={assistantId}
         />
       )}
 
@@ -184,7 +197,7 @@ export function ChoiceSurface({ surface, onAction }: ChoiceSurfaceProps) {
                   </span>
                   {option.recommended && (
                     <span className="rounded-full bg-[var(--primary-base)] px-2 py-0.5 text-label-small-default text-[var(--content-inset)]">
-                      Recommended
+                      {t("choiceSurface.recommended")}
                     </span>
                   )}
                 </span>
@@ -210,7 +223,7 @@ export function ChoiceSurface({ surface, onAction }: ChoiceSurfaceProps) {
             {submitting === "submit" && (
               <Loader2 className="h-4 w-4 animate-spin" />
             )}
-            {data.submitLabel ?? "Continue"}
+            {data.submitLabel ?? t("choiceSurface.continue")}
           </button>
         </div>
       )}

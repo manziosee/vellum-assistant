@@ -19,6 +19,7 @@ import {
   ensureConversationExists,
   getConversation,
 } from "../persistence/conversation-crud.js";
+import type { ConversationOrigin } from "../persistence/conversation-types.js";
 import { wrapWithCallSiteRouting } from "../providers/call-site-routing.js";
 import {
   mainAgentResolutionError,
@@ -26,6 +27,7 @@ import {
 } from "../providers/connection-resolution.js";
 import { RateLimitProvider } from "../providers/ratelimit.js";
 import { listProviders } from "../providers/registry.js";
+import { broadcastMessage } from "../runtime/assistant-event-hub.js";
 import { getSubagentManager } from "../subagent/index.js";
 import { getSandboxWorkingDir } from "../util/platform.js";
 import { Conversation } from "./conversation.js";
@@ -50,6 +52,61 @@ import { buildTransportHints } from "./transport-hints.js";
 // ── Per-conversation persistent options ────────────────────────────
 
 const conversationOptions = new Map<string, ConversationCreateOptions>();
+
+/**
+ * The channel a conversation created here belongs to.
+ *
+ * A trust context is stamped per inbound message from the gateway verdict,
+ * so `sourceChannel` names the channel the message creating this
+ * conversation actually arrived on. This is the moment that fact is known,
+ * and the caller is the only party that holds it.
+ *
+ * Returns `undefined` when there is no trust context, which does NOT mean
+ * native. `handleSendMessage` materializes a conversation before the route
+ * resolves trust, so a Slack or phone send reaches here with no
+ * `sourceChannel` yet. Assuming native there would stamp a remote
+ * conversation as the guardian's own, and nothing could repair it:
+ * `setConversationOriginChannelIfUnset` only writes over NULL, and
+ * `recoverRestingTrustContext` grants INTERNAL_GUARDIAN_TRUST_CONTEXT to the
+ * native channel on every later wake and boot-resume.
+ *
+ * `transport.channelId` is not a substitute. It is the external Slack
+ * conversation id, not a {@link ChannelId}.
+ *
+ * So this states the origin only where it is genuinely known, and leaves the
+ * rest to attribution exactly as before. The remaining callers get their
+ * origin when they are migrated with real knowledge of it, not by guessing
+ * here.
+ */
+function originFromStoredOptions(
+  storedOptions: ConversationCreateOptions | undefined,
+): ConversationOrigin | undefined {
+  return storedOptions?.trustContext?.sourceChannel;
+}
+
+/**
+ * Drops the transport fields that describe what the client had on screen for a
+ * single message rather than for the conversation as a whole.
+ *
+ * `conversationOptions` is a durable map: a rebuilt conversation (evicted or
+ * gone stale) re-applies whatever transport was stored the last time anyone
+ * touched it. View state must not survive that, or a scheduled wake hours
+ * later would resurrect an app the user has since closed and assert it is on
+ * screen. The current call still applies the full transport to the live
+ * conversation, so only the persisted copy is trimmed.
+ */
+export function withoutTurnScopedTransport(
+  options: ConversationCreateOptions,
+): ConversationCreateOptions {
+  const transport = options.transport;
+  if (!transport || transport.visibleAppId === undefined) {
+    return options;
+  }
+  return {
+    ...options,
+    transport: { ...transport, visibleAppId: undefined },
+  };
+}
 
 export function mergeConversationOptions(
   conversationId: string,
@@ -86,6 +143,7 @@ function applyTransportMetadata(
   conversation.applyHostEnvFromTransport(transport);
   conversation.applyClientTimezoneFromTransport(transport);
   conversation.applyClientOsFromTransport(transport);
+  conversation.applyVisibleAppFromTransport(transport);
 }
 
 /**
@@ -93,13 +151,19 @@ function applyTransportMetadata(
  *
  * Handles provider setup, rate limiting, system prompt, memory policy,
  * and conversation hydration.
+ *
+ * The in-memory Conversation snapshots the tool registry at construction.
+ * An empty snapshot is an empty tool list on the wire for the life of the
+ * instance, so the create path initializes the registry before that
+ * constructor runs. A hit in `findConversation` already has its snapshot.
+ * `initializeTools` is idempotent: a process that already initialized at
+ * boot awaits the settled promise.
  */
 export async function getOrCreateConversation(
   conversationId: string,
   options?: ConversationCreateOptions,
 ): Promise<Conversation> {
   let conversation = findConversation(conversationId);
-  const sendToClient = () => {};
 
   // `taskRunId` and `ephemeral` are per-call scopes, not durable conversation
   // metadata, so they are stripped before the remaining options are merged
@@ -110,12 +174,23 @@ export async function getOrCreateConversation(
     ...persistentOptions
   } = options ?? {};
   if (Object.values(persistentOptions).some((v) => v !== undefined)) {
-    mergeConversationOptions(conversationId, persistentOptions);
+    mergeConversationOptions(
+      conversationId,
+      withoutTurnScopedTransport(persistentOptions),
+    );
   }
 
+  // A stale conversation is rebuilt only once it is genuinely idle. Queued
+  // messages live in memory on the instance being disposed, and the queue
+  // drains via an async dispatch after the current turn releases, so
+  // `isProcessing()` can read false while a queued turn is still pending:
+  // rebuilding in that gap would silently drop those messages. The conversation
+  // stays stale and is rebuilt on a later call.
   if (
     !conversation ||
-    (conversation.isStale() && !conversation.isProcessing())
+    (conversation.isStale() &&
+      !conversation.isProcessing() &&
+      !conversation.hasQueuedMessages())
   ) {
     if (conversation) {
       // Stale rebuild: the conversation id lives on, so abort in-flight
@@ -160,11 +235,16 @@ export async function getOrCreateConversation(
       const systemPrompt = await resolveInitialSystemPrompt(storedOptions);
       const maxTokens = storedOptions?.maxResponseTokens;
 
+      const { initializeTools } = await import("../tools/registry.js");
+      await initializeTools();
+
       const newConversation = new Conversation(
         conversationId,
         provider,
         systemPrompt,
-        sendToClient,
+        // Top-level conversations deliver to the SSE hub for their whole life,
+        // so every subscribed client sees every event with no per-turn wiring.
+        broadcastMessage,
         workingDir,
         {
           maxTokens,
@@ -172,8 +252,6 @@ export async function getOrCreateConversation(
           modelOverride: storedOptions?.modelOverride,
         },
       );
-      newConversation.updateClient(sendToClient, true);
-
       // Ensure the conversations row exists before hydrating from DB.
       // `getOrCreateConversation` builds the in-memory Conversation, but
       // the persisted row is what `loadFromDb` reads for conversationType,
@@ -201,9 +279,13 @@ export async function getOrCreateConversation(
           createConversation({
             id: conversationId,
             conversationType: storedOptions.conversationType,
+            origin: originFromStoredOptions(storedOptions),
           });
         } else {
-          ensureConversationExists(conversationId);
+          ensureConversationExists(
+            conversationId,
+            originFromStoredOptions(storedOptions),
+          );
         }
       }
 
@@ -221,6 +303,13 @@ export async function getOrCreateConversation(
         await newConversation.ensureActorScopedHistory();
       }
       applyTransportMetadata(newConversation, storedOptions);
+      // The stored transport is stripped of view state, so a rebuild driven by
+      // a live send takes the app on screen from THIS call. A rebuild with no
+      // inbound transport (a scheduled wake, a background follow-up) correctly
+      // leaves it unset rather than inheriting whatever was open last time.
+      if (options?.transport) {
+        newConversation.applyVisibleAppFromTransport(options.transport);
+      }
       setConversation(conversationId, newConversation);
       return newConversation;
     })();
@@ -318,7 +407,12 @@ export function clearAllActiveConversations(): number {
 export function evictConversationsForReload(): void {
   const subagentManager = getSubagentManager();
   for (const [id, conversation] of conversationEntries()) {
-    if (!conversation.isProcessing()) {
+    // A conversation with queued messages is not idle: the queue drains via an
+    // async dispatch after the current turn releases, so `isProcessing()` can
+    // read false while a queued turn is still pending. Disposing in that gap
+    // would silently drop the queued messages, so mark it stale instead and
+    // let it rebuild once the queue has run.
+    if (!conversation.isProcessing() && !conversation.hasQueuedMessages()) {
       subagentManager.abortAllForParent(id);
       conversation.dispose();
       deleteConversation(id);

@@ -3,7 +3,7 @@
 openapi: 3.1.0
 info:
   title: Vellum Assistant API
-  version: 0.11.1
+  version: 0.11.5
   description: Auto-generated OpenAPI specification for the Vellum Assistant runtime HTTP server.
 servers:
   - url: http://127.0.0.1:7821
@@ -4017,8 +4017,8 @@ paths:
       summary: Get available channels
       description:
         Return the channels this assistant can surface to clients, with display metadata (label, icon, verification
-        capability, setup copy). Today this is a fixed base list plus `email` when an inbox is registered; will become
-        plugin/skill-driven in future.
+        capability, setup copy). A fixed base list plus `email` when an inbox is registered, plus the channels installed
+        plugins bring by declaring ingress routes. Each carries a `source` saying which of those it is.
       tags:
         - channels
       responses:
@@ -4036,16 +4036,9 @@ paths:
                       properties:
                         id:
                           type: string
-                          enum:
-                            - telegram
-                            - phone
-                            - vellum
-                            - whatsapp
-                            - slack
-                            - email
-                            - platform
-                            - a2a
-                            - discord
+                        source:
+                          type: string
+                          description: "`default` for a channel the assistant ships, `plugin:<name>` for one an installed plugin brings"
                         label:
                           type: string
                         subtitle:
@@ -4067,13 +4060,16 @@ paths:
                           additionalProperties: false
                       required:
                         - id
+                        - source
                         - label
                         - subtitle
                         - icon
                         - supportsVerification
                         - setupMessages
                       additionalProperties: false
-                    description: Available channels in display order
+                    description:
+                      "Available channels in display order: the ones the assistant ships, then the ones installed plugins bring
+                      by declaring ingress routes. `source` distinguishes them."
                 required:
                   - channels
                 additionalProperties: false
@@ -4152,6 +4148,12 @@ paths:
                       type: string
                     chatType:
                       type: string
+                    conversationType:
+                      type: string
+                      enum:
+                        - dm
+                        - private
+                        - public
                     threadId:
                       type: string
                     channelName:
@@ -4358,12 +4360,23 @@ paths:
                             - platform
                             - a2a
                             - discord
+                            - plugin
                         ready:
                           type: boolean
                         setupStatus:
                           anyOf:
                             - type: string
+                              enum:
+                                - not_configured
+                                - incomplete
+                                - ready
                             - type: "null"
+                        health:
+                          type: string
+                          enum:
+                            - ok
+                            - failing
+                            - unknown
                         checkedAt:
                           anyOf:
                             - type: number
@@ -4373,7 +4386,16 @@ paths:
                         reasons:
                           type: array
                           items:
-                            type: string
+                            type: object
+                            properties:
+                              code:
+                                type: string
+                              text:
+                                type: string
+                            required:
+                              - code
+                              - text
+                            additionalProperties: false
                         localChecks:
                           type: array
                           items:
@@ -4387,6 +4409,13 @@ paths:
                                 anyOf:
                                   - type: string
                                   - type: "null"
+                              indeterminate:
+                                type: boolean
+                              kind:
+                                type: string
+                                enum:
+                                  - configuration
+                                  - operational
                             required:
                               - name
                               - passed
@@ -4404,6 +4433,13 @@ paths:
                                 anyOf:
                                   - type: string
                                   - type: "null"
+                              indeterminate:
+                                type: boolean
+                              kind:
+                                type: string
+                                enum:
+                                  - configuration
+                                  - operational
                             required:
                               - name
                               - passed
@@ -4448,6 +4484,7 @@ paths:
                     - platform
                     - a2a
                     - discord
+                    - plugin
                 includeRemote:
                   description: Include remote checks (default true)
                   type: boolean
@@ -4478,12 +4515,23 @@ paths:
                             - platform
                             - a2a
                             - discord
+                            - plugin
                         ready:
                           type: boolean
                         setupStatus:
                           anyOf:
                             - type: string
+                              enum:
+                                - not_configured
+                                - incomplete
+                                - ready
                             - type: "null"
+                        health:
+                          type: string
+                          enum:
+                            - ok
+                            - failing
+                            - unknown
                         checkedAt:
                           anyOf:
                             - type: number
@@ -4493,7 +4541,16 @@ paths:
                         reasons:
                           type: array
                           items:
-                            type: string
+                            type: object
+                            properties:
+                              code:
+                                type: string
+                              text:
+                                type: string
+                            required:
+                              - code
+                              - text
+                            additionalProperties: false
                         localChecks:
                           type: array
                           items:
@@ -4507,6 +4564,13 @@ paths:
                                 anyOf:
                                   - type: string
                                   - type: "null"
+                              indeterminate:
+                                type: boolean
+                              kind:
+                                type: string
+                                enum:
+                                  - configuration
+                                  - operational
                             required:
                               - name
                               - passed
@@ -4524,6 +4588,13 @@ paths:
                                 anyOf:
                                   - type: string
                                   - type: "null"
+                              indeterminate:
+                                type: boolean
+                              kind:
+                                type: string
+                                enum:
+                                  - configuration
+                                  - operational
                             required:
                               - name
                               - passed
@@ -4614,6 +4685,84 @@ paths:
                     description: Number of disposed subscribers.
                 required:
                   - disconnected
+                additionalProperties: false
+  /v1/clients/presence:
+    post:
+      operationId: clients_presence_post
+      summary: Report desktop presence
+      description: Record the desktop presence state reported by the client identified by the X-Vellum-Client-Id header.
+      tags:
+        - clients
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                state:
+                  type: string
+                  enum:
+                    - active
+                    - idle
+                    - away
+                  description: Reported desktop presence state.
+              required:
+                - state
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  recorded:
+                    type: boolean
+                    description: Whether a connected client matched the reporting clientId.
+                required:
+                  - recorded
+                additionalProperties: false
+  /v1/clients/web-presence:
+    post:
+      operationId: clients_webpresence_post
+      summary: Report web tab visibility and focused conversation
+      description:
+        Record the visibility and focused conversation reported by the web client identified by the
+        X-Vellum-Client-Id header.
+      tags:
+        - clients
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                visible:
+                  type: boolean
+                  description: Whether the reporting tab is currently visible.
+                focusedConversationId:
+                  anyOf:
+                    - type: string
+                    - type: "null"
+                  description: The conversation currently focused (chat composer on screen) in the tab, or null.
+              required:
+                - visible
+                - focusedConversationId
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  recorded:
+                    type: boolean
+                    description: Whether a connected client matched the reporting clientId.
+                required:
+                  - recorded
                 additionalProperties: false
   /v1/config:
     get:
@@ -4737,6 +4886,8 @@ paths:
                           type: string
                         defaultProfile:
                           type: string
+                        shippedDefaultProfile:
+                          type: string
                       required:
                         - id
                         - displayName
@@ -4788,6 +4939,7 @@ paths:
                     - gemini
                     - fireworks
                     - openrouter
+                    - chatgpt
                     - vellum
                     - together
                     - vercel-ai-gateway
@@ -4987,6 +5139,8 @@ paths:
                 provider_connection:
                   type: string
                   minLength: 1
+                allowUnlisted:
+                  type: boolean
                 status:
                   anyOf:
                     - $ref: "#/components/schemas/ProfileStatus"
@@ -6543,9 +6697,46 @@ paths:
               - platform
               - a2a
               - discord
+              - plugin
           description:
             Filter by origin channel. When provided, only conversations with this exact origin_channel value are
             returned. Omit to include all channels.
+        - name: groupId
+          in: query
+          required: false
+          schema:
+            type: string
+          description:
+            Filter to a single group, so each sidebar section can load independently of the paginated list. Pass
+            "system:all" for conversations in no group, "system:pinned" for the Pinned section, or a custom group id. A
+            group-scoped request is recency-ordered like every list read (COALESCE(last_message_at, updated_at)
+            descending) and never has pinned rows appended to it. Omit to span every group.
+        - name: needsAttention
+          in: query
+          required: false
+          schema:
+            type: string
+            enum:
+              - "true"
+          description:
+            'Pass "true" to return only conversations whose latest assistant message the user has not seen: the same
+            predicate behind the unread count and the section index, so a client that keeps no complete conversation
+            list can ask for exactly the rows its attention surfaces need. Composes with every other filter. Any value
+            other than "true" is rejected. Omit to span every conversation.'
+        - name: foregroundOnly
+          in: query
+          required: false
+          schema:
+            type: string
+            enum:
+              - "true"
+          description:
+            Pass "true" to return only user-facing foreground conversations, dropping the automated background and
+            scheduled runs the standard listing admits when they are filed in a custom group (a surfaced run stays).
+            This is the same predicate the unread count and the section index apply, so a client can ask for the newest
+            conversation a user can open in one row instead of paging past runs it would skip. Composes with every other
+            filter; a foreground-only first page never has pinned rows appended to it. Any value other than "true" is
+            rejected. Omit to keep every visible row.
       responses:
         "200":
           description: Successful response
@@ -6669,6 +6860,7 @@ paths:
                                 - platform
                                 - a2a
                                 - discord
+                                - plugin
                             - type: "null"
                         assistantAttention:
                           type: object
@@ -6723,6 +6915,9 @@ paths:
                             - messageId
                             - title
                           additionalProperties: false
+                        historyOrphaned:
+                          type: boolean
+                          const: true
                         archivedAt:
                           type: number
                         surfacedAt:
@@ -6796,9 +6991,15 @@ paths:
                     `id`.
                   type: string
                 conversationType:
-                  description: Only standard conversations are created by this endpoint
+                  description:
+                    Conversation type for the new row. "background" keeps it out of the foreground list and the sidebar's
+                    Recents grouping, used by internal side-channel flows (onboarding research, persona/identity
+                    rewrites) that mint a throwaway thread the user should never see. "scheduled" is not accepted here;
+                    scheduled rows are owned by the schedule pipeline.
                   type: string
-                  const: standard
+                  enum:
+                    - standard
+                    - background
                 title:
                   description:
                     Explicit title for the conversation. When provided on creation, it is persisted as a user-set title (never
@@ -6893,7 +7094,9 @@ paths:
     get:
       operationId: conversations_by_id_get
       summary: Get conversation detail
-      description: Retrieve a single conversation with full metadata.
+      description:
+        Retrieve a single conversation with full metadata. Rows the listing hides by type (legacy private rows) are
+        not found here either.
       tags:
         - conversations
       parameters:
@@ -7023,6 +7226,7 @@ paths:
                               - platform
                               - a2a
                               - discord
+                              - plugin
                           - type: "null"
                       assistantAttention:
                         type: object
@@ -7077,6 +7281,9 @@ paths:
                           - messageId
                           - title
                         additionalProperties: false
+                      historyOrphaned:
+                        type: boolean
+                        const: true
                       archivedAt:
                         type: number
                       surfacedAt:
@@ -8233,6 +8440,7 @@ paths:
                               - platform
                               - a2a
                               - discord
+                              - plugin
                           - type: "null"
                       assistantAttention:
                         type: object
@@ -8287,6 +8495,9 @@ paths:
                           - messageId
                           - title
                         additionalProperties: false
+                      historyOrphaned:
+                        type: boolean
+                        const: true
                       archivedAt:
                         type: number
                       surfacedAt:
@@ -8420,7 +8631,8 @@ paths:
       summary: Open an inference-profile session
       description:
         Open (or replace) a session-backed inference-profile override for a conversation. Supports an optional TTL
-        — omit for a sticky (non-expiring) override.
+        — omit for a sticky (non-expiring) override. A profile that provably cannot dispatch is rejected rather than
+        pinned.
       tags:
         - conversations
       requestBody:
@@ -9228,8 +9440,10 @@ paths:
   /v1/conversations/reorder:
     post:
       operationId: conversations_reorder_post
-      summary: Reorder conversations
-      description: Batch-update display order and pin state for conversations.
+      summary: Move conversations between sections
+      description:
+        Batch-update which group holds each conversation, and its pin state. Lists are ordered by recency, so this
+        sets placement, not order.
       tags:
         - conversations
       requestBody:
@@ -9246,8 +9460,6 @@ paths:
                     properties:
                       conversationId:
                         type: string
-                      displayOrder:
-                        type: number
                       isPinned:
                         type: boolean
                       groupId:
@@ -9313,6 +9525,107 @@ paths:
                 required:
                   - query
                   - results
+                additionalProperties: false
+  /v1/conversations/sections:
+    get:
+      operationId: conversations_sections_get
+      summary: Sidebar section index
+      description:
+        "One row per renderable sidebar section (Pinned, each non-empty custom group, each origin channel with
+        unassigned conversations, Chats) with total and unread counts and no conversation rows. Lets a client know which
+        sections exist, and what their badges say, without fetching any conversation list. Totals follow the standard
+        listing visibility; unread applies the same rules as GET /v1/conversations/unread-count scoped to the section.
+        Chats is always present, even at zero: it is the leftover bucket and renders regardless."
+      tags:
+        - conversations
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sections:
+                    type: array
+                    items:
+                      oneOf:
+                        - type: object
+                          properties:
+                            kind:
+                              type: string
+                              const: pinned
+                            total:
+                              type: number
+                            unread:
+                              type: number
+                          required:
+                            - kind
+                            - total
+                            - unread
+                          additionalProperties: false
+                        - type: object
+                          properties:
+                            kind:
+                              type: string
+                              const: group
+                            groupId:
+                              type: string
+                            name:
+                              type: string
+                            icon:
+                              anyOf:
+                                - type: string
+                                - type: "null"
+                            sortPosition:
+                              type: number
+                            total:
+                              type: number
+                            unread:
+                              type: number
+                          required:
+                            - kind
+                            - groupId
+                            - name
+                            - icon
+                            - sortPosition
+                            - total
+                            - unread
+                          additionalProperties: false
+                        - type: object
+                          properties:
+                            kind:
+                              type: string
+                              const: channel
+                            channelId:
+                              type: string
+                            total:
+                              type: number
+                            unread:
+                              type: number
+                          required:
+                            - kind
+                            - channelId
+                            - total
+                            - unread
+                          additionalProperties: false
+                        - type: object
+                          properties:
+                            kind:
+                              type: string
+                              const: chats
+                            total:
+                              type: number
+                            unread:
+                              type: number
+                          required:
+                            - kind
+                            - total
+                            - unread
+                          additionalProperties: false
+                      type: object
+                required:
+                  - sections
                 additionalProperties: false
   /v1/conversations/seen:
     post:
@@ -9519,6 +9832,28 @@ paths:
                 required:
                   - ok
                 additionalProperties: false
+  /v1/conversations/unread-count:
+    get:
+      operationId: conversations_unreadcount_get
+      summary: Unread conversation count
+      description:
+        "Count of foreground conversations whose latest assistant message is unseen. Matches the sidebar's unread
+        indicators: archived rows and non-surfaced background/scheduled rows are excluded."
+      tags:
+        - conversations
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count:
+                    type: number
+                required:
+                  - count
+                additionalProperties: false
   /v1/conversations/wake:
     post:
       operationId: conversations_wake_post
@@ -9543,6 +9878,9 @@ paths:
                   default: cli
                   type: string
                 cronRunId:
+                  type: string
+                  minLength: 1
+                scheduleId:
                   type: string
                   minLength: 1
                 persist:
@@ -9622,7 +9960,10 @@ paths:
     post:
       operationId: credentials_delete_post
       summary: Delete a credential
-      description: Remove a secret, its metadata, and any associated OAuth connection from the vault.
+      description:
+        Remove a secret, its metadata, and any associated OAuth connection from the vault. Refused with
+        CREDENTIAL_IN_USE while an LLM provider connection resolves its auth through the credential, unless `force` is
+        set.
       tags:
         - credentials
       requestBody:
@@ -9638,6 +9979,9 @@ paths:
                 field:
                   type: string
                   description: Field name
+                force:
+                  description: Delete even when provider connections depend on the credential
+                  type: boolean
               required:
                 - service
                 - field
@@ -9653,9 +9997,15 @@ paths:
                     type: string
                   field:
                     type: string
+                  affectedConnections:
+                    type: array
+                    items:
+                      type: string
+                    description: Provider connections that depended on the deleted credential
                 required:
                   - service
                   - field
+                  - affectedConnections
                 additionalProperties: false
   /v1/credentials/inspect:
     post:
@@ -14266,7 +14616,8 @@ paths:
       description:
         Set llm.activeProfile after validating the name against the effective profile catalog (provider-aware
         default expansion included). Unknown or disabled profiles are rejected so the chat-model selection cannot be
-        silently stripped on the next config load.
+        silently stripped on the next config load. A profile that provably cannot dispatch is also rejected — there is
+        no escape hatch, because an unusable active profile locks the user out of chat.
       tags:
         - inference
       requestBody:
@@ -14299,7 +14650,7 @@ paths:
                   - activeProfile
                 additionalProperties: false
         "400":
-          description: Unknown or disabled profile name
+          description: Unknown or disabled profile name, or a profile that cannot serve requests
   /v1/inference/callsites:
     get:
       operationId: inference_callsites_get
@@ -14474,7 +14825,9 @@ paths:
       summary: Create an inference profile
       description:
         Create a validated custom profile. The provider must be a known LLM provider, the model must be in the
-        catalog (unless allowUnlisted), and a referenced connection must exist. Managed default names cannot be created.
+        catalog (unless allowUnlisted), a referenced connection must exist, and the profile must be able to dispatch — a
+        valid provider id with no credentialed connection behind it is rejected unless allowUnavailable is set, in which
+        case it is created with a warning.
       tags:
         - inference
       requestBody:
@@ -14513,6 +14866,8 @@ paths:
                   type: string
                 allowUnlisted:
                   type: boolean
+                allowUnavailable:
+                  type: boolean
               required:
                 - name
                 - provider
@@ -14525,7 +14880,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/InferenceProfileWriteResult"
         "400":
-          description: Invalid provider, uncataloged model, or missing connection
+          description: Invalid provider, uncataloged model, missing connection, or a profile that cannot serve requests
         "409":
           description: A profile with this name already exists
   /v1/inference/profiles/{name}:
@@ -14563,7 +14918,9 @@ paths:
         "404":
           description: Profile not found
         "409":
-          description: Profile is still referenced by activeProfile, advisorProfile, a call site, or a mix arm
+          description:
+            Profile is still referenced by activeProfile, advisorProfile, a call site, a default-tier override, or a
+            mix arm
     get:
       operationId: inference_profiles_by_name_get
       summary: Get an effective inference profile
@@ -14589,8 +14946,9 @@ paths:
       operationId: inference_profiles_by_name_patch
       summary: Update an inference profile
       description:
-        Partial update of a custom profile with the same write-time validation as create. Managed default profiles
-        are read-only.
+        Partial update of a custom profile with the same write-time validation as create. The dispatch-availability
+        guard (and its allowUnavailable escape hatch) applies when the update changes provider, model, or connection;
+        metadata-only edits skip it. Managed default profiles are read-only.
       tags:
         - inference
       parameters:
@@ -14632,6 +14990,8 @@ paths:
                   type: string
                 allowUnlisted:
                   type: boolean
+                allowUnavailable:
+                  type: boolean
       responses:
         "200":
           description: Successful response
@@ -14640,9 +15000,41 @@ paths:
               schema:
                 $ref: "#/components/schemas/InferenceProfileWriteResult"
         "400":
-          description: Invalid fields, or attempt to edit a managed profile
+          description: Invalid fields, a profile that cannot serve requests, or attempt to edit a managed profile
         "404":
           description: Profile not found
+  /v1/inference/profiles/{name}/validate:
+    post:
+      operationId: inference_profiles_by_name_validate_post
+      summary: Probe a saved profile with one minimal request
+      description:
+        "Dispatch one minimal test request through the named profile's resolved model and connection, and classify
+        any failure by which object the user should fix (the profile vs its provider connection). Advisory: the probe
+        never mutates the profile. Returns a null check when there is no verdict to give (missing, disabled, managed, or
+        routing-identity profiles, or a probe timeout). The probe spends one tiny request on the profile's own key."
+      tags:
+        - inference
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  check:
+                    anyOf:
+                      - $ref: "#/components/schemas/InferenceProfileCheck"
+                      - type: "null"
+                required:
+                  - check
+                additionalProperties: false
   /v1/inference/provider-connections:
     get:
       operationId: inference_providerconnections_get
@@ -14658,7 +15050,7 @@ paths:
             type: string
           description:
             "Filter by provider. One of: anthropic, openai, gemini, ollama, fireworks, together, openrouter,
-            vercel-ai-gateway, litellm, openai-compatible, minimax, atlascloud, baseten, poolside, vellum"
+            vercel-ai-gateway, litellm, openai-compatible, minimax, atlascloud, baseten, poolside, vellum, chatgpt"
       responses:
         "200":
           description: Successful response
@@ -14679,8 +15071,9 @@ paths:
       summary: Create a provider connection
       description:
         Create a new named provider connection. When auth is omitted it is derived from the provider (keyless
-        providers get none, vellum gets platform, everything else needs credential for api_key auth). Fails with 409 if
-        a connection with this name already exists.
+        providers get none, vellum gets platform, everything else needs credential for api_key auth). An explicit auth
+        object must agree with the provider; platform auth belongs to vellum and only to vellum. Fails with 409 if a
+        connection with this name already exists.
       tags:
         - inference
       requestBody:
@@ -14723,7 +15116,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProviderConnection"
+                $ref: "#/components/schemas/SavedProviderConnection"
         "400":
           description: Invalid provider or auth schema
         "409":
@@ -14789,8 +15182,9 @@ paths:
       summary: Update a provider connection
       description:
         Update an existing connection. Cannot rename or change the provider. Omitting auth keeps the stored auth;
-        passing credential alone rotates the key via provider-derived api_key auth. For the Vellum-managed connection
-        (vellum) the auth is locked to platform; label remains editable.
+        passing credential alone rotates the key via provider-derived api_key auth. An explicit auth object must agree
+        with the connection's provider; platform auth belongs to vellum and only to vellum. For the Vellum-managed
+        connection (vellum) the auth is locked to platform; label remains editable.
       tags:
         - inference
       parameters:
@@ -14833,7 +15227,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ProviderConnection"
+                $ref: "#/components/schemas/SavedProviderConnection"
         "400":
           description: Invalid auth schema, or attempt to change auth on a managed connection
         "404":
@@ -15179,6 +15573,67 @@ paths:
                   - publicBaseUrl
                   - localGatewayTarget
                   - success
+                additionalProperties: false
+  /v1/integrations/ingress/status:
+    get:
+      operationId: integrations_ingress_status_get
+      summary: Get ingress tunnel status
+      description:
+        Probe the configured public ingress URL and report whether a tunnel is serving this assistant.
+        `unconfigured` means no tunnel has ever been recorded (or the ingress is managed for this assistant, as it is
+        when platform-hosted or fronted by a Velay tunnel), `stopped` means a tunnel ran before and is not running now
+        (callback ingress is explicitly switched off, or its URL is gone), `healthy` means the URL answers and fronts
+        this assistant's web app, `unpairable` means it answers but does not serve that app, so a pairing link minted
+        against it would not open, `unreachable` means it does not answer, and `foreign` means it answers for a
+        different assistant. `lastTunnel` names the tunnel to restart, on the states where a recorded one applies to the
+        configured URL.
+      tags:
+        - config
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  state:
+                    type: string
+                    enum:
+                      - unconfigured
+                      - stopped
+                      - healthy
+                      - unpairable
+                      - unreachable
+                      - foreign
+                  publicBaseUrl:
+                    description: The probed URL. Set for healthy, unpairable, unreachable, and foreign.
+                    type: string
+                  lastTunnel:
+                    description:
+                      The tunnel to restart. Set on stopped whenever one is recorded, and on unpairable, unreachable and foreign
+                      when the recorded tunnel fronted the configured URL.
+                    type: object
+                    properties:
+                      provider:
+                        type: string
+                      publicBaseUrl:
+                        type: string
+                    required:
+                      - provider
+                      - publicBaseUrl
+                    additionalProperties: false
+                  servingAssistantName:
+                    description: Name the edge serves under. Set for foreign when it reports one.
+                    type: string
+                  detail:
+                    description: Short failure reason, free of the URL. Set for unreachable, and for unpairable when the edge gave one.
+                    type: string
+                  checkedAt:
+                    description: ISO-8601 instant the probe finished. Set whenever one ran.
+                    type: string
+                required:
+                  - state
                 additionalProperties: false
   /v1/integrations/oauth/start:
     post:
@@ -18766,6 +19221,7 @@ paths:
                                           - tavily
                                           - keenable
                                           - firecrawl
+                                          - fastcrw
                                       resultCount:
                                         type: number
                                       durationMs:
@@ -18818,6 +19274,7 @@ paths:
                                         enum:
                                           - default
                                           - firecrawl
+                                          - fastcrw
                                       status:
                                         type: number
                                       contentType:
@@ -18975,6 +19432,76 @@ paths:
                                 required:
                                   - requestId
                                   - entries
+                                additionalProperties: false
+                              answeredQuestion:
+                                type: object
+                                properties:
+                                  requestId:
+                                    type: string
+                                  questions:
+                                    type: array
+                                    items:
+                                      type: object
+                                      properties:
+                                        id:
+                                          type: string
+                                        question:
+                                          type: string
+                                        description:
+                                          type: string
+                                        options:
+                                          type: array
+                                          items:
+                                            type: object
+                                            properties:
+                                              id:
+                                                type: string
+                                              label:
+                                                type: string
+                                              description:
+                                                type: string
+                                            required:
+                                              - id
+                                              - label
+                                            additionalProperties: false
+                                        freeTextPlaceholder:
+                                          type: string
+                                      required:
+                                        - id
+                                        - question
+                                        - options
+                                      additionalProperties: false
+                                  responses:
+                                    type: array
+                                    items:
+                                      type: object
+                                      properties:
+                                        questionId:
+                                          type: string
+                                        decision:
+                                          type: string
+                                          enum:
+                                            - option
+                                            - free_text
+                                            - skipped
+                                        optionId:
+                                          type: string
+                                        text:
+                                          type: string
+                                      required:
+                                        - questionId
+                                        - decision
+                                      additionalProperties: false
+                                  overall:
+                                    type: string
+                                    enum:
+                                      - completed
+                                      - closed
+                                required:
+                                  - requestId
+                                  - questions
+                                  - responses
+                                  - overall
                                 additionalProperties: false
                             required:
                               - name
@@ -19205,6 +19732,7 @@ paths:
                                                   - tavily
                                                   - keenable
                                                   - firecrawl
+                                                  - fastcrw
                                               resultCount:
                                                 type: number
                                               durationMs:
@@ -19257,6 +19785,7 @@ paths:
                                                 enum:
                                                   - default
                                                   - firecrawl
+                                                  - fastcrw
                                               status:
                                                 type: number
                                               contentType:
@@ -19414,6 +19943,76 @@ paths:
                                         required:
                                           - requestId
                                           - entries
+                                        additionalProperties: false
+                                      answeredQuestion:
+                                        type: object
+                                        properties:
+                                          requestId:
+                                            type: string
+                                          questions:
+                                            type: array
+                                            items:
+                                              type: object
+                                              properties:
+                                                id:
+                                                  type: string
+                                                question:
+                                                  type: string
+                                                description:
+                                                  type: string
+                                                options:
+                                                  type: array
+                                                  items:
+                                                    type: object
+                                                    properties:
+                                                      id:
+                                                        type: string
+                                                      label:
+                                                        type: string
+                                                      description:
+                                                        type: string
+                                                    required:
+                                                      - id
+                                                      - label
+                                                    additionalProperties: false
+                                                freeTextPlaceholder:
+                                                  type: string
+                                              required:
+                                                - id
+                                                - question
+                                                - options
+                                              additionalProperties: false
+                                          responses:
+                                            type: array
+                                            items:
+                                              type: object
+                                              properties:
+                                                questionId:
+                                                  type: string
+                                                decision:
+                                                  type: string
+                                                  enum:
+                                                    - option
+                                                    - free_text
+                                                    - skipped
+                                                optionId:
+                                                  type: string
+                                                text:
+                                                  type: string
+                                              required:
+                                                - questionId
+                                                - decision
+                                              additionalProperties: false
+                                          overall:
+                                            type: string
+                                            enum:
+                                              - completed
+                                              - closed
+                                        required:
+                                          - requestId
+                                          - questions
+                                          - responses
+                                          - overall
                                         additionalProperties: false
                                     required:
                                       - name
@@ -19589,6 +20188,14 @@ paths:
                           additionalProperties: false
                         systemCard:
                           type: boolean
+                        providerError:
+                          type: object
+                          properties:
+                            code:
+                              type: string
+                            category:
+                              type: string
+                          additionalProperties: false
                         slackMessage:
                           type: object
                           properties:
@@ -19752,8 +20359,15 @@ paths:
                   type: string
                 clientOs:
                   description:
-                    Client OS surface ("web" | "ios" | "macos" | "android"), reported separately from `interface`. Drives the
-                    per-turn `client_os` context only; does not affect transport/host-proxy capabilities.
+                    Client OS surface ("web" | "ios" | "macos" | "windows" | "android"), reported separately from `interface`.
+                    Drives the per-turn `client_os` context only; does not affect transport/host-proxy capabilities.
+                  type: string
+                visibleAppId:
+                  description:
+                    'Id of the app the client currently has open on screen (app viewer or the app-editing split). Drives the
+                    per-turn `visible_app:` context line so the assistant can resolve "the app" to what the user is
+                    looking at. View state only: it never affects transport, routing, or tool gating, and is omitted
+                    whenever no app is in view.'
                   type: string
                 clientMessageId:
                   type: string
@@ -19797,6 +20411,16 @@ paths:
                     lands mid-turn returns { queued: true, requestId } but never appears in list-messages queued
                     snapshots, emits no echo, and does not supersede pending interactions. Honored on the standard send
                     path only — slash-command content bypasses it."
+                  type: boolean
+                scripted:
+                  description:
+                    "When true, this turn was auto-sent on the user's behalf rather than typed by them: onboarding research
+                    prompts, the personality rewrite message, research corrections, hidden kickoff greetings, the legacy
+                    pre-chat bootstrap. Stamped onto the persisted message and forwarded to turn telemetry, where
+                    activation metrics exclude it. Send false for a genuine typed message; OMIT the field only if the
+                    client genuinely cannot tell, since absent means UNKNOWN and a wrong false is trusted downstream.
+                    Independent of `hidden`: a turn can be visible and scripted (the research prompt) or hidden and
+                    scripted (the kickoff greeting)."
                   type: boolean
                 onboarding:
                   type: object
@@ -20551,6 +21175,10 @@ paths:
       responses:
         "200":
           description: Successful response
+        "403":
+          description: The queued message was enqueued by a different actor principal.
+        "404":
+          description: Conversation or queued message not found.
   /v1/migrations/export:
     post:
       operationId: migrations_export_post
@@ -21055,6 +21683,10 @@ paths:
                                     anyOf:
                                       - type: number
                                       - type: "null"
+                                  inactiveFileBytes:
+                                    anyOf:
+                                      - type: number
+                                      - type: "null"
                                   kernelBytes:
                                     anyOf:
                                       - type: number
@@ -21078,6 +21710,7 @@ paths:
                                 required:
                                   - anonBytes
                                   - fileBytes
+                                  - inactiveFileBytes
                                   - kernelBytes
                                   - slabReclaimableBytes
                                   - slabUnreclaimableBytes
@@ -21418,6 +22051,7 @@ paths:
                   minLength: 1
                   description: Feed item id (notif:<uuid>) or bare uuid
                 title:
+                  description: New title. An empty value is ignored, never cleared.
                   type: string
                 body:
                   type: string
@@ -21616,6 +22250,7 @@ paths:
                     - platform
                     - a2a
                     - discord
+                    - plugin
                     - scheduler
                     - watcher
                 sourceContextId:
@@ -21665,8 +22300,6 @@ paths:
                   type: string
                 throwOnError:
                   type: boolean
-                originatingConversationId:
-                  type: string
               required:
                 - sourceEventName
                 - sourceChannel
@@ -21807,6 +22440,11 @@ paths:
                             anyOf:
                               - type: string
                               - type: "null"
+                          acts_as:
+                            type: string
+                            enum:
+                              - user
+                              - assistant
                         required:
                           - provider_key
                           - display_name
@@ -21818,6 +22456,7 @@ paths:
                           - supports_managed_mode
                           - managed_service_is_paid
                           - feature_flag
+                          - acts_as
                         additionalProperties: false
                       - type: "null"
                   apps:
@@ -22335,6 +22974,11 @@ paths:
                           anyOf:
                             - type: string
                             - type: "null"
+                        acts_as:
+                          type: string
+                          enum:
+                            - user
+                            - assistant
                       required:
                         - provider_key
                         - display_name
@@ -22346,6 +22990,7 @@ paths:
                         - supports_managed_mode
                         - managed_service_is_paid
                         - feature_flag
+                        - acts_as
                       additionalProperties: false
                 required:
                   - providers
@@ -22619,6 +23264,51 @@ paths:
                         additionalProperties: {}
                       - type: "null"
                     description: Pending secret request or null
+                  pendingQuestion:
+                    anyOf:
+                      - type: object
+                        properties:
+                          requestId:
+                            type: string
+                          entries:
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                id:
+                                  type: string
+                                question:
+                                  type: string
+                                description:
+                                  type: string
+                                options:
+                                  type: array
+                                  items:
+                                    type: object
+                                    properties:
+                                      id:
+                                        type: string
+                                      label:
+                                        type: string
+                                      description:
+                                        type: string
+                                    required:
+                                      - id
+                                      - label
+                                    additionalProperties: false
+                                freeTextPlaceholder:
+                                  type: string
+                              required:
+                                - id
+                                - question
+                                - options
+                              additionalProperties: false
+                        required:
+                          - requestId
+                          - entries
+                        additionalProperties: false
+                      - type: "null"
+                    description: Outstanding ask_question prompt or null
                   interactions:
                     type: array
                     items:
@@ -23578,10 +24268,11 @@ paths:
       summary: Disable a plugin
       description:
         Disable a plugin in this workspace by dropping a `.disabled` sentinel, mirroring the CLI's `assistant
-        plugins disable <name>`. The change is honored live at read time by every tool / injector / hook gate — no
-        restart required. Broadcasts a `sync_changed` invalidation carrying the `plugins:list` tag so other clients
-        refetch `GET /v1/plugins`. An already-disabled plugin returns 409; a user plugin with no directory returns 404
-        (default plugins are stubbed on demand via the `default-` prefix); a malformed name returns 400.
+        plugins disable <name>`. Awaits the same source reconcile enable uses so the plugin's shutdown hook runs. Tools,
+        injectors, and hook gates also honor the sentinel at read time. Broadcasts a `sync_changed` invalidation
+        carrying the `plugins:list` tag so other clients refetch `GET /v1/plugins`. An already-disabled plugin returns
+        409; a user plugin with no directory returns 404 (default plugins are stubbed on demand via the `default-`
+        prefix); a malformed name returns 400.
       tags:
         - plugins
       parameters:
@@ -23910,14 +24601,43 @@ paths:
                             description:
                               Registered tool names from `tools/<name>.{ts,js}` (filenames derived to tool names, e.g. `create-issue` →
                               `create_issue`).
+                          schedules:
+                            type: array
+                            items:
+                              type: object
+                              properties:
+                                name:
+                                  type: string
+                                  description: "Schedule name: the declaration directory's name."
+                                cadence:
+                                  type: string
+                                  description: Raw schedule `expression` string from the declaration's config.
+                                mode:
+                                  type: string
+                                  enum:
+                                    - execute
+                                    - script
+                                  description: "`execute` for a markdown prompt entrypoint, `script` for `index.sh`."
+                              required:
+                                - name
+                                - cadence
+                                - mode
+                              additionalProperties: false
+                            description:
+                              Schedules declared under `schedules/`, each a `<name>/` directory with `config.json` plus one entrypoint.
+                              Display surface only; files directly under `schedules/` and unsupported declarations are
+                              omitted.
                         required:
                           - skills
                           - hooks
                           - tools
+                          - schedules
                         additionalProperties: false
                         description: Surfaces the installed copy contributes, read from its on-disk tree.
                       - type: "null"
-                    description: Surfaces the installed copy contributes (skills, hooks, tools); null when the plugin is not installed.
+                    description:
+                      Surfaces the installed copy contributes (skills, hooks, tools, schedules); null when the plugin is not
+                      installed.
                 required:
                   - name
                   - installed
@@ -23950,8 +24670,9 @@ paths:
         non-conflicting edits from both sides forward and resolving conflicting hunks toward the local edit (`ours`) or
         the target (`theirs`), or writing git conflict markers into the file and reporting them in
         `conflicts`/`binaryConflicts` for the assistant to resolve (`assistant`). A merge strategy whose install-time
-        baseline cannot be reconstructed returns 409. Mirrors the CLI''s `assistant plugins upgrade <name> [--strategy
-        <s>]`.'
+        baseline cannot be reconstructed returns 409. Pass `marketplaceOnly` to refuse the untrusted direct path
+        outright (409), which is what the unattended auto-update sweep does. Mirrors the CLI''s `assistant plugins
+        upgrade <name> [--strategy <s>]`.'
       tags:
         - plugins
       parameters:
@@ -23981,6 +24702,13 @@ paths:
                     - theirs
                     - overwrite
                     - assistant
+                marketplaceOnly:
+                  description:
+                    Refuse the upgrade (409) when the marketplace does not claim this plugin, instead of advancing it to
+                    whatever its recorded GitHub ref now resolves to. Set by unattended callers such as the automatic
+                    update sweep, for which running code no curator reviewed is never an acceptable outcome. Defaults to
+                    false.
+                  type: boolean
       responses:
         "200":
           description: Successful response
@@ -24080,8 +24808,9 @@ paths:
           description: No copy of the plugin is installed, or its source resolves to nothing.
         "409":
           description:
-            The install has neither a marketplace entry nor a recorded GitHub source to advance to, or a merge strategy
-            was requested whose install-time baseline cannot be reconstructed.
+            The install has neither a marketplace entry nor a recorded GitHub source to advance to, a `marketplaceOnly`
+            upgrade was requested for an install the marketplace does not claim, or a merge strategy was requested whose
+            install-time baseline cannot be reconstructed.
         "503":
           description: The plugin source (GitHub) was temporarily unavailable; the upgrade is retryable.
   /v1/plugins/{name}/versions:
@@ -24846,6 +25575,74 @@ paths:
       responses:
         "200":
           description: Successful response
+  /v1/resource-pressure/status:
+    get:
+      operationId: resourcepressure_status_get
+      summary: Get resource pressure status
+      description:
+        Return the current resource pressure status snapshot. Off-platform the guard does not run, so a disabled
+        status is returned.
+      tags:
+        - resource-pressure
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: object
+                    properties:
+                      enabled:
+                        type: boolean
+                      state:
+                        type: string
+                        enum:
+                          - disabled
+                          - ok
+                          - elevated
+                          - unknown
+                      cpuPercent:
+                        anyOf:
+                          - type: number
+                          - type: "null"
+                      memoryPercent:
+                        anyOf:
+                          - type: number
+                          - type: "null"
+                      cpuElevated:
+                        type: boolean
+                      memoryElevated:
+                        type: boolean
+                      cpuThresholdPercent:
+                        type: number
+                      memoryThresholdPercent:
+                        type: number
+                      lastCheckedAt:
+                        anyOf:
+                          - type: string
+                          - type: "null"
+                      error:
+                        anyOf:
+                          - type: string
+                          - type: "null"
+                    required:
+                      - enabled
+                      - state
+                      - cpuPercent
+                      - memoryPercent
+                      - cpuElevated
+                      - memoryElevated
+                      - cpuThresholdPercent
+                      - memoryThresholdPercent
+                      - lastCheckedAt
+                      - error
+                    additionalProperties: false
+                required:
+                  - status
+                additionalProperties: false
   /v1/retrospective/config:
     get:
       operationId: retrospective_config_get
@@ -24855,8 +25652,9 @@ paths:
         per conversation after activity (time/message thresholds, pre-compaction) — there is no global schedule, so
         `nextRunAt` is always null and no run-now endpoint exists. `intervalMs` is the per-conversation time threshold
         (`memory.retrospective.timeThresholdMs`), `lastRunAt` is the `createdAt` of the most recent retrospective
-        conversation across both legacy and fork sources, and `available` gates on `memory.enabled` (not
-        `memory.v2.enabled`).
+        conversation across both legacy and fork sources, `available` gates on `memory.enabled` (not
+        `memory.v2.enabled`), and `enabled` narrows that by `memory.retrospective.enabled`, the per-pass kill switch
+        that stops retrospectives without disabling the rest of memory.
       tags:
         - retrospective
       responses:
@@ -25142,6 +25940,12 @@ paths:
           schema:
             type: string
           description: When 'true', include deferred schedules that are normally hidden.
+        - name: inference_profile
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Return only schedules pinned to this inference profile (llm.profiles key).
       responses:
         "200":
           description: Successful response
@@ -25257,7 +26061,37 @@ paths:
                           anyOf:
                             - type: string
                             - type: "null"
+                        sourceKey:
+                          anyOf:
+                            - type: string
+                            - type: "null"
+                          description:
+                            Plugin declaration this schedule mirrors (plugin:<pluginName>/<scheduleName>); null for user-created
+                            schedules
+                        userEnabled:
+                          anyOf:
+                            - type: boolean
+                            - type: "null"
+                          description:
+                            User enable/disable override on a plugin-sourced schedule; null when the declaration's own enabled value
+                            applies. Always null for user-created schedules.
+                        disarmReason:
+                          anyOf:
+                            - type: string
+                              enum:
+                                - user_disabled
+                                - plugin_removed
+                                - plugin_disabled
+                                - declaration_removed
+                                - declaration_disabled
+                            - type: "null"
+                          description:
+                            "Why a plugin-sourced schedule is off: the user turned it off, the plugin is gone, the plugin is disabled,
+                            the declaration is gone, or the plugin's own files turned it off. Null whenever the schedule
+                            is on, and always null for user-created schedules."
                         isOneShot:
+                          type: boolean
+                        isDeferred:
                           type: boolean
                       required:
                         - id
@@ -25289,7 +26123,11 @@ paths:
                         - reuseConversation
                         - wakeConversationId
                         - workflowName
+                        - sourceKey
+                        - userEnabled
+                        - disarmReason
                         - isOneShot
+                        - isDeferred
                       additionalProperties: false
                     description: Schedule objects
                 required:
@@ -25351,8 +26189,10 @@ paths:
                     - type: string
                     - type: "null"
                   description:
-                    Inference profile (llm.profiles key) the schedule's runs use. Omitted or null = default, i.e. the mainAgent
-                    call-site model selection.
+                    Inference profile (llm.profiles key) the schedule's runs use. Omitted or null pins the schedule to the
+                    currently resolved default profile, so its model does not move when that default changes.
+                    Workflow-mode schedules resolve a model per workflow step, so the pin is recorded but does not
+                    govern their runs.
               required:
                 - name
                 - expression
@@ -25469,7 +26309,37 @@ paths:
                         anyOf:
                           - type: string
                           - type: "null"
+                      sourceKey:
+                        anyOf:
+                          - type: string
+                          - type: "null"
+                        description:
+                          Plugin declaration this schedule mirrors (plugin:<pluginName>/<scheduleName>); null for user-created
+                          schedules
+                      userEnabled:
+                        anyOf:
+                          - type: boolean
+                          - type: "null"
+                        description:
+                          User enable/disable override on a plugin-sourced schedule; null when the declaration's own enabled value
+                          applies. Always null for user-created schedules.
+                      disarmReason:
+                        anyOf:
+                          - type: string
+                            enum:
+                              - user_disabled
+                              - plugin_removed
+                              - plugin_disabled
+                              - declaration_removed
+                              - declaration_disabled
+                          - type: "null"
+                        description:
+                          "Why a plugin-sourced schedule is off: the user turned it off, the plugin is gone, the plugin is disabled,
+                          the declaration is gone, or the plugin's own files turned it off. Null whenever the schedule
+                          is on, and always null for user-created schedules."
                       isOneShot:
+                        type: boolean
+                      isDeferred:
                         type: boolean
                     required:
                       - id
@@ -25501,7 +26371,11 @@ paths:
                       - reuseConversation
                       - wakeConversationId
                       - workflowName
+                      - sourceKey
+                      - userEnabled
+                      - disarmReason
                       - isOneShot
+                      - isDeferred
                     additionalProperties: false
                     description: The created schedule
                 required:
@@ -25635,7 +26509,37 @@ paths:
                           anyOf:
                             - type: string
                             - type: "null"
+                        sourceKey:
+                          anyOf:
+                            - type: string
+                            - type: "null"
+                          description:
+                            Plugin declaration this schedule mirrors (plugin:<pluginName>/<scheduleName>); null for user-created
+                            schedules
+                        userEnabled:
+                          anyOf:
+                            - type: boolean
+                            - type: "null"
+                          description:
+                            User enable/disable override on a plugin-sourced schedule; null when the declaration's own enabled value
+                            applies. Always null for user-created schedules.
+                        disarmReason:
+                          anyOf:
+                            - type: string
+                              enum:
+                                - user_disabled
+                                - plugin_removed
+                                - plugin_disabled
+                                - declaration_removed
+                                - declaration_disabled
+                            - type: "null"
+                          description:
+                            "Why a plugin-sourced schedule is off: the user turned it off, the plugin is gone, the plugin is disabled,
+                            the declaration is gone, or the plugin's own files turned it off. Null whenever the schedule
+                            is on, and always null for user-created schedules."
                         isOneShot:
+                          type: boolean
+                        isDeferred:
                           type: boolean
                       required:
                         - id
@@ -25667,7 +26571,11 @@ paths:
                         - reuseConversation
                         - wakeConversationId
                         - workflowName
+                        - sourceKey
+                        - userEnabled
+                        - disarmReason
                         - isOneShot
+                        - isDeferred
                       additionalProperties: false
                     description: Updated schedule list
                 required:
@@ -25798,7 +26706,37 @@ paths:
                         anyOf:
                           - type: string
                           - type: "null"
+                      sourceKey:
+                        anyOf:
+                          - type: string
+                          - type: "null"
+                        description:
+                          Plugin declaration this schedule mirrors (plugin:<pluginName>/<scheduleName>); null for user-created
+                          schedules
+                      userEnabled:
+                        anyOf:
+                          - type: boolean
+                          - type: "null"
+                        description:
+                          User enable/disable override on a plugin-sourced schedule; null when the declaration's own enabled value
+                          applies. Always null for user-created schedules.
+                      disarmReason:
+                        anyOf:
+                          - type: string
+                            enum:
+                              - user_disabled
+                              - plugin_removed
+                              - plugin_disabled
+                              - declaration_removed
+                              - declaration_disabled
+                          - type: "null"
+                        description:
+                          "Why a plugin-sourced schedule is off: the user turned it off, the plugin is gone, the plugin is disabled,
+                          the declaration is gone, or the plugin's own files turned it off. Null whenever the schedule
+                          is on, and always null for user-created schedules."
                       isOneShot:
+                        type: boolean
+                      isDeferred:
                         type: boolean
                     required:
                       - id
@@ -25830,7 +26768,11 @@ paths:
                       - reuseConversation
                       - wakeConversationId
                       - workflowName
+                      - sourceKey
+                      - userEnabled
+                      - disarmReason
                       - isOneShot
+                      - isDeferred
                     additionalProperties: false
                     description: Schedule object
                 required:
@@ -25903,8 +26845,9 @@ paths:
                     - type: string
                     - type: "null"
                   description:
-                    Inference profile (llm.profiles key) the schedule's runs use; null clears it back to the default mainAgent
-                    call-site model selection
+                    Inference profile (llm.profiles key) the schedule's runs use; null re-pins the schedule to the currently
+                    resolved default profile. Workflow-mode schedules resolve a model per workflow step, so the pin is
+                    recorded but does not govern their runs.
       responses:
         "200":
           description: Successful response
@@ -26020,7 +26963,37 @@ paths:
                           anyOf:
                             - type: string
                             - type: "null"
+                        sourceKey:
+                          anyOf:
+                            - type: string
+                            - type: "null"
+                          description:
+                            Plugin declaration this schedule mirrors (plugin:<pluginName>/<scheduleName>); null for user-created
+                            schedules
+                        userEnabled:
+                          anyOf:
+                            - type: boolean
+                            - type: "null"
+                          description:
+                            User enable/disable override on a plugin-sourced schedule; null when the declaration's own enabled value
+                            applies. Always null for user-created schedules.
+                        disarmReason:
+                          anyOf:
+                            - type: string
+                              enum:
+                                - user_disabled
+                                - plugin_removed
+                                - plugin_disabled
+                                - declaration_removed
+                                - declaration_disabled
+                            - type: "null"
+                          description:
+                            "Why a plugin-sourced schedule is off: the user turned it off, the plugin is gone, the plugin is disabled,
+                            the declaration is gone, or the plugin's own files turned it off. Null whenever the schedule
+                            is on, and always null for user-created schedules."
                         isOneShot:
+                          type: boolean
+                        isDeferred:
                           type: boolean
                       required:
                         - id
@@ -26052,7 +27025,11 @@ paths:
                         - reuseConversation
                         - wakeConversationId
                         - workflowName
+                        - sourceKey
+                        - userEnabled
+                        - disarmReason
                         - isOneShot
+                        - isDeferred
                       additionalProperties: false
                     description: Updated schedule list
                 required:
@@ -26186,7 +27163,37 @@ paths:
                           anyOf:
                             - type: string
                             - type: "null"
+                        sourceKey:
+                          anyOf:
+                            - type: string
+                            - type: "null"
+                          description:
+                            Plugin declaration this schedule mirrors (plugin:<pluginName>/<scheduleName>); null for user-created
+                            schedules
+                        userEnabled:
+                          anyOf:
+                            - type: boolean
+                            - type: "null"
+                          description:
+                            User enable/disable override on a plugin-sourced schedule; null when the declaration's own enabled value
+                            applies. Always null for user-created schedules.
+                        disarmReason:
+                          anyOf:
+                            - type: string
+                              enum:
+                                - user_disabled
+                                - plugin_removed
+                                - plugin_disabled
+                                - declaration_removed
+                                - declaration_disabled
+                            - type: "null"
+                          description:
+                            "Why a plugin-sourced schedule is off: the user turned it off, the plugin is gone, the plugin is disabled,
+                            the declaration is gone, or the plugin's own files turned it off. Null whenever the schedule
+                            is on, and always null for user-created schedules."
                         isOneShot:
+                          type: boolean
+                        isDeferred:
                           type: boolean
                       required:
                         - id
@@ -26218,7 +27225,11 @@ paths:
                         - reuseConversation
                         - wakeConversationId
                         - workflowName
+                        - sourceKey
+                        - userEnabled
+                        - disarmReason
                         - isOneShot
+                        - isDeferred
                       additionalProperties: false
                     description: Updated schedule list
                 required:
@@ -26228,7 +27239,9 @@ paths:
     post:
       operationId: schedules_by_id_run_post
       summary: Run schedule now
-      description: Trigger an immediate execution of a schedule.
+      description:
+        Trigger an immediate execution of a schedule. A plugin-sourced schedule is rejected with a 400 when its
+        plugin is disabled or no longer declares it.
       tags:
         - schedules
       parameters:
@@ -26352,7 +27365,37 @@ paths:
                           anyOf:
                             - type: string
                             - type: "null"
+                        sourceKey:
+                          anyOf:
+                            - type: string
+                            - type: "null"
+                          description:
+                            Plugin declaration this schedule mirrors (plugin:<pluginName>/<scheduleName>); null for user-created
+                            schedules
+                        userEnabled:
+                          anyOf:
+                            - type: boolean
+                            - type: "null"
+                          description:
+                            User enable/disable override on a plugin-sourced schedule; null when the declaration's own enabled value
+                            applies. Always null for user-created schedules.
+                        disarmReason:
+                          anyOf:
+                            - type: string
+                              enum:
+                                - user_disabled
+                                - plugin_removed
+                                - plugin_disabled
+                                - declaration_removed
+                                - declaration_disabled
+                            - type: "null"
+                          description:
+                            "Why a plugin-sourced schedule is off: the user turned it off, the plugin is gone, the plugin is disabled,
+                            the declaration is gone, or the plugin's own files turned it off. Null whenever the schedule
+                            is on, and always null for user-created schedules."
                         isOneShot:
+                          type: boolean
+                        isDeferred:
                           type: boolean
                       required:
                         - id
@@ -26384,7 +27427,11 @@ paths:
                         - reuseConversation
                         - wakeConversationId
                         - workflowName
+                        - sourceKey
+                        - userEnabled
+                        - disarmReason
                         - isOneShot
+                        - isDeferred
                       additionalProperties: false
                     description: Updated schedule list
                 required:
@@ -26519,7 +27566,7 @@ paths:
     post:
       operationId: schedules_by_id_toggle_post
       summary: Toggle schedule
-      description: Enable or disable a schedule.
+      description: Enable or disable a schedule. On a plugin-managed schedule this records the user's override (userEnabled).
       tags:
         - schedules
       parameters:
@@ -26655,7 +27702,37 @@ paths:
                           anyOf:
                             - type: string
                             - type: "null"
+                        sourceKey:
+                          anyOf:
+                            - type: string
+                            - type: "null"
+                          description:
+                            Plugin declaration this schedule mirrors (plugin:<pluginName>/<scheduleName>); null for user-created
+                            schedules
+                        userEnabled:
+                          anyOf:
+                            - type: boolean
+                            - type: "null"
+                          description:
+                            User enable/disable override on a plugin-sourced schedule; null when the declaration's own enabled value
+                            applies. Always null for user-created schedules.
+                        disarmReason:
+                          anyOf:
+                            - type: string
+                              enum:
+                                - user_disabled
+                                - plugin_removed
+                                - plugin_disabled
+                                - declaration_removed
+                                - declaration_disabled
+                            - type: "null"
+                          description:
+                            "Why a plugin-sourced schedule is off: the user turned it off, the plugin is gone, the plugin is disabled,
+                            the declaration is gone, or the plugin's own files turned it off. Null whenever the schedule
+                            is on, and always null for user-created schedules."
                         isOneShot:
+                          type: boolean
+                        isDeferred:
                           type: boolean
                       required:
                         - id
@@ -26687,11 +27764,55 @@ paths:
                         - reuseConversation
                         - wakeConversationId
                         - workflowName
+                        - sourceKey
+                        - userEnabled
+                        - disarmReason
                         - isOneShot
+                        - isDeferred
                       additionalProperties: false
                     description: Updated schedule list
                 required:
                   - schedules
+                additionalProperties: false
+  /v1/schedules/reassign-profile:
+    post:
+      operationId: schedules_reassignprofile_post
+      summary: Reassign schedules to another inference profile
+      description:
+        Move schedules onto one inference profile. Pass 'from' to move only the schedules pinned to that profile,
+        so deleting a profile does not leave its schedules pointing at a name that no longer exists. Omit 'from' to move
+        every schedule, which re-pins the whole set onto one profile. Schedules already pinned to the target are
+        skipped.
+      tags:
+        - schedules
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                from:
+                  description: Inference profile key the schedules are pinned to now; omit to select every schedule
+                  type: string
+                to:
+                  type: string
+                  description: Inference profile key to move them to; must be configured
+              required:
+                - to
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  reassigned:
+                    type: number
+                    description: Number of schedules moved
+                required:
+                  - reassigned
                 additionalProperties: false
   /v1/schedules/usage-summary:
     get:
@@ -27054,7 +28175,9 @@ paths:
     delete:
       operationId: secrets_delete
       summary: Delete a secret
-      description: Remove a secret from the credential vault by name.
+      description:
+        Remove a secret from the credential vault by name. Refused with CREDENTIAL_IN_USE while an LLM provider
+        connection resolves its auth through the credential, unless `force` is set.
       tags:
         - secrets
       requestBody:
@@ -27070,6 +28193,9 @@ paths:
                 name:
                   type: string
                   description: Name of the secret to delete
+                force:
+                  description: Delete even when provider connections depend on the credential
+                  type: boolean
               required:
                 - type
                 - name
@@ -27184,10 +28310,13 @@ paths:
                     type: string
                   name:
                     type: string
+                  error:
+                    description:
+                      Why the secret was not stored (e.g. provider-side API key validation failed). Present only when success is
+                      false.
+                    type: string
                 required:
                   - success
-                  - type
-                  - name
                 additionalProperties: false
   /v1/secrets/read:
     post:
@@ -28834,6 +29963,73 @@ paths:
                   - mimeType
                   - isBinary
                   - content
+                additionalProperties: false
+  /v1/skills/{id}/history:
+    get:
+      operationId: skills_by_id_history_get
+      summary: Get skill revision history
+      description:
+        "Return a skill's recent updates, newest first, each with a combined diff across the skill directory.
+        Read-only: revisions come from the workspace git repository, which already retains prior content. Commits whose
+        only in-skill change is the `lastUsedAt` usage stamp are omitted, so entries are edits rather than loads."
+      tags:
+        - skills
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+          description: Maximum revisions to return, newest first. Defaults to 20 and is clamped to 100.
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  skillId:
+                    type: string
+                    description: The skill these revisions belong to
+                  revisions:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                          description: Opaque revision identifier
+                        changedAt:
+                          type: string
+                          description: ISO-8601 time of the update
+                        files:
+                          type: array
+                          items:
+                            type: string
+                          description: Paths changed, relative to the skill directory
+                        diff:
+                          type: string
+                          description: Unified diff of this update, scoped to the skill
+                      required:
+                        - id
+                        - changedAt
+                        - files
+                        - diff
+                      additionalProperties: false
+                    description: Recent updates, newest first
+                  truncatedByCompaction:
+                    type: boolean
+                    description: Older history was squashed away, so the oldest entry is a floor rather than the skill's creation
+                required:
+                  - skillId
+                  - revisions
+                  - truncatedByCompaction
                 additionalProperties: false
   /v1/skills/{id}/inspect:
     get:
@@ -33253,23 +34449,7 @@ components:
       additionalProperties: {}
     LLMProvider:
       type: string
-      enum:
-        - anthropic
-        - openai
-        - gemini
-        - ollama
-        - fireworks
-        - openrouter
-        - vercel-ai-gateway
-        - openai-compatible
-        - minimax
-        - atlascloud
-        - together
-        - litellm
-        - baseten
-        - poolside
-        - vellum
-        - chatgpt
+      minLength: 1
     ProfilePatchEntry:
       type: object
       properties:
@@ -33436,6 +34616,10 @@ components:
           anyOf:
             - type: string
               minLength: 1
+            - type: "null"
+        allowUnlisted:
+          anyOf:
+            - type: boolean
             - type: "null"
         status:
           anyOf:
@@ -33650,6 +34834,7 @@ components:
         - baseten
         - poolside
         - vellum
+        - chatgpt
     Auth:
       oneOf:
         - type: object
@@ -33867,6 +35052,7 @@ components:
                     - gemini
                     - fireworks
                     - openrouter
+                    - chatgpt
                     - vellum
                     - together
                     - vercel-ai-gateway
@@ -34207,6 +35393,8 @@ components:
         provider_connection:
           type: string
           minLength: 1
+        allowUnlisted:
+          type: boolean
         status:
           anyOf:
             - $ref: "#/components/schemas/ProfileStatus"
@@ -34244,6 +35432,7 @@ components:
                 - gemini
                 - fireworks
                 - openrouter
+                - chatgpt
                 - vellum
                 - together
                 - vercel-ai-gateway
@@ -34265,13 +35454,14 @@ components:
               type: string
               enum:
                 - ok
-                - missing_default
+                - incomplete
                 - missing_connection
                 - missing_credential
                 - provider_mismatch
                 - unsupported_auth
                 - vellum_unauthenticated
                 - unknown
+                - missing_default
             message:
               type: string
           required:
@@ -34481,6 +35671,8 @@ components:
           anyOf:
             - $ref: "#/components/schemas/ProfileConnectionAvailability"
             - type: "null"
+        config_issue:
+          $ref: "#/components/schemas/InferenceProfileConfigIssue"
       required:
         - name
         - label
@@ -34497,6 +35689,7 @@ components:
           type: string
           enum:
             - ok
+            - incomplete
             - missing_connection
             - missing_credential
             - provider_mismatch
@@ -34507,6 +35700,21 @@ components:
           type: string
       required:
         - status
+      additionalProperties: false
+    InferenceProfileConfigIssue:
+      type: object
+      properties:
+        code:
+          type: string
+          enum:
+            - model_unknown
+            - over_output_cap
+            - no_input_room
+        message:
+          type: string
+      required:
+        - code
+        - message
       additionalProperties: false
     InferenceProfileWriteResult:
       type: object
@@ -34525,11 +35733,14 @@ components:
           type: array
           items:
             type: string
+        verify:
+          type: string
       required:
         - ok
         - name
         - entry
         - warnings
+        - verify
       additionalProperties: false
     InferenceProfileDetail:
       type: object
@@ -34545,10 +35756,35 @@ components:
           anyOf:
             - $ref: "#/components/schemas/ProfileConnectionAvailability"
             - type: "null"
+        config_issue:
+          $ref: "#/components/schemas/InferenceProfileConfigIssue"
       required:
         - name
         - entry
         - availability
+      additionalProperties: false
+    InferenceProfileCheck:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        blame:
+          type: string
+          enum:
+            - profile
+            - provider
+            - transient
+            - unknown
+        reason:
+          type: string
+        detail:
+          type: string
+        connection:
+          type: string
+        message:
+          type: string
+      required:
+        - ok
       additionalProperties: false
     ProviderConnection:
       type: object
@@ -34596,6 +35832,78 @@ components:
         - createdAt
         - updatedAt
         - isManaged
+      additionalProperties: false
+    SavedProviderConnection:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+        provider:
+          $ref: "#/components/schemas/ConnectionProvider"
+        auth:
+          $ref: "#/components/schemas/AuthOutput"
+        label:
+          anyOf:
+            - type: string
+              minLength: 1
+            - type: "null"
+        baseUrl:
+          anyOf:
+            - type: string
+              format: uri
+            - type: "null"
+        models:
+          anyOf:
+            - type: array
+              items:
+                $ref: "#/components/schemas/ConnectionModelOutput"
+            - type: "null"
+        createdAt:
+          type: integer
+          minimum: -9007199254740991
+          maximum: 9007199254740991
+        updatedAt:
+          type: integer
+          minimum: -9007199254740991
+          maximum: 9007199254740991
+        isManaged:
+          type: boolean
+        endpoint_check:
+          $ref: "#/components/schemas/EndpointCheck"
+      required:
+        - name
+        - provider
+        - auth
+        - label
+        - baseUrl
+        - models
+        - createdAt
+        - updatedAt
+        - isManaged
+      additionalProperties: false
+    EndpointCheck:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        status:
+          type: integer
+          minimum: -9007199254740991
+          maximum: 9007199254740991
+        resolved_url:
+          type: string
+        error_class:
+          type: string
+          enum:
+            - http_error
+            - timeout
+            - network
+        hint:
+          type: string
+      required:
+        - ok
+        - resolved_url
       additionalProperties: false
     ProcessEntry:
       type: object

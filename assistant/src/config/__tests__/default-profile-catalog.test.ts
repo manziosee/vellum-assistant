@@ -7,6 +7,7 @@ import {
   CODE_DEFAULT_PROFILE_ENTRIES,
   getEffectiveProfile,
   getEffectiveProfiles,
+  getEffectiveProfilesForProvider,
   PROFILE_IMPLS,
   resolveDefaultProfileForProvider,
 } from "../default-profile-catalog.js";
@@ -22,6 +23,7 @@ import {
 import {
   type DefaultProviderConfig,
   type LLMCallSite,
+  LLMCallSiteEnum,
   LLMSchema,
   type ProfileEntry,
 } from "../schemas/llm.js";
@@ -55,12 +57,12 @@ describe("getEffectiveProfiles", () => {
     }
   });
 
-  test("the managed Balanced profile routes GPT-5.6 Luna through OpenAI", () => {
+  test("the managed Balanced profile routes GLM 5.2 through Fireworks", () => {
     const balanced = CODE_DEFAULT_PROFILE_ENTRIES.balanced;
-    expect(balanced.model).toBe("gpt-5.6-luna");
+    expect(balanced.model).toBe("accounts/fireworks/models/glm-5p2");
     expect(resolveRoutingIdentity(balanced.provider, balanced.model)).toEqual({
       connectionName: "vellum",
-      expectedProvider: "openai",
+      expectedProvider: "fireworks",
     });
   });
 
@@ -228,12 +230,10 @@ describe("resolver integration", () => {
     expect(resolved.model).not.toBe("claude-sonnet-4-6");
   });
 
-  test("a pre-existing user profile cannot shadow an internal profile's call sites", () => {
-    // `latency-optimized` was a legal custom profile name before it was
-    // reserved, so a workspace can already hold one. The user-shadow rule
-    // that lets a user replace a default they can select must not apply to a
-    // name they were never able to select: the voice front model would
-    // silently run on an arbitrary user model.
+  test("a user profile cannot shadow latency-optimized", () => {
+    // `latency-optimized` is code-owned: it fronts every live-voice turn, so
+    // a same-named workspace entry never governs what it resolves to. The
+    // entry stays on disk and stays a valid `activeProfile` reference.
     const llm = LLMSchema.parse({
       profiles: {
         "latency-optimized": {
@@ -246,17 +246,19 @@ describe("resolver integration", () => {
         },
       },
     });
-    const body = CODE_DEFAULT_PROFILE_ENTRIES["latency-optimized"];
-    for (const callSite of ["voiceFrontDoor", "voiceFrontDecision"] as const) {
+    const body = CODE_DEFAULT_PROFILE_ENTRIES["latency-optimized"]!;
+    for (const callSite of [
+      "voiceFrontDoor",
+      "voiceProgressNarration",
+    ] as const) {
       const resolved = resolveCallSiteConfig(callSite, llm);
       expect(resolved.model).toBe(body.model as string);
       expect(resolved.model).not.toBe("claude-opus-4-6");
       expect(String(resolved.provider)).toBe("vellum");
     }
-    // The entry itself is untouched — still on disk, still listed, and still
-    // a valid `activeProfile` reference for the user who created it.
+    // Listing follows resolution: the catalog body is what surfaces.
     expect(getEffectiveProfiles(llm.profiles)["latency-optimized"]?.model).toBe(
-      "claude-opus-4-6",
+      body.model,
     );
     expect(() =>
       LLMSchema.parse({
@@ -268,6 +270,12 @@ describe("resolver integration", () => {
 });
 
 describe("schema validation", () => {
+  test("voiceFrontDoor is the only front callsite", () => {
+    expect(
+      LLMCallSiteEnum.options.filter((callSite) => callSite.includes("Front")),
+    ).toEqual(["voiceFrontDoor"]);
+  });
+
   test("always-available default names are valid references; os-beta only when materialized", () => {
     expect(() => LLMSchema.parse({ activeProfile: "balanced" })).not.toThrow();
     expect(() =>
@@ -326,7 +334,7 @@ describe("resolveDefaultProfileForProvider", () => {
         expect(typeof entry?.model).toBe("string");
         expect(entry?.provider).toBeDefined();
         // Identity columns stamp no connection; BYOK columns always do.
-        if (entry?.provider === "vellum") {
+        if (entry?.provider === "vellum" || entry?.provider === "chatgpt") {
           expect(entry?.provider_connection).toBeUndefined();
         } else {
           expect(entry?.provider_connection).toBeDefined();
@@ -334,6 +342,27 @@ describe("resolveDefaultProfileForProvider", () => {
         expect(entry?.source).toBe("managed");
       }
     }
+  });
+
+  test("the chatgpt column resolves Codex-pinned models with no connection stamp", () => {
+    const byKey: Record<string, string> = {
+      balanced: "gpt-5.6-luna",
+      "quality-optimized": "gpt-5.6-sol",
+      "cost-optimized": "gpt-5.6-luna",
+      "latency-optimized": "gpt-5.6-luna",
+    };
+    const effective = getEffectiveProfilesForProvider(undefined, dp("chatgpt"));
+    for (const [key, model] of Object.entries(byKey)) {
+      const entry = effective[key];
+      expect(entry?.provider).toBe("chatgpt");
+      expect(entry?.model).toBe(model);
+      expect(entry?.provider_connection).toBeUndefined();
+      expect(entry?.source).toBe("managed");
+    }
+    // Cost and Speed both opt fully out of reasoning.
+    expect(effective["cost-optimized"]?.effort).toBe("none");
+    expect(effective["latency-optimized"]?.effort).toBe("none");
+    expect(effective.balanced?.thinking?.enabled).toBe(true);
   });
 
   test("a provider without a named matrix column materializes from the shared BYOK templates", () => {

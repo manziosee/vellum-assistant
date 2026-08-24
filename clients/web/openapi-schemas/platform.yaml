@@ -1581,7 +1581,9 @@ paths:
       description: Transcribe pre-recorded audio through Vellum's managed Deepgram
         speech-to-text proxy. Vellum validates the request, checks billing eligibility,
         calls Deepgram with managed credentials, bills the transcribed duration, and
-        returns the transcript.
+        returns the transcript. Pass 'language' to name the spoken language (a BCP-47
+        code, or 'multi' for code-switching); omitting it decodes as English rather
+        than detecting the language.
       parameters:
       - in: path
         name: assistant_id
@@ -4152,6 +4154,27 @@ paths:
           description: ''
       x-vellum-api-clients:
       - platform
+  /v1/managed-speech/tts/voices/:
+    get:
+      operationId: managed_speech_tts_voices_retrieve
+      description: List the voices offered by Vellum's managed text-to-speech, in
+        display order, with the platform's default voice. Only voices that are currently
+        priced (and therefore usable via the synthesize endpoint) are returned.
+      tags:
+      - managed-speech
+      security:
+      - VellumAPIKey: []
+      - cookieAuth: []
+      - XSessionTokenAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ManagedSpeechTTSVoicesResponse'
+          description: ''
+      x-vellum-api-clients:
+      - platform
   /v1/organizations/:
     get:
       operationId: organizations_list
@@ -4235,6 +4258,58 @@ paths:
           multipart/form-data:
             schema:
               $ref: '#/components/schemas/AutoTopUpConfigRequestRequest'
+        required: true
+      security:
+      - VellumAPIKey: []
+      - cookieAuth: []
+      - XSessionTokenAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AutoTopUpConfigResponse'
+          description: ''
+      x-vellum-api-clients:
+      - platform
+  /v1/organizations/billing/auto-top-up/confirm-setup-intent/:
+    post:
+      operationId: organizations_billing_auto_top_up_confirm_setup_intent_create
+      description: |-
+        Persist the payment method from a just-confirmed SetupIntent.
+
+        Call this immediately after Stripe's client-side ``confirmSetup``
+        resolves so the saved card is readable on the very next GET, instead of
+        waiting on the ``setup_intent.succeeded`` webhook. The webhook remains
+        the durable fallback; whichever lands second is a no-op.
+
+        Returns the same payload as ``GET .../auto-top-up/``.
+
+        The caller's id is never trusted on its own: the SetupIntent is re-read
+        from Stripe and must be tagged ``metadata.auto_top_up=true``, carry this
+        org's ``metadata.organization_id``, sit on this org's Stripe customer,
+        and be ``succeeded`` with a payment method attached.
+      parameters:
+      - in: header
+        name: Vellum-Organization-Id
+        schema:
+          type: string
+          format: uuid
+        description: Required if using Cookie-based or X-Session-Token authentication
+          methods.
+      tags:
+      - organizations
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AutoTopUpConfirmSetupIntentRequestRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/AutoTopUpConfirmSetupIntentRequestRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/AutoTopUpConfirmSetupIntentRequestRequest'
         required: true
       security:
       - VellumAPIKey: []
@@ -4377,6 +4452,63 @@ paths:
           description: ''
       x-vellum-api-clients:
       - platform
+  /v1/organizations/billing/checkout-bonus/:
+    get:
+      operationId: organizations_billing_checkout_bonus_retrieve
+      description: |-
+        Return whether the organization may claim the bonus, and its amount.
+
+        Read-only — never creates or modifies billing state. The eligibility
+        check may perform outbound Stripe reads to verify abandonment.
+      parameters:
+      - in: header
+        name: Vellum-Organization-Id
+        schema:
+          type: string
+          format: uuid
+        description: Required if using Cookie-based or X-Session-Token authentication
+          methods.
+      tags:
+      - organizations
+      security:
+      - VellumAPIKey: []
+      - cookieAuth: []
+      - XSessionTokenAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckoutBonusEligibilityResponse'
+          description: ''
+      x-vellum-api-clients:
+      - platform
+    post:
+      operationId: organizations_billing_checkout_bonus_create
+      description: Claim the one-time bonus; the service re-verifies eligibility.
+      parameters:
+      - in: header
+        name: Vellum-Organization-Id
+        schema:
+          type: string
+          format: uuid
+        description: Required if using Cookie-based or X-Session-Token authentication
+          methods.
+      tags:
+      - organizations
+      security:
+      - VellumAPIKey: []
+      - cookieAuth: []
+      - XSessionTokenAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckoutBonusClaimResponse'
+          description: ''
+      x-vellum-api-clients:
+      - platform
   /v1/organizations/billing/daily-credit-limit/:
     get:
       operationId: organizations_billing_daily_credit_limit_retrieve
@@ -4429,6 +4561,64 @@ paths:
             schema:
               $ref: '#/components/schemas/DailyCreditLimitRequestRequest'
         required: true
+      security:
+      - VellumAPIKey: []
+      - cookieAuth: []
+      - XSessionTokenAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DailyCreditLimitResponse'
+          description: ''
+      x-vellum-api-clients:
+      - platform
+  /v1/organizations/billing/daily-credit-limit/skip-today/:
+    post:
+      operationId: organizations_billing_daily_credit_limit_skip_today_create
+      description: |-
+        Skip the daily limit for the rest of the current UTC day.
+
+        Idempotent: skipping an already-skipped day rewrites the same bucket.
+        Rejected with 400 when no limit is configured, so the client can never
+        record a skip that has nothing to suspend.
+      parameters:
+      - in: header
+        name: Vellum-Organization-Id
+        schema:
+          type: string
+          format: uuid
+        description: Required if using Cookie-based or X-Session-Token authentication
+          methods.
+      tags:
+      - organizations
+      security:
+      - VellumAPIKey: []
+      - cookieAuth: []
+      - XSessionTokenAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DailyCreditLimitResponse'
+          description: ''
+      x-vellum-api-clients:
+      - platform
+    delete:
+      operationId: organizations_billing_daily_credit_limit_skip_today_destroy
+      description: Restore the daily limit immediately, ending an active skip early.
+      parameters:
+      - in: header
+        name: Vellum-Organization-Id
+        schema:
+          type: string
+          format: uuid
+        description: Required if using Cookie-based or X-Session-Token authentication
+          methods.
+      tags:
+      - organizations
       security:
       - VellumAPIKey: []
       - cookieAuth: []
@@ -4599,6 +4789,7 @@ paths:
       - VellumAPIKey: []
       - cookieAuth: []
       - XSessionTokenAuth: []
+      - AssistantAPIKey: []
       responses:
         '200':
           content:
@@ -4652,6 +4843,7 @@ paths:
       security:
       - cookieAuth: []
       - XSessionTokenAuth: []
+      - AssistantAPIKey: []
       responses:
         '200':
           content:
@@ -5903,6 +6095,28 @@ components:
       - id
       - is_read
       - read_at
+    AndroidDevicePushTokenUpsertPlatformEnum:
+      enum:
+      - android
+      type: string
+      description: '* `android` - android'
+    AndroidDevicePushTokenUpsertRequest:
+      type: object
+      properties:
+        token:
+          type: string
+          minLength: 1
+          maxLength: 512
+        platform:
+          $ref: '#/components/schemas/AndroidDevicePushTokenUpsertPlatformEnum'
+        bundle_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+      required:
+      - bundle_id
+      - platform
+      - token
     ApnsEnvironmentEnum:
       enum:
       - production
@@ -6316,6 +6530,18 @@ components:
       - stripe_payment_method_updated_at
       - stubbed
       - threshold_usd
+    AutoTopUpConfirmSetupIntentRequestRequest:
+      type: object
+      description: POST /…/auto-top-up/confirm-setup-intent/ request body.
+      properties:
+        setup_intent_id:
+          type: string
+          minLength: 1
+          description: Stripe SetupIntent id returned by the client-side confirmSetup
+            call.
+          maxLength: 255
+      required:
+      - setup_intent_id
     AutoTopUpDisableResponse:
       type: object
       properties:
@@ -6491,8 +6717,14 @@ components:
             "0.00" when the stored counter is from a prior UTC day.
         daily_limit_reached:
           type: boolean
-          description: True when a daily limit is set and today's spend has reached
-            it.
+          description: True when a daily limit is set, today's spend has reached it,
+            and the limit is being enforced. False while the limit is skipped for
+            the day (see daily_limit_snoozed). Drives the in-app daily-limit banner.
+        daily_limit_snoozed:
+          type: boolean
+          description: True when the daily limit has been skipped for the current
+            UTC day, so it is not enforced until the next reset. Auto top-up is unaffected
+            and keeps charging.
         low_balance_threshold_usd:
           type: string
           description: Effective low-balance alert threshold in USD as a decimal string
@@ -6503,10 +6735,32 @@ components:
           description: True when the balance is above zero but below the low-balance
             threshold and auto-top-up is not enabled. Drives the in-app low-credits
             banner.
+        credits_expiring_soon_usd:
+          type: string
+          description: Unexpired remaining credit (USD, decimal string) from grants
+            whose expiry falls within the next 30 days. Already-expired remainders
+            are excluded.
+        next_credit_expiry_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Earliest upcoming expiry across grants that still hold credit,
+            or null when no unexpired credit remains.
+        available_usage_balance:
+          type: string
+          description: Unused credit (USD, decimal string) remaining on unexpired
+            initial-credit and subscription (Pro bundle) grants.
+        total_usage_balance:
+          type: string
+          description: Total granted credit (USD, decimal string) across unexpired
+            initial-credit and subscription (Pro bundle) grants, including amounts
+            already used but net of refunded credit.
       required:
       - allowed_top_up_amounts
+      - credits_expiring_soon_usd
       - daily_credit_limit_usd
       - daily_limit_reached
+      - daily_limit_snoozed
       - daily_spend_usd
       - effective_balance
       - effective_balance_usd
@@ -6519,6 +6773,7 @@ components:
       - maximum_top_up_usd
       - minimum_top_up
       - minimum_top_up_usd
+      - next_credit_expiry_at
       - pending_compute
       - pending_compute_usd
       - settled_balance
@@ -6526,6 +6781,41 @@ components:
     BlankEnum:
       enum:
       - ''
+    CheckoutBonusClaimResponse:
+      type: object
+      description: POST /…/checkout-bonus/ response shape.
+      properties:
+        status:
+          $ref: '#/components/schemas/CheckoutBonusClaimResponseStatusEnum'
+        amount_usd:
+          type: string
+        balance_usd:
+          type: string
+      required:
+      - amount_usd
+      - balance_usd
+      - status
+    CheckoutBonusClaimResponseStatusEnum:
+      enum:
+      - granted
+      - already_claimed
+      - ineligible
+      type: string
+      description: |-
+        * `granted` - granted
+        * `already_claimed` - already_claimed
+        * `ineligible` - ineligible
+    CheckoutBonusEligibilityResponse:
+      type: object
+      description: GET /…/checkout-bonus/ response shape.
+      properties:
+        eligible:
+          type: boolean
+        amount_usd:
+          type: string
+      required:
+      - amount_usd
+      - eligible
     ClassificationEnum:
       enum:
       - something_broken
@@ -6548,6 +6838,7 @@ components:
       enum:
       - macos
       - ios
+      - android
       - web
       - cli
       - electron
@@ -6555,6 +6846,7 @@ components:
       description: |-
         * `macos` - macOS
         * `ios` - iOS
+        * `android` - Android
         * `web` - Web
         * `cli` - CLI
         * `electron` - Electron
@@ -6816,9 +7108,16 @@ components:
         day_bucket:
           type: string
           nullable: true
+        daily_limit_snoozed:
+          type: boolean
+        daily_limit_snoozed_day_bucket:
+          type: string
+          nullable: true
       required:
       - current_day_spent_usd
       - daily_credit_limit_usd
+      - daily_limit_snoozed
+      - daily_limit_snoozed_day_bucket
       - day_bucket
     DetailResponse:
       type: object
@@ -6834,37 +7133,37 @@ components:
           type: string
           maxLength: 512
         platform:
-          $ref: '#/components/schemas/PlatformEnum'
+          $ref: '#/components/schemas/DevicePushTokenUpsertPlatformEnum'
         bundle_id:
           type: string
           maxLength: 128
         apns_environment:
-          $ref: '#/components/schemas/ApnsEnvironmentEnum'
+          nullable: true
+          oneOf:
+          - $ref: '#/components/schemas/ApnsEnvironmentEnum'
+          - $ref: '#/components/schemas/NullEnum'
       required:
       - apns_environment
       - bundle_id
       - platform
       - token
+    DevicePushTokenUpsertPlatformEnum:
+      enum:
+      - ios
+      - android
+      type: string
+      description: |-
+        * `ios` - ios
+        * `android` - android
     DevicePushTokenUpsertRequest:
-      type: object
-      properties:
-        token:
-          type: string
-          minLength: 1
-          maxLength: 512
-        platform:
-          $ref: '#/components/schemas/PlatformEnum'
-        bundle_id:
-          type: string
-          minLength: 1
-          maxLength: 128
-        apns_environment:
-          $ref: '#/components/schemas/ApnsEnvironmentEnum'
-      required:
-      - apns_environment
-      - bundle_id
-      - platform
-      - token
+      oneOf:
+      - $ref: '#/components/schemas/IosDevicePushTokenUpsertRequest'
+      - $ref: '#/components/schemas/AndroidDevicePushTokenUpsertRequest'
+      discriminator:
+        propertyName: platform
+        mapping:
+          ios: '#/components/schemas/IosDevicePushTokenUpsertRequest'
+          android: '#/components/schemas/AndroidDevicePushTokenUpsertRequest'
     DoctorMessage:
       type: object
       description: Serializer for a single persisted Doctor message ledger entry.
@@ -7519,6 +7818,31 @@ components:
       required:
       - has_more
       - invoices
+    IosDevicePushTokenUpsertPlatformEnum:
+      enum:
+      - ios
+      type: string
+      description: '* `ios` - ios'
+    IosDevicePushTokenUpsertRequest:
+      type: object
+      properties:
+        token:
+          type: string
+          minLength: 1
+          maxLength: 512
+        platform:
+          $ref: '#/components/schemas/IosDevicePushTokenUpsertPlatformEnum'
+        bundle_id:
+          type: string
+          minLength: 1
+          maxLength: 128
+        apns_environment:
+          $ref: '#/components/schemas/ApnsEnvironmentEnum'
+      required:
+      - apns_environment
+      - bundle_id
+      - platform
+      - token
     LiveActivityTokenUpsert:
       type: object
       description: |-
@@ -7529,6 +7853,11 @@ components:
         deliberately not allowed to invent wording of its own (see the model).
         Validating it here makes that a 400 at registration rather than a silently
         dropped push mid-session.
+
+        ``accent_hex`` and ``muted`` ride along for a related reason: they are
+        ``ContentState`` fields only the client can observe, and every push replaces
+        that state wholesale. The client re-registers when either changes, so the
+        newest registration is always what a dispatch composes from.
       properties:
         token:
           type: string
@@ -7542,6 +7871,11 @@ components:
           type: string
           maxLength: 64
         labels: {}
+        accent_hex:
+          type: string
+          maxLength: 9
+        muted:
+          type: boolean
       required:
       - apns_environment
       - bundle_id
@@ -7557,6 +7891,11 @@ components:
         deliberately not allowed to invent wording of its own (see the model).
         Validating it here makes that a 400 at registration rather than a silently
         dropped push mid-session.
+
+        ``accent_hex`` and ``muted`` ride along for a related reason: they are
+        ``ContentState`` fields only the client can observe, and every push replaces
+        that state wholesale. The client re-registers when either changes, so the
+        newest registration is always what a dispatch composes from.
       properties:
         token:
           type: string
@@ -7573,6 +7912,11 @@ components:
           minLength: 1
           maxLength: 64
         labels: {}
+        accent_hex:
+          type: string
+          maxLength: 9
+        muted:
+          type: boolean
       required:
       - apns_environment
       - bundle_id
@@ -7756,6 +8100,10 @@ components:
           minLength: 1
         source:
           type: string
+        language:
+          type: string
+          minLength: 1
+          maxLength: 32
       required:
       - audioBase64
       - mimeType
@@ -8834,11 +9182,6 @@ components:
             ProPlan, discriminated by ``id``.
       required:
       - plans
-    PlatformEnum:
-      enum:
-      - ios
-      type: string
-      description: '* `ios` - ios'
     PreviewChannelOptInResult:
       type: object
       properties:
@@ -9324,6 +9667,10 @@ components:
           type: string
           format: date-time
           nullable: true
+        current_period_start:
+          type: string
+          format: date-time
+          nullable: true
         current_period_end:
           type: string
           format: date-time
@@ -9519,7 +9866,12 @@ components:
           type: string
           minLength: 1
           default: /assistant/settings/billing
-          description: Client-side path to redirect to after checkout completes.
+          description: Client-side path to redirect to after checkout completes. Ignored
+            when return_target is 'native'.
+        return_target:
+          allOf:
+          - $ref: '#/components/schemas/ReturnTargetEnum'
+          default: web
     TopUpCheckoutResponse:
       type: object
       description: Response body for a successfully created top-up checkout session.

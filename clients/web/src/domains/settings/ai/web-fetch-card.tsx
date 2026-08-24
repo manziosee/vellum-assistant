@@ -2,12 +2,15 @@ import { Loader2 } from "lucide-react";
 import { useCallback, useMemo, useState } from "react";
 
 import {
+  WEB_FETCH_API_BASE_PROVIDER_IDS,
   WEB_FETCH_BYOK_PROVIDER_IDS,
+  WEB_FETCH_PROVIDER_DEFAULT_API_BASE,
   WEB_FETCH_PROVIDER_DISPLAY_NAMES,
   WEB_FETCH_PROVIDER_IDS,
   WEB_FETCH_PROVIDER_KEY_PLACEHOLDERS,
 } from "@/assistant/generated/web-fetch-provider-catalog.gen";
 import { secretPlaceholder } from "@/domains/settings/ai/secret-placeholder";
+import { useTranslation } from "@/i18n";
 import { captureError } from "@/lib/sentry/capture-error";
 import {
   getLocalSetting,
@@ -15,7 +18,7 @@ import {
   setLocalSetting,
 } from "@/utils/local-settings";
 import { useQueryClient } from "@tanstack/react-query";
-import { Dropdown } from "@vellumai/design-library/components/dropdown";
+import { Select } from "@vellumai/design-library/components/select";
 import { Input } from "@vellumai/design-library/components/input";
 import { toast } from "@vellumai/design-library/components/toast";
 
@@ -42,10 +45,11 @@ const DEFAULT_PROVIDER = "default";
 /**
  * Web Fetch service card. Unlike Web Search there is no managed proxy, so the
  * card is mode-less (`ByoServiceCard`): pick the built-in fetcher or a BYOK
- * provider (Firecrawl) that scrapes via its hosted API. Firecrawl reuses the
- * same stored credential as Web Search.
+ * provider that scrapes via its hosted API. BYOK providers reuse the same
+ * stored credential as Web Search.
  */
 export function WebFetchCard() {
+  const { t } = useTranslation("settings");
   const assistantId = useActiveAssistantId();
   const queryClient = useQueryClient();
 
@@ -77,12 +81,22 @@ export function WebFetchCard() {
     );
   }, [daemonConfig]);
 
+  const serverApiBase = useMemo((): string => {
+    const service = daemonConfig?.services?.["web-fetch"] as
+      | { apiBase?: string }
+      | undefined;
+    return service?.apiBase ?? "";
+  }, [daemonConfig]);
+
   const [saving, setSaving] = useState(false);
   const [webFetchProvider, setDraftWebFetchProvider] = useDraftOverride(
     serverWebFetchProvider,
   );
+  const [webFetchApiBase, setDraftWebFetchApiBase] =
+    useDraftOverride(serverApiBase);
   const [webFetchApiKey, setWebFetchApiKey] = useState("");
 
+  const showsApiBase = WEB_FETCH_API_BASE_PROVIDER_IDS.has(webFetchProvider);
   const requiresProviderCredential =
     WEB_FETCH_BYOK_PROVIDER_IDS.has(webFetchProvider);
   const { hasStoredCredential: webFetchHasStoredKey } =
@@ -95,16 +109,25 @@ export function WebFetchCard() {
 
   // --- Derived state ---
   const hasNewApiKey = webFetchApiKey.trim().length > 0;
-  const configChanged = webFetchProvider !== serverWebFetchProvider;
+  const trimmedApiBase = webFetchApiBase.trim();
+  const hasCustomApiBase = showsApiBase && trimmedApiBase.length > 0;
+  const configChanged =
+    webFetchProvider !== serverWebFetchProvider ||
+    (showsApiBase && trimmedApiBase !== serverApiBase.trim());
   const needsKeyBeforeSave =
-    requiresProviderCredential && !webFetchHasStoredKey && !hasNewApiKey;
+    requiresProviderCredential &&
+    !hasCustomApiBase &&
+    !webFetchHasStoredKey &&
+    !hasNewApiKey;
   const saveDisabled =
     saving || needsKeyBeforeSave || (!configChanged && !hasNewApiKey);
   const apiKeyPlaceholder = secretPlaceholder(
     WEB_FETCH_PROVIDER_KEY_PLACEHOLDERS[webFetchProvider] ??
-      "Enter your API key",
+      t("webFetchCard.apiKeyPlaceholder"),
     webFetchHasStoredKey,
   );
+  const defaultApiBase =
+    WEB_FETCH_PROVIDER_DEFAULT_API_BASE[webFetchProvider] ?? "";
 
   const handleSave = useCallback(async () => {
     setSaving(true);
@@ -119,14 +142,15 @@ export function WebFetchCard() {
           path: { assistant_id: assistantId },
           body: {
             services: {
-              "web-fetch": { provider: webFetchProvider },
+              "web-fetch": {
+                provider: webFetchProvider,
+                ...(showsApiBase ? { apiBase: trimmedApiBase } : {}),
+              },
             },
           },
         })
         .catch((error) => {
-          toast.error(
-            "Failed to update assistant configuration. Please try again.",
-          );
+          toast.error(t("webFetchCard.configUpdateFailedToast"));
           captureError(error, { context: "patch_daemon_config" });
           throw error;
         });
@@ -151,10 +175,10 @@ export function WebFetchCard() {
         void queryClient.invalidateQueries({ queryKey: presenceKey });
         setWebFetchApiKey("");
       }
-      toast.success("Web fetch settings saved.");
+      toast.success(t("webFetchCard.savedToast"));
     } catch (err) {
       captureError(err, { context: "settings-ai-web-fetch-persist-local" });
-      toast.error("Saved, but local preferences could not be written.");
+      toast.error(t("webFetchCard.localPreferencesFailedToast"));
     }
   }, [
     requiresProviderCredential,
@@ -164,6 +188,9 @@ export function WebFetchCard() {
     assistantId,
     webFetchApiKey,
     webFetchProvider,
+    showsApiBase,
+    trimmedApiBase,
+    t,
   ]);
 
   const handleReset = useCallback(() => {
@@ -172,22 +199,23 @@ export function WebFetchCard() {
       removeLocalSetting(storageKey);
     }
     setWebFetchApiKey("");
+    setDraftWebFetchApiBase("");
     setDraftWebFetchProvider(DEFAULT_PROVIDER);
     setLocalSetting(LS_WEB_FETCH_PROVIDER, DEFAULT_PROVIDER);
-  }, [webFetchProvider, setDraftWebFetchProvider]);
+  }, [webFetchProvider, setDraftWebFetchProvider, setDraftWebFetchApiBase]);
 
   return (
     <ByoServiceCard
       id="web-fetch"
-      title="Web Fetch"
-      subtitle="Configure how your assistant reads individual web pages"
+      title={t("webFetchCard.title")}
+      subtitle={t("webFetchCard.subtitle")}
     >
       <div className="space-y-4">
         <div className="space-y-1">
           <label className="block text-body-small-default text-[var(--content-tertiary)]">
-            Provider
+            {t("webFetchCard.providerLabel")}
           </label>
-          <Dropdown
+          <Select
             value={webFetchProvider}
             onChange={setDraftWebFetchProvider}
             options={WEB_FETCH_PROVIDER_IDS.map((p) => ({
@@ -197,9 +225,31 @@ export function WebFetchCard() {
           />
         </div>
 
+        {showsApiBase && (
+          <div className="space-y-1">
+            <Input
+              label={t("webFetchCard.apiBaseLabel")}
+              type="url"
+              value={webFetchApiBase}
+              onChange={(e) => setDraftWebFetchApiBase(e.target.value)}
+              placeholder={
+                defaultApiBase || t("webFetchCard.apiBasePlaceholder")
+              }
+              fullWidth
+            />
+            {defaultApiBase ? (
+              <p className="text-body-small-default text-[var(--content-tertiary)]">
+                {t("webFetchCard.apiBaseHint", {
+                  defaultBase: defaultApiBase,
+                })}
+              </p>
+            ) : null}
+          </div>
+        )}
+
         {requiresProviderCredential && (
           <Input
-            label="API Key"
+            label={t("webFetchCard.apiKeyLabel")}
             type="password"
             value={webFetchApiKey}
             onChange={(e) => setWebFetchApiKey(e.target.value)}

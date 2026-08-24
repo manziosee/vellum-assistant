@@ -22,6 +22,13 @@ import {
   waitFor,
 } from "@testing-library/react";
 
+// The row chrome the component wears under `mobileRow`, asserted from the
+// same constants it paints with so the two cannot drift.
+import {
+  MOBILE_CONTROL_CLASS,
+  MOBILE_GLYPH_CLASS,
+} from "@/domains/chat/components/chat-composer/composer-mobile-chrome";
+
 const addBreadcrumbSpy = mock((_breadcrumb: unknown) => {});
 mock.module("@sentry/react", () => ({
   addBreadcrumb: addBreadcrumbSpy,
@@ -597,5 +604,109 @@ describe("VoiceInputButton — forced native provider (macOS Native Dictation)",
     expect(postSttTranscribeSpy).not.toHaveBeenCalled();
     expect(onTranscript).not.toHaveBeenCalled();
     expect(lastBreadcrumb().data.outcome).toBe("error");
+  });
+});
+
+describe("VoiceInputButton: mobile composer row chrome", () => {
+  afterEach(() => {
+    cleanup();
+    useVoiceRecordingStore.getState().reset();
+  });
+
+  test("mobileRow gives the idle mic the row's 40x40 circle and 20px glyph", () => {
+    // GIVEN the mic in the mobile composer row
+    render(
+      <VoiceInputButton
+        assistantId="assistant-1"
+        onTranscript={async () => {}}
+        mobileRow
+      />,
+    );
+
+    // THEN the resting mic reads at the design's 20px rather than at the
+    // primitive's default, and the row sizes the control itself so a narrow
+    // mouse-driven window gets the same mic a phone does
+    const button = screen.getByRole("button", { name: "Start voice input" });
+    expect(button.className).toContain(MOBILE_CONTROL_CLASS);
+    expect(button.querySelector("span")?.className).toContain(
+      MOBILE_GLYPH_CLASS,
+    );
+  });
+
+  test("the default leaves the idle mic at the primitive's sizing", () => {
+    // GIVEN the mic anywhere else, the desktop action row included
+    render(
+      <VoiceInputButton
+        assistantId="assistant-1"
+        onTranscript={async () => {}}
+      />,
+    );
+
+    // THEN the row's own sizing does not reach it, and the primitive's
+    // `touch-mobile:` chrome is left in charge
+    const button = screen.getByRole("button", { name: "Start voice input" });
+    expect(button.className).not.toContain(MOBILE_CONTROL_CLASS);
+    expect(button.className).toContain("touch-mobile:h-10");
+    expect(button.querySelector("span")?.className).not.toContain(
+      MOBILE_GLYPH_CLASS,
+    );
+  });
+
+  test("holdComposerFocus holds the composer's focus through the press", () => {
+    // GIVEN the mic in the focus-gated row, on a press that would not carry
+    // focus to it
+    render(
+      <VoiceInputButton
+        assistantId="assistant-1"
+        onTranscript={async () => {}}
+        mobileRow
+        holdComposerFocus
+      />,
+    );
+    const button = screen.getByRole("button", { name: "Start voice input" });
+
+    // THEN `pointerdown` runs untouched: WebKit drops the rest of the tap's
+    // sequence, `click` included, when it is cancelled
+    expect(fireEvent.pointerDown(button)).toBe(true);
+
+    // WHILE `mousedown` is cancelled, since that is the press that would blur
+    // the textarea, collapse the focus-gated row and move this circle out from
+    // under the finger before the click arrives
+    expect(fireEvent.mouseDown(button)).toBe(false);
+  });
+
+  test("the default leaves the press alone, mobile row or not", () => {
+    // GIVEN the mic anywhere else, where no row is gated on the composer's
+    // focus
+    render(
+      <VoiceInputButton
+        assistantId="assistant-1"
+        onTranscript={async () => {}}
+      />,
+    );
+
+    // THEN the press behaves as the platform intends
+    expect(
+      fireEvent.mouseDown(
+        screen.getByRole("button", { name: "Start voice input" }),
+      ),
+    ).toBe(true);
+
+    // AND the row's chrome alone does not cancel it: a window dragged narrow
+    // takes the row with a pointing device still driving it, and that device
+    // focuses the button it presses, so the row never drops.
+    cleanup();
+    render(
+      <VoiceInputButton
+        assistantId="assistant-1"
+        onTranscript={async () => {}}
+        mobileRow
+      />,
+    );
+    expect(
+      fireEvent.mouseDown(
+        screen.getByRole("button", { name: "Start voice input" }),
+      ),
+    ).toBe(true);
   });
 });

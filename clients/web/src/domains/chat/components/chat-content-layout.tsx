@@ -2,9 +2,9 @@
  * Chat content layout — routes the active `mainView` to the appropriate
  * panel arrangement.
  *
- * Single responsibility: reads `mainView` from the viewer store, renders
- * `ChatMainPanel` inside the correct layout shell (standalone, or
- * as the left pane of a `ResizablePanel` with a side panel on the right).
+ * Single responsibility: reads the viewer store, resolves the arrangement,
+ * and hands the surfaces to `WorkspacePanes`, which draws them. Side panels
+ * and overlays keep their own shells.
  *
  * Side-panel state (app, document, subagent, tool-detail) is read directly
  * from stores — no props required for layout decisions.
@@ -13,11 +13,11 @@
 import { lazy, useCallback, useEffect, type ReactNode } from "react";
 import { useNavigate } from "react-router";
 import { Loader2 } from "lucide-react";
-import { ResizablePanel } from "@vellumai/design-library";
 import { AnimatedRightDrawer } from "@/domains/chat/components/animated-right-drawer";
 import { LazyBoundary } from "@/components/lazy-boundary";
 import { AppViewerContainer } from "@/components/app-viewer-container";
 import { DocumentViewerContainer } from "@/domains/chat/components/document-viewer-container";
+import { FilePreviewContainer } from "@/domains/chat/components/local-file/preview/file-preview-container";
 import {
   ChatMainPanel,
   type ChatMainPanelProps,
@@ -25,6 +25,8 @@ import {
 import { handleAppViewerAction } from "@/domains/chat/app-viewer-actions";
 import { useResolvedAssistantsStore } from "@/stores/resolved-assistants-store";
 import { useConversationStore } from "@/stores/conversation-store";
+import { paneState } from "@/stores/pane-state";
+import { WorkspacePanes } from "@/domains/chat/components/workspace-panes";
 import { useDeployStore } from "@/stores/deploy-store";
 import { useViewerStore } from "@/stores/viewer-store";
 import { useSubagentStore } from "@/domains/chat/subagent-store";
@@ -46,6 +48,8 @@ const importToolDetailPanel = () =>
   import("@/domains/chat/components/tool-detail-panel");
 const importActivityStepsPanel = () =>
   import("@/domains/chat/components/activity-steps-panel");
+const importMessageFilesPanel = () =>
+  import("@/domains/chat/components/message-files-panel");
 const importAcpRunDetailPanel = () =>
   import("@/domains/chat/components/acp-run-detail-panel/acp-run-detail-panel");
 const importWorkflowDetailPanel = () =>
@@ -70,6 +74,9 @@ const ToolDetailPanel = lazy(() =>
 const ActivityStepsPanel = lazy(() =>
   importActivityStepsPanel().then((m) => ({ default: m.ActivityStepsPanel })),
 );
+const MessageFilesPanel = lazy(() =>
+  importMessageFilesPanel().then((m) => ({ default: m.MessageFilesPanel })),
+);
 const BackgroundTaskDetailPanel = lazy(() =>
   importBackgroundTaskDetailPanel().then((m) => ({
     default: m.BackgroundTaskDetailPanel,
@@ -86,15 +93,19 @@ const SkillDetailPanel = lazy(() =>
 export function ChatContentLayout(props: ChatMainPanelProps) {
   const mainView = useViewerStore.use.mainView();
   const openedAppState = useViewerStore.use.openedAppState();
+  const isAppMinimized = useViewerStore.use.isAppMinimized();
   const openedDocumentState = useViewerStore.use.openedDocumentState();
   const editingConversationId =
     useConversationStore.use.editingConversationId();
+  const activeConversationId = useConversationStore.use.activeConversationId();
   const activeSubagentId = useViewerStore.use.activeSubagentId();
   const activeWorkflowRunId = useViewerStore.use.activeWorkflowRunId();
   const activeToolDetail = useViewerStore.use.activeToolDetail();
   const closeToolDetail = useViewerStore.use.closeToolDetail();
   const activeActivitySteps = useViewerStore.use.activeActivitySteps();
   const closeActivitySteps = useViewerStore.use.closeActivitySteps();
+  const activeMessageFiles = useViewerStore.use.activeMessageFiles();
+  const closeMessageFiles = useViewerStore.use.closeMessageFiles();
   // Subscribe to only the active subagent's entry rather than the whole `byId`
   // map, so streaming events from *other* subagents don't re-render the chat
   // layout (and the chat transcript it hosts) on every token.
@@ -313,6 +324,7 @@ export function ChatContentLayout(props: ChatMainPanelProps) {
       importSubagentDetailPanel().catch(() => {});
       importToolDetailPanel().catch(() => {});
       importActivityStepsPanel().catch(() => {});
+      importMessageFilesPanel().catch(() => {});
       importAcpRunDetailPanel().catch(() => {});
       importWorkflowDetailPanel().catch(() => {});
       importBackgroundTaskDetailPanel().catch(() => {});
@@ -331,16 +343,21 @@ export function ChatContentLayout(props: ChatMainPanelProps) {
   // -------------------------------------------------------------------------
 
   // App editing: resizable split with chat + app editor
-  if (mainView === "app-editing" && openedAppState && editingConversationId) {
+  if (
+    paneState({
+      mainView,
+      appId: openedAppState?.appId ?? null,
+      conversationId: activeConversationId,
+      boundConversationId: editingConversationId,
+      isAppMinimized,
+    }).presentation === "side" &&
+    openedAppState
+  ) {
     return (
-      <ResizablePanel
-        storageKey="appEditPanelWidth"
-        hideDivider
-        defaultRightWidth={400}
-        minLeftWidth={300}
-        minRightWidth={400}
-        left={<ChatMainPanel {...props} />}
-        right={
+      <WorkspacePanes
+        presentation="side"
+        secondary={<ChatMainPanel {...props} />}
+        primary={
           <AppViewerContainer
             appId={openedAppState.appId}
             appName={openedAppState.name}
@@ -371,18 +388,23 @@ export function ChatContentLayout(props: ChatMainPanelProps) {
       );
     }
     return (
-      <AppViewerContainer
-        appId={openedAppState.appId}
-        appName={openedAppState.name}
-        html={openedAppState.html}
-        assistantId={assistantId ?? ""}
-        onClose={handleCloseApp}
-        onEdit={handleEditApp}
-        onShare={handleShareApp}
-        isSharing={isSharing}
-        onDeploy={handleDeployApp}
-        isDeploying={isDeploying}
-        onAction={handleAppAction}
+      <WorkspacePanes
+        presentation="single"
+        primary={
+          <AppViewerContainer
+            appId={openedAppState.appId}
+            appName={openedAppState.name}
+            html={openedAppState.html}
+            assistantId={assistantId ?? ""}
+            onClose={handleCloseApp}
+            onEdit={handleEditApp}
+            onShare={handleShareApp}
+            isSharing={isSharing}
+            onDeploy={handleDeployApp}
+            isDeploying={isDeploying}
+            onAction={handleAppAction}
+          />
+        }
       />
     );
   }
@@ -405,25 +427,45 @@ export function ChatContentLayout(props: ChatMainPanelProps) {
   let rightPanel: ReactNode = null;
   if (!isMobile) {
     if (mainView === "document" && openedDocumentState && assistantId) {
-      rightPanel = (
-        <DocumentViewerContainer
-          documentName={openedDocumentState.documentName}
-          content={openedDocumentState.content}
-          onClose={handleCloseDocument}
-          assistantId={assistantId}
-          surfaceId={openedDocumentState.surfaceId}
-          conversationId={openedDocumentState.conversationId}
-          onSubmitFeedback={() => {
-            const prompt = `Please review and address my comments on "${openedDocumentState.documentName}".`;
-            navigate(
-              routes.conversationWithPrompt(
-                openedDocumentState.conversationId,
-                prompt,
-              ),
-            );
-          }}
-        />
-      );
+      // A workspace file is shown read-only, in a panel that fetches its own
+      // bytes.
+      if (openedDocumentState.source === "workspace-file-preview") {
+        rightPanel = (
+          <FilePreviewContainer
+            key={`preview:${openedDocumentState.workspacePath}`}
+            assistantId={assistantId}
+            workspacePath={openedDocumentState.workspacePath}
+            documentName={openedDocumentState.documentName}
+            previewKind={openedDocumentState.previewKind}
+            onClose={handleCloseDocument}
+          />
+        );
+      } else {
+        // Keyed per document so switching targets remounts the editor. Feeding a
+        // new document into the mounted editor emits a Tiptap update, which the
+        // autosave would write straight into whichever target is now current.
+        rightPanel = (
+          <DocumentViewerContainer
+            key={`document:${openedDocumentState.surfaceId}`}
+            source="document"
+            documentName={openedDocumentState.documentName}
+            content={openedDocumentState.content}
+            onClose={handleCloseDocument}
+            assistantId={assistantId}
+            surfaceId={openedDocumentState.surfaceId}
+            conversationId={openedDocumentState.conversationId}
+            onSubmitFeedback={() => {
+              const prompt = `Please review and address my comments on "${openedDocumentState.documentName}".`;
+              navigate(
+                routes.conversationWithPrompt(
+                  openedDocumentState.conversationId,
+                  prompt,
+                ),
+              );
+            }}
+          />
+        );
+      }
     } else if (
       mainView === "subagent-detail" &&
       activeSubagentId &&
@@ -436,6 +478,7 @@ export function ChatContentLayout(props: ChatMainPanelProps) {
             onClose={onCloseSubagentDetail}
             onStop={onStopSubagent}
             onRequestDetail={onRequestSubagentDetail}
+            assistantId={assistantId}
           />
         </LazyBoundary>
       );
@@ -445,6 +488,7 @@ export function ChatContentLayout(props: ChatMainPanelProps) {
           <ToolDetailPanel
             detail={activeToolDetail}
             onClose={closeToolDetail}
+            assistantId={assistantId}
           />
         </LazyBoundary>
       );
@@ -461,6 +505,19 @@ export function ChatContentLayout(props: ChatMainPanelProps) {
             }`}
             payload={activeActivitySteps}
             onClose={closeActivitySteps}
+            assistantId={assistantId}
+          />
+        </LazyBoundary>
+      );
+    } else if (mainView === "message-files" && activeMessageFiles) {
+      rightPanel = (
+        <LazyBoundary>
+          <MessageFilesPanel
+            // Re-key per message so the panel resets when a different
+            // message's tile is clicked while the panel is already open.
+            key={activeMessageFiles.messageId}
+            payload={activeMessageFiles}
+            onClose={closeMessageFiles}
           />
         </LazyBoundary>
       );
@@ -474,6 +531,7 @@ export function ChatContentLayout(props: ChatMainPanelProps) {
           <AcpRunDetailPanel
             entry={activeAcpRunEntry}
             onClose={onCloseAcpRunDetail}
+            assistantId={assistantId}
           />
         </LazyBoundary>
       );
@@ -527,9 +585,6 @@ export function ChatContentLayout(props: ChatMainPanelProps) {
   return (
     <AnimatedRightDrawer
       storageKey="rightPanelWidth"
-      defaultWidth={400}
-      minWidth={400}
-      minLeftWidth={300}
       open={rightPanel != null}
       left={chatContent}
       right={rightPanel}

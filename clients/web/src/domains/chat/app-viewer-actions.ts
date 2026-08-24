@@ -10,14 +10,17 @@
  *   repeatedly. No-op for `"active"` when no conversation is open.
  *
  * - `open_conversation` ({ conversationId }) — navigates to an existing
- *   conversation by ID without sending a message. Used by plugins that
- *   manage their own background conversations (e.g. battleship) to let the
- *   user view the conversation from within the app UI.
+ *   conversation by ID without sending a message. On a wide viewport the
+ *   app stays open in the side-by-side layout so the conversation is
+ *   visible. Used by plugins that manage their own background conversations
+ *   (e.g. battleship) to let the user view the conversation from within the
+ *   app UI.
  *
  * - `set_view` ({ view }) — moves the app panel: `"split"` (side by side with
  *   chat), `"full"` (full-width), or `"chat"` (close the app). Side-by-side has
  *   no mobile layout, so `"split"` is ignored on mobile (the app keeps its
- *   full-screen overlay).
+ *   full-screen overlay). On a wide viewport it uses the open conversation,
+ *   and starts one when none is open.
  *
  * Stateless and framework-agnostic: stores are read via `getState()` and
  * navigation / viewport arrive through `ctx`, so this is unit-testable.
@@ -26,6 +29,7 @@
 import { createDraftConversationId } from "@/domains/chat/utils/conversation-selection";
 import { useConversationStore } from "@/stores/conversation-store";
 import { useViewerStore } from "@/stores/viewer-store";
+import { keepOpenAppBesideConversation } from "@/utils/conversation-navigation";
 import { routes } from "@/utils/routes";
 
 export interface AppViewerActionContext {
@@ -60,6 +64,19 @@ function relayPrompt(
   );
 }
 
+/**
+ * Select `conversationId` and land on it, keeping an open app beside it
+ * rather than dismissing the app for the chat.
+ */
+function goToConversation(
+  ctx: AppViewerActionContext,
+  conversationId: string,
+): void {
+  useConversationStore.getState().setActiveConversationId(conversationId);
+  keepOpenAppBesideConversation(conversationId);
+  ctx.navigate(routes.conversation(conversationId));
+}
+
 function openConversation(
   ctx: AppViewerActionContext,
   data?: Record<string, unknown>,
@@ -69,8 +86,7 @@ function openConversation(
   if (!conversationId) {
     return;
   }
-  useConversationStore.getState().setActiveConversationId(conversationId);
-  ctx.navigate(routes.conversation(conversationId));
+  goToConversation(ctx, conversationId);
 }
 
 function setView(
@@ -93,11 +109,13 @@ function setView(
       }
       const conversationId =
         useConversationStore.getState().activeConversationId;
-      if (!conversationId) {
+      if (conversationId) {
+        keepOpenAppBesideConversation(conversationId);
         return;
       }
-      useConversationStore.getState().setEditingConversationId(conversationId);
-      viewer.enterAppEditing();
+      // Split view is a chat beside the app, so it needs a conversation to
+      // put there.
+      goToConversation(ctx, createDraftConversationId());
       return;
     }
     default:

@@ -72,6 +72,22 @@ export function deriveAuthForProvider(
   return credential ? { type: "api_key", credential } : null;
 }
 
+/**
+ * The auth a connection dispatches with. The stored auth object is
+ * authoritative only where it carries a payload (an api_key credential ref,
+ * the oauth_subscription marker, a deliberately keyed keyless provider);
+ * the vellum provider IS the managed route, so its auth derives from the
+ * provider and the stored value can never mislead dispatch.
+ */
+export function effectiveConnectionAuth(connection: {
+  provider: string;
+  auth: Auth;
+}): Auth {
+  return connection.provider === VELLUM_MANAGED_PROVIDER
+    ? { type: "platform" }
+    : connection.auth;
+}
+
 // ---------------------------------------------------------------------------
 // ResolvedAuth — what the dispatcher hands to each adapter
 // ---------------------------------------------------------------------------
@@ -110,6 +126,12 @@ export const VALID_CONNECTION_PROVIDERS: readonly string[] = [
   // persisted `vellum` rows — the routing threaded in via `providerOverride`
   // never runs on a row that fails to load.
   VELLUM_MANAGED_PROVIDER,
+  // The ChatGPT-subscription row stores the "chatgpt" routing identity in its
+  // `provider` column for the same reason: the row IS the subscription route
+  // (auth modality = provider identity), and dispatch derives the openai
+  // upstream per-request. Allowlisted explicitly or the DB loaders would drop
+  // the persisted row.
+  "chatgpt",
 ];
 
 export type ConnectionProvider = string;
@@ -153,11 +175,22 @@ export type ConnectionModel = z.infer<typeof ConnectionModelSchema>;
 /**
  * Providers whose connections require an explicit `baseUrl` and non-empty
  * `models` list (openai-compatible endpoints have no fixed upstream, so the
- * user must supply both). Every other provider derives these from its catalog
- * entry and rejects a client-supplied `baseUrl`.
+ * user must supply both).
  */
 export const PROVIDERS_REQUIRING_BASE_URL_AND_MODELS: ReadonlySet<string> =
   new Set(["openai-compatible"]);
+
+/**
+ * Providers that persist a client-supplied `baseUrl`. openai-compatible
+ * requires one (see above); ollama has a well-known local default and treats
+ * a stored URL as an optional override. Every other provider derives its
+ * upstream from the catalog and rejects a client-supplied `baseUrl` so a
+ * keyed connection cannot be pointed at an attacker-controlled host.
+ */
+export const PROVIDERS_ALLOWING_CUSTOM_BASE_URL: ReadonlySet<string> = new Set([
+  ...PROVIDERS_REQUIRING_BASE_URL_AND_MODELS,
+  "ollama",
+]);
 
 // ---------------------------------------------------------------------------
 // Full connection shape used by CRUD layer

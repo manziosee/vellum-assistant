@@ -2,7 +2,7 @@
  * Tests for the presentational `CreditBundlePicker`.
  *
  * Renders via `@testing-library/react` (happy-dom registered in test-setup.ts)
- * and drives the design-library Dropdown — a custom combobox, not a native
+ * and drives the design-library Select — a custom combobox, not a native
  * <select> — by clicking the trigger to open the listbox, then clicking the
  * option whose visible label matches. No jest-dom matchers; we assert with
  * plain bun `expect` against query results.
@@ -64,7 +64,7 @@ const TIERS: CreditTier[] = [
   },
 ];
 
-function openDropdown(): void {
+function openSelect(): void {
   const trigger = document.querySelector<HTMLButtonElement>(
     'button[role="combobox"][aria-label="Credit bundle"]',
   );
@@ -96,12 +96,12 @@ function clickOption(label: string): void {
 
 describe("formatBundleOptionLabel", () => {
   test("formats whole-dollar tiers", () => {
-    expect(formatBundleOptionLabel(TIERS[2]!)).toBe("50 credits — $50/mo");
+    expect(formatBundleOptionLabel(TIERS[2]!)).toBe("50 credits - $50/mo");
   });
 
   test("formats sub-dollar cents with two decimals", () => {
     expect(formatBundleOptionLabel({ ...TIERS[0]!, price_cents: 1050 })).toBe(
-      "10 credits — $10.50/mo",
+      "10 credits - $10.50/mo",
     );
   });
 });
@@ -115,15 +115,15 @@ describe("CreditBundlePicker", () => {
         onCreditTierChange={() => {}}
       />,
     );
-    openDropdown();
+    openSelect();
 
     expect(optionLabels()).toEqual([
-      "No credit bundle — $0/mo",
-      "10 credits — $10/mo",
-      "25 credits — $25/mo",
-      "50 credits — $50/mo",
-      "100 credits — $100/mo",
-      "200 credits — $200/mo",
+      "No credit bundle - $0/mo",
+      "10 credits - $10/mo",
+      "25 credits - $25/mo",
+      "50 credits - $50/mo",
+      "100 credits - $100/mo",
+      "200 credits - $200/mo",
     ]);
   });
 
@@ -136,8 +136,8 @@ describe("CreditBundlePicker", () => {
         onCreditTierChange={onCreditTierChange}
       />,
     );
-    openDropdown();
-    clickOption("50 credits — $50/mo");
+    openSelect();
+    clickOption("50 credits - $50/mo");
 
     expect(onCreditTierChange).toHaveBeenCalledTimes(1);
     expect(onCreditTierChange.mock.calls[0]?.[0]).toBe("credits_50");
@@ -152,8 +152,8 @@ describe("CreditBundlePicker", () => {
         onCreditTierChange={onCreditTierChange}
       />,
     );
-    openDropdown();
-    clickOption("No credit bundle — $0/mo");
+    openSelect();
+    clickOption("No credit bundle - $0/mo");
 
     expect(onCreditTierChange).toHaveBeenCalledTimes(1);
     expect(onCreditTierChange.mock.calls[0]?.[0]).toBeNull();

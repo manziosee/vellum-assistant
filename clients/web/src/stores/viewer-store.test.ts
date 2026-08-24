@@ -1,11 +1,34 @@
-import { beforeEach, describe, it, expect } from "bun:test";
+import { beforeEach, describe, it, expect, mock } from "bun:test";
 
-import {
-  isAppNotFoundError,
-  useViewerStore,
-  type ActivityStepsPayload,
-  type ToolDetailPayload,
+import type {
+  ActivityStepsPayload,
+  MessageFilesPayload,
+  ToolDetailPayload,
 } from "@/stores/viewer-store";
+import type { DocumentsByIdGetResponse } from "@/generated/daemon/types.gen";
+import { ApiError } from "@/utils/api-errors";
+import { makeDisplayAttachment } from "@/domains/chat/components/chat-attachments/attachment-test-helpers";
+import { useUnseenDocumentChangesStore } from "@/domains/chat/unseen-document-changes-store";
+
+// The store opens documents through the daemon SDK. Spread the real module so
+// the actions this file does not exercise keep their real bindings.
+const daemonSdk = await import("@/generated/daemon/sdk.gen");
+
+type DocumentResult = {
+  data: DocumentsByIdGetResponse | null;
+};
+
+let documentResult: () => Promise<DocumentResult> = () =>
+  Promise.reject(new Error("not stubbed"));
+
+mock.module("@/generated/daemon/sdk.gen", () => ({
+  ...daemonSdk,
+  documentsByIdGet: () => documentResult(),
+}));
+
+const { isAppNotFoundError, useViewerStore } = await import(
+  "@/stores/viewer-store"
+);
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -15,8 +38,16 @@ function getState() {
   return useViewerStore.getState();
 }
 
+/** The surface ids a conversation currently holds unseen changes for. */
+function unseenFor(conversationId: string): string[] {
+  const changed =
+    useUnseenDocumentChangesStore.getState().changedDocuments[conversationId];
+  return [...(changed ?? [])];
+}
+
 beforeEach(() => {
   getState().reset();
+  useUnseenDocumentChangesStore.setState({ changedDocuments: {} });
 });
 
 const SAMPLE_APP = {
@@ -26,11 +57,25 @@ const SAMPLE_APP = {
   html: "<h1>App</h1>",
 };
 const SAMPLE_DOC = {
+  source: "document",
   surfaceId: "surf-1",
   conversationId: "conv-1",
   documentName: "README.md",
   content: "# Hello",
-};
+} as const;
+const SAMPLE_OTHER_DOC = {
+  source: "document",
+  surfaceId: "surf-2",
+  conversationId: "conv-1",
+  documentName: "notes.md",
+  content: "# Notes",
+} as const;
+const SAMPLE_FILE_PREVIEW = {
+  source: "workspace-file-preview",
+  workspacePath: "data/rows.csv",
+  documentName: "rows.csv",
+  previewKind: "csv",
+} as const;
 const SAMPLE_TOOL: ToolDetailPayload = {
   toolCallId: "tc-1",
   toolName: "spawn_subagent",
@@ -562,6 +607,14 @@ describe("closeActiveOverlay", () => {
     expect(getState().activeWorkflowRunId).toBeNull();
   });
 
+  it("closes the message-files overlay and restores its prior view", () => {
+    getState().openMessageFiles({ messageId: "m1", attachments: [] });
+
+    expect(getState().closeActiveOverlay()).toBe(true);
+    expect(getState().mainView).toBe("chat");
+    expect(getState().activeMessageFiles).toBeNull();
+  });
+
   it("returns false without changing a non-overlay view", () => {
     useViewerStore.setState({ mainView: "app", activeAppId: "app-1" });
 
@@ -762,6 +815,66 @@ describe("openActivitySteps / toggleActivitySteps / closeActivitySteps", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Message files panel
+// ---------------------------------------------------------------------------
+
+const SAMPLE_FILES: MessageFilesPayload = {
+  messageId: "m1",
+  attachments: [
+    makeDisplayAttachment({ id: "a1" }),
+    makeDisplayAttachment({ id: "a2" }),
+  ],
+  assistantId: "asst-1",
+};
+
+describe("openMessageFiles / toggleMessageFiles / closeMessageFiles", () => {
+  it("opens the panel with the payload and records the prior view", () => {
+    getState().openMessageFiles(SAMPLE_FILES);
+    const state = getState();
+    expect(state.mainView).toBe("message-files");
+    expect(state.activeMessageFiles).toBe(SAMPLE_FILES);
+    expect(state.viewBeforeMessageFiles).toBe("chat");
+  });
+
+  it("close restores the prior view and clears the payload", () => {
+    useViewerStore.setState({ mainView: "app" });
+    getState().openMessageFiles(SAMPLE_FILES);
+    expect(getState().viewBeforeMessageFiles).toBe("app");
+    getState().closeMessageFiles();
+    const state = getState();
+    expect(state.mainView).toBe("app");
+    expect(state.activeMessageFiles).toBeNull();
+  });
+
+  it("toggle closes the panel when targeting the SAME message", () => {
+    getState().openMessageFiles(SAMPLE_FILES);
+    getState().toggleMessageFiles({ ...SAMPLE_FILES });
+    const state = getState();
+    expect(state.mainView).toBe("chat");
+    expect(state.activeMessageFiles).toBeNull();
+  });
+
+  it("toggle switches to a DIFFERENT message instead of closing", () => {
+    getState().openMessageFiles(SAMPLE_FILES);
+    getState().toggleMessageFiles({ ...SAMPLE_FILES, messageId: "m2" });
+    const state = getState();
+    expect(state.mainView).toBe("message-files");
+    expect(state.activeMessageFiles?.messageId).toBe("m2");
+  });
+
+  it("clears the transcript panel payloads without touching mainView", () => {
+    useViewerStore.setState({ mainView: "app" });
+    getState().openMessageFiles(SAMPLE_FILES);
+    getState().clearTranscriptPanelPayloads();
+    const state = getState();
+    expect(state.activeMessageFiles).toBeNull();
+    expect(state.activeActivitySteps).toBeNull();
+    expect(state.activeToolDetail).toBeNull();
+    expect(state.mainView).toBe("message-files");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Document viewer
 // ---------------------------------------------------------------------------
 
@@ -817,18 +930,179 @@ describe("closeDocument", () => {
     const state = getState();
     expect(state.mainView).toBe("app");
     expect(state.openedDocumentState).toBeNull();
+    expect(state.activeDocumentTarget).toBeNull();
+  });
+});
+
+describe("updateDocumentContent", () => {
+  it("applies a streamed replace to the matching document surface", () => {
+    useViewerStore.setState({ openedDocumentState: SAMPLE_DOC });
+    getState().updateDocumentContent("surf-1", "# Replaced", "replace");
+    expect(getState().openedDocumentState).toMatchObject({
+      content: "# Replaced",
+    });
+  });
+
+  it("leaves a document with a different surface id alone", () => {
+    useViewerStore.setState({ openedDocumentState: SAMPLE_OTHER_DOC });
+    getState().updateDocumentContent("surf-1", "# Replaced", "replace");
+    expect(getState().openedDocumentState).toBe(SAMPLE_OTHER_DOC);
+  });
+
+  it("leaves a read-only preview alone", () => {
+    useViewerStore.setState({ openedDocumentState: SAMPLE_FILE_PREVIEW });
+    getState().updateDocumentContent("surf-1", "# Replaced", "replace");
+    expect(getState().openedDocumentState).toBe(SAMPLE_FILE_PREVIEW);
   });
 });
 
 // ---------------------------------------------------------------------------
-// Assets
+// Document viewer: read-only file previews
 // ---------------------------------------------------------------------------
 
-describe("refreshAssets", () => {
-  it("increments the refresh key", () => {
-    useViewerStore.setState({ assetsRefreshKey: 5 });
-    getState().refreshAssets();
-    expect(getState().assetsRefreshKey).toBe(6);
+describe("openWorkspaceFilePreview", () => {
+  it("shows the file read-only, named by its basename", () => {
+    getState().openWorkspaceFilePreview("data/reports/rows.csv", "csv");
+
+    const state = getState();
+    expect(state.mainView).toBe("document");
+    expect(state.openedDocumentState).toEqual({
+      source: "workspace-file-preview",
+      workspacePath: "data/reports/rows.csv",
+      documentName: "rows.csv",
+      previewKind: "csv",
+    });
+    expect(state.activeDocumentTarget).toEqual({
+      source: "workspace-file-preview",
+      workspacePath: "data/reports/rows.csv",
+    });
+  });
+
+  it("saves the prior view so closing restores it", () => {
+    useViewerStore.setState({ mainView: "app" });
+
+    getState().openWorkspaceFilePreview("rows.csv", "csv");
+    expect(getState().viewBeforeDocument).toBe("app");
+
+    getState().closeDocument();
+    const state = getState();
+    expect(state.mainView).toBe("app");
+    expect(state.openedDocumentState).toBeNull();
+    expect(state.activeDocumentTarget).toBeNull();
+  });
+
+  it("keeps the prior view when swapping one preview for another", () => {
+    useViewerStore.setState({ mainView: "app" });
+
+    getState().openWorkspaceFilePreview("rows.csv", "csv");
+    getState().openWorkspaceFilePreview("run.log", "text");
+
+    const state = getState();
+    expect(state.viewBeforeDocument).toBe("app");
+    expect(state.openedDocumentState).toMatchObject({
+      workspacePath: "run.log",
+      previewKind: "text",
+    });
+  });
+
+  it("makes an in-flight document load stale", async () => {
+    let resolveLoad: (value: DocumentResult) => void = () => {};
+    documentResult = () =>
+      new Promise<DocumentResult>((resolve) => {
+        resolveLoad = resolve;
+      });
+
+    const load = getState().loadDocument("asst-1", "surf-1");
+    getState().openWorkspaceFilePreview("rows.csv", "csv");
+
+    resolveLoad({ data: documentSurface() });
+    await load;
+
+    expect(getState().openedDocumentState).toMatchObject({
+      source: "workspace-file-preview",
+    });
+  });
+
+  it("opens a markdown file read-only, like any other format", () => {
+    getState().openWorkspaceFilePreview("drafts/notes.md", "markdown");
+
+    expect(getState().openedDocumentState).toEqual({
+      source: "workspace-file-preview",
+      workspacePath: "drafts/notes.md",
+      documentName: "notes.md",
+      previewKind: "markdown",
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Document viewer: document surfaces
+// ---------------------------------------------------------------------------
+
+/** The daemon's answer for a document surface fetched by id. */
+function documentSurface(
+  overrides: Partial<DocumentsByIdGetResponse> = {},
+): DocumentsByIdGetResponse {
+  return {
+    success: true,
+    surfaceId: "surf-1",
+    conversationId: "conv-1",
+    title: "Notes",
+    content: "# Notes",
+    wordCount: 2,
+    createdAt: 1,
+    updatedAt: 2,
+    ...overrides,
+  };
+}
+
+describe("loadDocument", () => {
+  it("clears the unseen change for the document it opened", async () => {
+    useUnseenDocumentChangesStore
+      .getState()
+      .markDocumentChanged("conv-1", "surf-1");
+    documentResult = () => Promise.resolve({ data: documentSurface() });
+
+    await getState().loadDocument("asst-1", "surf-1");
+
+    expect(getState().mainView).toBe("document");
+    expect(unseenFor("conv-1")).toEqual([]);
+  });
+
+  it("leaves the conversation's other unseen documents alone", async () => {
+    const unseen = useUnseenDocumentChangesStore.getState();
+    unseen.markDocumentChanged("conv-1", "surf-1");
+    unseen.markDocumentChanged("conv-1", "surf-2");
+    documentResult = () => Promise.resolve({ data: documentSurface() });
+
+    await getState().loadDocument("asst-1", "surf-1");
+
+    expect(unseenFor("conv-1")).toEqual(["surf-2"]);
+  });
+
+  it("clears a change recorded against a conversation other than the document's", async () => {
+    // The daemon records the edit against the conversation the tool ran in,
+    // while the document row keeps the conversation that created it.
+    useUnseenDocumentChangesStore
+      .getState()
+      .markDocumentChanged("conv-2", "surf-1");
+    documentResult = () =>
+      Promise.resolve({ data: documentSurface({ conversationId: "conv-1" }) });
+
+    await getState().loadDocument("asst-1", "surf-1");
+
+    expect(unseenFor("conv-2")).toEqual([]);
+  });
+
+  it("keeps the unseen change when the open fails", async () => {
+    useUnseenDocumentChangesStore
+      .getState()
+      .markDocumentChanged("conv-1", "surf-1");
+    documentResult = () => Promise.reject(new ApiError(404, "Not found"));
+
+    await getState().loadDocument("asst-1", "surf-1");
+
+    expect(unseenFor("conv-1")).toEqual(["surf-1"]);
   });
 });
 

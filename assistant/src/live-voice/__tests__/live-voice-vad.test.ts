@@ -19,7 +19,6 @@ import type {
 } from "../../stt/types.js";
 import { __resetRegistryForTesting } from "../../tools/registry.js";
 import { getWorkspaceSkillsDir } from "../../util/platform.js";
-import type { VoiceFrontDecider } from "../front-decision.js";
 import type { LiveVoiceAudioArchiveResult } from "../live-voice-archive.js";
 import {
   CONTINUATION_DELIVERY_CONTENT,
@@ -83,6 +82,21 @@ function pcm(amplitude: number, sampleCount = 240): Uint8Array {
   return new Uint8Array(buffer);
 }
 
+function tonePcm(
+  amplitude: number,
+  frequencyHz: number,
+  sampleCount = 240,
+): Uint8Array {
+  const buffer = Buffer.alloc(sampleCount * 2);
+  for (let index = 0; index < sampleCount; index += 1) {
+    const sample = Math.round(
+      amplitude * Math.sin((2 * Math.PI * frequencyHz * index) / SAMPLE_RATE),
+    );
+    buffer.writeInt16LE(sample, index * 2);
+  }
+  return new Uint8Array(buffer);
+}
+
 // 10 ms of speech at 24 kHz.
 const LOUD_CHUNK = pcm(8_000);
 // 300 ms of speech at 24 kHz — comfortably exceeds the default sustained-speech
@@ -103,9 +117,13 @@ class MockStreamingTranscriber implements StreamingTranscriber {
   readonly received: Buffer[] = [];
   stopped = false;
   private onEvent: ((event: SttStreamServerEvent) => void) | null = null;
+  private flushed = false;
+  // Claimed on the first audio chunk, so the scripted transcript is spent in
+  // the order cycles hear speech (see takeScriptedFinal).
+  private scriptedFinal: string | null = null;
 
   constructor(
-    private readonly stopEvents: SttStreamServerEvent[],
+    private readonly takeScriptedFinal: () => string,
     private readonly holdStopEvents = false,
   ) {}
 
@@ -114,6 +132,7 @@ class MockStreamingTranscriber implements StreamingTranscriber {
   }
 
   sendAudio(chunk: Buffer): void {
+    this.scriptedFinal ??= this.takeScriptedFinal();
     this.received.push(Buffer.from(chunk));
   }
 
@@ -128,19 +147,20 @@ class MockStreamingTranscriber implements StreamingTranscriber {
   }
 
   flushStopEvents(): void {
-    // A stream that was never sent audio has nothing to transcribe, so a real
-    // provider closes without a final. Scripting one anyway let a cycle that
-    // armed and tore down in the same breath — a client interrupt racing the
-    // post-cancel re-arm — hand the session a transcript it never heard, which
-    // launched a turn nothing would ever finalize and wedged the
-    // one-turn-at-a-time gate for every later utterance.
-    const events =
-      this.received.length > 0
-        ? this.stopEvents
-        : this.stopEvents.filter((event) => event.type !== "final");
-    for (const event of events) {
-      this.onEvent?.(event);
+    if (this.flushed) {
+      return;
     }
+    this.flushed = true;
+    // A stream that was never sent audio has nothing to transcribe, so a real
+    // provider closes without a final. Scripting one anyway lets a cycle that
+    // arms and tears down in the same breath (a client interrupt racing the
+    // post-cancel re-arm) hand the session a transcript it never heard, which
+    // launches a turn nothing will ever finalize and wedges the
+    // one-turn-at-a-time gate for every later utterance.
+    if (this.scriptedFinal !== null) {
+      this.onEvent?.({ type: "final", text: this.scriptedFinal });
+    }
+    this.onEvent?.({ type: "closed" });
   }
 
   // Provider-initiated event (e.g. an idle-timeout close), no stop() needed.
@@ -158,7 +178,9 @@ function createHarness(options: {
   turnDetectorConfig?: TurnDetectorConfig;
   speechEnergyThreshold?: number;
   bargeInMinSpeechMs?: number;
-  frontDecider?: VoiceFrontDecider | null;
+  echoBargeInMargin?: number;
+  echoEmaHalfLifeMs?: number;
+  echoDrainSlackMs?: number;
   frontModelConfig?: Partial<LiveVoiceFrontModelConfig>;
   emitMetrics?: boolean;
   metricsClock?: () => number;
@@ -192,12 +214,23 @@ function createHarness(options: {
   };
 
   const finals = options.finals ?? ["hello world"];
+  // Scripted finals are handed out in the order cycles first receive audio,
+  // not in the order they arm. Server VAD arms and discards audio-free cycles
+  // on wall-clock timers (the trailing-silence timer, the post-cancel re-arm),
+  // so how many cycles have armed by a given point depends on how fast the
+  // event loop is, while the order the test feeds audio in does not. Keying
+  // off audio keeps `finals` reading as "what the user says, in order".
+  let scriptedFinalIndex = 0;
+  const takeScriptedFinal = (): string => {
+    const text =
+      finals[scriptedFinalIndex] ?? `utterance ${scriptedFinalIndex + 1}`;
+    scriptedFinalIndex += 1;
+    return text;
+  };
   const transcribers: MockStreamingTranscriber[] = [];
   const resolveTranscriber = mock(async () => {
-    const text =
-      finals[transcribers.length] ?? `utterance ${transcribers.length + 1}`;
     const transcriber = new MockStreamingTranscriber(
-      [{ type: "final", text }, { type: "closed" }],
+      takeScriptedFinal,
       options.holdStopEventsFor?.includes(transcribers.length) ?? false,
     );
     transcribers.push(transcriber);
@@ -225,9 +258,10 @@ function createHarness(options: {
       (options.viaFactory ? undefined : { silenceThresholdMs: 40 }),
     speechEnergyThreshold: options.speechEnergyThreshold,
     bargeInMinSpeechMs: options.bargeInMinSpeechMs,
-    ...(options.frontDecider !== undefined
-      ? { frontDecider: options.frontDecider }
-      : {}),
+    echoBargeInMargin:
+      options.echoBargeInMargin ?? (options.viaFactory ? undefined : 1),
+    echoEmaHalfLifeMs: options.echoEmaHalfLifeMs,
+    echoDrainSlackMs: options.echoDrainSlackMs,
     ...(options.frontModelConfig
       ? { frontModelConfig: options.frontModelConfig }
       : {}),
@@ -271,6 +305,15 @@ function makeTtsChunk(text: string): LiveVoiceTtsAudioChunk {
     contentType: "audio/pcm",
     sampleRate: SAMPLE_RATE,
     dataBase64: Buffer.from(text).toString("base64"),
+  };
+}
+
+function makePcmTtsChunk(audio: Uint8Array): LiveVoiceTtsAudioChunk {
+  return {
+    type: "tts_audio",
+    contentType: "audio/pcm",
+    sampleRate: SAMPLE_RATE,
+    dataBase64: Buffer.from(audio).toString("base64"),
   };
 }
 
@@ -1207,8 +1250,16 @@ describe("LiveVoiceSession server VAD", () => {
     });
     // The barge-in utterance transcribes to nothing, so no follow-up turn
     // consumes the stash before the interrupt lands.
+    //
+    // "third question" is repeated because finals are handed out by transcriber
+    // creation order, and the session pre-arms a transcriber for the next
+    // utterance. The interrupt below can discard that pre-armed one and re-arm,
+    // which shifts the final utterance onto the following index — with a
+    // 3-entry list it would fall off the end and transcribe to the "utterance
+    // N" placeholder, so the wait for "third question" would time out rather
+    // than fail on the assertion. Both landing spots carry the same text.
     const { frames, session } = createHarness({
-      finals: ["first question", "", "third question"],
+      finals: ["first question", "", "third question", "third question"],
       startVoiceTurn,
       streamTtsAudio,
       spawnBackgroundContinuation,
@@ -2921,8 +2972,11 @@ describe("LiveVoiceSession server VAD", () => {
 
   test("an idle transcriber close before speech re-arms capture for the next utterance", async () => {
     const { startVoiceTurn, calls } = makeAutoCompletingTurnStarter(["Hi."]);
+    // The first transcriber closes before it is sent any audio, so it never
+    // claims a scripted final: the one entry belongs to the cycle that speech
+    // actually reaches.
     const { frames, session, transcribers } = createHarness({
-      finals: ["never spoken", "hello after close"],
+      finals: ["hello after close"],
       startVoiceTurn,
     });
 
@@ -3181,6 +3235,9 @@ describe("LiveVoiceSession VAD threshold configuration", () => {
       silenceThresholdMs: 1200,
       maxTurnDurationMs: 30_000,
       bargeInMinSpeechMs: 250,
+      echoBargeInMargin: 1.5,
+      echoEmaHalfLifeMs: 400,
+      echoDrainSlackMs: 300,
     });
 
     const { frames, session } = createHarness({ viaFactory: true });
@@ -3294,6 +3351,10 @@ describe("LiveVoiceSession sustained-speech barge-in guard", () => {
   // detector timers stay out of the guard's audio-duration accounting.
   function createSpeakingTurnHarness(options: {
     bargeInMinSpeechMs: number;
+    echoEmaHalfLifeMs?: number;
+    echoBargeInMargin?: number;
+    echoDrainSlackMs?: number;
+    ttsAudio?: Uint8Array;
     finals?: string[];
     startFrame?: LiveVoiceClientStartFrame;
   }) {
@@ -3304,7 +3365,11 @@ describe("LiveVoiceSession sustained-speech barge-in guard", () => {
       return { turnId: "bridge-turn", abort };
     });
     const streamTtsAudio = mock(async (ttsOptions: LiveVoiceTtsOptions) => {
-      ttsOptions.onAudioChunk(makeTtsChunk("assistant audio"));
+      ttsOptions.onAudioChunk(
+        options.ttsAudio
+          ? makePcmTtsChunk(options.ttsAudio)
+          : makeTtsChunk("assistant audio"),
+      );
       return makeTtsResult("assistant audio");
     });
     const harness = createHarness({
@@ -3312,6 +3377,9 @@ describe("LiveVoiceSession sustained-speech barge-in guard", () => {
       startVoiceTurn,
       streamTtsAudio,
       bargeInMinSpeechMs: options.bargeInMinSpeechMs,
+      echoEmaHalfLifeMs: options.echoEmaHalfLifeMs ?? 4,
+      echoBargeInMargin: options.echoBargeInMargin ?? 1,
+      echoDrainSlackMs: options.echoDrainSlackMs ?? 60_000,
       turnDetectorConfig: { silenceThresholdMs: 5_000 },
       ...(options.startFrame ? { startFrame: options.startFrame } : {}),
     });
@@ -3625,6 +3693,238 @@ describe("LiveVoiceSession sustained-speech barge-in guard", () => {
     ).toMatchObject({ type: "turn_cancelled", turnId: "live-turn-1" });
     await waitFor(() => abort.mock.calls.length === 1);
   });
+
+  describe("echo-adaptive barge-in", () => {
+    const playbackEchoChunk = tonePcm(4_700, 200);
+    const bargeInSpeechChunk = tonePcm(9_400, 530);
+    const playbackReference = tonePcm(4_700, 200, SAMPLE_RATE * 2);
+
+    test("steady loud playback echo does not interrupt the turn", async () => {
+      const { frames, session, abort, speakFirstReply } =
+        createSpeakingTurnHarness({
+          bargeInMinSpeechMs: 60,
+          echoBargeInMargin: 1.5,
+          echoEmaHalfLifeMs: 40,
+          ttsAudio: playbackReference,
+        });
+      await speakFirstReply();
+      const speechStartedBaseline = countType(frames, "speech_started");
+
+      for (let index = 0; index < 40; index += 1) {
+        await session.handleBinaryAudio(playbackEchoChunk);
+      }
+      await flushAsyncCallbacks();
+
+      expect(countType(frames, "speech_started")).toBe(speechStartedBaseline);
+      expect(countType(frames, "turn_cancelled")).toBe(0);
+      expect(abort).not.toHaveBeenCalled();
+    });
+
+    test("speech above the learned echo margin still interrupts", async () => {
+      const { frames, session, abort, speakFirstReply } =
+        createSpeakingTurnHarness({
+          bargeInMinSpeechMs: 60,
+          echoBargeInMargin: 1.5,
+          echoEmaHalfLifeMs: 400,
+          ttsAudio: playbackReference,
+        });
+      await speakFirstReply();
+
+      for (let index = 0; index < 25; index += 1) {
+        await session.handleBinaryAudio(playbackEchoChunk);
+      }
+      for (let index = 0; index < 8; index += 1) {
+        await session.handleBinaryAudio(bargeInSpeechChunk);
+      }
+
+      await waitFor(() => countType(frames, "turn_cancelled") === 1);
+      await waitFor(() => abort.mock.calls.length === 1);
+    });
+
+    test("classified echo resets a partial guard run immediately", async () => {
+      const { frames, session, abort, speakFirstReply } =
+        createSpeakingTurnHarness({
+          bargeInMinSpeechMs: 60,
+          echoBargeInMargin: 1.5,
+          echoEmaHalfLifeMs: 400,
+          ttsAudio: playbackReference,
+        });
+      await speakFirstReply();
+
+      for (let index = 0; index < 25; index += 1) {
+        await session.handleBinaryAudio(playbackEchoChunk);
+      }
+      for (let index = 0; index < 5; index += 1) {
+        await session.handleBinaryAudio(bargeInSpeechChunk);
+      }
+      await session.handleBinaryAudio(playbackEchoChunk);
+      await session.handleBinaryAudio(bargeInSpeechChunk);
+      await flushAsyncCallbacks();
+
+      expect(countType(frames, "turn_cancelled")).toBe(0);
+      expect(abort).not.toHaveBeenCalled();
+
+      for (let index = 0; index < 5; index += 1) {
+        await session.handleBinaryAudio(bargeInSpeechChunk);
+      }
+      await waitFor(() => countType(frames, "turn_cancelled") === 1);
+    });
+
+    test("quiet playback keeps fixed-threshold barge-in sensitivity", async () => {
+      const { frames, session, abort, speakFirstReply } =
+        createSpeakingTurnHarness({
+          bargeInMinSpeechMs: 60,
+          echoBargeInMargin: 1.5,
+          echoEmaHalfLifeMs: 40,
+          ttsAudio: playbackReference,
+        });
+      await speakFirstReply();
+
+      for (let index = 0; index < 31; index += 1) {
+        await session.handleBinaryAudio(pcm(200));
+      }
+      for (let index = 0; index < 7; index += 1) {
+        await session.handleBinaryAudio(bargeInSpeechChunk);
+      }
+
+      await waitFor(() => countType(frames, "turn_cancelled") === 1);
+      await waitFor(() => abort.mock.calls.length === 1);
+    });
+
+    test("playback echo is not forwarded as transcription pre-roll", async () => {
+      const { frames, session, transcribers, speakFirstReply } =
+        createSpeakingTurnHarness({
+          bargeInMinSpeechMs: 60,
+          echoBargeInMargin: 1.5,
+          echoEmaHalfLifeMs: 40,
+          ttsAudio: playbackReference,
+        });
+      await speakFirstReply();
+
+      const echoChunk = playbackEchoChunk;
+      for (let index = 0; index < 5; index += 1) {
+        await session.handleBinaryAudio(echoChunk);
+      }
+      for (let index = 0; index < 7; index += 1) {
+        await session.handleBinaryAudio(bargeInSpeechChunk);
+      }
+      await waitFor(() => countType(frames, "turn_cancelled") === 1);
+
+      const echoBuffer = Buffer.from(echoChunk);
+      expect(
+        transcribers.some((transcriber) =>
+          transcriber.received.some((buffer) => buffer.equals(echoBuffer)),
+        ),
+      ).toBe(false);
+    });
+
+    test("instant barge-in remains protected from onset echo", async () => {
+      const { frames, session, abort, speakFirstReply } =
+        createSpeakingTurnHarness({
+          bargeInMinSpeechMs: 0,
+          echoBargeInMargin: 1.5,
+          echoEmaHalfLifeMs: 40,
+          ttsAudio: playbackReference,
+        });
+      await speakFirstReply();
+
+      for (let index = 0; index < 30; index += 1) {
+        await session.handleBinaryAudio(playbackEchoChunk);
+      }
+      await flushAsyncCallbacks();
+      expect(countType(frames, "turn_cancelled")).toBe(0);
+
+      await session.handleBinaryAudio(bargeInSpeechChunk);
+      await waitFor(() => countType(frames, "turn_cancelled") === 1);
+      await waitFor(() => abort.mock.calls.length === 1);
+    });
+
+    test("echo suppression covers the client playback tail", async () => {
+      const { frames, session, abort, speakFirstReply, completeFirstReply } =
+        createSpeakingTurnHarness({
+          bargeInMinSpeechMs: 60,
+          echoBargeInMargin: 1.5,
+          echoEmaHalfLifeMs: 40,
+          ttsAudio: playbackReference,
+        });
+      await speakFirstReply();
+      completeFirstReply();
+      await waitFor(() => frames.some((frame) => frame.type === "tts_done"));
+      const speechStartedBaseline = countType(frames, "speech_started");
+
+      for (let index = 0; index < 40; index += 1) {
+        await session.handleBinaryAudio(playbackEchoChunk);
+      }
+      await flushAsyncCallbacks();
+
+      expect(countType(frames, "speech_started")).toBe(speechStartedBaseline);
+      expect(countType(frames, "turn_cancelled")).toBe(0);
+      expect(abort).not.toHaveBeenCalled();
+    });
+
+    test("speech at playback onset cannot seed its own echo threshold", async () => {
+      const { frames, session, abort, speakFirstReply, transcribers } =
+        createSpeakingTurnHarness({
+          bargeInMinSpeechMs: 250,
+          echoBargeInMargin: 1.5,
+          echoEmaHalfLifeMs: 400,
+          ttsAudio: playbackReference,
+        });
+      await speakFirstReply();
+
+      const onsetSpeech = tonePcm(9_400, 530, 7_200);
+      await session.handleBinaryAudio(onsetSpeech);
+
+      await waitFor(() => countType(frames, "turn_cancelled") === 1);
+      await waitFor(() => abort.mock.calls.length === 1);
+      expect(
+        transcribers.some((transcriber) =>
+          transcriber.received.some((buffer) =>
+            buffer.equals(Buffer.from(onsetSpeech)),
+          ),
+        ),
+      ).toBe(true);
+    });
+
+    test("speech already in progress bypasses playback warm-up", async () => {
+      let callbacks: VoiceTurnCallbacks | undefined;
+      const abort = mock();
+      const startVoiceTurn = mock(async (options: VoiceTurnOptions) => {
+        callbacks ??= options.callbacks;
+        return { turnId: "bridge-turn", abort };
+      });
+      const streamTtsAudio = mock(async (options: LiveVoiceTtsOptions) => {
+        options.onAudioChunk(makeTtsChunk("assistant audio"));
+        return makeTtsResult("assistant audio");
+      });
+      const { frames, session } = createHarness({
+        finals: ["what's the weather", "actually never mind"],
+        startVoiceTurn,
+        streamTtsAudio,
+        bargeInMinSpeechMs: 60,
+        echoBargeInMargin: 1.5,
+        echoEmaHalfLifeMs: 400,
+        echoDrainSlackMs: 60_000,
+        turnDetectorConfig: { silenceThresholdMs: 5_000 },
+      });
+
+      await session.start();
+      await session.handleBinaryAudio(LOUD_CHUNK);
+      await session.handleClientFrame({ type: "ptt_release" });
+      await waitFor(() => frames.some((frame) => frame.type === "thinking"));
+      for (let index = 0; index < 3; index += 1) {
+        await session.handleBinaryAudio(pcm(3_000));
+      }
+      callbacks?.assistant_text_delta?.(makeTextDelta("It is sunny today."));
+      await waitFor(() => frames.some((frame) => frame.type === "tts_audio"));
+      for (let index = 0; index < 3; index += 1) {
+        await session.handleBinaryAudio(pcm(3_000));
+      }
+
+      await waitFor(() => countType(frames, "turn_cancelled") === 1);
+      await waitFor(() => abort.mock.calls.length === 1);
+    });
+  });
 });
 
 describe("LiveVoiceSession unified front-door endpointing", () => {
@@ -3662,15 +3962,6 @@ describe("LiveVoiceSession unified front-door endpointing", () => {
     return { startVoiceTurn, calls, discard };
   }
 
-  // A decider that phrases nothing: the front-door leg IS the endpoint
-  // decision, so these tests only need the decider seam to exist.
-  function makeSilentDecider(): VoiceFrontDecider {
-    return {
-      generateAckText: async () => null,
-      generateProgressText: async () => null,
-    };
-  }
-
   async function startWithPartial(
     session: LiveVoiceSession,
     transcribers: MockStreamingTranscriber[],
@@ -3683,12 +3974,10 @@ describe("LiveVoiceSession unified front-door endpointing", () => {
   }
 
   test("a chatty answer commits: verdict leg replaces the decider, frames follow commit order", async () => {
-    const decider = makeSilentDecider();
     const starter = makeVerdictTurnStarter([["Hey! Not much."]]);
     const { frames, session, transcribers } = createHarness({
       finals: ["hello world"],
       startVoiceTurn: starter.startVoiceTurn,
-      frontDecider: decider,
     });
 
     await startWithPartial(session, transcribers);

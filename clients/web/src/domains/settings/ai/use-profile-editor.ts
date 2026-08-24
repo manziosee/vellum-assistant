@@ -8,6 +8,10 @@ import { useEffect, useMemo, useState } from "react";
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
+import { validateInferenceProfileConfig } from "@vellumai/assistant-api";
+
+import { t } from "@/i18n";
+
 import {
   getManagedUpstreamForModel,
   getModelsForProvider,
@@ -15,10 +19,13 @@ import {
   type LlmCatalogModel,
 } from "@/assistant/llm-model-catalog";
 import {
-  MANAGED_ROUTABLE_PROVIDERS,
+  CHATGPT_CONNECTION_PROVIDER,
+  OPENAI_COMPATIBLE_PROVIDER,
   VELLUM_CONNECTION_PROVIDER,
 } from "@/domains/settings/ai/constants";
 import { resolveModelDisplayName } from "@/domains/settings/ai/model-display";
+import { connectionServesProvider } from "@/domains/settings/ai/provider-availability";
+import { CONNECTION_PROVIDERS } from "@/domains/settings/ai/provider-editor-constants";
 import { deriveProfileDefaults } from "@/domains/settings/ai/profile-prefill";
 import {
   isGeminiThinkingLevel,
@@ -40,31 +47,42 @@ import type {
   ProfileStatus,
   ProviderConnection,
 } from "@/generated/daemon/types.gen";
+import { assistantSupportsEntryProviderBinding } from "@/lib/backwards-compat/entry-provider-binding";
 import { assistantSupportsVellumProviderProfiles } from "@/lib/backwards-compat/vellum-profile-provider";
+import { badRequestMessage } from "@/utils/api-errors";
+
+/**
+ * The settings surface persists through the generic config PATCH, which is
+ * the deliberately unvalidated escape hatch, so an impossible output budget
+ * must be rejected here before the write or it lands stored. The judgment is
+ * the daemon's own `validateInferenceProfileConfig` (shared via
+ * assistant-api) so the two paths cannot drift; only the copy is local.
+ */
+function maxTokensBudgetError(
+  catalogModel: LlmCatalogModel,
+  maxTokens: number,
+): string | null {
+  const issue = validateInferenceProfileConfig({
+    maxTokens,
+    modelMaxOutputTokens: catalogModel.maxOutputTokens,
+    modelContextWindowTokens: catalogModel.contextWindowTokens,
+  });
+  if (!issue) {
+    return null;
+  }
+  return issue.code === "over_output_cap"
+    ? t("settings:profileEditor.maxTokensOverCap", {
+        maxTokens,
+        cap: catalogModel.maxOutputTokens,
+      })
+    : t("settings:profileEditor.maxTokensNoInputRoom", {
+        maxTokens,
+        window: catalogModel.contextWindowTokens,
+      });
+}
 
 export type ProfileEditorMode = "create" | "edit" | "view";
 export type EffortSelection = "inherit" | NonNullable<ProfileEntry["effort"]>;
-
-/**
- * Whether a connection (identified by its stored `provider`) can back a profile
- * whose provider is `selectedProvider`. The provider-agnostic Vellum-managed
- * connection stores the `vellum` sentinel but serves every managed-routable
- * provider, so it counts as available for those.
- */
-function connectionServesProvider(
-  connectionProvider: string,
-  selectedProvider: string,
-): boolean {
-  if (connectionProvider === selectedProvider) {
-    return true;
-  }
-  // Legacy wire shape: a managed profile stores its real upstream (e.g.
-  // "fireworks") while binding to the provider-agnostic vellum connection.
-  return (
-    connectionProvider === VELLUM_CONNECTION_PROVIDER &&
-    MANAGED_ROUTABLE_PROVIDERS.has(selectedProvider)
-  );
-}
 
 export interface UseProfileEditorArgs {
   mode: ProfileEditorMode;
@@ -104,6 +122,8 @@ export interface ProfileEditor {
   saving: boolean;
   saveError: string | null;
   keyError: string | null;
+  /** Why the Provider field blocks Save, or null when it does not. */
+  providerError: string | null;
   isInvalid: boolean;
 
   maxTokens: number | null;
@@ -128,6 +148,11 @@ export interface ProfileEditor {
   connectionNotFound: boolean;
 
   creatingProvider: boolean;
+  /**
+   * The supported-but-unconnected provider the inline create sub-form was
+   * opened for, or `null` when it was opened from the generic create entry.
+   */
+  pendingCreateProvider: ConnectionProvider | null;
   newProviderNote: boolean;
 
   setDescription: (value: string) => void;
@@ -147,6 +172,7 @@ export interface ProfileEditor {
     value: GeminiThinkingLevel | typeof THINKING_LEVEL_INHERIT,
   ) => void;
   setCreatingProvider: (value: boolean) => void;
+  setPendingCreateProvider: (value: ConnectionProvider | null) => void;
   setNewProviderNote: (value: boolean) => void;
 
   handleLabelChange: (value: string) => void;
@@ -201,12 +227,14 @@ export function useProfileEditor({
   // upstream is derived from the model at save time. The form opens on the
   // stored upstream and only promotes to Vellum once the loaded connections
   // prove the bound row is the managed sentinel (see the effect below).
-  // A stored "chatgpt" provider (written via the API or CLI) opens with no
-  // provider selected - ChatGPT is a connection sub-option, never a provider
-  // selection here.
+  // A stored "chatgpt" provider (migration 144 output, the picker, or the
+  // API) opens as the ChatGPT selection.
   const [provider, setProvider] = useState<ConnectionProvider | "">(
-    initialValues?.provider && initialValues.provider !== "chatgpt"
-      ? initialValues.provider
+    initialValues?.provider
+      ? // The wire type is an open string (the daemon accepts entry names in
+        // storage); the editor's selection set is the connection-provider
+        // union, and a value outside it renders as no selection.
+        (initialValues.provider as ConnectionProvider)
       : "",
   );
   const [model, setModel] = useState(initialValues?.model ?? "");
@@ -350,11 +378,21 @@ export function useProfileEditor({
   const availableConnectionsForProvider = useMemo(
     () =>
       provider
-        ? effectiveConnections.filter((c) =>
-            connectionServesProvider(c.provider, provider),
+        ? effectiveConnections.filter(
+            (c) =>
+              connectionServesProvider(c.provider, provider) ||
+              // Legacy pinned pairing dispatch still accepts: an openai
+              // profile bound by name to the canonical subscription row,
+              // whose stored provider is "chatgpt" once DB migration 366
+              // has run. Migration 144 leaves these pins in place; without
+              // this the editor reads the binding as missing and clears it
+              // on save.
+              (provider === "openai" &&
+                c.name === providerConnection &&
+                c.provider === CHATGPT_CONNECTION_PROVIDER),
           )
         : [],
-    [provider, effectiveConnections],
+    [provider, effectiveConnections, providerConnection],
   );
 
   // Saved binding no longer points at any known connection. The save handler
@@ -371,6 +409,14 @@ export function useProfileEditor({
   // Create-mode-only UI: whether the inline "+ Create new provider" sub-form
   // is mounted.
   const [creatingProvider, setCreatingProvider] = useState(false);
+  // The supported-but-unconnected provider the inline sub-form was opened for,
+  // or null when it was opened from the generic create entry. It preselects the
+  // sub-form's own Provider picker and keeps the outer trigger showing the
+  // provider the user actually picked while the form is open. The profile's
+  // `provider` is deliberately NOT set until the connection exists - cancelling
+  // must not strand the profile on a route the daemon can't dispatch through.
+  const [pendingCreateProvider, setPendingCreateProvider] =
+    useState<ConnectionProvider | null>(null);
   // One-time helper note shown after an inline provider create succeeds.
   const [newProviderNote, setNewProviderNote] = useState(false);
 
@@ -392,10 +438,44 @@ export function useProfileEditor({
     }
   }, [connections, provider, initialValues]);
 
+  // Open a stored entry-name provider (the entries model: the binding lives
+  // IN the provider value) as its row's kind plus the row as the binding,
+  // so the picker and model logic stay vendor-keyed. Skipped once the user
+  // changes the provider; identity rows keep their own flows above.
+  useEffect(() => {
+    const stored = initialValues?.provider;
+    if (!stored || provider !== stored) {
+      return;
+    }
+    // A provider id is never an entry name: the daemon reads a bare id as
+    // "the kind's default entry", so a row that happens to carry such a
+    // name must not pin or re-vendor the profile on open.
+    if (
+      CONNECTION_PROVIDERS.includes(stored as ConnectionProvider) ||
+      stored === VELLUM_CONNECTION_PROVIDER ||
+      stored === CHATGPT_CONNECTION_PROVIDER
+    ) {
+      return;
+    }
+    const row = connections?.find((c) => c.name === stored);
+    if (
+      !row ||
+      row.provider === VELLUM_CONNECTION_PROVIDER ||
+      row.provider === CHATGPT_CONNECTION_PROVIDER
+    ) {
+      return;
+    }
+    setProvider(row.provider);
+    if (providerConnection === "") {
+      setProviderConnection(row.name);
+    }
+  }, [connections, provider, providerConnection, initialValues]);
+
   // Reset dirty tracking when the editor re-opens with new values.
   useEffect(() => {
     resetDirty();
     setCreatingProvider(false);
+    setPendingCreateProvider(null);
     setNewProviderNote(false);
     setLocallyCreatedConnections([]);
   }, [profileName, mode, resetDirty]);
@@ -408,10 +488,15 @@ export function useProfileEditor({
     setModel("");
     // Auto-select connection: if exactly one connection exists for the new
     // provider, select it automatically. If multiple exist, clear so the user
-    // must pick. If zero, clear.
-    const connectionsForProvider = effectiveConnections.filter((c) =>
-      connectionServesProvider(c.provider, newProvider),
-    );
+    // must pick. If zero, clear. The chatgpt identity never binds a
+    // connection: dispatch resolves the canonical subscription row
+    // per-request, and the daemon rejects noncanonical pins.
+    const connectionsForProvider =
+      newProvider === CHATGPT_CONNECTION_PROVIDER
+        ? []
+        : effectiveConnections.filter((c) =>
+            connectionServesProvider(c.provider, newProvider),
+          );
     setProviderConnection(
       connectionsForProvider.length === 1 ? connectionsForProvider[0].name : "",
     );
@@ -501,6 +586,7 @@ export function useProfileEditor({
     setProviderConnection(connection.name);
     setModel("");
     setCreatingProvider(false);
+    setPendingCreateProvider(null);
     setNewProviderNote(true);
     void queryClient.invalidateQueries({
       queryKey: inferenceProviderconnectionsGetQueryKey({
@@ -535,6 +621,28 @@ export function useProfileEditor({
         ? "A profile with this key already exists"
         : null;
 
+  // An untouched create form is blank by definition, so flagging its empty
+  // fields on open would be scolding the user for not having started. Edit
+  // mode is the opposite: an existing profile missing a provider or model is
+  // already broken, the resolver already skips it, and the row that links
+  // here says "Click to fix", so the reason has to be visible on arrival.
+  // The Model field already explains `providerWithoutModel` itself, keyed to
+  // why it is empty (no catalog entries, connection not configured, nothing
+  // picked). Provider is the one blocking state with no copy anywhere.
+  //
+  // An untouched create form is blank by definition, so flagging it on open
+  // would be scolding the user for not having started. Edit mode is the
+  // opposite: a profile with no provider is already broken, the resolver
+  // skips it, and the row that links here says "Click to fix", so the
+  // reason has to be visible on arrival.
+  // Read-only (managed) profiles get no field errors, matching how `keyError`
+  // is suppressed for them: the picker is disabled, so naming a problem the
+  // user cannot act on here is just noise.
+  const showFieldErrors =
+    !isReadOnly && (effectiveMode === "edit" || getDirty());
+  const providerError =
+    showFieldErrors && providerMissing ? "Select a provider" : null;
+
   async function handleSave() {
     if (isInvalid && !isReadOnly) {
       return;
@@ -551,12 +659,27 @@ export function useProfileEditor({
       setSaveError(null);
       try {
         await onSave(keyTrimmed, { status: "active" }, { mode: "merge" });
-      } catch {
-        setSaveError("Failed to save profile. Please try again.");
+      } catch (error) {
+        // A 400 names why the profile can't be enabled (no connection or key
+        // for its provider); anything else is opaque, so keep the retry copy.
+        setSaveError(
+          badRequestMessage(error) ??
+            "Failed to save profile. Please try again.",
+        );
       } finally {
         setSaving(false);
       }
       return;
+    }
+    // `selectedModel` already resolves the routed `<provider>/<model>` form
+    // to its native catalog entry, so the judgment sees the same model the
+    // save will dispatch.
+    if (visibility.maxTokens && maxTokens !== null && selectedModel) {
+      const budgetError = maxTokensBudgetError(selectedModel, maxTokens);
+      if (budgetError) {
+        setSaveError(budgetError);
+        return;
+      }
     }
     setSaving(true);
     setSaveError(null);
@@ -576,9 +699,13 @@ export function useProfileEditor({
       // (`provider: "vellum"` + native model, no binding); older daemons get
       // the legacy shape: the model's managed upstream as `provider`, bound
       // to the provider-agnostic vellum connection.
+      // The chatgpt identity needs no version gate: the picker offers it
+      // only when the daemon returned a provider "chatgpt" row, which only
+      // daemons that understand the identity payload do.
       const writesIdentityPayload =
-        provider === VELLUM_CONNECTION_PROVIDER &&
-        (await assistantSupportsVellumProviderProfiles(assistantId));
+        provider === CHATGPT_CONNECTION_PROVIDER ||
+        (provider === VELLUM_CONNECTION_PROVIDER &&
+          (await assistantSupportsVellumProviderProfiles(assistantId)));
       const wireProvider =
         provider === VELLUM_CONNECTION_PROVIDER
           ? writesIdentityPayload
@@ -591,13 +718,54 @@ export function useProfileEditor({
       const wireModel = nativeModel;
       // Identity payloads carry no binding; sending null on edit clears a
       // legacy-shape binding left on the stored profile.
-      const wireBinding = writesIdentityPayload ? "" : effectiveBinding;
+      let wireBinding = writesIdentityPayload ? "" : effectiveBinding;
+      // Entries wire shape (version-gated): gated daemons store the binding
+      // IN the provider value (the entry name when the user picked a named
+      // row among siblings and always for openai-compatible endpoints, the
+      // bare vendor id meaning the kind's default entry otherwise) and
+      // never a provider_connection. Identity-bound rows keep their
+      // existing payloads: rewriting a vellum/chatgpt binding as an entry
+      // name would change what the daemon bills the request to.
+      const boundRow =
+        effectiveBinding !== ""
+          ? effectiveConnections.find((c) => c.name === effectiveBinding)
+          : undefined;
+      // A binding is only expressible as an entry name when the daemon
+      // would read that name back as this row. Identity rows dispatch by
+      // their own rules, and a row named after a provider id or identity
+      // value reads as "the kind's default entry" or the identity, not as
+      // the row: all of those keep the legacy shape so the pin survives.
+      const bindingInexpressibleAsEntryName =
+        boundRow !== undefined &&
+        (boundRow.provider === VELLUM_CONNECTION_PROVIDER ||
+          boundRow.provider === CHATGPT_CONNECTION_PROVIDER ||
+          boundRow.name === VELLUM_CONNECTION_PROVIDER ||
+          boundRow.name === CHATGPT_CONNECTION_PROVIDER ||
+          CONNECTION_PROVIDERS.includes(boundRow.name as ConnectionProvider));
+      let entryWireProvider = wireProvider;
+      if (
+        !writesIdentityPayload &&
+        provider !== "" &&
+        provider !== VELLUM_CONNECTION_PROVIDER &&
+        !bindingInexpressibleAsEntryName &&
+        (await assistantSupportsEntryProviderBinding(assistantId))
+      ) {
+        const kindSiblings = effectiveConnections.filter(
+          (c) => c.provider === provider,
+        ).length;
+        entryWireProvider =
+          boundRow !== undefined &&
+          (provider === OPENAI_COMPATIBLE_PROVIDER || kindSiblings >= 2)
+            ? boundRow.name
+            : provider;
+        wireBinding = "";
+      }
       if (effectiveMode === "edit") {
         // In edit mode send null for cleared fields so the server deep-merges
         // them as cleared rather than silently preserving the old value.
         entry.label = label.trim() || null;
         entry.description = description.trim() || null;
-        entry.provider = wireProvider || null;
+        entry.provider = entryWireProvider || null;
         entry.model = wireModel || null;
         entry.provider_connection = wireBinding || null;
       } else {
@@ -608,8 +776,8 @@ export function useProfileEditor({
         if (description.trim()) {
           entry.description = description.trim();
         }
-        if (wireProvider) {
-          entry.provider = wireProvider;
+        if (entryWireProvider) {
+          entry.provider = entryWireProvider;
         }
         if (wireModel) {
           entry.model = wireModel;
@@ -653,12 +821,17 @@ export function useProfileEditor({
       if (visibility.thinking) {
         entry.thinking = {
           enabled: thinkingEnabled,
-          ...(thinkingEnabled ? { streamThinking: thinkingStreamThinking } : {}),
+          ...(thinkingEnabled
+            ? { streamThinking: thinkingStreamThinking }
+            : {}),
         };
       }
       // Gemini: a chosen level implies thinking is on; "default" omits the
       // field so the daemon applies the model default.
-      if (visibility.thinkingLevel && thinkingLevel !== THINKING_LEVEL_INHERIT) {
+      if (
+        visibility.thinkingLevel &&
+        thinkingLevel !== THINKING_LEVEL_INHERIT
+      ) {
         entry.thinking = { enabled: true, level: thinkingLevel };
       }
       // Status - always include in edit mode; omit in create when active
@@ -669,8 +842,10 @@ export function useProfileEditor({
       }
       // Do NOT include source or name
       await onSave(keyTrimmed, entry);
-    } catch {
-      setSaveError("Failed to save profile. Please try again.");
+    } catch (error) {
+      setSaveError(
+        badRequestMessage(error) ?? "Failed to save profile. Please try again.",
+      );
     } finally {
       setSaving(false);
     }
@@ -697,6 +872,7 @@ export function useProfileEditor({
     saving,
     saveError,
     keyError,
+    providerError,
     isInvalid,
     maxTokens,
     contextWindowMaxInputTokens,
@@ -718,6 +894,7 @@ export function useProfileEditor({
     availableConnectionsForProvider,
     connectionNotFound,
     creatingProvider,
+    pendingCreateProvider,
     newProviderNote,
     setDescription,
     setStatus,
@@ -734,6 +911,7 @@ export function useProfileEditor({
     setThinkingStreamThinking,
     setThinkingLevel,
     setCreatingProvider,
+    setPendingCreateProvider,
     setNewProviderNote,
     handleLabelChange,
     handleKeyChange,

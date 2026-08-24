@@ -2,11 +2,12 @@
  * MESSAGE_CREATE → the canonical `GatewayInboundEvent`.
  *
  * The normalizer runs after the admission gate (`admit.ts`), so every message
- * here is a mention of the bot in an allow-listed channel — inside Discord's
- * content exemption, carrying real content. It maps identity fields onto the
- * channel-identity vocabulary: `conversationExternalId` is the delivery
- * address (the parent channel for thread messages, mirroring Slack's
- * channel + thread_ts split), `actorExternalId` the author's user snowflake.
+ * here is either a mention of the bot in an allow-listed channel or a DM to
+ * the bot. Attachment-only DMs can have empty content. It maps identity
+ * fields onto the channel-identity vocabulary:
+ * `conversationExternalId` is the delivery address (the parent channel for
+ * thread messages, mirroring Slack's channel + thread_ts split, and the DM
+ * channel for a DM), `actorExternalId` the author's user snowflake.
  *
  * Mention markup (`<@snowflake>`) is forwarded verbatim; rendering is the
  * ingress-rendering slice's concern, and the daemon receives `raw` either way.
@@ -14,6 +15,7 @@
 
 import type { DiscordInboundEvent } from "../channels/inbound-event.js";
 import type { AdmissionCandidate } from "./admit.js";
+import { extractDiscordAttachments } from "./attachments.js";
 import type { DiscordMessageCreate } from "./message-schemas.js";
 
 /**
@@ -62,6 +64,11 @@ export function normalizeDiscordMessage(
   }
 
   const inThread = options.parentChannelId !== undefined;
+  // Discord marks a DM only by the absence of a guild, and a DM channel is
+  // already the private one-to-one address, so it is its own conversation and
+  // can never be in a thread.
+  const isDirectMessage = message.guild_id === undefined;
+  const attachments = extractDiscordAttachments(message.attachments);
   return {
     version: "v1",
     sourceChannel: "discord",
@@ -70,6 +77,7 @@ export function normalizeDiscordMessage(
       content: message.content,
       conversationExternalId: options.parentChannelId ?? message.channel_id,
       externalMessageId: message.id,
+      ...(attachments.length > 0 ? { attachments } : {}),
     },
     actor: {
       actorExternalId: authorId,
@@ -86,7 +94,12 @@ export function normalizeDiscordMessage(
     source: {
       updateId: message.id,
       messageId: message.id,
-      chatType: "channel",
+      chatType: isDirectMessage ? "dm" : "channel",
+      // Discord proves a DM by the absence of a guild, and proves nothing about
+      // a guild channel's visibility without fetching the channel and reading
+      // its permission overwrites. Left unset rather than guessed, so a rule
+      // written for public rooms cannot reach a private one.
+      ...(isDirectMessage ? { conversationType: "dm" as const } : {}),
       ...(inThread ? { threadId: message.channel_id } : {}),
     },
     raw: options.raw,

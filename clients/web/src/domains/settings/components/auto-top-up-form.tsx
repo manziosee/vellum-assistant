@@ -1,5 +1,6 @@
 import { useState, type ChangeEvent } from "react";
 
+import { useTranslation } from "@/i18n";
 import { Button } from "@vellumai/design-library/components/button";
 import { Input } from "@vellumai/design-library/components/input";
 
@@ -117,6 +118,7 @@ export function AutoTopUpForm({
   onSave,
   onCancel,
 }: AutoTopUpFormProps) {
+  const { t } = useTranslation("settings");
   const [values, setValues] = useState<AutoTopUpFormValues>(initialValues);
   const [touched, setTouched] = useState<
     Record<keyof AutoTopUpFormValues, boolean>
@@ -181,12 +183,12 @@ export function AutoTopUpForm({
 
   return (
     <div className="mt-4">
-      <div className="flex flex-wrap items-start gap-3">
-        <div className="min-w-[10rem] flex-1">
+      <div className="flex flex-wrap items-start gap-2">
+        <div className="w-full max-w-full sm:w-[200px]">
           <Input
             type="number"
             step="1"
-            label="Auto-reload when balance below"
+            label={t("autoTopUpForm.thresholdLabel")}
             value={values.threshold_usd}
             onChange={onChange("threshold_usd")}
             onBlur={onBlur("threshold_usd")}
@@ -195,11 +197,11 @@ export function AutoTopUpForm({
             fullWidth
           />
         </div>
-        <div className="min-w-[10rem] flex-1">
+        <div className="w-full max-w-full sm:w-[200px]">
           <Input
             type="number"
             step="1"
-            label="Auto-reload amount"
+            label={t("autoTopUpForm.amountLabel")}
             value={values.amount_usd}
             onChange={onChange("amount_usd")}
             onBlur={onBlur("amount_usd")}
@@ -208,12 +210,11 @@ export function AutoTopUpForm({
             fullWidth
           />
         </div>
-        <div className="min-w-[10rem] flex-1">
+        <div className="w-full max-w-full sm:w-[200px]">
           <Input
             type="number"
             step="1"
-            label="Monthly spending cap"
-            helperText="Pauses auto top-ups for the rest of the month once spending reaches this amount. Manual purchases also count toward the total. Leave empty for no limit."
+            label={t("autoTopUpForm.capLabel")}
             value={values.monthly_cap_usd}
             onChange={onChange("monthly_cap_usd")}
             onBlur={onBlur("monthly_cap_usd")}
@@ -231,7 +232,7 @@ export function AutoTopUpForm({
          */}
         <div className="flex shrink-0 items-center gap-2 pt-[18px]">
           <Button variant="outlined" onClick={onCancel} disabled={submitting}>
-            Cancel
+            {t("autoTopUpForm.cancel")}
           </Button>
           <Button
             variant="primary"
@@ -239,7 +240,7 @@ export function AutoTopUpForm({
             disabled={submitting}
             data-testid="auto-top-up-save-button"
           >
-            Save
+            {t("autoTopUpForm.save")}
           </Button>
         </div>
       </div>

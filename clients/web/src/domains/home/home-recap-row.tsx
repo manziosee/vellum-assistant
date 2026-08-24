@@ -1,56 +1,80 @@
-import { Mail, MailOpen, MessageSquare, RotateCcw, Trash2 } from "lucide-react";
-import { type ReactNode, useState } from "react";
+import { useMemo } from "react";
 
+import { SwipeActionReveal } from "@/components/swipe-action-reveal";
+import { useHoverCapable } from "@/hooks/use-hover-affordance";
+import { useLongPressSheet } from "@/hooks/use-long-press-sheet";
+import { useTranslation } from "@/i18n";
 import { formatRelativeDate } from "@/utils/format-date";
-import type {
-  FeedItem,
-  FeedItemCategory,
-  FeedItemStatus,
-} from "@vellumai/assistant-api";
-import { cn, Tooltip } from "@vellumai/design-library";
-import { CATEGORY_STYLES } from "./home-feed-filter-bar";
+import type { FeedItem, FeedItemStatus } from "@vellumai/assistant-api";
+import {
+  cn,
+  CrossfadeStack,
+  Typography,
+  type TypographyVariant,
+} from "@vellumai/design-library";
 
-function HoverIconButton({
-  label,
-  onClick,
-  className,
-  children,
-}: {
-  label: string;
-  onClick: () => void;
-  className?: string;
-  children: ReactNode;
-}) {
-  return (
-    <Tooltip content={label}>
-      <button
-        type="button"
-        aria-label={label}
-        onClick={(e) => {
-          e.stopPropagation();
-          onClick();
-        }}
-        className={cn(
-          "flex h-8 w-8 shrink-0 cursor-pointer items-center justify-center rounded-md",
-          "text-[var(--content-secondary)] transition-colors",
-          "hover:bg-[var(--surface-hover)] hover:text-[var(--content-default)]",
-          className,
-        )}
-      >
-        {children}
-      </button>
-    </Tooltip>
-  );
+import { FeedCategoryChip } from "./feed-category-chip";
+import { resolvePreview } from "./feed-preview";
+import {
+  buildRecapActions,
+  RecapActionButtons,
+  RecapActions,
+  RecapActionsTrigger,
+  swipeActionsFor,
+  type HomeRecapRowTrailingAction,
+} from "./home-recap-actions";
+import { resolveFeedItemTitle } from "./utils";
+
+/**
+ * Marks the card's own click target, the one control a long press may arm on:
+ * it covers the whole card, so requiring a press to miss it would leave no
+ * gesture at all. Every other control (an inline action, a button a swipe has
+ * revealed) owns its own press.
+ */
+const CARD_LINK_ATTRIBUTE = "data-recap-card-link";
+const cardLinkProps = { [CARD_LINK_ATTRIBUTE]: "" };
+
+const skipRowControls = (target: Element | null) => {
+  const control = target?.closest("button, a");
+  return control != null && !control.hasAttribute(CARD_LINK_ATTRIBUTE);
+};
+
+/** Source labels that carry nothing the category chip does not already say. */
+const GENERIC_SOURCE_LABELS = new Set(["Conversation", "Other"]);
+
+export type HomeRecapRowDensity = "comfortable" | "compact";
+
+interface DensityStyle {
+  /** Card padding. */
+  card: string;
+  /** Gap between the rows of the content stack. */
+  stack: string;
+  titleVariant: TypographyVariant;
+  clamp: string;
+  /**
+   * Whether the first line is a meta row naming the item's category and
+   * source, with the title on its own line under it. Without that row the
+   * title takes the first line and shares it with the timestamp.
+   */
+  showsMetaRow: boolean;
 }
 
-function resolveStyle(category?: FeedItemCategory) {
-  if (category && CATEGORY_STYLES[category]) {
-    return CATEGORY_STYLES[category];
-  }
-  return CATEGORY_STYLES.system;
-}
-
-export type HomeRecapRowTrailingAction = "dismiss" | "restore";
+const DENSITY_STYLES: Record<HomeRecapRowDensity, DensityStyle> = {
+  comfortable: {
+    card: "p-[var(--app-spacing-md)]",
+    stack: "gap-[var(--app-spacing-xs)]",
+    titleVariant: "title-small",
+    clamp: "line-clamp-2",
+    showsMetaRow: true,
+  },
+  compact: {
+    card: "p-[var(--app-spacing-sm)]",
+    stack: "gap-[var(--app-spacing-xxs)]",
+    titleVariant: "body-medium-default",
+    clamp: "line-clamp-1",
+    showsMetaRow: false,
+  },
+};
 
 export interface HomeRecapRowProps {
   item: FeedItem;
@@ -61,8 +85,22 @@ export interface HomeRecapRowProps {
   onToggleRead?: (itemId: string, newStatus: FeedItemStatus) => void;
   onGoToThread?: (conversationId: string) => void;
   trailingAction?: HomeRecapRowTrailingAction;
+  density?: HomeRecapRowDensity;
 }
 
+/**
+ * One item of the home recap, as a card: the item's category and source, its
+ * title, a preview of its summary, when it arrived, and the commands that act
+ * on it.
+ *
+ * Every command has a path for each input. A pointer reveals the row's inline
+ * buttons, which share a cell with the timestamp and cross-fade with it. Where
+ * the device cannot hover there is nothing to trade that cell with, so the
+ * timestamp keeps it and the commands move behind one button beside it that
+ * opens them as a sheet. A swipe reaches the state changes directly and a long
+ * press opens the same sheet: accelerators for a thumb, on top of a control that
+ * is always there to be found, named, and focused.
+ */
 export function HomeRecapRow({
   item,
   isActive = false,
@@ -72,104 +110,198 @@ export function HomeRecapRow({
   onToggleRead,
   onGoToThread,
   trailingAction = "dismiss",
+  density = "comfortable",
 }: HomeRecapRowProps) {
-  const [isHovering, setIsHovering] = useState(false);
-  const style = resolveStyle(item.category);
-  const Icon = style.icon;
+  const { t } = useTranslation("home");
   const isUnread = item.status === "new";
-  const isRestore = trailingAction === "restore";
+  const densityStyle = DENSITY_STYLES[density];
 
-  return (
-    <button
-      type="button"
-      onClick={() => onSelect(item)}
-      onMouseEnter={() => setIsHovering(true)}
-      onMouseLeave={() => setIsHovering(false)}
+  const actions = buildRecapActions({
+    item,
+    isUnread,
+    validConversationIds,
+    onDismiss,
+    onToggleRead,
+    onGoToThread,
+    trailingAction,
+    t,
+  });
+
+  /* Which shape the commands take, not whether they are reachable: the row
+     offers all of them either way. */
+  const showsActionButtons = useHoverCapable();
+  const longPress = useLongPressSheet({ shouldSkip: skipRowControls });
+  const actionsLabel = t("homeRecapRow.actionsTitle");
+
+  const sourceLabel =
+    item.sourceLabel && !GENERIC_SOURCE_LABELS.has(item.sourceLabel)
+      ? item.sourceLabel
+      : null;
+
+  // Both memoized: each parses the summary as markdown, and the feed re-renders
+  // every card whenever its filter changes.
+  const title = useMemo(
+    () => resolveFeedItemTitle({ title: item.title, summary: item.summary }),
+    [item.title, item.summary],
+  );
+
+  const preview = useMemo(
+    () => resolvePreview(title, item.summary),
+    [title, item.summary],
+  );
+
+  // leading-snug: the title-small token is line-height:1, and line-clamp's
+  // overflow clipping would cut descenders without real line height.
+  const titleLine = (
+    <Typography
+      data-testid="home-recap-row-title"
+      variant={densityStyle.titleVariant}
       className={cn(
-        "flex min-h-[48px] w-full cursor-pointer items-center gap-[var(--app-spacing-sm)]",
-        "rounded-[var(--radius-md)] px-[var(--app-spacing-md)] py-[var(--app-spacing-sm)]",
+        "leading-snug text-[var(--content-default)]",
+        // On the first line the title has to yield to the timestamp beside it,
+        // so it shrinks and ellipsizes rather than pushing the timestamp out.
+        densityStyle.showsMetaRow
+          ? densityStyle.clamp
+          : "min-w-0 flex-1 truncate",
+      )}
+    >
+      {title}
+    </Typography>
+  );
+
+  /* `data-reveal-yield` only where the buttons take the cell over on hover:
+     without them the timestamp is the cell's only occupant and has nothing to
+     stand down for. */
+  const timestamp = (
+    <Typography
+      variant="body-small-default"
+      className="text-[var(--content-tertiary)]"
+      {...(showsActionButtons ? { "data-reveal-yield": "" } : {})}
+    >
+      {formatRelativeDate(item.timestamp)}
+    </Typography>
+  );
+
+  const card = (
+    <div
+      data-reveal-row=""
+      className={cn(
+        "group relative flex w-full items-start gap-[var(--app-spacing-sm)]",
+        "rounded-[var(--radius-lg)] border border-[var(--border-base)]",
         "transition-[background-color,opacity] duration-150",
+        densityStyle.card,
         isActive
           ? "bg-[var(--surface-active)]"
-          : isHovering
-            ? "bg-[var(--surface-hover)]"
-            : "bg-[var(--surface-overlay)]",
+          : "bg-[var(--surface-overlay)] hover:bg-[var(--surface-hover)]",
         !isUnread && !isActive && "opacity-70",
       )}
     >
-      <span className="relative shrink-0" aria-hidden="true">
-        <span
-          className="flex items-center justify-center rounded-full"
-          style={{
-            width: 26,
-            height: 26,
-            backgroundColor: style.weak,
-          }}
-        >
-          <Icon width={12} height={12} style={{ color: style.strong }} />
-        </span>
-        {isUnread && (
-          <span className="absolute -left-0.5 -top-0.5 h-2 w-2 rounded-full bg-[var(--system-mid-strong)]" />
-        )}
-      </span>
+      {/* Stretched link: the card's single click target. Everything else stacks
+          above it and so must stay `pointer-events-none` unless it is itself
+          interactive, or clicks meant for the card get swallowed. */}
+      <button
+        type="button"
+        aria-label={title}
+        onClick={() => onSelect(item)}
+        {...cardLinkProps}
+        className="absolute inset-0 w-full cursor-pointer rounded-[var(--radius-lg)]"
+      />
 
-      <span
+      {/* The gutter is reserved whether or not the item is unread, so a card
+          keeps the same text alignment once it is marked read. h-8 is the
+          height of the first line, which the h-8 action buttons set, so the dot
+          sits against the meta row or the title depending on density. */}
+      <div
+        data-testid="home-recap-row-dot-gutter"
+        className="pointer-events-none relative flex h-8 w-2 shrink-0 items-center"
+      >
+        {isUnread && (
+          <span
+            data-testid="home-recap-row-unread-dot"
+            aria-hidden="true"
+            className="h-2 w-2 rounded-full bg-[var(--system-mid-strong)]"
+          />
+        )}
+      </div>
+
+      <div
         className={cn(
-          "text-body-medium-default min-w-0 flex-1 truncate text-left",
-          "text-[var(--content-secondary)]",
+          "pointer-events-none relative flex min-w-0 flex-1 flex-col",
+          densityStyle.stack,
         )}
       >
-        {item.title ?? item.summary}
-      </span>
+        <div className="flex items-center gap-[var(--app-spacing-sm)]">
+          {densityStyle.showsMetaRow ? (
+            <>
+              <FeedCategoryChip category={item.category} />
 
-      {isHovering && !isRestore ? (
-        <span className="flex shrink-0 items-center gap-[var(--app-spacing-sm)]">
-          {onToggleRead && (
-            <HoverIconButton
-              label={isUnread ? "Mark as read" : "Mark as unread"}
-              onClick={() => onToggleRead(item.id, isUnread ? "seen" : "new")}
-            >
-              {isUnread ? (
-                <MailOpen width={16} height={16} />
-              ) : (
-                <Mail width={16} height={16} />
+              {sourceLabel !== null && (
+                <Typography
+                  variant="body-small-default"
+                  className="min-w-0 truncate text-[var(--content-tertiary)]"
+                >
+                  {sourceLabel}
+                </Typography>
               )}
-            </HoverIconButton>
+            </>
+          ) : (
+            titleLine
           )}
-          {onGoToThread &&
-            item.conversationId &&
-            (!validConversationIds ||
-              validConversationIds.has(item.conversationId)) && (
-              <HoverIconButton
-                label="Go to thread"
-                onClick={() => {
-                  if (isUnread && onToggleRead) {
-                    onToggleRead(item.id, "seen");
-                  }
-                  onGoToThread(item.conversationId!);
-                }}
+
+          {showsActionButtons ? (
+            /* Timestamp and buttons share one cell so the card keeps a stable
+               width as they cross-fade. */
+            <CrossfadeStack className="ml-auto justify-items-end">
+              {timestamp}
+
+              <span
+                data-reveal=""
+                className="flex items-center gap-[var(--app-spacing-sm)]"
               >
-                <MessageSquare width={16} height={16} />
-              </HoverIconButton>
+                <RecapActionButtons actions={actions} />
+              </span>
+            </CrossfadeStack>
+          ) : (
+            <span className="ml-auto flex items-center gap-[var(--app-spacing-sm)]">
+              {timestamp}
+              <RecapActionsTrigger label={actionsLabel} />
+            </span>
+          )}
+        </div>
+
+        {densityStyle.showsMetaRow && titleLine}
+
+        {preview !== null && (
+          <Typography
+            variant="body-medium-lighter"
+            className={cn(
+              "leading-normal text-[var(--content-secondary)]",
+              densityStyle.clamp,
             )}
-          <HoverIconButton label="Dismiss" onClick={() => onDismiss(item.id)}>
-            <Trash2 width={16} height={16} />
-          </HoverIconButton>
-        </span>
-      ) : isHovering && isRestore ? (
-        <HoverIconButton
-          label="Restore"
-          onClick={() => onDismiss(item.id)}
-          className="w-auto gap-[var(--app-spacing-xs)] px-2"
+          >
+            {preview}
+          </Typography>
+        )}
+      </div>
+    </div>
+  );
+
+  return (
+    <RecapActions
+      actions={actions}
+      title={actionsLabel}
+      open={longPress.open}
+      onOpenChange={longPress.onOpenChange}
+    >
+      <div {...longPress.wrapperProps}>
+        <SwipeActionReveal
+          leadingActions={swipeActionsFor(actions, "leading")}
+          trailingActions={swipeActionsFor(actions, "trailing")}
+          className="rounded-[var(--radius-lg)]"
         >
-          <RotateCcw width={16} height={16} aria-hidden="true" />
-          <span className="text-body-small-default">Restore</span>
-        </HoverIconButton>
-      ) : (
-        <span className="shrink-0 text-body-small-default text-[var(--content-tertiary)]">
-          {formatRelativeDate(item.timestamp)}
-        </span>
-      )}
-    </button>
+          {card}
+        </SwipeActionReveal>
+      </div>
+    </RecapActions>
   );
 }

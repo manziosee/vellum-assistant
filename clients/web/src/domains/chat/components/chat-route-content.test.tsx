@@ -48,7 +48,10 @@ mock.module("@/domains/chat/hooks/use-empty-state-greeting", () => ({
 }));
 
 mock.module("@/domains/chat/hooks/use-conversation-starters", () => ({
-  useConversationStarters: () => ({ starters: [] }),
+  useConversationStarters: () => ({
+    starters: [],
+    isAwaitingStarters: false,
+  }),
 }));
 
 const FEATURED: ThreadSuggestion = {
@@ -161,6 +164,7 @@ function Harness({
     mainView: "chat",
     openedAppState: null,
     isAssistantBusy: false,
+    showCreditsUpsell: false,
     onSelectStarter: () => {},
     onSelectSuggestion: setSelected,
   });

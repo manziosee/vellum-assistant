@@ -4,9 +4,9 @@ import type { DiscordInboundEvent } from "../channels/inbound-event.js";
 import { RESUMABLE_CLOSE_CODE } from "./close-codes.js";
 import {
   DiscordGatewayClient,
-  type CancelTimer,
   type GatewaySocketLike,
 } from "./gateway-socket.js";
+import type { CancelTimer } from "../util/schedule.js";
 import "../__tests__/test-preload.js";
 
 const INTERVAL = 41_250;
@@ -216,8 +216,9 @@ describe("connect and identify", () => {
     };
     expect(identify.op).toBe(2);
     expect(identify.d.token).toBe("token-abc");
-    // GUILDS | GUILD_MESSAGES — the unprivileged bitmask, pinned in intents.ts.
-    expect(identify.d.intents).toBe(513);
+    // GUILDS | GUILD_MESSAGES | DIRECT_MESSAGES: the unprivileged bitmask,
+    // pinned in intents.ts.
+    expect(identify.d.intents).toBe(4609);
   });
 
   test("a transient REST failure retries and connects on success", async () => {

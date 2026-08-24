@@ -169,6 +169,7 @@ describe("Invariant 2: no generic plaintext secret read API", () => {
       "messaging/providers/telegram-bot/adapter.ts", // Telegram bot token lookup for connectivity check
       "messaging/providers/slack/api.ts", // Slack Web API client (bot token for direct sends)
       "messaging/providers/telegram-bot/api.ts", // Telegram Bot API client (bot token for direct sends)
+      "messaging/providers/discord/api.ts", // Discord REST client (bot token for direct sends)
       "runtime/channel-readiness-service.ts", // channel readiness probes for Telegram connectivity
       "telegram/webhook-health.ts", // Telegram webhook health sweep — reads bot_token to call getWebhookInfo (Bot API authenticates via the token in the URL path) and checks webhook_secret for existence only; neither value is logged, persisted, or returned
       "messaging/providers/whatsapp/adapter.ts", // WhatsApp credential lookup for connectivity check
@@ -236,7 +237,8 @@ describe("Invariant 2: no generic plaintext secret read API", () => {
       "tools/network/web-fetch.ts", // Firecrawl /scrape BYOK fetch provider API key lookup (firecrawl provider key)
       "workspace/default-provider-ensure.ts", // legacy anthropic echo disambiguation (vault key presence check)
       "providers/inference/connection-availability.ts", // shared (provider, connection) availability status (credential presence check only; value never leaves the helper)
-      "plugin-api/resolve-credential.ts", // plugin-facing resolveCredential — reveal-equivalent plaintext read, scoped to the in-context plugin's own field
+      "plugin-api/resolve-credential.ts", // plugin-facing resolveCredential: reveal-equivalent plaintext read, scoped to the in-context plugin's own service
+      "tools/credentials/store.ts", // shared credential write path (setSecureKeyAsync only; no reads) behind credentials/set and plugin-facing storeCredential
     ]);
 
     const thisDir = dirname(fileURLToPath(import.meta.url));

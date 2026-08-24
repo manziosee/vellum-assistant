@@ -11,6 +11,7 @@ import type { PairingResult } from "../conversation-pairing.js";
 import type { NotificationSignal } from "../signal.js";
 import type {
   ChannelAdapter,
+  ChannelDeliveryObserver,
   ChannelDeliveryPayload,
   ChannelDestination,
   DeliveryResult,
@@ -60,9 +61,14 @@ mock.module("../conversation-pairing.js", () => ({
   },
 }));
 
+// Status writes are inert by default; tests that need a failing store swap
+// the implementation in.
+let updateDeliveryStatusImpl: (status: string) => void = () => {};
+
 mock.module("../deliveries-store.js", () => ({
   createDelivery: () => {},
-  updateDeliveryStatus: () => {},
+  updateDeliveryStatus: (_deliveryId: string, status: string) =>
+    updateDeliveryStatusImpl(status),
   findDeliveryByDecisionAndChannel: () => undefined,
 }));
 
@@ -161,6 +167,7 @@ beforeEach(() => {
   knownConversations = new Set();
   pairingByChannel = {};
   pairingErrorByChannel = {};
+  updateDeliveryStatusImpl = () => {};
 });
 
 // ── Tests ───────────────────────────────────────────────────────────────
@@ -231,6 +238,36 @@ describe("NotificationBroadcaster last-resort copy resolution", () => {
     expect(sends[0]?.payload.copy.body).toBe("Time to drink water");
     expect(results.length).toBe(1);
     expect(results[0]?.status).toBe("sent");
+  });
+});
+
+describe("NotificationBroadcaster delivery status recording", () => {
+  test("a successful send is recorded as sent even when its status write throws", async () => {
+    // The results array is what `emitNotificationSignal` reads to decide
+    // whether a retry would re-deliver. Reporting a real send as failed
+    // releases the signal's dedupe claim, so the retry sends this message a
+    // second time. The lost status write only costs the delivery row.
+    composeFallbackReturn = {
+      vellum: { title: "Reminder", body: "Time to drink water" },
+    };
+    updateDeliveryStatusImpl = (status: string) => {
+      if (status === "sent") {
+        throw new Error("deliveries store is locked");
+      }
+    };
+
+    const { adapter, sends } = makeCapturingAdapter("vellum");
+    const broadcaster = new NotificationBroadcaster([adapter]);
+
+    const results = await broadcaster.broadcastDecision(
+      makeSignal(),
+      makeDecision({ renderedCopy: {} }),
+    );
+
+    expect(sends.length).toBe(1);
+    expect(results.length).toBe(1);
+    expect(results[0]?.status).toBe("sent");
+    expect(results[0]?.errorMessage).toBeUndefined();
   });
 });
 
@@ -344,6 +381,9 @@ describe("NotificationBroadcaster remotePushDispatched flag", () => {
     expect(vellum.sends.length).toBe(1);
     expect(vellum.sends[0]?.payload.remotePushDispatched).toBe(true);
     expect(platform.sends.length).toBe(1);
+    expect(platform.sends[0]?.payload.correlationId).toBe(
+      vellum.sends[0]?.payload.correlationId,
+    );
     expect(platform.sends[0]?.payload.remotePushDispatched).toBeUndefined();
   });
 
@@ -364,6 +404,25 @@ describe("NotificationBroadcaster remotePushDispatched flag", () => {
 
     expect(vellum.sends.length).toBe(1);
     expect(vellum.sends[0]?.payload.remotePushDispatched).toBe(false);
+  });
+
+  test("vellum payload carries platforms accepted before a partial failure", async () => {
+    bothChannelsCopy();
+
+    const vellum = makeCapturingAdapter("vellum");
+    const platform = makeCapturingAdapter("platform", {
+      success: false,
+      error: "FCM failed",
+      remotePushPlatforms: ["ios"],
+    });
+    const broadcaster = new NotificationBroadcaster([
+      vellum.adapter,
+      platform.adapter,
+    ]);
+
+    await broadcaster.broadcastDecision(makeSignal(), bothChannelsDecision());
+
+    expect(vellum.sends[0]?.payload.remotePushPlatforms).toEqual(["ios"]);
   });
 
   test("vellum payload carries false when the platform reports no accepted push (skipped or zero tokens)", async () => {
@@ -461,8 +520,10 @@ describe("NotificationBroadcaster remotePushDispatched flag", () => {
       send(
         payload: ChannelDeliveryPayload,
         destination: ChannelDestination,
+        observer?: ChannelDeliveryObserver,
       ): Promise<DeliveryResult> {
         platformSends.push({ payload, destination });
+        observer?.onRemotePushPlatforms(["ios"]);
         return new Promise<DeliveryResult>((resolve) => {
           resolvePlatform = resolve;
         });
@@ -480,6 +541,7 @@ describe("NotificationBroadcaster remotePushDispatched flag", () => {
     expect(platformSends.length).toBe(1);
     expect(vellum.sends.length).toBe(1);
     expect(vellum.sends[0]?.payload.remotePushDispatched).toBe(false);
+    expect(vellum.sends[0]?.payload.remotePushPlatforms).toEqual(["ios"]);
     expect(results.find((r) => r.channel === "platform")?.status).toBe(
       "pending",
     );

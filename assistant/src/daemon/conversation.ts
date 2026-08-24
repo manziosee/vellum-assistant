@@ -41,6 +41,7 @@ import {
   derefToolResultReReads,
   postTurnTruncateToolResults,
 } from "../context/post-turn-tool-result-truncation.js";
+import { isGuardianCardRow } from "../notifications/approval-card-data.js";
 import { PermissionPrompter } from "../permissions/prompter.js";
 import { SecretPrompter } from "../permissions/secret-prompter.js";
 import type { UserDecision } from "../permissions/types.js";
@@ -96,6 +97,7 @@ import type { OnboardingContext } from "../types/onboarding-context.js";
 import type { AbortReason } from "../util/abort-reasons.js";
 import { UserError } from "../util/errors.js";
 import { getLogger } from "../util/logger.js";
+import { withSqliteRetry } from "../util/sqlite-retry.js";
 import type { WorkspaceGitService } from "../workspace/git-service.js";
 import type { commitTurnChanges } from "../workspace/turn-commit.js";
 import type { AssistantAttachmentDraft } from "./assistant-attachments.js";
@@ -154,7 +156,7 @@ import {
 } from "./conversation-surfaces.js";
 import type {
   SubagentToolGateMode,
-  ToolSetupContext,
+  SubagentToolStats,
   WakeToolContextPin,
 } from "./conversation-tool-setup.js";
 import {
@@ -275,8 +277,8 @@ export interface ConversationConstructorOptions {
    * Give this conversation's LLM calls provider-native (server-side) web
    * search when the resolved provider supports it (see
    * {@link AgentLoopConfig.enableNativeWebSearch}). Set by the subagent manager
-   * for the tool-less advisor consult so it can ground guidance with live web
-   * access; non-native providers get nothing. Defaults to false.
+   * for the advisor consult so it can ground guidance with live web access;
+   * non-native providers get nothing. Defaults to false.
    */
   enableNativeWebSearch?: boolean;
   /**
@@ -318,7 +320,21 @@ export class Conversation {
   /** @internal */ prompter: PermissionPrompter;
   /** @internal */ secretPrompter: SecretPrompter;
   private executor: ToolExecutor;
-  /** @internal */ sendToClient: (msg: AssistantEvent) => void;
+  /**
+   * The conversation's event sink, fixed for its whole life. Top-level
+   * conversations deliver to the SSE hub, so every subscribed client sees
+   * every event without any per-turn wiring; a subagent's sink re-envelopes
+   * its events under the parent conversation. Reached only through
+   * {@link emit}, which also notifies {@link addEventObserver} observers.
+   */
+  private readonly sendToClient: (msg: AssistantEvent) => void;
+  /**
+   * Observers notified after every {@link emit}, in registration order. An
+   * observer sees the event after the sink delivered it, so anything it does
+   * in response (e.g. voice auto-resolving a confirmation) lands on the wire
+   * after the event itself.
+   */
+  private readonly eventObservers = new Set<(msg: AssistantEvent) => void>();
   /** @internal */ workingDir: string;
   /** @internal */ allowedToolNames?: Set<string>;
   /**
@@ -360,6 +376,20 @@ export class Conversation {
    * @internal
    */
   subagentDeniedToolNames = new Set<string>();
+  /**
+   * Machine tool-call counters for this conversation when it runs as a
+   * subagent child. Recorded by the tool executor (gated on {@link isSubagent},
+   * so parent conversations never accumulate anything here) and harvested by
+   * the SubagentManager into the child's state when the run ends, where it
+   * becomes the stats footer on the parent's completion notification and on
+   * `subagent_read`. Ephemeral, never persisted.
+   * @internal
+   */
+  subagentToolStats: SubagentToolStats = {
+    calls: 0,
+    succeeded: 0,
+    filesWritten: new Set<string>(),
+  };
   /**
    * How {@link subagentAllowedTools} is enforced — see
    * {@link SubagentToolGateMode}. Set and restored alongside the allowlist
@@ -420,7 +450,18 @@ export class Conversation {
    * @internal
    */
   currentCallSite?: LLMCallSite;
-  /** @internal */ hasNoClient = false;
+  /**
+   * Whether no human is present to see UI or answer prompts. Derived from the
+   * in-flight turn's interactivity ({@link currentTurnIsNonInteractive}); a
+   * conversation with no turn in flight has no client. Presence is a property
+   * of the turn, never of where events are delivered, so there is no setter:
+   * dispatch paths declare interactivity per turn (`isInteractive` on
+   * `runAgentLoop`, or a wake's pin), and this reads it.
+   * @internal
+   */
+  get hasNoClient(): boolean {
+    return this.currentTurnIsNonInteractive ?? true;
+  }
   /**
    * For subagent conversations, the id of the parent that spawned this one; set
    * once at construction and never reassigned. `undefined` for top-level
@@ -481,6 +522,14 @@ export class Conversation {
    */
   wakePersonaOverride?: SystemPromptPersonaOverride;
   /** @internal */ currentTurnOverrideProfile?: string;
+  /**
+   * The firing's `cron_runs.id` when a schedule triggered the current turn.
+   * Exposed on the live conversation so the tool context can forward it to
+   * delegated LLM work (subagent spawns and messages), whose usage rows then
+   * attribute to the same firing.
+   * @internal
+   */
+  currentTurnCronRunId?: string | null;
   /** @internal */ currentTurnIsNonInteractive?: boolean;
   /** @internal */ currentTurnModelProfileNoticeKey?: string;
   /** @internal */ currentTurnRequestOrigin?: string;
@@ -539,10 +588,22 @@ export class Conversation {
    */
   pendingSteerRepair = false;
   /**
+   * Set by `abortConversation` when a user interrupt (Stop / Esc / the CLI
+   * cancel signal) ends a turn that still has messages queued behind it. Those
+   * messages survive the abort and drain into the next turn, so the drain path
+   * owes them the same synthetic tool_result repair a steer gets: the killed
+   * turn may have left `tool_use` blocks with no results. Unlike
+   * `pendingSteerRepair` this does not promote a single head message. An
+   * interrupt has nothing to promote, so the drain batches the queue the way it
+   * would after any other turn. Cleared after repair.
+   * @internal
+   */
+  pendingInterruptRepair = false;
+  /**
    * When true, side-effect tools must prompt even if a trust/allow rule
    * would auto-allow. Set by non-interactive callers (e.g. non-guardian
    * phone voice) so their auto-deny handler reliably sees a
-   * `confirmation_request` event. See ToolSetupContext.forcePromptSideEffects.
+   * `confirmation_request` event. See `forcePromptSideEffects` below.
    * @internal
    */
   forcePromptSideEffects = false;
@@ -605,7 +666,7 @@ export class Conversation {
   /** @internal */ clientTimezone?: string;
   /**
    * @internal
-   * The client's OS surface ("web" | "ios" | "macos"), reported separately
+   * The client's OS surface, reported separately
    * from the transport `interfaceId` so the assistant's per-turn context can
    * show the real platform without affecting host-proxy/transport gating.
    * This is the LIVE value (re-applied from transport on every inbound
@@ -622,6 +683,23 @@ export class Conversation {
    * @internal
    */
   currentTurnClientOs?: string;
+  /**
+   * @internal
+   * Id of the app the client currently has open on screen, reported by the
+   * client on each message. Drives the per-turn `visible_app:` context line so
+   * the assistant can resolve "the app" to what the user is looking at. This
+   * is the LIVE value; the assembly reads the frozen
+   * {@link currentTurnVisibleAppId}.
+   */
+  visibleAppId?: string;
+  /**
+   * Per-turn frozen copy of {@link visibleAppId}, captured by the agent loop at
+   * turn start for the same reason as {@link currentTurnClientOs}: a queued
+   * message sent from a different view re-applies transport metadata before it
+   * is enqueued, and must not swap the app under the in-flight turn.
+   * @internal
+   */
+  currentTurnVisibleAppId?: string;
   /**
    * Per-turn temporal snapshot frozen by the agent loop and read by
    * `applyRuntimeInjections` to build the `<turn_context>` timezone-mismatch
@@ -705,10 +783,10 @@ export class Conversation {
     this.workingDir = workingDir;
     this.sendToClient = sendToClient;
     this.graphMemory = new ConversationGraphMemory(conversationId);
-    this.prompter = new PermissionPrompter(sendToClient);
+    // The prompter emits through the conversation so its confirmation_request
+    // reaches the sink and every observer (voice policy) like any other event.
+    this.prompter = new PermissionPrompter((msg) => this.emit(msg));
     this.prompter.setOnStateChanged((requestId, state, source, toolUseId) => {
-      // Route through emitConfirmationStateChanged so the event reaches
-      // the client via sendToClient (wired to the SSE hub for HTTP conversations).
       this.emitConfirmationStateChanged({
         conversationId: this.conversationId,
         requestId,
@@ -748,7 +826,7 @@ export class Conversation {
       this.executor,
       this.prompter,
       this.secretPrompter,
-      this as ToolSetupContext,
+      this,
     );
 
     const config = getConfig();
@@ -1041,11 +1119,10 @@ export class Conversation {
       preStrippedCount = boundary === -1 ? slicedDbMessages.length : boundary;
     }
 
-    // The injection-time personal-memory gate, so background/local
-    // conversations (sourceChannel `undefined` or `"vellum"`) can rehydrate
-    // the persisted v2 static memory block. The shared helper folds in the
-    // HTTP-auth-disabled dev bypass so rehydration and injection agree on the
-    // effective trust class.
+    // The injection-time personal-memory gate, so rehydration of the persisted
+    // blocks admits exactly the actors injection would. The shared helper folds
+    // in the HTTP-auth-disabled dev bypass, so a turn with no bound actor
+    // resolves the same way on both paths.
     const personalMemoryAllowed = isPersonalMemoryAllowed(this.trustContext);
     // Pruned v3 card slugs, read lazily on the first row that carries a v3
     // block (most conversations carry none, so most loads never query). The
@@ -1264,6 +1341,16 @@ export class Conversation {
       parsedMessages.length,
     );
     for (const [index, message] of parsedMessages.entries()) {
+      // Applied after the compaction slice, never before it: the slice and
+      // `rowToHistoryIndex` are both computed against the full row list, so
+      // dropping earlier would shift them. A dropped row maps to a null
+      // history index exactly like a fully-injected user row that strips to
+      // nothing. `index` is shared with `slicedDbMessages`, which
+      // `parsedMessages` maps 1:1.
+      if (isGuardianCardRow(slicedDbMessages[index]?.content)) {
+        preRepairIndexBySlicedRow[index] = null;
+        continue;
+      }
       const stripped =
         index < preStrippedCount
           ? stripInjectionsForCompaction([message])
@@ -1366,7 +1453,7 @@ export class Conversation {
       messageCount: this.messages.length,
     });
 
-    this.restoreSurfaceStateFromHistory();
+    this.restoreSurfaceStateFromHistory(parsedMessages);
     this.graphMemory.restoreState();
 
     // Row→history correspondence for this load: slice offset, then the
@@ -1398,14 +1485,19 @@ export class Conversation {
    * populate surfaceState so that findConversationBySurfaceId works for
    * surfaces restored from history (e.g. after daemon restart).
    *
-   * Only scans live (non-compacted) messages in this.messages — not all DB
-   * rows — because surface IDs are not globally unique and restoring stale
-   * compacted surfaces would let findConversationBySurfaceId route actions
-   * to the wrong conversation.
+   * Scans the live (non-compacted) window only, never all DB rows, because
+   * surface IDs are not globally unique and restoring stale compacted
+   * surfaces would let findConversationBySurfaceId route actions to the wrong
+   * conversation.
+   *
+   * Takes that window as rows rather than reading `this.messages`, because a
+   * surface's lifecycle and the model's context are different questions. A
+   * guardian card is absent from `this.messages`, but it is exactly the card
+   * whose Approve/Reject buttons must still route after a restart.
    */
-  private restoreSurfaceStateFromHistory(): void {
+  private restoreSurfaceStateFromHistory(liveWindow: Message[]): void {
     this.surfaceState.clear();
-    for (const msg of this.messages) {
+    for (const msg of liveWindow) {
       if (!Array.isArray(msg.content)) {
         continue;
       }
@@ -1420,11 +1512,12 @@ export class Conversation {
 
   async ensureActorScopedHistory(): Promise<void> {
     const currentTrustClass = this.trustContext?.trustClass;
-    // `loadFromDb` gates personal-memory rehydration on `sourceChannel` too
-    // (via `isPersonalMemoryAllowed`), so a same-trust-class reuse from a
-    // different channel (e.g. internal `vellum` → remote channel) must also
-    // trigger a reload. Otherwise stale personal-memory blocks can leak to
-    // an untrusted remote turn, or be hidden when they should be present.
+    // Tracked alongside the trust class because `loadFromDb` gates
+    // personal-memory rehydration on `isPersonalMemoryAllowed`, which folds in
+    // the disabled-auth elevation of an unbound actor: two contexts can share a
+    // trust class and still differ here. A reuse that changes the answer has to
+    // reload, or stale personal-memory blocks persist into a turn that must not
+    // see them, or stay stripped from one that should.
     const currentPersonalMemoryAllowed = isPersonalMemoryAllowed(
       this.trustContext,
     );
@@ -1437,31 +1530,55 @@ export class Conversation {
     await this.loadFromDb();
   }
 
-  updateClient(
-    sendToClient: (msg: AssistantEvent) => void,
-    hasNoClient = false,
-  ): void {
-    this.sendToClient = sendToClient;
-    this.hasNoClient = hasNoClient;
-    this.prompter.updateSender(sendToClient);
-
-    // Replay last activity state so a reconnecting client sees the current phase
-    // instead of being stuck on the last state it received before disconnection.
-    if (!hasNoClient && this.lastActivityStateMsg) {
+  /**
+   * Deliver an event through the conversation's sink, then to every observer.
+   * The single emission point for conversation-level events (activity state,
+   * confirmation prompts and state, notifier output, out-of-turn pushes); the
+   * agent loop's own stream rides its per-turn `onEvent`, which defaults to
+   * this when the caller passes none.
+   */
+  readonly emit = (msg: AssistantEvent): void => {
+    try {
+      this.sendToClient(msg);
+    } catch (err) {
+      log.warn(
+        { err, conversationId: this.conversationId, type: msg.type },
+        "conversation sink threw",
+      );
+    }
+    for (const observer of this.eventObservers) {
       try {
-        sendToClient(this.lastActivityStateMsg);
+        observer(msg);
       } catch (err) {
         log.warn(
-          { err, conversationId: this.conversationId },
-          "Failed to replay activity state on client reconnection",
+          { err, conversationId: this.conversationId, type: msg.type },
+          "conversation event observer threw",
         );
       }
     }
+  };
+
+  /**
+   * Observe every event this conversation emits, after the sink delivered it.
+   * For policy layered on delivery (voice auto-resolves approval prompts it
+   * has no UI for), not for delivery itself. Returns the disposer.
+   */
+  addEventObserver(observer: (msg: AssistantEvent) => void): () => void {
+    this.eventObservers.add(observer);
+    return () => {
+      this.eventObservers.delete(observer);
+    };
   }
 
-  /** Returns the current sendToClient reference for identity comparison. */
-  getCurrentSender(): (msg: AssistantEvent) => void {
-    return this.sendToClient;
+  /**
+   * Re-emit the last activity state so a client that reconnected mid-phase
+   * sees the current phase instead of the last one it received before
+   * disconnecting. The send route calls this on every interactive send.
+   */
+  replayActivityState(): void {
+    if (this.lastActivityStateMsg) {
+      this.emit(this.lastActivityStateMsg);
+    }
   }
 
   setSubagentAllowedTools(tools: Set<string> | undefined): void {
@@ -1547,38 +1664,45 @@ export class Conversation {
    * Mutate the server-authoritative `processing` flag. Web/Capacitor/CLI
    * caches treat this flag as the source of truth for the avatar streaming
    * ring and thinking indicator, so the `true → false` clear must announce
-   * itself: the daemon flips it in the agent-loop `finally`, which runs after
-   * the user-visible terminal SSE events, and a racing metadata refetch can
-   * otherwise re-read the not-yet-cleared `true` and clobber the client's
+   * itself: the daemon flips it once the finished turn's content is settled,
+   * after the user-visible terminal SSE events, and a racing metadata refetch
+   * can otherwise re-read the not-yet-cleared `true` and clobber the client's
    * optimistic `false`.
    *
    * Emitting a metadata invalidation on the clear lets every client GET the
    * authoritative `false`, per the multi-client-sync contract in AGENTS.md
    * ("emit the invalidation after the canonical state write succeeds").
+   *
+   * The two directions have different failure semantics because the in-memory
+   * flag and the persisted column serve different readers. Acquiring is
+   * strict: a failed persist reverts the in-memory flag and re-throws, so the
+   * caller's existing failure handling runs and the two never disagree about a
+   * turn that is starting. Clearing is not: the in-memory flag is the queue
+   * gate this process enforces, while the column is advisory state for
+   * out-of-process readers that the boot-time stale-processing sweep already
+   * recovers. Reverting a clear because a mirror write lost a race with
+   * SQLITE_BUSY would latch the conversation into "busy" for the rest of the
+   * daemon's life, so the clear always sticks.
    */
   setProcessing(value: boolean): void {
     const wasProcessing = this._processing;
     this._processing = value;
     // Persist the cross-process source of truth so out-of-process callers
     // (retrospective CLI, future detached workers) can detect mid-turn state
-    // by reading the conversations row directly. If the write fails (e.g.
-    // SQLITE_BUSY), the persisted column keeps its prior value, so revert the
-    // in-memory flag to match rather than stranding `processing = true` in
-    // memory against a NULL column. Re-throw so callers' existing failure
-    // handling still runs.
-    try {
-      setConversationProcessingStartedAt(
-        this.conversationId,
-        value ? Date.now() : null,
-      );
-    } catch (err) {
-      this._processing = wasProcessing;
-      throw err;
+    // by reading the conversations row directly.
+    if (value) {
+      try {
+        setConversationProcessingStartedAt(this.conversationId, Date.now());
+      } catch (err) {
+        this._processing = wasProcessing;
+        throw err;
+      }
+    } else {
+      this.mirrorProcessingCleared();
     }
     if (!value && this.idleWaiters.size > 0) {
-      // Notify only after the persisted write above committed — a thrown
-      // write reverts the in-memory flag and re-throws, so waiters must not
-      // observe a release that never happened. Copy-and-clear so a waiter
+      // The in-memory flag is the release, so waiters are notified on it
+      // rather than on the advisory mirror write. Copy-and-clear so a waiter
       // registered from inside a notification can't be re-entered.
       const waiters = [...this.idleWaiters];
       this.idleWaiters.clear();
@@ -1591,6 +1715,37 @@ export class Conversation {
         conversationMetadataSyncTag(this.conversationId),
       ]);
     }
+  }
+
+  /**
+   * Mirror a released processing lock into the advisory `processing_started_at`
+   * column, without ever reporting failure back to the release.
+   *
+   * `withSqliteRetry` runs its first attempt synchronously, so the common case
+   * is the same single write the acquire direction performs; only a contended
+   * write falls back to the backoff retries, which run detached. The retry
+   * re-checks the in-memory flag because a new turn may have acquired the lock
+   * (and written its own timestamp) while the backoff slept, and a late clear
+   * would then blank a column that describes a live turn.
+   */
+  private mirrorProcessingCleared(): void {
+    void withSqliteRetry(
+      () => {
+        if (this._processing) {
+          return;
+        }
+        setConversationProcessingStartedAt(this.conversationId, null);
+      },
+      {
+        op: "conversation:clearProcessing",
+        context: { conversationId: this.conversationId },
+      },
+    ).catch((err: unknown) => {
+      log.error(
+        { err, conversationId: this.conversationId },
+        "Failed to clear the persisted processing marker; the conversation is released in memory and the boot-time stale-processing sweep recovers the column",
+      );
+    });
   }
 
   /**
@@ -1711,7 +1866,7 @@ export class Conversation {
   } {
     return enqueueMessageImpl(this, {
       ...options,
-      onEvent: options.onEvent ?? this.sendToClient,
+      onEvent: options.onEvent ?? this.emit,
     });
   }
 
@@ -1729,8 +1884,13 @@ export class Conversation {
     return this.queue.snapshot();
   }
 
-  removeQueuedMessage(requestId: string): boolean {
-    return this.queue.removeByRequestId(requestId) !== undefined;
+  /**
+   * Drop a queued message by request id. Returns the removed entry so callers
+   * can pair a cancellation event with the same visibility metadata the
+   * enqueue ack used, or `undefined` when nothing matched.
+   */
+  removeQueuedMessage(requestId: string): QueuedMessage | undefined {
+    return this.queue.removeByRequestId(requestId);
   }
 
   canHandoffAtCheckpoint(): boolean {
@@ -1881,14 +2041,7 @@ export class Conversation {
       type: "confirmation_state_changed",
       ...params,
     } as AssistantEvent;
-    try {
-      this.sendToClient(msg);
-    } catch (err) {
-      log.warn(
-        { err, conversationId: this.conversationId },
-        "sendToClient threw in emitConfirmationStateChanged",
-      );
-    }
+    this.emit(msg);
   }
 
   emitActivityState(
@@ -1913,14 +2066,7 @@ export class Conversation {
       ...(statusText ? { statusText } : {}),
     } as AssistantEvent;
     this.lastActivityStateMsg = msg;
-    try {
-      this.sendToClient(msg);
-    } catch (err) {
-      log.warn(
-        { err, conversationId: this.conversationId },
-        "sendToClient threw in emitActivityState",
-      );
-    }
+    this.emit(msg);
   }
 
   /**
@@ -1957,31 +2103,83 @@ export class Conversation {
     }
   }
 
-  async forceCompact(): Promise<ContextWindowResult> {
-    // Report the user-facing before/after using the provider's real tokenizer
-    // (count_tokens) so the `/compact` line matches the context-window
-    // indicator, which reflects the provider's actual reported usage — rather
-    // than the local chars/4 estimate the compaction pipeline runs internally
-    // (it under-counts by ~25% on typical histories). `calculateTokens`
-    // falls back to that estimate when the provider has no count endpoint or
-    // the count call fails, so behavior degrades gracefully.
-    //
-    // Only the *displayed* numbers are overridden — the compaction log and
-    // circuit-breaker accounting inside `runCompaction` keep the estimate-based
-    // figures, leaving calibration and historical logs untouched.
+  /**
+   * Push the conversation's current context-window usage to clients so the
+   * context-window indicator matches the numbers a user-initiated compaction
+   * card reports. Turn-driven compaction needs no push: the turn's own
+   * `usage_update` carries the post-compaction count.
+   *
+   * Defaults to the conversation's own sender, the channel `emitActivityState`
+   * and `context_compacted` already use, so a queued `/compact` reaches the
+   * same client its result card does. Routes that resolve a conversation
+   * outside the send path never wire that sender and pass their own `onEvent`.
+   */
+  private emitContextWindowUsage(
+    tokens: number,
+    maxTokens: number,
+    onEvent?: (msg: AssistantEvent) => void,
+  ): void {
+    try {
+      (onEvent ?? this.emit)({
+        type: "context_window_usage",
+        conversationId: this.conversationId,
+        tokens,
+        maxTokens,
+      });
+    } catch (err) {
+      log.warn(
+        { err, conversationId: this.conversationId },
+        "sendToClient threw in emitContextWindowUsage",
+      );
+    }
+  }
+
+  /**
+   * Run a user-initiated compaction (`run`), reporting its before/after with
+   * the provider's real tokenizer (count_tokens) rather than the local chars/4
+   * estimate the compaction pipeline runs internally (it under-counts by ~25%
+   * on typical histories), and pushing the resulting count to clients.
+   * `calculateTokens` falls back to that estimate when the provider has no
+   * count endpoint or the count call fails, so behavior degrades gracefully.
+   *
+   * Only the *displayed* numbers are overridden: the compaction log and
+   * circuit-breaker accounting inside `runCompaction` keep the estimate-based
+   * figures, leaving calibration and historical logs untouched.
+   *
+   * `run` must leave the compacted history applied to `this.messages`, which
+   * every `runCompaction` path does. `onEvent` overrides the sink the usage
+   * push goes to.
+   */
+  private async runUserCompaction(
+    run: () => Promise<ContextWindowResult>,
+    onEvent?: (msg: AssistantEvent) => void,
+  ): Promise<ContextWindowResult> {
     const before = await this.calculateTokens(this.messages);
-    const result = await this.runCompaction(true);
-    // `runCompaction` applies the compacted history to `this.messages` in
-    // place, so after a successful compaction this re-counts the new history;
-    // a no-op leaves the context unchanged, so before === after.
+    const result = await run();
+    // A no-op leaves the context unchanged, so before === after.
     const after = result.compacted
       ? await this.calculateTokens(this.messages)
       : before;
+    this.emitContextWindowUsage(after, result.maxInputTokens, onEvent);
     return {
       ...result,
       previousEstimatedInputTokens: before,
       estimatedInputTokens: after,
     };
+  }
+
+  /**
+   * `/compact`. `onEvent` is the sink for the context-window usage push, and
+   * callers pass whatever sink they render the result card through: the queue
+   * drain carries the queued item's own `onEvent`, and `sendToClient` is reset
+   * to a no-op once an interactive turn finishes (`process-message.ts`), so a
+   * `/compact` draining behind that turn would otherwise push into nothing
+   * while its card still reaches the client.
+   */
+  async forceCompact(
+    onEvent?: (msg: AssistantEvent) => void,
+  ): Promise<ContextWindowResult> {
+    return this.runUserCompaction(() => this.runCompaction(true), onEvent);
   }
 
   /**
@@ -1996,9 +2194,15 @@ export class Conversation {
    * `resolveMetaSlashCommand`. Throws {@link UserError} (messages are
    * user-facing) when the boundary cannot be resolved or the row→history
    * index mapping cannot be verified.
+   *
+   * `onEvent` is the sink for the context-window usage push. The management
+   * route that owns this action resolves its conversation outside the send
+   * path, so the instance can still hold the store's no-op sender; it passes
+   * the same broadcast path its result card goes out on.
    */
   async summarizeUpToMessage(
     beforeMessageId: string,
+    onEvent?: (msg: AssistantEvent) => void,
   ): Promise<ContextWindowResult> {
     const priorTrustContext = this.trustContext;
     if (!resolveCapabilities(priorTrustContext?.trustClass).canAccessMemory) {
@@ -2078,17 +2282,22 @@ export class Conversation {
           firstRowByHistoryIndex[historyIndex] = rowIndex;
         }
       }
-      return await this.runCompaction(true, undefined, {
-        fixedTailStartIndex: tailIndex,
-        // When repair merged preceding continuation rows into the boundary's
-        // message, the row boundary retreats to the message's first
-        // contributing row: the summary call reads messages[0..tailIndex),
-        // which excludes the merged rows' content, so the image manifest and
-        // watermarks must not treat them as summarized.
-        fixedBoundaryRowIndex:
-          firstRowByHistoryIndex[tailIndex] ?? boundaryRowIndex,
-        fixedBoundaryRowView: { rows, firstRowByHistoryIndex },
-      });
+      return await this.runUserCompaction(
+        () =>
+          this.runCompaction(true, undefined, {
+            fixedTailStartIndex: tailIndex,
+            // When repair merged preceding continuation rows into the
+            // boundary's message, the row boundary retreats to the message's
+            // first contributing row: the summary call reads
+            // messages[0..tailIndex), which excludes the merged rows' content,
+            // so the image manifest and watermarks must not treat them as
+            // summarized.
+            fixedBoundaryRowIndex:
+              firstRowByHistoryIndex[tailIndex] ?? boundaryRowIndex,
+            fixedBoundaryRowView: { rows, firstRowByHistoryIndex },
+          }),
+        onEvent,
+      );
     } finally {
       // Only undo the temporary guardian context this method installed. If
       // trustContext was legitimately updated at an `await` boundary, the
@@ -2263,11 +2472,11 @@ export class Conversation {
     ) {
       await this.agentLoop.compactionCircuit.recordOutcome(
         result.summaryFailed,
-        this.sendToClient,
+        this.emit,
       );
     }
     if (result.compacted) {
-      await applyCompactionResult(this, result, this.sendToClient, null, {
+      await applyCompactionResult(this, result, this.emit, null, {
         slackContextCompactionWatermarkTs:
           fixedBoundarySlackWatermarkTs ??
           getSlackCompactionWatermarkForPrefix(
@@ -2328,6 +2537,54 @@ export class Conversation {
 
   getAuthContext(): AuthContext | undefined {
     return this.authContext;
+  }
+
+  /**
+   * Trust the in-flight turn is executing under.
+   *
+   * Use this for authorization and for routing a reply to the requester:
+   * cases where substituting the conversation's owner would be wrong rather
+   * than approximate. Provenance is not such a case; see
+   * {@link getTurnOrRestingTrust} and `docs/architecture/turn-actor.md`.
+   *
+   * `undefined` when no turn recorded one, which is a gap in the entry point
+   * rather than an answer. Deliberately does not fall back to the
+   * conversation's trust: a caller that can accept the conversation's owner
+   * instead spells `?? getTrustContext()`, so the substitution is visible
+   * where it happens.
+   */
+  getTurnTrust(): TrustContext | undefined {
+    return this.currentTurnTrustContext;
+  }
+
+  /**
+   * Trust of the actor the conversation belongs to, independent of any turn.
+   *
+   * Use this where there is no turn to speak of: routes reporting on a
+   * conversation, hydration, and persisting conversation-level options. A
+   * caller that wants the conversation's owner *rather than* whoever is
+   * currently acting should be obviously doing so; if it is not obvious,
+   * {@link getTurnTrust} is probably the one meant.
+   */
+  getTrustContext(): TrustContext | undefined {
+    return this.trustContext;
+  }
+
+  /**
+   * Trust of the in-flight turn, or the conversation's owner when the turn
+   * recorded none. The substitution is in the name: callers that can accept
+   * the owner as a stand-in ask this, including provenance stamping, whose
+   * readers treat an absent trust class as more trusted than `"unknown"`.
+   * Callers for which the owner would be wrong rather than approximate call
+   * {@link getTurnTrust} and handle `undefined`.
+   *
+   * The fallback half is load-bearing, not transitional politeness: a
+   * deferred wake fires with no inbound actor, and refusing it an answer
+   * denies every sensitive tool in the resumed turn (LUM-2929). It becomes
+   * removable in one place when every entry point records a turn actor.
+   */
+  getTurnOrRestingTrust(): TrustContext | undefined {
+    return this.currentTurnTrustContext ?? this.trustContext;
   }
 
   /**
@@ -2396,6 +2653,10 @@ export class Conversation {
 
   applyClientOsFromTransport(transport: ConversationTransportMetadata): void {
     this.clientOs = transport.clientOs ?? undefined;
+  }
+
+  applyVisibleAppFromTransport(transport: ConversationTransportMetadata): void {
+    this.visibleAppId = transport.visibleAppId ?? undefined;
   }
 
   setAssistantId(assistantId: string | null): void {
@@ -2471,6 +2732,8 @@ export class Conversation {
       titleText?: string;
       /** See {@link runAgentLoopImpl} — hidden machine-signal turn marker. */
       isHiddenPrompt?: boolean;
+      /** See {@link runAgentLoopImpl}: triggering row's daemon-authored kind. */
+      messageKind?: string;
       /**
        * See {@link runAgentLoopImpl}: the row the end-of-turn reply
        * notification treats as the prompt this turn answers.
@@ -2499,6 +2762,12 @@ export class Conversation {
        * forwarded into {@link runAgentLoopImpl} and threaded to `recordUsage`.
        */
       cronRunId?: string | null;
+      /**
+       * See {@link runAgentLoopImpl}: trust this turn runs under. Queue
+       * drains pass the sender's trust captured at enqueue so the run is not
+       * reset to the conversation's most recent actor.
+       */
+      turnTrustContext?: TrustContext;
     },
   ): Promise<void> {
     const { onEvent, ...rest } = options ?? {};
@@ -2506,7 +2775,7 @@ export class Conversation {
       this,
       content,
       userMessageId,
-      onEvent ?? this.sendToClient,
+      onEvent ?? this.emit,
       rest,
     );
   }
@@ -2532,7 +2801,7 @@ export class Conversation {
     this.cacheWarmAbort = undefined;
     return processMessageImpl(this, {
       ...options,
-      onEvent: options.onEvent ?? this.sendToClient,
+      onEvent: options.onEvent ?? this.emit,
     });
   }
 
@@ -2560,6 +2829,7 @@ export class Conversation {
     actionId: string,
     data?: Record<string, unknown>,
     sourceActorPrincipalId?: string,
+    requesterTrustContext?: TrustContext,
   ): Promise<SurfaceActionResult> {
     return handleSurfaceActionImpl(
       this,
@@ -2567,6 +2837,7 @@ export class Conversation {
       actionId,
       data,
       sourceActorPrincipalId,
+      requesterTrustContext,
     );
   }
 

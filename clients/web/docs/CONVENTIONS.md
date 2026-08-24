@@ -50,7 +50,7 @@ to hide irrelevant sections.
 
 ```
 routes.tsx
-  <App />            ← shared shell (nav, layout, providers)
+  <RootLayout />     ← shared shell (nav, layout, providers)
     <Outlet />
       <ChatPage />           ← lifecycle guards → mounts ActiveChatView
       <LibraryPage />        ← library listing
@@ -59,7 +59,7 @@ routes.tsx
 
 Push hooks down to the route component that needs them. Lift shared
 state to the nearest common ancestor — typically a layout route or a
-context provider mounted in `<App />`.
+context provider mounted in `<RootLayout />`.
 
 ### Layout header slots
 
@@ -276,10 +276,12 @@ src/
   utils/                           # cross-domain shared utilities
     conversation-cache.ts          #   low-level read/write over conversation caches
     conversation-cache-mutations.ts #  domain-level cache mutation helpers
+    conversation-list-keys.ts      #   generated conversationsGet keys + filter for every list cache
+    conversation-list-options.ts   #   the one queryOptions factory behind every list cache
     conversation-list-fetchers.ts  #   pure async fetch functions for conversation lists
     conversation-transforms.ts     #   daemon → client field mapping
-    format.ts
-    browser.ts
+    format-date.ts
+    semver.ts
   types/                           # cross-domain shared types (no owning module)
     window.d.ts
     event-types.ts
@@ -290,11 +292,12 @@ src/
     feature-flags/                 #   feature flag provider
     sync/                          #   server state sync (query-tag keys, sync types)
     streaming/                     #   SSE transport, event parsing, debug tracking
-    api-client.ts                  #   HeyAPI configured client + interceptors
+    api-interceptors.ts            #   HeyAPI client interceptors (auth, routing)
     telemetry/                     #   client identity for daemon registration
   runtime/                         # framework adapters, platform bridges
     native-auth.ts
-    route-adapter.ts
+    native-deep-link.ts
+    event-sources/                 #   event-bus signal sources
   components/                      # cross-domain shared UI
 ```
 
@@ -415,25 +418,24 @@ conversations (Slack, email, Telegram) have keys like
 **Rules:**
 
 1. **API queries from web must send `conversationId` (the UUID), never
-   `conversationKey`.** Assistant 0.8.5+ accepts `conversationId` on
+   `conversationKey`.** Assistant 0.8.6+ accepts `conversationId` on
    `POST /v1/messages` and `GET /v1/events` and looks it up directly
    against the `conversations` table. The version gate that picks
-   between `conversationId` (>= 0.8.5) and the legacy `conversationKey`
-   (< 0.8.5) lives in
+   between `conversationId` (>= 0.8.6) and the legacy `conversationKey`
+   (< 0.8.6, or version not yet known) lives in
    [`lib/backwards-compat/conversation-id-wire-field.ts`](../src/lib/backwards-compat/conversation-id-wire-field.ts).
    The legacy `conversationKey` path is supported indefinitely for
-   non-vellum channel adapters (Telegram, WhatsApp, etc.), but web
-   code never uses it.
+   non-vellum channel adapters (Telegram, WhatsApp, etc.); web code
+   reaches it only through that gate, never by hand.
 
    ```ts
    // Correct
    query: { conversationId }
    ```
 
-2. **URL route params carry UUIDs.** The route param is currently named
-   `:conversationKey` for historical reasons but the value must be a
-   UUID. Never put a channel-scoped key (e.g. `default:slack:C0123`)
-   in the URL.
+2. **URL route params carry UUIDs.** The route param is
+   `:conversationId` and the value must be a UUID. Never put a
+   channel-scoped key (e.g. `default:slack:C0123`) in the URL.
 
 3. **When the codebase says `conversationKey`, read it as "the
    identifier we route by" — which for web is always a UUID.** The
@@ -478,10 +480,10 @@ owns it.
 | `assistant/` | Core business-domain code for the assistant itself — the central concept every feature composes around. Every domain may depend on it; it depends on no domain. New top-level business-concept folders require explicit team approval. | `api.ts`, `lifecycle.ts`, `types.ts`, `llm-model-catalog.ts` |
 | `stores/` | App-level Zustand stores (cross-domain state) | `viewer-store.ts`, `sse-connected-store.ts`, `assistant-feature-flag-store.ts` |
 | `hooks/` | Cross-domain React hooks | `use-is-mobile.ts`, `use-visible-viewport.ts`, `use-feature-flag-bus-sync.ts` |
-| `utils/` | Pure utility functions (no side effects, no third-party SDKs) | `format.ts`, `browser.ts`, `network-status.ts`, `stable-id.ts` |
+| `utils/` | Pure utility functions (no side effects, no third-party SDKs) | `format-date.ts`, `semver.ts`, `to-error.ts`, `create-selectors.ts` |
 | `types/` | Cross-domain shared type definitions with no clear owning module. Types consumed by a single module live with that module. Types produced by a module live in the module that produces them — consumers use `import type`. | `window.d.ts`, `event-types.ts`, `conversation-types.ts` |
-| `lib/` | Third-party SDK wrappers and app-internal infrastructure (registries, transports, interceptors). Side effects, module-level state, or lifecycle ownership. See [`lib/` vs `utils/`](#lib-vs-utils--where-does-my-code-go) below. | `sentry/` (error reporting), `auth/` (allauth + CSRF), `feature-flags/` (catalog + registry), `sync/` (state sync), `streaming/` (SSE transport), `event-bus.ts` (pub/sub registry), `diagnostics.ts` (session ring buffer), `api-client.ts` (HeyAPI) |
-| `runtime/` | Framework adapters and native platform bridges | `route-adapter.ts`, `native-auth.ts`, `native-deep-link.ts`, `app-bridge.ts` |
+| `lib/` | Third-party SDK wrappers and app-internal infrastructure (registries, transports, interceptors). Side effects, module-level state, or lifecycle ownership. See [`lib/` vs `utils/`](#lib-vs-utils--where-does-my-code-go) below. | `sentry/` (error reporting), `auth/` (allauth + CSRF), `feature-flags/` (catalog + registry), `sync/` (state sync), `streaming/` (SSE transport), `event-bus.ts` (pub/sub registry), `diagnostics.ts` (session ring buffer), `api-interceptors.ts` (HeyAPI) |
+| `runtime/` | Framework adapters and native platform bridges | `native-auth.ts`, `native-deep-link.ts`, `platform-detection.ts`, `event-sources/` |
 | `components/` | Cross-domain shared UI | `error-boundary.tsx`, `sign-in-gate.tsx`, `providers.tsx` |
 
 | `generated/` | Auto-generated code (HeyAPI, catalogs) | `api/`, `catalogs/` |
@@ -494,7 +496,7 @@ owns it.
 | **Side effects?** | Yes — module-level state, listener registration, SDK init, interceptors, or pub/sub registries | No — pure input→output, no global state, no I/O |
 | **Third-party SDK dependency?** | Optional — third-party wrappers (`@sentry/react`, `@heyapi/client-fetch`) AND first-party infrastructure (`event-bus.ts`, `chunk-errors.ts`, `local-mode.ts`) both belong here | No — only standard library / language utilities |
 | **Subdirectories?** | When a single integration warrants multiple files (`lib/sentry/`, `lib/auth/`, `lib/sync/`); single-file infrastructure stays at the `lib/` top level (`lib/diagnostics.ts`, `lib/event-bus.ts`) | Flat — individual utility files at the top level |
-| **Examples** | `lib/sentry/sentry-init.ts`, `lib/auth/allauth-client.ts`, `lib/api-client.ts`, `lib/event-bus.ts`, `lib/diagnostics.ts`, `lib/chunk-errors.ts` | `utils/format.ts`, `utils/browser.ts`, `utils/cn.ts` |
+| **Examples** | `lib/sentry/sentry-init.ts`, `lib/auth/allauth-client.ts`, `lib/api-interceptors.ts`, `lib/event-bus.ts`, `lib/diagnostics.ts`, `lib/chunk-errors.ts` | `utils/format-date.ts`, `utils/semver.ts`, `utils/to-error.ts` |
 
 If the code holds state at module scope, registers global listeners,
 configures an SDK, manages a session, or runs at startup, it belongs
@@ -555,7 +557,7 @@ flow through a single event bus. See
 
 Quick summary:
 
-- **One SSE connection per tab.** Only `useEventBusInit` calls `subscribeChatEvents`; every other consumer subscribes to `bus.sse.event`.
+- **One SSE connection per tab.** Only `useEventBusInit` calls `sseService.attach()`; every other consumer subscribes to `bus.sse.event`.
 - **No per-component `visibilitychange` listeners** for data-refresh. Subscribe to `bus.app.resume` / `bus.app.hidden` instead.
 - **No `window.online` / `window.offline` listeners** in components or stores. Subscribe to `bus.app.online` / `bus.app.offline`.
 - **No polling** for state the daemon could push. Emit a typed event over `/v1/events` and subscribe via the bus.
@@ -711,6 +713,62 @@ imperative write.
 Reference: `lib/commit-pressure.ts` — the probe that measures this
 traffic and attaches it to error-185 Sentry events.
 
+### Don't measure an element to give back the space you took from it
+
+If you position something absolutely and then reserve its measured height
+as padding somewhere else, the absolute positioning bought nothing: the
+element ends up occupying exactly the space normal flow would have given
+it. What you have built is flow layout, reimplemented in JavaScript, at
+the cost of a `ResizeObserver`, a piece of state, an effect, and usually
+a prop threaded through someone else's component. `ChatBody`'s nudge
+banner did this for six weeks and put the component in the error-185
+family (LUM-2927).
+
+Ask which of the two things you actually want:
+
+- **It needs space.** Make it a flow sibling and let flexbox size it. A
+  `flex-1` neighbour gives back exactly the right height at every
+  viewport, for free, with nothing to keep in sync.
+- **It floats over content.** Reserve nothing, like the scroll-to-latest
+  pill. Measure only when content must scroll _behind_ it and the
+  scrollport's own padding is what keeps the tail reachable, which is the
+  one case that genuinely needs a number
+  (`side-menu-overlay-bottom-column.tsx`).
+
+Putting both kinds in one positioned container is what forces the
+measurement, because the container can only have one layout behavior.
+
+When you do need a live box, `hooks/use-element-size.ts` already exists.
+
+### Never key an effect on a `ReactNode` prop
+
+An element is a fresh object on every render of whoever created it, so
+`useEffect(fn, [someNode])` re-runs `fn` in _every_ commit for as long as
+that node is mounted. When `fn` measures the DOM, swaps an observer, or
+calls `setState`, that is per-commit work landing in the commit stream,
+and it feeds the same counter described above (LUM-3062, LUM-2927).
+
+Key on what actually changed instead: a boolean for "is it mounted", an
+id for "which one is it". Note that re-keying alone is not a fix if the
+node can be swapped underneath you: sibling slots in one parent are
+matched by index and element type, so mounting an unkeyed sibling can
+hand your observed node to a different subtree while the effect sleeps.
+
+The same reasoning applies one level up, to any hook returning an object:
+
+```ts
+// Avoid: a fresh object every render busts every downstream useMemo,
+// which remints the elements built from it, which re-runs any effect
+// keyed on those elements.
+return { bannerShouldShow, handleDismiss };
+
+// Good
+return useMemo(
+  () => ({ bannerShouldShow, handleDismiss }),
+  [bannerShouldShow, handleDismiss],
+);
+```
+
 ---
 
 ## Framework strategy
@@ -795,9 +853,15 @@ Reference: [Vite — SSR guidance](https://vite.dev/guide/ssr.html)
 ### `packages/design-library/`
 
 Domain-agnostic UI primitives (Button, Card, Modal, Typography, etc.)
-live in `packages/design-library/` outside `clients/web/`. The package is
-consumed as a `file:` dependency and resolved via its `exports` field
-in `package.json` — no Vite alias or tsconfig `paths` needed.
+live in `packages/design-library/` outside `clients/web/`. The package is a
+`workspace:*` dependency resolved via its `exports` field in `package.json`,
+so Vite serves it as source and edits hot-update live. No Vite alias or
+tsconfig `paths` needed.
+
+**Do not convert it to a `file:` dependency.** A `file:` dep (especially
+paired with `preserveSymlinks` or a per-package React install) resolves a
+second copy of React and white-screens the app. See
+[`clients/web/AGENTS.md`](../AGENTS.md) for the full constraint.
 
 ```ts
 import { Button, Typography } from "@vellumai/design-library";
@@ -841,8 +905,8 @@ export function ChatMarkdownMessage(props: ChatMarkdownMessageProps) {
 ```
 
 For component authoring conventions (React 19 ref-as-prop, `data-slot`,
-variant patterns, file organization), see
-[`packages/design-library/README.md`](../../../packages/design-library/README.md).
+variant patterns, file organization, story rules), see
+[`packages/design-library/AGENTS.md`](../../../packages/design-library/AGENTS.md).
 
 References:
 - [Node.js — Package exports](https://nodejs.org/api/packages.html#exports)
@@ -1092,6 +1156,10 @@ wrapping the SPA.
 ---
 
 ## Platform gating
+
+"Platform" here means the Vellum platform (hosting and auth), not the device
+platform. For surfaces that differ across desktop, iOS, and Android, see
+[`PLATFORM_ADAPTATION.md`](./PLATFORM_ADAPTATION.md).
 
 The web app can run in three auth/hosting configurations that affect
 which UI surfaces are available:
@@ -1362,6 +1430,33 @@ the `Vellum-Organization-Id` header and uses bearer auth instead.
   files. Files pass individually but may fail in a full `bun test` run.
   CI uses `bun run test:ci` (each file in its own subprocess) to
   guarantee isolation.
+- **Type a `mock.module()` factory against the module it replaces.**
+  An untyped factory is an object literal nobody checks, so when the real
+  module grows a field the stub silently keeps returning the old shape.
+  The consumer reads `undefined`, and `undefined` is falsy, so it flips
+  branches rather than throwing and the suite stays green while testing
+  behavior the app no longer has.
+
+  ```ts
+  import type * as ConversationQueries from "@/hooks/conversation-queries";
+
+  mock.module(
+    "@/hooks/conversation-queries",
+    (): Partial<typeof ConversationQueries> => ({
+      useSectionConversationListQuery: () => ({ ... }),
+    }),
+  );
+  ```
+
+  `Partial<>` keeps you free to stub only the exports you need, while
+  still checking the shape of the ones you do stub. This is not
+  hypothetical: a section hook gained a `hasData` field, three mocks kept
+  returning the old shape, and every section silently fell back to its
+  derived rows, and the tests passed because nothing was being filtered
+  rather than because it was. Typing the factories also surfaced four
+  older stubs that had been missing `isLoading` / `isError` / `refetch`
+  the whole time.
+
 - **Run tests:**
   ```bash
   bun test src/path/to/file.test.ts  # single file (fast)
@@ -1412,19 +1507,32 @@ renders correctly given the data it actually receives in production.
   the app, and harder to spot. Hex in sample _data_ is fine (an avatar
   color the component receives as a prop): the line is whether the value
   styles the story or is the fixture.
-- **Pin a viewport when the component is responsive.** Components with
-  `max-md:` variants key off the *viewport*, so at a narrow window a
-  story silently renders the mobile treatment while still passing a
-  desktop variant. Set `globals: { viewport: { value: ... } }` on the
-  meta (viewport is built into Storybook core, no addon needed). Note
-  this holds the **Canvas** only: every story on a docs page shares one
-  iframe, so no per-story viewport applies in **Docs**, and that iframe
-  runs roughly 300px narrower than the browser window.
+- **Stories start at a desktop width; name a viewport only to leave it.**
+  Components with `max-md:` variants key off the *viewport*, so at a
+  narrow window a story would silently render the mobile treatment while
+  still passing a desktop variant. `.storybook/preview.tsx` starts every
+  story at the shared `sbDesktop` option from `.storybook/viewports.ts`,
+  and the toolbar still switches to `sbMobile`. A story that documents
+  the mobile treatment sets `globals: { viewport: { value: "sbMobile",
+  isRotated: false } }` on its meta, naming an option from that shared
+  list rather than declaring its own. This holds the **Canvas** only:
+  every story on a docs page shares one iframe, so no viewport global
+  applies in **Docs**, and that iframe runs roughly 300px narrower than
+  the browser window.
+
+- **One router, configured through `parameters.router`.** The preview mounts
+  the only router a story gets; a story that mounts its own crashes the
+  canvas, since React Router rejects a `<Router>` inside another. A story
+  that needs a particular address or route params declares
+  `parameters: { router: { initialEntries, paths } }`, listing every route
+  pattern it navigates between: a component that navigates to an address no
+  pattern matches renders nothing rather than failing.
 
 References:
 - [Storybook - Writing stories](https://storybook.js.org/docs/writing-stories)
 - [Storybook - Decorators](https://storybook.js.org/docs/writing-stories/decorators)
 - [Storybook - Viewport](https://storybook.js.org/docs/essentials/viewport)
+- [React Router - MemoryRouter](https://reactrouter.com/api/declarative-routers/MemoryRouter)
 
 ---
 

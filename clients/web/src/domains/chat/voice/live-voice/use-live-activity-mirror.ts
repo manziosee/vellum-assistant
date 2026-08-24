@@ -1,15 +1,25 @@
 /**
  * `useLiveActivityMirror()` — mirrors the running live-voice session into the
- * iOS Live Activity (the Dynamic Island and Lock Screen presence for a session
- * that otherwise lives entirely in the web layer).
+ * platform's out-of-app session surface: the Dynamic Island and Lock Screen on
+ * iOS, the floating panel on macOS. Both are presence for a session that
+ * otherwise lives entirely in the web layer.
+ *
+ * **One snapshot, two sinks.** The payload is identical because the two
+ * surfaces show the same facts, so the content is computed once here and
+ * handed to whichever transport the host has: `runtime/native-live-activity`
+ * (Capacitor → ActivityKit) and `runtime/desktop-voice-activity` (Electron IPC
+ * → BrowserWindow). Each no-ops off its own host, so this hook needs no
+ * platform branch of its own. A mirror that asked "which platform am I on"
+ * would have to be updated for each new surface, whereas a sink that answers
+ * "not mine" degrades on its own.
  *
  * Mounted by {@link useLiveVoiceSessionController}, so the mirror's lifetime is
  * exactly the session's. It is deliberately a *separate module* from the
  * controller: the controller owns session lifecycle, this owns an optional
  * platform flourish. Nothing here may reach the session — every bridge call
- * goes through `runtime/native-live-activity`, which no-ops off iOS, on an
- * older App Store shell, and when the user has turned Live Activities off in
- * Settings (see that module's skew contract), and is then fired and forgotten.
+ * no-ops off its host, on an older shell, and when the user has turned Live
+ * Activities off in Settings (see each module's skew contract), and is then
+ * fired and forgotten.
  *
  * **Everything runs inside an effect**, reading the store through
  * {@link subscribeSettledLiveVoiceState} rather than a reactive selector. The
@@ -24,11 +34,15 @@
  * **Updates are pushed only when the content actually changes.** ActivityKit
  * rate-limits updates and silently drops the overflow, so an activity that
  * spends its budget on redundant pushes stops reflecting the session at all.
+ * The desktop panel has no such budget (it is local IPC), but it is fed from
+ * the same comparison anyway: two sinks diverging on *when* they update is how
+ * the two surfaces would come to show different things.
  * The mirror therefore reads only what a `ContentState` is built from (phase,
  * reconnecting, `assistantAudioActive` for the label remap, muted, accent) and
  * compares each candidate against the last payload it pushed. `inputAmplitude`
  * is never read: it changes per animation frame and would exhaust the budget
- * within a second.
+ * within a second. `activityLabel` is read and is safe to: the daemon emits it
+ * only on a change it wants surfaced, a few times per turn at most.
  */
 
 import { useEffect } from "react";
@@ -54,6 +68,11 @@ import {
   type VoiceLiveActivityContent,
   type VoiceLiveActivityStart,
 } from "@/runtime/native-live-activity";
+import {
+  endVoiceActivity,
+  startVoiceActivity,
+  updateVoiceActivity,
+} from "@/runtime/desktop-voice-activity";
 import { encodeAvatarForIsland } from "@/utils/avatar-island-encode";
 import type { AvatarRender } from "@/utils/avatar-render";
 import { useAssistantIdentityStore } from "@/stores/assistant-identity-store";
@@ -76,14 +95,15 @@ function toActivityContent(
   }
   return {
     phase: session.state,
-    // The room's label, verbatim — the same `liveVoiceSurfaceLabel` call the
-    // room makes, including both its "Reconnecting…" relabel and its
-    // silent-`speaking` → "Thinking…" remap — so the island never has wording
-    // of its own to drift from.
+    // The room's label, verbatim: the same `liveVoiceSurfaceLabel` call the
+    // room makes, including its "Reconnecting…" relabel, its
+    // silent-`speaking` to "Thinking…" remap, and its muted-`listening` to
+    // "Muted" remap, so the island never has wording of its own to drift from.
     label: liveVoiceSurfaceLabel(
       session.state,
       session.reconnecting,
       session.assistantAudioActive,
+      session.muted,
     ),
     // The accent the avatar (and therefore the voice room) renders. `""` for
     // an avatar with no color to match: the native side canonicalizes
@@ -92,6 +112,21 @@ function toActivityContent(
     // not an attribute, so it is not frozen at `start`.
     accentHex: getRenderedAvatarAccentHex() ?? "",
     muted: session.muted,
+    // Only this path carries it — the APNs path composes content from the
+    // push registration, which has no `outputMuted` in it. See the field's
+    // docs in `native-live-activity.ts`.
+    outputMuted: session.outputMuted,
+    // The daemon's wording, verbatim, for the same reason the phase label is
+    // the room's wording verbatim: the island has a second driver (the APNs
+    // push the daemon dispatches while this layer is suspended) and the two
+    // must render the same thing.
+    detail: session.activityLabel,
+    // Arrives on the same frame as the line above and is the other half of the
+    // same fact: `detail` says the turn is waiting, this says which decision
+    // it is waiting on, and only the second one makes the island's buttons
+    // answerable. `""` for a turn that is not waiting, which is the state a
+    // session spends nearly all of its time in.
+    approvalRequestId: session.pendingApprovalRequestId ?? "",
   };
 }
 
@@ -146,10 +181,17 @@ async function startWithAvatar(
   if (start === null) {
     return;
   }
-  await startVoiceLiveActivity({
+  const payload = {
     ...start,
     ...(avatarBase64 ? { avatarBase64 } : {}),
-  });
+  };
+  // Handed to both sinks unchanged. `VoiceActivityStart`'s `phase` is the same
+  // vocabulary as `ActiveLiveVoiceSessionState`, restated in the IPC contract
+  // rather than imported across the package boundary. This assignment is what
+  // holds the two in step, so a phase added to the store without a matching
+  // case in `@vellumai/ipc-contract` fails to compile here.
+  startVoiceActivity(payload);
+  await startVoiceLiveActivity(payload);
 }
 
 /** Whether two payloads would render the same island. */
@@ -161,7 +203,13 @@ function sameContent(
     a.phase === b.phase &&
     a.label === b.label &&
     a.accentHex === b.accentHex &&
-    a.muted === b.muted
+    a.muted === b.muted &&
+    a.outputMuted === b.outputMuted &&
+    a.detail === b.detail &&
+    // Compared as well as pushed: a wait can be entered and left without the
+    // rest of the content moving at all, and an island whose buttons outlive
+    // the decision behind them is worse than one that never had any.
+    a.approvalRequestId === b.approvalRequestId
   );
 }
 
@@ -189,13 +237,16 @@ export function useLiveActivityMirror(): void {
     let pushToken: string | null = null;
     /**
      * What was last registered with the platform, as `token:assistant:
-     * conversation`.
+     * conversation:accent:muted`.
      *
-     * All three matter and none of them is stable: the token rotates, and a
-     * session started from a draft has no conversation id until the server's
-     * `ready` assigns one — registering against `null` and never revisiting it
-     * would leave the activity addressable by nothing. Comparing the triple
-     * re-registers when any part moves and stays quiet when none does.
+     * Every part matters and none is stable: the token rotates; a session
+     * started from a draft has no conversation id until the server's `ready`
+     * assigns one; registering against `null` and never revisiting it would
+     * leave the activity addressable by nothing; and the accent and mute state
+     * are content the platform composes its pushes from, so a stale
+     * registration would push the island back to whatever they were at start.
+     * Comparing the whole tuple re-registers when any part moves and stays
+     * quiet when none does.
      */
     let registeredKey: string | null = null;
 
@@ -206,7 +257,10 @@ export function useLiveActivityMirror(): void {
      * This is what lets the island keep updating after iOS suspends this web
      * view — see `live-activity-push-registration.ts`.
      */
-    const syncPushRegistration = (session: LiveVoiceState): void => {
+    const syncPushRegistration = (
+      session: LiveVoiceState,
+      content: VoiceLiveActivityContent,
+    ): void => {
       const { assistantId, conversationId } = session;
       if (
         pushToken === null ||
@@ -215,16 +269,19 @@ export function useLiveActivityMirror(): void {
       ) {
         return;
       }
-      const key = `${pushToken}:${assistantId}:${conversationId}`;
+      const { accentHex, muted } = content;
+      const key = `${pushToken}:${assistantId}:${conversationId}:${accentHex}:${String(muted)}`;
       if (key === registeredKey) {
         return;
       }
       registeredKey = key;
-      void registerLiveActivityPushToken(
-        pushToken,
+      void registerLiveActivityPushToken({
+        token: pushToken,
         assistantId,
         conversationId,
-      );
+        accentHex,
+        muted,
+      });
     };
 
     const sync = (session: LiveVoiceState): void => {
@@ -243,10 +300,11 @@ export function useLiveActivityMirror(): void {
         registeredKey = null;
         void unregisterLiveActivityPushToken();
         void endVoiceLiveActivity();
+        endVoiceActivity();
         return;
       }
 
-      syncPushRegistration(session);
+      syncPushRegistration(session, content);
 
       if (pushed === null) {
         pushed = content;
@@ -278,6 +336,7 @@ export function useLiveActivityMirror(): void {
       }
       pushed = content;
       void updateVoiceLiveActivity(content);
+      updateVoiceActivity(content);
     };
 
     // A session can already be running when this mounts — the controller
@@ -292,21 +351,29 @@ export function useLiveActivityMirror(): void {
     const unsubscribeToken = subscribeVoiceLiveActivityPushToken(
       ({ token }) => {
         pushToken = token;
-        syncPushRegistration(useLiveVoiceStore.getState());
+        const session = useLiveVoiceStore.getState();
+        const content = toActivityContent(session);
+        // A token for a session that has already ended registers nothing: the
+        // activity it addresses is on its way out, and the `end` path has
+        // already dropped the registration.
+        if (content !== null) {
+          syncPushRegistration(session, content);
+        }
       },
     );
 
     return () => {
       unsubscribe();
       unsubscribeToken();
-      // An activity that outlives its mirror sits on the Lock Screen showing a
-      // phase nothing is driving.
+      // A surface that outlives its mirror sits on the Lock Screen, or floats
+      // over the desktop, showing a phase nothing is driving.
       if (pushed !== null) {
         pushed = null;
         pushToken = null;
         registeredKey = null;
         void unregisterLiveActivityPushToken();
         void endVoiceLiveActivity();
+        endVoiceActivity();
       }
     };
   }, []);

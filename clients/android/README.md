@@ -51,8 +51,45 @@ For local development, pick the `devDebug` variant in Android Studio. If you
 sync a different `VELLUM_ENVIRONMENT`, build the matching flavor so the WebView
 origin and native auth host agree.
 
-Launcher and splash colors also distinguish production, staging, and dev
-installs.
+Launcher colors distinguish production, staging, and dev installs. The launch
+screen follows the saved app appearance, falling back to the Android light or
+dark setting until the web app has stored a preference. Android's app night
+mode keeps the OS splash and native overlay on the same theme. Android 11 and
+older skip the OS preview window so the themed native overlay is the first app
+frame.
+
+## HTTPS App Links
+
+Each flavor claims only its own web host. The verified routes are the app root,
+pairing, conversations, voice settings, OAuth completion, and billing pages.
+Other paths stay in the browser. Incoming links navigate the existing WebView
+with their query string and fragment intact.
+
+A shell paired to a self-hosted assistant keeps its current server when a
+Vellum Cloud App Link arrives. App Links do not interrupt pairing or switch a
+self-hosted WebView to Vellum Cloud.
+
+Android verifies a claim only after the matching host serves
+`/.well-known/assetlinks.json` with HTTP 200, `application/json`, and no
+redirect. Each statement must use the application ID in the Build Variants
+table and real SHA-256 fingerprints for every certificate that signs that
+flavor. Play App Signing fingerprints must come from Play Console. Do not use
+an upload-certificate fingerprint as a substitute.
+
+The existing custom schemes remain supported for native auth, pairing, billing
+completion, and voice commands. HTTPS App Links are additive.
+
+After the Digital Asset Links file is deployed, install the matching build on
+a physical device and check verification with:
+
+```bash
+adb shell pm get-app-links ai.vellum.assistant
+adb shell am start -a android.intent.action.VIEW \
+  -c android.intent.category.BROWSABLE \
+  -d 'https://www.vellum.ai/assistant/conversations/conv-xyz?message=message-123#reply'
+```
+
+Use the suffixed application ID and matching host when checking staging or dev.
 
 ## Native Auth
 
@@ -75,15 +112,38 @@ vellum-assistant-dev://connect?url=https%3A%2F%2Fassistant.example.com&code=devi
 ```
 
 The production and staging builds use their matching auth schemes from the
-Build Variants table. Scanning a connect link switches the native shell to the
-validated server, opens `<server>/assistant/pair`, and keeps an existing server
-path prefix intact. Cold and warm app launches use the same route.
+Build Variants table. An optional `name=<label>` parameter supplies a
+user-facing label; the value is trimmed and a blank label is treated as
+absent. Scanning a connect link switches the native shell to the validated
+server, opens `<server>/assistant/pair`, and keeps an existing server path
+prefix intact. Cold and warm app launches use the same route.
 
-Only the validated server base is saved after the pairing page loads. The
-one-time device code is kept out of app preferences and the generated
-Capacitor configuration. HTTPS is required except for `localhost`, `127.0.0.1`,
-and the Android emulator host alias `10.0.2.2`. Use `adb reverse` when a physical
-development device needs to reach a service through `localhost`.
+Only the validated server base is saved after the pairing page loads; the
+same deferred write appends the server, with its label, to the remembered
+list. The one-time device code is kept out of app preferences and the
+generated Capacitor configuration. HTTPS is required except for `localhost`,
+`127.0.0.1`, and the Android emulator host alias `10.0.2.2`. Use `adb reverse`
+when a physical development device needs to reach a service through
+`localhost`.
+
+Paired servers accumulate in a remembered list, stored as JSON `{name?, url}`
+entries in the same `self_hosted_server` SharedPreferences file as the active
+server. Entries are keyed by the canonical URL the web chooser's
+`normalizeOriginUrl` also computes (scheme-default ports collapse, trailing
+slashes are stripped, and percent-escape casing and interior duplicate
+separators are preserved), so both sides agree on which strings mean the same
+HTTPS server. The cleartext development hosts are the exception: the web
+normalizer rejects every non-HTTPS URL, so an `http://localhost`-style server
+stays in the native list and remains switchable through a connect link, but
+never surfaces as a chooser card.
+
+The web assistant chooser is the management surface. The `SelfHostedServers`
+Capacitor plugin exposes the list to it and handles switch and forget
+(`list`/`add`/`remove`/`switchTo`/`switchToPath`). Switching recreates the
+activity so Capacitor starts on a configuration rebuilt around the new
+`server.url`; that configuration loads `<base>/assistant`, so a hosting path
+prefix survives the ingress redirect that would otherwise drop it. Forgetting
+the active server returns the shell to Vellum Cloud the same way.
 
 If Android terminates the app before the pairing page loads, scan the connect
 link again. The shell intentionally does not save the one-time code for process
@@ -110,8 +170,52 @@ are disabled, and token values are never written to logs or crash metadata.
 The `VoiceAudioSession` plugin requests transient voice-communication audio focus while a live voice session is active. Calls and competing media produce the same interruption payload used by iOS.
 Wired and Bluetooth changes are nonfatal, duckable audio does not end voice, and focus is released when voice ends or the activity closes so interrupted media can resume.
 
-Microphone capture and the voice socket remain in the foreground WebView. No microphone foreground service is used.
-Physical-device background validation has not been completed, so app switching and screen locking are not supported as background voice behavior.
+The same lifecycle starts `VoiceModeService` while the app is visible and the
+microphone permission is active. This microphone foreground service keeps the
+WebView-owned capture, playback, and voice socket running when the screen locks
+or the user switches apps. It stops with audio focus when voice ends, fails, or
+the activity is torn down.
+
+## Voice Status and Launch Surfaces
+
+`VoiceLiveActivity` mirrors the active web voice session into the foreground
+service's one stable ongoing notification. Connecting, listening,
+transcribing/thinking, and speaking update that notification in place. Ending,
+failure, app reset, activity teardown, and process recovery remove it. Tapping
+it sends the shared
+`<scheme>://voice?mode=resume` command, whose web consumer restores the room for
+the conversation that owns the live session. It never creates a second voice
+session.
+
+On Android 16, the notification requests promoted Live Update treatment only
+when the system reports that promoted notifications are enabled and the built
+notification is eligible. Every supported Android version uses the required
+foreground-service notification as the baseline. Notification permission is
+never requested by the plugin, so voice continues normally when Android hides
+the notification from the notification drawer.
+
+The launcher exposes New chat and Start voice shortcuts. Users may also add the
+Start voice Quick Settings tile. The tile exists only while Android invokes its
+`TileService`; tapping it opens the app and hands the same start command to the
+web layer. It does not capture audio or retain a background process.
+Gradle renders `app/src/main/shortcuts.xml` with an explicit target for each
+flavor, so side-by-side installations cannot receive one another's shortcuts.
+
+The only registered Google Assistant App Action is the official
+`OPEN_APP_FEATURE` built-in intent, with New chat and Voice mode as its inline
+inventory. Android has no supported built-in intent whose semantics match
+asking Vellum a free-form question or managing a live voice session, so those
+Assistant surfaces are intentionally not advertised.
+
+Physical-device validation is still required for Android 16 promotion,
+notification permission changes, launcher shortcut ingestion, Quick Settings
+tile addition, background voice, lock-screen notification taps, and warm/cold
+voice launches.
+
+## Native notifications
+
+Android registers FCM on `vellum-alerts`, renders foreground pushes once, and handles background pushes and taps.
+FCM needs Play services and untracked `google-services.json`; failures retry on resume.
 
 ## Structure
 
@@ -131,9 +235,15 @@ clients/
     │       │   ├── MainActivity.java
     │       │   ├── NativeAuthPlugin.java
     │       │   ├── NativeBiometricPlugin.java
+    │       │   ├── NativeLaunchScreenPlugin.java
     │       │   ├── BiometricTokenStore.java
     │       │   ├── SelfHostedServer.java
+    │       │   ├── SelfHostedServersPlugin.java
     │       │   ├── VoiceAudioSessionPlugin.java
+    │       │   ├── VoiceDeepLink.java
+    │       │   ├── VoiceLiveActivityPlugin.java
+    │       │   ├── VoiceModeService.java
+    │       │   ├── VoiceQuickSettingsTileService.java
     │       │   └── WorkOSAuth.java
     │       └── res/              # Vellum icon, splash, colors, file paths
     ├── build.gradle
@@ -193,10 +303,14 @@ annotations and methods are retained by `app/proguard-rules.pro`.
 
 `.github/workflows/release-android.yaml` is the reusable Android release
 workflow. It builds a signed AAB, retains it as an artifact, and uploads it to
-the matching Play internal track. Production-track promotion remains manual.
+the matching Play internal track through the Android Publisher API. The
+publisher uses Google's official Android Publisher client and repository-owned
+code, not an external Play publishing action. Production-track promotion
+remains manual.
+When Firebase configuration is available, the workflow validates that it
+matches the selected flavor before including it in the build.
 
-Configure these environment-scoped GitHub secrets independently for `dev`,
-`staging`, and `production`:
+Configure these shared repository-level GitHub secrets once:
 
 | Secret | Format |
 |--------|--------|
@@ -204,30 +318,81 @@ Configure these environment-scoped GitHub secrets independently for `dev`,
 | `ANDROID_UPLOAD_KEYSTORE_PASSWORD` | Upload keystore password |
 | `ANDROID_UPLOAD_KEY_ALIAS` | Upload key alias |
 | `ANDROID_UPLOAD_KEY_PASSWORD` | Upload key password |
-| `GOOGLE_PLAY_SERVICE_ACCOUNT_JSON` | Raw Play service account JSON |
 
-Never commit the keystore, credentials, or decoded secret material. The
-workflow removes restored signing files even when a build fails.
+Configure the optional `ANDROID_FIREBASE_CONFIG_B64` secret independently on
+the `dev`, `staging`, and `production` GitHub environments. Each value must be
+the base64-encoded `google-services.json` for that environment's package.
 
-After all prerequisites and environment secrets are ready, set the repository
-variable `ANDROID_RELEASE_ENABLED` to `true`. Until then, both orchestrators
-skip Android distribution so existing releases remain unaffected.
+The publish job authenticates without a JSON key by using the existing
+environment-scoped `GCP_WORKLOAD_IDENTITY_PROVIDER` and `GCP_SERVICE_ACCOUNT`
+GitHub variables. `GCP_SERVICE_ACCOUNT` must match the environment's
+`assistant_deploy_service_account_email` Terraform output.
+
+Never commit Firebase configuration, the keystore, or decoded secret material.
+The workflow removes restored files even when a build fails.
+
+`ANDROID_FIREBASE_CONFIG_B64` remains optional so signing and internal
+distribution do not depend on push setup. When it is absent, the workflow emits
+a warning and the resulting AAB has no native push support. When it is present,
+malformed base64, invalid JSON, or a package mismatch fails the build.
+
+After completing the prerequisites and GitHub configuration, enable Android
+distribution independently with these repository variables:
+
+| Variable | Release workflow |
+|----------|------------------|
+| `ANDROID_DEV_RELEASE_ENABLED` | Dev releases |
+| `ANDROID_STAGING_RELEASE_ENABLED` | Staging releases |
+| `ANDROID_PRODUCTION_RELEASE_ENABLED` | Production releases |
+
+Set only `ANDROID_DEV_RELEASE_ENABLED` to `true` to test the dev app on its Play
+internal track. Leave the staging and production variables unset or set to
+`false` until those apps are ready. A missing or non-`true` variable skips the
+matching Android distribution job. Manually dispatch the **Dev Release**
+workflow to run the dev release immediately instead of waiting for its hourly
+schedule.
 
 ### Manual Play Prerequisites
 
 Complete the following setup before enabling internal-track uploads:
 
-1. Create Play Console apps for `ai.vellum.assistant`,
+1. Apply the platform Terraform stacks that enable the Android Publisher API
+   in the dev, staging, and production GCP projects.
+2. Create Play Console apps for `ai.vellum.assistant`,
    `ai.vellum.assistant.staging`, and
    `ai.vellum.assistant.dev`.
-2. Enable Play App Signing for each app and create one controlled upload key.
-3. Upload and roll out one signed AAB to each app's internal track manually.
+3. Enable Play App Signing for each app and create one controlled upload key.
+4. Upload and roll out one signed AAB to each app's internal track manually.
    Google Play requires this initial release before the Publisher API can
    upload a completed release.
-4. Grant the release service account permission to publish to each app's
-   internal track, then configure the environment-scoped secrets above.
-5. Complete each Play listing, privacy policy, Data Safety form, content rating,
-   and the declarations required for microphone permissions.
+5. In Play Console, grant each environment's `GCP_SERVICE_ACCOUNT` access only
+   to its matching app, with **View app information (read-only)** and
+   **Release apps to testing tracks**. Do not grant production publishing.
+6. Configure the repository and environment secrets above.
+7. Complete each Play listing, privacy policy, Data Safety form, content rating,
+   and the declarations required for microphone and camera permissions.
 
 Before wider rollout, test the internal-track AAB on a physical device and
 verify its identity, web origin, authentication, keyboard, and file sharing.
+
+### Manual Firebase Prerequisites
+
+Create a separate Firebase Android app in each matching Firebase project:
+
+| GitHub environment | Android package ID |
+|--------------------|--------------------|
+| `production` | `ai.vellum.assistant` |
+| `staging` | `ai.vellum.assistant.staging` |
+| `dev` | `ai.vellum.assistant.dev` |
+
+For each app, download its `google-services.json`, encode it without line
+breaks, and save the result as the `ANDROID_FIREBASE_CONFIG_B64` secret on the
+matching GitHub Environment:
+
+```bash
+base64 < google-services.json | tr -d '\n'
+```
+
+Do not reuse a Firebase file across environments. After configuring the
+secret, verify push registration and notification delivery from an
+internal-track install on a physical device.

@@ -12,8 +12,14 @@
 export * from "./types";
 export * from "./schemas";
 export {
+  type ElectronHostOS,
+  type LocalConnectImportResult,
+  type LocalListDevicesResult,
+  type LocalPairedDeviceRecord,
+  type LocalRevokeDeviceResult,
   type LocalUpgradeOptions,
   type LocalWakeOptions,
   type VellumBridge,
+  VELLUM_BRIDGE_KEYS,
 } from "./bridge";
 export * from "./channels";

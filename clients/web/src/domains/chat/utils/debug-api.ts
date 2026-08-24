@@ -33,6 +33,7 @@ import {
 import { fetchConversationMessages as defaultFetchConversationMessages } from "@/domains/chat/api/messages";
 import { useStreamStore } from "@/domains/chat/stream-store";
 import type {
+  PendingAcpConnectState,
   PendingConfirmationState,
   PendingContactRequestState,
   PendingQuestionState,
@@ -47,6 +48,7 @@ import {
 import type { DisplayMessage } from "@/domains/chat/types/types";
 import type { ReconcileActiveConversationResult } from "@/domains/chat/hooks/use-message-reconciliation";
 import { setImpersonatedAssistantVersion } from "@/lib/backwards-compat/impersonate-version-flag";
+import { toggleAppIframeSandboxDisabled } from "@/lib/app-sandbox-debug-flag";
 import { classifyScrollPosition } from "@/domains/chat/transcript/transcript-scroll-utils";
 import type { TranscriptHandle } from "@/domains/chat/transcript/transcript";
 import type { TranscriptItem } from "@/domains/chat/transcript/types";
@@ -136,20 +138,27 @@ export interface ChatDebugThinkingDoneSignal {
  * snapshot never carries tool-call argument values.
  */
 export interface PendingInteractionsSnapshot {
+  submittingByKind: Record<string, string | null>;
   pendingSecret: PendingSecretState | null;
-  isSubmittingSecret: boolean;
   pendingConfirmation: PendingConfirmationState | null;
-  isSubmittingConfirmation: boolean;
   pendingContactRequest: PendingContactRequestState | null;
-  isSubmittingContactRequest: boolean;
   pendingQuestion: PendingQuestionState | null;
-  isSubmittingQuestion: boolean;
   /** True while the question card is hidden but `pendingQuestion` is set —
    *  the composer free-text intercept still routes to `submitQuestionResponse`. */
   isQuestionCardDismissed: boolean;
   /** Tool-call id paired with the currently-rendered inline confirmation,
    *  or `null` when no inline confirmation is active. */
   inlineConfirmationToolCallId: string | null;
+  /** The inline "Connect Claude Code" prompt currently raised by a failed
+   *  `acp_spawn`, or `null` when no Connect card is showing. */
+  pendingAcpConnect: PendingAcpConnectState | null;
+  /** Tool-call ids whose Connect card was dismissed in this session, sorted
+   *  so the dump is stable across captures. A dismissed id suppresses the
+   *  card even when the same failure is replayed by a resync. */
+  dismissedAcpConnectToolUseIds: string[];
+  /** True while a completed connect flow is waiting for the chat view to
+   *  fire its hidden continuation send. */
+  pendingAcpContinue: boolean;
 }
 
 /**
@@ -609,11 +618,13 @@ export function createChatDebugApi(refs: ChatDebugRefs): ChatDebugApi {
     if (conditions.hasUncompletedVisibleSurface) {
       failingConditions.push("hasUncompletedVisibleSurface");
     }
-    if (!(
-      conditions.isThinking ||
-      conditions.restoredProcessing ||
-      !conditions.hasStreamingAssistantMessage
-    )) {
+    if (
+      !(
+        conditions.isThinking ||
+        conditions.restoredProcessing ||
+        !conditions.hasStreamingAssistantMessage
+      )
+    ) {
       failingConditions.push("streamingAssistantMessageActive");
     }
     if (conditions.hasStreamingAssistantThinking) {
@@ -832,7 +843,7 @@ export function createChatDebugApi(refs: ChatDebugRefs): ChatDebugApi {
       "  .serverMessages()          [experimental] fetch /v1/history and return the server snapshot response (messages + seq)",
       "                              (diff against getClientMessages() manually in the console)",
       "  .listPendingInteractions() frontend-tracked pending prompts (secret/confirmation/",
-      "                              contact-request/question) and submission flags",
+      "                              contact-request/question/acp-connect) and submission flags",
       "  .getScrollState()          scroll geometry + pagination — why can't I scroll up?",
       "                              .diagnosis gives a human-readable summary",
       "  .getDiagnostics(prefix?)   main diagnostics ring (per-delta SSE / drop gates / history applies),",
@@ -871,9 +882,9 @@ const API_NS = "api";
 
 /**
  * Dev-only toggle surface. Each function is a single-purpose imperative
- * flip — call from the console to flip a localStorage-persisted flag.
- * Toggles that change React hook ordering or module-load constants
- * reload the page so the new value takes effect cleanly.
+ * flip, called from the console. Toggles that change React hook ordering
+ * or module-load constants reload the page so the new value takes effect
+ * cleanly; the rest apply in place.
  */
 export interface VellumDebugFlagsApi {
   /** Override the assistant's reported version for every version-gated
@@ -888,6 +899,19 @@ export interface VellumDebugFlagsApi {
    *
    *  Returns the value in effect after the call. */
   impersonateVersion(value?: string | null): string | null;
+  /** Render app iframes without their `sandbox` attribute, giving the
+   *  app document the host's origin so origin-gated APIs
+   *  (`getDisplayMedia()`, …) work. Costs the isolation the sandbox
+   *  buys, so it is off by default and lives only in memory: a reload
+   *  restores the sandbox.
+   *
+   *  - `toggleAppsSandboxDisabled()`      : flip the current value.
+   *  - `toggleAppsSandboxDisabled(true)`  : drop the sandbox.
+   *  - `toggleAppsSandboxDisabled(false)` : restore it.
+   *
+   *  Open apps reload in place, so no page reload is needed. Returns the
+   *  value in effect after the call. */
+  toggleAppsSandboxDisabled(value?: boolean): boolean;
 }
 
 interface VellumDebugRoot extends Record<string, unknown> {
@@ -914,8 +938,9 @@ declare global {
  *   - `api` — the full `@vellumai/assistant-api` namespace, so a developer
  *     can pull canonical SSE schemas (`RelationshipStateUpdatedEventSchema`, …)
  *     out of the shipped bundle from the console.
- *   - `flags` — dev-toggleable feature flags (`impersonateVersion`).
- *     Stable singleton; pure module exports backed by localStorage.
+ *   - `flags`: dev-toggleable feature flags (`impersonateVersion`,
+ *     `toggleAppsSandboxDisabled`). Stable singleton; pure module
+ *     exports over localStorage and in-memory flag state.
  *
  * Consolidating these into one installer guarantees they're set at the
  * same time and torn down together, so DevTools never sees one namespace
@@ -1007,6 +1032,7 @@ export function useChatDebugApi(refs: ChatDebugRefs): void {
     const api = createChatDebugApi(stableRefs);
     const flagsApi: VellumDebugFlagsApi = {
       impersonateVersion: setImpersonatedAssistantVersion,
+      toggleAppsSandboxDisabled: toggleAppIframeSandboxDisabled,
     };
     const uninstall = installVellumDebugApi(api, flagsApi);
     return uninstall;

@@ -1,3 +1,4 @@
+import { useTranslation } from "@/i18n";
 /**
  * Devin-style chat view for an ACP run. Assembles the projected chat blocks
  * into a streaming conversation, with the usage meter in the header, a nested
@@ -11,16 +12,17 @@
 
 import {
   ArrowDown,
-  ArrowLeft,
+  ArrowDownToLine,
+  ArrowUpFromLine,
+  ChevronLeft,
   ChevronRight,
   Send,
-  Square,
-  X,
 } from "lucide-react";
 import { useCallback, useMemo, useState, type FormEvent } from "react";
 
 import { Button, Typography } from "@vellumai/design-library";
 
+import { DetailShellHeader } from "@/components/detail-shell";
 import {
   useAcpRunChatBlocks,
   type AcpChatBlock,
@@ -46,11 +48,15 @@ import {
   type AcpFileChange,
 } from "@/domains/chat/components/acp-run-chat-view/acp-chat-tool-card";
 import { AcpChatUserTurn } from "@/domains/chat/components/acp-run-chat-view/acp-chat-user-turn";
-import { AcpUsageMeter } from "@/domains/chat/components/acp-run-chat-view/acp-usage-meter";
 import { CommandOutputView } from "@/domains/chat/components/acp-run-chat-view/command-output-view";
 import { FileDiffView } from "@/domains/chat/components/acp-run-chat-view/file-diff-view";
 import { useStickToBottom } from "@/domains/chat/components/acp-run-chat-view/use-stick-to-bottom";
 import { AcpAgentIcon } from "@/domains/chat/components/acp-run-inline-card/acp-agent-icon";
+import { DetailPanelStopButton } from "@/domains/chat/components/detail-panel-stop-button";
+import {
+  AnimatedMetricCard,
+  formatNumber,
+} from "@/domains/chat/components/metric-card";
 import { StatusBadgePill } from "@/domains/chat/components/status-badge-pill";
 import { steerAcpRun, stopAcpRun } from "@/domains/chat/utils/acp-run-actions";
 import { acpRunStatusBadge, isActiveAcpStatus } from "@/utils/acp-run-status";
@@ -86,13 +92,25 @@ type ActiveDetail =
 export interface AcpRunChatViewProps {
   entry: AcpRunEntry;
   onClose: () => void;
+  /**
+   * Assistant that owns the run's parent conversation. `entry` carries no id
+   * of its own: the ACP run store is populated from that conversation's
+   * stream. Threaded to every markdown block so workspace file references
+   * resolve against the right workspace.
+   */
+  assistantId?: string | null;
 }
 
 // ---------------------------------------------------------------------------
 // Main component
 // ---------------------------------------------------------------------------
 
-export function AcpRunChatView({ entry, onClose }: AcpRunChatViewProps) {
+export function AcpRunChatView({
+  entry,
+  onClose,
+  assistantId,
+}: AcpRunChatViewProps) {
+  const { t } = useTranslation("chat");
   const isRunning = isActiveAcpStatus(entry.status);
 
   const events = useAcpRunStore(
@@ -227,7 +245,10 @@ export function AcpRunChatView({ entry, onClose }: AcpRunChatViewProps) {
               newText={activeDiff?.newText}
             />
           ) : (
-            <CommandOutputView content={activeToolBlock?.content} />
+            <CommandOutputView
+              content={activeToolBlock?.content}
+              assistantId={assistantId}
+            />
           )}
         </div>
       ) : (
@@ -237,6 +258,37 @@ export function AcpRunChatView({ entry, onClose }: AcpRunChatViewProps) {
             data-testid="acp-chat-conversation"
             className="flex h-full flex-col gap-4 overflow-y-auto px-5 py-5"
           >
+            {(entry.inputTokens !== undefined ||
+              entry.outputTokens !== undefined) && (
+              <div
+                className="grid grid-cols-2 gap-3"
+                data-testid="acp-run-metrics"
+              >
+                <AnimatedMetricCard
+                  icon={
+                    <ArrowDownToLine
+                      className="h-4 w-4 shrink-0"
+                      style={{ color: "var(--content-secondary)" }}
+                    />
+                  }
+                  target={entry.inputTokens ?? 0}
+                  format={(n) => formatNumber(Math.round(n))}
+                  label={t("acpRunChatView.inputLabel")}
+                />
+                <AnimatedMetricCard
+                  icon={
+                    <ArrowUpFromLine
+                      className="h-4 w-4 shrink-0"
+                      style={{ color: "var(--content-secondary)" }}
+                    />
+                  }
+                  target={entry.outputTokens ?? 0}
+                  format={(n) => formatNumber(Math.round(n))}
+                  label={t("acpRunChatView.outputLabel")}
+                />
+              </div>
+            )}
+
             <ObjectiveSection task={entry.task} />
 
             {/* Blocks render on a vertical timeline rail with a dot on action
@@ -264,6 +316,7 @@ export function AcpRunChatView({ entry, onClose }: AcpRunChatViewProps) {
                     isTerminal={isTerminal}
                     onOpenDiff={handleOpenDiff}
                     onOpenOutput={handleOpenOutput}
+                    assistantId={assistantId}
                   />
                 </AcpChatTimelineBlock>
               ))}
@@ -285,8 +338,8 @@ export function AcpRunChatView({ entry, onClose }: AcpRunChatViewProps) {
               size="compact"
               iconOnly={<ArrowDown />}
               onClick={scrollToLatest}
-              aria-label="Go to newest"
-              tooltip="Go to newest"
+              aria-label={t("acpRunChatView.goToNewest")}
+              tooltip={t("acpRunChatView.goToNewest")}
               data-testid="acp-chat-scroll-to-latest"
               className="absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full shadow-md"
             />
@@ -321,6 +374,7 @@ function ChatViewHeader({
   showBack?: boolean;
   onBack?: () => void;
 }) {
+  const { t } = useTranslation("chat");
   const [stopping, setStopping] = useState(false);
 
   // Stop-reason-aware so a run cancelled mid-flight (completed + cancelled)
@@ -336,50 +390,39 @@ function ChatViewHeader({
   }, [entry.acpSessionId]);
 
   return (
-    <div className="flex shrink-0 items-center gap-3 border-b border-[var(--border-hover)] px-5 py-4">
-      {showBack && (
-        <Button
-          variant="outlined"
-          iconOnly={<ArrowLeft />}
-          onClick={onBack}
-          aria-label="Back to conversation"
-          tooltip="Back"
-          data-testid="acp-chat-diff-back"
-          className="shrink-0 rounded-lg"
-        />
-      )}
-      <AcpAgentIcon agent={entry.agent} className="h-5 w-5 shrink-0" />
-      <Typography
-        variant="title-medium"
-        title={entry.agent}
-        className="min-w-0 shrink truncate leading-snug text-[var(--content-default)]"
-      >
-        {entry.agent}
-      </Typography>
-      <StatusBadgePill color={statusBadge.color} label={statusBadge.label} />
-      <span className="flex-1" />
-      <AcpUsageMeter entry={entry} />
-      {isRunning && (
-        <button
-          type="button"
-          aria-label="Stop run"
-          onClick={handleStop}
-          disabled={stopping}
-          className="flex h-8 shrink-0 cursor-pointer items-center gap-1.5 rounded-lg border border-[var(--system-negative-strong)] bg-transparent px-2.5 py-1.5 text-[var(--system-negative-strong)] transition-colors hover:bg-[var(--system-negative-weak)] disabled:cursor-default disabled:opacity-50"
-        >
-          <Square className="h-3 w-3" fill="currentColor" />
-          <Typography variant="label-small-default">Stop</Typography>
-        </button>
-      )}
-      <Button
-        variant="outlined"
-        iconOnly={<X />}
-        onClick={onClose}
-        aria-label="Close run detail"
-        tooltip="Close"
-        className="shrink-0 rounded-lg"
-      />
-    </div>
+    <DetailShellHeader
+      icon={
+        <>
+          {showBack && (
+            <Button
+              variant="outlined"
+              iconOnly={<ChevronLeft />}
+              onClick={onBack}
+              aria-label={t("acpRunChatView.backToConversationAria")}
+              tooltip={t("acpRunChatView.backTooltip")}
+              data-testid="acp-chat-diff-back"
+              className="shrink-0"
+            />
+          )}
+          <AcpAgentIcon agent={entry.agent} className="h-5 w-5 shrink-0" />
+        </>
+      }
+      title={entry.agent}
+      headerTrailing={
+        <StatusBadgePill color={statusBadge.color} label={statusBadge.label} />
+      }
+      headerActions={
+        isRunning ? (
+          <DetailPanelStopButton
+            onStop={handleStop}
+            ariaLabel={t("acpRunChatView.stopRunAria")}
+            disabled={stopping}
+          />
+        ) : undefined
+      }
+      closeLabel={t("acpRunChatView.closeRunDetail")}
+      onClose={onClose}
+    />
   );
 }
 
@@ -388,6 +431,7 @@ function ChatViewHeader({
 // ---------------------------------------------------------------------------
 
 function ObjectiveSection({ task }: { task: string | undefined }) {
+  const { t } = useTranslation("chat");
   if (!task) {
     return null;
   }
@@ -398,7 +442,7 @@ function ObjectiveSection({ task }: { task: string | undefined }) {
         as="h3"
         className="mb-1 text-[var(--content-emphasised)]"
       >
-        Objective
+        {t("acpRunChatView.objective")}
       </Typography>
       <Typography
         variant="body-medium-lighter"
@@ -421,12 +465,15 @@ function ChatBlock({
   isTerminal,
   onOpenDiff,
   onOpenOutput,
+  assistantId,
 }: {
   block: AcpChatBlock;
   /** When the run is terminal, force trailing live agent/thinking blocks complete. */
   isTerminal: boolean;
   onOpenDiff: (toolCallId: string, fileChange: AcpFileChange) => void;
   onOpenOutput: (toolCallId: string) => void;
+  /** Assistant that owns the run's parent conversation. */
+  assistantId?: string | null;
 }) {
   switch (block.kind) {
     case "user":
@@ -436,6 +483,7 @@ function ChatBlock({
         <AcpChatAgentMessage
           content={block.content}
           isComplete={block.isComplete || isTerminal}
+          assistantId={assistantId}
         />
       );
     case "thinking":
@@ -443,6 +491,7 @@ function ChatBlock({
         <AcpChatThinkingBlock
           content={block.content}
           isComplete={block.isComplete || isTerminal}
+          assistantId={assistantId}
         />
       );
     case "tool":
@@ -464,6 +513,7 @@ function ChatBlock({
 // ---------------------------------------------------------------------------
 
 function SteerComposer({ acpSessionId }: { acpSessionId: string }) {
+  const { t } = useTranslation("chat");
   const [input, setInput] = useState("");
   const [pending, setPending] = useState(false);
 
@@ -516,9 +566,9 @@ function SteerComposer({ acpSessionId }: { acpSessionId: string }) {
           type="text"
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          placeholder="Steer the run…"
+          placeholder={t("acpRunChatView.steerPlaceholder")}
           disabled={pending}
-          aria-label="Steering instruction"
+          aria-label={t("acpRunChatView.steerAria")}
           className="text-body-medium-default min-w-0 flex-1 bg-transparent text-[color:var(--content-default)] placeholder:text-[color:var(--content-tertiary)] focus:outline-none disabled:opacity-50"
         />
         <Button
@@ -527,7 +577,7 @@ function SteerComposer({ acpSessionId }: { acpSessionId: string }) {
           size="compact"
           iconOnly={<Send />}
           disabled={pending || input.trim() === ""}
-          aria-label="Send steering instruction"
+          aria-label={t("acpRunChatView.sendSteerAria")}
           className="shrink-0"
         />
       </div>

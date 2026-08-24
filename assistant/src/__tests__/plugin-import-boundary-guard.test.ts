@@ -99,7 +99,6 @@ const BASELINE: Record<string, readonly string[]> = {
     "../../../../../security/untrusted-content.js",
     "../../../../api/events/memory-recalled.js",
     "../../../../api/responses/memory-v3-selection-log.js",
-    "../../../../channels/types.js",
     "../../../../config/assistant-feature-flags.js",
     "../../../../config/default-profile-catalog.js",
     "../../../../config/loader.js",
@@ -115,6 +114,12 @@ const BASELINE: Record<string, readonly string[]> = {
     "../../../../config/skill-state.js",
     "../../../../config/skills.js",
     "../../../../config/types.js",
+    // Same host module the retrospective job couples to (the `../../../`
+    // entry below): the sweep job and v2 router warm the guardian-delivery
+    // cache before their sync `resolveUserName` reads so worker-process
+    // prompts address the guardian instead of the default profile. No
+    // plugin-api equivalent.
+    "../../../../contacts/guardian-delivery-reader.js",
     "../../../../context/token-estimator.js",
     "../../../../daemon/conversation-error.js",
     "../../../../daemon/conversation-notices.js",
@@ -224,9 +229,15 @@ const BASELINE: Record<string, readonly string[]> = {
     "../../../util/sqlite-retry.js",
     "../../../util/strip-comment-lines.js",
     "../../../util/truncate.js",
+    "../../../util/worker-compute.js",
     "../../../util/worker-memory.js",
     "../../../util/worker-process.js",
     "../../types.js",
+    // The memory jobs worker runs as its own OS process and hosts real agent
+    // conversations, so it registers the host's default-plugin hook and
+    // injector surface at startup (hooks only, no init hooks). Host-owned
+    // composition with no plugin-api equivalent.
+    "../../worker-plugin-surface.js",
     "../injection-presence.js",
     "../injector-order.js",
     "@qdrant/js-client-rest",

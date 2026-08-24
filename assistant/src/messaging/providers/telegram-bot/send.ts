@@ -13,6 +13,7 @@ import { getLogger } from "../../../util/logger.js";
 import {
   callTelegramBotApi,
   callTelegramBotApiMultipart,
+  type TelegramMessage,
   TelegramNonRetryableError,
 } from "./api.js";
 import { renderTelegramHtml } from "./render.js";
@@ -121,18 +122,66 @@ function buildInlineKeyboard(approval: ApprovalUIMetadata): {
 // Public API
 // ---------------------------------------------------------------------------
 
+/** Outcome of a Telegram reply send. */
+export interface TelegramSendResult {
+  /**
+   * Channel-native id of the last sent chunk (the message carrying the
+   * inline keyboard when an approval was attached). Callers that need to
+   * address the message later (e.g. approval-card withdrawal) persist this.
+   * Undefined when the API response did not carry a message id.
+   */
+  lastMessageId?: string;
+}
+
 /**
  * Send a Telegram text reply, splitting long messages and optionally
  * attaching inline keyboard buttons for approval prompts.
  */
+/**
+ * Replace a Telegram message in place.
+ *
+ * Telegram rejects an edit whose text already matches the message. That is the
+ * request having been satisfied rather than a failure, so it resolves. Every
+ * other rejection throws: an edit that quietly became a new message would
+ * leave the original sitting beside it, which reads as answering twice.
+ *
+ * Unlike a send, this cannot split long text across messages, because an edit
+ * addresses exactly one. Telegram rejects text past its limit, and that
+ * rejection reaches the caller rather than being papered over.
+ */
+export async function editTelegramMessage(
+  chatId: string,
+  messageId: string,
+  text: string,
+): Promise<void> {
+  try {
+    await callTelegramBotApi<TelegramMessage>("editMessageText", {
+      chat_id: chatId,
+      message_id: Number(messageId),
+      text,
+    });
+  } catch (err) {
+    if (
+      err instanceof TelegramNonRetryableError &&
+      err.description?.includes("message is not modified")
+    ) {
+      log.debug({ chatId, messageId }, "Telegram edit already applied");
+      return;
+    }
+    throw err;
+  }
+  log.debug({ chatId, messageId }, "Telegram message edited");
+}
+
 export async function sendTelegramReply(
   chatId: string,
   text: string,
   approval?: ApprovalUIMetadata,
   opts?: TelegramSendOptions,
-): Promise<void> {
+): Promise<TelegramSendResult> {
   const chunks = splitText(text, TELEGRAM_MAX_MESSAGE_LEN);
 
+  let lastMessageId: string | undefined;
   for (let i = 0; i < chunks.length; i++) {
     const payload: Record<string, unknown> = {
       chat_id: chatId,
@@ -146,10 +195,18 @@ export async function sendTelegramReply(
       payload.reply_markup = buildInlineKeyboard(approval);
     }
 
-    await callTelegramBotApi("sendMessage", payload);
+    const sent = await callTelegramBotApi<TelegramMessage>(
+      "sendMessage",
+      payload,
+    );
+    lastMessageId =
+      typeof sent?.message_id === "number"
+        ? String(sent.message_id)
+        : undefined;
   }
 
   log.debug({ chatId, chunks: chunks.length }, "Telegram reply sent");
+  return lastMessageId !== undefined ? { lastMessageId } : {};
 }
 
 /**

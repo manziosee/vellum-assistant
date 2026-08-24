@@ -60,7 +60,7 @@
         }
       },
       "compatibility": "Designed for Vellum personal assistants",
-      "updatedAt": "2026-07-30T02:16:04.000Z"
+      "updatedAt": "2026-08-18T17:13:09.000Z"
     },
     {
       "id": "chat-complex-documents",
@@ -184,7 +184,7 @@
         }
       },
       "compatibility": "Designed for Vellum personal assistants",
-      "updatedAt": "2026-07-02T13:30:40.000Z"
+      "updatedAt": "2026-08-20T22:31:34.000Z"
     },
     {
       "id": "doordash",
@@ -354,7 +354,7 @@
     {
       "id": "google-calendar",
       "name": "google-calendar",
-      "description": "View, create, and manage Google Calendar events and check availability",
+      "description": "View Google Calendar events for any day, create and manage events, and check availability",
       "metadata": {
         "icon": "assets/icon.svg",
         "emoji": "📅",
@@ -363,19 +363,19 @@
           "display-name": "Google Calendar",
           "user-invocable": "true",
           "activation-hints": [
-            "check my availability this week",
-            "find open time slots / when am I free",
-            "cross-calendar free/busy across my connected accounts"
+            "plan my day or my week",
+            "what does my day look like",
+            "check my availability, find open time slots, when am I free"
           ]
         }
       },
       "compatibility": "Designed for Vellum personal assistants",
-      "updatedAt": "2026-07-07T04:41:13.000Z"
+      "updatedAt": "2026-08-10T18:03:33.000Z"
     },
     {
       "id": "guardian-verify-setup",
       "name": "guardian-verify-setup",
-      "description": "Set up channel verification for phone, Telegram, Slack, or email channels via outbound verification flow",
+      "description": "Set up channel verification for phone, Telegram, Slack, Discord, or email channels via outbound verification flow",
       "metadata": {
         "emoji": "🔐",
         "vellum": {
@@ -392,21 +392,24 @@
         }
       },
       "compatibility": "Designed for Vellum personal assistants",
-      "updatedAt": "2026-06-13T01:05:59.000Z"
+      "updatedAt": "2026-08-20T22:55:26.000Z"
     },
     {
       "id": "headless-claude-code",
       "name": "headless-claude-code",
-      "description": "Reference guide for running Claude Code in headless, container, and CI environments — covers auth strategies, interactive mode pitfalls, tmux orchestration, root user workarounds, and git auth without SSH agents or keychains",
+      "description": "Reference guide for running Claude Code in third-party headless, container, and CI environments. Covers auth strategies, interactive mode pitfalls, tmux orchestration, root user workarounds, and git auth without SSH agents or keychains",
       "metadata": {
         "emoji": "🖥️",
         "vellum": {
           "category": "development",
-          "display-name": "Headless Claude Code"
+          "display-name": "Headless Claude Code",
+          "avoid-when": [
+            "Setting up or authenticating Claude Code inside a Vellum assistant: the ACP skill owns that path"
+          ]
         }
       },
       "compatibility": "Any environment running Claude Code headlessly",
-      "updatedAt": "2026-06-03T03:10:07.000Z"
+      "updatedAt": "2026-08-07T13:48:02.000Z"
     },
     {
       "id": "inbox-cleanup",
@@ -500,7 +503,7 @@
     {
       "id": "llm-cost-optimizer",
       "name": "llm-cost-optimizer",
-      "description": "Analyze and reduce LLM spend: read usage breakdowns by call site, model, and inference profile, understand single-winner profile resolution, and pin call sites to managed profiles (Balanced / Quality / Speed) only where they should deviate from shipped defaults.",
+      "description": "Analyze and reduce LLM spend: read usage breakdowns by call site, model, and inference profile, understand single-winner profile resolution, and pin call sites to managed profiles (Balanced / Quality / Cost / Speed) only where they should deviate from shipped defaults.",
       "metadata": {
         "emoji": "💸",
         "vellum": {
@@ -508,7 +511,7 @@
           "display-name": "LLM Cost Optimizer"
         }
       },
-      "updatedAt": "2026-07-28T05:02:41.000Z"
+      "updatedAt": "2026-08-04T23:11:27.000Z"
     },
     {
       "id": "llm-provider-setup",
@@ -521,7 +524,7 @@
           "display-name": "LLM Provider Setup"
         }
       },
-      "updatedAt": "2026-07-10T04:43:15.000Z"
+      "updatedAt": "2026-08-04T23:11:27.000Z"
     },
     {
       "id": "macos-automation",
@@ -623,7 +626,7 @@
         }
       },
       "compatibility": "Designed for Vellum personal assistants",
-      "updatedAt": "2026-07-30T02:27:39.000Z"
+      "updatedAt": "2026-08-18T17:13:09.000Z"
     },
     {
       "id": "notifications",
@@ -713,7 +716,7 @@
     {
       "id": "outlook-calendar",
       "name": "outlook-calendar",
-      "description": "View, create, and manage Outlook Calendar events and check availability",
+      "description": "View Outlook Calendar events for any day, create and manage events, and check availability",
       "metadata": {
         "icon": "assets/icon.svg",
         "emoji": "📅",
@@ -722,14 +725,14 @@
           "display-name": "Outlook Calendar",
           "user-invocable": "true",
           "activation-hints": [
-            "check my availability this week",
-            "find open time slots / when am I free",
-            "cross-calendar free/busy across my connected accounts"
+            "plan my day or my week",
+            "what does my day look like",
+            "check my availability, find open time slots, when am I free"
           ]
         }
       },
       "compatibility": "Designed for Vellum personal assistants",
-      "updatedAt": "2026-07-07T04:41:13.000Z"
+      "updatedAt": "2026-08-10T18:03:33.000Z"
     },
     {
       "id": "plugin-builder",
@@ -744,6 +747,8 @@
             "User wants to build, scaffold, or author a Vellum plugin",
             "User wants to edit, update, or push changes to an existing plugin's GitHub repo",
             "User wants to package skills, hooks, or tools into an installable plugin",
+            "User wants to ship MCP servers as part of a plugin (mcp.json)",
+            "User wants a plugin to receive public webhooks or become a channel (channels/ingress.json)",
             "User wants to extend their assistant with a new capability shipped as a plugin",
             "User wants to publish a plugin to the Vellum marketplace catalog",
             "User asks how to ship or distribute extensions for Vellum"
@@ -756,7 +761,7 @@
         }
       },
       "compatibility": "Designed for Vellum personal assistants",
-      "updatedAt": "2026-07-29T22:31:05.000Z"
+      "updatedAt": "2026-08-21T15:44:11.000Z"
     },
     {
       "id": "public-ingress",
@@ -972,7 +977,7 @@
         }
       },
       "compatibility": "Designed for Vellum personal assistants",
-      "updatedAt": "2026-07-23T15:54:16.000Z"
+      "updatedAt": "2026-08-06T20:22:56.000Z"
     },
     {
       "id": "twilio-setup",
@@ -1038,9 +1043,30 @@
       "updatedAt": "2026-07-07T20:33:02.000Z"
     },
     {
+      "id": "vellum-client-capabilities",
+      "name": "vellum-client-capabilities",
+      "description": "Truthful answers about what the Vellum client apps can and cannot do on the user's device. Device location and GPS are unavailable in every client and there is no location permission prompt to approve, so location requests are answered by asking for a typed city or address instead.",
+      "metadata": {
+        "emoji": "📍",
+        "vellum": {
+          "category": "system",
+          "display-name": "Vellum Client Capabilities",
+          "activation-hints": [
+            "asked to use the user's current location, GPS, or device position",
+            "whether the app can access a device sensor, permission, or hardware feature"
+          ],
+          "avoid-when": [
+            "the user already gave a location as text (just use it)"
+          ]
+        }
+      },
+      "compatibility": "Designed for Vellum personal assistants",
+      "updatedAt": "2026-08-21T19:07:59.000Z"
+    },
+    {
       "id": "vellum-conversation-management",
       "name": "vellum-conversation-management",
-      "description": "Manage conversation threads (rename, list, export)",
+      "description": "Manage conversation threads (rename, list, search, export)",
       "metadata": {
         "emoji": "💬",
         "vellum": {
@@ -1049,7 +1075,7 @@
         }
       },
       "compatibility": "Designed for Vellum personal assistants",
-      "updatedAt": "2026-07-06T16:01:24.000Z"
+      "updatedAt": "2026-08-20T21:25:08.000Z"
     },
     {
       "id": "vellum-github-app-setup",
@@ -1109,7 +1135,7 @@
         }
       },
       "compatibility": "Designed for Vellum personal assistants",
-      "updatedAt": "2026-06-03T03:10:07.000Z"
+      "updatedAt": "2026-08-18T17:59:07.000Z"
     },
     {
       "id": "vellum-memory-v3-migration",
@@ -1146,7 +1172,7 @@
         }
       },
       "compatibility": "Designed for Vellum personal assistants",
-      "updatedAt": "2026-07-23T15:54:16.000Z"
+      "updatedAt": "2026-08-07T06:03:32.000Z"
     },
     {
       "id": "vellum-self-knowledge",
@@ -1162,6 +1188,7 @@
             "how Vellum works or its architecture",
             "its current configuration or settings",
             "what it can do, or what skills/tools are available",
+            "whether a service is connected, and in which sense",
             "how to self-host a Vellum assistant",
             "how to configure your own model API key"
           ],
@@ -1171,7 +1198,7 @@
         }
       },
       "compatibility": "Designed for Vellum personal assistants",
-      "updatedAt": "2026-07-28T22:26:01.000Z"
+      "updatedAt": "2026-08-07T07:15:43.000Z"
     },
     {
       "id": "vellum-skills-catalog",
@@ -1215,7 +1242,7 @@
     {
       "id": "vellum-terminal-sessions",
       "name": "vellum-terminal-sessions",
-      "description": "Manage persistent terminal sessions via tmux. Create, read, write to, list, and close named shell sessions. Use when the user asks about running terminal processes, wants help orchestrating CLI tasks, or asks you to monitor or interact with long-running commands. Also use when the user mentions tmux sessions.",
+      "description": "Manage persistent tmux terminal sessions: create, read, write to, list, and close named shell sessions. For Claude Code or Codex, use the ACP skill instead.",
       "metadata": {
         "emoji": "🖥️",
         "author": "vellum-ai",
@@ -1225,19 +1252,19 @@
           "display-name": "Terminal Sessions",
           "activation-hints": [
             "User asks about their running terminal sessions or processes",
-            "User wants to monitor a long-running command",
-            "User wants the assistant to run something in a persistent shell",
+            "User wants to monitor a long-running command or run something in a persistent shell",
             "User mentions tmux or terminal management",
-            "User wants to orchestrate multiple CLI agents (e.g. Claude Code sessions)"
+            "User wants to orchestrate multiple CLI processes in parallel"
           ],
           "avoid-when": [
+            "Setting up, authenticating, or running Claude Code or Codex: the ACP skill owns those agents",
             "A simple one-shot command that host_bash handles fine",
             "The user is asking about shell scripting in general, not session management"
           ]
         }
       },
       "compatibility": "Sandbox mode works without any host dependencies. Host mode requires tmux installed on the user's machine. Works on macOS and Linux.",
-      "updatedAt": "2026-06-03T03:10:07.000Z"
+      "updatedAt": "2026-08-07T13:48:02.000Z"
     },
     {
       "id": "vellum-workspace-theme",

@@ -12,13 +12,18 @@ import { useState } from "react";
 import { ArrowRight } from "lucide-react";
 
 import { OnboardingEdgeCharacters } from "@/domains/onboarding/components/onboarding-edge-characters";
-import { OnboardingLayout } from "@/domains/onboarding/components/onboarding-layout";
+import { OnboardingLayout } from "@/components/onboarding-layout";
 import { TagAutocompleteInput } from "@/domains/onboarding/components/onboarding-autocomplete";
 import { HOBBY_SUGGESTIONS } from "@/domains/onboarding/onboarding-suggestions";
 import { Button } from "@vellumai/design-library/components/button";
 import { Input } from "@vellumai/design-library/components/input";
 
-import { MOBILE_INPUT_NO_ZOOM } from "@/domains/onboarding/onboarding-step-layout";
+import {
+  MOBILE_INPUT_NO_ZOOM,
+  ONBOARDING_DARK_SURFACE,
+} from "@/domains/onboarding/onboarding-step-layout";
+import { usePublishPageSurface } from "@/stores/page-surface-store";
+import { useTranslation } from "@/i18n";
 
 export interface ResearchOnboardingValues {
   firstName: string;
@@ -53,6 +58,10 @@ export function ResearchOnboardingScreen({
   initialLastName = "",
   onSubmit,
 }: ResearchOnboardingScreenProps) {
+  const { t } = useTranslation("onboarding");
+  // The screen owns the whole viewport, so the shell paints its safe-area
+  // strips to match. See `page-surface-store`.
+  usePublishPageSurface(ONBOARDING_DARK_SURFACE);
   const [firstName, setFirstName] = useState(initialFirstName);
   const [lastName, setLastName] = useState(initialLastName);
   const [role, setRole] = useState("");
@@ -86,14 +95,14 @@ export function ResearchOnboardingScreen({
             className="text-center font-serif text-[2.75rem] leading-[1.05] tracking-tight"
             style={riseIn(0.05)}
           >
-            Let&apos;s start with you.
+            {t("researchOnboardingScreen.title")}
           </h1>
 
           <p
             className="mt-3 text-center text-body-medium-lighter text-[var(--content-secondary)]"
             style={riseIn(0.12)}
           >
-            A few details so I can get to know you.
+            {t("researchOnboardingScreen.body")}
           </p>
 
           <div className="mt-10 flex w-full flex-col gap-5">
@@ -101,7 +110,7 @@ export function ResearchOnboardingScreen({
               <Input
                 label={
                   <>
-                    What should I call you?
+                    {t("researchOnboardingScreen.firstNameLabel")}
                     <span
                       aria-hidden
                       className="text-[var(--system-negative-strong)]"
@@ -110,7 +119,7 @@ export function ResearchOnboardingScreen({
                     </span>
                   </>
                 }
-                placeholder="Your name"
+                placeholder={t("researchOnboardingScreen.firstNamePlaceholder")}
                 value={firstName}
                 onChange={(e) => setFirstName(e.target.value)}
                 className={MOBILE_INPUT_NO_ZOOM}
@@ -122,8 +131,8 @@ export function ResearchOnboardingScreen({
 
             <div style={riseIn(0.27, 30)}>
               <Input
-                label="And your last name?"
-                placeholder="Your last name (optional)"
+                label={t("researchOnboardingScreen.lastNameLabel")}
+                placeholder={t("researchOnboardingScreen.lastNamePlaceholder")}
                 value={lastName}
                 onChange={(e) => setLastName(e.target.value)}
                 className={MOBILE_INPUT_NO_ZOOM}
@@ -133,8 +142,8 @@ export function ResearchOnboardingScreen({
 
             <div style={riseIn(0.34, 20)}>
               <Input
-                label="Your role"
-                placeholder="What do you do for work?"
+                label={t("researchOnboardingScreen.roleLabel")}
+                placeholder={t("researchOnboardingScreen.rolePlaceholder")}
                 value={role}
                 onChange={(e) => setRole(e.target.value)}
                 className={MOBILE_INPUT_NO_ZOOM}
@@ -145,8 +154,8 @@ export function ResearchOnboardingScreen({
 
             <div style={riseIn(0.41, 10)}>
               <TagAutocompleteInput
-                label="Any hobbies?"
-                placeholder="Cars, books, growing tomatoes?"
+                label={t("researchOnboardingScreen.hobbiesLabel")}
+                placeholder={t("researchOnboardingScreen.hobbiesPlaceholder")}
                 values={hobbies}
                 onChange={setHobbies}
                 suggestions={HOBBY_SUGGESTIONS}
@@ -164,7 +173,7 @@ export function ResearchOnboardingScreen({
               disabled={!canSubmit}
               className="h-11 text-base"
             >
-              Continue
+              {t("actions.continue")}
             </Button>
           </div>
         </form>

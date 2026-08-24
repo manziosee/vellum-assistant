@@ -3,6 +3,7 @@ import { useEffect } from "react";
 import { Navigate, useNavigate } from "react-router";
 
 import { PlatformLoginNotice } from "@/components/platform-login-notice";
+import { useTranslation } from "@/i18n";
 import {
   useActiveAssistantIsPlatformHosted,
   useActiveAssistantLifecycleIsLoading,
@@ -12,7 +13,6 @@ import { routes } from "@/utils/routes";
 import { Button } from "@vellumai/design-library/components/button";
 import { Card } from "@vellumai/design-library/components/card";
 import { Notice } from "@vellumai/design-library/components/notice";
-import { toast } from "@vellumai/design-library/components/toast";
 import { Typography } from "@vellumai/design-library/components/typography";
 
 /**
@@ -20,11 +20,15 @@ import { Typography } from "@vellumai/design-library/components/typography";
  *
  * When a user bails out of the Stripe-hosted upgrade flow, Stripe redirects
  * them here. Stripe does not create a subscription on cancellation, so there
- * is no backend state to clean up — we just surface a non-blocking toast and
- * bounce the user back to the billing settings page via `router.replace` so
- * the cancel route does not pollute browser history.
+ * is no backend state to clean up. This page bounces the user back to the
+ * billing settings page via `router.replace` (so the cancel route does not
+ * pollute browser history), carrying `billing_status=cancel` so the billing
+ * page's `BillingStatusHandler` owns the cancel UX in one place: the toast
+ * (`billing_context=upgrade` picks the upgrade copy) and the
+ * abandoned-checkout bonus offer.
  */
 export function UpgradeCancelPage() {
+  const { t } = useTranslation("settings");
   // Defense in depth: this page is only reachable from a Stripe Checkout
   // session that started on the Billing tab (itself gated). But deep-link
   // or bookmark navigation can still land a self-hosted user here, together
@@ -34,9 +38,10 @@ export function UpgradeCancelPage() {
   // Strict hosting predicate for the side effect below. `platformGate ===
   // "full"` is the *Render*-tier predicate — it's intentionally permissive
   // during the lifecycle-loading window so the page chrome stays mounted.
-  // The toast + navigate side effect is a *Fetch/Interact*-tier action and
+  // The cancel-redirect side effect is a *Fetch/Interact*-tier action and
   // must wait for positive hosted resolution; otherwise a self-hosted
-  // deep-link user sees the stray toast before `<Navigate />` flips below.
+  // deep-link user gets the stray cancel redirect (and its toast on the
+  // billing page) before `<Navigate />` flips below.
   const isPlatformHosted = useActiveAssistantIsPlatformHosted();
   // Distinguish the genuine *resolving* window from terminal-non-hosted
   // states. The resolving window lets the existing "Returning you to
@@ -48,20 +53,24 @@ export function UpgradeCancelPage() {
   const navigate = useNavigate();
 
   useEffect(() => {
-    // Wait for positive hosted resolution before firing the toast +
-    // redirect. During the lifecycle-loading window `platformGate ===
-    // "full"` AND `isPlatformHosted === false` — running the effect here
-    // would defeat the gate on a self-hosted deep-link. Once lifecycle
-    // resolves, either `isPlatformHosted` flips true (run the effect) or
-    // `platformGate` flips to `"gated"` (body's `<Navigate />` takes
-    // over, this effect never runs).
+    // Wait for positive hosted resolution before firing the redirect.
+    // During the lifecycle-loading window `platformGate === "full"` AND
+    // `isPlatformHosted === false`; running the effect here would defeat
+    // the gate on a self-hosted deep-link. Once lifecycle resolves, either
+    // `isPlatformHosted` flips true (run the effect) or `platformGate`
+    // flips to `"gated"` (body's `<Navigate />` takes over, this effect
+    // never runs).
     if (!isPlatformHosted) {
       return;
     }
-    toast.info("Upgrade canceled. No changes to your plan.", {
-      id: "pro-upgrade-cancel",
-    });
-    navigate(routes.settings.usageBilling, { replace: true });
+    // `usageBilling` already carries `?tab=billing`, hence the `&`. The
+    // billing page's BillingStatusHandler consumes these params: it shows
+    // the upgrade-cancel toast and runs the server-side check for the
+    // abandoned-checkout bonus offer.
+    navigate(
+      `${routes.settings.usageBilling}&billing_status=cancel&billing_context=upgrade`,
+      { replace: true },
+    );
   }, [navigate, isPlatformHosted]);
 
   if (platformGate === "gated") {
@@ -71,7 +80,7 @@ export function UpgradeCancelPage() {
     return (
       <div className="max-w-4xl space-y-6">
         <PlatformLoginNotice>
-          Log in to the Vellum platform to manage billing and usage.
+          {t("upgradeCancelPage.platformLoginNotice")}
         </PlatformLoginNotice>
       </div>
     );
@@ -86,7 +95,7 @@ export function UpgradeCancelPage() {
     return (
       <div className="max-w-4xl space-y-6">
         <Notice tone="warning">
-          Billing isn&apos;t available for the current assistant state.
+          {t("upgradeCancelPage.billingUnavailable")}
         </Notice>
         <div className="flex justify-end">
           <Button
@@ -95,7 +104,7 @@ export function UpgradeCancelPage() {
               navigate(routes.settings.usageBilling, { replace: true })
             }
           >
-            Return to billing
+            {t("upgradeCancelPage.returnToBilling")}
           </Button>
         </div>
       </div>
@@ -106,10 +115,10 @@ export function UpgradeCancelPage() {
     <div className="max-w-4xl space-y-6">
       <Card padding="lg">
         <Typography as="h1" variant="title-large">
-          Upgrade canceled
+          {t("upgradeCancelPage.title")}
         </Typography>
         <Typography as="p" variant="body-medium-default" className="mt-2">
-          Returning you to billing settings…
+          {t("upgradeCancelPage.redirectingBody")}
         </Typography>
       </Card>
     </div>

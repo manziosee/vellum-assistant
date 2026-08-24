@@ -35,12 +35,14 @@ import { ACP_RUN_DESCRIPTOR } from "@/domains/chat/process-registry/descriptors/
 import { SUBAGENT_DESCRIPTOR } from "@/domains/chat/process-registry/descriptors/subagent";
 import { InlineProcessCardRow } from "@/domains/chat/process-registry/inline-process-card-row";
 import { useIsMobile } from "@/hooks/use-is-mobile";
+import { useTouchMobile } from "@/hooks/use-touch-mobile";
 
 import type {
   ConversationActivityRow,
   ConversationActivity,
 } from "@/domains/chat/hooks/use-conversation-activity";
 import type { BackgroundProcessDescriptor } from "@/domains/chat/process-registry/types";
+import { useTranslation } from "@/i18n";
 
 export const ACTIVITY_PILL_TESTID = "conversation-activity-pill";
 export const RUNNING_GROUP_TESTID = "activity-trigger-running";
@@ -175,13 +177,14 @@ function ActivityPanel({
   activity: ConversationActivity;
   onClose: () => void;
 }) {
+  const { t } = useTranslation("chat");
   const { running, completed } = activity;
   // Headings only earn their space when both groups are present; a list that is
   // all-running or all-finished is already self-describing.
   const showLabels = running.length > 0 && completed.length > 0;
   return (
     <div className="flex min-w-0 flex-col">
-      {showLabels ? <SectionLabel>Running</SectionLabel> : null}
+      {showLabels ? <SectionLabel>{t("conversationActivityPill.running")}</SectionLabel> : null}
       <div className="px-2 pb-1">
         {running.map((row) => (
           <ActivityRow
@@ -192,7 +195,7 @@ function ActivityPanel({
           />
         ))}
       </div>
-      {showLabels ? <SectionLabel>Recent</SectionLabel> : null}
+      {showLabels ? <SectionLabel>{t("conversationActivityPill.recent")}</SectionLabel> : null}
       <div className="px-2 pb-2">
         {completed.map((row) => (
           <ActivityRow
@@ -210,9 +213,11 @@ function ActivityPanel({
 export function ConversationActivityPill({
   conversationId,
 }: ConversationActivityPillProps) {
+  const { t } = useTranslation("chat");
   const activity = useConversationActivity(conversationId);
   const [open, setOpen] = useState(false);
   const isMobile = useIsMobile();
+  const isTouchMobile = useTouchMobile();
   const handleClose = useCallback(() => setOpen(false), []);
 
   const { running, completed, total } = activity;
@@ -280,7 +285,7 @@ export function ConversationActivityPill({
 
   const panel = <ActivityPanel activity={activity} onClose={handleClose} />;
 
-  if (isMobile) {
+  if (isTouchMobile) {
     return (
       <BottomSheet.Root open={open} onOpenChange={setOpen}>
         <BottomSheet.Trigger asChild>
@@ -301,7 +306,7 @@ export function ConversationActivityPill({
         </BottomSheet.Trigger>
         <BottomSheet.Content className="max-h-[85dvh]">
           <BottomSheet.Header>
-            <BottomSheet.Title>Activity</BottomSheet.Title>
+            <BottomSheet.Title>{t("conversationActivityPill.activity")}</BottomSheet.Title>
           </BottomSheet.Header>
           <BottomSheet.Body className="pt-0">{panel}</BottomSheet.Body>
         </BottomSheet.Content>
@@ -324,14 +329,17 @@ export function ConversationActivityPill({
         </Button>
       </Popover.Trigger>
       {/* `align="end"`, unlike the Assets pill's centred panel: Activity sits
-          further right in the cluster, so a centred 320px panel resolves flush
+          further right in the cluster, so a centred panel resolves flush
           against the window edge. Anchoring the panel's trailing edge to the
-          trigger matches the notification bell, its neighbour on that side. */}
+          trigger matches the notification bell, its neighbour on that side,
+          whose 384px width the rows here borrow too: a generated process name
+          plus its status metadata needs the room, and `max-w` still yields to
+          a narrow viewport. */}
       <Popover.Content
         side="bottom"
         align="end"
         sideOffset={8}
-        className="w-80 max-w-[calc(100vw-2rem)] p-0"
+        className="w-96 max-w-[calc(100vw-2rem)] p-0"
       >
         <div className="max-h-[280px] overflow-y-auto">{panel}</div>
       </Popover.Content>

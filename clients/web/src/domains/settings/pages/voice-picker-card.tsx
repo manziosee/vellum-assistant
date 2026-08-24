@@ -15,20 +15,19 @@
 
 import { useState } from "react";
 
-import { Link } from "react-router";
-
 import { Button } from "@vellumai/design-library/components/button";
 
 import { DetailCard } from "@/components/detail-card";
 import { useActiveAssistantId } from "@/assistant/use-active-assistant-id";
+import { ByoVoiceNote } from "@/components/speech/byo-voice-note";
 import { useManagedVoiceSelection } from "@/components/speech/use-managed-voice-selection";
-import { MANAGED_VOICE_CREDITS_NOTE } from "@/lib/tts/managed-voice-catalog";
 import { VoiceLabel } from "@/components/speech/voice-list";
 import { VoicePickerModal } from "@/components/speech/voice-picker-modal";
+import { useTranslation } from "@/i18n";
 import { useAssistantIdentityStore } from "@/stores/assistant-identity-store";
-import { routes } from "@/utils/routes";
 
 export function VoicePickerCard() {
+  const { t } = useTranslation("settings");
   const assistantId = useActiveAssistantId();
   const { available, voices, currentModel } =
     useManagedVoiceSelection(assistantId);
@@ -39,11 +38,16 @@ export function VoicePickerCard() {
   // input cards below stay plain — those are yours). Falls back to a bare
   // "Voice" when the assistant has no name yet, never "'s Voice".
   const assistantName = useAssistantIdentityStore.use.name();
-  const voiceTitle = assistantName ? `${assistantName}’s Voice` : "Voice";
+  const voiceTitle = assistantName
+    ? t("voicePickerCard.titleWithName", { name: assistantName })
+    : t("voicePickerCard.title");
 
   if (available && current) {
     return (
-      <DetailCard title={voiceTitle} subtitle={MANAGED_VOICE_CREDITS_NOTE}>
+      <DetailCard
+        title={voiceTitle}
+        subtitle={t("voicePickerCard.creditsNote")}
+      >
         <div className="flex items-center gap-3">
           <VoiceLabel
             description={current.description}
@@ -58,7 +62,7 @@ export function VoicePickerCard() {
             onClick={() => setPickerOpen(true)}
             className="shrink-0"
           >
-            Change
+            {t("voicePickerCard.changeButton")}
           </Button>
         </div>
         <VoicePickerModal
@@ -72,17 +76,7 @@ export function VoicePickerCard() {
 
   return (
     <DetailCard title={voiceTitle}>
-      <p className="text-body-small-default text-[var(--content-tertiary)]">
-        Your assistant speaks through a provider you configured yourself. Set
-        its voice on{" "}
-        <Link
-          to={`${routes.settings.ai}#text-to-speech`}
-          className="text-[var(--primary-base)] hover:underline"
-        >
-          Models &amp; Services
-        </Link>
-        .
-      </p>
+      <ByoVoiceNote />
     </DetailCard>
   );
 }

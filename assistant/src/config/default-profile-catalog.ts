@@ -4,19 +4,17 @@ import {
   isModelInCatalog,
 } from "../providers/model-catalog.js";
 import { resolveModelIntent } from "../providers/model-intents.js";
+import { isCodexSubscriptionModel } from "../providers/openai/codex-models.js";
 import type { ModelIntent } from "../providers/types.js";
 import { getManagedUpstream } from "../providers/vellum-model-routing.js";
+import { getBalancedModelExperimentArm } from "./balanced-model-experiment.js";
 import {
   DEFAULT_PROFILE_KEYS,
   DEFAULT_PROFILE_PROVIDERS,
   type DefaultProfileKey,
   type DefaultProfileProvider,
-  INTERNAL_PROFILE_KEYS,
-  type InternalProfileKey,
   isDefaultProfileProvider,
   OS_BETA_PROFILE_KEY,
-  PROFILE_MATRIX_KEYS,
-  type ProfileMatrixKey,
 } from "./default-profile-names.js";
 import { resolveDefaultConnectionName } from "./default-provider-resolution.js";
 import {
@@ -28,13 +26,15 @@ import {
 
 /**
  * Code-defined catalog of the default inference profiles (`balanced`,
- * `quality-optimized`, `cost-optimized`, plus the flag-gated `os-beta`).
+ * `quality-optimized`, `cost-optimized`, `latency-optimized`, plus the
+ * flag-gated `os-beta`).
  *
  * The catalog is the single source of truth for default profile CONTENT,
  * structured as an intent × provider matrix: each default profile is an
  * intent, and each provider that can serve default profiles has a concrete
  * implementation of that intent (model, token budget, effort, thinking).
- * The `vellum` column is the platform-managed implementation; the other
+ * The `vellum` column is the platform-managed implementation and the
+ * `chatgpt` column is the ChatGPT-subscription implementation; the other
  * columns are the BYOK implementations resolved through `llm.defaultProvider`
  * on off-platform installs.
  *
@@ -60,6 +60,9 @@ export type DefaultProfileTemplate = Omit<
   provider: NonNullable<ProfileEntry["provider"]>;
 };
 
+/** One implementation of every default profile, keyed by profile key. */
+type ProfileImpls = Record<DefaultProfileKey, DefaultProfileTemplate>;
+
 /**
  * The `vellum` column: platform-managed implementations, stamped
  * `provider: "vellum"` — dispatch derives the upstream from the model.
@@ -68,9 +71,9 @@ export type DefaultProfileTemplate = Omit<
  * Overwritten in workspace config on every daemon boot so Vellum can push
  * model/config updates to customers in new releases.
  */
-const VELLUM_PROFILE_IMPLS: Record<ProfileMatrixKey, DefaultProfileTemplate> = {
+const VELLUM_PROFILE_IMPLS: ProfileImpls = {
   balanced: {
-    model: "gpt-5.6-luna",
+    model: "accounts/fireworks/models/glm-5p2",
     provider: "vellum",
     source: "managed",
     label: "Balanced",
@@ -96,14 +99,14 @@ const VELLUM_PROFILE_IMPLS: Record<ProfileMatrixKey, DefaultProfileTemplate> = {
     },
   },
   "cost-optimized": {
-    model: "accounts/fireworks/models/deepseek-v4-flash",
+    model: "accounts/fireworks/models/deepseek-v4-flash-0731",
     provider: "vellum",
     source: "managed",
-    label: "Speed",
+    label: "Cost",
     // Tier intent only - never name the concrete model here. Clients
     // surface the live model beside the description, so a model name in
     // this copy would go stale the moment the pin moves.
-    description: "Fastest responses at lower cost",
+    description: "Cheapest responses, for high-volume work",
     maxTokens: 8192,
     // Explicit reasoning opt-out. OpenAI-compat APIs default reasoning to
     // "medium" when the field is omitted, and effort-driven providers encode
@@ -116,28 +119,135 @@ const VELLUM_PROFILE_IMPLS: Record<ProfileMatrixKey, DefaultProfileTemplate> = {
     },
   },
   "latency-optimized": {
-    // The managed latency class. Its leading tokens are the live-voice
-    // turn-taking verdict, so what this profile optimizes is the tail of
-    // time-to-first-token rather than the median: a verdict slower than
-    // `liveVoice.frontModel.endpointDecisionTimeoutMs` trips the speculative
-    // fail-open commit in live-voice-session.ts, which is audible dead air.
+    // The managed latency class, also what the live-voice front model runs on.
+    // Its leading tokens are the turn-taking verdict, so what this profile
+    // optimizes is the tail of time-to-first-token rather than the median: a
+    // verdict slower than `liveVoice.frontModel.endpointDecisionTimeoutMs`
+    // trips the speculative fail-open commit in live-voice-session.ts, which
+    // is audible dead air.
     //
     // Two constraints bind the model id. Its managed credentials must be
     // provisioned in every environment, and it alone selects the upstream:
     // `provider` below is the provider-agnostic managed sentinel, so
     // `getManagedUpstream` resolves the real upstream from the model's catalog
-    // owner.
+    // owner. This model is the one live-voice TTFT drives validated.
     model: "gpt-5.6-luna",
     provider: "vellum",
     source: "managed",
-    label: "Latency",
-    description: "Lowest time-to-first-token, for real-time call sites",
+    label: "Speed",
+    description: "Fastest responses, with reasoning turned off",
     maxTokens: 8192,
-    effort: "low",
+    // Explicit reasoning opt-out, matching `cost-optimized` above: this
+    // profile advertises reasoning as off, and OpenAI-compat APIs default
+    // reasoning to "medium" when the field is omitted, so the opt-out has to
+    // be stated rather than implied.
+    effort: "none",
     thinking: { enabled: false, streamThinking: false },
     contextWindow: {
       maxInputTokens: DEFAULT_CONTEXT_WINDOW_MAX_INPUT_TOKENS,
     },
+  },
+};
+
+/**
+ * Arm to managed model pin for the `experiment-balanced-model-2026-08-06` A/B
+ * test (`balanced-model-experiment.ts` owns the flag read). An arm repoints
+ * the model of the managed (`vellum`) implementation of `balanced` and nothing
+ * else: effort, thinking, token budget, label and description all stay on the
+ * shipped body, and the `chatgpt` and BYOK columns are untouched because those
+ * installs run the provider their user chose and sit outside the experiment.
+ *
+ * `control` is absent by design. It, an arm this build does not know, and an
+ * unset flag all resolve to the shipped body, so no LaunchDarkly value can
+ * strand an install on a model that is not pinned here. A `Map` rather than an
+ * object literal keeps that true for every string LaunchDarkly can send: the
+ * arm is remote input, and an object lookup would resolve `constructor` or
+ * `toString` to an inherited `Object.prototype` member instead of missing.
+ *
+ * `glm-5p2` names the same model as the shipped pin and stays in the table so
+ * the arm keeps its meaning if the shipped pin moves again.
+ */
+const BALANCED_EXPERIMENT_MODELS = new Map<string, string>([
+  ["terra", "gpt-5.6-terra"],
+  ["glm-5p2", "accounts/fireworks/models/glm-5p2"],
+]);
+
+/**
+ * The managed (`vellum`) implementation of a default profile, carrying the
+ * balanced-model experiment arm. Resolved per call rather than materialized
+ * once: the gateway pushes flag changes to a running daemon, so the arm can
+ * move under a live process.
+ */
+function managedProfileImpl(key: DefaultProfileKey): DefaultProfileTemplate {
+  const impl = VELLUM_PROFILE_IMPLS[key];
+  if (key !== "balanced") {
+    return impl;
+  }
+  const arm = getBalancedModelExperimentArm();
+  const model = arm == null ? undefined : BALANCED_EXPERIMENT_MODELS.get(arm);
+  return model == null ? impl : { ...impl, model };
+}
+
+/**
+ * The `chatgpt` column: ChatGPT-subscription implementations, stamped
+ * `provider: "chatgpt"` so dispatch routes through the canonical
+ * `chatgpt-subscription` row via `resolveRoutingIdentity` with no pinned
+ * connection. Models are pinned (never intents): the intent tables are
+ * keyed by concrete dispatch providers, and the Codex endpoint serves only
+ * `CODEX_SUBSCRIPTION_MODEL_IDS`. Cost and Speed are identical
+ * implementations here: the subscription serves no tier cheaper or faster
+ * than luna, and both profiles advertise reasoning off.
+ */
+const CHATGPT_PROFILE_IMPLS: ProfileImpls = {
+  balanced: {
+    model: "gpt-5.6-luna",
+    provider: "chatgpt",
+    source: "managed",
+    label: "Balanced",
+    description: "Good balance of quality, cost, and speed",
+    // Matches the vellum column's Balanced token budget: the Codex path
+    // sends no max_output_tokens, so this only sizes internal budgeting.
+    maxTokens: 32000,
+    effort: "high",
+    thinking: { enabled: true, streamThinking: true },
+    contextWindow: { maxInputTokens: DEFAULT_CONTEXT_WINDOW_MAX_INPUT_TOKENS },
+  },
+  "quality-optimized": {
+    model: "gpt-5.6-sol",
+    provider: "chatgpt",
+    source: "managed",
+    label: "Quality",
+    description: "Best results with the most capable model",
+    maxTokens: 32000,
+    effort: "high",
+    thinking: { enabled: true, streamThinking: true },
+    contextWindow: { maxInputTokens: DEFAULT_CONTEXT_WINDOW_MAX_INPUT_TOKENS },
+  },
+  "cost-optimized": {
+    model: "gpt-5.6-luna",
+    provider: "chatgpt",
+    source: "managed",
+    label: "Cost",
+    description: "Cheapest responses, for high-volume work",
+    maxTokens: 8192,
+    effort: "none",
+    thinking: { enabled: false, streamThinking: false },
+    contextWindow: { maxInputTokens: DEFAULT_CONTEXT_WINDOW_MAX_INPUT_TOKENS },
+  },
+  "latency-optimized": {
+    model: "gpt-5.6-luna",
+    provider: "chatgpt",
+    source: "managed",
+    label: "Speed",
+    description: "Fastest responses, with reasoning turned off",
+    maxTokens: 8192,
+    // Explicit reasoning opt-out, matching the other columns: this profile
+    // advertises reasoning as off, and OpenAI-compat APIs default reasoning
+    // to "medium" when the field is omitted, so the opt-out has to be stated
+    // rather than implied.
+    effort: "none",
+    thinking: { enabled: false, streamThinking: false },
+    contextWindow: { maxInputTokens: DEFAULT_CONTEXT_WINDOW_MAX_INPUT_TOKENS },
   },
 };
 
@@ -150,7 +260,7 @@ const VELLUM_PROFILE_IMPLS: Record<ProfileMatrixKey, DefaultProfileTemplate> = {
  * per-request for any other default-capable provider.
  */
 const BYOK_PROFILE_IMPLS: Record<
-  ProfileMatrixKey,
+  DefaultProfileKey,
   Omit<DefaultProfileTemplate, "provider">
 > = {
   balanced: {
@@ -173,23 +283,26 @@ const BYOK_PROFILE_IMPLS: Record<
     thinking: { enabled: true, streamThinking: true },
     contextWindow: { maxInputTokens: DEFAULT_CONTEXT_WINDOW_MAX_INPUT_TOKENS },
   },
+  // On providers whose cheapest model is also their fastest (anthropic,
+  // ollama, fireworks) these two intents resolve the same model and the split
+  // is effort alone (see PROVIDER_MODEL_INTENTS).
   "cost-optimized": {
-    intent: "latency-optimized",
+    intent: "cost-optimized",
     source: "user",
-    label: "Speed",
-    description: "Fastest responses at lower cost",
+    label: "Cost",
+    description: "Cheapest responses, for high-volume work",
     maxTokens: 8192,
-    effort: "low",
+    effort: "none",
     thinking: { enabled: false, streamThinking: false },
     contextWindow: { maxInputTokens: DEFAULT_CONTEXT_WINDOW_MAX_INPUT_TOKENS },
   },
   "latency-optimized": {
     intent: "latency-optimized",
     source: "user",
-    label: "Latency",
-    description: "Lowest time-to-first-token, for real-time call sites",
+    label: "Speed",
+    description: "Fastest responses, with reasoning turned off",
     maxTokens: 8192,
-    effort: "low",
+    effort: "none",
     thinking: { enabled: false, streamThinking: false },
     contextWindow: { maxInputTokens: DEFAULT_CONTEXT_WINDOW_MAX_INPUT_TOKENS },
   },
@@ -200,22 +313,24 @@ const BYOK_PROFILE_IMPLS: Record<
  * implementation of default profile `key` on `provider`.
  */
 export const PROFILE_IMPLS: Record<
-  ProfileMatrixKey,
+  DefaultProfileKey,
   Record<DefaultProfileProvider, DefaultProfileTemplate>
 > = Object.fromEntries(
-  PROFILE_MATRIX_KEYS.map((key) => [
+  DEFAULT_PROFILE_KEYS.map((key) => [
     key,
     Object.fromEntries(
       DEFAULT_PROFILE_PROVIDERS.map((provider) => [
         provider,
         provider === "vellum"
           ? VELLUM_PROFILE_IMPLS[key]
-          : { ...BYOK_PROFILE_IMPLS[key], provider },
+          : provider === "chatgpt"
+            ? CHATGPT_PROFILE_IMPLS[key]
+            : { ...BYOK_PROFILE_IMPLS[key], provider },
       ]),
     ) as Record<DefaultProfileProvider, DefaultProfileTemplate>,
   ]),
 ) as Record<
-  ProfileMatrixKey,
+  DefaultProfileKey,
   Record<DefaultProfileProvider, DefaultProfileTemplate>
 >;
 
@@ -230,17 +345,44 @@ export const MANAGED_PROFILE_TEMPLATES: Record<string, DefaultProfileTemplate> =
   );
 
 /**
+ * The values BYOK hatch seeding wrote onto each `custom-*` copy, for the keys
+ * whose live template carries something else. The conversion pass recognizes
+ * an unedited copy by comparing it field-by-field against the frozen body, so
+ * every field here must describe what sits on disk, not what the profile
+ * resolves to today. A field the live template alone supplies makes every
+ * unedited copy read as user-edited and stop converting.
+ *
+ * `intent` selects the copy's model through `materializeProfile`, so it is the
+ * load-bearing pin. `label` is compared nowhere in the body, but
+ * `userOverlayState` reads it to tell a user rename from the hatch's own
+ * label, and a mismatch there carries a phantom rename onto the bare key.
+ */
+const HATCH_ERA_TEMPLATE_FIELDS: Partial<
+  Record<DefaultProfileKey, Partial<DefaultProfileTemplate>>
+> = {
+  "cost-optimized": {
+    intent: "latency-optimized",
+    label: "Speed",
+    description: "Fastest responses at lower cost",
+    effort: "low",
+  },
+};
+
+/**
  * Frozen record of the `custom-*` profile bodies that pre-conversion BYOK
  * hatches wrote to workspace config (the anthropic column; provider and
  * connection were overridden per hatch). Consumed by the existing-install
  * conversion pass as the reference for recognizing unedited copies, which
  * are safe to remove in favor of the code-resolved defaults.
+ *
+ * The `latency-optimized` entry exists for shape only: hatch seeding writes no
+ * `custom-latency-optimized`, so no install holds one to recognize.
  */
 export const USER_PROFILE_TEMPLATES: Record<string, DefaultProfileTemplate> =
   Object.fromEntries(
     DEFAULT_PROFILE_KEYS.map((key) => [
       `custom-${key}`,
-      PROFILE_IMPLS[key].anthropic,
+      { ...PROFILE_IMPLS[key].anthropic, ...HATCH_ERA_TEMPLATE_FIELDS[key] },
     ]),
   );
 
@@ -263,6 +405,17 @@ export const OS_BETA_PROFILE_TEMPLATE: DefaultProfileTemplate = {
   topP: 0.95,
 };
 
+/**
+ * Profiles whose body is code-owned outright: no workspace overlay, and no
+ * user-owned shadow. The shadow rule below lets a user replace a default they
+ * can select, but `latency-optimized` serves `voiceFrontDoor` and
+ * `voiceProgressNarration`, where a model outside the latency envelope is
+ * audible dead air rather than a slow reply. A same-named
+ * workspace entry stays on disk and stays listed; it just never governs what
+ * this name resolves to.
+ */
+export const CODE_OWNED_PROFILE_NAMES = new Set<string>(["latency-optimized"]);
+
 // All managed profiles, including the flag-gated os-beta, are invariant:
 // their MANAGED-SOURCE entries are read-only to user-facing writes except
 // re-enabling a disabled one (enforced at commitConfigWrite). A user-owned
@@ -270,7 +423,6 @@ export const OS_BETA_PROFILE_TEMPLATE: DefaultProfileTemplate = {
 // the on-disk entry's `source` being `managed`.
 export const INVARIANT_PROFILE_NAMES = new Set<string>([
   ...DEFAULT_PROFILE_KEYS,
-  ...INTERNAL_PROFILE_KEYS,
   OS_BETA_PROFILE_KEY,
 ]);
 
@@ -283,7 +435,6 @@ export const INVARIANT_PROFILE_NAMES = new Set<string>([
 // same-named user profile.
 export const MANAGED_PROFILE_NAMES = new Set<string>([
   ...DEFAULT_PROFILE_KEYS,
-  ...INTERNAL_PROFILE_KEYS,
   OS_BETA_PROFILE_KEY,
 ]);
 
@@ -319,7 +470,7 @@ export function materializeProfile(
 // `PROVIDER_MODEL_INTENTS`' own check): exactly one of `intent`/`model` is
 // set, and every pinned model id exists in PROVIDER_CATALOG for its
 // underlying provider — catching drift when a model is renamed or removed.
-for (const key of PROFILE_MATRIX_KEYS) {
+for (const key of DEFAULT_PROFILE_KEYS) {
   for (const provider of DEFAULT_PROFILE_PROVIDERS) {
     const impl = PROFILE_IMPLS[key][provider];
     if ((impl.model == null) === (impl.intent == null)) {
@@ -327,25 +478,40 @@ for (const key of PROFILE_MATRIX_KEYS) {
         `PROFILE_IMPLS[${key}][${provider}] must set exactly one of \`intent\` or \`model\`.`,
       );
     }
-    if (impl.provider === "vellum" && impl.model == null) {
+    if (ROUTING_IDENTITY_PROVIDERS.has(impl.provider) && impl.model == null) {
       throw new Error(
-        `PROFILE_IMPLS[${key}][${provider}] must pin a \`model\`: the vellum ` +
-          `column has no intent table, and the model selects the upstream.`,
+        `PROFILE_IMPLS[${key}][${provider}] must pin a \`model\`: routing ` +
+          `identities have no intent table, and the model selects the route.`,
       );
     }
     if (impl.model != null) {
       const routable =
         impl.provider === "vellum"
           ? getManagedUpstream(impl.model) !== null
-          : isModelInCatalog(impl.provider, impl.model);
+          : impl.provider === "chatgpt"
+            ? isCodexSubscriptionModel(impl.model)
+            : isModelInCatalog(impl.provider, impl.model);
       if (!routable) {
         throw new Error(
           `PROFILE_IMPLS[${key}][${provider}] references model "${impl.model}" ` +
-            `which is not ${impl.provider === "vellum" ? "served by any managed upstream" : `in PROVIDER_CATALOG for provider "${impl.provider}"`}. ` +
+            `which is not ${impl.provider === "vellum" ? "served by any managed upstream" : impl.provider === "chatgpt" ? "in CODEX_SUBSCRIPTION_MODEL_IDS" : `in PROVIDER_CATALOG for provider "${impl.provider}"`}. ` +
             `Update model-catalog.ts or default-profile-catalog.ts.`,
         );
       }
     }
+  }
+}
+
+// The experiment arms substitute into the managed column at request time, so
+// they need the same routability guarantee as the pins validated above: a
+// LaunchDarkly arm must never select a model no managed upstream serves.
+for (const [arm, model] of BALANCED_EXPERIMENT_MODELS) {
+  if (getManagedUpstream(model) === null) {
+    throw new Error(
+      `BALANCED_EXPERIMENT_MODELS["${arm}"] references model "${model}" which ` +
+        `is not served by any managed upstream. ` +
+        `Update model-catalog.ts or default-profile-catalog.ts.`,
+    );
   }
 }
 
@@ -355,7 +521,7 @@ for (const provider of DEFAULT_PROVIDER_CHOICES) {
   if (isDefaultProfileProvider(provider)) {
     continue;
   }
-  for (const key of PROFILE_MATRIX_KEYS) {
+  for (const key of DEFAULT_PROFILE_KEYS) {
     const { model } = materializeProfile(
       { ...BYOK_PROFILE_IMPLS[key], provider },
       provider,
@@ -372,7 +538,7 @@ for (const provider of DEFAULT_PROVIDER_CHOICES) {
 
 function buildDefaultProfileEntries(): Record<string, ProfileEntry> {
   const entries: Record<string, ProfileEntry> = {};
-  for (const key of PROFILE_MATRIX_KEYS) {
+  for (const key of DEFAULT_PROFILE_KEYS) {
     const impl = PROFILE_IMPLS[key].vellum;
     entries[key] = materializeProfile(impl, impl.provider);
   }
@@ -387,6 +553,14 @@ function buildDefaultProfileEntries(): Record<string, ProfileEntry> {
  * The materialized code-default bodies keyed by profile name — the
  * code-owned content a managed-source workspace entry resolves to. These are
  * the `vellum` column (the managed implementations).
+ *
+ * Materialized once at module load, so this is the shipped catalog: the
+ * balanced-model experiment arm is applied by the provider-aware resolvers
+ * (`resolveDefaultProfileForProvider`, `getEffectiveProfilesForProvider`),
+ * which are what every runtime and client-facing reader of a default profile's
+ * content goes through. The name-only readers that serve from this record
+ * (`getEffectiveProfile`, `getEffectiveProfiles`) consume a profile's
+ * existence and status, never its model.
  */
 export const CODE_DEFAULT_PROFILE_ENTRIES: Readonly<
   Record<string, ProfileEntry>
@@ -445,15 +619,7 @@ function resolveAgainstBody(
   if (body == null) {
     return workspace;
   }
-  // An internal profile's body is code-owned outright — no workspace overlay,
-  // not even a user-owned shadow. The shadow rule below exists so a user can
-  // deliberately replace a default they can see and select; an internal name
-  // was never selectable, so a same-named workspace entry (legal before the
-  // name was reserved) is unrelated state, not an override. Honoring it would
-  // silently hand a latency-class call site an arbitrary user model. The
-  // entry itself is untouched: it stays in `llm.profiles`, stays listed, and
-  // stays valid as an `activeProfile` reference.
-  if (isInternalProfileKey(name)) {
+  if (CODE_OWNED_PROFILE_NAMES.has(name)) {
     return { ...body };
   }
   if (workspace == null) {
@@ -480,7 +646,9 @@ function resolveAgainstBody(
  * Non-obvious rules:
  *
  * - The `vellum` column stamps `provider: "vellum"` with no connection —
- *   dispatch derives the upstream from the model per-request.
+ *   dispatch derives the upstream from the model per-request. The `chatgpt`
+ *   column likewise stamps its routing identity with no connection;
+ *   dispatch resolves the canonical subscription row per-request.
  * - A default provider without a named matrix column materializes from the
  *   shared `BYOK_PROFILE_IMPLS` templates, with `resolveModelIntent`
  *   falling back to the provider's catalog `defaultModel`.
@@ -507,32 +675,47 @@ export function isDefaultProfileKey(name: string): name is DefaultProfileKey {
 }
 
 /**
- * Whether a name is implemented by the intent × provider matrix — the
- * user-facing defaults plus the internal call-site-only profiles. This is the
- * predicate resolution uses: an internal profile must resolve through the
- * default provider's column exactly like a default, even though it is never
- * listed or seeded.
+ * The implementation of default profile `key` on `provider`: the named matrix
+ * column when the provider has one, the shared BYOK template otherwise. The
+ * managed column carries the balanced-model experiment arm, which is why the
+ * lookup runs through here rather than reading `PROFILE_IMPLS` directly.
  */
-export function isMatrixProfileKey(name: string): name is ProfileMatrixKey {
-  return (PROFILE_MATRIX_KEYS as readonly string[]).includes(name);
+function defaultProfileImplForProvider(
+  key: DefaultProfileKey,
+  provider: NonNullable<ProfileEntry["provider"]>,
+): DefaultProfileTemplate {
+  if (!isDefaultProfileProvider(provider)) {
+    return { ...BYOK_PROFILE_IMPLS[key], provider };
+  }
+  if (provider === "vellum") {
+    return managedProfileImpl(key);
+  }
+  return PROFILE_IMPLS[key][provider];
 }
 
-/** Whether a name is a code-owned profile that must never be listed to users. */
-export function isInternalProfileKey(name: string): name is InternalProfileKey {
-  return (INTERNAL_PROFILE_KEYS as readonly string[]).includes(name);
-}
-
+/**
+ * The code-owned body a default profile name resolves to under the given
+ * default provider. This is the single choke point where a default profile key
+ * becomes a concrete body, so every consumer (the runtime resolver through
+ * `resolveDefaultProfileForProvider`, the client-facing listing through
+ * `getEffectiveProfilesForProvider`) reports the same model the request runs
+ * on, experiment arm included.
+ */
 function defaultProfileBodyForProvider(
   name: string,
   defaultProvider: DefaultProviderConfig | null,
 ): ProfileEntry | undefined {
-  if (defaultProvider == null || !isMatrixProfileKey(name)) {
+  if (!isDefaultProfileKey(name)) {
     return CODE_DEFAULT_PROFILE_ENTRIES[name];
   }
+  if (defaultProvider == null) {
+    // The frozen `CODE_DEFAULT_PROFILE_ENTRIES` body, re-materialized so an
+    // install that predates `llm.defaultProvider` still sees the arm.
+    const managed = managedProfileImpl(name);
+    return materializeProfile(managed, managed.provider);
+  }
   const { provider } = defaultProvider;
-  const impl = isDefaultProfileProvider(provider)
-    ? PROFILE_IMPLS[name][provider]
-    : { ...BYOK_PROFILE_IMPLS[name], provider };
+  const impl = defaultProfileImplForProvider(name, provider);
   return clampMaxTokensToModelCap({
     ...materializeProfile(
       impl,
@@ -569,12 +752,6 @@ function clampMaxTokensToModelCap(body: ProfileEntry): ProfileEntry {
  * available code default, merged per `getEffectiveProfile`. This is the
  * record all runtime readers of `llm.profiles` should consume; the raw
  * workspace record is a write-path concern.
- *
- * Internal profiles are omitted: they exist only to be named by a call-site
- * default, so listing them would offer them as selectable models and let
- * `activeProfile`/`overrideProfile` validation accept them. Resolution
- * reaches them by name through `resolveDefaultProfileForProvider`, which
- * does not go through this record.
  */
 export function getEffectiveProfiles(
   workspaceProfiles: Record<string, ProfileEntry> | undefined,
@@ -586,9 +763,6 @@ export function getEffectiveProfiles(
     ...(workspaceProfiles ?? {}),
   };
   for (const name of Object.keys(catalogEntries)) {
-    if (isInternalProfileKey(name)) {
-      continue;
-    }
     const entry = getEffectiveProfile(workspaceProfiles, name, catalogEntries);
     if (entry != null) {
       effective[name] = entry;
@@ -613,9 +787,6 @@ export function getEffectiveProfilesForProvider(
     ...(workspaceProfiles ?? {}),
   };
   for (const name of Object.keys(CODE_DEFAULT_PROFILE_ENTRIES)) {
-    if (isInternalProfileKey(name)) {
-      continue;
-    }
     const entry = resolveDefaultProfileForProvider(
       workspaceProfiles,
       name,

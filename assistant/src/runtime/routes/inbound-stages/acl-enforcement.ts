@@ -19,6 +19,7 @@ import {
   getPendingSession,
   resolveBootstrapToken,
 } from "../../../channels/gateway-verification-sessions.js";
+import { audienceForReader } from "../../../channels/message-audience.js";
 import type { ChannelId } from "../../../channels/types.js";
 import {
   channelStatusToMemberStatus,
@@ -90,7 +91,6 @@ export interface AclEnforcementParams {
   rawSenderId: string | undefined;
   sourceChannel: ChannelId;
   conversationExternalId: string;
-  canonicalAssistantId: string;
   trimmedContent: string;
   sourceMetadata: SourceMetadata | undefined;
   actorDisplayName: string | undefined;
@@ -190,7 +190,6 @@ export async function enforceIngressAcl(
     rawSenderId,
     sourceChannel,
     conversationExternalId,
-    canonicalAssistantId,
     trimmedContent,
     sourceMetadata,
     actorDisplayName,
@@ -426,7 +425,6 @@ export async function enforceIngressAcl(
             // Still notify the guardian about the access attempt
             try {
               await notifyGuardianOfAccessRequest({
-                canonicalAssistantId,
                 sourceChannel,
                 conversationExternalId,
                 actorExternalId: canonicalSenderId ?? rawSenderId,
@@ -509,7 +507,6 @@ export async function enforceIngressAcl(
           if (emailVerifyResult.initiated) {
             try {
               await notifyGuardianOfAccessRequest({
-                canonicalAssistantId,
                 sourceChannel,
                 conversationExternalId,
                 actorExternalId: canonicalSenderId ?? rawSenderId,
@@ -554,14 +551,12 @@ export async function enforceIngressAcl(
         let handshakeInProgress = false;
         if (isCallbackInteraction) {
           handshakeInProgress = await isApprovalHandshakeInProgress({
-            canonicalAssistantId,
             sourceChannel,
             actorExternalId: (canonicalSenderId ?? rawSenderId)!,
           });
         } else {
           try {
             const accessResult = await notifyGuardianOfAccessRequest({
-              canonicalAssistantId,
               sourceChannel,
               conversationExternalId,
               actorExternalId: canonicalSenderId ?? rawSenderId,
@@ -601,11 +596,11 @@ export async function enforceIngressAcl(
             text: replyText,
             assistantId,
           };
-          // On Slack, send as ephemeral so only the requester sees the rejection
-          if (sourceChannel === "slack" && (canonicalSenderId ?? rawSenderId)) {
-            replyPayload.ephemeral = true;
-            replyPayload.user = (canonicalSenderId ?? rawSenderId)!;
-          }
+          replyPayload.audience = audienceForReader(
+            sourceChannel,
+            conversationExternalId,
+            canonicalSenderId ?? rawSenderId,
+          );
           try {
             await deliverChannelReply(replyCallbackUrl, replyPayload);
             replyDelivered = true;
@@ -730,7 +725,6 @@ export async function enforceIngressAcl(
             if (slackVerifyResult.initiated) {
               try {
                 await notifyGuardianOfAccessRequest({
-                  canonicalAssistantId,
                   sourceChannel,
                   conversationExternalId,
                   actorExternalId: canonicalSenderId ?? rawSenderId,
@@ -803,14 +797,12 @@ export async function enforceIngressAcl(
           if (!terminallyKeptOut) {
             if (isCallbackInteraction) {
               handshakeInProgress = await isApprovalHandshakeInProgress({
-                canonicalAssistantId,
                 sourceChannel,
                 actorExternalId: (canonicalSenderId ?? rawSenderId)!,
               });
             } else {
               try {
                 const accessResult = await notifyGuardianOfAccessRequest({
-                  canonicalAssistantId,
                   sourceChannel,
                   conversationExternalId,
                   actorExternalId: canonicalSenderId ?? rawSenderId,
@@ -856,14 +848,11 @@ export async function enforceIngressAcl(
               text: inactiveReplyText,
               assistantId,
             };
-            // On Slack, send as ephemeral so only the requester sees the rejection
-            if (
-              sourceChannel === "slack" &&
-              (canonicalSenderId ?? rawSenderId)
-            ) {
-              inactiveReplyPayload.ephemeral = true;
-              inactiveReplyPayload.user = (canonicalSenderId ?? rawSenderId)!;
-            }
+            inactiveReplyPayload.audience = audienceForReader(
+              sourceChannel,
+              conversationExternalId,
+              canonicalSenderId ?? rawSenderId,
+            );
             try {
               await deliverChannelReply(replyCallbackUrl, inactiveReplyPayload);
               inactiveReplyDelivered = true;
@@ -900,10 +889,11 @@ export async function enforceIngressAcl(
             text: denyReplyText,
             assistantId,
           };
-          if (sourceChannel === "slack" && (canonicalSenderId ?? rawSenderId)) {
-            denyPayload.ephemeral = true;
-            denyPayload.user = (canonicalSenderId ?? rawSenderId)!;
-          }
+          denyPayload.audience = audienceForReader(
+            sourceChannel,
+            conversationExternalId,
+            canonicalSenderId ?? rawSenderId,
+          );
           try {
             await deliverChannelReply(replyCallbackUrl, denyPayload);
             denyReplyDelivered = true;
@@ -980,7 +970,12 @@ async function initiateVerificationChallenge(params: {
     try {
       [existingChallenge, existingSession] = await Promise.all([
         getPendingSession(sourceChannel),
-        findActiveSession(sourceChannel),
+        // Scoped to this sender. Reading the channel's latest and comparing
+        // its `expectedExternalUserId` misses their session whenever somebody
+        // else started more recently.
+        findActiveSession(sourceChannel, {
+          expectedExternalUserId: senderUserId,
+        }),
       ]);
     } catch (err) {
       log.warn(
@@ -992,8 +987,7 @@ async function initiateVerificationChallenge(params: {
     const senderHasPending =
       (existingChallenge &&
         existingChallenge.expectedExternalUserId === senderUserId) ||
-      (existingSession &&
-        existingSession.expectedExternalUserId === senderUserId);
+      existingSession != null;
     if (senderHasPending) {
       log.debug(
         {

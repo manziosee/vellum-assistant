@@ -7,6 +7,7 @@
 import { z } from "zod";
 
 import { findConversation } from "../../daemon/conversation-registry.js";
+import { assistantEventHub } from "../assistant-event-hub.js";
 import { ACTOR_PRINCIPALS } from "../auth/route-policy.js";
 import {
   enforceSameActorOrThrow,
@@ -107,7 +108,26 @@ async function handleHostCuResult({ body, headers }: RouteHandlerArgs) {
       targetActorPrincipalId: peeked.targetActorPrincipalId,
       targetClientId: peeked.targetClientId,
       op: "host_cu",
+      hubForMissingTarget: assistantEventHub,
     });
+  }
+
+  // Conversation-agnostic observation (see `runtime/host-observe.ts`): the
+  // request was raised outside any turn, so there is no conversation and no CU
+  // proxy to format the observation. Hand the raw fields to the waiting caller.
+  if (peeked.conversationId === undefined) {
+    const interaction = pendingInteractions.resolve(requestId, "answered");
+    interaction?.rpcResolve?.({
+      axTree,
+      axDiff,
+      screenshot,
+      screenshotWidthPx,
+      screenshotHeightPx,
+      screenWidthPt,
+      screenHeightPt,
+      executionError,
+    });
+    return { accepted: true };
   }
 
   const conversation = findConversation(peeked.conversationId);

@@ -12,7 +12,8 @@ import {
   IMAGE_EXTENSIONS,
   readImageFile,
 } from "../shared/filesystem/image-read.js";
-import { sandboxPolicyWithHostFallback } from "../shared/filesystem/path-policy.js";
+import { legacyReadArgsError } from "../shared/filesystem/legacy-read-args.js";
+import { sandboxReadPolicy } from "../shared/filesystem/path-policy.js";
 import {
   invalidToolInputResult,
   toToolInputSchema,
@@ -25,8 +26,8 @@ import type {
 
 /**
  * Model-input schema, the single source for both runtime validation (via
- * `TOOL_INPUT_SCHEMAS`) and the advertised `input_schema` below. `offset` and
- * `limit` catch to `undefined` because the tool has always ignored non-numeric
+ * `TOOL_INPUT_SCHEMAS`) and the advertised `input_schema` below. `start_index`
+ * and `max_chars` catch to `undefined` because the tool ignores non-numeric
  * values rather than failing the read.
  */
 export const fileReadInputSchema = z.looseObject({
@@ -36,14 +37,16 @@ export const fileReadInputSchema = z.looseObject({
     .describe(
       "The path to the file to read (absolute or relative to working directory)",
     ),
-  offset: z
+  start_index: z
     .number()
-    .describe("Line number to start reading from (1-indexed)")
+    .describe("Character to start reading from (0-indexed). Text files only.")
     .optional()
     .catch(undefined),
-  limit: z
+  max_chars: z
     .number()
-    .describe("Maximum number of lines to read")
+    .describe(
+      "Maximum number of characters to read. Defaults to 20000, which is also the ceiling. Text files only.",
+    )
     .optional()
     .catch(undefined),
   activity: z
@@ -58,7 +61,7 @@ export const fileReadInputSchema = z.looseObject({
 export const fileReadTool = {
   name: "file_read",
   description:
-    "Read the contents of a file on your own machine. For image files (JPEG, PNG, GIF, WebP), returns the image for visual analysis. For audio files (MP3, WAV, OGG, FLAC, AAC, M4A), returns the audio for listening. Use host_file_read for files on your guardian's device instead.",
+    "Read the contents of a file on your own machine. Text reads return the first 20000 characters unless you pass `max_chars`; when a read stops short the result says so, and `start_index` pages on from there. To find where something is in a large file, code_search is cheaper than paging through it. For image files (JPEG, PNG, GIF, WebP), returns the image for visual analysis. For audio files (MP3, WAV, OGG, FLAC, AAC, M4A), returns the audio for listening. Use host_file_read for files on your guardian's device instead.",
   category: "filesystem",
   executionTarget: "sandbox",
   defaultRiskLevel: RiskLevel.Low,
@@ -75,15 +78,17 @@ export const fileReadTool = {
     if (!parsed.success) {
       return invalidToolInputResult("file_read", parsed.error);
     }
-    const { path: rawPath, offset, limit } = parsed.data;
+    const {
+      path: rawPath,
+      start_index: startIndex,
+      max_chars: maxChars,
+    } = parsed.data;
 
-    // For image files, delegate to the shared image reader.
+    // For image files, delegate to the shared image reader. Media reads carry
+    // no window, so the legacy-argument guard below does not apply to them.
     const ext = extname(rawPath).toLowerCase();
     if (IMAGE_EXTENSIONS.has(ext)) {
-      const pathCheck = sandboxPolicyWithHostFallback(
-        rawPath,
-        context.workingDir,
-      );
+      const pathCheck = sandboxReadPolicy(rawPath, context.workingDir);
       if (!pathCheck.ok) {
         return {
           content: `Error: ${pathCheck.error}. To read files outside the workspace, use the host_file_read tool instead.`,
@@ -95,10 +100,7 @@ export const fileReadTool = {
 
     // For audio files, delegate to the shared audio reader.
     if (AUDIO_EXTENSIONS.has(ext)) {
-      const pathCheck = sandboxPolicyWithHostFallback(
-        rawPath,
-        context.workingDir,
-      );
+      const pathCheck = sandboxReadPolicy(rawPath, context.workingDir);
       if (!pathCheck.ok) {
         return {
           content: `Error: ${pathCheck.error}. To read files outside the workspace, use the host_file_read tool instead.`,
@@ -108,11 +110,20 @@ export const fileReadTool = {
       return readAudioFile(pathCheck.resolved);
     }
 
+    const legacyArgs = legacyReadArgsError("file_read", input);
+    if (legacyArgs !== undefined) {
+      return { content: legacyArgs, isError: true };
+    }
+
     const ops = new FileSystemOps((path, opts) =>
-      sandboxPolicyWithHostFallback(path, context.workingDir, opts),
+      sandboxReadPolicy(path, context.workingDir, opts),
     );
 
-    const result = ops.readFileSafe({ path: rawPath, offset, limit });
+    const result = await ops.readFileSafe({
+      path: rawPath,
+      startIndex,
+      maxChars,
+    });
 
     if (!result.ok) {
       const { error } = result;

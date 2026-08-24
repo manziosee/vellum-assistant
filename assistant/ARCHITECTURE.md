@@ -35,6 +35,16 @@ Safe storage limits protect the workspace volume from running out of disk. The d
 
 **Prompt and tools:** Cleanup-mode turns carry `diskPressureContext` through runtime assembly and receive the concise `<disk_pressure_warning>` injector in `src/plugins/defaults/memory-retrieval/injectors.ts`. The instruction tells the assistant to warn first, call `skill_load` for `system-storage-cleanup`, and explain that background processes and trusted-contact messages are blocked. Tool setup marks the turn as cleanup mode; `skill_load` remains available so the assistant can load the cleanup skill (or another already-installed skill) for its instructions, but under the lock it performs **no side effects** — it skips catalog auto-install (workspace writes / `bun install`) and strips inline command tokens instead of executing them, so loading a skill cannot write to the workspace or run shell. `skill_execute` and skill-origin tools remain unavailable, and a loaded skill's own tools stay filtered by the cleanup allowlist. The bundled `system-storage-cleanup` skill (`src/config/bundled-skills/system-storage-cleanup/SKILL.md`) carries the detailed cleanup procedure and deletion safety rules, including read-only SQLite diagnosis only; product-owned retention and maintenance work remains tracked separately by ATL-450 and related tickets. `src/tools/tool-approval-handler.ts` rejects non-cleanup-safe tools, and foreground shell inspection remains available while background `bash` and `host_bash` modes are rejected. When a new lock is created, active background terminal tools are cancelled with reason `disk_pressure`.
 
+### Resource Pressure Monitoring
+
+Resource pressure monitoring reports sustained CPU/memory pressure on platform-hosted assistants so clients can suggest a plan upgrade. Unlike disk pressure it never locks or blocks work; it is observe-and-report only.
+
+**Guard state:** `src/daemon/resource-pressure-guard.ts` is gated on `getIsPlatform()`: off-platform there is no plan allocation to measure against, so the guard stays disabled and samples nothing. On platform it samples every 30 seconds. CPU percent comes from the shared rolling container CPU sampler (`src/util/container-cpu-sampler.ts`) measured against the cgroup CPU allocation (null when no CPU cores are reported); memory percent is the working set (cgroup usage minus reclaimable file cache) measured against the container memory limit. Each signal keeps a 20-sample window (10 minutes) with hysteresis: it enters `elevated` only when the window is full and at least 18 samples exceeded the enter threshold (CPU 85%, memory 90%), and clears only after 10 consecutive samples below the clear threshold (CPU 70%, memory 80%). An unavailable sample resets that signal's window; when both samples fail the status becomes `unknown` with the sample error. The overall state is `elevated` while either signal holds.
+
+**Runtime API and events:** `src/runtime/routes/resource-pressure-routes.ts` exposes the read-only `GET /v1/resource-pressure/status` (scope `settings.read`, actor principals); there are no acknowledge or override transitions. `resource_pressure_status_changed` events broadcast the same status shape, but only on substantive transitions: the raw percents and `lastCheckedAt` are excluded from the change fingerprint so the 30-second cadence does not spam the SSE hub. The canonical wire contract lives in `src/api/events/resource-pressure-status-changed.ts`.
+
+**Lifecycle:** `src/daemon/resource-pressure-guard-lifecycle.ts` starts the guard at daemon boot with the first sample deferred onto a macrotask so it never blocks startup, and stops the guard (cancelling any pending deferred sample) on shutdown. The web chat banner built on this status is documented in the repo-level [`/ARCHITECTURE.md`](../ARCHITECTURE.md) "Resource Pressure Monitoring" section.
+
 ### Single-Header JWT Auth Model
 
 All HTTP API requests use a single `Authorization: Bearer <jwt>` header for authentication. The JWT carries identity, permissions, and policy versioning in a unified token.
@@ -67,8 +77,10 @@ All HTTP API requests use a single `Authorization: Bearer <jwt>` header for auth
 | -------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------- |
 | `actor_client_v1`    | `chat.{read,write}`, `approval.{read,write}`, `settings.{read,write}`, `attachments.{read,write}`, `calls.{read,write}`, `feature_flags.{read,write}` | Desktop, CLI clients                         |
 | `gateway_ingress_v1` | `ingress.write`, `internal.write`                                                                                                                     | Gateway channel inbound + webhook forwarding |
-| `gateway_service_v1` | `settings.read`, `settings.write`, `internal.write`                                                                                                   | Gateway service-to-daemon calls              |
-| `internal_v1`        | `internal.all`                                                                                                                                        | Internal service connections                 |
+| `gateway_service_v1` | `chat.{read,write}`, `settings.{read,write}`, `attachments.{read,write}`, `internal.write`                                                            | Gateway service-to-daemon calls              |
+| `local_v1`           | `local.all`                                                                                                                                           | Local (loopback) conversation sessions       |
+| `speech_relay_v1`    | `speech.relay`                                                                                                                                        | Daemon dial of the gateway speech relay only |
+| `ui_page_v1`         | `settings.read`                                                                                                                                       | Served UI pages                              |
 
 **Identity lifecycle:**
 
@@ -622,16 +634,21 @@ To add a new daemon batch STT provider, follow the full checklist in `docs/stt-p
 
 Real-time conversation chat message capture on macOS uses a WebSocket-based streaming STT path. When the configured `services.stt` provider supports conversation streaming (determined by the `conversationStreamingMode` field in the provider catalog), native clients open a WebSocket session through the gateway to the daemon's `/v1/stt/stream` endpoint. The daemon resolves a `StreamingTranscriber` for the configured provider and streams partial/final transcript events back to the client in real time.
 
-Two provider adapters are supported, each implementing the `StreamingTranscriber` interface from `src/stt/types.ts`:
+Each provider that advertises a conversation streaming mode in the catalog ships an adapter implementing the `StreamingTranscriber` interface from `src/stt/types.ts`. The catalog (`src/providers/speech-to-text/provider-catalog.ts`) is the source of truth for which providers are streaming-capable; `resolveStreamingTranscriber()` maps each to its adapter:
 
-| Provider          | Adapter                                                     | Mode          | Mechanism                                                                                                                                                                                                                                                    |
-| ----------------- | ----------------------------------------------------------- | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Deepgram**      | `src/providers/speech-to-text/deepgram-realtime.ts`         | `realtime-ws` | Opens a WebSocket to Deepgram's `/v1/listen` endpoint, forwards raw PCM audio, normalizes Deepgram's `is_final`/`speech_final` semantics into `partial`/`final` events. Uses model `nova-2`.                                                                 |
-| **Google Gemini** | `src/providers/speech-to-text/google-gemini-live-stream.ts` | `realtime-ws` | Opens a bidirectional streaming session against Gemini's Live API (`ai.live.connect`), forwards PCM audio frames, and normalizes `serverContent.inputTranscription` events into `partial`/`final` events. Uses model `gemini-2.5-flash-native-audio-latest`. |
+| Provider           | Adapter                                                     | Mode                | Mechanism                                                                                                                                                                                                                                                           |
+| ------------------ | ----------------------------------------------------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Deepgram**       | `src/providers/speech-to-text/deepgram-realtime.ts`         | `realtime-ws`       | Opens a WebSocket to Deepgram's `/v1/listen` endpoint, forwards raw PCM audio, normalizes Deepgram's `is_final`/`speech_final` semantics into `partial`/`final` events. Uses model `nova-2`.                                                                        |
+| **Deepgram Flux**  | `src/providers/speech-to-text/deepgram-flux-realtime.ts`    | `realtime-ws`       | Opens a WebSocket to Deepgram's `/v2/listen` conversational endpoint. The model decides turn boundaries, so the adapter also emits `turn-start`, `eager-turn-end`, `turn-resumed`, and `turn-end`. Streaming only, no batch endpoint. Uses model `flux-general-en`. |
+| **Google Gemini**  | `src/providers/speech-to-text/google-gemini-live-stream.ts` | `realtime-ws`       | Opens a bidirectional streaming session against Gemini's Live API (`ai.live.connect`), forwards PCM audio frames, and normalizes `serverContent.inputTranscription` events into `partial`/`final` events. Uses model `gemini-2.5-flash-native-audio-latest`.        |
+| **Vellum managed** | `src/providers/speech-to-text/vellum-managed-realtime.ts`   | `realtime-ws`       | Wraps the Deepgram adapter and dials the gateway speech relay (`/v1/speech/stt/stream`) instead of Deepgram directly; both relay legs speak Deepgram's wire protocol, and the model is pinned server-side.                                                          |
+| **xAI**            | `src/providers/speech-to-text/xai-realtime.ts`              | `realtime-ws`       | Opens a WebSocket to `wss://api.x.ai/v1/stt` and normalizes xAI's `transcript.partial`/`transcript.done` payloads into `partial`/`final` events.                                                                                                                    |
+| **OpenAI Whisper** | `src/providers/speech-to-text/openai-whisper-stream.ts`     | `incremental-batch` | Whisper exposes no streaming endpoint, so the shared `incremental-batch-stream.ts` strategy re-transcribes an accumulating buffer and diffs successive results into `partial`/`final` events.                                                                       |
 
 **Provider-specific behavior differences:**
 
 - **Deepgram (`realtime-ws`)**: True WebSocket streaming with sub-second partial latency. Emits `partial` events for `is_final: false` frames and `final` events for `is_final: true` frames. Supports backpressure (drops audio frames when `bufferedAmount > 1 MiB`). Sends `CloseStream` message on stop with a 5-second grace period for the provider to flush remaining finals. Inactivity timeout: 30 seconds (provider-side hang detection). Connect timeout: 10 seconds. Auth errors map to close codes 1008/4001; rate limits to 1013.
+- **Deepgram Flux (`realtime-ws`)**: The model owns turn detection, so the adapter carries no endpointing heuristics and exposes no `finalizeUtterance`: callers feature-detect it and fall back to `stop()`. It emits the four turn-boundary events alongside transcripts, where `eager-turn-end` is a speculative end-of-turn that a later `turn-resumed` retracts or a `turn-end` confirms. Streaming only: batch callers get a diagnostic naming `deepgram` as the batch-capable provider on the same credential.
 - **Google Gemini (`realtime-ws`)**: WebSocket-backed Live API session. Partials are emitted as Gemini streams `inputTranscription.text` fragments; a `final` is emitted when the server signals `generationComplete` or `turnComplete`. On `stop()`, the adapter sends `audioStreamEnd: true` and waits up to a 5-second grace window for the server to flush remaining transcription before force-closing. Inactivity timeout: 30 seconds. Connect timeout: 10 seconds. Close codes 1008/4001 map to `auth`; 1013 maps to `rate-limit`; other codes map to `provider-error`. The model's own text turn is suppressed via a silent system instruction so we only pay for transcription.
 
 **Session lifecycle (daemon side):**
@@ -641,7 +658,7 @@ Two provider adapters are supported, each implementing the `StreamingTranscriber
 3. The transcriber's `start()` method opens the provider session.
 4. A `ready` event (with `provider` field) is sent to the client, signaling that audio frames are accepted.
 5. Client sends `audio` frames (binary WebSocket frames or base64-encoded JSON) and a `stop` event when recording ends.
-6. The transcriber emits `partial` and `final` events, forwarded to the client as JSON frames with monotonic `seq` numbers.
+6. The transcriber emits transcript events, plus turn-boundary events (`turn-start`, `eager-turn-end`, `turn-resumed`, `turn-end`) from providers that detect them, forwarded to the client as JSON frames with monotonic `seq` numbers.
 7. The session closes deterministically on: client disconnect, `stop` event followed by provider `closed`, idle timeout (60 seconds), or runtime shutdown.
 
 **Session lifecycle (client side):**
@@ -701,6 +718,8 @@ The assistant-side live voice module is intentionally bounded under `src/live-vo
 Live voice STT uses the same `resolveStreamingTranscriber()` path as conversation streaming. For V1 latency-sensitive behavior, the selected `services.stt.provider` must resolve to a `daemon-streaming` transcriber whose catalog entry has `conversationStreamingMode: "realtime-ws"` and usable credentials. Providers that only support batch or incremental-batch transcription remain valid for other voice surfaces, but do not satisfy live voice's streaming STT requirement.
 
 Live voice TTS uses `streamLiveVoiceTtsAudio()` and the configured `services.tts.provider`. The selected provider must be registered, catalog-compatible, and expose `capabilities.supportsStreaming` plus `synthesizeStream()`. Providers whose catalog entry advertises `supportsStreaming` (currently all four catalog providers: ElevenLabs, Fish Audio, Deepgram, and xAI) satisfy this requirement; a buffered-only provider would remain available for buffered message playback or other supported surfaces, but live voice reports a TTS error instead of silently falling back to buffered playback.
+
+The `voiceFrontDoor` prompt skips current-turn legacy and v3 memory retrieval, while prior frozen memory cards and static memory context remain available. The front-door rule escalates rather than guessing when required personal context is absent. The escalated leg runs the ordinary memory pipeline against the latest visible caller prompt before the quality model, with low selector effort. This keeps memory work off the front-door TTFT path without cross-leg speculative state.
 
 V1 is local/gateway-scoped. Managed/cloud WebSocket proxy support, cross-region routing, and p50/p95 latency guarantees are out of scope for this version. Metrics frames expose timing data for measurement, but the architecture does not promise a hard latency SLO.
 
@@ -836,7 +855,7 @@ graph LR
         JOBS["memory_jobs<br/>───────────────<br/>Async task queue<br/>Types: embed, extract,<br/>summarize, backfill, cleanup<br/>Status: pending → running →<br/>completed | failed"]
         ATT["attachments<br/>───────────────<br/>base64-encoded file data<br/>mime_type, size_bytes<br/>Linked to messages via<br/>message_attachments join"]
         REM["reminders<br/>───────────────<br/>One-time scheduled reminders<br/>label, message, fireAt<br/>mode: notify | execute<br/>status: pending → fired | cancelled<br/>routing_intent: single_channel |<br/>multi_channel | all_channels<br/>routing_hints_json (free-form)"]
-        SCHED_JOBS["cron_jobs (recurrence schedules)<br/>───────────────<br/>Recurring schedule definitions<br/>cron_expression: cron or RRULE string<br/>schedule_syntax: 'cron' | 'rrule'<br/>timezone, message, next_run_at<br/>enabled, retry_count<br/>Legacy alias: scheduleJobs"]
+        SCHED_JOBS["cron_jobs (recurrence schedules)<br/>───────────────<br/>Recurring schedule definitions<br/>cron_expression: cron or RRULE string<br/>schedule_syntax: 'cron' | 'rrule'<br/>timezone, message, next_run_at<br/>enabled, retry_count<br/>source_key: plugin-declared provenance<br/>definition_hash, user_enabled<br/>Legacy alias: scheduleJobs"]
         SCHED_RUNS["cron_runs (schedule runs)<br/>───────────────<br/>Execution history per schedule<br/>job_id (FK → cron_jobs)<br/>status: ok | error<br/>duration_ms, output, error<br/>Legacy alias: scheduleRuns"]
         TASKS["tasks<br/>───────────────<br/>Reusable prompt templates<br/>title, Handlebars template<br/>inputSchema, contextFlags<br/>requiredTools, status"]
         TASK_RUNS["task_runs<br/>───────────────<br/>Execution history per task<br/>taskId (FK → tasks)<br/>conversationId, status<br/>startedAt, finishedAt, error"]
@@ -860,6 +879,74 @@ graph LR
 ```
 
 ---
+
+## Plugin-Declared Schedules: Declaration → Reconciler → cron_jobs
+
+Plugins contribute recurring schedules as a surface: directories under
+`<pluginDir>/schedules/`, each a `<name>/` holding `config.json` plus
+exactly one `index.md` (runs as `execute`) or `index.sh` (runs as `script`)
+entrypoint. Ambiguity fails closed: a file sitting directly under
+`schedules/`, zero/multiple/unsupported entrypoints, and malformed config
+produce per-schedule `DeclarationError`s without affecting siblings
+(`src/schedule/plugin-schedule-declarations.ts`).
+
+A level-based reconciler (`src/schedule/plugin-schedule-reconciler.ts`)
+converges declarations into ordinary `cron_jobs` rows keyed by the nullable
+`source_key` column (`plugin:<plugin>/<name>`). Rows with `source_key IS
+NULL` are imperative schedules the reconciler never touches. Triggers: a
+startup pass in `daemon/lifecycle.ts` (after plugin init, before the
+scheduler starts), the end of `reconcilePluginSourcesNow()` in
+`plugins/mtime-cache.ts` (install/uninstall/upgrade and sentinel-driven
+changes), the plugin enable/disable routes, and a 60s backstop sweep
+registered with the HTTP server's background sweeps. The desired set is
+gated on activation as well as on what is on disk:
+`collectDesiredDeclarations` skips any plugin directory that
+`isPluginDirActivated` (`plugins/mtime-cache.ts`) does not report as brought
+up in this process, so a directory that merely exists under the plugins root
+never arms a row.
+
+Reconcile lag never lets a disabled plugin run. The disable path writes a
+`.disabled` sentinel that only a reconcile pass turns into disarmed rows, so
+the scheduler re-reads the sentinel at fire time and records a skipped run
+instead of executing a claimed row whose plugin is off. Run-now applies the
+same boundary through `pluginScheduleSourceAvailable`
+(`schedule/plugin-schedule-availability.ts`), which composes the activation
+ledger with `declarationExistsOnDisk`. That disk probe also covers a plugin
+whose manifest no longer parses, a declaration directory that is gone, and a
+plugin root or declaration directory resolving outside the tree it belongs to
+(the same `isInsidePluginRoot` containment the loader applies before importing
+a plugin). Fire time in the scheduler and the user re-enable path in
+`schedule-store.ts` deliberately use the disk probe on its own, because both
+can run outside the daemon process, where the activation ledger is empty and
+every plugin would read as unactivated. The reconciler's sweep disarms the
+rows of a plugin it has not activated within one pass, which bounds what
+those disk-only probes can let through.
+
+A declaration that stops parsing keeps its execute row armed on the message
+already stored in the row, but disarms its script rows: a script row fires its
+entrypoint by absolute path, so leaving it armed would run the very `index.sh`
+the parser rejected. Those rows re-arm on the pass after the declaration parses
+again.
+
+Ownership boundaries: the reconciler owns definition columns (expression,
+timezone, message/script, retry policy, `definition_hash`); the execution
+engine owns runtime columns (`next_run_at`, `status`, `last_*`,
+`retry_count`) and its latches are never overridden; the user owns
+`user_enabled`, a sticky override consulted when computing effective
+`enabled`. `definition_hash` is a sha256 over the relPath and bytes of
+exactly two files, the declaration's `config.json` and its entrypoint, so
+nothing else under `schedules/<name>/` can produce a definition change.
+Nothing ever writes to plugin files. Execution itself is
+unchanged: declared rows fire through the same `claimDueSchedules` path as
+imperative ones.
+
+Consent and surfacing: CLI install/upgrade list declared schedules and
+prompt before finalizing; unattended daemon-route installs are covered by
+`schedule.declared` arrival notifications, with `schedule.definition_changed`
+and `schedule.definition_error` covering upgrades and broken declarations
+(events registered in `notifications/signal.ts`, deterministic templates in
+`notifications/copy-composer.ts`). Settings routes, CLI, and web render
+plugin-sourced rows read-only except the enabled toggle.
 
 ---
 

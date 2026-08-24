@@ -3,7 +3,6 @@ import {
   type MouseEvent as ReactMouseEvent,
   type ReactNode,
   useCallback,
-  useEffect,
   useMemo,
   useRef,
   useState,
@@ -15,7 +14,8 @@ import { resolveAttachmentFilename } from "@vellumai/service-contracts/attachmen
 import { downloadAttachment } from "@/domains/chat/components/chat-attachments/download-attachment";
 import { MessageAttachments } from "@/domains/chat/components/chat-attachments/message-attachments";
 import {
-  hasToolResultImages,
+  embeddedImageFileNames,
+  resolveToolResultImages,
   ToolResultImages,
 } from "@/domains/chat/components/chat-attachments/tool-result-images";
 import { ChatMarkdownMessage } from "@/domains/chat/components/chat-markdown-message";
@@ -37,15 +37,24 @@ import { SingleActivity } from "@/domains/chat/components/single-activity/single
 import { MultiActivityGroup } from "@/domains/chat/components/multi-activity-group/multi-activity-group";
 import { WEB_TOOL_NAMES } from "@/domains/chat/utils/tool-call-card-utils";
 import {
+  deriveStepLabel,
+  type IconName,
+} from "@/domains/chat/components/tool-progress-card/derive-step-label";
+import {
   activityItemsToCardData,
   type ContentBlockActivityItem,
   groupContentBlocks,
   isSubagentSpawnCall,
 } from "@/domains/chat/transcript/message-content";
 import { AcpConnectAffordance } from "@/domains/chat/transcript/acp-connect-affordance";
+import { ResponseArtifactCard } from "@/domains/chat/transcript/response-artifact-card";
+import { hasRenderableAnswer } from "@/domains/chat/answered-question";
+import { AnsweredQuestionCard } from "@/domains/chat/components/answered-question-card";
+import { useCoarsePointerReveal } from "@/domains/chat/transcript/use-coarse-pointer-reveal";
 import { AssistantContentDisclosure } from "@/domains/chat/transcript/assistant-content-disclosure";
 import { parseInlineSurfaces } from "@/domains/chat/utils/parse-inline-surfaces";
 import { useSmoothStreamText } from "@/domains/chat/hooks/use-smooth-stream-text";
+import { useTranslation } from "@/i18n";
 import { useSupportsRedactedCredentialChips } from "@/lib/backwards-compat/use-supports-redacted-credential-chips";
 import { stopAcpRun } from "@/domains/chat/utils/acp-run-actions";
 import { stopBackgroundTask } from "@/domains/chat/utils/background-task-actions";
@@ -95,6 +104,17 @@ import { saveFile } from "@/runtime/native-file";
  */
 const STREAM_WORD_FADE_MAX_CHARS = 12000;
 
+/**
+ * Prose inside the "Earlier activity" disclosure. It is superseded by the final
+ * response, so it drops to the size of the activity rows around it (they are
+ * off-scale 13px too) and to the secondary tone — the revealed run reads as
+ * context rather than a second answer.
+ *
+ * typography: off-scale — matches `SingleActivity`'s 13px inline rows.
+ */
+const COLLAPSED_MARKDOWN_CLASS =
+  "text-[13px] leading-[20px] text-[var(--content-secondary)]";
+
 /** Percent-decodes `value`, returning it unchanged on malformed encoding. */
 function safeDecodeURIComponent(value: string): string {
   try {
@@ -136,11 +156,13 @@ export function TranscriptMessageBody({
   onStopSubagent,
   onWorkflowClick,
   onStopWorkflow,
+  responseArtifacts,
   isStreaming = false,
   isLatestMessage = false,
 }: TranscriptMessageBodyProps) {
-  const collapseAssistantIntermediates =
-    useClientFeatureFlagStore.use.collapseAssistantIntermediates();
+  const { t } = useTranslation("chat");
+  const inlineAssistantIntermediates =
+    useClientFeatureFlagStore.use.inlineAssistantIntermediates();
   const isSlackMessage = Boolean(message.slackMessage);
   const isSlackReaction = message.slackMessage?.eventKind === "reaction";
   const isUser = message.role === "user";
@@ -171,11 +193,24 @@ export function TranscriptMessageBody({
   // widget lands, its call resolves, or the turn ends.
   const pendingVisualToolUseIds = message.pendingVisualToolUseIds ?? [];
 
+  // The images this message's own prose presents with a markdown embed. A media
+  // skill asks the model to show its result that way, so the mid-turn strip owes
+  // nothing for the same file. Read by the strip and by the collapse rule that
+  // pins the group holding it, so the two agree on what renders.
+  const embeddedImageNames = useMemo(
+    () => embeddedImageFileNames(message.contentBlocks),
+    [message.contentBlocks],
+  );
+
   const isTouch = isPointerCoarse();
 
-  const textBubbleClass = isSlackMessage
-    ? "max-w-[80%] text-[var(--content-default)] sm:max-w-[640px]"
-    : "w-full text-[var(--content-default)]";
+  // Width and color are split so the collapsed variant below can restate the
+  // color without the two arbitrary-value `text-[…]` utilities racing on
+  // stylesheet order.
+  const textBubbleWidthClass = isSlackMessage
+    ? "max-w-[80%] sm:max-w-[640px]"
+    : "w-full";
+  const textBubbleClass = `${textBubbleWidthClass} text-[var(--content-default)]`;
   // On touch devices, the long-press gesture opens the message actions sheet.
   // iOS's native text selection (blue highlight + callout bar) otherwise races
   // the 500ms long-press timer, so both surface at once. Suppress native
@@ -187,6 +222,9 @@ export function TranscriptMessageBody({
   const segmentClass = isUser
     ? "break-words text-[15px]"
     : `break-words text-[15px] ${textBubbleClass}`;
+  // The collapsed variant leaves size and color to `COLLAPSED_MARKDOWN_CLASS`
+  // on the markdown container itself (see `renderTextWithInlineSurfaces`).
+  const collapsedSegmentClass = `break-words ${textBubbleWidthClass}`;
 
   const forkMessageId = message.id;
   const forkHandler =
@@ -214,8 +252,7 @@ export function TranscriptMessageBody({
       ? onRetryLatestTurn
       : undefined;
 
-  const wrapperRef = useRef<HTMLDivElement | null>(null);
-  const [revealed, setRevealed] = useState(false);
+  const { wrapperRef, revealed, toggleRevealed } = useCoarsePointerReveal();
   const slackMessageUrl = getExternalLinkUrl(message.slackMessage?.messageLink);
 
   const [longPressOpen, setLongPressOpen] = useState(false);
@@ -255,24 +292,6 @@ export function TranscriptMessageBody({
     }
   }, []);
 
-  useEffect(() => {
-    if (!revealed) {
-      return;
-    }
-    const onDocPointerDown = (e: PointerEvent) => {
-      const target = e.target as Node | null;
-      if (
-        target &&
-        wrapperRef.current &&
-        !wrapperRef.current.contains(target)
-      ) {
-        setRevealed(false);
-      }
-    };
-    document.addEventListener("pointerdown", onDocPointerDown);
-    return () => document.removeEventListener("pointerdown", onDocPointerDown);
-  }, [revealed]);
-
   const handleBubbleClick = useCallback(
     (e: ReactMouseEvent<HTMLDivElement>) => {
       // Suppress the click that follows a long-press activation so the
@@ -297,9 +316,9 @@ export function TranscriptMessageBody({
       if (!isPointerCoarse()) {
         return;
       }
-      setRevealed((v) => !v);
+      toggleRevealed();
     },
-    [slackMessageUrl],
+    [slackMessageUrl, toggleRevealed],
   );
 
   const linkedSubagentEntries = useSubagentStore((s) =>
@@ -405,6 +424,22 @@ export function TranscriptMessageBody({
     const id = extractBgIdFromResult(tc);
     return id !== undefined && cardBackedBackgroundTaskIds.has(id) ? id : null;
   };
+  /**
+   * Whether a dedicated inline card renders this tool call's content, which
+   * makes the raw chip a duplicate. Each clause requires the card to actually
+   * be there: a failed call (no id), a run with no store entry, and an answered
+   * question with nothing to show are all not card-backed, so they keep the
+   * chip instead of vanishing from the transcript.
+   *
+   * Read by all three places that must agree on this: the chip filter, the
+   * group's suppression set, and the collapse guard that keeps a card-backed
+   * group out of the "Earlier activity" disclosure.
+   */
+  const isCardBacked = (tc: ChatMessageToolCall): boolean =>
+    cardBackedWorkflowRunId(tc) !== null ||
+    cardBackedAcpRunId(tc) !== null ||
+    cardBackedBackgroundTaskId(tc) !== null ||
+    hasRenderableAnswer(tc.answeredQuestion);
   const handleAcpRunClick = useCallback((acpSessionId: string) => {
     useViewerStore.getState().openAcpRunDetail(acpSessionId);
   }, []);
@@ -498,16 +533,18 @@ export function TranscriptMessageBody({
           }
           await saveFile(data, filename);
         } catch {
-          toast.error("Failed to download file", { description: filename });
+          toast.error(t("fileDownload.failed"), { description: filename });
         }
       })();
     } else {
       toast.error(
-        `File not available for download${pending.isHost ? " (host file approval may have timed out)" : ""}`,
+        pending.isHost
+          ? t("transcriptMessageBody.fileUnavailableHostTimeout")
+          : t("transcriptMessageBody.fileUnavailable"),
         { description: pending.filename },
       );
     }
-  }, [pendingVellumFile, assistantId]);
+  }, [pendingVellumFile, assistantId, t]);
 
   const vellumFileModal = (
     <VellumFileActionModal
@@ -522,7 +559,14 @@ export function TranscriptMessageBody({
     text: string,
     key: string,
     streamWordFade?: "revealing" | "caughtUp",
+    collapsed = false,
   ) => {
+    const textClass = collapsed ? collapsedSegmentClass : segmentClass;
+    // `MarkdownMessage` sets its own `text-chat text-[var(--content-default)]`
+    // on its container, so a color on the wrapper alone never reaches the
+    // prose. The override rides the component's own `className` (merged via
+    // `cn`, so it drops the base size and color).
+    const markdownClass = collapsed ? COLLAPSED_MARKDOWN_CLASS : undefined;
     const inlineSegments = parseInlineSurfaces(text);
     if (inlineSegments) {
       return (
@@ -548,10 +592,11 @@ export function TranscriptMessageBody({
               <div
                 key={`inline-text-${si}`}
                 data-message-text=""
-                className={segmentClass}
+                className={textClass}
               >
                 <ChatMarkdownMessage
                   content={seg.content}
+                  className={markdownClass}
                   hardLineBreaks
                   onVellumLinkClick={handleVellumLinkClick}
                   attachments={message.attachments}
@@ -569,9 +614,10 @@ export function TranscriptMessageBody({
       );
     }
     return (
-      <div key={key} data-message-text="" className={segmentClass}>
+      <div key={key} data-message-text="" className={textClass}>
         <ChatMarkdownMessage
           content={text}
+          className={markdownClass}
           hardLineBreaks
           onVellumLinkClick={handleVellumLinkClick}
           attachments={message.attachments}
@@ -621,7 +667,7 @@ export function TranscriptMessageBody({
             id={runId}
             onOpen={onWorkflowClick ? () => onWorkflowClick(runId) : undefined}
             onStop={onStopWorkflow ? () => onStopWorkflow(runId) : undefined}
-            stopAriaLabel="Stop workflow"
+            stopAriaLabel={t("transcriptMessageBody.stopWorkflow")}
             testId="inline-process-card"
           />
         ))}
@@ -653,7 +699,7 @@ export function TranscriptMessageBody({
                 });
               })
             }
-            stopAriaLabel="Stop run"
+            stopAriaLabel={t("transcriptMessageBody.stopRun")}
             testId="inline-process-card"
           />
         ))}
@@ -673,6 +719,27 @@ export function TranscriptMessageBody({
     toolCalls.some((tc) => tc.id === acpConnectToolUseId) ? (
       <AcpConnectAffordance assistantId={assistantId} />
     ) : null;
+
+  // An answered `ask_question` renders its questions and the user's answers as
+  // a durable transcript row. The record rides the tool call itself (live from
+  // `tool_result`, then from the daemon's persisted copy on reload), so this
+  // renders identically on both paths and cannot double up: one card per
+  // answered tool call.
+  const renderAnsweredQuestionCards = (toolCalls: ChatMessageToolCall[]) => {
+    const answered = toolCalls.filter((tc) =>
+      hasRenderableAnswer(tc.answeredQuestion),
+    );
+    if (answered.length === 0) {
+      return null;
+    }
+    return (
+      <div className="flex w-full flex-col gap-1.5">
+        {answered.map((tc) => (
+          <AnsweredQuestionCard key={tc.id} answered={tc.answeredQuestion!} />
+        ))}
+      </div>
+    );
+  };
 
   const renderInlineBackgroundTaskCards = (
     toolCalls: ChatMessageToolCall[],
@@ -699,7 +766,7 @@ export function TranscriptMessageBody({
                 });
               })
             }
-            stopAriaLabel="Stop command"
+            stopAriaLabel={t("transcriptMessageBody.stopCommand")}
             testId="inline-process-card"
           />
         ))}
@@ -710,7 +777,8 @@ export function TranscriptMessageBody({
   const renderToolResultImages = (toolCalls: ChatMessageToolCall[]) => (
     <ToolResultImages
       toolCalls={toolCalls}
-      hasAttachments={hasAttachments}
+      messageAttachments={message.attachments}
+      embeddedImageNames={embeddedImageNames}
       assistantId={assistantId}
     />
   );
@@ -718,19 +786,21 @@ export function TranscriptMessageBody({
   const renderSurfaceNode = (
     surface: ConversationMessageSurface,
     key: string,
-  ): ReactNode => (
-    <div key={key} className="w-full">
-      <SurfaceRouter
-        surface={wireSurfaceToDisplay(surface)}
-        onAction={onSurfaceAction}
-        onOpenApp={onOpenApp}
-        onOpenDocument={onOpenDocument}
-        assistantId={assistantId}
-        toolCalls={message.toolCalls}
-        onVellumLinkClick={handleVellumLinkClick}
-      />
-    </div>
-  );
+  ): ReactNode => {
+    return (
+      <div key={key} className="w-full">
+        <SurfaceRouter
+          surface={wireSurfaceToDisplay(surface)}
+          onAction={onSurfaceAction}
+          onOpenApp={onOpenApp}
+          onOpenDocument={onOpenDocument}
+          assistantId={assistantId}
+          toolCalls={message.toolCalls}
+          onVellumLinkClick={handleVellumLinkClick}
+        />
+      </div>
+    );
+  };
 
   // Render one `activity` group (a contiguous thinking + tool run) into its
   // combined `MultiActivityGroup`, a lone inline link, or a bare thinking
@@ -748,16 +818,7 @@ export function TranscriptMessageBody({
       it.kind === "thinking" ? [it.text] : [],
     );
     const renderableToolCalls = groupToolCalls.filter(
-      // Suppress the raw chip only for a card-backed run_workflow / acp_spawn /
-      // background bash call (see cardBackedWorkflowRunId / cardBackedAcpRunId /
-      // cardBackedBackgroundTaskId). A failed call (no id) or a run with no
-      // store entry is not card-backed, so it renders its tool result instead
-      // of vanishing.
-      (tc) =>
-        !isSubagentSpawnCall(tc) &&
-        cardBackedWorkflowRunId(tc) === null &&
-        cardBackedAcpRunId(tc) === null &&
-        cardBackedBackgroundTaskId(tc) === null,
+      (tc) => !isSubagentSpawnCall(tc) && !isCardBacked(tc),
     );
     const loneTool =
       cardItems.length === 1 &&
@@ -776,25 +837,17 @@ export function TranscriptMessageBody({
           {renderInlineWorkflowCards(groupToolCalls)}
           {renderInlineAcpRunCards(groupToolCalls)}
           {renderInlineBackgroundTaskCards(groupToolCalls)}
+          {renderAnsweredQuestionCards(groupToolCalls)}
           {renderAcpConnectAffordance(groupToolCalls)}
         </Fragment>
       );
     }
     if (renderableToolCalls.length > 0) {
-      // A card-backed run_workflow / acp_spawn call is shown by its dedicated
-      // inline card, so drop it from the steps MultiActivityGroup renders too
-      // (the group filters subagent_spawn internally but not the others). A
-      // failed or pruned call is not card-backed and is kept, so its tool result
-      // still renders as a step; subagent spawns are left for the group to filter.
+      // A card-backed call is shown by its dedicated inline card, so drop it
+      // from the steps MultiActivityGroup renders too (the group filters
+      // subagent_spawn internally but not the others).
       const suppressedCardIds = new Set(
-        groupToolCalls
-          .filter(
-            (tc) =>
-              cardBackedWorkflowRunId(tc) !== null ||
-              cardBackedAcpRunId(tc) !== null ||
-              cardBackedBackgroundTaskId(tc) !== null,
-          )
-          .map((tc) => tc.id),
+        groupToolCalls.filter(isCardBacked).map((tc) => tc.id),
       );
       const groupCardToolCalls =
         suppressedCardIds.size === 0
@@ -828,6 +881,7 @@ export function TranscriptMessageBody({
           {renderInlineWorkflowCards(groupToolCalls)}
           {renderInlineAcpRunCards(groupToolCalls)}
           {renderInlineBackgroundTaskCards(groupToolCalls)}
+          {renderAnsweredQuestionCards(groupToolCalls)}
           {renderAcpConnectAffordance(groupToolCalls)}
         </Fragment>
       );
@@ -853,6 +907,7 @@ export function TranscriptMessageBody({
         {renderInlineWorkflowCards(groupToolCalls)}
         {renderInlineAcpRunCards(groupToolCalls)}
         {renderInlineBackgroundTaskCards(groupToolCalls)}
+        {renderAnsweredQuestionCards(groupToolCalls)}
       </Fragment>
     );
   };
@@ -861,8 +916,7 @@ export function TranscriptMessageBody({
     items: Array<{ kind: "text" | "nonText"; node: ReactNode }>,
   ): ReactNode => {
     type Slot =
-      | { kind: "bubble"; nodes: ReactNode[] }
-      | { kind: "raw"; node: ReactNode };
+      { kind: "bubble"; nodes: ReactNode[] } | { kind: "raw"; node: ReactNode };
     const slots: Slot[] = [];
     let textRun: ReactNode[] = [];
 
@@ -915,10 +969,62 @@ export function TranscriptMessageBody({
     );
   };
 
+  /**
+   * Whether a group renders a visible row at all. A thinking run whose
+   * reasoning never arrived renders nothing once settled (`SingleActivity`
+   * collapses an empty, settled thought), and a timeline slot for it would show
+   * a lone glyph against blank space. While streaming, the trailing group still
+   * renders the shimmering "Thinking" row before any text lands.
+   */
+  const groupRendersRow = (
+    group: (typeof groups)[number],
+    groupIndex: number,
+  ): boolean => {
+    if (group.type === "text") {
+      return group.text.trim().length > 0;
+    }
+    if (group.type === "surface") {
+      return true;
+    }
+    const { cardItems, toolCalls } = activityItemsToCardData(group.items);
+    if (toolCalls.some((tc) => !isSubagentSpawnCall(tc) && !isCardBacked(tc))) {
+      return true;
+    }
+    const hasThinking = cardItems.some(
+      (it) => it.kind === "thinking" && it.text.length > 0,
+    );
+    return hasThinking || (isStreaming && groupIndex === groups.length - 1);
+  };
+
+  /**
+   * Timeline glyph for one group inside an "Earlier activity" disclosure: the
+   * first renderable step's icon, a globe for a web run (`deriveStepLabel`
+   * covers non-web tools only), a brain for a thinking-only run, and none for
+   * prose — which keeps its gutter slot but shows no glyph.
+   */
+  const disclosureIconForGroup = (
+    group: (typeof groups)[number],
+  ): IconName | undefined => {
+    if (group.type !== "activity") {
+      return undefined;
+    }
+    const { toolCalls } = activityItemsToCardData(group.items);
+    const leadCall = toolCalls.find(
+      (tc) => !isSubagentSpawnCall(tc) && !isCardBacked(tc),
+    );
+    if (!leadCall) {
+      return "brain";
+    }
+    return WEB_TOOL_NAMES.has(leadCall.name)
+      ? "globe"
+      : deriveStepLabel(leadCall).iconName;
+  };
+
   const lastGroupIndex = groups.length - 1;
   const renderGroupNode = (
     group: (typeof groups)[number],
     gi: number,
+    collapsed = false,
   ): ReactNode => {
     if (group.type === "text") {
       const isSmoothedTrailing =
@@ -936,6 +1042,7 @@ export function TranscriptMessageBody({
         isSmoothedTrailing ? smoothedTrailingText : group.text,
         `b-text-${gi}`,
         fadeMode,
+        collapsed,
       );
     }
     if (group.type === "surface") {
@@ -1037,67 +1144,134 @@ export function TranscriptMessageBody({
   const finalResponseGroupIndex = groups.findLastIndex(
     (group) => group.type === "text" && group.text.trim().length > 0,
   );
-  const renderedGroups = groups.map((group, gi) => renderGroupNode(group, gi));
-  const collapsibleGroupIndexes = collapseAssistantIntermediates
-    ? groups.flatMap((group, groupIndex) => {
-        if (groupIndex >= finalResponseGroupIndex) {
-          return [];
-        }
-        if (group.type === "surface") {
-          return [];
-        }
-        if (group.type === "text") {
-          const isSurfaceAdjacent =
-            groups[groupIndex - 1]?.type === "surface" ||
-            groups[groupIndex + 1]?.type === "surface";
-          return parseInlineSurfaces(group.text) || isSurfaceAdjacent
-            ? []
-            : [groupIndex];
-        }
+  // Per-user opt-out of the "Earlier activity" disclosure: with the flag on,
+  // no group is collapsible, so the whole response renders inline at full
+  // size and none of the collapsed styling applies.
+  const collapsibleGroupIndexes = groups.flatMap((group, groupIndex) => {
+    if (inlineAssistantIntermediates) {
+      return [];
+    }
+    if (groupIndex >= finalResponseGroupIndex) {
+      return [];
+    }
+    if (group.type === "surface") {
+      return [];
+    }
+    if (group.type === "text") {
+      const isSurfaceAdjacent =
+        groups[groupIndex - 1]?.type === "surface" ||
+        groups[groupIndex + 1]?.type === "surface";
+      return parseInlineSurfaces(group.text) || isSurfaceAdjacent
+        ? []
+        : [groupIndex];
+    }
 
-        const { toolCalls } = activityItemsToCardData(group.items);
-        const hasVisibleOutputOrControl =
-          hasToolResultImages(toolCalls) ||
-          toolCalls.some(
-            (toolCall) =>
-              isToolCallRunning(toolCall) ||
-              toolCall.pendingConfirmation !== undefined ||
-              isSubagentSpawnCall(toolCall) ||
-              cardBackedWorkflowRunId(toolCall) !== null ||
-              cardBackedAcpRunId(toolCall) !== null ||
-              cardBackedBackgroundTaskId(toolCall) !== null ||
-              acpConnectToolUseId === toolCall.id ||
-              unknownNudgeToolCallIds?.has(toolCall.id) === true,
-          );
-        return hasVisibleOutputOrControl ? [] : [groupIndex];
-      })
-    : [];
-  const collapsibleGroupIndexSet = new Set(collapsibleGroupIndexes);
-  const assistantContent =
-    collapsibleGroupIndexes.length > 0
-      ? renderedGroups.map((renderedGroup, groupIndex) => {
-          if (
-            collapsibleGroupIndexSet.has(groupIndex) &&
-            !collapsibleGroupIndexSet.has(groupIndex - 1)
-          ) {
-            let runEndIndex = groupIndex + 1;
-            while (collapsibleGroupIndexSet.has(runEndIndex)) {
-              runEndIndex += 1;
-            }
-            return (
-              <AssistantContentDisclosure
-                key={`earlier-activity-${groupIndex}`}
-                isStreaming={isStreaming}
-              >
-                {renderedGroups.slice(groupIndex, runEndIndex)}
-              </AssistantContentDisclosure>
-            );
-          }
-          return collapsibleGroupIndexSet.has(groupIndex)
-            ? null
-            : renderedGroup;
-        })
-      : renderedGroups;
+    const { toolCalls } = activityItemsToCardData(group.items);
+    const hasVisibleOutputOrControl =
+      // Pinned only when the strip actually draws something. A group whose
+      // images the end-of-turn attachments already show draws nothing, so it
+      // has no reason to sit outside "Earlier activity".
+      resolveToolResultImages(
+        toolCalls,
+        message.attachments,
+        embeddedImageNames,
+      ).length > 0 ||
+      toolCalls.some(
+        (toolCall) =>
+          isToolCallRunning(toolCall) ||
+          toolCall.pendingConfirmation !== undefined ||
+          isSubagentSpawnCall(toolCall) ||
+          isCardBacked(toolCall) ||
+          acpConnectToolUseId === toolCall.id ||
+          unknownNudgeToolCallIds?.has(toolCall.id) === true,
+      );
+    return hasVisibleOutputOrControl ? [] : [groupIndex];
+  });
+  // Which collapsible groups actually render a row. A group that renders
+  // nothing is still swallowed by the disclosure, but claims no timeline slot,
+  // which would otherwise put a lone glyph against blank space.
+  const collapsibleRowIndexes = collapsibleGroupIndexes.filter((groupIndex) =>
+    groupRendersRow(groups[groupIndex]!, groupIndex),
+  );
+  // A disclosure over one lone activity row does not earn its keep: that row is
+  // already a single one-line link (`SingleActivity`'s bare "Thinking" / tool
+  // link, or `MultiActivityGroup`'s header) whose reasoning and step timeline
+  // live in a drawer, so collapsing it swaps one line of chrome for another.
+  // Two or more rows, or a single row of prose, still collapse.
+  const earnsDisclosure =
+    collapsibleRowIndexes.length > 1 ||
+    (collapsibleRowIndexes.length === 1 &&
+      groups[collapsibleRowIndexes[0]!]?.type !== "activity");
+  // Every group the disclosure swallows, collected message-wide rather than per
+  // contiguous run, and resolved before the render pass so a group knows it is
+  // collapsed while it renders: prose reads that to drop to the muted, smaller
+  // collapsed tone.
+  //
+  // Collecting per contiguous run instead would let a pinned group (a surface,
+  // a running tool, a result image, an inline process card) split the run
+  // around it, and a run stranded on the far side often renders a single
+  // activity row, which does not earn a disclosure of its own: one message
+  // would show the same kind of row twice over, indented inside a disclosure
+  // and flush at the margin below it. Message-wide there is exactly one
+  // disclosure, anchored where the first collapsible group sits, and pinned
+  // groups keep their positions around it.
+  //
+  // The trade is ordering: a collapsed group that ran *after* a pinned one
+  // still reads above it once the disclosure is open, because one disclosure
+  // cannot interleave with what it does not contain. Closed, which is how a
+  // settled turn renders, nothing moves.
+  const disclosedGroupIndexes = new Set<number>(
+    earnsDisclosure ? collapsibleGroupIndexes : [],
+  );
+  const disclosureAnchorIndex = earnsDisclosure
+    ? collapsibleGroupIndexes[0]
+    : undefined;
+
+  const renderedGroups = groups.map((group, gi) =>
+    renderGroupNode(group, gi, disclosedGroupIndexes.has(gi)),
+  );
+  const assistantContent: ReactNode[] = [];
+  for (
+    let groupIndex = 0;
+    groupIndex < renderedGroups.length;
+    groupIndex += 1
+  ) {
+    if (groupIndex === disclosureAnchorIndex) {
+      assistantContent.push(
+        <AssistantContentDisclosure
+          key={`earlier-activity-${groupIndex}`}
+          isStreaming={isStreaming}
+          items={collapsibleRowIndexes.map((rowIndex) => ({
+            key: `earlier-activity-item-${rowIndex}`,
+            node: renderedGroups[rowIndex],
+            iconName: disclosureIconForGroup(groups[rowIndex]!),
+          }))}
+        />,
+      );
+      continue;
+    }
+    // Rendered inside the disclosure at the anchor above.
+    if (disclosedGroupIndexes.has(groupIndex)) {
+      continue;
+    }
+    assistantContent.push(renderedGroups[groupIndex]);
+  }
+
+  // Resolved across the whole response by `Transcript` and handed only to the
+  // message that ends it. Each kind's card decides for itself whether it can
+  // render. Without an opener it opens nothing, so it does not.
+  const responseArtifactCards = isAssistant
+    ? responseArtifacts?.map((artifact) => (
+        <ResponseArtifactCard
+          key={`artifact-${artifact.kind}-${artifact.id}`}
+          artifact={artifact}
+          assistantId={assistantId}
+          conversationId={conversationId}
+          onOpenDocument={onOpenDocument}
+          onOpenApp={onOpenApp}
+        />
+      ))
+    : null;
 
   return (
     <div
@@ -1122,8 +1296,12 @@ export function TranscriptMessageBody({
           <MessageAttachments
             attachments={message.attachments ?? []}
             assistantId={assistantId}
+            messageId={message.id}
           />
         )}
+        {/* Outside the `AssistantContentDisclosure` collapse, so a turn whose
+            asset work lands in "Earlier activity" still ends with its cards. */}
+        {responseArtifactCards}
         {trailer}
       </div>
       {vellumFileModal}

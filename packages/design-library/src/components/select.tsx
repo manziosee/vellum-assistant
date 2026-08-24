@@ -1,7 +1,8 @@
 import { Check, ChevronDown } from "lucide-react";
-import type { CSSProperties, ReactNode } from "react";
+import { useId, type CSSProperties, type ReactNode } from "react";
 import * as RadixSelect from "@radix-ui/react-select";
 
+import { Field, fieldDescriptionId } from "./field";
 import { cn } from "../utils/cn";
 import { usePortalContainer } from "../utils/portal-container";
 import { Tooltip } from "./tooltip";
@@ -10,13 +11,27 @@ export type SelectMenuAlign = "start" | "end";
 
 export type SelectSize = "regular" | "compact";
 
+/**
+ * `"ghost"` shrink-wraps the trigger and drops its border and fill until the
+ * pointer or keyboard focus reaches it.
+ *
+ * Use it where the control sits in a run of read-only values (a detail panel's
+ * fact list, say) and a permanently drawn box would make the one editable row
+ * the heaviest thing on the surface. The chevron still marks it editable at
+ * rest, so the affordance survives the missing border.
+ */
+export type SelectVariant = "default" | "ghost";
+
 export interface SelectOption<T extends string> {
   /**
+   * `null` marks the row meaning "no value chosen", where that is a real
+   * choice rather than the absence of one. Selecting it calls
+   * {@link SelectProps.onSelectNone} instead of `onChange`.
+   *
    * Must not be the empty string: Radix reserves it to mean "cleared". For a
-   * leading "nothing chosen" row, use `placeholder`; for a row that means
-   * something specific ("Default", "Custom"), give it a real sentinel value.
+   * trigger that shows nothing until the user picks, use `placeholder`.
    */
-  readonly value: T;
+  readonly value: T | null;
   readonly label: string;
   readonly icon?: ReactNode;
   readonly suffix?: ReactNode;
@@ -27,17 +42,35 @@ export interface SelectOption<T extends string> {
   readonly tooltip?: ReactNode;
   /** Renders dimmed and cannot be chosen by click, keyboard, or typeahead. */
   readonly disabled?: boolean;
+  /**
+   * Pins the row to the bottom edge of the scrolling menu, so it stays on
+   * screen however far the list is scrolled.
+   *
+   * For the row that escapes the list rather than continuing it ("Create
+   * new..."): in a menu long enough to scroll, an unpinned last row is the
+   * one nobody finds. Only meaningful on the last option, and only one row
+   * should claim it.
+   */
+  readonly sticky?: boolean;
 }
 
 export interface SelectProps<T extends string> {
   readonly options: ReadonlyArray<SelectOption<T>>;
   /** Empty string means "nothing chosen", which renders `placeholder`. */
-  readonly value: T | "";
+  /** `null` selects the option carrying a `null` value, if one is offered. */
+  readonly value: T | "" | null;
   readonly onChange: (value: T) => void;
+  /**
+   * Called instead of `onChange` when the user picks the row whose value is
+   * `null`. Separate so `onChange` keeps promising a narrowed `T`.
+   */
+  readonly onSelectNone?: () => void;
   readonly placeholder?: string;
   readonly disabled?: boolean;
   /** Trigger + option density. Defaults to `"regular"` (36px trigger). */
   readonly size?: SelectSize;
+  /** Trigger chrome. Defaults to `"default"` (border and fill always drawn). */
+  readonly variant?: SelectVariant;
   readonly className?: string;
   readonly style?: CSSProperties;
   readonly id?: string;
@@ -48,7 +81,20 @@ export interface SelectProps<T extends string> {
   readonly menuAlign?: SelectMenuAlign;
   readonly "aria-label"?: string;
   readonly "aria-labelledby"?: string;
+  readonly "aria-describedby"?: string;
   readonly "data-testid"?: string;
+  /** Field label rendered above the trigger and wired to it. */
+  readonly label?: ReactNode;
+  /** Guidance below the trigger. Suppressed while `errorText` is set. */
+  readonly helperText?: ReactNode;
+  /**
+   * Blocking message below the trigger. Also tints the trigger border and
+   * marks it `aria-invalid`, matching `Input`.
+   */
+  readonly errorText?: ReactNode;
+  /** Stretch the field to its container. Defaults to true. */
+  readonly fullWidth?: boolean;
+  readonly wrapperClassName?: string;
 }
 
 const DEFAULT_MENU_MAX_HEIGHT = 280;
@@ -63,9 +109,32 @@ const OPTION_SIZE_CLASSES: Record<SelectSize, string> = {
   compact: "px-2.5 py-1.5 text-body-small-default",
 };
 
+/**
+ * Scroll padding held clear at the bottom of the menu, roughly one row tall,
+ * applied when an option is pinned there. Keyboard navigation scrolls a
+ * highlighted row to the nearest edge, and the pinned row floats over that
+ * edge, so without the reserve the highlight can land underneath it and Enter
+ * commits a choice nobody saw.
+ */
+const STICKY_SCROLL_PADDING_CLASSES: Record<SelectSize, string> = {
+  regular: "scroll-pb-10",
+  compact: "scroll-pb-8",
+};
+
 const CHEVRON_SIZE_CLASSES: Record<SelectSize, string> = {
   regular: "h-3.5 w-3.5",
   compact: "h-3 w-3",
+};
+
+/**
+ * Ghost triggers set padding but no height, so a row of them keeps whatever
+ * rhythm its container already has. A fixed height here would reintroduce the
+ * problem the variant exists to solve: one row standing taller than its
+ * read-only neighbours.
+ */
+const GHOST_TRIGGER_SIZE_CLASSES: Record<SelectSize, string> = {
+  regular: "px-2 py-1 text-body-medium-lighter",
+  compact: "px-1.5 py-0.5 text-body-small-default",
 };
 
 /**
@@ -102,6 +171,7 @@ export function Select<T extends string>({
   placeholder,
   disabled = false,
   size = "regular",
+  variant = "default",
   className,
   style,
   id,
@@ -111,9 +181,23 @@ export function Select<T extends string>({
   menuAlign = "start",
   "aria-label": ariaLabel,
   "aria-labelledby": ariaLabelledBy,
+  "aria-describedby": ariaDescribedBy,
+  onSelectNone,
   "data-testid": dataTestId,
+  label,
+  helperText,
+  errorText,
+  fullWidth = true,
+  wrapperClassName,
 }: SelectProps<T>) {
   const portalContainer = usePortalContainer();
+  const ghost = variant === "ghost";
+  const reactId = useId();
+  const triggerId = id ?? `select-${reactId}`;
+  const invalid = Boolean(errorText);
+  const describedBy =
+    ariaDescribedBy ??
+    fieldDescriptionId(triggerId, invalid, Boolean(helperText));
 
   // Radix throws if an item claims the empty string. Drop such options rather
   // than take the tree down, and say why: the intent is almost always a
@@ -133,25 +217,46 @@ export function Select<T extends string>({
     return false;
   });
 
+  // Radix addresses items by string, so the null row needs one. Derived from
+  // the values actually present rather than fixed, so no real value can ever
+  // be mistaken for it and nothing has to be reserved outside this file.
+  const noneToken = (() => {
+    const taken = new Set<string>(
+      selectableOptions.flatMap((option) =>
+        option.value === null ? [] : [option.value],
+      ),
+    );
+    let token = "\u0000none";
+    while (taken.has(token)) {
+      token += "\u0000";
+    }
+    return token;
+  })();
+
+  const tokenFor = (optionValue: T | null): string =>
+    optionValue === null ? noneToken : optionValue;
+
   const selectedOption = selectableOptions.find(
     (option) => option.value === value,
   );
 
-  return (
+  const hasStickyOption = selectableOptions.some((option) => option.sticky);
+
+  const control = (
     <RadixSelect.Root
       // Passed through untouched, empty string included. Radix reads
       // `prop !== undefined` as "controlled", so translating "" to `undefined`
       // would hand control back to Radix the moment a caller cleared the
       // value, leaving the trigger showing a stale choice. Radix already
       // treats "" as the placeholder state.
-      value={value}
+      value={value === null ? noneToken : value}
       // Radix hands back a plain `string`, but `onChange` promises callers a
       // narrowed `T`. Look the value up in `selectableOptions` and forward the
       // matched option's own `value`, so the type is earned at the runtime
       // boundary rather than asserted across it.
       onValueChange={(next) => {
         const matched = selectableOptions.find(
-          (option) => option.value === next,
+          (option) => tokenFor(option.value) === next,
         );
         if (!matched) {
           // Radix only emits values belonging to mounted items, so this is
@@ -165,24 +270,56 @@ export function Select<T extends string>({
           }
           return;
         }
+        if (matched.value === null) {
+          onSelectNone?.();
+          return;
+        }
         onChange(matched.value);
       }}
       disabled={disabled}
       name={name}
     >
-      <div data-slot="select" className={cn("relative", className)} style={style}>
+      <div
+        data-slot="select"
+        // A ghost trigger sizes to its content, so the wrapper goes inline to
+        // shrink-wrap with it. Left block, it would stretch to the container
+        // and strand the trigger on the left of a right-aligned row.
+        className={cn("relative", ghost && "inline-flex", className)}
+        style={style}
+      >
         <RadixSelect.Trigger
-          id={id}
+          id={triggerId}
           aria-label={ariaLabel}
-          aria-labelledby={ariaLabelledBy}
+          aria-labelledby={
+            ariaLabelledBy ?? (label ? `${triggerId}-label` : undefined)
+          }
+          aria-describedby={describedBy}
+          aria-invalid={invalid || undefined}
           // Radix sets the native `disabled` attribute and `data-disabled`,
           // but not `aria-disabled`.
           aria-disabled={disabled || undefined}
           data-testid={dataTestId}
           data-slot="select-trigger"
           className={cn(
-            "flex w-full items-center gap-2 rounded-md border border-[var(--field-border)] bg-[var(--field-bg)] text-left transition-colors focus:outline-none data-[state=open]:border-[var(--border-active)] disabled:cursor-not-allowed disabled:opacity-60",
-            TRIGGER_SIZE_CLASSES[size],
+            "flex items-center gap-2 rounded-md border text-left transition-colors disabled:cursor-not-allowed disabled:opacity-60",
+            // Ghost draws its own focus ring as an outline, so suppressing the
+            // UA outline here would erase it.
+            ghost || "focus:outline-none",
+            ghost
+              ? "w-auto bg-transparent hover:bg-[var(--field-bg)] data-[state=open]:bg-[var(--field-bg)]"
+              : "w-full bg-[var(--field-bg)]",
+            invalid
+              ? "border-[var(--system-negative-strong)] data-[state=open]:border-[var(--system-negative-strong)]"
+              : ghost
+                ? // The ring is withheld until the control is aimed at, so at
+                  // rest the row reads as one of the values around it. Drawn
+                  // as an outline rather than a border because outlines sit
+                  // outside layout: the trigger keeps the height of a bare
+                  // line of text, so its row matches its read-only
+                  // neighbours and nothing shifts when the ring appears.
+                  "border-0 outline outline-1 -outline-offset-1 outline-transparent hover:outline-[var(--field-border)] focus-visible:outline-[var(--field-border)] data-[state=open]:outline-[var(--border-active)]"
+                : "border-[var(--field-border)] data-[state=open]:border-[var(--border-active)]",
+            ghost ? GHOST_TRIGGER_SIZE_CLASSES[size] : TRIGGER_SIZE_CLASSES[size],
           )}
           style={{
             color: selectedOption
@@ -205,11 +342,11 @@ export function Select<T extends string>({
               title={selectedOption?.label || undefined}
             >
               {/* Explicit children rather than Radix's default, which reads
-                  from the mounted item and so renders nothing before the menu
-                  has opened or under `renderToStaticMarkup`. Falling back to
-                  the placeholder keeps a value that no longer matches any
-                  option (a deleted profile, say) from rendering as a blank
-                  control. */}
+                    from the mounted item and so renders nothing before the menu
+                    has opened or under `renderToStaticMarkup`. Falling back to
+                    the placeholder keeps a value that no longer matches any
+                    option (a deleted profile, say) from rendering as a blank
+                    control. */}
               <RadixSelect.Value placeholder={placeholder ?? ""}>
                 {selectedOption?.label ?? placeholder ?? ""}
               </RadixSelect.Value>
@@ -248,12 +385,22 @@ export function Select<T extends string>({
             maxHeight: `min(${menuMaxHeight}px, var(--radix-select-content-available-height))`,
           }}
         >
-          <RadixSelect.Viewport className="py-1">
+          <RadixSelect.Viewport
+            className={cn(
+              "pt-1",
+              // A pinned row sticks to the padding edge, so bottom padding
+              // leaves a band below it where scrolling rows stay visible.
+              // Drop the padding and let the pinned row close the menu.
+              hasStickyOption
+                ? cn("pb-0", STICKY_SCROLL_PADDING_CLASSES[size])
+                : "pb-1",
+            )}
+          >
             {selectableOptions.map((option) => {
               const optionRow = (
                 <RadixSelect.Item
-                  key={option.value}
-                  value={option.value}
+                  key={tokenFor(option.value)}
+                  value={tokenFor(option.value)}
                   disabled={option.disabled}
                   data-slot="select-option"
                   className={cn(
@@ -301,9 +448,9 @@ export function Select<T extends string>({
                   </RadixSelect.ItemIndicator>
                 </RadixSelect.Item>
               );
-              return option.tooltip ? (
+              const row = option.tooltip ? (
                 <Tooltip
-                  key={option.value}
+                  key={tokenFor(option.value)}
                   content={option.tooltip}
                   side="right"
                 >
@@ -312,10 +459,43 @@ export function Select<T extends string>({
               ) : (
                 optionRow
               );
+              if (!option.sticky) {
+                return row;
+              }
+              return (
+                <div
+                  key={tokenFor(option.value)}
+                  data-slot="select-pinned-option"
+                  role="presentation"
+                  className="sticky bottom-0 z-10 border-t border-[var(--border-element)] bg-[var(--field-bg)]"
+                >
+                  {row}
+                </div>
+              );
             })}
           </RadixSelect.Viewport>
         </RadixSelect.Content>
       </RadixSelect.Portal>
     </RadixSelect.Root>
+  );
+
+  // Nothing to label or explain: stay a bare control so existing call
+  // sites that position the trigger themselves are unaffected.
+  if (label == null && helperText == null && errorText == null) {
+    return control;
+  }
+
+  return (
+    <Field
+      id={triggerId}
+      label={label}
+      helperText={helperText}
+      errorText={errorText}
+      fullWidth={fullWidth}
+      disabled={disabled}
+      className={wrapperClassName}
+    >
+      {control}
+    </Field>
   );
 }

@@ -17,6 +17,7 @@ import {
   attachmentsToContentBlocks,
   type MessageAttachmentInput,
 } from "../../agent/attachments.js";
+import { audienceForReader } from "../../channels/message-audience.js";
 import {
   CHANNEL_IDS,
   INTERFACE_IDS,
@@ -38,10 +39,10 @@ import {
 import { getDiskPressureStatus } from "../../daemon/disk-pressure-guard.js";
 import { classifyDiskPressureTurnPolicy } from "../../daemon/disk-pressure-policy.js";
 import { processMessage } from "../../daemon/process-message.js";
-import { mapChatTypeToConversationType } from "../../daemon/trust-context.js";
 import type { TrustContext } from "../../daemon/trust-context-types.js";
 import { HeartbeatService } from "../../heartbeat/heartbeat-service.js";
 import type { Message as ProviderMessage } from "../../messaging/provider-types.js";
+import { editChannelMessage } from "../../messaging/providers/index.js";
 import {
   resolveSlackBotUserId,
   withSlackBotToken,
@@ -77,7 +78,7 @@ import {
   addMessage,
   getMessageById,
   getMessages,
-  selectSlackMetaCandidateMetadata,
+  selectProviderMetaCandidateMetadata,
   updateMessageContent,
   updateMessageMetadata,
 } from "../../persistence/conversation-crud.js";
@@ -90,6 +91,7 @@ import {
 import { markProcessed } from "../../persistence/delivery-status.js";
 import { upsertBinding } from "../../persistence/external-conversation-store.js";
 import type { ContentBlock } from "../../providers/types.js";
+import { checkIngressForSecrets } from "../../security/secret-ingress.js";
 import { canonicalizeInboundIdentity } from "../../util/canonicalize-identity.js";
 import { getLogger } from "../../util/logger.js";
 import { truncate } from "../../util/truncate.js";
@@ -101,7 +103,6 @@ import {
 import { DAEMON_INTERNAL_ASSISTANT_ID } from "../assistant-scope.js";
 import { deliverChannelReply } from "../gateway-client.js";
 import { trustContextFromVerdict } from "../trust-verdict-consumer.js";
-import { canonicalChannelAssistantId } from "./channel-route-shared.js";
 import { BadRequestError } from "./errors.js";
 import { handleApprovalInterception } from "./guardian-approval-interception.js";
 import {
@@ -371,16 +372,6 @@ export async function handleChannelInbound({
     throw new BadRequestError("content or attachmentIds is required");
   }
 
-  // Canonicalize the assistant ID so all DB-facing operations use the
-  // consistent 'self' key regardless of what the gateway sent.
-  const canonicalAssistantId = canonicalChannelAssistantId(assistantId);
-  if (canonicalAssistantId !== assistantId) {
-    log.debug(
-      { raw: assistantId, canonical: canonicalAssistantId },
-      "Canonicalized channel assistant ID",
-    );
-  }
-
   // Coerce actorExternalId to a string at the boundary — the field
   // comes from unvalidated JSON and may be a number, object, or other
   // non-string type. Non-string truthy values would throw inside
@@ -428,9 +419,10 @@ export async function handleChannelInbound({
   // 👍 never triggers a verification handshake or an access-request
   // notification, and a stranger's reaction creates no conversation/binding.
   // The interceptor drops strangers, records known contacts' reactions as
-  // transcript signals, and routes a guardian's reaction on an approval card
-  // through the guardian decision pipeline. Reactions never drive an
-  // agent turn.
+  // transcript signals in the conversation of the reacted message, and routes
+  // a guardian's reaction on an approval card through the guardian decision
+  // pipeline. Reactions never mint a conversation and never drive an agent
+  // turn.
   if (isSlackReactionEvent(body)) {
     return handleSlackReactionIntercept({
       callbackData: body.callbackData!,
@@ -438,14 +430,12 @@ export async function handleChannelInbound({
       sourceInterface,
       conversationExternalId,
       externalMessageId,
-      canonicalAssistantId,
       rawSenderId,
       canonicalSenderId,
       actorDisplayName: body.actorDisplayName,
       actorUsername: body.actorUsername,
       replyCallbackUrl: body.replyCallbackUrl,
       sourceMetadata: body.sourceMetadata,
-      slackChannelName,
       approvalConversationGenerator,
     });
   }
@@ -486,7 +476,6 @@ export async function handleChannelInbound({
     rawSenderId,
     sourceChannel,
     conversationExternalId,
-    canonicalAssistantId,
     trimmedContent,
     sourceMetadata: body.sourceMetadata,
     actorDisplayName: body.actorDisplayName,
@@ -709,7 +698,6 @@ export async function handleChannelInbound({
       externalMessageId,
       sourceMessageId,
       sourceThreadId: channelThreadId,
-      canonicalAssistantId,
       assistantId,
       content,
       channelId: resolvedMember?.channelId,
@@ -723,28 +711,24 @@ export async function handleChannelInbound({
     externalMessageId,
     {
       sourceMessageId,
-      assistantId: canonicalAssistantId,
       sourceThreadId: channelThreadId,
     },
   );
 
   const replyCallbackUrl = body.replyCallbackUrl;
 
-  // external_conversation_bindings is assistant-agnostic. Restrict writes to
-  // self so assistant-scoped legacy routes do not overwrite each other's
-  // channel binding metadata for the same chat.
-  if (canonicalAssistantId === DAEMON_INTERNAL_ASSISTANT_ID) {
-    upsertBinding({
-      conversationId: result.conversationId,
-      sourceChannel,
-      externalChatId: conversationExternalId,
-      externalChatName: slackChannelName,
-      externalThreadId: channelThreadId ?? null,
-      externalUserId: canonicalSenderId ?? rawSenderId ?? null,
-      displayName: body.actorDisplayName ?? null,
-      username: body.actorUsername ?? null,
-    });
-  }
+  // `external_conversation_bindings` is assistant-agnostic: one row per chat,
+  // whichever caller writes it.
+  upsertBinding({
+    conversationId: result.conversationId,
+    sourceChannel,
+    externalChatId: conversationExternalId,
+    externalChatName: slackChannelName,
+    externalThreadId: channelThreadId ?? null,
+    externalUserId: canonicalSenderId ?? rawSenderId ?? null,
+    displayName: body.actorDisplayName ?? null,
+    username: body.actorUsername ?? null,
+  });
 
   // ── Actor role resolution ──
   // Built from the gateway-stamped trust verdict (ACL + identity). An absent
@@ -844,7 +828,6 @@ export async function handleChannelInbound({
     if (isCallbackInteraction) {
       if (floorSenderId) {
         handshakeInProgress = await isApprovalHandshakeInProgress({
-          canonicalAssistantId,
           sourceChannel,
           actorExternalId: floorSenderId,
         });
@@ -852,7 +835,6 @@ export async function handleChannelInbound({
     } else {
       try {
         const accessResult = await notifyGuardianOfAccessRequest({
-          canonicalAssistantId,
           sourceChannel,
           conversationExternalId,
           actorExternalId: floorSenderId,
@@ -925,12 +907,13 @@ export async function handleChannelInbound({
       const replyPayload: Parameters<typeof deliverChannelReply>[1] = {
         chatId: conversationExternalId,
         text: replyText,
-        assistantId: canonicalAssistantId,
+        assistantId: DAEMON_INTERNAL_ASSISTANT_ID,
       };
-      if (sourceChannel === "slack" && (canonicalSenderId ?? rawSenderId)) {
-        replyPayload.ephemeral = true;
-        replyPayload.user = (canonicalSenderId ?? rawSenderId)!;
-      }
+      replyPayload.audience = audienceForReader(
+        sourceChannel,
+        conversationExternalId,
+        canonicalSenderId ?? rawSenderId,
+      );
       try {
         await deliverChannelReply(replyCallbackUrl, replyPayload);
         replyDelivered = true;
@@ -987,12 +970,13 @@ export async function handleChannelInbound({
       const replyPayload: Parameters<typeof deliverChannelReply>[1] = {
         chatId: conversationExternalId,
         text: DISK_PRESSURE_REMOTE_BLOCK_REPLY,
-        assistantId: canonicalAssistantId,
+        assistantId: DAEMON_INTERNAL_ASSISTANT_ID,
       };
-      if (sourceChannel === "slack" && (canonicalSenderId ?? rawSenderId)) {
-        replyPayload.ephemeral = true;
-        replyPayload.user = (canonicalSenderId ?? rawSenderId)!;
-      }
+      replyPayload.audience = audienceForReader(
+        sourceChannel,
+        conversationExternalId,
+        canonicalSenderId ?? rawSenderId,
+      );
       try {
         await deliverChannelReply(replyCallbackUrl, replyPayload);
       } catch (err) {
@@ -1045,7 +1029,11 @@ export async function handleChannelInbound({
     sourceMetadata.chatType.trim().length > 0
       ? sourceMetadata.chatType.trim()
       : undefined;
-  trustCtx.conversationType = mapChatTypeToConversationType(sourceChatType);
+  // Decided by the sending channel, which is the only side that knows what its
+  // own surfaces mean. The daemon reads the answer rather than re-deriving it
+  // from a vocabulary where `channel` means a public room on Slack and a
+  // broadcast feed on Telegram.
+  trustCtx.conversationType = sourceMetadata?.conversationType;
 
   // Preserve locale from sourceMetadata so the model can greet in the user's language
   const sourceLanguageCode =
@@ -1059,7 +1047,6 @@ export async function handleChannelInbound({
     isDuplicate: result.duplicate,
     commandIntent,
     rawSenderId,
-    canonicalAssistantId,
     sourceChannel,
     conversationExternalId,
     eventId: result.eventId,
@@ -1081,7 +1068,6 @@ export async function handleChannelInbound({
     callbackData: body.callbackData,
     rawSenderId,
     canonicalSenderId,
-    canonicalAssistantId,
     sourceChannel,
     conversationExternalId,
     conversationId: result.conversationId,
@@ -1109,8 +1095,8 @@ export async function handleChannelInbound({
     // cleanup. When a Slack block_actions payload is forwarded, the gateway
     // sets sourceMetadata.messageId to the ts of the message containing
     // the button. This lets us edit the message after resolution.
-    const approvalMessageTs =
-      sourceChannel === "slack" && typeof sourceMetadata?.messageId === "string"
+    const approvalMessageId =
+      typeof sourceMetadata?.messageId === "string"
         ? sourceMetadata.messageId
         : undefined;
 
@@ -1123,10 +1109,10 @@ export async function handleChannelInbound({
       actorExternalId: canonicalSenderId ?? rawSenderId,
       replyCallbackUrl,
       trustCtx,
-      assistantId: canonicalAssistantId,
+      assistantId: DAEMON_INTERNAL_ASSISTANT_ID,
       approvalCopyGenerator,
       approvalConversationGenerator,
-      approvalMessageTs,
+      approvalMessageId,
     });
 
     if (approvalResult.handled) {
@@ -1211,15 +1197,16 @@ export async function handleChannelInbound({
         }
       }
 
-      // On Slack, edit the original approval message to remove stale buttons
-      // and deliver an ephemeral error so the user gets visible feedback
+      // Edit the original approval message to remove stale buttons
+      // and reply so the user gets visible feedback
       // instead of a silent no-op (JARVIS-299).
-      if (sourceChannel === "slack" && replyCallbackUrl && approvalMessageTs) {
-        deliverChannelReply(replyCallbackUrl, {
+      // No channel check: a transport without `edit` declines the call, so a
+      // channel gains this the moment it can revise a sent message.
+      if (replyCallbackUrl && approvalMessageId) {
+        editChannelMessage(replyCallbackUrl, {
           chatId: conversationExternalId,
+          messageId: approvalMessageId,
           text: "This approval request has been resolved.",
-          messageTs: approvalMessageTs,
-          assistantId: canonicalAssistantId,
         }).catch((err) => {
           log.error(
             { err, conversationId: result.conversationId },
@@ -1255,7 +1242,6 @@ export async function handleChannelInbound({
       actorUsername: body.actorUsername,
       trustCtx,
       replyCallbackUrl,
-      canonicalAssistantId,
     });
 
     if (ingressResult.blocked) {
@@ -1296,7 +1282,6 @@ export async function handleChannelInbound({
         const admittedSenderId = canonicalSenderId ?? rawSenderId;
         if (admittedSenderId) {
           void maybeNotifyGuardianOfAdmittedContact({
-            canonicalAssistantId,
             sourceChannel,
             conversationExternalId,
             actorExternalId: admittedSenderId,
@@ -1497,7 +1482,7 @@ export async function handleChannelInbound({
         commandIntent,
         sourceLanguageCode,
         replyCallbackUrl,
-        assistantId: canonicalAssistantId,
+        assistantId: DAEMON_INTERNAL_ASSISTANT_ID,
         approvalCopyGenerator,
         chatType: sourceChatType,
         clientTimezone: inboundClientTimezone,
@@ -1561,7 +1546,7 @@ function countSlackMetaMessages(conversationId: string): number {
   while (offset < SLACK_DM_CANDIDATE_MAX_SCAN) {
     const remaining = SLACK_DM_CANDIDATE_MAX_SCAN - offset;
     const batchLimit = Math.min(SLACK_DM_CANDIDATE_BATCH_SIZE, remaining);
-    const candidates = selectSlackMetaCandidateMetadata(
+    const candidates = selectProviderMetaCandidateMetadata(
       conversationId,
       batchLimit,
       offset,
@@ -1700,6 +1685,10 @@ function readStoredSlackThreadState(
  * content.
  * Caller is responsible for dedup checks before invoking; this helper
  * performs no idempotency check itself.
+ *
+ * Returns false when the row was refused rather than written. Callers mark
+ * the channel ts seen either way, so a refused body is not reconsidered on
+ * the next pass.
  */
 async function persistBackfilledSlackMessage(params: {
   conversationId: string;
@@ -1707,8 +1696,27 @@ async function persistBackfilledSlackMessage(params: {
   message: ProviderMessage;
   account?: string;
   guardianExternalUserId?: string;
-}): Promise<void> {
+}): Promise<boolean> {
   const { message } = params;
+
+  // Backfill writes externally-authored bodies into a conversation, so it
+  // carries the same secret gate as live channel ingress
+  // (`runSecretIngressCheck`). Runs before file hydration, so a refused row
+  // costs no downloads.
+  const secretScan = checkIngressForSecrets(message.text ?? "");
+  if (secretScan.blocked) {
+    log.warn(
+      {
+        conversationId: params.conversationId,
+        channelId: params.channelId,
+        channelTs: message.id,
+        detectedTypes: secretScan.detectedTypes,
+      },
+      "Skipping backfilled Slack message: secret detected",
+    );
+    return false;
+  }
+
   const slackFilesWithUrls = readSlackFilesWithUrlsFromProviderMetadata(
     message.metadata,
   );
@@ -1760,9 +1768,19 @@ async function persistBackfilledSlackMessage(params: {
 
   const rawText = message.text ?? "";
 
+  // `sentAt` is when the message was sent; the row's `createdAt` is when the
+  // import wrote it. History serialization prefers `sentAt` for the display
+  // timestamp, so setting it is what keeps weeks-old history from reading as
+  // having just arrived. The Slack adapter already derives this from the
+  // message ts, so no parsing happens here.
+  const sentAt = Number.isFinite(message.timestamp)
+    ? message.timestamp
+    : undefined;
+
   const persisted = await addMessage(params.conversationId, role, rawText, {
     metadata: {
       slackMeta: writeSlackMetadata(slackMeta),
+      ...(sentAt !== undefined ? { sentAt } : {}),
       provenanceTrustClass: isGuardian ? "guardian" : "unknown",
       provenanceSourceChannel: "slack",
       ...(params.guardianExternalUserId
@@ -1785,7 +1803,7 @@ async function persistBackfilledSlackMessage(params: {
       f.mimetype.startsWith("image/"),
   );
   if (imageFiles.length === 0) {
-    return;
+    return true;
   }
 
   const hydratedAttachments = await withSlackBotToken(
@@ -1816,7 +1834,7 @@ async function persistBackfilledSlackMessage(params: {
             );
             continue;
           }
-          attachInlineAttachmentToMessage(
+          await attachInlineAttachmentToMessage(
             persisted.id,
             i,
             downloaded.filename,
@@ -1856,28 +1874,29 @@ async function persistBackfilledSlackMessage(params: {
       { conversationId: params.conversationId, channelTs: message.id },
       "No Slack token available for backfill image hydration; skipping",
     );
-    return;
+    return true;
   }
 
   if (hydratedAttachments.length > 0) {
     updateMessageContent(
       persisted.id,
       JSON.stringify(
-        buildBackfilledSlackContentBlocks(rawText, hydratedAttachments),
+        await buildBackfilledSlackContentBlocks(rawText, hydratedAttachments),
       ),
     );
   }
+  return true;
 }
 
-function buildBackfilledSlackContentBlocks(
+async function buildBackfilledSlackContentBlocks(
   text: string,
   attachments: MessageAttachmentInput[],
-): ContentBlock[] {
+): Promise<ContentBlock[]> {
   const blocks: ContentBlock[] = [];
   if (text.trim().length > 0) {
     blocks.push({ type: "text", text });
   }
-  blocks.push(...attachmentsToContentBlocks(attachments));
+  blocks.push(...(await attachmentsToContentBlocks(attachments)));
   return blocks;
 }
 
@@ -2103,7 +2122,7 @@ async function runBackfillSlackDmIfCold(params: {
         continue;
       }
       try {
-        await persistBackfilledSlackMessage({
+        const stored = await persistBackfilledSlackMessage({
           conversationId: params.conversationId,
           channelId: params.channelId,
           message,
@@ -2113,7 +2132,9 @@ async function runBackfillSlackDmIfCold(params: {
             : {}),
         });
         seen.add(message.id);
-        written++;
+        if (stored) {
+          written++;
+        }
       } catch (perRowErr) {
         log.warn(
           {
@@ -2701,7 +2722,7 @@ export async function triggerSlackThreadBackfillIfNeeded(params: {
         continue;
       }
       try {
-        await persistBackfilledSlackMessage({
+        const stored = await persistBackfilledSlackMessage({
           conversationId,
           channelId,
           message,
@@ -2709,7 +2730,9 @@ export async function triggerSlackThreadBackfillIfNeeded(params: {
           ...(guardianExternalUserId ? { guardianExternalUserId } : {}),
         });
         threadState.storedChannelTs.add(message.id);
-        persisted++;
+        if (stored) {
+          persisted++;
+        }
       } catch (err) {
         log.warn(
           { err, conversationId, channelId, threadTs, channelTs: message.id },

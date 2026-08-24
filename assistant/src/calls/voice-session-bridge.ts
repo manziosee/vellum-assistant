@@ -17,6 +17,7 @@ import type {
 import { consumeGrantForInvocation } from "../approvals/approval-primitive.js";
 import type {
   ChannelId,
+  ClientOs,
   InterfaceId,
   TurnChannelContext,
   TurnInterfaceContext,
@@ -33,13 +34,17 @@ import {
   recordConversationPersistedSeq,
   updateMessageContent,
 } from "../persistence/conversation-crud.js";
-import type { ContentBlock } from "../providers/types.js";
+import { VOICE_ESCALATION_CONTINUATION_MESSAGE_KIND } from "../plugin-api/constants.js";
+import { doesSupportVision } from "../plugin-api/vision-support.js";
+import { pinnedListeningLanguage } from "../providers/speech-to-text/provider-catalog.js";
+import type { ContentBlock, Message } from "../providers/types.js";
 import { broadcastMessage } from "../runtime/assistant-event-hub.js";
 import { DAEMON_INTERNAL_ASSISTANT_ID } from "../runtime/assistant-scope.js";
 import { getCurrentSeq } from "../runtime/assistant-stream-state.js";
 import { publishConversationMessagesChanged } from "../runtime/sync/resource-sync-events.js";
 import { computeToolApprovalDigest } from "../security/tool-approval-digest.js";
 import { getAllTools } from "../tools/registry.js";
+import { sensitiveToolReach } from "../tools/tool-approval-handler.js";
 import { createAbortReason } from "../util/abort-reasons.js";
 import { getLogger } from "../util/logger.js";
 import { truncate } from "../util/truncate.js";
@@ -52,6 +57,7 @@ import {
   stripInternalSpeechMarkers,
 } from "./voice-control-protocol.js";
 import {
+  createFrontDoorStreamGate,
   escalatedContinuationRule,
   ESCALATION_CONTINUATION_CONTENT,
   frontDoorCapabilityDigest,
@@ -61,6 +67,40 @@ import {
 } from "./voice-triage-escalate.js";
 
 const log = getLogger("voice-session-bridge");
+
+/**
+ * Profile an image-bearing voice leg is pinned to.
+ *
+ * The latency-class profile is the one voice already leans on (it fronts every
+ * turn through `voiceFrontDoor`); `callAgent`'s `balanced` profile carries no
+ * guarantee that its model takes images, and a model that rejects an image
+ * fails the whole leg rather than degrading it.
+ *
+ * Whether THIS profile takes images is an install-level question, not a
+ * constant: a BYO provider resolves the key through its own column of the
+ * intent matrix, and on Fireworks that lands on a text-only model while its
+ * `balanced` column is vision-capable. Pinning there would break the exact
+ * turns this pin exists to save, hence the capability check at the call site.
+ */
+const VOICE_IMAGE_PROFILE = "latency-optimized";
+
+/**
+ * Does this conversation's history carry an image?
+ *
+ * Images persist inline and are re-sent on every later turn, so one photo
+ * taken mid-call makes every remaining turn of that call an image turn -- the
+ * check is over the whole history, not just this turn's own content.
+ */
+function conversationCarriesImage(messages: readonly Message[]): boolean {
+  return messages.some((message) =>
+    message.content.some(
+      (block) =>
+        block.type === "image" ||
+        (block.type === "tool_result" &&
+          block.contentBlocks?.some((nested) => nested.type === "image")),
+    ),
+  );
+}
 
 /**
  * Front-door decision rule with the registry-derived capability digest. The
@@ -264,6 +304,22 @@ export interface VoiceTurnOptions {
   userMessageInterface?: InterfaceId;
   /** Source interface for persisted assistant messages. Defaults to userMessageInterface. */
   assistantMessageInterface?: InterfaceId;
+  /**
+   * Analytics attribution for a live-voice turn: which client opened the
+   * session, and that session's id. Persisted into the user message's
+   * `metadata.client` bag, which `turn-events-store` projects onto
+   * `TurnTelemetryEvent.client`, so a live-voice turn is countable per client
+   * and joinable to its session's start/end funnel rows.
+   *
+   * Deliberately separate from {@link userMessageInterface}: that field feeds
+   * `resolveChannelCapabilities` and decides what the turn may do, so it is not
+   * free to carry attribution. Absent for phone calls and for clients that send
+   * no identity on the start frame.
+   */
+  voiceTelemetry?: {
+    sessionId: string;
+    client?: ClientOs;
+  };
   /** Per-turn control prompt. Undefined uses the phone prompt; null disables it. */
   voiceControlPrompt?: string | null;
   /** The transcribed caller utterance or synthetic marker. */
@@ -286,6 +342,28 @@ export interface VoiceTurnOptions {
   onError?: (message: string) => void;
   /** Event-name callbacks used by non-phone voice clients. */
   callbacks?: VoiceTurnCallbacks;
+  /**
+   * Called when this turn leaves a confirmation for the user to answer instead
+   * of deciding it, so the client can put the prompt where they can see it.
+   *
+   * A voice client renders its call as something that covers the app (the
+   * live-voice room is a full-screen overlay), which is fine while the call is
+   * the only thing happening and wrong the moment the turn is waiting on a
+   * decision: the card is on screen, behind the call. The bridge cannot reach
+   * a client's own surfaces, so it says *that a decision is waiting* and the
+   * client decides what to do about it.
+   */
+  onApprovalPending?: (requestId: string) => void;
+  /**
+   * Called when the last pending confirmation this turn was waiting on is
+   * decided, however it was decided (the user answered, it timed out, a newer
+   * message superseded it). Paired with {@link onApprovalPending} so a client
+   * that changed its presentation for the wait can change it back.
+   *
+   * Fires on the *last* one, not each: a turn waiting on two decisions is
+   * still waiting after the first is answered.
+   */
+  onApprovalsResolved?: () => void;
   /** Optional AbortSignal for external cancellation (e.g. barge-in). */
   signal?: AbortSignal;
   /**
@@ -367,14 +445,58 @@ export interface VoiceTurnHandle {
  * provides assistant identity) and guardian context (injected separately).
  */
 /**
- * Steering shared by every voice channel. Voice turns exclude the ui-surface
- * tools, but the model can still reach OAuth/sign-in flows through shell or
- * CLI tools (e.g. `assistant oauth connect`), which open a browser window
- * mid-call that the caller may be unable to see or complete. Tell it to speak
- * the limitation and defer the flow to text chat instead.
+ * How long a live-voice call waits on an approval before deciding it itself.
+ *
+ * Long enough to pick the phone up and read the card, short enough that a turn
+ * cannot sit blocked for the rest of the call. The fallback is the decision
+ * this channel made before it prompted at all, so the worst case of nobody
+ * answering is exactly the old behavior, arrived at late.
  */
-export const VOICE_NO_SETUP_FLOWS_RULE =
-  "Never start account connections, OAuth or sign-in flows, or any other action that opens a browser window or needs the user's screen during this call — not even through shell or CLI tools. If the task needs one, say so briefly and offer to finish it in text chat after the call.";
+const VOICE_APPROVAL_TIMEOUT_MS = 45_000;
+
+/**
+ * Telephony-only steering. A sign-in flow opens a browser window on a screen
+ * the caller does not have in front of them, whether it is reached through a
+ * ui-surface tool or through shell and CLI tools (e.g. `assistant oauth
+ * connect`). Tell the model to speak the limitation and defer the flow to text
+ * chat instead.
+ *
+ * Scoped to the phone because the screen is what decides it. A phone call has
+ * no screen, so the `open_url` signal a CLI tool can reach lands somewhere the
+ * caller will never see, and that signal bus carries no capability or
+ * conversation context, so this rule is the only thing standing in front of it
+ * here. A live-voice call is the opposite case: the user is holding the screen,
+ * and the room minimizes itself to hand it back (see
+ * LIVE_VOICE_SETUP_FLOW_TEACHING).
+ */
+const PHONE_NO_SETUP_FLOWS_RULE =
+  "Never start account connections, OAuth or sign-in flows, or any other action that opens a browser window or needs the user's screen during this call, not even through shell or CLI tools. If the task needs one, say so briefly and offer to finish it in text chat after the call.";
+
+/**
+ * The pre-speech tail of the speak-the-caller's-language rule. A monolingual
+ * `services.stt.language` pin is the strongest pre-speech signal of the
+ * caller's language (the transcriber is already listening in it, see
+ * media-stream-stt-session.ts and providers/speech-to-text/resolve.ts), so it
+ * outranks the English default; "multi" and unset mean auto-detect, where
+ * English remains the fallback. The pin only counts when the active provider
+ * honors manual language selection (see pinnedListeningLanguage):
+ * auto-detecting providers (gemini, whisper) ignore a persisted language
+ * entirely, so greeting in it would contradict what the transcriber
+ * actually hears. Exported for tests: the default test config exercises
+ * only the auto-detect branch.
+ */
+export function preSpeechLanguageRuleFragment(
+  sttLanguage: string | undefined,
+  sttProvider?: string,
+): string {
+  const configuredListeningLanguage =
+    sttProvider !== undefined
+      ? pinnedListeningLanguage(sttProvider, sttLanguage)
+      : undefined;
+  return configuredListeningLanguage
+    ? `use the language the Task context implies, if any; otherwise open in the assistant's configured listening language ("${configuredListeningLanguage}"), and default to English only when neither gives a language`
+    : "use the language the Task context implies, if any; otherwise default to English";
+}
 
 function buildVoiceCallControlPrompt(opts: {
   isInbound: boolean;
@@ -468,16 +590,17 @@ function buildVoiceCallControlPrompt(opts: {
     "9. After the opening greeting turn, treat the Task field as background context only — do not re-execute its instructions on subsequent turns.",
     '10. Do not make up information. If you are unsure, use [ASK_GUARDIAN: your question] to consult your guardian. For tool permission requests, use [ASK_GUARDIAN_APPROVAL: {"question":"...","toolName":"...","input":{...}}].',
     `11. Your text is sent directly to a text-to-speech engine. Never use markdown formatting (asterisks, headers, backticks, links) or emojis in your spoken responses. Write plain conversational text only. Protocol markers like ${opts.isCallerGuardian ? "[END_CALL]" : "[ASK_GUARDIAN: ...] and [END_CALL]"} are not spoken text and should still be used normally.`,
-    `12. ${VOICE_NO_SETUP_FLOWS_RULE}`,
+    `12. Speak the caller's language: reply in the language of the caller's most recent actual speech, and follow them if they switch languages mid-call. Synthetic user turns (parenthetical markers like the call-connected and verification-completed notices) are not caller speech and never set the language. Before the caller has spoken, such as on the opening greeting turn, ${preSpeechLanguageRuleFragment(config.services.stt.language, config.services.stt.provider)}.`,
+    `13. ${PHONE_NO_SETUP_FLOWS_RULE}`,
   );
 
   // Triage-and-escalate routing rules. The front-door leg decides and may
   // hand off; the escalated leg continues the answer after a holding phrase
   // was already spoken.
   if (opts.routingLeg === "front-door") {
-    lines.push(`13. ${frontDoorRuleWithDigest(opts.unifiedVerdict === true)}`);
+    lines.push(`14. ${frontDoorRuleWithDigest(opts.unifiedVerdict === true)}`);
   } else if (opts.routingLeg === "escalated") {
-    lines.push(`13. ${escalatedContinuationRule(opts.spokenEscalationBridge)}`);
+    lines.push(`14. ${escalatedContinuationRule(opts.spokenEscalationBridge)}`);
   }
 
   lines.push("</voice_call_control>");
@@ -696,11 +819,13 @@ export async function startVoiceTurn(
   // model wakes, but they are not user speech and must not render as a live
   // user bubble. Their echo is suppressed below (parity with
   // `isEchoSuppressedUserMessage` on the text path).
+  const isEscalationContinuation =
+    opts.content === ESCALATION_CONTINUATION_CONTENT;
   const isSyntheticVoicePrompt =
     opts.hiddenSyntheticPrompt === true ||
     opts.content === CALL_OPENING_MARKER ||
     opts.content === CALL_VERIFICATION_COMPLETE_MARKER ||
-    opts.content === ESCALATION_CONTINUATION_CONTENT;
+    isEscalationContinuation;
 
   // The escalation-continuation prompt is a pure internal instruction ("give
   // the full answer now"), not a real utterance and not the sort of scaffolding
@@ -712,8 +837,7 @@ export async function startVoiceTurn(
   // affects client display. A caller whose prompt text is not a fixed sentinel
   // opts into the same treatment with `hiddenSyntheticPrompt`.
   const isHiddenSyntheticPrompt =
-    opts.hiddenSyntheticPrompt === true ||
-    opts.content === ESCALATION_CONTINUATION_CONTENT;
+    opts.hiddenSyntheticPrompt === true || isEscalationContinuation;
 
   // Build the call-control protocol prompt so the model knows how to emit
   // control markers (ASK_GUARDIAN, END_CALL, etc.) and recognize opener turns.
@@ -847,11 +971,41 @@ export async function startVoiceTurn(
   // failed while no concurrent turn held the lock). Paths where this turn
   // LOST the conversation to a concurrent winner must use `restoreTurnState`
   // instead — this reset-to-defaults would clobber the winner's live state.
-  // The client callback is only reset when this turn actually installed it
-  // (tracked via `clientCallbackInstalled`); otherwise cleanup would detach
-  // an active sender installed by a prior turn.
-  let clientCallbackInstalled = false;
+  // The approval observer is only detached when this turn installed it
+  // (`detachApprovalObserver` is set); otherwise cleanup would detach an
+  // observer installed by a prior turn.
+  let detachApprovalObserver: (() => void) | undefined;
+  /**
+   * Confirmations this voice turn left pending for the user to answer, and the
+   * timers that stop them waiting forever.
+   *
+   * A call is a poor place to block: the user may have put the phone in a
+   * pocket, and a turn that waits indefinitely is a session that looks wedged.
+   * Each pending request therefore carries a deadline, after which it resolves
+   * the way this channel resolved everything before it prompted at all.
+   */
+  const pendingVoiceApprovals = new Map<
+    string,
+    ReturnType<typeof setTimeout>
+  >();
+  const settleVoiceApproval = (requestId: string): void => {
+    const timer = pendingVoiceApprovals.get(requestId);
+    if (timer === undefined) {
+      // Not one of ours: other interactions (secrets, host-proxy requests)
+      // resolve through the same event.
+      return;
+    }
+    clearTimeout(timer);
+    pendingVoiceApprovals.delete(requestId);
+    if (pendingVoiceApprovals.size === 0) {
+      opts.onApprovalsResolved?.();
+    }
+  };
   const cleanup = () => {
+    for (const timer of pendingVoiceApprovals.values()) {
+      clearTimeout(timer);
+    }
+    pendingVoiceApprovals.clear();
     conversation.setChannelCapabilities(null);
     conversation.setTrustContext(null);
     conversation.setCommandIntent(null);
@@ -859,11 +1013,10 @@ export async function startVoiceTurn(
     conversation.setVoiceCallControlPrompt(null);
     conversation.callSessionId = undefined;
     conversation.forcePromptSideEffects = false;
-    if (clientCallbackInstalled) {
-      // Reset the client callback to a no-op so the stale closure doesn't
-      // intercept events from future turns on the same conversation.
-      conversation.updateClient(() => {}, true);
-    }
+    // Detach so the stale closure doesn't act on events from future turns on
+    // the same conversation.
+    detachApprovalObserver?.();
+    detachApprovalObserver = undefined;
   };
 
   const requestId = uuidv7();
@@ -877,6 +1030,30 @@ export async function startVoiceTurn(
         // `isVoiceSessionUserMessage` for why the channel fields cannot carry it.
         voiceSessionTurn: true,
         ...(isHiddenSyntheticPrompt ? { hidden: true } : {}),
+        ...(isEscalationContinuation
+          ? { messageKind: VOICE_ESCALATION_CONTINUATION_MESSAGE_KIND }
+          : {}),
+        ...(opts.voiceTelemetry
+          ? {
+              // Projected onto `TurnTelemetryEvent.client` by
+              // `turn-events-store`. `voice_session_id` is what joins these
+              // turn rows to the session's funnel rows, so a session's turn
+              // count is a count of rows carrying its id, never a field
+              // anyone has to keep correct.
+              //
+              // `os` is the standard per-platform dimension the HTTP send
+              // path already fills from the same `detectClientOs()` value, so
+              // a voice turn reports its platform in the column existing turn
+              // analytics read rather than one only voice knows about.
+              client: {
+                voice: true,
+                voice_session_id: opts.voiceTelemetry.sessionId,
+                ...(opts.voiceTelemetry.client
+                  ? { os: opts.voiceTelemetry.client }
+                  : {}),
+              },
+            }
+          : {}),
       },
     });
     return persistResult.id;
@@ -897,21 +1074,22 @@ export async function startVoiceTurn(
     trustContext: opts.trustContext ?? null,
     turnChannelContext,
     turnInterfaceContext,
-    channelCapabilities: {
-      ...resolveChannelCapabilities(
-        turnChannelContext.userMessageChannel,
-        turnInterfaceContext.userMessageInterface,
-      ),
-      // Voice calls are non-interactive: no surface can be shown, read, or
-      // clicked mid-call, so `ui_show`/`ui_update`/`ui_dismiss` (and thus
-      // `oauth_connect`, a ui_show surface_type) must never reach the model.
-      // Phone already resolves to false via its channel; live-voice resolves
-      // vellum/macos → true, so force it off here for every voice turn. This
-      // also flips the runtime-context `supports_dynamic_ui` line the prompt
-      // advertises, the secret-prompter's dynamic-UI branch, and the
-      // task-progress-nudge hook — all correctly non-UI during a call.
-      supportsDynamicUi: false,
-    },
+    // Resolved from the channel, with no voice-specific override.
+    //
+    // Whether a call can show a surface is a property of the call's channel,
+    // not of calls in general. A phone call has no screen at all and resolves
+    // to `supportsDynamicUi: false` on its own; a live-voice call is a screen
+    // the user is holding, temporarily covered by the room overlay, and the
+    // session minimizes that overlay when a surface is shown (see the ui-tool
+    // branch of the live-voice session's `tool_use_start`).
+    //
+    // This one flag also drives the runtime-context `supports_dynamic_ui`
+    // line, the secret-prompter's dynamic-UI branch, and the
+    // task-progress-nudge hook, so a live-voice turn now reaches all of them.
+    channelCapabilities: resolveChannelCapabilities(
+      turnChannelContext.userMessageChannel,
+      turnInterfaceContext.userMessageInterface,
+    ),
     voiceCallControlPrompt,
   };
   const installVoiceTurnState = () => {
@@ -1106,19 +1284,25 @@ export async function startVoiceTurn(
     publishConversationMessagesChanged(opts.conversationId);
   }
 
-  // Hook into conversation to intercept confirmation_request and secret_request events.
-  // Voice auto-denies/auto-allows/auto-resolves these since there's no interactive UI.
+  // Observe confirmation_request and secret_request events so voice can
+  // auto-deny/auto-allow/auto-resolve them (there is no interactive UI on a
+  // call). Delivery is not this observer's job: the conversation's sink has
+  // already put each event on the wire before the observer sees it, which is
+  // what keeps a resolution's `interaction_resolved` after the request it
+  // answers.
   let lastError: string | null = null;
-  conversation.updateClient(async (msg: AssistantEvent) => {
+  const handleVoiceEvent = async (msg: AssistantEvent): Promise<void> => {
+    // The user (or anything else) answered: stop the fallback from firing on a
+    // request that is already decided.
+    if (msg.type === "interaction_resolved") {
+      settleVoiceApproval(msg.requestId);
+    }
     if (msg.type === "confirmation_request") {
-      // Broadcast the request BEFORE resolving it: resolution synchronously
-      // broadcasts `interaction_resolved` (handleConfirmationResponse →
-      // prompter → pending-interactions), and attached clients (e.g. the
-      // web app behind a live-voice room) clear their approval card only on
-      // that event — resolving first would put `interaction_resolved`
-      // before `confirmation_request` on the wire, leaving an orphaned card
-      // whose Allow/Deny buttons 404.
-      broadcastMessage(msg);
+      // The request is already on the wire (the sink delivered it before this
+      // observer ran), so a resolution below lands after it: attached clients
+      // (e.g. the web app behind a live-voice room) clear their approval card
+      // only on `interaction_resolved`, and the reverse order would leave an
+      // orphaned card whose Allow/Deny buttons 404.
       if (!isGuardian) {
         // Non-guardian voice callers have no interactive approval UI.
         // The pre-exec gate (tool-approval-handler.ts) handles grant
@@ -1186,6 +1370,71 @@ export async function startVoiceTurn(
         });
         return;
       }
+      // A live-voice call has a screen, so a consequential action can be put
+      // to the user instead of decided for them.
+      //
+      // Everything used to be allowed here on the strength of the caller being
+      // a guardian, which made a voice call the one surface where a tool that
+      // writes to the workspace or reaches the host never had to ask. Only
+      // *sensitive* reach prompts: gating every confirmation would interrupt a
+      // conversation constantly, and the tools that read or render were never
+      // the reason approval exists.
+      //
+      // Phone keeps the old behavior in full. There is no screen on that
+      // channel, so a prompt there is a question nobody can answer.
+      // The workspace root is what makes an escape visible. A sandbox file
+      // tool pointed outside the workspace reaches the host filesystem on a
+      // non-containerized install, and `sensitiveToolReach` can only see that
+      // when it is given the boundary to compare against: without it,
+      // `file_read { path: "/etc/hosts" }` classifies as `none` and would fall
+      // through to the auto-allow this branch exists to prevent.
+      const workspaceRoot = conversation.workingDir;
+      const reach = sensitiveToolReach(
+        msg.toolName,
+        // Absent on requests that do not come from the tool pipeline (proxy
+        // and network prompters). Unknown reads as the more consequential of
+        // the two: the cost of being wrong is a prompt the user did not need,
+        // against an unreviewed action on their machine.
+        msg.executionTarget ?? "host",
+        msg.input,
+        workspaceRoot,
+      );
+      const canPrompt = turnChannelContext.userMessageChannel === "vellum";
+      // Fail closed on a missing boundary for the same reason: with no
+      // workspace root there is no way to tell an ordinary write from an
+      // escape, and the safe reading of "cannot tell" is "ask". A real
+      // conversation always has one, so this is a guard rather than a path.
+      if (canPrompt && (reach !== "none" || !workspaceRoot)) {
+        log.info(
+          { turnId, toolName: msg.toolName, reach },
+          "Prompting guardian voice caller for a sensitive tool",
+        );
+        // Left pending: the request is already broadcast, so the approval card
+        // an attached client renders is now answerable rather than cleared a
+        // moment later by this handler.
+        //
+        // Announced separately, because "a card exists" and "the user can see
+        // it" are different things on a channel whose call covers the app.
+        opts.onApprovalPending?.(msg.requestId);
+        const timer = setTimeout(() => {
+          pendingVoiceApprovals.delete(msg.requestId);
+          if (pendingVoiceApprovals.size === 0) {
+            opts.onApprovalsResolved?.();
+          }
+          log.info(
+            { turnId, toolName: msg.toolName },
+            "Voice approval timed out — falling back to the guardian allow",
+          );
+          conversation.handleConfirmationResponse(msg.requestId, "allow", {
+            decisionContext: `Permission approved for "${msg.toolName}": this is a verified guardian voice call and the approval prompt went unanswered.`,
+          });
+        }, VOICE_APPROVAL_TIMEOUT_MS);
+        // Never hold the process open for a prompt nobody is looking at.
+        timer.unref?.();
+        pendingVoiceApprovals.set(msg.requestId, timer);
+        return;
+      }
+
       log.info(
         { turnId, toolName: msg.toolName },
         "Auto-approving confirmation request for guardian voice turn",
@@ -1196,11 +1445,14 @@ export async function startVoiceTurn(
       return;
     }
     if (msg.type === "secret_request") {
-      // Defense-in-depth: SecretPrompter.prompt fails fast with
-      // `unsupported_channel` on voice turns (supportsDynamicUi is forced
-      // off above), so a secret_request should never reach this handler.
-      // Resolve immediately anyway in case an emitter bypasses the
-      // prompter's channel check or races a capability install.
+      // Auto-resolved rather than prompted, on every voice channel.
+      //
+      // A phone call cannot render a secret field at all. A live-voice call
+      // now can (its channel resolves `supportsDynamicUi` true), so this is
+      // where the prompt would surface, and it deliberately does not yet:
+      // typing a credential into a screen you reached by minimizing a call is
+      // a flow that needs designing, not a flag flip. Resolving with no secret
+      // leaves the tool to fail the way it does today.
       log.info(
         { turnId, service: msg.service, field: msg.field },
         "Auto-resolving secret request for voice turn (no secret-entry UI)",
@@ -1208,9 +1460,15 @@ export async function startVoiceTurn(
       conversation.handleSecretResponse(msg.requestId, undefined, "store");
       return;
     }
-    broadcastMessage(msg);
+  };
+  detachApprovalObserver = conversation.addEventObserver((msg) => {
+    handleVoiceEvent(msg).catch((err) => {
+      log.warn(
+        { turnId, eventType: msg.type, err },
+        "Voice approval observer failed",
+      );
+    });
   });
-  clientCallbackInstalled = true;
 
   // Registered before the agent loop starts so the NEXT turn on this
   // conversation waits for this turn's `finally { cleanup() }` — not just
@@ -1239,6 +1497,34 @@ export async function startVoiceTurn(
   // Set by the handle's discard(): the whole leg must leave no trace.
   let discarded = false;
 
+  // Verdict-first gate on the hub broadcast. A front-door leg's raw stream
+  // carries its routing verdict, so hub subscribers (web, passive devices)
+  // read it through the gate and see only the text the caller heard. Every
+  // other leg, including the escalated continuation that answers for real,
+  // broadcasts its deltas untouched.
+  const frontDoorStreamGate =
+    opts.routingLeg === "front-door"
+      ? createFrontDoorStreamGate(opts.unifiedVerdict === true)
+      : null;
+
+  /**
+   * Broadcast one agent-loop event to hub subscribers, holding a front-door
+   * leg's control-plane text back at the boundary rather than emitting it and
+   * repairing the transcript afterwards. Text released by the gate travels as
+   * an ordinary delta on the leg's own reserved row, so a client that renders
+   * the stream lands on the same text the teardown hygiene pass persists.
+   */
+  const broadcastLegEvent = (msg: AssistantEvent): void => {
+    if (frontDoorStreamGate === null || msg.type !== "assistant_text_delta") {
+      broadcastMessage(msg);
+      return;
+    }
+    const released = frontDoorStreamGate.push(msg.text);
+    if (released.length > 0) {
+      broadcastMessage({ ...msg, text: released });
+    }
+  };
+
   /**
    * Teardown transcript hygiene. Runs after the agent loop has fully
    * settled — including the stranded-content fold that finalizes an aborted
@@ -1266,6 +1552,12 @@ export async function startVoiceTurn(
    * the escalated leg — blocked on this turn's teardown — snapshots it, so
    * the quality model never sees the marker text either. Best-effort: a
    * hiccup here must not escalate into a turn-level failure.
+   *
+   * This pass owns the PERSISTED row, which the agent loop writes from the
+   * model's raw output regardless of what was broadcast. The live hub stream
+   * is gated separately by `broadcastLegEvent`, so the refetch this pass
+   * publishes confirms text a subscriber already holds instead of correcting
+   * it.
    */
   const finalizeVoiceLegTranscript = async (): Promise<void> => {
     if (reservedAssistantRowId == null) {
@@ -1400,6 +1692,23 @@ export async function startVoiceTurn(
         conversation.toolsDisabledDepth++;
         frontDoorToolsSuppressed = true;
       }
+      // Resolved once here rather than inside the options literal below, so
+      // the history scan happens once per leg. A front-door leg is skipped:
+      // its own call site already resolves to the same profile. The
+      // capability check comes before the scan because it is the cheaper of
+      // the two and it decides whether the pin is worth anything at all.
+      const carriesImage =
+        opts.routingLeg !== "front-door" &&
+        doesSupportVision(VOICE_IMAGE_PROFILE) &&
+        conversationCarriesImage(conversation.getMessages());
+      if (carriesImage) {
+        log.info(
+          { turnId, routingLeg: opts.routingLeg ?? null },
+          "Voice leg carries an image; pinning the image-capable profile",
+        );
+      }
+      const profilePin =
+        opts.overrideProfile ?? (carriesImage ? VOICE_IMAGE_PROFILE : null);
       await conversation.runAgentLoop(persistedContent, messageId, {
         onEvent: (msg: AssistantEvent) => {
           if (msg.type === "assistant_turn_start") {
@@ -1409,7 +1718,24 @@ export async function startVoiceTurn(
           } else if (msg.type === "conversation_error") {
             lastError = msg.userMessage;
           }
-          broadcastMessage(msg);
+          if (frontDoorStreamGate !== null && msg.type === "message_complete") {
+            // A leg that completed mid-bridge (a holding phrase with no
+            // sentence terminator) still hands off and speaks what arrived,
+            // so release it ahead of the completion frame. A cancelled leg
+            // never hands off, and correspondingly never flushes.
+            const trailing = frontDoorStreamGate.finish();
+            if (trailing.length > 0) {
+              broadcastMessage({
+                type: "assistant_text_delta",
+                text: trailing,
+                ...(reservedAssistantRowId !== null
+                  ? { messageId: reservedAssistantRowId }
+                  : {}),
+                conversationId: opts.conversationId,
+              });
+            }
+          }
+          broadcastLegEvent(msg);
 
           // Forward voice-relevant events to the real-time event sink
           if (msg.type === "assistant_text_delta") {
@@ -1446,20 +1772,30 @@ export async function startVoiceTurn(
         // ordinary call-agent resolution.
         callSite:
           opts.routingLeg === "front-door" ? "voiceFrontDoor" : "callAgent",
+        // A caller is on the line, so the turn is interactive: approval prompts
+        // must be raised rather than pre-denied, because the approval observer
+        // above is what decides them (auto-resolve for a non-guardian caller,
+        // a real card the guardian can answer).
+        isInteractive: true,
         // The escalation-continuation prompt is a transcript-suppressed machine
         // signal (persisted `hidden`), so flag the turn to match — keeps
         // prompt-as-user-speech consumers (e.g. title generation) from treating
         // it as user speech.
         ...(isHiddenSyntheticPrompt ? { isHiddenPrompt: true } : {}),
+        ...(isEscalationContinuation
+          ? { messageKind: VOICE_ESCALATION_CONTINUATION_MESSAGE_KIND }
+          : {}),
         // Triage-and-escalate routing pins this turn to the fast front-door or
         // strong escalation profile. `forceOverrideProfile` floats it above the
         // callAgent call-site layers (callAgent is not `mainAgent`, so the
         // override would otherwise sit below the call-site profile).
-        ...(opts.overrideProfile != null
-          ? {
-              overrideProfile: opts.overrideProfile,
-              forceOverrideProfile: true,
-            }
+        //
+        // An explicit routing pin wins; failing that, a leg whose history
+        // carries an image is pinned to a profile whose model takes one. A
+        // front-door leg needs neither: its own call site already resolves
+        // there.
+        ...(profilePin != null
+          ? { overrideProfile: profilePin, forceOverrideProfile: true }
           : {}),
       });
       if (lastError) {

@@ -46,17 +46,18 @@ const {
   surfaceProxyResolver,
 } = await import("../daemon/conversation-surfaces.js");
 
-import type { SurfaceConversationContext } from "../daemon/conversation-surfaces.js";
+import type { Conversation } from "../daemon/conversation.js";
 import type {
   CardSurfaceData,
   SurfaceData,
   SurfaceType,
 } from "../daemon/message-protocol.js";
+import { asConversation } from "./helpers/mock-conversation.js";
 
-function makeContext(sent: AssistantEvent[] = []): SurfaceConversationContext {
-  return {
+function makeContext(sent: AssistantEvent[] = []): Conversation {
+  return asConversation({
     conversationId: "conv-persist-1",
-    sendToClient: (msg) => sent.push(msg),
+    emit: (msg) => sent.push(msg),
     pendingSurfaceActions: new Map<string, { surfaceType: SurfaceType }>(),
     lastSurfaceAction: new Map<
       string,
@@ -74,7 +75,7 @@ function makeContext(sent: AssistantEvent[] = []): SurfaceConversationContext {
     getQueueDepth: () => 0,
     processMessage: async () => "ok",
     withSurface: createSurfaceMutex(),
-  };
+  });
 }
 
 function seedRows(rows: Array<{ id: string; content: unknown }>): void {

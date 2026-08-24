@@ -1,7 +1,7 @@
 import { Loader2 } from "lucide-react";
 import { Suspense, useCallback, useEffect, useState } from "react";
 
-import { useNavigate, useSearchParams } from "react-router";
+import { useLocation, useNavigate, useSearchParams } from "react-router";
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
@@ -10,6 +10,8 @@ import { PlatformLoginNotice } from "@/components/platform-login-notice";
 import { AndroidBillingGate } from "@/domains/settings/billing/android-billing-gate";
 import { BillingOnboardingModal } from "@/domains/settings/billing/pro-onboarding/billing-onboarding-modal";
 import { shouldShowBillingTab } from "@/domains/settings/billing/billing-tab-visibility";
+import { CheckoutBonusModal } from "@/domains/settings/billing/checkout-bonus-modal";
+import { useCheckoutBonusOffer } from "@/domains/settings/billing/use-checkout-bonus-offer";
 import { proPackageDisplayName } from "@/domains/settings/billing/package-types";
 import { UsageTab } from "@/domains/settings/billing/usage/usage-tab";
 import { AdjustPlanModal } from "@/domains/settings/components/adjust-plan-modal";
@@ -18,14 +20,16 @@ import { BillingPortalReturnHandler } from "@/domains/settings/components/billin
 import { BillingUsagePanel } from "@/domains/settings/components/billing-usage/billing-usage-panel";
 import { GracePeriodBanner } from "@/domains/settings/components/grace-period-banner";
 import { InvoicesTable } from "@/domains/settings/components/invoices-table";
+import { PaymentMethodsCard } from "@/domains/settings/components/payment-methods-card";
 import { PlanCard } from "@/domains/settings/components/plan-card";
 import { useAssistantDomains } from "@/domains/settings/billing/pro-onboarding/use-assistant-domains";
 import {
   organizationsBillingSubscriptionOnboardingRetrieveOptions,
   organizationsBillingSubscriptionRetrieveOptions,
-  organizationsBillingSummaryRetrieveOptions,
 } from "@/generated/api/@tanstack/react-query.gen";
 import { useIsOrgReady } from "@/hooks/use-is-org-ready";
+import { notifyCheckoutSuccess } from "@/lib/billing/checkout-success";
+import { useTranslation } from "@/i18n";
 import {
   useActiveAssistantIsPlatformHosted,
   useActiveAssistantLifecycleIsLoading,
@@ -40,12 +44,22 @@ import { toast } from "@vellumai/design-library/components/toast";
 
 /**
  * Handles the `billing_status` query parameter that Stripe redirects back with
- * after checkout completes (success) or is cancelled.
+ * after checkout completes (success) or is cancelled. The upgrade-cancel page
+ * funnels into the cancel branch too, tagged `billing_context=upgrade` so the
+ * toast keeps its copy. A cancel is also lifted into parent state via
+ * `onCheckoutCancelled` before the navigate below wipes the query string, so
+ * the abandoned-checkout bonus offer can run its server-side eligibility
+ * check.
  */
-function BillingStatusHandler() {
+function BillingStatusHandler({
+  onCheckoutCancelled,
+}: {
+  onCheckoutCancelled: () => void;
+}) {
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const { t } = useTranslation("settings");
 
   useEffect(() => {
     const billingStatus = searchParams.get("billing_status");
@@ -54,23 +68,19 @@ function BillingStatusHandler() {
     }
 
     if (billingStatus === "success") {
-      toast.success(
-        "Payment received! Your credit balance will update shortly.",
-        {
-          id: "billing-status",
-        },
-      );
-      queryClient.invalidateQueries({
-        queryKey: organizationsBillingSummaryRetrieveOptions().queryKey,
-      });
+      notifyCheckoutSuccess(queryClient);
     } else if (billingStatus === "cancel") {
-      toast.info("Checkout was cancelled. No credits were added.", {
-        id: "billing-status",
-      });
+      toast.info(
+        searchParams.get("billing_context") === "upgrade"
+          ? t("billingStatusHandler.upgradeCancelToast")
+          : t("billingStatusHandler.topUpCancelToast"),
+        { id: "billing-status" },
+      );
+      onCheckoutCancelled();
     }
 
     navigate(routes.settings.usageBilling, { replace: true });
-  }, [searchParams, navigate, queryClient]);
+  }, [searchParams, navigate, queryClient, onCheckoutCancelled, t]);
 
   return null;
 }
@@ -84,6 +94,7 @@ function FinishProSetupNotice({
 }: {
   onFinishSetup: () => void;
 }) {
+  const { t } = useTranslation("settings");
   // Gate the query chain on org readiness (and subscribe to it, so the notice
   // re-evaluates when the org hydrates): a request fired before the org store
   // settles omits `Vellum-Organization-Id` and the platform rejects it.
@@ -115,7 +126,9 @@ function FinishProSetupNotice({
   return (
     <Notice
       tone="info"
-      title={`Finish setting up your ${proPackageDisplayName(subscription?.package)} plan`}
+      title={t("billingPage.finishSetupTitle", {
+        plan: proPackageDisplayName(subscription?.package),
+      })}
       actions={
         <Button
           variant="outlined"
@@ -123,17 +136,18 @@ function FinishProSetupNotice({
           onClick={onFinishSetup}
           data-testid="finish-pro-setup-button"
         >
-          Finish setup
+          {t("billingPage.finishSetupButton")}
         </Button>
       }
       data-testid="finish-pro-setup-notice"
     >
-      Your assistant&apos;s email address hasn&apos;t been set up yet.
+      {t("billingPage.finishSetupBody")}
     </Notice>
   );
 }
 
 function BillingTabContent() {
+  const { t } = useTranslation("settings");
   const platformGate = usePlatformGate({ platformHostedOnly: true });
   const billingGate = usePlatformGate();
   const isPlatformHosted = useActiveAssistantIsPlatformHosted();
@@ -146,6 +160,28 @@ function BillingTabContent() {
   const [resizeModalOpen, setResizeModalOpen] = useState(false);
   const onTierUpgraded = useCallback(() => setResizeModalOpen(true), []);
   const [proOnboardingOpen, setProOnboardingOpen] = useState(false);
+
+  // Abandoned-checkout bonus: the cancel signal lives in state (not the URL)
+  // because BillingStatusHandler immediately navigate-replaces the query
+  // string away. It's a timestamp, not a boolean: this tab is a persistent
+  // mount on Electron/iOS, so a second cancel must read as a fresh trigger
+  // (the hook re-asks the server) instead of latching after the first. The
+  // server's answer alone decides whether the offer shows. Local dismissal
+  // keeps a declined offer closed until the next cancel re-arms it.
+  const [checkoutCancelledAt, setCheckoutCancelledAt] = useState<number | null>(
+    null,
+  );
+  const [bonusDismissed, setBonusDismissed] = useState(false);
+  const onCheckoutCancelled = useCallback(() => {
+    setCheckoutCancelledAt(Date.now());
+    setBonusDismissed(false);
+  }, []);
+  const { showOffer, amountUsd } = useCheckoutBonusOffer(checkoutCancelledAt);
+  const onBonusOpenChange = useCallback((open: boolean) => {
+    if (!open) {
+      setBonusDismissed(true);
+    }
+  }, []);
 
   useEffect(() => {
     // Only consume the modal-opening params once billing is usable (signed
@@ -206,7 +242,7 @@ function BillingTabContent() {
     return (
       <div className="space-y-4">
         <PlatformLoginNotice>
-          Log in to the Vellum platform to manage billing and usage.
+          {t("billingPage.platformLoginNotice")}
         </PlatformLoginNotice>
       </div>
     );
@@ -217,7 +253,7 @@ function BillingTabContent() {
       <div className="space-y-4">
         <div className="flex items-center gap-2 py-6 text-body-medium-lighter text-[var(--content-secondary)]">
           <Loader2 className="h-4 w-4 animate-spin" />
-          Loading billing…
+          {t("billingPage.loadingBilling")}
         </div>
       </div>
     );
@@ -239,7 +275,7 @@ function BillingTabContent() {
     return (
       <div className="space-y-4">
         <Notice tone="warning">
-          Billing isn&apos;t available for the current assistant state.
+          {t("billingPage.billingUnavailable")}
         </Notice>
       </div>
     );
@@ -248,7 +284,7 @@ function BillingTabContent() {
   return (
     <div className="space-y-4">
       <Suspense fallback={null}>
-        <BillingStatusHandler />
+        <BillingStatusHandler onCheckoutCancelled={onCheckoutCancelled} />
         <BillingPortalReturnHandler />
       </Suspense>
       {showPlanManagement && <GracePeriodBanner />}
@@ -265,6 +301,14 @@ function BillingTabContent() {
           onTierUpgraded={onTierUpgraded}
         />
       )}
+      <CheckoutBonusModal
+        open={showOffer && !bonusDismissed}
+        onOpenChange={onBonusOpenChange}
+        amountUsd={amountUsd}
+      />
+      <Suspense fallback={null}>
+        <PaymentMethodsCard />
+      </Suspense>
       <Suspense fallback={null}>
         <BillingPanel />
       </Suspense>
@@ -311,8 +355,11 @@ function UsagePanel() {
 }
 
 export function BillingPage() {
+  const { t } = useTranslation("settings");
   const billingGate = usePlatformGate();
-  const [searchParams, setSearchParams] = useSearchParams();
+  const [searchParams] = useSearchParams();
+  const navigate = useNavigate();
+  const { hash } = useLocation();
   // Shown when signed in (`"full"`); for a signed-out-but-reachable viewer
   // (`"disabled"`) it stays reachable only when the URL carries billing intent
   // (a deeplink / upgrade CTA / Stripe return), so the BillingTab login notice
@@ -344,14 +391,17 @@ export function BillingPage() {
     if (searchParams.get("tab") !== activeTab) {
       const next = new URLSearchParams(searchParams);
       next.set("tab", activeTab);
-      setSearchParams(next, { replace: true });
+      // Not `setSearchParams` — that drops the URL hash, and anchor deep
+      // links (`#daily-credit-limit` from the daily-limit email) must survive
+      // this normalization however late the anchored card mounts.
+      void navigate({ search: `?${next}`, hash }, { replace: true });
     }
-  }, [isPlatformSessionSettled, searchParams, activeTab, setSearchParams]);
+  }, [isPlatformSessionSettled, searchParams, activeTab, navigate, hash]);
 
   const handleTabChange = (value: string) => {
     const next = new URLSearchParams(searchParams);
     next.set("tab", value);
-    setSearchParams(next, { replace: true });
+    void navigate({ search: `?${next}`, hash }, { replace: true });
   };
 
   return (
@@ -359,9 +409,11 @@ export function BillingPage() {
       <Tabs.Root value={activeTab} onValueChange={handleTabChange}>
         <Tabs.List>
           {showBillingTab && (
-            <Tabs.Trigger value="billing">Billing</Tabs.Trigger>
+            <Tabs.Trigger value="billing">
+              {t("billingPage.billingTab")}
+            </Tabs.Trigger>
           )}
-          <Tabs.Trigger value="usage">Usage</Tabs.Trigger>
+          <Tabs.Trigger value="usage">{t("billingPage.usageTab")}</Tabs.Trigger>
         </Tabs.List>
         {showBillingTab && (
           <Tabs.Panel value="billing" className="pt-4">

@@ -14,6 +14,8 @@ export interface RemoteProcess {
   command: string;
 }
 
+const VELLUM_PROCESS_MARKER = /vellum|qdrant|openclaw/;
+
 export function classifyProcess(command: string): string {
   if (/qdrant/.test(command)) return "qdrant";
   if (/vellum-gateway/.test(command)) return "gateway";
@@ -23,9 +25,9 @@ export function classifyProcess(command: string): string {
     )
   )
     return "openclaw-adapter";
-  if (/vellum-daemon/.test(command)) return "assistant";
+  if (/vellum-daemon|[\\/]daemon[\\/]main/.test(command)) return "assistant";
   if (/daemon\s+(start|restart)/.test(command)) return "assistant";
-  if (/vellum-cli/.test(command)) return "vellum";
+  if (/vellum-cli|[\\/]vellum(?:-cli)?\.exe/.test(command)) return "vellum";
   // Exclude macOS desktop app processes — their path contains .app/Contents/MacOS/
   // but they are not background service processes.
   if (/\.app\/Contents\/MacOS\//.test(command)) return "unknown";
@@ -35,6 +37,42 @@ export function classifyProcess(command: string): string {
   // We require a word boundary before "vellum" to avoid matching repo paths.
   if (/(?:^|\/)vellum(?:\s|$)/.test(command)) return "vellum";
   return "unknown";
+}
+
+/**
+ * True when the command line is a deliberate long-running interactive CLI
+ * session (e.g. a live `vellum tunnel` in someone's terminal). Such sessions
+ * have no PID-file registration, so `vellum clean` would otherwise kill them
+ * mid-session. The command line may be "bun /path/to/bin/vellum tunnel ...",
+ * so match the subcommand right after the vellum binary/script path (allowing
+ * only the known global flags in between; see GLOBAL_FLAGS in cli/src/index.ts).
+ * Later argv tokens (e.g. "vellum hatch --name logs") must not match.
+ *
+ * `detectOrphanedProcesses` consults this before classification so that
+ * service-like substrings in later argv (e.g. `vellum exec -it --service
+ * vellum-gateway -- /bin/sh`) cannot re-flag a live session, while
+ * `classifyProcess` stays a pure display label for `vellum ps`.
+ *
+ * Also spared: bare `vellum` (no subcommand launches the implicit TUI client
+ * via tryLaunchClient) and `vellum wake --foreground` (stays attached with
+ * logs in the terminal).
+ */
+export function isInteractiveCliSession(command: string): boolean {
+  const vellumToken =
+    /(?:^|[\\/])vellum(?:-cli)?(?:\.exe)?["']?(?:\s+--(?:no-color|plain))*/;
+  const interactiveSubcommand = new RegExp(
+    vellumToken.source +
+      String.raw`\s+(?:tunnel|events|logs|client|terminal|ssh|exec|message|workflows)\b`,
+  );
+  const implicitTuiClient = new RegExp(vellumToken.source + String.raw`\s*$`);
+  const foregroundWake = new RegExp(
+    vellumToken.source + String.raw`\s+wake\b(?:\s+\S+)*\s--foreground\b`,
+  );
+  return (
+    interactiveSubcommand.test(command) ||
+    implicitTuiClient.test(command) ||
+    foregroundWake.test(command)
+  );
 }
 
 export function parseRemotePs(output: string): RemoteProcess[] {
@@ -119,6 +157,28 @@ export interface DetectOrphansOptions {
    * avoid touching the real on-host lockfiles.
    */
   excludePids?: Set<string>;
+  platform?: NodeJS.Platform;
+}
+
+const WINDOWS_PROCESS_LIST_SCRIPT =
+  'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId) $($_.ParentProcessId) $($_.CommandLine)" }';
+
+export function processTableCommand(hostPlatform: NodeJS.Platform): {
+  command: string;
+  args: string[];
+} {
+  if (hostPlatform === "win32") {
+    return {
+      command: "powershell.exe",
+      args: [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        WINDOWS_PROCESS_LIST_SCRIPT,
+      ],
+    };
+  }
+  return { command: "ps", args: ["ax", "-o", "pid=,ppid=,args="] };
 }
 
 export async function detectOrphanedProcesses(
@@ -138,20 +198,22 @@ export async function detectOrphanedProcesses(
   // Process table scan — discover orphaned processes by scanning the OS
   // process table rather than reading PID files from the workspace.
   try {
-    const output = await execOutput(
-      "sh",
-      [
-        "-c",
-        "ps ax -o pid=,ppid=,args= | grep -E 'vellum|qdrant|openclaw' | grep -v grep",
-      ],
-      { timeoutMs: 5_000 },
-    );
+    const table = processTableCommand(options.platform ?? process.platform);
+    const output = await execOutput(table.command, table.args, {
+      timeoutMs: 5_000,
+    });
     const procs = parseRemotePs(output);
     const ownPid = String(process.pid);
 
     for (const p of procs) {
       if (p.pid === ownPid || seenPids.has(p.pid)) continue;
       if (knownPids.has(p.pid)) continue;
+      if (!VELLUM_PROCESS_MARKER.test(p.command)) continue;
+      // Live interactive sessions are spared before classification so that
+      // service substrings in their argv cannot mark them as orphans.
+      if (isInteractiveCliSession(p.command)) {
+        continue;
+      }
       const type = classifyProcess(p.command);
       if (type === "unknown") continue;
       results.push({ name: type, pid: p.pid, source: "process table" });

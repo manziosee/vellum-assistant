@@ -82,9 +82,27 @@ class FakeAPIError extends Error {
   }
 }
 
+// Simulate the SDK's transport-failure and caller-abort subclasses; the
+// error normalizer distinguishes them by class, so the mock must define both
+// for suites that share this process.
+class FakeAPIConnectionError extends FakeAPIError {
+  constructor() {
+    super(undefined as unknown as number, "Connection error.");
+    this.name = "APIConnectionError";
+  }
+}
+class FakeAPIUserAbortError extends FakeAPIError {
+  constructor() {
+    super(undefined as unknown as number, "Request was aborted.");
+    this.name = "APIUserAbortError";
+  }
+}
+
 mock.module("openai", () => ({
   default: class MockOpenAI {
     static APIError = FakeAPIError;
+    static APIConnectionError = FakeAPIConnectionError;
+    static APIUserAbortError = FakeAPIUserAbortError;
     constructor(opts: Record<string, unknown>) {
       lastConstructorOptions = opts;
     }
@@ -337,6 +355,28 @@ describe("OpenAIProvider", () => {
       expectOpenAIConstructorOptions({
         apiKey: "ollama",
         baseURL: "http://127.0.0.1:11434/v1",
+        timeout: DEFAULT_SDK_TIMEOUT_MS,
+      });
+    } finally {
+      if (previousBaseUrl !== undefined) {
+        process.env.OLLAMA_BASE_URL = previousBaseUrl;
+      } else {
+        delete process.env.OLLAMA_BASE_URL;
+      }
+    }
+  });
+
+  test("ollama wrapper prefers an explicit baseURL over OLLAMA_BASE_URL", () => {
+    const previousBaseUrl = process.env.OLLAMA_BASE_URL;
+    try {
+      process.env.OLLAMA_BASE_URL = "http://127.0.0.1:11434/v1";
+      const ollama = new OllamaProvider("llama3.2", {
+        baseURL: "http://192.168.1.50:11434/v1",
+      });
+      expect(ollama.name).toBe("ollama");
+      expectOpenAIConstructorOptions({
+        apiKey: "ollama",
+        baseURL: "http://192.168.1.50:11434/v1",
         timeout: DEFAULT_SDK_TIMEOUT_MS,
       });
     } finally {

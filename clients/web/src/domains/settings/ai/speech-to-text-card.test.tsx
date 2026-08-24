@@ -15,11 +15,12 @@
  *
  * The native-dictation runtime module is mocked (its real implementation
  * imports a Vite `?worker&url` asset and probes `window.vellum`); the
- * design-library Dropdown is real, driven via its combobox trigger like
+ * design-library Select is real, driven via its combobox trigger like
  * `provider-create-form.test.tsx`.
  */
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import type { ElectronHostOS } from "@vellumai/ipc-contract";
 import {
   cleanup,
   fireEvent,
@@ -31,6 +32,10 @@ import {
 let nativeDictationSupported = false;
 mock.module("@/runtime/native-dictation-partials", () => ({
   isNativeDictationSupported: () => nativeDictationSupported,
+}));
+let electronHostOS: ElectronHostOS | null = "macos";
+mock.module("@/runtime/platform-detection", () => ({
+  detectElectronHostOS: () => electronHostOS,
 }));
 
 const ASSISTANT_ID = "asst-test";
@@ -97,9 +102,11 @@ mock.module("@/generated/daemon/sdk.gen", () => ({
   },
 }));
 
-const { SpeechToTextCard } =
-  await import("@/domains/settings/ai/speech-to-text-card");
+const { SpeechToTextCard } = await import(
+  "@/domains/settings/ai/speech-to-text-card"
+);
 const { LS_STT_PROVIDER } = await import("@/utils/local-settings-keys");
+const { changeLocale } = await import("@/i18n");
 
 function renderCard() {
   const queryClient = new QueryClient({
@@ -112,7 +119,7 @@ function renderCard() {
   );
 }
 
-function openProviderDropdown(): void {
+function openProviderSelect(): void {
   const trigger = document.querySelector<HTMLButtonElement>(
     'button[role="combobox"][aria-label="STT provider"]',
   );
@@ -142,9 +149,11 @@ function selectOption(label: string): void {
 }
 
 describe("SpeechToTextCard — macOS Native Dictation option", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
+    await changeLocale("en");
     localStorage.clear();
     nativeDictationSupported = false;
+    electronHostOS = "macos";
     credentialsSetCalls.length = 0;
     configPatchCalls.length = 0;
     daemonConfigData = { services: {} };
@@ -160,7 +169,7 @@ describe("SpeechToTextCard — macOS Native Dictation option", () => {
   test("native option is absent when the helper recognizer is unavailable", () => {
     renderCard();
 
-    openProviderDropdown();
+    openProviderSelect();
     expect(visibleOptions()).not.toContain("macOS Native Dictation");
   });
 
@@ -168,7 +177,7 @@ describe("SpeechToTextCard — macOS Native Dictation option", () => {
     nativeDictationSupported = true;
     renderCard();
 
-    openProviderDropdown();
+    openProviderSelect();
     expect(visibleOptions()).toContain("macOS Native Dictation");
 
     selectOption("macOS Native Dictation");
@@ -183,6 +192,33 @@ describe("SpeechToTextCard — macOS Native Dictation option", () => {
     // macOS native dictation is client-only — Save must not touch the daemon.
     expect(credentialsSetCalls.length).toBe(0);
     expect(configPatchCalls.length).toBe(0);
+  });
+
+  test("Windows uses native provider metadata for its speech stack", () => {
+    nativeDictationSupported = true;
+    electronHostOS = "windows";
+    renderCard();
+
+    openProviderSelect();
+    expect(visibleOptions()).toContain("Windows Native Dictation");
+    expect(visibleOptions()).not.toContain("macOS Native Dictation");
+
+    selectOption("Windows Native Dictation");
+    expect(screen.getByText(/download Basic speech recognition/)).toBeTruthy();
+    expect(screen.queryByText(/System Settings/)).toBeNull();
+  });
+
+  test("Windows native provider metadata follows the active locale", async () => {
+    nativeDictationSupported = true;
+    electronHostOS = "windows";
+    await changeLocale("es");
+    renderCard();
+
+    openProviderSelect();
+    expect(visibleOptions()).toContain("Dictado nativo de Windows");
+
+    selectOption("Dictado nativo de Windows");
+    expect(screen.getByText(/Reconocimiento de voz básico/)).toBeTruthy();
   });
 
   test("selecting Deepgram and saving provisions the daemon (CES key + services.stt)", async () => {
@@ -256,7 +292,7 @@ describe("SpeechToTextCard — macOS Native Dictation option", () => {
     daemonConfigData = { services: { stt: { provider: "vellum" } } };
     renderCard();
 
-    openProviderDropdown();
+    openProviderSelect();
     selectOption("OpenAI");
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
@@ -287,7 +323,7 @@ describe("SpeechToTextCard — Vellum provider", () => {
   test("Vellum is offered in the provider dropdown", () => {
     renderCard();
 
-    openProviderDropdown();
+    openProviderSelect();
     expect(visibleOptions()).toContain("Vellum");
   });
 
@@ -309,7 +345,7 @@ describe("SpeechToTextCard — Vellum provider", () => {
   test("selecting Vellum saves provider vellum and stores no credential", async () => {
     renderCard();
 
-    openProviderDropdown();
+    openProviderSelect();
     selectOption("Vellum");
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
@@ -346,7 +382,7 @@ describe("SpeechToTextCard — Vellum provider", () => {
     };
     renderCard();
 
-    openProviderDropdown();
+    openProviderSelect();
     selectOption("Deepgram");
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
@@ -364,7 +400,7 @@ describe("SpeechToTextCard — Vellum provider", () => {
     daemonConfigData = { services: { stt: { provider: "vellum" } } };
     renderCard();
 
-    openProviderDropdown();
+    openProviderSelect();
     selectOption("macOS Native Dictation");
     fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
@@ -502,7 +538,7 @@ describe("SpeechToTextCard: Spoken language picker", () => {
 
     await waitFor(() => expect(languageTrigger()).not.toBeNull());
 
-    openProviderDropdown();
+    openProviderSelect();
     selectOption("macOS Native Dictation");
 
     expect(languageTrigger()).toBeNull();
@@ -527,7 +563,7 @@ describe("SpeechToTextCard: Spoken language picker", () => {
 
     await waitFor(() => expect(languageTrigger()).not.toBeNull());
 
-    openProviderDropdown();
+    openProviderSelect();
     selectOption("OpenAI");
 
     expect(languageTrigger()).toBeNull();
@@ -553,7 +589,7 @@ describe("SpeechToTextCard: Spoken language picker", () => {
 
     await waitFor(() => expect(languageTrigger()).not.toBeNull());
 
-    openProviderDropdown();
+    openProviderSelect();
     selectOption("Vellum");
 
     expect(languageTrigger()).toBeNull();

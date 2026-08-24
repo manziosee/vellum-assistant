@@ -31,31 +31,27 @@ interface ToneClasses {
 
 const TONE_CLASSES: Record<NoticeTone, ToneClasses> = {
   info: {
-    container:
-      "bg-[var(--surface-overlay)] border-[var(--border-element)]",
+    container: "bg-[var(--surface-overlay)]",
     icon: "text-[color:var(--content-secondary)]",
     DefaultIcon: Info,
   },
   success: {
-    container:
-      "bg-[var(--system-positive-weak)] border-[color-mix(in_srgb,var(--system-positive-strong)_25%,transparent)]",
+    container: "bg-[var(--system-positive-weak)]",
     icon: "text-[color:var(--system-positive-strong)]",
     DefaultIcon: CircleCheck,
   },
   warning: {
-    container:
-      "bg-[var(--system-mid-weak)] border-[color-mix(in_srgb,var(--system-mid-strong)_30%,transparent)]",
+    container: "bg-[var(--system-mid-weak)]",
     icon: "text-[color:var(--system-mid-strong)]",
     DefaultIcon: CircleAlert,
   },
   error: {
-    container:
-      "bg-[var(--system-negative-weak)] border-[color-mix(in_srgb,var(--system-negative-strong)_25%,transparent)]",
+    container: "bg-[var(--system-negative-weak)]",
     icon: "text-[color:var(--system-negative-strong)]",
     DefaultIcon: TriangleAlert,
   },
   neutral: {
-    container: "bg-[var(--surface-overlay)] border-[var(--border-base)]",
+    container: "bg-[var(--surface-overlay)]",
     icon: "text-[color:var(--content-secondary)]",
     DefaultIcon: null,
   },
@@ -82,6 +78,11 @@ export function Notice({
         : null
       : icon;
 
+  // Anything stacked under the icon (a title, or an actions row) reads as a
+  // block the icon labels, so the icon aligns to the first line rather than to
+  // the middle of the notice.
+  const alignTop = Boolean(title || actions);
+
   return (
     <div
       {...rest}
@@ -89,8 +90,8 @@ export function Notice({
       role={role}
       data-slot="notice"
       className={cn(
-        "relative flex w-full gap-3 rounded-lg border p-3",
-        title ? "items-start" : "items-center",
+        "relative flex w-full gap-3 rounded-lg p-3",
+        alignTop ? "items-start" : "items-center",
         "text-[color:var(--content-default)]",
         toneClasses.container,
         className,
@@ -100,7 +101,7 @@ export function Notice({
         <span
           className={cn(
             "flex shrink-0 items-center justify-center",
-            title && "mt-0.5",
+            alignTop && "mt-0.5",
             toneClasses.icon,
           )}
         >
@@ -127,12 +128,24 @@ export function Notice({
             {children}
           </Typography>
         ) : null}
+        {/*
+         * Actions sit under the message rather than beside it: a side column
+         * competes with the text for width, which collapses the message to a
+         * one-word-per-line column in narrow notices and strands the buttons
+         * against dead space in wide ones.
+         */}
+        {actions ? (
+          <div className="flex flex-wrap items-center gap-2 pt-1">{actions}</div>
+        ) : null}
       </div>
 
-      {actions ? (
-        <div className="flex shrink-0 flex-wrap items-center gap-2">{actions}</div>
-      ) : null}
-
+      {/*
+       * The dismiss control stays in the flow rather than being pinned to the
+       * corner: reserving a corner lane means a root padding class, and `cn()`
+       * merges the consumer's `className` last, so any caller passing its own
+       * `p-*` would silently drop the reservation and let the button overlap
+       * the message. At ~22px it costs the message almost nothing.
+       */}
       {onDismiss ? (
         <button
           type="button"

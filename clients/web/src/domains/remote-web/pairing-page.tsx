@@ -7,6 +7,8 @@ import {
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useLocation, useNavigate } from "react-router";
 
+import { Button } from "@vellumai/design-library/components/button";
+
 import { NotFound } from "@/components/not-found";
 import {
   activateRemoteGatewaySession,
@@ -16,14 +18,18 @@ import {
   remoteGatewayPublicBaseUrl,
   RemoteWebPairingError,
 } from "@/lib/auth/remote-gateway-session";
-import { isRemoteGatewayMode } from "@/lib/local-mode";
-import { isNativePlatform } from "@/runtime/native-auth";
 import {
-  isAndroidBrowser,
-  isIOSBrowser,
-} from "@/runtime/platform-detection";
+  getRemoteGatewayAssistantName,
+  getRemoteGatewayHubUrl,
+  isRemoteGatewayMode,
+} from "@/lib/local-mode";
+import { isNativePlatform } from "@/runtime/native-auth";
+import { isAndroidBrowser, isIOSBrowser } from "@/runtime/platform-detection";
+import { nativeSwitchToOriginPath } from "@/runtime/self-hosted-servers";
 import { sanitizeReturnTo } from "@/utils/return-to";
 import { routes } from "@/utils/routes";
+
+import { useTranslation } from "@/i18n";
 
 type PairingDetails = {
   deviceCode: string;
@@ -81,10 +87,20 @@ function statusCopy(state: PairingState): { title: string; body: string } {
 
 function StatusIcon({ state }: { state: PairingState }) {
   if (state.kind === "approved") {
-    return <CheckCircle2 className="h-5 w-5 text-green-600" aria-hidden />;
+    return (
+      <CheckCircle2
+        className="h-5 w-5 text-[var(--system-positive-strong)]"
+        aria-hidden
+      />
+    );
   }
   if (state.kind === "handoff_choice") {
-    return <Smartphone className="h-5 w-5 text-blue-600" aria-hidden />;
+    return (
+      <Smartphone
+        className="h-5 w-5 text-[var(--system-info-strong)]"
+        aria-hidden
+      />
+    );
   }
   if (
     state.kind === "starting" ||
@@ -93,12 +109,17 @@ function StatusIcon({ state }: { state: PairingState }) {
   ) {
     return (
       <LoaderCircle
-        className="h-5 w-5 animate-spin text-blue-600"
+        className="h-5 w-5 animate-spin text-[var(--system-info-strong)]"
         aria-hidden
       />
     );
   }
-  return <AlertCircle className="h-5 w-5 text-red-600" aria-hidden />;
+  return (
+    <AlertCircle
+      className="h-5 w-5 text-[var(--system-negative-strong)]"
+      aria-hidden
+    />
+  );
 }
 
 /**
@@ -134,27 +155,54 @@ type AppHandoffPlatform = "ios" | "android";
  * link the mobile app consumes to persist this server and finish pairing inside
  * the app. `url` is the page's own public base (origin + served path prefix)
  * so the app reconnects to the same self-hosted assistant this browser is
- * already on.
+ * already on. When the served config carries the assistant's display name, a
+ * `name` param rides along so the app can label the server.
  */
 function buildAppHandoffUrl(
   deviceCode: string,
   platform: AppHandoffPlatform,
 ): string {
-  const query = new URLSearchParams({
+  const params = new URLSearchParams({
     url: remoteGatewayPublicBaseUrl(),
     code: deviceCode,
   });
+  const assistantName = getRemoteGatewayAssistantName();
+  if (assistantName) {
+    params.set("name", assistantName);
+  }
+  // Percent-encode spaces: URLSearchParams form-encodes them as `+`, which
+  // the iOS app's Foundation URLComponents parser keeps as a literal plus.
+  const query = params.toString().replace(/\+/g, "%20");
   if (platform === "ios") {
-    return `${VELLUM_APP_SCHEME}://connect?${query.toString()}`;
+    return `${VELLUM_APP_SCHEME}://connect?${query}`;
   }
 
   const fallbackUrl = encodeURIComponent(window.location.href);
   return (
-    `intent://connect?${query.toString()}` +
+    `intent://connect?${query}` +
     `#Intent;scheme=${VELLUM_APP_SCHEME};` +
     `package=${VELLUM_ANDROID_PACKAGE};` +
     `S.browser_fallback_url=${fallbackUrl};end`
   );
+}
+
+/**
+ * The hub's chooser on its own origin, or `null` when the served config names
+ * no hub. Abandoning a pairing has to leave this origin: the chooser sits
+ * behind `requireRemoteGatewayPairing`, which bounces an unauthenticated visit
+ * straight back here and mints a fresh code. `noAutoSkip` keeps the hub on the
+ * chooser instead of skipping through a lone assistant.
+ */
+function hubChooserUrl(): string | null {
+  const hubUrl = getRemoteGatewayHubUrl();
+  if (!hubUrl) {
+    return null;
+  }
+  try {
+    return `${new URL(hubUrl).origin}${routes.selectAssistant}?noAutoSkip=1`;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -172,6 +220,7 @@ function PairingHandoffActions({
   platform: AppHandoffPlatform;
   onContinueInBrowser: () => void;
 }) {
+  const { t } = useTranslation("remote-web");
   const appLink = useMemo(
     () => buildAppHandoffUrl(deviceCode, platform),
     [deviceCode, platform],
@@ -179,24 +228,18 @@ function PairingHandoffActions({
 
   return (
     <div className="mt-6 flex flex-col gap-3">
-      <a
-        href={appLink}
-        className="inline-flex items-center justify-center rounded-md bg-blue-600 px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-blue-700"
-      >
-        Open in the Vellum app
-      </a>
-      <button
-        type="button"
-        onClick={onContinueInBrowser}
-        className="inline-flex items-center justify-center rounded-md border border-[var(--border-default)] bg-[var(--background-surface)] px-4 py-2.5 text-sm font-medium text-[var(--content-primary)] transition-colors hover:bg-[var(--background-muted)]"
-      >
-        Continue in this browser
-      </button>
+      <Button variant="primary" fullWidth asChild>
+        <a href={appLink}>{t("pairingPage.openInApp")}</a>
+      </Button>
+      <Button variant="outlined" fullWidth onClick={onContinueInBrowser}>
+        {t("pairingPage.continueInBrowser")}
+      </Button>
     </div>
   );
 }
 
 export function RemoteWebPairingPage() {
+  const { t } = useTranslation("remote-web");
   const location = useLocation();
   const navigate = useNavigate();
   const enabled = isRemoteGatewayMode();
@@ -215,18 +258,15 @@ export function RemoteWebPairingPage() {
   // A phone that scanned the pairing QR with its camera lands here in a browser.
   // If the Vellum app is installed we offer to hand the pairing to it before
   // burning the single-use code, never inside a native shell that pairs directly.
-  const appHandoffPlatform = useMemo<AppHandoffPlatform | null>(
-    () => {
-      if (!params.deviceCode || isNativePlatform()) {
-        return null;
-      }
-      if (isAndroidBrowser()) {
-        return "android";
-      }
-      return isIOSBrowser() ? "ios" : null;
-    },
-    [params.deviceCode],
-  );
+  const appHandoffPlatform = useMemo<AppHandoffPlatform | null>(() => {
+    if (!params.deviceCode || isNativePlatform()) {
+      return null;
+    }
+    if (isAndroidBrowser()) {
+      return "android";
+    }
+    return isIOSBrowser() ? "ios" : null;
+  }, [params.deviceCode]);
 
   const [pairing, setPairing] = useState<PairingDetails | null>(() =>
     params.deviceCode
@@ -376,6 +416,17 @@ export function RemoteWebPairingPage() {
     setState({ kind: "verifying" });
   }, []);
 
+  const cancelUrl = useMemo(() => hubChooserUrl(), []);
+  const handleCancel = useCallback(() => {
+    void nativeSwitchToOriginPath(null, `select-assistant?noAutoSkip=1`).then(
+      (switched) => {
+        if (!switched && cancelUrl) {
+          window.location.assign(cancelUrl);
+        }
+      },
+    );
+  }, [cancelUrl]);
+
   if (!enabled) {
     return <NotFound />;
   }
@@ -383,25 +434,27 @@ export function RemoteWebPairingPage() {
   const copy = statusCopy(state);
 
   return (
-    <main className="flex min-h-svh items-center justify-center bg-[var(--background-default)] px-6 py-10 text-[var(--content-primary)]">
-      <section className="w-full max-w-md rounded-lg border border-[var(--border-default)] bg-[var(--background-surface)] p-8 shadow-sm">
+    <main className="flex min-h-svh items-center justify-center bg-[var(--surface-base)] px-6 py-10 text-[var(--content-default)]">
+      <section className="w-full max-w-md rounded-lg border border-[var(--border-subtle)] bg-[var(--surface-lift)] p-8 shadow-[var(--shadow-sm)]">
         <div className="mb-5 flex items-center gap-3">
           <StatusIcon state={state} />
-          <h1 className="text-xl font-semibold">{copy.title}</h1>
+          <h1 className="text-title-medium text-[var(--content-emphasised)]">
+            {copy.title}
+          </h1>
         </div>
 
         {state.kind === "polling" && pairing?.userCode ? (
-          <div className="mb-5 rounded-md border border-[var(--border-subtle)] bg-[var(--background-muted)] p-4 text-center">
-            <div className="text-xs font-medium uppercase text-[var(--content-secondary)]">
-              Pairing code
+          <div className="mb-5 rounded-md border border-[var(--border-subtle)] bg-[var(--surface-sunken)] p-4 text-center">
+            <div className="text-label-small-default uppercase tracking-wide text-[var(--content-tertiary)]">
+              {t("pairingPage.pairingCode")}
             </div>
-            <div className="mt-2 font-mono text-3xl font-semibold tracking-[0.18em]">
+            <div className="mt-2 font-mono text-3xl font-semibold tracking-[0.18em] text-[var(--content-emphasised)]">
               {pairing.userCode}
             </div>
           </div>
         ) : null}
 
-        <p className="text-sm leading-6 text-[var(--content-secondary)]">
+        <p className="text-body-medium-lighter leading-6 text-[var(--content-secondary)]">
           {copy.body}
         </p>
 
@@ -414,9 +467,22 @@ export function RemoteWebPairingPage() {
         ) : null}
 
         {state.kind === "polling" && state.expiresAt ? (
-          <p className="mt-4 text-xs text-[var(--content-tertiary)]">
-            Expires {new Date(state.expiresAt).toLocaleTimeString()}.
+          <p className="text-body-small-lighter mt-4 text-[var(--content-tertiary)]">
+            {t("pairingPage.expiresAt", {
+              time: new Date(state.expiresAt).toLocaleTimeString(),
+            })}
           </p>
+        ) : null}
+
+        {state.kind === "polling" && cancelUrl ? (
+          <Button
+            variant="outlined"
+            fullWidth
+            className="mt-6"
+            onClick={handleCancel}
+          >
+            {t("pairingPage.cancel")}
+          </Button>
         ) : null}
       </section>
     </main>

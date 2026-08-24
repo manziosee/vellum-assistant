@@ -301,7 +301,76 @@ describe("queryUnreportedTurnEvents", () => {
     expect(byId[final.id].outcome).toBeNull();
   });
 
+  test("projects the scripted flag, keeping false distinct from unknown", async () => {
+    const conv = createConversation({ conversationType: "standard" });
+    const scripted = await addMessage(conv.id, "user", "auto-sent kickoff", {
+      metadata: { scripted: true },
+    });
+    const typed = await addMessage(conv.id, "user", "a real message", {
+      metadata: { scripted: false },
+    });
+    const legacy = await addMessage(conv.id, "user", "row predating the flag");
+
+    const events = queryUnreportedTurnEvents(0, undefined, 100);
+    const byId = Object.fromEntries(events.map((e) => [e.id, e]));
+
+    // sqlite's json_extract yields 1/0 for JSON booleans, so these must come
+    // back as real booleans. A raw 1 would be rejected by the platform's
+    // BooleanField and the event silently dropped at ingest.
+    expect(byId[scripted.id].scripted).toBe(true);
+    expect(byId[typed.id].scripted).toBe(false);
+
+    // The three-state contract: a row persisted before the flag existed is
+    // UNKNOWN, not "the user typed it". Collapsing this to false is exactly
+    // the bug the flag exists to fix, so assert null rather than falsy.
+    expect(byId[legacy.id].scripted).toBeNull();
+    expect(byId[legacy.id].scripted).not.toBe(false);
+  });
+
   test("stampTurnOutcome never throws, even for a nonexistent message id", () => {
     expect(() => stampTurnOutcome("no-such-message", "failed")).not.toThrow();
+  });
+});
+
+describe("unfinalized rows and turn accounting", () => {
+  test("an in-flight grouped tool-result row is not a real user turn", async () => {
+    const conv = createConversation({ conversationType: "standard" });
+    const first = await insertUserMessageAt(conv.id, "real question", 1000);
+    // The grouped tool-result row: user-role, reserved unfinalized while
+    // tool output streams, content a { ref } that does not contain the
+    // tool_result text the content exclusions match. Without the finalized
+    // predicate it counts as a phantom user turn until the fold.
+    const inflight = await insertUserMessageAt(
+      conv.id,
+      JSON.stringify({ ref: "conversations/conv/inflight/x.jsonl" }),
+      2000,
+    );
+    getDb().run(`UPDATE messages SET finalized = 0 WHERE id = '${inflight}'`);
+    const second = await insertUserMessageAt(conv.id, "second question", 3000);
+
+    const events = queryUnreportedTurnEvents(0, undefined, 100);
+    const ids = events
+      .filter((e) => e.conversationId === conv.id)
+      .map((e) => e.id);
+
+    expect(ids).toEqual([first, second]);
+    const byId = Object.fromEntries(events.map((e) => [e.id, e]));
+    expect(byId[first].turnIndex).toBe(1);
+    expect(byId[second].turnIndex).toBe(2);
+  });
+
+  test("a persisted empty-display user row still counts as a turn", async () => {
+    const conv = createConversation({ conversationType: "standard" });
+    const real = await insertUserMessageAt(conv.id, "real question", 1000);
+    // A hidden send persists its user row with [] content (displayContent "")
+    // and still runs a turn, so [] rows must stay in turn accounting.
+    const hidden = await insertUserMessageAt(conv.id, "[]", 2000);
+
+    const events = queryUnreportedTurnEvents(0, undefined, 100);
+    const ids = events
+      .filter((e) => e.conversationId === conv.id)
+      .map((e) => e.id);
+
+    expect(ids).toEqual([real, hidden]);
   });
 });

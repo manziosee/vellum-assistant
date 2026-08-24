@@ -23,6 +23,7 @@ import { cliIpcCall } from "../../ipc/cli-client.js";
 import type { OAuth2Config } from "../../security/oauth2.js";
 import { subcommand } from "../lib/cli-command-help.js";
 import { writeCliError } from "../lib/cli-output.js";
+import { openInHostBrowser } from "../lib/open-browser.js";
 import { attachDefaultProviderSubcommand } from "./inference-providers-default.js";
 
 // ---------------------------------------------------------------------------
@@ -38,8 +39,25 @@ interface ProviderConnection {
   name: string;
   provider: string;
   auth: AuthInfo;
+  baseUrl?: string | null;
   createdAt: string;
   updatedAt: string;
+  /** Save-time probe of a custom base URL; advisory, never blocks the save. */
+  endpoint_check?: {
+    ok: boolean;
+    status?: number;
+    resolved_url: string;
+    hint?: string;
+  };
+}
+
+/** Human-mode warning line for a failed save-time endpoint probe. */
+function formatEndpointCheckWarning(conn: ProviderConnection): string {
+  const check = conn.endpoint_check;
+  if (!check || check.ok) {
+    return "";
+  }
+  return `Warning: ${check.hint ?? `The endpoint returned HTTP ${check.status} for a test request.`} (probed ${check.resolved_url})\n`;
 }
 
 // ---------------------------------------------------------------------------
@@ -129,10 +147,11 @@ function collectRepeatable(value: string, previous: string[]): string[] {
 }
 
 /**
- * Build the openai-compatible custom-provider fields (`base_url`, `models`)
- * from CLI flags, forwarded to the connection route under its exact field
- * names. The daemon stays authoritative on whether they are required/allowed;
- * the CLI only shape-forwards what the user passed.
+ * Build the custom-provider fields (`base_url`, `models`) from CLI flags,
+ * forwarded to the connection route under its exact field names. The daemon
+ * stays authoritative on whether they are required or allowed (openai-compatible
+ * requires both; ollama accepts an optional base URL); the CLI only
+ * shape-forwards what the user passed.
  */
 function buildCustomProviderFields(opts: {
   baseUrl?: string;
@@ -219,6 +238,9 @@ function attachGetSubcommand(parent: Command): void {
       process.stdout.write(`name:     ${conn.name}\n`);
       process.stdout.write(`provider: ${conn.provider}\n`);
       process.stdout.write(`auth:     ${formatAuth(conn.auth)}\n`);
+      if (conn.baseUrl) {
+        process.stdout.write(`base_url: ${conn.baseUrl}\n`);
+      }
       process.stdout.write(
         `created:  ${new Date(conn.createdAt).toISOString()}\n`,
       );
@@ -299,6 +321,7 @@ function attachCreateSubcommand(parent: Command): void {
         } else {
           process.stdout.write(
             `Added provider "${conn.name}" (provider=${conn.provider})\n` +
+              formatEndpointCheckWarning(conn) +
               `Verify it works: point a profile at "${conn.name}", then run: assistant inference send --profile <profile> "Reply with OK"\n`,
           );
         }
@@ -389,6 +412,7 @@ function attachUpdateSubcommand(parent: Command): void {
         } else {
           process.stdout.write(
             `Updated provider "${name}" (auth=${formatAuth(conn.auth)})\n` +
+              formatEndpointCheckWarning(conn) +
               `Verify it works: assistant inference send --profile <profile-using-this-provider> "Reply with OK"\n`,
           );
         }
@@ -451,12 +475,19 @@ function attachLoginChatgptSubcommand(providers: Command): void {
           import("../../security/secure-keys.js"),
         ]);
         // Step 1: Run browser-based PKCE OAuth flow
-        process.stdout.write("Opening browser for ChatGPT authentication...\n");
+        if (!opts.json) {
+          process.stdout.write(
+            "Opening browser for ChatGPT authentication...\n",
+          );
+        }
         const result = await startOAuth2Flow(
           OPENAI_CODEX_OAUTH_CONFIG,
           {
             openUrl: (url) => {
-              Bun.spawn(["open", url]);
+              openInHostBrowser(url);
+              const fallbackMessage = `If the browser did not open, visit:\n${url}\n`;
+              const output = opts.json ? process.stderr : process.stdout;
+              output.write(fallbackMessage);
             },
           },
           {
@@ -519,7 +550,7 @@ function attachLoginChatgptSubcommand(providers: Command): void {
             {
               body: {
                 name: connectionName,
-                provider: "openai",
+                provider: "chatgpt",
                 auth: authInput,
               },
             },

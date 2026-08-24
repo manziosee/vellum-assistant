@@ -20,12 +20,20 @@ import type {
   AppVersionInfo,
   AssistantStatus,
   BundleScanData,
+  CompanionCharacter,
+  CompanionGrowth,
+  CompanionContext,
+  CompanionIntroAction,
+  CompanionSurfaceState,
   ConnectivityState,
   DeepLink,
+  DictationOverlayHitRegion,
   DictationOverlayMessage,
   DictationOverlayState,
   DictationPartialEvent,
   DictationPartialsResult,
+  DictationTranscribeResult,
+  ElectronHostOS,
   FnPushToTalkResult,
   HelperRestartResult,
   HelperState,
@@ -33,6 +41,9 @@ import type {
   HotkeyEventState,
   HotkeyScope,
   LocalAssistantStatusResult,
+  LocalConnectImportResult,
+  LocalListDevicesResult,
+  LocalRevokeDeviceResult,
   LocalUpgradeOptions,
   LocalWakeOptions,
   NotificationActionEvent,
@@ -46,17 +57,29 @@ import type {
   SystemPermissionStatus,
   SystemPermissionsState,
   TextInsertionResult,
+  TitleBarOverlayTheme,
   UpdateState,
   UpdateStatus,
   VellumCommand,
+  VoiceActivityContent,
+  VoiceActivityControl,
+  VoiceActivityControlAction,
+  VoiceActivityPhase,
+  VoiceActivityStart,
+  VoiceActivityState,
 } from "@vellumai/ipc-contract";
 
 export type {
   AppVersionInfo,
   AssistantStatus,
   BundleScanData,
+  CompanionGrowth,
+  CompanionContext,
+  CompanionIntroAction,
+  CompanionSurfaceState,
   ConnectivityState,
   DeepLink,
+  DictationOverlayHitRegion,
   DictationOverlayMessage,
   DictationOverlayState,
   DictationPartialEvent,
@@ -78,13 +101,13 @@ export type {
   UpdateState,
   UpdateStatus,
   VellumCommand,
+  VoiceActivityContent,
+  VoiceActivityControl,
+  VoiceActivityControlAction,
+  VoiceActivityPhase,
+  VoiceActivityStart,
+  VoiceActivityState,
 };
-
-// Legacy aliases — existing consumers import these `Electron`-prefixed names.
-// They are structurally identical to the contract types.
-export type ElectronShowNotificationPayload = ShowNotificationPayload;
-export type ElectronTextInsertionResult = TextInsertionResult;
-export type ElectronNotificationActionEvent = NotificationActionEvent;
 
 // ─── Window augmentation ────────────────────────────────────────────────
 // The renderer's `window.vellum` declaration intentionally marks many
@@ -98,6 +121,7 @@ declare global {
   interface Window {
     vellum?: {
       platform: "electron";
+      hostOS?: ElectronHostOS;
       app: {
         versionInfo(): Promise<AppVersionInfo>;
         openWebsite(): Promise<void>;
@@ -145,7 +169,7 @@ declare global {
           ): () => void;
           transcribe?(
             audio: ArrayBuffer,
-          ): Promise<{ ok: boolean; reason?: string }>;
+          ): Promise<DictationTranscribeResult>;
           onTranscribed?(
             callback: (event: DictationPartialEvent) => void,
           ): () => void;
@@ -171,6 +195,7 @@ declare global {
       };
       icon?: {
         setAvatar(png: Uint8Array | null): void;
+        setCharacter?(character: CompanionCharacter | null): void;
       };
       dock: {
         setBadge(count: number): void;
@@ -180,6 +205,8 @@ declare global {
       };
       menu: {
         setPlatformSession(has: boolean): Promise<void>;
+        titles?(): Promise<Array<{ id: string; label: string }>>;
+        popup?(id: string, x: number, y: number): Promise<void>;
       };
       localMode: {
         hatch(
@@ -190,16 +217,30 @@ declare global {
           assistantId?: string;
           error?: string;
         }>;
+        listDevices?(assistantId: string): Promise<LocalListDevicesResult>;
         readLockfile(): Promise<Lockfile>;
         saveLockfileAssistant(
           assistant: Record<string, unknown>,
           activeAssistant?: string,
+        ): Promise<LockfileWriteResult>;
+        renameLockfileAssistant?(
+          assistantId: string,
+          name: string,
         ): Promise<LockfileWriteResult>;
         replacePlatformAssistants(
           platformAssistants: Array<Record<string, unknown>>,
           organizationId?: string,
         ): Promise<LockfileWriteResult>;
         retire(assistantId: string): Promise<{ ok: boolean; error?: string }>;
+        revokeDevice?(
+          assistantId: string,
+          hashedDeviceId: string,
+        ): Promise<LocalRevokeDeviceResult>;
+        unpair?(assistantId: string): Promise<LockfileWriteResult>;
+        connectImport?(
+          bundle: string,
+          name?: string,
+        ): Promise<LocalConnectImportResult>;
         sleep?(assistantId: string): Promise<{ ok: boolean; error?: string }>;
         wake?(
           assistantId: string,
@@ -229,6 +270,7 @@ declare global {
       mainWindow: {
         ensureVisible(): Promise<void>;
         setOnboarding(active: boolean): Promise<void>;
+        setTitleBarOverlay?(colors: TitleBarOverlayTheme): Promise<void>;
       };
       power: {
         onEvent(callback: (event: PowerEvent) => void): () => void;
@@ -270,6 +312,7 @@ declare global {
         requestStop(): void;
         onStopRequested(callback: () => void): () => void;
         setInteractive(interactive: boolean): void;
+        setHitRegion?(region: DictationOverlayHitRegion | null): void;
       };
       notifications?: {
         show(
@@ -291,6 +334,31 @@ declare global {
         check(): Promise<void>;
         install(): Promise<void>;
         onState(callback: (state: UpdateState) => void): () => void;
+      };
+      voiceActivity?: {
+        start(state: VoiceActivityStart): void;
+        update(content: VoiceActivityContent): void;
+        end(): void;
+        control(control: VoiceActivityControl): void;
+        onControl(
+          callback: (control: VoiceActivityControl) => void,
+        ): () => void;
+      };
+      companion?: {
+        getState(): Promise<CompanionSurfaceState | null>;
+        onState(callback: (state: CompanionSurfaceState) => void): () => void;
+        setInteractive?(interactive: boolean): void;
+        moveBy?(dx: number, dy: number): void;
+        startVoice?(): void;
+        toggleWatch?(): void;
+        answerWatchRetro?(open: boolean): void;
+        activate?(): void;
+        setComposing?(composing: boolean): void;
+        submit?(message: string, startsConversation: boolean): void;
+        setContext?(context: CompanionContext): void;
+        advanceIntro?(action: CompanionIntroAction): void;
+        showContextMenu?(): void;
+        openLink?(url: string): void;
       };
     };
   }

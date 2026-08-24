@@ -39,20 +39,20 @@ mock.module("electron", () => ({
   },
 }));
 
-mock.module("./about", () => ({
+mock.module("./about.client", () => ({
   openAboutWindow: () => undefined,
 }));
 
-mock.module("./auto-update", () => ({
+mock.module("./auto-update.client", () => ({
   checkForUpdates: () => undefined,
 }));
 
-mock.module("./commands", () => ({
+mock.module("./commands.client", () => ({
   acceleratorOption: () => ({}),
   dispatchToFocused: () => undefined,
 }));
 
-mock.module("./command-palette-window", () => ({
+mock.module("./command-palette.client", () => ({
   closeCommandPaletteWindow: () => undefined,
   isCommandPaletteWindowFocused: () => false,
   openCommandPaletteWindow: () => undefined,
@@ -72,14 +72,13 @@ mock.module("./main-window", () => ({
 
 // Full `./settings` surface so this mock — which leaks into co-run test files
 // via the global module registry — doesn't break sibling modules.
-mock.module("./settings", () => ({
+mock.module("@vellumai/electron-desktop/settings", () => ({
   readSetting: () => null,
-  readHotkeyOverride: () => null,
   writeSetting: () => {},
   onSettingChange: () => () => {},
 }));
 
-mock.module("./window-state", () => ({
+mock.module("@vellumai/electron-desktop/window-state", () => ({
   readOnboardingActive: () => false,
 }));
 

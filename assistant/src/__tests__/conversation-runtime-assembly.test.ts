@@ -103,6 +103,7 @@ mock.module("../daemon/date-context.js", () => ({
   formatTurnTimestamp: () => FIXED_TURN_TIMESTAMP,
 }));
 
+import type { SurfaceDataByType } from "../api/surfaces.js";
 import { resolveCallSiteConfig } from "../config/llm-resolver.js";
 import { LLMSchema } from "../config/schemas/llm.js";
 import { REFUSAL_FALLBACK_TEXT } from "../context/refusal-quarantine.js";
@@ -136,7 +137,7 @@ import {
   stripInjectionsForCompaction,
   stripNowScratchpad,
 } from "../daemon/conversation-runtime-assembly.js";
-import type { SurfaceData, SurfaceType } from "../daemon/message-protocol.js";
+import type { SurfaceStateEntry } from "../daemon/conversation-surface-state.js";
 import { buildPkbReminder } from "../daemon/pkb-reminder-builder.js";
 import type { TrustContext } from "../daemon/trust-context-types.js";
 import {
@@ -161,6 +162,7 @@ import { wrapUntrustedContent } from "../security/untrusted-content.js";
 import { getSubagentManager } from "../subagent/index.js";
 import type { SubagentState } from "../subagent/types.js";
 import { getWorkspacePromptPath } from "../util/platform.js";
+import { asConversation } from "./helpers/mock-conversation.js";
 
 // `applyRuntimeInjections` self-resolves the Slack active-thread focus block by
 // reading the live conversation's persisted message rows, so the schema must
@@ -215,27 +217,30 @@ function seedActiveSurfaceConversation(
   conversationId: string,
   workspaceText: string,
   surfaceId: string,
-  data: SurfaceData,
+  data: SurfaceDataByType["dynamic_page"],
   channelCapabilities?: ChannelCapabilities,
   commandIntent?: { type: string; payload?: string; languageCode?: string },
   currentTurnTemporalSnapshot?: {
     clientTimezone: string | null;
+    timeSinceLastMessage: string | null;
   },
 ): void {
-  setConversation(conversationId, {
+  setConversation(
     conversationId,
-    workingDir: "/sandbox",
-    workspaceTopLevelContext: workspaceText,
-    workspaceTopLevelDirty: false,
-    currentActiveSurfaceId: surfaceId,
-    surfaceState: new Map<
-      string,
-      { surfaceType: SurfaceType; data: SurfaceData }
-    >([[surfaceId, { surfaceType: "dynamic_page", data }]]),
-    channelCapabilities: channelCapabilities ?? undefined,
-    commandIntent,
-    currentTurnTemporalSnapshot,
-  } as never);
+    asConversation({
+      conversationId,
+      workingDir: "/sandbox",
+      workspaceTopLevelContext: workspaceText,
+      workspaceTopLevelDirty: false,
+      currentActiveSurfaceId: surfaceId,
+      surfaceState: new Map<string, SurfaceStateEntry>([
+        [surfaceId, { surfaceType: "dynamic_page", data }],
+      ]),
+      channelCapabilities: channelCapabilities ?? undefined,
+      commandIntent,
+      currentTurnTemporalSnapshot,
+    }),
+  );
 }
 
 function clearWorkspaceContext(): void {
@@ -252,15 +257,18 @@ function seedChannelCapabilitiesConversation(
   caps: ChannelCapabilities | null,
   transportHints?: string[],
 ): void {
-  setConversation("runtime-assembly-fallback", {
-    conversationId: "runtime-assembly-fallback",
-    workingDir: "/sandbox",
-    workspaceTopLevelContext: "",
-    workspaceTopLevelDirty: false,
-    surfaceState: new Map(),
-    channelCapabilities: caps ?? undefined,
-    transportHints,
-  } as never);
+  setConversation(
+    "runtime-assembly-fallback",
+    asConversation({
+      conversationId: "runtime-assembly-fallback",
+      workingDir: "/sandbox",
+      workspaceTopLevelContext: "",
+      workspaceTopLevelDirty: false,
+      surfaceState: new Map(),
+      channelCapabilities: caps ?? undefined,
+      transportHints,
+    }),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -986,6 +994,7 @@ describe("applyRuntimeInjections — injection mode", () => {
       { type: "start" },
       {
         clientTimezone: null,
+        timeSinceLastMessage: null,
       },
     );
   });
@@ -1023,15 +1032,18 @@ describe("applyRuntimeInjections — injection mode", () => {
     // rehydration-order tests in conversation-lifecycle.test.ts). background-turn
     // fires only for a background/scheduled live conversation, so register one
     // under the turn's conversation id.
-    setConversation("injection-mode-conv", {
-      conversationId: "injection-mode-conv",
-      workingDir: "/sandbox",
-      workspaceTopLevelContext: "",
-      workspaceTopLevelDirty: false,
-      surfaceState: new Map(),
-      channelCapabilities,
-      conversationType: "background",
-    } as never);
+    setConversation(
+      "injection-mode-conv",
+      asConversation({
+        conversationId: "injection-mode-conv",
+        workingDir: "/sandbox",
+        workspaceTopLevelContext: "",
+        workspaceTopLevelDirty: false,
+        surfaceState: new Map(),
+        channelCapabilities,
+        conversationType: "background",
+      }),
+    );
 
     const { blocks } = await applyRuntimeInjections(baseMessages, fullOptions);
 
@@ -1484,6 +1496,17 @@ describe("stripInjectionsForCompaction memory/info wrapper matching", () => {
 // applyRuntimeInjections with nowScratchpad
 // ---------------------------------------------------------------------------
 
+/**
+ * Personal-memory content (NOW.md, PKB, v3 cards) is gated on the actor's
+ * trust class, so suites asserting that content have to name the actor they
+ * are about. Left unset, the injector substitutes the low-trust fallback and
+ * the assertion silently becomes a test of the gate instead of the content.
+ */
+const GUARDIAN_TRUST_FIXTURE = {
+  trustClass: "guardian",
+  sourceChannel: "vellum",
+} as const;
+
 describe("applyRuntimeInjections with nowScratchpad", () => {
   const baseMessages: Message[] = [
     {
@@ -1501,6 +1524,7 @@ describe("applyRuntimeInjections with nowScratchpad", () => {
     seedNowScratchpad("Current focus: fix the bug");
     const { messages: result } = await applyRuntimeInjections(baseMessages, {
       conversationId: FALLBACK_CONVERSATION_ID,
+      trust: GUARDIAN_TRUST_FIXTURE,
     });
 
     expect(result.length).toBe(1);
@@ -1515,6 +1539,7 @@ describe("applyRuntimeInjections with nowScratchpad", () => {
     seedNowScratchpad("scratchpad notes");
     const { messages: result } = await applyRuntimeInjections(baseMessages, {
       conversationId: FALLBACK_CONVERSATION_ID,
+      trust: GUARDIAN_TRUST_FIXTURE,
     });
 
     // Scratchpad comes first (before user content)
@@ -1530,6 +1555,7 @@ describe("applyRuntimeInjections with nowScratchpad", () => {
   test("does not inject when the NOW.md file is absent", async () => {
     const { messages: result } = await applyRuntimeInjections(baseMessages, {
       conversationId: FALLBACK_CONVERSATION_ID,
+      trust: GUARDIAN_TRUST_FIXTURE,
     });
 
     expect(result.length).toBe(1);
@@ -1540,6 +1566,7 @@ describe("applyRuntimeInjections with nowScratchpad", () => {
     seedNowScratchpad("Current focus: fix the bug");
     const { messages: result } = await applyRuntimeInjections(baseMessages, {
       conversationId: FALLBACK_CONVERSATION_ID,
+      trust: GUARDIAN_TRUST_FIXTURE,
       mode: "minimal",
     });
 
@@ -2227,20 +2254,24 @@ describe("applyRuntimeInjections with unifiedTurnContext", () => {
   // context (so the injector sources the interface label to match
   // `sampleOptions.interfaceName`).
   function seedTemporalSnapshot(): void {
-    setConversation("runtime-assembly-fallback", {
-      conversationId: "runtime-assembly-fallback",
-      workingDir: "/sandbox",
-      workspaceTopLevelContext: "",
-      workspaceTopLevelDirty: false,
-      surfaceState: new Map(),
-      currentTurnTemporalSnapshot: {
-        clientTimezone: null,
-      },
-      currentTurnInterfaceContext: {
-        userMessageInterface: "macos",
-        assistantMessageInterface: "macos",
-      },
-    } as never);
+    setConversation(
+      "runtime-assembly-fallback",
+      asConversation({
+        conversationId: "runtime-assembly-fallback",
+        workingDir: "/sandbox",
+        workspaceTopLevelContext: "",
+        workspaceTopLevelDirty: false,
+        surfaceState: new Map(),
+        currentTurnTemporalSnapshot: {
+          clientTimezone: null,
+          timeSinceLastMessage: null,
+        },
+        currentTurnInterfaceContext: {
+          userMessageInterface: "macos",
+          assistantMessageInterface: "macos",
+        },
+      }),
+    );
   }
 
   test("injects the turn-context block when the inputs are provided", async () => {
@@ -2327,17 +2358,20 @@ describe("applyRuntimeInjections timezone resolution", () => {
     clientTimezone: string | null,
     timeSinceLastMessage: string | null = null,
   ): void {
-    setConversation("runtime-assembly-fallback", {
-      conversationId: "runtime-assembly-fallback",
-      workingDir: "/sandbox",
-      workspaceTopLevelContext: "",
-      workspaceTopLevelDirty: false,
-      surfaceState: new Map(),
-      currentTurnTemporalSnapshot: {
-        clientTimezone,
-        timeSinceLastMessage,
-      },
-    } as never);
+    setConversation(
+      "runtime-assembly-fallback",
+      asConversation({
+        conversationId: "runtime-assembly-fallback",
+        workingDir: "/sandbox",
+        workspaceTopLevelContext: "",
+        workspaceTopLevelDirty: false,
+        surfaceState: new Map(),
+        currentTurnTemporalSnapshot: {
+          clientTimezone,
+          timeSinceLastMessage,
+        },
+      }),
+    );
   }
 
   function injectedText(result: { messages: Message[] }): string {
@@ -2491,20 +2525,24 @@ describe("applyRuntimeInjections blocks.unifiedTurnContext", () => {
   // context (so the injector sources the interface label to match
   // `sampleOptions.interfaceName`).
   function seedTemporalSnapshot(): void {
-    setConversation("runtime-assembly-fallback", {
-      conversationId: "runtime-assembly-fallback",
-      workingDir: "/sandbox",
-      workspaceTopLevelContext: "",
-      workspaceTopLevelDirty: false,
-      surfaceState: new Map(),
-      currentTurnTemporalSnapshot: {
-        clientTimezone: null,
-      },
-      currentTurnInterfaceContext: {
-        userMessageInterface: "macos",
-        assistantMessageInterface: "macos",
-      },
-    } as never);
+    setConversation(
+      "runtime-assembly-fallback",
+      asConversation({
+        conversationId: "runtime-assembly-fallback",
+        workingDir: "/sandbox",
+        workspaceTopLevelContext: "",
+        workspaceTopLevelDirty: false,
+        surfaceState: new Map(),
+        currentTurnTemporalSnapshot: {
+          clientTimezone: null,
+          timeSinceLastMessage: null,
+        },
+        currentTurnInterfaceContext: {
+          userMessageInterface: "macos",
+          assistantMessageInterface: "macos",
+        },
+      }),
+    );
   }
 
   test("captures unifiedTurnContext when tail is a user message", async () => {
@@ -2688,15 +2726,18 @@ describe("applyRuntimeInjections — subagent status", () => {
   // a fallback fake carrying that delegation for the seeded children to
   // surface.
   beforeEach(() => {
-    setConversation(FALLBACK_CONVERSATION_ID, {
-      conversationId: FALLBACK_CONVERSATION_ID,
-      workingDir: "/sandbox",
-      workspaceTopLevelContext: "",
-      workspaceTopLevelDirty: false,
-      surfaceState: new Map(),
-      getSubagentChildren: () =>
-        getSubagentManager().getChildrenOf(FALLBACK_CONVERSATION_ID),
-    } as never);
+    setConversation(
+      FALLBACK_CONVERSATION_ID,
+      asConversation({
+        conversationId: FALLBACK_CONVERSATION_ID,
+        workingDir: "/sandbox",
+        workspaceTopLevelContext: "",
+        workspaceTopLevelDirty: false,
+        surfaceState: new Map(),
+        getSubagentChildren: () =>
+          getSubagentManager().getChildrenOf(FALLBACK_CONVERSATION_ID),
+      }),
+    );
   });
 
   afterEach(() => {
@@ -2750,14 +2791,17 @@ describe("applyRuntimeInjections — subagent status", () => {
 
   test("skips subagent status when the conversation is itself a subagent", async () => {
     // GIVEN the live conversation is itself a subagent (no nesting)
-    setConversation("runtime-assembly-fallback", {
-      conversationId: "runtime-assembly-fallback",
-      workingDir: "/sandbox",
-      workspaceTopLevelContext: "",
-      workspaceTopLevelDirty: false,
-      surfaceState: new Map(),
-      isSubagent: true,
-    } as never);
+    setConversation(
+      "runtime-assembly-fallback",
+      asConversation({
+        conversationId: "runtime-assembly-fallback",
+        workingDir: "/sandbox",
+        workspaceTopLevelContext: "",
+        workspaceTopLevelDirty: false,
+        surfaceState: new Map(),
+        isSubagent: true,
+      }),
+    );
     // AND a child is registered under its id
     seedSubagentChild(
       "runtime-assembly-fallback",
@@ -2844,6 +2888,7 @@ describe("applyRuntimeInjections — PKB relevance hints", () => {
   function makePkbOptions(overrides: Record<string, unknown> = {}) {
     return {
       conversationId: FALLBACK_CONVERSATION_ID,
+      trust: GUARDIAN_TRUST_FIXTURE,
       ...overrides,
     };
   }
@@ -3130,7 +3175,7 @@ describe("applyRuntimeInjections — PKB relevance hints", () => {
     // filtered out.
     const { messages: initialResult } = await applyRuntimeInjections(
       preCompactionMessages,
-      { conversationId: FALLBACK_CONVERSATION_ID },
+      makePkbOptions(),
     );
     // Unwrap the injected reminder from the last user message.
     const initialTexts = extractTexts(initialResult);
@@ -3164,7 +3209,7 @@ describe("applyRuntimeInjections — PKB relevance hints", () => {
     // should be filtered, and beta (no longer "in context") should appear.
     const { messages: rebuiltResult } = await applyRuntimeInjections(
       postCompactionMessages,
-      { conversationId: FALLBACK_CONVERSATION_ID },
+      makePkbOptions(),
     );
     const rebuiltTexts = extractTexts(rebuiltResult);
     const rebuiltReminder = rebuiltTexts.find(
@@ -3995,6 +4040,59 @@ describe("Slack channel chronological rendering — multi-thread", () => {
     expect(allText).not.toContain("private guardian-only context");
   });
 
+  // Slack builds provider history from rows rather than `this.messages`, so a
+  // guardian card dropped only at `Conversation.loadFromDb` would still reach
+  // the model here -- the channel the incident happened on.
+  test("loadSlackChronologicalContext drops guardian card rows", () => {
+    const caps: ChannelCapabilities = {
+      channel: "slack",
+      dashboardCapable: false,
+      supportsDynamicUi: false,
+      supportsVoiceInput: false,
+      chatType: "channel",
+    };
+    const cardRow: MessageRow = {
+      id: "m-card",
+      conversationId: "conv-1",
+      role: "assistant",
+      content: [
+        {
+          type: "ui_surface",
+          surfaceId: "tool-approval-req-1",
+          surfaceType: "card",
+          title: "Tool Approval",
+          data: {},
+          display: "inline",
+        },
+        { type: "text", text: "Tool Approval card body" },
+      ],
+      createdAt: 1700000035_000,
+      metadata: null,
+      clientMessageId: null,
+      finalized: 1,
+    } as MessageRow;
+    const rows: MessageRow[] = [
+      userRow({
+        id: "asked",
+        createdAt: 1700000030_000,
+        text: "please run it",
+        slackMeta: buildSlackMeta({ channelTs: T2, displayName: "carol" }),
+      }),
+      cardRow,
+    ];
+
+    const result = loadSlackChronologicalContext("conv-1", caps, {
+      loader: () => rows,
+      trustClass: "guardian",
+    });
+
+    expect(result).not.toBeNull();
+    const renderedText = JSON.stringify(result!.messages);
+    expect(renderedText).toContain("please run it");
+    expect(renderedText).not.toContain("Tool Approval card body");
+    expect(renderedText).not.toContain("tool-approval-req-1");
+  });
+
   test("loadSlackChronologicalContext preserves summary and filters by Slack watermark", () => {
     const caps: ChannelCapabilities = {
       channel: "slack",
@@ -4317,19 +4415,22 @@ describe("Slack channel chronological rendering — multi-thread", () => {
         )
         .run();
     }
-    setConversation("runtime-assembly-fallback", {
-      conversationId: "runtime-assembly-fallback",
-      workingDir: "/sandbox",
-      workspaceTopLevelContext: "",
-      workspaceTopLevelDirty: false,
-      surfaceState: new Map(),
-      channelCapabilities: caps,
-      trustContext: { trustClass: "guardian" },
-      slackContextCompactionWatermarkTs:
-        compaction.slackContextCompactionWatermarkTs ?? null,
-      contextCompactedMessageCount:
-        compaction.contextCompactedMessageCount ?? 0,
-    } as never);
+    setConversation(
+      "runtime-assembly-fallback",
+      asConversation({
+        conversationId: "runtime-assembly-fallback",
+        workingDir: "/sandbox",
+        workspaceTopLevelContext: "",
+        workspaceTopLevelDirty: false,
+        surfaceState: new Map(),
+        channelCapabilities: caps,
+        trustContext: { trustClass: "guardian", sourceChannel: "vellum" },
+        slackContextCompactionWatermarkTs:
+          compaction.slackContextCompactionWatermarkTs ?? null,
+        contextCompactedMessageCount:
+          compaction.contextCompactedMessageCount ?? 0,
+      }),
+    );
   }
 
   // Re-run a Slack-channel turn through the public assembly path. The
@@ -6567,6 +6668,7 @@ describe("applyRuntimeInjections blocks.pkbSystemReminder", () => {
     pkbSearchThrows = null;
     const { blocks } = await applyRuntimeInjections(baseMessages, {
       conversationId: FALLBACK_CONVERSATION_ID,
+      trust: GUARDIAN_TRUST_FIXTURE,
       mode: "full",
     });
 
@@ -6578,6 +6680,7 @@ describe("applyRuntimeInjections blocks.pkbSystemReminder", () => {
     seedPkbContent();
     const { blocks } = await applyRuntimeInjections(baseMessages, {
       conversationId: FALLBACK_CONVERSATION_ID,
+      trust: GUARDIAN_TRUST_FIXTURE,
       mode: "minimal",
     });
 
@@ -6587,6 +6690,7 @@ describe("applyRuntimeInjections blocks.pkbSystemReminder", () => {
   test("not captured when PKB inactive", async () => {
     const { blocks } = await applyRuntimeInjections(baseMessages, {
       conversationId: FALLBACK_CONVERSATION_ID,
+      trust: GUARDIAN_TRUST_FIXTURE,
       mode: "full",
     });
 

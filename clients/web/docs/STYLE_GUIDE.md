@@ -24,8 +24,8 @@ chat-body.tsx               # component
 stream-event-types.ts       # types
 ```
 
-The only exceptions are `App.tsx` (conventional React entry-point name)
-and generated files that follow their generator's convention.
+The only exception is generated files, which follow their generator's
+convention.
 
 Reference: [TypeScript Deep Dive — File naming](https://basarat.gitbook.io/typescript/styleguide#filename)
 
@@ -61,7 +61,7 @@ Colocated test files append `.test` before the extension:
 
 ```
 src/
-  App.tsx                    # root layout component
+  root-layout.tsx            # shared shell mounted by the root route
   main.tsx                   # entry point (createRoot, RouterProvider)
   routes.tsx                 # route tree (createBrowserRouter)
   stores/                    # app-level Zustand stores (cross-domain)
@@ -185,6 +185,30 @@ Reference: [TypeScript — Type-Only Imports](https://www.typescriptlang.org/doc
 
 ---
 
+## Native mobile styling
+
+CSS written for a Capacitor shell should apply to both iOS and Android by
+default. Use the `native-mobile:` Tailwind variant from `src/index.css` for
+component classes. For global CSS, match both explicit platform markers:
+
+```css
+:root:is([data-native-platform="ios"], [data-native-platform="android"]) {
+  /* Native mobile styles */
+}
+```
+
+Do not use a generic `[data-native-platform]` selector. The native mobile
+boundary is specifically iOS plus Android and must not silently expand to a
+future native platform or the Electron macOS app. In render code, use
+`useIsNativeMobile()` for the same boundary.
+
+Keep a style iOS-only only when it depends on an iOS-specific platform
+constraint, such as the Dynamic Island or a documented WKWebView behavior.
+State that constraint at the call site. Otherwise, treat an iOS styling change
+as native-mobile work and verify its Android behavior in the same change.
+
+---
+
 ## Color
 
 ### Theme-aware color
@@ -235,7 +259,7 @@ Use `type` for unions, intersections, mapped types, and utility types.
 
 ```ts
 // Good
-interface ChatRouteContentProps {
+interface ChatMainPanelProps {
   messages: DisplayMessage[];
   turnState: TurnState;
 }
@@ -529,9 +553,9 @@ so it's obvious at a glance exactly what the branch runs. They also close
 a common footgun — a second line added under a braceless condition reads
 as if it sits inside the branch, but executes unconditionally.
 
-The `curly` ESLint rule flags braceless bodies (currently at `warn`). It
-is fully auto-fixable — `eslint --fix` adds the braces with no behavior
-change — so add braces to any control statement you touch.
+The `curly` ESLint rule flags braceless bodies at `error`, so a braceless
+body fails lint and blocks CI. It is fully auto-fixable: `eslint --fix`
+adds the braces with no behavior change.
 
 Reference: [ESLint — `curly`](https://eslint.org/docs/latest/rules/curly)
 

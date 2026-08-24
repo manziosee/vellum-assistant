@@ -17,27 +17,31 @@ import { ContextMenu, PanelItem } from "@vellumai/design-library";
 import { cn } from "@vellumai/design-library/utils/cn";
 
 import { SwipeActionReveal } from "@/components/swipe-action-reveal";
+import { useShowsHoverAffordance } from "@/hooks/use-hover-affordance";
 import {
   ConversationActionsMenu,
   ConversationActionsSheet,
   renderConversationMenuItems,
   type ConversationMenuItemsProps,
 } from "@/domains/chat/components/conversation-actions-menu";
+import { useTranslation } from "@/i18n";
 import { useLongPressSheet } from "@/hooks/use-long-press-sheet";
 import {
   hasThreadStatus,
   ThreadStatusIndicator,
 } from "@/domains/chat/components/thread-status-indicator";
-import type { DragReorderItemProps } from "@/domains/chat/hooks/use-drag-reorder";
 import { isChannelConversation } from "@/domains/chat/utils/conversation-channel";
 import { copyIdToClipboard } from "@/domains/chat/utils/copy-id-to-clipboard";
 import {
   buildMoveToGroupTargets,
-  isConversationPinned,
   isInCustomGroup,
 } from "@/domains/chat/utils/group-conversations";
 import type { Conversation } from "@/types/conversation-types";
-import { canMarkRead, canMarkUnread } from "@/utils/conversation-predicates";
+import {
+  canMarkRead,
+  canMarkUnread,
+  isConversationPinned,
+} from "@/utils/conversation-predicates";
 import { isPointerCoarse } from "@/utils/pointer";
 import type { SwipeAction } from "@/hooks/use-swipe-to-reveal";
 
@@ -48,13 +52,6 @@ import {
 
 export interface ConversationRowProps {
   conversation: Conversation;
-  /**
-   * Drag-reorder section key. Omit for non-reorderable lists (Recents,
-   * channel sections) — only Pinned and custom groups reorder.
-   */
-  dragSection?: string;
-  /** The section's full ordered list, for drag math. Defaults to nothing. */
-  dragSiblings?: Conversation[];
   /** Wrap in a right-click context menu. Default true; false in the rail flyout. */
   withContextMenu?: boolean;
   /** Marquee the title on hover. Default true; false in the rail flyout. */
@@ -104,45 +101,16 @@ export function buildMenuProps(
         ? () => ctx.onRemoveFromGroup?.(conversation)
         : undefined,
     onOpenInNewWindow:
-      ctx.onOpenInNewWindow && hasId
+      ctx.showInternalActions && ctx.onOpenInNewWindow && hasId
         ? () => ctx.onOpenInNewWindow?.(conversation)
         : undefined,
     onShareFeedback: ctx.onShareFeedback,
     onInspect:
       ctx.onInspect && hasId ? () => ctx.onInspect?.(conversation) : undefined,
-    onCopyConversationId: hasId
-      ? () => copyIdToClipboard(conversation.conversationId!, "Conversation ID")
-      : undefined,
-  };
-}
-
-export function buildDragProps(
-  ctx: ConversationListContextValue,
-  conversation: Conversation,
-  dragSection: string | undefined,
-  dragSiblings: Conversation[] | undefined,
-): Partial<DragReorderItemProps> & { className?: string } {
-  if (
-    !dragSection ||
-    !ctx.canReorder ||
-    !dragSiblings ||
-    dragSiblings.length < 2
-  ) {
-    return {};
-  }
-  const { draggingId, dropIndicator } = ctx.dragReorder;
-  const edge =
-    dropIndicator?.section === dragSection &&
-    dropIndicator.itemId === conversation.conversationId
-      ? dropIndicator.edge
-      : null;
-  return {
-    ...ctx.dragReorder.getItemProps(dragSection, dragSiblings, conversation),
-    className: cn(
-      draggingId === conversation.conversationId && "opacity-50",
-      edge === "before" && "shadow-[inset_0_2px_0_0_var(--primary-base)]",
-      edge === "after" && "shadow-[inset_0_-2px_0_0_var(--primary-base)]",
-    ),
+    onCopyConversationId:
+      ctx.showInternalActions && hasId
+        ? () => copyIdToClipboard(conversation.conversationId!, "conversation")
+        : undefined,
   };
 }
 
@@ -160,18 +128,16 @@ const skipNestedControls = (target: Element | null) =>
  * - Swipe left (trailing) → Archive / Unarchive
  * - Swipe right (leading) → Pin / Unpin
  *
- * Returns empty arrays on desktop (fine pointer) or for channel conversations
- * (read-only — no pin/archive actions available). Actions without a callback
- * in the context are omitted, so the swipe surface gracefully degrades when
- * the host list doesn't provide every action.
+ * Returns empty arrays for channel conversations (read-only, so no pin/archive
+ * actions are available). Actions without a callback in the context are
+ * omitted, so the swipe surface gracefully degrades when the host list doesn't
+ * provide every action. Whether a swipe is the input at all is
+ * `SwipeActionReveal`'s question, which passes through untouched where it isn't.
  */
-export function buildSwipeActions(
+function buildSwipeActions(
   ctx: ConversationListContextValue,
   conversation: Conversation,
 ): { leadingActions: SwipeAction[]; trailingActions: SwipeAction[] } {
-  if (!isPointerCoarse()) {
-    return { leadingActions: [], trailingActions: [] };
-  }
   const isChannel = isChannelConversation(conversation);
 
   const leadingActions: SwipeAction[] = [];
@@ -215,14 +181,13 @@ export function buildSwipeActions(
 
 export function ConversationRow({
   conversation,
-  dragSection,
-  dragSiblings,
   withContextMenu = true,
   marquee = true,
   onSelect,
 }: ConversationRowProps) {
   const ctx = useConversationListContext();
   const { conversationId } = conversation;
+  const { t } = useTranslation("chat");
 
   const isProcessing =
     conversationId === ctx.activeConversationId
@@ -245,18 +210,17 @@ export function ConversationRow({
     needsAttention,
     hasUnread: conversation.hasUnseenLatestAssistantMessage === true,
   };
-  const dragProps = buildDragProps(
-    ctx,
-    conversation,
-    dragSection,
-    dragSiblings,
-  );
   const { leadingActions, trailingActions } = buildSwipeActions(
     ctx,
     conversation,
   );
 
   const isTouch = isPointerCoarse();
+  // The swipe and the long-press sheet are the paths that replace the inline
+  // ellipsis, and both are armed by a coarse pointer, so a device that has
+  // neither hover nor a coarse pointer (a hoverless stylus) keeps the ellipsis:
+  // right-click alone is not a path ordinary tapping or a screen reader finds.
+  const showsEllipsis = useShowsHoverAffordance(withContextMenu && isTouch);
 
   const panelItem = (
     <SwipeActionReveal
@@ -264,21 +228,36 @@ export function ConversationRow({
       trailingActions={trailingActions}
     >
       <PanelItem
-        label={conversation.title ?? "Untitled"}
+        label={conversation.title ?? t("conversationRow.untitled")}
         marqueeOnHover={marquee}
         active={conversationId === ctx.activeConversationId}
         onSelect={() => select(conversationId)}
-        hideTrailingActionOnTouch={withContextMenu}
         badge={
           hasThreadStatus(status) ? (
             <ThreadStatusIndicator {...status} />
           ) : undefined
         }
-        trailingAction={<ConversationActionsMenu {...menuProps} />}
-        {...dragProps}
+        badgeBare
+        trailingAction={
+          showsEllipsis ? <ConversationActionsMenu {...menuProps} /> : undefined
+        }
         className={cn(
-          "h-[30px] p-[6px] text-[var(--content-default)]",
-          dragProps.className,
+          // `!` forces this over PanelItem's own max-md:py-3: cross-package
+          // Tailwind generation order doesn't reliably favor a plain
+          // (unmarked) override here.
+          "p-[6px] max-md:p-2! text-[var(--content-default)]",
+          // A row in the drawer stands at the same height as the pills above
+          // it, which is taller than a row in the rail. Restated under
+          // `max-md` for the same reason the padding above is: PanelItem's own
+          // `max-md:h-auto` is a variant, so an unprefixed height never
+          // reaches it at a touch viewport.
+          // The wash belongs to the row rather than the panel: declared on the
+          // menu it would reach every active PanelItem in the drawer, and a
+          // tinted pill that publishes `--panel-item-bg` and no active value
+          // of its own would lose its colour to it.
+          ctx.overlayCards
+            ? "min-h-[var(--side-menu-tile-size)] [--panel-item-active:var(--surface-hover)]"
+            : "h-[30px]",
         )}
       />
     </SwipeActionReveal>
@@ -310,7 +289,11 @@ export function ConversationRow({
     <ContextMenu.Root>
       <ContextMenu.Trigger>{panelItem}</ContextMenu.Trigger>
       <ContextMenu.Content onClick={(event) => event.stopPropagation()}>
-        {renderConversationMenuItems({ Primitive: ContextMenu, ...menuProps })}
+        {renderConversationMenuItems({
+          Primitive: ContextMenu,
+          t,
+          ...menuProps,
+        })}
       </ContextMenu.Content>
     </ContextMenu.Root>
   );

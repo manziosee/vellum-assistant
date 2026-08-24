@@ -11,12 +11,17 @@ import {
 import { getConfig } from "../config/loader.js";
 import type { LLMCallSite } from "../config/schemas/llm.js";
 import { getDb } from "../persistence/db-connection.js";
+import type { ProviderRouteAttribution } from "../util/errors.js";
 import { getLogger } from "../util/logger.js";
 import {
   describeSubscriptionModelIncompatibility,
   isConnectionCompatibleWithModel,
 } from "./connection-model-compat.js";
 import {
+  connectionProviderKind,
+  dispatchProviderResolvable,
+  expectedVendorProvider,
+  resolveEntryConnectionName,
   resolveRoutingIdentity,
   tryResolveProviderForConnectionName,
 } from "./connection-resolution.js";
@@ -37,6 +42,13 @@ const log = getLogger("provider-send-message");
 export interface ConfiguredProviderResult {
   provider: Provider;
   configuredProviderName: string;
+  /**
+   * True when the profile's provider was an entry label and dispatch routed
+   * through that row. The row's own credential already signed resolution, so
+   * vendor-keyed preflights (which check the generic per-vendor key slot)
+   * do not apply to this result.
+   */
+  entryRouted: boolean;
 }
 
 export type ConfiguredProviderOptions = Pick<
@@ -58,6 +70,16 @@ export class CallSiteConfiguredProvider implements Provider {
   // Forward native web-search capability so it survives the wrapper chain
   // (callers like the advisor consult gate on it). Fixed at construction.
   public readonly supportsNativeWebSearch?: boolean;
+
+  /**
+   * Route the inner adapter signs with, stamped at connection resolution.
+   * Forwarded live (not snapshotted) so consumers holding this wrapper —
+   * e.g. the save-time probe's billing gate — read the row dispatch
+   * actually selected.
+   */
+  get routeAttribution(): ProviderRouteAttribution | undefined {
+    return this.inner.routeAttribution;
+  }
 
   constructor(
     private readonly inner: Provider,
@@ -140,7 +162,10 @@ export async function resolveConfiguredProvider(
     }
   }
 
-  const resolved = resolveCallSiteConfig(callSite, config.llm, opts);
+  const resolved = resolveCallSiteConfig(callSite, config.llm, {
+    ...opts,
+    isResolvableProvider: dispatchProviderResolvable,
+  });
   const inferenceProvider = resolved.provider;
   let connectionName = resolved.provider_connection;
 
@@ -157,6 +182,14 @@ export async function resolveConfiguredProvider(
       inferenceProvider,
       resolved.model,
     )?.connectionName;
+  }
+  // An entry-name provider IS the connection name: the label points at a
+  // row, and the row's own provider drives dispatch.
+  const entryRoute = connectionName
+    ? null
+    : resolveEntryConnectionName(inferenceProvider);
+  if (entryRoute) {
+    connectionName = entryRoute;
   }
   if (!connectionName) {
     if (inferenceProvider) {
@@ -202,7 +235,7 @@ export async function resolveConfiguredProvider(
   const connectionProvider = await tryResolveProviderForConnectionName(
     connectionName,
     config,
-    inferenceProvider,
+    expectedVendorProvider(inferenceProvider, resolved.model),
     resolved.model,
   );
   if (!connectionProvider) {
@@ -234,7 +267,14 @@ export async function resolveConfiguredProvider(
       opts.overrideProfile,
       opts.forceOverrideProfile,
     ),
-    configuredProviderName: inferenceProvider,
+    // The dispatched vendor kind, not the config label: an entry-name
+    // provider reports its row's kind so provider-keyed consumers
+    // (telemetry, pricing) never see a label that matches no catalog id.
+    configuredProviderName:
+      (entryRoute
+        ? connectionProviderKind(entryRoute, resolved.model)
+        : undefined) ?? inferenceProvider,
+    entryRouted: entryRoute !== null,
   };
 }
 

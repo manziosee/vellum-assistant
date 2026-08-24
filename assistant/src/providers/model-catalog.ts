@@ -939,7 +939,7 @@ const RAW_PROVIDER_CATALOG: ProviderCatalogEntry[] = [
         pricing: { inputPer1mTokens: 1.74, outputPer1mTokens: 3.48 },
       },
       {
-        id: "accounts/fireworks/models/deepseek-v4-flash",
+        id: "accounts/fireworks/models/deepseek-v4-flash-0731",
         displayName: "DeepSeek V4 Flash",
         contextWindowTokens: 1040000,
         maxOutputTokens: 131072,
@@ -951,11 +951,11 @@ const RAW_PROVIDER_CATALOG: ProviderCatalogEntry[] = [
         pricing: {
           inputPer1mTokens: 0.14,
           outputPer1mTokens: 0.28,
-          cacheReadPer1mTokens: 0.03,
+          cacheReadPer1mTokens: 0.028,
         },
       },
     ],
-    defaultModel: "accounts/fireworks/models/deepseek-v4-flash",
+    defaultModel: "accounts/fireworks/models/deepseek-v4-flash-0731",
     apiKeyUrl: "https://fireworks.ai/account/api-keys",
     apiKeyPlaceholder: "fw_...",
   },
@@ -2190,6 +2190,16 @@ export function catalogMaxOutputTokens(
   )?.maxOutputTokens;
 }
 
+/** The `contextWindowTokens` declared for a (provider, model) catalog entry, if any. */
+export function catalogContextWindowTokens(
+  provider: string,
+  modelId: string,
+): number | undefined {
+  return PROVIDER_CATALOG.find((p) => p.id === provider)?.models.find(
+    (m) => m.id === modelId,
+  )?.contextWindowTokens;
+}
+
 /**
  * Model IDs (across all catalog providers) flagged
  * `supportsPromptCacheBreakpoints`. Consumed by the OpenAI Responses
@@ -2231,6 +2241,21 @@ export function getCatalogProviderForModel(
 ): string | undefined {
   return PROVIDER_CATALOG.find((p) => p.models.some((m) => m.id === modelId))
     ?.id;
+}
+
+/**
+ * Human-readable display name for a model id, from the first catalog entry
+ * that serves it (a model carries the same display name under every provider
+ * that offers it). Undefined for uncataloged ids.
+ */
+export function getModelDisplayName(modelId: string): string | undefined {
+  for (const provider of PROVIDER_CATALOG) {
+    const match = provider.models.find((m) => m.id === modelId);
+    if (match) {
+      return match.displayName;
+    }
+  }
+  return undefined;
 }
 
 /**

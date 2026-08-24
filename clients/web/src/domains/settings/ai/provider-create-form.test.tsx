@@ -104,8 +104,9 @@ mock.module("@/domains/settings/ai/use-provider-credentials-list", () => ({
   }),
 }));
 
-const { ProviderCreateForm } =
-  await import("@/domains/settings/ai/provider-create-form");
+const { ProviderCreateForm } = await import(
+  "@/domains/settings/ai/provider-create-form"
+);
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -199,11 +200,11 @@ function openAdvancedFields(): void {
 }
 
 /**
- * Drive the design-library Dropdown (a custom combobox, not a native
+ * Drive the design-library Select (a custom combobox, not a native
  * <select>): click the trigger to open the listbox, then click the option
  * whose visible label matches.
  */
-function selectDropdownOption(ariaLabel: string, optionLabel: string): void {
+function selectOption(ariaLabel: string, optionLabel: string): void {
   const trigger = document.querySelector<HTMLButtonElement>(
     `button[role="combobox"][aria-label="${ariaLabel}"]`,
   );
@@ -424,6 +425,63 @@ describe("ProviderCreateForm submit sequence", () => {
       name: "ollama-personal",
       provider: "ollama",
       auth: { type: "none" },
+      base_url: null,
+    });
+  });
+
+  test("Ollama create form shows an optional Base URL field", async () => {
+    useAssistantLifecycleStore.setState({
+      assistantState: { kind: "self_hosted" },
+    });
+    render(
+      <ModalWrapper>
+        <ProviderCreateForm
+          assistantId={ASSISTANT_ID}
+          existingNames={[]}
+          defaultProviderType="ollama"
+          onCreated={() => {}}
+          onCancel={() => {}}
+        />
+      </ModalWrapper>,
+    );
+
+    expect(
+      getInputByPlaceholder("http://127.0.0.1:11434/v1"),
+    ).toBeDefined();
+    expect(document.body.textContent).toContain(
+      "Leave blank to use the local Ollama default, or enter a remote or non-default host.",
+    );
+  });
+
+  test("Ollama create posts a filled Base URL", async () => {
+    useAssistantLifecycleStore.setState({
+      assistantState: { kind: "self_hosted" },
+    });
+    render(
+      <ModalWrapper>
+        <ProviderCreateForm
+          assistantId={ASSISTANT_ID}
+          existingNames={[]}
+          defaultProviderType="ollama"
+          onCreated={() => {}}
+          onCancel={() => {}}
+        />
+      </ModalWrapper>,
+    );
+
+    fireEvent.change(getInputByPlaceholder("http://127.0.0.1:11434/v1"), {
+      target: { value: "http://192.168.1.50:11434/v1" },
+    });
+    fireEvent.click(getButton("Add"));
+
+    await waitFor(() => {
+      expect(createConnectionCalls.length).toBe(1);
+    });
+    expect(createConnectionCalls[0].body).toMatchObject({
+      name: "ollama-personal",
+      provider: "ollama",
+      auth: { type: "none" },
+      base_url: "http://192.168.1.50:11434/v1",
     });
   });
 
@@ -463,7 +521,7 @@ describe("ProviderCreateForm submit sequence", () => {
       </ModalWrapper>,
     );
 
-    selectDropdownOption("Provider", "ChatGPT Subscription");
+    selectOption("Provider", "ChatGPT Subscription");
 
     // Subscription auth is owned by the OAuth flow: no API key field, no
     // Add button, sign-in affordance present.
@@ -614,7 +672,7 @@ describe("ProviderCreateForm submit sequence", () => {
     );
 
     openAdvancedFields();
-    selectDropdownOption("Provider", "OpenAI");
+    selectOption("Provider", "OpenAI");
 
     expect(getInputByPlaceholder("e.g. My Anthropic Key").value).toBe("OpenAI");
   });
@@ -637,7 +695,7 @@ describe("ProviderCreateForm submit sequence", () => {
       target: { value: "My Custom Name" },
     });
 
-    selectDropdownOption("Provider", "OpenAI");
+    selectOption("Provider", "OpenAI");
 
     expect(getInputByPlaceholder("e.g. My Anthropic Key").value).toBe(
       "My Custom Name",
@@ -692,7 +750,7 @@ describe("ProviderCreateForm submit sequence", () => {
     fireEvent.change(getInputByPlaceholder("e.g. My Anthropic Key"), {
       target: { value: "My Custom Name" },
     });
-    selectDropdownOption("Provider", "Custom provider");
+    selectOption("Provider", "Custom provider");
 
     // The custom form's submit binds to the edited name.
     fireEvent.click(getButton("Add My Custom Name"));
@@ -764,7 +822,7 @@ describe("ProviderCreateForm submit sequence", () => {
     openAdvancedFields();
     expect(internalKeyInputMounted()).toBe(false);
 
-    selectDropdownOption("Provider", "Custom provider");
+    selectOption("Provider", "Custom provider");
     // The custom form replaces the Advanced disclosure with a top-level
     // Name field; the internal key still never renders.
     expect(

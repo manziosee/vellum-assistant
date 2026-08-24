@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { Command } from "commander";
 
 let lastIpcCall: { method: string; params?: any } | null = null;
+let ipcCalls: { method: string; params?: any }[] = [];
 let mockIpcResult: { ok: boolean; result?: unknown; error?: string } = {
   ok: true,
   result: {},
@@ -19,6 +20,7 @@ let mockIpcResult: { ok: boolean; result?: unknown; error?: string } = {
 mock.module("../../../ipc/cli-client.js", () => ({
   cliIpcCall: async (method: string, params?: Record<string, unknown>) => {
     lastIpcCall = { method, params };
+    ipcCalls.push({ method, params });
     return mockIpcResult;
   },
 }));
@@ -36,6 +38,7 @@ const { inferenceHelp } = await import("../inference.help.js");
 
 beforeEach(() => {
   lastIpcCall = null;
+  ipcCalls = [];
   mockIpcResult = { ok: true, result: {} };
   process.exitCode = 0;
 });
@@ -82,6 +85,13 @@ describe("profiles list", () => {
     await run(["profiles", "list"]);
     expect(lastIpcCall?.method).toBe("inference_profiles_list");
   });
+
+  test("bare `profiles` runs list", async () => {
+    mockIpcResult = { ok: true, result: { profiles: [] } };
+    const { exitCode } = await run(["profiles"]);
+    expect(lastIpcCall?.method).toBe("inference_profiles_list");
+    expect(exitCode).toBe(0);
+  });
 });
 
 describe("profiles create", () => {
@@ -127,9 +137,15 @@ describe("profiles create", () => {
       "--thinking",
       "on",
       "--allow-unlisted",
+      "--allow-unavailable",
     ]);
-    expect(lastIpcCall?.method).toBe("inference_profiles_create");
-    expect(lastIpcCall?.params?.body).toEqual({
+    const createCall = ipcCalls.find(
+      (c) => c.method === "inference_profiles_create",
+    );
+    expect(createCall).toBeDefined();
+    // The save is followed by the advisory probe call.
+    expect(ipcCalls.at(-1)?.method).toBe("inference_profiles_validate");
+    expect(createCall?.params?.body).toEqual({
       name: "p",
       provider: "anthropic",
       model: "claude-opus-4-8",
@@ -139,13 +155,20 @@ describe("profiles create", () => {
       temperature: 0.5,
       thinking: true,
       allowUnlisted: true,
+      allowUnavailable: true,
     });
   });
 
   test("prints the verification hint on success", async () => {
     mockIpcResult = {
       ok: true,
-      result: { ok: true, name: "p", entry: {}, warnings: [] },
+      result: {
+        ok: true,
+        name: "p",
+        entry: {},
+        warnings: [],
+        verify: 'assistant inference send --profile p "Reply with OK"',
+      },
     };
     const { stdout } = await run([
       "profiles",
@@ -158,6 +181,34 @@ describe("profiles create", () => {
     ]);
     expect(stdout).toContain("Verify it works:");
     expect(stdout).toContain("assistant inference send --profile p");
+  });
+
+  test("--json passes the daemon's verify hint through verbatim", async () => {
+    mockIpcResult = {
+      ok: true,
+      result: {
+        ok: true,
+        name: "p",
+        entry: { provider: "anthropic" },
+        warnings: ["heads up"],
+        verify: 'assistant inference send --profile p "Reply with OK"',
+      },
+    };
+    const { stdout } = await run([
+      "profiles",
+      "create",
+      "p",
+      "--provider",
+      "anthropic",
+      "--model",
+      "claude-opus-4-8",
+      "--json",
+    ]);
+    const parsed = JSON.parse(stdout.trim());
+    expect(parsed.verify).toBe(
+      'assistant inference send --profile p "Reply with OK"',
+    );
+    expect(parsed.warnings).toEqual(["heads up"]);
   });
 
   test("rejects a non-numeric --max-tokens before calling the daemon", async () => {
@@ -200,11 +251,15 @@ describe("profiles update", () => {
       result: { ok: true, name: "p", entry: {}, warnings: [] },
     };
     await run(["profiles", "update", "p", "--effort", "low"]);
-    expect(lastIpcCall?.method).toBe("inference_profiles_update");
-    expect(lastIpcCall?.params).toEqual({
+    const updateCall = ipcCalls.find(
+      (c) => c.method === "inference_profiles_update",
+    );
+    expect(updateCall?.params).toEqual({
       pathParams: { name: "p" },
       body: { effort: "low" },
     });
+    // The save is followed by the advisory probe call.
+    expect(ipcCalls.at(-1)?.method).toBe("inference_profiles_validate");
   });
 
   test("refuses an empty update", async () => {

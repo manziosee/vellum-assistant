@@ -13,6 +13,7 @@ import type { Surface } from "@/domains/chat/types/types";
 
 import { ChatMarkdownMessage } from "@/domains/chat/components/chat-markdown-message";
 import { cn } from "@/utils/misc";
+import { useTranslation } from "@/i18n";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -25,6 +26,12 @@ interface FileUploadSurfaceProps {
     actionId: string,
     data?: Record<string, unknown>,
   ) => void;
+  /**
+   * Assistant that owns the conversation this surface belongs to. Lets
+   * workspace file references in the prompt copy resolve against its
+   * workspace instead of degrading to an inert file card.
+   */
+  assistantId?: string | null;
 }
 
 interface SelectedFile {
@@ -126,7 +133,9 @@ function readFileAsBase64(file: File): Promise<string> {
 export function FileUploadSurface({
   surface,
   onAction,
+  assistantId,
 }: FileUploadSurfaceProps) {
+  const { t } = useTranslation("chat");
   // The wire keeps surface `data` opaque; narrow it with the canonical schema
   // (every field optional/coerced, so a real surface never fails to parse). The
   // schema also coerces `acceptedTypes` to a string[], the shape this
@@ -311,6 +320,7 @@ export function FileUploadSurface({
       <ChatMarkdownMessage
         content={data.prompt ?? ""}
         className="mb-3 text-body-medium-lighter text-[var(--content-strong)]"
+        assistantId={assistantId}
       />
 
       {/* Drop zone */}
@@ -335,16 +345,16 @@ export function FileUploadSurface({
           )}
         />
         <p className="text-body-medium-lighter text-[var(--content-quiet)]">
-          Drag and drop files here, or click to browse
+          {t("fileUploadSurface.dropHint")}
         </p>
         {data.acceptedTypes && data.acceptedTypes.length > 0 && (
           <p className="text-body-small-default text-[var(--content-faint)]">
-            Accepted: {data.acceptedTypes.join(", ")}
+            {t("fileUploadSurface.accepted", { types: data.acceptedTypes.join(", ") })}
           </p>
         )}
         {data.maxSizeBytes && (
           <p className="text-body-small-default text-[var(--content-faint)]">
-            Max size: {formatFileSize(data.maxSizeBytes)}
+            {t("fileUploadSurface.maxSize", { size: formatFileSize(data.maxSizeBytes) })}
           </p>
         )}
       </div>
@@ -414,7 +424,7 @@ export function FileUploadSurface({
             isSubmitting ? <Loader2 className="animate-spin" /> : <Upload />
           }
         >
-          {isSubmitting ? "Uploading..." : "Upload"}
+          {isSubmitting ? t("fileUploadSurface.uploading") : t("fileUploadSurface.upload")}
         </Button>
       </div>
     </div>

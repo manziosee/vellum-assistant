@@ -48,6 +48,11 @@ export interface NavigationState {
   consentHydrationTimedOut?: boolean;
   /** Whether the resolved assistants list reflects at least one authoritative load. */
   assistantsHydrated: boolean;
+  /**
+   * Whether any resolved assistant is already past first-run onboarding.
+   * Hatch age is the stored proxy (see `hasOnboardedAssistant`).
+   */
+  alreadyOnboarded: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -112,10 +117,7 @@ const LOCAL_ONLY_ONBOARDING_PATHS: Set<string> = new Set([
   routes.onboarding.apiKey,
 ]);
 
-const LOCAL_ONLY_STANDALONE_PATHS: Set<string> = new Set([
-  routes.welcome,
-  routes.selectAssistant,
-]);
+const LOCAL_ONLY_STANDALONE_PATHS: Set<string> = new Set([routes.welcome]);
 
 function isOnboardingPath(pathname: string): boolean {
   return (
@@ -290,7 +292,12 @@ export function resolveNavigation(
     case "hatch-gate":
       return resolveHatchGate(state);
     case "post-auth":
-      return resolvePostAuth(query.authIntent, query.returnTo, query.fallback);
+      return resolvePostAuth(
+        state,
+        query.authIntent,
+        query.returnTo,
+        query.fallback,
+      );
     case "post-retire":
       return resolvePostRetire(state);
   }
@@ -503,6 +510,22 @@ function requireRemoteGatewayPairing(
   };
 }
 
+/**
+ * The local-mode chooser, decided the same way for an unauthenticated visit
+ * (`requireAuth`) and an authenticated one (`enforceModeBoundary`): an empty
+ * lockfile has nothing to choose from, so the visit funnels to hosting.
+ *
+ * Deciding either way is what keeps the local chooser short-circuiting ahead of
+ * the assistant and consent gates: it is itself an onboarding surface,
+ * reachable before there is a platform session to gate on.
+ */
+function localChooserDecision(state: NavigationState): NavigationDecision {
+  if (!state.hasAssistants) {
+    return { action: "redirect", to: routes.onboarding.hosting };
+  }
+  return { action: "allow" };
+}
+
 function requireAuth(
   state: NavigationState,
   path: string,
@@ -514,10 +537,12 @@ function requireAuth(
 
   if (
     state.isLocalClient &&
-    (isOnboardingPath(path) || LOCAL_ONLY_STANDALONE_PATHS.has(path))
+    (isOnboardingPath(path) ||
+      LOCAL_ONLY_STANDALONE_PATHS.has(path) ||
+      path === routes.selectAssistant)
   ) {
-    if (path === routes.selectAssistant && !state.hasAssistants) {
-      return { action: "redirect", to: routes.onboarding.hosting };
+    if (path === routes.selectAssistant) {
+      return localChooserDecision(state);
     }
     return { action: "allow" };
   }
@@ -537,12 +562,18 @@ function enforceModeBoundary(
   state: NavigationState,
   path: string,
 ): NavigationDecision | null {
+  // The chooser is reachable in every mode: local clients keep their
+  // lockfile-driven picker, and the platform build hosts the hub chooser. The
+  // non-local case falls through rather than allowing, so `requireConsent`
+  // below still binds on this route; `requireAssistant` exempts it on purpose
+  // (see NO_ASSISTANT_EXEMPT_PATHS).
+  if (path === routes.selectAssistant) {
+    return state.isLocalClient ? localChooserDecision(state) : null;
+  }
+
   if (LOCAL_ONLY_STANDALONE_PATHS.has(path)) {
     if (!state.isLocalClient) {
       return { action: "redirect", to: routes.assistant };
-    }
-    if (path === routes.selectAssistant && !state.hasAssistants) {
-      return { action: "redirect", to: routes.onboarding.hosting };
     }
     return { action: "allow" };
   }
@@ -593,6 +624,25 @@ function allowSetupRoutes(
 
   if (!isOnboardingPath(path)) {
     return null;
+  }
+
+  // An already-onboarded assistant should not re-enter first-run privacy.
+  // Research stays reachable on demand (replay); only the automatic privacy
+  // entry is bounced. A paid hatch riding on `returnTo` is resumed so a
+  // purchased resize is not dropped.
+  if (path === routes.onboarding.privacy && state.alreadyOnboarded) {
+    const qIdx = pathnameWithSearch.indexOf("?");
+    const returnTo =
+      qIdx >= 0
+        ? new URLSearchParams(pathnameWithSearch.slice(qIdx + 1)).get(
+            "returnTo",
+          )
+        : null;
+    const paidReturn = postCheckoutHatchReturnTo(returnTo);
+    if (paidReturn) {
+      return { action: "redirect", to: paidReturn };
+    }
+    return { action: "redirect", to: routes.assistant };
   }
 
   return enforceFunnelConsent(state, path, pathnameWithSearch);
@@ -669,6 +719,26 @@ function enforceFunnelConsent(
   return { action: "allow" };
 }
 
+/**
+ * The routes a no-assistant user reaches without being funneled into
+ * provisioning first.
+ *
+ * `checkout` is where the marketing pricing CTAs deep-link a brand-new user to
+ * start Stripe checkout for a chosen package; every other billing surface still
+ * provisions first. `selectAssistant` is the hub chooser, the one screen that
+ * answers the empty state for an account whose assistants are all self-hosted:
+ * remembered origins are client-local, so they never reach `hasAssistants`, and
+ * a `?register=` handoff arriving from a self-hosted origin would be lost on the
+ * funnel bounce before the chooser could record it.
+ *
+ * Only the funnel is lifted. `requireConsent` runs after this step, so neither
+ * route can be reached on unaccepted or stale terms.
+ */
+const NO_ASSISTANT_EXEMPT_PATHS: ReadonlySet<string> = new Set([
+  routes.checkout,
+  routes.selectAssistant,
+]);
+
 function requireAssistant(
   state: NavigationState,
   path: string,
@@ -678,13 +748,7 @@ function requireAssistant(
     return null;
   }
 
-  // The marketing pricing CTAs deep-link a brand-new user (no assistant yet)
-  // straight into Stripe checkout for a chosen package. Exempt that route from
-  // the no-assistant funnel redirect only here — `requireConsent` runs after
-  // this step, so consent is still enforced before any paid checkout starts.
-  // Every other billing surface still funnels a no-assistant user into
-  // provisioning first.
-  if (path === routes.checkout) {
+  if (NO_ASSISTANT_EXEMPT_PATHS.has(path)) {
     return null;
   }
 
@@ -766,7 +830,7 @@ function resolveOnboardingIntercept(
   if (state.isLocalClient && state.hasAssistants) {
     return { action: "allow" };
   }
-  if (hasCompletedOnboarding(state)) {
+  if (hasCompletedOnboarding(state) || state.alreadyOnboarded) {
     return { action: "allow" };
   }
 
@@ -827,12 +891,46 @@ function isImportFunnelDestination(destination: string): boolean {
   );
 }
 
+function isOnboardingResearchPath(destination: string): boolean {
+  const path = extractPathname(destination);
+  const qIdx = path.indexOf("?");
+  const pathname = qIdx < 0 ? path : path.slice(0, qIdx);
+  return (
+    pathname === routes.onboarding.privacy ||
+    pathname === routes.onboarding.research
+  );
+}
+
 function resolvePostAuth(
+  state: NavigationState,
   authIntent: "login" | "signup",
   returnTo: string | null,
   fallback: string,
 ): NavigationDecision {
   const destination = sanitizeReturnTo(returnTo, fallback);
+  // The import funnel replaces onboarding: a signup that started on /import
+  // lands back there instead of the consent screen.
+  if (authIntent === "signup" && isImportFunnelDestination(destination)) {
+    return { action: "redirect", to: destination };
+  }
+
+  // An already-onboarded assistant skips first-run privacy and research.
+  // Treat the auth as a login so a pricing-CTA checkout stash is not marked
+  // for the privacy screen to consume. A paid hatch return keeps its
+  // destination so a purchased resize is not dropped.
+  if (state.alreadyOnboarded) {
+    const skipTarget = postCheckoutHatchReturnTo(destination)
+      ? destination
+      : isOnboardingResearchPath(destination)
+        ? fallback
+        : destination;
+    resolveSignupCheckoutDestination({
+      intent: "login",
+      returnTo: skipTarget,
+    });
+    return { action: "redirect", to: skipTarget };
+  }
+
   // The shared resolver stashes a pricing-CTA checkout package across signup,
   // discards a stale stash for any non-checkout auth, and picks the
   // destination (privacy for signup, the sanitized `returnTo` for login).
@@ -840,11 +938,6 @@ function resolvePostAuth(
     intent: authIntent,
     returnTo: destination,
   });
-  // The import funnel replaces onboarding: a signup that started on /import
-  // lands back there instead of the consent screen.
-  if (authIntent === "signup" && isImportFunnelDestination(destination)) {
-    return { action: "redirect", to: destination };
-  }
   return { action: "redirect", to: resolved };
 }
 
@@ -854,7 +947,8 @@ function resolvePostAuth(
 
 function resolvePostRetire(state: NavigationState): NavigationDecision {
   if (state.hasAssistants) {
-    // select-assistant is local-only; platform users go straight to /assistant
+    // Platform users land on /assistant post-retire; the chooser is an
+    // explicit destination there, not the retire landing.
     return {
       action: "redirect",
       to: state.isLocalClient ? routes.selectAssistant : routes.assistant,

@@ -67,7 +67,11 @@
  */
 
 export type { HookName } from "./constants.js";
-export { HOOKS, INTERNAL_NUDGE_OUTPUT_SUPPRESSION } from "./constants.js";
+export {
+  HOOKS,
+  INTERNAL_NUDGE_OUTPUT_SUPPRESSION,
+  VOICE_ESCALATION_CONTINUATION_MESSAGE_KIND,
+} from "./constants.js";
 // Conversation message/content shapes. A hook receives the live message
 // history (e.g. `PostToolUseContext.latestMessages: Message[]`), so plugins
 // that inspect or narrow content blocks — reading a `tool_use` block's input,
@@ -166,13 +170,42 @@ export { doesSupportVision } from "./vision-support.js";
 // Resolve a stored credential to its plaintext value — the same value
 // `assistant credentials reveal` prints — from a UUID or a "service/field"
 // reference. When a plugin is in context, resolution is scoped to credentials
-// whose `field` matches the plugin's manifest name; outside any plugin it is
+// whose service matches the plugin's manifest name; outside any plugin it is
 // unscoped. Throws CredentialResolutionError when the ref does not resolve, the
 // store is unreachable, or the credential is out of the plugin's scope.
 export {
   CredentialResolutionError,
   resolveCredential,
 } from "./resolve-credential.js";
+// Store a credential's plaintext value (the same write `assistant credentials
+// set` performs), creating it or replacing an existing one, named by UUID or a
+// "service/field" reference. A plugin may only write credentials whose service
+// matches its manifest name, and the write fails closed with no plugin in
+// context. Throws CredentialStoreError when there is no calling plugin, the ref
+// is malformed, the value is invalid, the store rejects the write, or the
+// credential is out of the plugin's scope.
+export type {
+  StoreCredentialOptions,
+  StoredCredentialRef,
+} from "./store-credential.js";
+export { CredentialStoreError, storeCredential } from "./store-credential.js";
+// Resolve the public URL a third party should deliver to for one of the
+// plugin's own ingress routes. Which URL is correct depends on how the
+// assistant is reachable (a managed platform callback route, or a configured
+// public ingress), and `ingress.publicBaseUrl` alone does not decide it. Uses
+// the same resolution as `webhooks register`, and registers the callback route
+// on the managed branches. The plugin defaults to the one in context.
+export { resolveWebhookUrl, type WebhookUrlOptions } from "./webhook-url.js";
+// Resolve the redirect URI an authorization server should send a user back
+// to after consent. One shared route serves every OAuth flow in the
+// assistant, demultiplexed by OAuth `state`, so this takes no arguments and
+// returns the same URL for every caller and every attempt. A plugin needs it
+// when it publishes something that has to name the redirect URI ahead of the
+// flow, such as a Client ID Metadata Document, whose `redirect_uris` an
+// authorization server matches exactly. Throws when no public ingress is
+// configured and the assistant is not connected to the platform, which is the
+// case where no URL would work.
+export { resolveOauthCallbackUrl } from "../inbound/oauth-callback-url.js";
 // Resolve a provider for a call site (optionally overriding the profile) so a
 // plugin can run inference through the workspace's configured profiles and
 // credentials — managed-proxy or BYOK — without supplying its own API key.
@@ -317,6 +350,7 @@ export {
   deleteConversation,
   getConversation,
   getConversationDirPath,
+  getConversationProcessingStartedAt,
   getMessages,
   hasLexicalTokens,
   isConversationProcessing,
@@ -326,6 +360,12 @@ export {
   syncMessageToDisk,
   updateMessageMetadata,
 } from "../persistence/conversation-plugin-facade.js";
+// System cards: a transcript notice authored by the daemon rather than the
+// assistant persona, for telling the user something a turn did to their input
+// that the model's reply cannot explain (e.g. an attachment that could not be
+// sent). Persisted and pushed to clients; not seated in the turn's working
+// history.
+export { persistSystemCard } from "./system-card.js";
 // Synthesize text to speech through the assistant's globally configured TTS
 // provider (ElevenLabs, Fish Audio, etc.). Plugins that need voice output —
 // e.g. a meeting bot speaking into a live call — use this instead of managing
@@ -337,21 +377,26 @@ export { synthesizeText, TtsSynthesisError } from "../tts/synthesize-text.js";
 export type { TtsSynthesisResult } from "../tts/types.js";
 // Streaming speech-to-text — open a live transcription session against the
 // assistant's globally configured STT provider stack. The plugin feeds audio
-// chunks via `sendAudio` and receives partial/final transcript events through
-// the `start(onEvent)` callback, closing with `stop`. `SttStreamServerEvent`
-// and its variants type the events handed to `onEvent`; `SttErrorCategory`
-// classifies `error` events; `SttProviderId` names the resolved session's
-// provider.
+// chunks via `sendAudio` and receives transcript and turn-boundary events
+// through the `start(onEvent)` callback, closing with `stop`.
+// `SttStreamServerEvent` types the events handed to `onEvent`; every member of
+// that union is exported alongside it so a plugin can name each variant in an
+// exhaustive switch. `SttErrorCategory` classifies `error` events;
+// `SttProviderId` names the resolved session's provider.
 export type {
   StreamingTranscriber,
   SttErrorCategory,
   SttProviderId,
   SttStreamServerClosedEvent,
+  SttStreamServerEagerTurnEndEvent,
   SttStreamServerErrorEvent,
   SttStreamServerEvent,
   SttStreamServerFinalEvent,
   SttStreamServerFinalizedEvent,
   SttStreamServerPartialEvent,
+  SttStreamServerTurnEndEvent,
+  SttStreamServerTurnResumedEvent,
+  SttStreamServerTurnStartEvent,
 } from "../stt/types.js";
 export { openTranscriptionSession } from "./transcription-session.js";
 // Conversation agent-loop turn — run a full conversation turn (persist user
@@ -362,6 +407,7 @@ export { openTranscriptionSession } from "./transcription-session.js";
 // (e.g. meeting-bot flushing a transcript excerpt) should prefer this over the
 // stateless `provider.sendMessage()` call.
 export type {
+  ConversationChannelAddress,
   RunConversationTurnOptions,
   RunConversationTurnResult,
 } from "./conversation-turn.js";

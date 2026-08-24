@@ -1,7 +1,15 @@
-import { lstatSync, realpathSync } from "node:fs";
-import { resolve, sep } from "node:path";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  realpathSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname, resolve, sep } from "node:path";
 
 import { getWorkspaceDir } from "../../util/platform.js";
+import { BadRequestError, ConflictError } from "./errors.js";
 
 /**
  * Resolves a user-provided relative path to an absolute path within the workspace.
@@ -75,6 +83,35 @@ export function resolveWorkspacePath(
   }
 
   return resolved;
+}
+
+/**
+ * Write bytes to a workspace-relative path, enforcing the workspace boundary.
+ *
+ * This is the one write primitive behind every daemon-side workspace file
+ * write, so the traversal and directory-conflict rules cannot drift apart
+ * between callers.
+ *
+ * Returns the number of bytes written. Throws {@link BadRequestError} when the
+ * path escapes the workspace and {@link ConflictError} when it names a
+ * directory.
+ */
+export function writeWorkspaceFile(
+  relativePath: string,
+  contents: Buffer,
+): number {
+  const resolved = resolveWorkspacePath(relativePath);
+  if (resolved === undefined) {
+    throw new BadRequestError("Invalid path");
+  }
+
+  if (existsSync(resolved) && statSync(resolved).isDirectory()) {
+    throw new ConflictError("Path is a directory");
+  }
+
+  mkdirSync(dirname(resolved), { recursive: true });
+  writeFileSync(resolved, contents);
+  return contents.byteLength;
 }
 
 const TEXT_MIME_PREFIXES = [

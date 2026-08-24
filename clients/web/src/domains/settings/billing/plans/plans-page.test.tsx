@@ -303,6 +303,7 @@ function freeSubscription(): SubscriptionResponse {
     plan_id: "base",
     status: "active",
     renewal_date: null,
+    current_period_start: null,
     current_period_end: "2026-07-10T00:00:00Z",
     cancel_at_period_end: false,
     cancel_at: null,
@@ -315,6 +316,7 @@ function proMightySubscription(): SubscriptionResponse {
     plan_id: "pro",
     status: "active",
     renewal_date: null,
+    current_period_start: null,
     current_period_end: "2026-07-10T00:00:00Z",
     cancel_at_period_end: false,
     cancel_at: null,
@@ -328,6 +330,7 @@ function proSuperSubscription(): SubscriptionResponse {
     plan_id: "pro",
     status: "active",
     renewal_date: null,
+    current_period_start: null,
     current_period_end: "2026-07-10T00:00:00Z",
     cancel_at_period_end: false,
     cancel_at: null,
@@ -430,7 +433,6 @@ describe("PlansPage — full catalog render", () => {
     const html = renderStatic(freeSubscription(), fullCatalog());
     expect(html).toContain("Custom Plan");
     expect(html).toContain("Configure");
-    expect(html).toContain("Billed monthly");
     expect(html).toContain("Read our Docs.");
   });
 });
@@ -643,9 +645,7 @@ afterEach(() => {
 describe("PlansPage on native Android", () => {
   test("redirects to billing without exposing plan actions", async () => {
     nativeAndroid = true;
-    const { getByTestId, queryByRole } = renderInteractive(
-      freeSubscription(),
-    );
+    const { getByTestId, queryByRole } = renderInteractive(freeSubscription());
 
     await waitFor(() =>
       expect(getByTestId("loc").textContent).toBe(
@@ -992,7 +992,9 @@ describe("PlansPage — Pro package switch (change-package)", () => {
     // Capture only stashes for a hydrated list holding exactly one assistant.
     useResolvedAssistantsStore.setState({
       activeAssistantId: "a1",
-      assistants: [{ id: "a1", isLocal: false, isPlatformHosted: true }],
+      assistants: [
+        { id: "a1", isLocal: false, isPlatformHosted: true, isPaired: false },
+      ],
       assistantsHydrated: true,
     });
     client.setQueryData([...avatarQueryKey("a1"), true], {
@@ -1118,6 +1120,7 @@ describe("PlansPage — Custom Pro subs switch via neutral confirm", () => {
       plan_id: "pro",
       status: "active",
       renewal_date: null,
+      current_period_start: null,
       current_period_end: "2026-07-10T00:00:00Z",
       cancel_at_period_end: false,
       cancel_at: null,
@@ -1372,7 +1375,7 @@ function legacyStorageCatalog(): PlanListResponse {
   return catalog;
 }
 
-function openDropdown(ariaLabel: string): void {
+function openSelect(ariaLabel: string): void {
   const trigger = document.querySelector<HTMLButtonElement>(
     `button[role="combobox"][aria-label="${ariaLabel}"]`,
   );
@@ -1383,8 +1386,8 @@ function openDropdown(ariaLabel: string): void {
 }
 
 /** Clicks the open-menu option whose text starts with `label`. */
-function selectOption(dropdownLabel: string, optionLabel: string): void {
-  openDropdown(dropdownLabel);
+function selectOption(selectLabel: string, optionLabel: string): void {
+  openSelect(selectLabel);
   const option = Array.from(
     document.querySelectorAll<HTMLElement>('[role="option"]'),
   ).find((o) => (o.textContent?.trim() ?? "").startsWith(optionLabel));

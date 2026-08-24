@@ -11,7 +11,10 @@ import { syncDiagnosticsToMain } from "@/runtime/diagnostics";
 import { sanitizeUrl } from "@/lib/sentry/url-sanitize";
 import { isElectron } from "@/runtime/is-electron";
 import { isNativePlatform } from "@/runtime/native-auth";
-import { detectClientOs } from "@/runtime/platform-detection";
+import {
+  detectClientOs,
+  detectElectronHostOS,
+} from "@/runtime/platform-detection";
 
 /**
  * Recognize React's nested-update-limit error in every form it ships as.
@@ -36,7 +39,9 @@ function isReactError185(message: string): boolean {
 /** Resolve the Sentry DSN for the current host. */
 function resolveDsn(): string | undefined {
   if (isElectron()) {
-    return import.meta.env.VITE_SENTRY_DSN_MACOS;
+    return detectElectronHostOS() === "windows"
+      ? import.meta.env.VITE_SENTRY_DSN_WINDOWS
+      : import.meta.env.VITE_SENTRY_DSN_MACOS;
   }
   if (isNativePlatform()) {
     const platform = Capacitor.getPlatform();
@@ -175,7 +180,8 @@ const options: BrowserOptions = {
  * is available when the consent gate reads localStorage.
  *
  * Also syncs the effective (session-gated) reporting gate to the Electron main
- * process (no-op on web/iOS) so the main-process Sentry client matches.
+ * process (no-op on web and native mobile) so the main-process Sentry client
+ * matches.
  */
 export function initSentry(): void {
   // Resolve host-detected values at init time (post host-detection), not at

@@ -54,15 +54,27 @@ selectors to subscribe to. Wrapping it in a Zustand store adds
 ceremony without value — `useEventBusStore.getState().publish(...)`
 when `publish(...)` is the actual operation.
 
-The convention: stateless pub/sub registries are plain modules with
-exported functions. They live in `lib/` alongside other app
-infrastructure. The event bus is the canonical example; other
-registries (if any are added) should follow the same shape.
+The convention: `lib/event-bus.ts` is that registry, singular. It is a
+module to use, not a shape to copy. A new stateless signal is an entry in
+`BusEventMap` plus a producer (see
+[`EVENT_BUS.md`](./EVENT_BUS.md#adding-a-new-event)), not a second module with
+its own listener `Set`. A parallel registry is a second mechanism for one job,
+and it is invisible to anyone reading the bus's event table to find out what
+signals exist. Don't stand one up without a documented reason, the same bar
+`EVENT_BUS.md` puts on adding a producer.
+
+The line this section draws is *stateless signal* versus *state*, and only
+the first side belongs on the bus. A module that pairs listeners with
+values consumers read back is a store, however much its listener `Set`
+resembles a registry: that belongs in Zustand, or in `useSyncExternalStore`
+when it is mirroring a browser API it does not own (`hooks/use-element-size.ts`,
+`lib/app-sandbox-debug-flag.ts`). Reaching for the bus there loses selectors
+and gives subscribers no value to read.
 
 ## Zustand store conventions
 
 Each domain owns its store, colocated within the domain folder:
-`domains/messages/message-store.ts`. Store files use
+`domains/chat/chat-session-store.ts`. Store files use
 `{domain}-store.ts`. Zustand stores are module-level singletons with
 both React hook and non-React APIs (`.getState()`, `.setState()`,
 `.subscribe()`), so the file describes what the module *is* (a store),
@@ -517,6 +529,12 @@ const query = useQuery({
 Queries mounted inside `<ActiveAssistantGate>` typically don't race
 because the lifecycle resolves after org hydration, but the gate is
 cheap and safe to add defensively.
+
+A platform session whose API calls are conclusively rejected (a
+settled 401/403/410 from the org or assistants endpoints during the
+session probe) settles `platformSession: "absent"`, so bearer-auth
+(local/paired gateway) connections never stay org-gated behind a
+dead cookie.
 
 Reference: [TanStack Query — Dependent Queries](https://tanstack.com/query/latest/docs/framework/react/guides/dependent-queries)
 

@@ -1,5 +1,7 @@
 process.title = "vellum-gateway";
 
+import { slackEventRefersToAnotherMessage } from "./slack/event-kind.js";
+import { buildSlackSourceMetadata } from "./slack/source-metadata.js";
 import { randomBytes } from "node:crypto";
 
 import {
@@ -48,6 +50,11 @@ import {
   type SttStreamSocketData,
 } from "./http/routes/stt-stream-websocket.js";
 import {
+  createWatchStreamWebsocketHandler,
+  getWatchStreamWebsocketHandlers,
+  type WatchStreamSocketData,
+} from "./http/routes/watch-stream-websocket.js";
+import {
   createSpeechRelayUpgradeHandler,
   getSpeechRelayWebsocketHandlers,
   type SpeechRelaySocketData,
@@ -95,6 +102,11 @@ import {
   handleCredentialRequestSubmit,
 } from "./http/routes/credential-requests.js";
 import { handleCreateRemoteWebPairingChallenge } from "./http/routes/remote-web-pairing-challenge.js";
+import {
+  handleApproveRemoteWebPairingRequest,
+  handleDenyRemoteWebPairingRequest,
+  handleListRemoteWebPairingRequests,
+} from "./http/routes/remote-web-pairing-requests.js";
 import { handleRemoteWebPairingToken } from "./http/routes/remote-web-pairing-token.js";
 import { handleVerifyRemoteWebPairingChallenge } from "./http/routes/remote-web-pairing-verification.js";
 import { createSlackControlPlaneProxyHandler } from "./http/routes/slack-control-plane-proxy.js";
@@ -102,6 +114,7 @@ import { createOAuthAppsProxyHandler } from "./http/routes/oauth-apps-proxy.js";
 import { createOAuthProvidersProxyHandler } from "./http/routes/oauth-providers-proxy.js";
 import { createChannelReadinessProxyHandler } from "./http/routes/channel-readiness-proxy.js";
 import { createPsHandler } from "./http/routes/ps.js";
+import { createVelayStatusHandler } from "./http/routes/velay-status.js";
 import { createRuntimeHealthProxyHandler } from "./http/routes/runtime-health-proxy.js";
 import { createUpgradeBroadcastProxyHandler } from "./http/routes/upgrade-broadcast-proxy.js";
 import {
@@ -143,6 +156,7 @@ import {
 } from "./http/routes/channel-admission-policy.js";
 import {
   createChannelIngressApproveHandler,
+  createChannelIngressListHandler,
   createChannelIngressRevokeHandler,
 } from "./http/routes/channel-ingress.js";
 import { createPluginWebhookHandler } from "./http/routes/plugin-webhook.js";
@@ -161,11 +175,12 @@ import {
 } from "./http/routes/channel-permission-overrides.js";
 import { getLogger, initLogger } from "./logger.js";
 import { getPlatformBaseUrl } from "./platform-url.js";
+import { CircuitBreakerOpenError, uploadAttachment } from "./runtime/client.js";
 import {
-  AttachmentValidationError,
-  CircuitBreakerOpenError,
-  uploadAttachment,
-} from "./runtime/client.js";
+  appendFailedAttachmentNotice,
+  ingestAttachments,
+} from "./attachments/ingest.js";
+import { createConversationTaskQueue } from "./channels/conversation-queue.js";
 import { buildSchema } from "./schema.js";
 import {
   createSlackSocketModeClient,
@@ -174,6 +189,7 @@ import {
 import { downloadSlackFile } from "./slack/download.js";
 import { slackBotContactNote } from "./slack/actor.js";
 import { DiscordGatewayClient } from "./discord/gateway-socket.js";
+import { createDiscordInboundEventHandler } from "./discord/forward.js";
 import { readDiscordAllowedChannelIds } from "./discord/allowed-channels.js";
 import { handleInbound } from "./handlers/handle-inbound.js";
 import { upsertContactChannel } from "./verification/contact-helpers.js";
@@ -217,6 +233,7 @@ import { channelPermissionRoutes } from "./ipc/channel-permission-handlers.js";
 import { trustVerdictRoutes } from "./ipc/trust-verdict-handlers.js";
 import { guardianDeliveryRoutes } from "./ipc/guardian-delivery-handlers.js";
 import { createLogTailRoutes } from "./ipc/log-tail-handlers.js";
+import { createChannelSocketHealthRoutes } from "./ipc/channel-socket-health-handlers.js";
 import { createCredentialRequestIpcRoutes } from "./ipc/credential-request-handlers.js";
 import { slackThreadRoutes } from "./ipc/slack-thread-handlers.js";
 import { thresholdRoutes } from "./ipc/threshold-handlers.js";
@@ -229,6 +246,7 @@ import { AvatarChannelSyncer } from "./avatar-sync/avatar-channel-syncer.js";
 import { AvatarSyncWatcher } from "./avatar-sync/avatar-sync-watcher.js";
 import { SlackAvatarSyncer } from "./avatar-sync/slack-avatar-syncer.js";
 import { initGatewayDb } from "./db/connection.js";
+import { cleanupExpiredInboundEvents } from "./db/inbound-dedup-store.js";
 import { runPostAssistantReady } from "./post-assistant-ready.js";
 import {
   clearManagedPublicBaseUrl,
@@ -297,6 +315,14 @@ function isSttStreamSocketData(data: unknown): data is SttStreamSocketData {
   );
 }
 
+function isWatchStreamSocketData(data: unknown): data is WatchStreamSocketData {
+  return (
+    !!data &&
+    typeof data === "object" &&
+    (data as { wsType?: unknown }).wsType === "watch-stream"
+  );
+}
+
 function isLiveVoiceSocketData(data: unknown): data is LiveVoiceSocketData {
   return (
     !!data &&
@@ -346,6 +372,15 @@ function getClientIp(
   const addr = server.requestIP(req);
   return addr?.address ?? "unknown";
 }
+
+/**
+ * How often expired inbound dedup claims are swept.
+ *
+ * Hourly, because nothing depends on the sweep being timely: an expired claim
+ * is already reclaimed in place by the next delivery on the same key, so this
+ * is a size bound, not a correctness one.
+ */
+const INBOUND_DEDUP_CLEANUP_INTERVAL_MS = 60 * 60 * 1_000;
 
 async function main() {
   const config = loadConfig();
@@ -517,6 +552,7 @@ async function main() {
     credentials: credentialCache,
   });
   const handleSttStreamWs = createSttStreamWebsocketHandler(config);
+  const handleWatchStreamWs = createWatchStreamWebsocketHandler(config);
   const handleLiveVoiceWs = createLiveVoiceWebsocketHandler(config);
   const handleSpeechRelaySttWs = createSpeechRelayUpgradeHandler(
     config,
@@ -531,6 +567,7 @@ async function main() {
   const twilioMediaStreamWebsocketHandlers = getMediaStreamWebsocketHandlers();
   const pluginWebhookWebsocketHandlers = getPluginWebhookWebsocketHandlers();
   const sttStreamWebsocketHandlers = getSttStreamWebsocketHandlers();
+  const watchStreamWebsocketHandlers = getWatchStreamWebsocketHandlers();
   const liveVoiceWebsocketHandlers = getLiveVoiceWebsocketHandlers();
   const speechRelayWebsocketHandlers = getSpeechRelayWebsocketHandlers();
   const { handler: handleWhatsAppWebhook, dedupCache: whatsappDedupCache } =
@@ -573,6 +610,7 @@ async function main() {
   const oauthProvidersProxy = createOAuthProvidersProxyHandler(config);
   const channelReadinessProxy = createChannelReadinessProxyHandler(config);
   const psHandler = createPsHandler(config);
+  const velayStatusHandler = createVelayStatusHandler(velayTunnelClient);
   const runtimeHealthProxy = createRuntimeHealthProxyHandler(config);
   const upgradeBroadcastProxy = createUpgradeBroadcastProxyHandler(config);
   const migrationExportProxy = createMigrationExportProxyHandler(config);
@@ -617,6 +655,7 @@ async function main() {
     createChannelAdmissionPolicySetHandler();
   const handleChannelAdmissionPolicyDelete =
     createChannelAdmissionPolicyDeleteHandler();
+  const handleChannelIngressList = createChannelIngressListHandler();
   const handleChannelIngressApprove = createChannelIngressApproveHandler();
   const handleChannelIngressRevoke = createChannelIngressRevokeHandler();
   const handlePluginWebhook = createPluginWebhookHandler({
@@ -779,6 +818,23 @@ async function main() {
       handler: () => psHandler.handlePs(),
     },
 
+    // ── Velay tunnel status ──
+    {
+      path: "/v1/velay/status",
+      method: "GET",
+      auth: "edge",
+      handler: () => velayStatusHandler.handleVelayStatus(),
+    },
+    // Assistant-scoped mirror: self-hosted clients emit /v1/assistants/<id>/velay/status
+    // and rewriteForSelfHostedIngress preserves that path, so a flat-only route
+    // would fall through to the runtime proxy and 404. The assistant id is discarded.
+    {
+      path: /^\/v1\/assistants\/[^/]+\/velay\/status\/?$/,
+      method: "GET",
+      auth: "edge-scoped",
+      handler: () => velayStatusHandler.handleVelayStatus(),
+    },
+
     // ── Brain graph ──
     {
       path: "/v1/brain-graph",
@@ -884,6 +940,27 @@ async function main() {
       method: "POST",
       auth: "none",
       handler: (req) => handleRemoteWebPairingToken(req),
+    },
+    {
+      path: "/v1/remote-web/pairing-requests",
+      method: "GET",
+      auth: "none",
+      handler: (req, _params, getClientIp) =>
+        handleListRemoteWebPairingRequests(req, getClientIp()),
+    },
+    {
+      path: "/v1/remote-web/pairing-requests/approve",
+      method: "POST",
+      auth: "none",
+      handler: (req, _params, getClientIp) =>
+        handleApproveRemoteWebPairingRequest(req, getClientIp()),
+    },
+    {
+      path: "/v1/remote-web/pairing-requests/deny",
+      method: "POST",
+      auth: "none",
+      handler: (req, _params, getClientIp) =>
+        handleDenyRemoteWebPairingRequest(req, getClientIp()),
     },
     // ── Credential requests (one-time credential-collection links) ──
     // Unauthenticated by design: the single-use token in the request BODY is
@@ -1594,8 +1671,16 @@ async function main() {
     // is the decision the assistant must not make for itself; and there are no
     // assistant-scoped variants, because the guardian reaches these directly
     // rather than through the platform proxy. Deliberately absent from the IPC
-    // surface for the same reason as the auth choice. POST verb paths — a
-    // grant has no id of its own until a guardian creates one.
+    // surface for the same reason as the auth choice. Approve and revoke are
+    // POST verb paths because a grant has no id of its own until a guardian
+    // creates one. The listing is guardian-only for a different reason: it says
+    // which declarations are waiting, which the public surface will not.
+    {
+      path: /^\/v1\/channel-ingress\/?$/,
+      method: "GET",
+      auth: "edge-guardian",
+      handler: () => handleChannelIngressList(),
+    },
     {
       path: /^\/v1\/channel-ingress\/([^/]+)\/approve\/?$/,
       method: "POST",
@@ -1604,6 +1689,33 @@ async function main() {
     },
     {
       path: /^\/v1\/channel-ingress\/([^/]+)\/revoke\/?$/,
+      method: "POST",
+      auth: "edge-guardian",
+      handler: (req, params) => handleChannelIngressRevoke(req, params[0]!),
+    },
+
+    // ── Channel ingress: assistant-scoped variants ──
+    // Same handlers, same guardian auth, reached through the prefix a client
+    // built on the platform's addressing produces. Approvals are
+    // gateway-global, so the assistant id is matched and discarded, the same
+    // precedent as channel-permission-overrides below. These exist because the
+    // web client's generated gateway SDK only speaks the prefixed form; the
+    // guardian decision they carry is unchanged, since `edge-guardian` is what
+    // decides who may call them and it applies to both spellings.
+    {
+      path: /^\/v1\/assistants\/[^/]+\/channel-ingress\/?$/,
+      method: "GET",
+      auth: "edge-guardian",
+      handler: () => handleChannelIngressList(),
+    },
+    {
+      path: /^\/v1\/assistants\/[^/]+\/channel-ingress\/([^/]+)\/approve\/?$/,
+      method: "POST",
+      auth: "edge-guardian",
+      handler: (req, params) => handleChannelIngressApprove(req, params[0]!),
+    },
+    {
+      path: /^\/v1\/assistants\/[^/]+\/channel-ingress\/([^/]+)\/revoke\/?$/,
       method: "POST",
       auth: "edge-guardian",
       handler: (req, params) => handleChannelIngressRevoke(req, params[0]!),
@@ -1782,6 +1894,10 @@ async function main() {
           sttStreamWebsocketHandlers.open(ws as never);
           return;
         }
+        if (isWatchStreamSocketData(ws.data)) {
+          watchStreamWebsocketHandlers.open(ws as never);
+          return;
+        }
         if (isLiveVoiceSocketData(ws.data)) {
           liveVoiceWebsocketHandlers.open(ws as never);
           return;
@@ -1805,6 +1921,10 @@ async function main() {
           sttStreamWebsocketHandlers.message(ws as never, message);
           return;
         }
+        if (isWatchStreamSocketData(ws.data)) {
+          watchStreamWebsocketHandlers.message(ws as never, message);
+          return;
+        }
         if (isLiveVoiceSocketData(ws.data)) {
           liveVoiceWebsocketHandlers.message(ws as never, message);
           return;
@@ -1826,6 +1946,10 @@ async function main() {
         }
         if (isSttStreamSocketData(ws.data)) {
           sttStreamWebsocketHandlers.close(ws as never, code, reason);
+          return;
+        }
+        if (isWatchStreamSocketData(ws.data)) {
+          watchStreamWebsocketHandlers.close(ws as never, code, reason);
           return;
         }
         if (isLiveVoiceSocketData(ws.data)) {
@@ -2050,6 +2174,19 @@ async function main() {
       return undefined as unknown as Response;
     }
 
+    // Reachable both ways: directly on a self-hosted ingress with an actor
+    // edge JWT, and through the velay tunnel on a managed assistant, which is
+    // why it is in `VELAY_ALLOWED_PATHS`. The handler authorizes each shape on
+    // its own terms and admits only the guardian either way. A paired
+    // assistant has no transport at all and never reaches here.
+    if (url.pathname === "/v1/watch/stream") {
+      const upgradeResult = await handleWatchStreamWs(req, server);
+      if (upgradeResult !== undefined) {
+        return upgradeResult;
+      }
+      return undefined as unknown as Response;
+    }
+
     if (url.pathname === "/v1/live-voice") {
       const upgradeResult = await handleLiveVoiceWs(req, server);
       if (upgradeResult !== undefined) return upgradeResult;
@@ -2152,6 +2289,21 @@ async function main() {
   whatsappDedupCache.startCleanup();
   emailDedupCache.startCleanup();
 
+  // The persistent inbound claims sweep too, more slowly. Expired rows are
+  // already reclaimed in place by the next claim on the same key, so this only
+  // keeps the table from growing a row per message that nothing will read
+  // again.
+  const inboundDedupCleanup = setInterval(() => {
+    try {
+      const evicted = cleanupExpiredInboundEvents();
+      if (evicted > 0) {
+        log.debug({ evicted }, "Evicted expired inbound dedup claims");
+      }
+    } catch (err) {
+      log.warn({ err }, "Inbound dedup cleanup failed");
+    }
+  }, INBOUND_DEDUP_CLEANUP_INTERVAL_MS);
+
   const telegramCaches = {
     credentials: credentialCache,
     configFile: configFileCache,
@@ -2174,6 +2326,7 @@ async function main() {
 
   // ── Slack Socket Mode lifecycle ──
   let slackSocketClient: SlackSocketModeClient | null = null;
+  const slackForwardQueue = createConversationTaskQueue();
   // Guards concurrent startSlackSocket calls: at boot both the credential
   // watcher's and the config-file watcher's initial polls fire it, and the
   // second call can pass the stop() guard while the first is still awaiting
@@ -2272,19 +2425,11 @@ async function main() {
         const origMessageTs = normalized.event.source.messageId;
         if (!threadTs && origMessageTs) params.set("messageTs", origMessageTs);
         const replyCallbackUrl = `${config.gatewayInternalBaseUrl}/deliver/slack?${params}`;
-        const slackSourceMetadata = {
-          ...(normalized.event.raw.type === "app_mention"
-            ? { slackBotMentioned: true }
-            : {}),
-          ...(threadTs && !normalized.event.source.threadId
-            ? { threadId: threadTs }
-            : {}),
-        };
 
-        // Whether this event represents an edit or callback action — these
-        // never carry attachments to upload.
-        const isEdit = !!normalized.event.message.isEdit;
-        const isCallback = !!normalized.event.message.callbackData;
+        const refersToAnotherMessage = slackEventRefersToAnotherMessage(
+          normalized.event.message,
+        );
+        const slackSourceMetadata = buildSlackSourceMetadata(normalized);
 
         // Handle /new command — reset conversation before it reaches the runtime
         if (isNewCommand(normalized.event.message.content)) {
@@ -2339,23 +2484,16 @@ async function main() {
           }
 
           try {
-            // Download and upload attachments if present (skip for edits and
-            // callback actions — edits only update text, callbacks have no media)
+            // Download and upload attachments if present. An event that acts
+            // on another message brings no media of its own.
             let attachmentIds: string[] | undefined;
             const eventAttachments = normalized.event.message.attachments;
             if (
               eventAttachments &&
               eventAttachments.length > 0 &&
               normalized.slackFiles &&
-              !isEdit &&
-              !isCallback
+              !refersToAnotherMessage
             ) {
-              attachmentIds = [];
-              const failedAttachmentNames: string[] = [];
-              const maxBytes =
-                config.maxAttachmentBytes.slack ??
-                config.maxAttachmentBytes.default;
-
               // Guardian-actor bypass: when the Slack sender is the
               // assistant's owner, the upload is marked trustedSource so the
               // assistant accepts arbitrary MIME types and extensions
@@ -2381,87 +2519,38 @@ async function main() {
                 }
               }
 
-              // Filter oversized attachments
-              const eligible = eventAttachments.filter((att) => {
-                if (att.fileSize !== undefined && att.fileSize > maxBytes) {
-                  log.warn(
-                    {
-                      fileId: att.fileId,
-                      fileSize: att.fileSize,
-                      limit: maxBytes,
-                    },
-                    "Skipping oversized Slack attachment",
-                  );
-                  return false;
-                }
-                return true;
-              });
-
-              // Process with bounded concurrency. Socket Mode has no retry
-              // mechanism, so all errors (validation and transient) are logged
-              // and skipped — the message is still delivered without the
-              // failed attachment.
-              for (
-                let i = 0;
-                i < eligible.length;
-                i += config.maxAttachmentConcurrency
-              ) {
-                const batch = eligible.slice(
-                  i,
-                  i + config.maxAttachmentConcurrency,
-                );
-                const results = await Promise.allSettled(
-                  batch.map(async (att) => {
+              const result = await ingestAttachments(
+                config,
+                "slack",
+                eventAttachments,
+                log,
+                {
+                  download: (att, maxBytes) => {
                     const slackFile = normalized.slackFiles?.get(att.fileId);
                     if (!slackFile) {
                       throw new Error(
                         `No SlackFile found for attachment ${att.fileId}`,
                       );
                     }
-                    const downloaded = await downloadSlackFile(
-                      slackFile,
-                      botToken,
-                    );
-                    return uploadAttachment(
+                    return downloadSlackFile(slackFile, botToken, maxBytes);
+                  },
+                  upload: (downloaded) =>
+                    uploadAttachment(
                       config,
                       { ...downloaded, trustedSource: isGuardianActor },
                       { skipCircuitBreaker: true },
-                    );
-                  }),
-                );
-                for (let j = 0; j < results.length; j++) {
-                  const result = results[j];
-                  if (result.status === "fulfilled") {
-                    attachmentIds.push(result.value.id);
-                  } else if (
-                    result.reason instanceof AttachmentValidationError
-                  ) {
-                    const att = batch[j];
-                    failedAttachmentNames.push(att.fileName || att.fileId);
-                    log.warn(
-                      { err: result.reason },
-                      "Skipping Slack attachment with validation error",
-                    );
-                  } else {
-                    const att = batch[j];
-                    failedAttachmentNames.push(att.fileName || att.fileId);
-                    log.warn(
-                      { err: result.reason },
-                      "Skipping Slack attachment due to download/upload failure",
-                    );
-                  }
-                }
-              }
-
-              if (failedAttachmentNames.length > 0) {
-                const nameList = failedAttachmentNames
-                  .map((n) => `"${n}"`)
-                  .join(", ");
-                normalized.event.message.content += `\n\n[The user attached file(s) that could not be retrieved: ${nameList}. Ask them to re-send if the content is important.]`;
-              }
+                    ),
+                  failurePolicy: { mode: "skip" },
+                },
+              );
+              attachmentIds = result.attachmentIds;
+              normalized.event.message.content = appendFailedAttachmentNotice(
+                normalized.event.message.content,
+                result.failedAttachmentNames,
+              );
             }
 
-            handleInbound(config, normalized.event, {
+            await handleInbound(config, normalized.event, {
               replyCallbackUrl,
               routingOverride: normalized.routing,
               ...(Object.keys(slackSourceMetadata).length > 0
@@ -2481,7 +2570,7 @@ async function main() {
               { err, channel, threadTs },
               "Failed to process Slack event — delivering message without attachments",
             );
-            handleInbound(config, normalized.event, {
+            await handleInbound(config, normalized.event, {
               replyCallbackUrl,
               routingOverride: normalized.routing,
               ...(Object.keys(slackSourceMetadata).length > 0
@@ -2500,12 +2589,14 @@ async function main() {
         // persisted message rows (see `assembleSlackChronologicalMessages`
         // in the assistant), so the gateway no longer fetches per-turn
         // thread/DM context to inject as transport hints.
-        forward().catch((err) => {
-          log.error(
-            { err, channel, threadTs },
-            "Unhandled error in Slack forward",
-          );
-        });
+        void slackForwardQueue
+          .enqueue(normalized.event.message.conversationExternalId, forward)
+          .catch((err) => {
+            log.error(
+              { err, channel, threadTs },
+              "Unhandled error in Slack forward",
+            );
+          });
 
         // Approval message replacement is handled by the assistant's
         // direct Slack delivery path (messaging/providers/slack/send.ts).
@@ -2532,6 +2623,7 @@ async function main() {
   // only reads services listed there, and the registration is pinned by
   // credential-reader.test.ts.
   let discordGatewayClient: DiscordGatewayClient | null = null;
+  const discordForwardQueue = createConversationTaskQueue();
 
   async function startDiscordGateway(): Promise<void> {
     if (discordGatewayClient) {
@@ -2554,31 +2646,12 @@ async function main() {
         readAllowedChannelIds: () =>
           readDiscordAllowedChannelIds(configFileCache),
       },
-      (event) => {
-        // Reset the platform idle-sleep timer — inbound Discord activity
-        // keeps the assistant awake like any other channel's.
-        notifyRecordActivity();
-
-        // Seed a contact channel for the actor (dual-write, fire-and-forget)
-        // so later verification flows have a record to upgrade.
-        void upsertContactChannel({
-          sourceChannel: "discord",
-          externalUserId: event.actor.actorExternalId,
-          displayName: event.actor.displayName,
-          username: event.actor.username,
-        }).catch(() => {});
-
-        // Read-only slice: no replyCallbackUrl until the send path exists.
-        handleInbound(config, event).catch((err) => {
-          log.error(
-            {
-              err,
-              conversationExternalId: event.message.conversationExternalId,
-            },
-            "Failed to forward Discord event to runtime",
-          );
-        });
-      },
+      createDiscordInboundEventHandler({
+        config,
+        log,
+        notifyRecordActivity,
+        forwardQueue: discordForwardQueue,
+      }),
     );
 
     discordGatewayClient.start().catch((err) => {
@@ -2818,6 +2891,10 @@ async function main() {
     ...guardianDeliveryRoutes,
     ...riskClassificationRoutes,
     ...createLogTailRoutes(config),
+    ...createChannelSocketHealthRoutes({
+      slack: () => slackSocketClient,
+      discord: () => discordGatewayClient,
+    }),
     ...trustRulesRoutes,
     ...createVelayRoutes(velayTunnelClient),
     ...createCredentialRequestIpcRoutes(
@@ -2914,6 +2991,7 @@ async function main() {
     telegramDedupCache.stopCleanup();
     whatsappDedupCache.stopCleanup();
     emailDedupCache.stopCleanup();
+    clearInterval(inboundDedupCleanup);
     if (slackSocketClient) {
       slackSocketClient.stop();
       slackSocketClient = null;

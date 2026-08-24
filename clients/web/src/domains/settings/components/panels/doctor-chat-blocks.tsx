@@ -17,23 +17,29 @@ import {
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
+import type { MarkdownLinkComponent } from "@vellumai/design-library";
 import { MarkdownMessage } from "@vellumai/design-library";
 import { Button } from "@vellumai/design-library/components/button";
 
-import { copyToClipboard } from "@/lib/copy-to-clipboard";
-
+import {
+  EXTERNAL_LINK_CLASS,
+  ExternalAnchor,
+} from "@/components/external-anchor";
 import type {
   ApprovalMeta,
   BackupPromptMeta,
   ChatEntry,
   ToolCallMeta,
 } from "@/domains/settings/components/panels/doctor-history";
+import { Trans, useTranslation } from "@/i18n";
+import { copyToClipboard } from "@/lib/copy-to-clipboard";
 
 // ---------------------------------------------------------------------------
 // MessageCopyButton
 // ---------------------------------------------------------------------------
 
 export function MessageCopyButton({ text }: { text: string }) {
+  const { t } = useTranslation("settings");
   const [copied, setCopied] = useState(false);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -47,7 +53,7 @@ export function MessageCopyButton({ text }: { text: string }) {
 
   const handleCopy = () => {
     copyToClipboard(text, {
-      errorMessage: "Couldn't copy the message.",
+      errorMessage: t("doctorChatBlocks.copyError"),
       onCopied: () => {
         setCopied(true);
         if (timerRef.current) {
@@ -65,9 +71,18 @@ export function MessageCopyButton({ text }: { text: string }) {
     <button
       type="button"
       onClick={handleCopy}
-      title={copied ? "Copied!" : "Copy"}
-      aria-label={copied ? "Copied" : "Copy to clipboard"}
-      className="flex h-6 w-6 cursor-pointer items-center justify-center rounded-md bg-[var(--surface-overlay)] text-[var(--content-tertiary)] pointer-events-none opacity-0 transition-opacity duration-150 group-hover/msg:pointer-events-auto group-hover/msg:opacity-100 hover:text-[var(--content-secondary)] [@media(hover:none)]:pointer-events-auto [@media(hover:none)]:opacity-100"
+      title={
+        copied
+          ? t("doctorChatBlocks.copyTitleCopied")
+          : t("doctorChatBlocks.copyTitle")
+      }
+      aria-label={
+        copied
+          ? t("doctorChatBlocks.copyAriaCopied")
+          : t("doctorChatBlocks.copyAria")
+      }
+      data-reveal=""
+      className="flex h-6 w-6 cursor-pointer items-center justify-center rounded-md bg-[var(--surface-overlay)] text-[var(--content-tertiary)] hover:text-[var(--content-secondary)]"
     >
       <div className="relative h-3.5 w-3.5">
         <Check
@@ -94,15 +109,16 @@ export function ToolCallBlock({
 }: {
   entry: ChatEntry & { kind: "tool_call"; meta: ToolCallMeta };
 }) {
+  const { t } = useTranslation("settings");
   const [expanded, setExpanded] = useState(false);
   const { toolName, input, result, isError, status } = entry.meta;
   const isRunning = status === "running";
 
   const statusLabel = isRunning
-    ? "Running 1 step"
+    ? t("doctorChatBlocks.runningStep")
     : isError
-      ? "Failed 1 step"
-      : "Completed 1 step";
+      ? t("doctorChatBlocks.failedStep")
+      : t("doctorChatBlocks.completedStep");
 
   const canExpand =
     !isRunning && (result !== undefined || Object.keys(input).length > 0);
@@ -165,7 +181,7 @@ export function ToolCallBlock({
 
           <div className="mt-2.5">
             <div className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-[var(--content-disabled)]">
-              Technical Details
+              {t("doctorChatBlocks.technicalDetails")}
             </div>
             {Object.entries(input).map(([key, value]) => (
               <div key={key} className="mt-0.5">
@@ -186,7 +202,7 @@ export function ToolCallBlock({
           {result !== undefined && (
             <div className="mt-3">
               <div className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-[var(--content-disabled)]">
-                Output
+                {t("doctorChatBlocks.output")}
               </div>
               <div
                 className={`rounded-md border p-3 ${
@@ -228,6 +244,7 @@ export function ApprovalBlock({
   onRespond: (response: string) => void;
   disabled: boolean;
 }) {
+  const { t } = useTranslation("settings");
   const { toolName, description, input } = entry.meta;
   const [showDetails, setShowDetails] = useState(false);
 
@@ -240,7 +257,7 @@ export function ApprovalBlock({
         <div className="flex min-w-0 flex-1 items-start gap-2">
           <Shield className="mt-0.5 h-4 w-4 shrink-0 text-[var(--content-disabled)]" />
           <span className="text-body-medium-default text-[var(--content-default)]">
-            Confirmation required
+            {t("doctorChatBlocks.confirmationRequired")}
           </span>
         </div>
 
@@ -251,7 +268,7 @@ export function ApprovalBlock({
             onClick={() => onRespond("approve")}
             className="flex items-center gap-1.5 rounded-md bg-[var(--system-positive-strong)] px-3 py-1.5 text-body-small-default text-white transition-colors hover:bg-[var(--system-positive-strong)] disabled:cursor-not-allowed disabled:opacity-50"
           >
-            Allow once
+            {t("doctorChatBlocks.allowOnce")}
           </button>
           {canApproveFutureExecCommands && (
             <button
@@ -260,7 +277,7 @@ export function ApprovalBlock({
               onClick={() => onRespond("approve all exec")}
               className="flex items-center gap-1.5 rounded-md border border-[var(--system-positive-strong)] bg-[var(--surface-lift)] px-3 py-1.5 text-body-small-default text-[var(--system-positive-strong)] transition-colors hover:bg-[var(--system-positive-weak)] disabled:cursor-not-allowed disabled:opacity-50"
             >
-              Always Allow
+              {t("doctorChatBlocks.alwaysAllow")}
             </button>
           )}
           <button
@@ -269,7 +286,7 @@ export function ApprovalBlock({
             onClick={() => onRespond("deny")}
             className="flex items-center gap-1.5 rounded-md border border-[var(--system-negative-strong)] bg-[var(--surface-lift)] px-3 py-1.5 text-body-small-default text-[var(--system-negative-strong)] transition-colors hover:bg-[var(--system-negative-weak)] disabled:cursor-not-allowed disabled:opacity-50"
           >
-            Deny
+            {t("doctorChatBlocks.deny")}
           </button>
         </div>
       </div>
@@ -284,13 +301,15 @@ export function ApprovalBlock({
             <ChevronRight
               className={`h-3 w-3 transition-transform ${showDetails ? "rotate-90" : ""}`}
             />
-            {showDetails ? "Hide details" : "Show details"}
+            {showDetails
+              ? t("doctorChatBlocks.hideDetails")
+              : t("doctorChatBlocks.showDetails")}
           </button>
           {showDetails && (
             <div className="mt-2 space-y-1.5">
               {toolName && (
                 <div className="flex items-center gap-1.5 text-body-small-default text-[var(--content-tertiary)]">
-                  <span>Tool:</span>
+                  <span>{t("doctorChatBlocks.toolLabel")}</span>
                   <code className="rounded bg-[var(--surface-base)] px-1.5 py-0.5 font-mono text-[var(--content-secondary)] dark:bg-[var(--surface-lift)] dark:text-[var(--content-default)]">
                     {toolName}
                   </code>
@@ -327,6 +346,7 @@ export function BackupPromptBlock({
   onRespond: (response: string) => void;
   disabled: boolean;
 }) {
+  const { t } = useTranslation("settings");
   const { toolName } = entry.meta;
 
   return (
@@ -336,14 +356,19 @@ export function BackupPromptBlock({
           <HardDrive className="mt-0.5 h-4 w-4 shrink-0 text-[var(--content-disabled)]" />
           <div className="flex flex-col gap-1">
             <span className="text-body-medium-default text-[var(--content-default)]">
-              Create a backup before modifying?
+              {t("doctorChatBlocks.backupPromptTitle")}
             </span>
             <span className="text-body-small-default text-[var(--content-tertiary)]">
-              The doctor is about to run{" "}
-              <code className="rounded bg-[var(--surface-base)] px-1 py-0.5 font-mono text-[var(--content-secondary)]">
-                {toolName}
-              </code>
-              . Would you like to back up your workspace first?
+              <Trans
+                ns="settings"
+                i18nKey="doctorChatBlocks.backupPromptBody"
+                values={{ toolName }}
+                components={{
+                  toolCode: (
+                    <code className="rounded bg-[var(--surface-base)] px-1 py-0.5 font-mono text-[var(--content-secondary)]" />
+                  ),
+                }}
+              />
             </span>
           </div>
         </div>
@@ -354,14 +379,14 @@ export function BackupPromptBlock({
             disabled={disabled}
             onClick={() => onRespond("backup")}
           >
-            Back up
+            {t("doctorChatBlocks.backUp")}
           </Button>
           <Button
             variant="outlined"
             disabled={disabled}
             onClick={() => onRespond("skip_backup")}
           >
-            Skip
+            {t("doctorChatBlocks.skip")}
           </Button>
         </div>
       </div>
@@ -374,6 +399,8 @@ export function FeedbackPromptBlock({
 }: {
   onOpenFeedback: () => void;
 }) {
+  const { t } = useTranslation("settings");
+
   return (
     <div className="rounded-lg border border-[var(--border-base)] bg-[var(--surface-lift)] p-4">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
@@ -381,11 +408,10 @@ export function FeedbackPromptBlock({
           <MessageSquareText className="mt-0.5 h-4 w-4 shrink-0 text-[var(--content-disabled)]" />
           <div className="flex flex-col gap-1">
             <span className="text-body-medium-default text-[var(--content-default)]">
-              This sounds like feedback for the Vellum team.
+              {t("doctorChatBlocks.feedbackTitle")}
             </span>
             <span className="text-body-small-default text-[var(--content-tertiary)]">
-              You can send it with logs while the Doctor keeps looking for a fix
-              or workaround here.
+              {t("doctorChatBlocks.feedbackBody")}
             </span>
           </div>
         </div>
@@ -396,7 +422,7 @@ export function FeedbackPromptBlock({
             onClick={onOpenFeedback}
             leftIcon={<MessageSquareText />}
           >
-            Share Feedback
+            {t("doctorChatBlocks.shareFeedback")}
           </Button>
         </div>
       </div>
@@ -415,6 +441,8 @@ export function UserOutcomePromptBlock({
   onRespond: (resolved: boolean) => void;
   disabled?: boolean;
 }) {
+  const { t } = useTranslation("settings");
+
   return (
     <div className="rounded-lg border border-[var(--border-base)] bg-[var(--surface-lift)] p-4">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
@@ -430,12 +458,12 @@ export function UserOutcomePromptBlock({
             {answer === "resolved" ? (
               <>
                 <ThumbsUp className="h-4 w-4 text-[var(--system-positive-strong)]" />
-                Glad it&apos;s solved!
+                {t("doctorChatBlocks.gladSolved")}
               </>
             ) : (
               <>
                 <ThumbsDown className="h-4 w-4" />
-                Not solved
+                {t("doctorChatBlocks.notSolved")}
               </>
             )}
           </span>
@@ -446,16 +474,16 @@ export function UserOutcomePromptBlock({
               onClick={() => onRespond(true)}
               disabled={disabled}
               iconOnly={<ThumbsUp />}
-              aria-label="Yes, my problem is solved"
-              title="Yes, my problem is solved"
+              aria-label={t("doctorChatBlocks.solvedAria")}
+              title={t("doctorChatBlocks.solvedAria")}
             />
             <Button
               variant="outlined"
               onClick={() => onRespond(false)}
               disabled={disabled}
               iconOnly={<ThumbsDown />}
-              aria-label="No, my problem is not solved"
-              title="No, my problem is not solved"
+              aria-label={t("doctorChatBlocks.notSolvedAria")}
+              title={t("doctorChatBlocks.notSolvedAria")}
             />
           </div>
         )}
@@ -470,7 +498,7 @@ export function UserOutcomePromptBlock({
 
 export function UserMessage({ entry }: { entry: ChatEntry }) {
   return (
-    <div className="group/msg flex items-start justify-end gap-1.5">
+    <div data-reveal-row="" className="flex items-start justify-end gap-1.5">
       <div className="flex shrink-0 items-center self-center">
         <MessageCopyButton text={entry.content} />
       </div>
@@ -481,11 +509,22 @@ export function UserMessage({ entry }: { entry: ChatEntry }) {
   );
 }
 
+/**
+ * The design-library default anchor is web-only, so doctor's links have to
+ * carry the app's external-link behaviour themselves to stay alive in the
+ * native shells.
+ */
+const DoctorLink: MarkdownLinkComponent = ({ href, children }) => (
+  <ExternalAnchor href={href} className={EXTERNAL_LINK_CLASS}>
+    {children}
+  </ExternalAnchor>
+);
+
 export function AssistantMessage({ entry }: { entry: ChatEntry }) {
   return (
-    <div className="group/msg flex items-start justify-start gap-1.5">
+    <div data-reveal-row="" className="flex items-start justify-start gap-1.5">
       <div className="w-full text-chat text-[var(--content-default)]">
-        <MarkdownMessage content={entry.content} />
+        <MarkdownMessage content={entry.content} linkComponent={DoctorLink} />
       </div>
       <div className="flex shrink-0 items-center pt-0.5">
         <MessageCopyButton text={entry.content} />

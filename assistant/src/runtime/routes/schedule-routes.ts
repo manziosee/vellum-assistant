@@ -5,6 +5,9 @@
  * the shared ROUTES array.
  */
 
+import { statSync } from "node:fs";
+import { join } from "node:path";
+
 import { z } from "zod";
 
 import { getOrCreateConversation } from "../../daemon/conversation-store.js";
@@ -15,8 +18,11 @@ import {
   getUsageCostForRun,
   listRunConversationIds,
 } from "../../persistence/llm-usage-store.js";
+import { isPluginDisabled } from "../../plugins/disabled-state.js";
 import { isDeferSchedule } from "../../schedule/defer-provenance.js";
 import { validateScheduleInferenceProfile } from "../../schedule/inference-profile.js";
+import { pluginScheduleSourceAvailable } from "../../schedule/plugin-schedule-availability.js";
+import { isPluginSchedulesEnabled } from "../../schedule/plugin-schedules-gate.js";
 import {
   describeRRuleExpression,
   isSingleFireRRule,
@@ -36,9 +42,11 @@ import {
   getLastScheduleConversationId,
   getSchedule,
   getScheduleRuns,
+  isEngineLatched,
   listSchedules,
   resolveScheduleConversationGroupId,
   type ScheduleJob,
+  setUserEnabled,
   updateSchedule,
 } from "../../schedule/schedule-store.js";
 import { getScheduleUsageSummaries } from "../../schedule/schedule-usage-store.js";
@@ -46,6 +54,7 @@ import { buildWakeScheduleOptions } from "../../schedule/wake-schedule-options.j
 import { initializeTools } from "../../tools/registry.js";
 import { UserError } from "../../util/errors.js";
 import { getLogger } from "../../util/logger.js";
+import { getWorkspacePluginsDir } from "../../util/platform.js";
 import { normalizeCapabilityManifest } from "../../workflows/capabilities.js";
 import { getWorkflowRunManager } from "../../workflows/run-manager.js";
 import { isOwnerCaller } from "../auth/owner-caller.js";
@@ -105,6 +114,76 @@ async function assertWakeMutationAllowed(
 // Response schemas (shared by all schedule routes)
 // ---------------------------------------------------------------------------
 
+const DISARM_REASONS = [
+  "user_disabled",
+  "plugin_removed",
+  "plugin_disabled",
+  "declaration_removed",
+  "declaration_disabled",
+] as const;
+
+type DisarmReason = (typeof DISARM_REASONS)[number];
+
+/**
+ * Why a plugin-sourced schedule sits disarmed, so a client can say so instead
+ * of showing an off row with no explanation.
+ *
+ * Only a sourced row that is off can have one, which also bounds the disk
+ * probes below to those rows. The first matching cause wins, ordered so the
+ * most specific answer comes first: the user's own override outranks anything
+ * the plugin's files say, a plugin that is gone outranks one that is merely
+ * disabled, and a declaration that is gone outranks one that is still there.
+ * `declaration_disabled` is the fallback the plugin's own files account for:
+ * a declared `enabled: false`, a declaration too broken to arm, or a manifest
+ * that no longer parses.
+ *
+ * Two off states never get a reason, because in neither did the plugin's files
+ * turn the schedule off. A row the engine latched (a fired or cancelled
+ * one-shot, a bounded recurrence the claim path exhausted) is a schedule that
+ * finished, not one that is paused. And when the `plugin-schedules` kill switch
+ * is off the reconciler disarms every sourced row regardless of what its
+ * declaration says, so no per-row cause is the true one. Both return null, and
+ * clients show the row like any other schedule that is off.
+ */
+function deriveDisarmReason(
+  job: Pick<
+    ScheduleJob,
+    | "sourceKey"
+    | "enabled"
+    | "userEnabled"
+    | "status"
+    | "nextRunAt"
+    | "lastRunAt"
+  >,
+): DisarmReason | null {
+  if (job.sourceKey === null || job.enabled) {
+    return null;
+  }
+  if (job.userEnabled === false) {
+    return "user_disabled";
+  }
+  if (isEngineLatched(job) || !isPluginSchedulesEnabled()) {
+    return null;
+  }
+  const match = /^plugin:([^/]+)\/(.+)$/.exec(job.sourceKey);
+  if (!match) {
+    return null;
+  }
+  const [, pluginName, scheduleName] = match;
+  const pluginDir = join(getWorkspacePluginsDir(), pluginName!);
+  if (!statSync(pluginDir, { throwIfNoEntry: false })?.isDirectory()) {
+    return "plugin_removed";
+  }
+  if (isPluginDisabled(pluginName!)) {
+    return "plugin_disabled";
+  }
+  const declarationDir = join(pluginDir, "schedules", scheduleName!);
+  if (!statSync(declarationDir, { throwIfNoEntry: false })?.isDirectory()) {
+    return "declaration_removed";
+  }
+  return "declaration_disabled";
+}
+
 const scheduleSchema = z.object({
   id: z.string(),
   name: z.string(),
@@ -135,7 +214,30 @@ const scheduleSchema = z.object({
   reuseConversation: z.boolean(),
   wakeConversationId: z.string().nullable(),
   workflowName: z.string().nullable(),
+  sourceKey: z
+    .string()
+    .nullable()
+    .describe(
+      "Plugin declaration this schedule mirrors (plugin:<pluginName>/<scheduleName>); null for user-created schedules",
+    ),
+  userEnabled: z
+    .boolean()
+    .nullable()
+    .describe(
+      "User enable/disable override on a plugin-sourced schedule; null when the declaration's own enabled value applies. Always null for user-created schedules.",
+    ),
+  disarmReason: z
+    .enum(DISARM_REASONS)
+    .nullable()
+    .describe(
+      "Why a plugin-sourced schedule is off: the user turned it off, the plugin is gone, the plugin is disabled, the declaration is gone, or the plugin's own files turned it off. Null whenever the schedule is on, and always null for user-created schedules.",
+    ),
   isOneShot: z.boolean(),
+  // A deferred wake ("remind me about this tomorrow") is an ordinary schedule
+  // row created by the defer path, distinguishable only by `createdBy`, which
+  // is not otherwise projected. Clients need it to separate the user's named
+  // schedules from their reminders when listing what a change affects.
+  isDeferred: z.boolean(),
 });
 
 const scheduleRunSchema = z.object({
@@ -219,6 +321,15 @@ function getCadenceDescription(
 }
 
 /**
+ * Whether a schedule still has a firing ahead of it. `fired` and `cancelled`
+ * are the two terminal states a one-shot lands in; everything else (including
+ * a disabled row, which fires again once re-enabled) can still run.
+ */
+function canScheduleStillRun(job: Pick<ScheduleJob, "status">): boolean {
+  return job.status !== "fired" && job.status !== "cancelled";
+}
+
+/**
  * Presentation-layer one-shot flag. A COUNT=1 rrule fires exactly once and
  * should read as one-time in clients, even though the scheduler internally
  * treats expression-backed jobs as recurring (retry policy, conversation
@@ -271,13 +382,20 @@ function serializeSchedule(
     reuseConversation: j.reuseConversation,
     wakeConversationId: j.wakeConversationId,
     workflowName: j.workflowName,
+    sourceKey: j.sourceKey,
+    userEnabled: j.userEnabled,
+    disarmReason: deriveDisarmReason(j),
     isOneShot: isOneShotForDisplay(j),
+    isDeferred: isDeferSchedule(j.createdBy),
   };
 }
 
 function handleListSchedules(queryParams: Record<string, string>) {
   const includeAll = queryParams.include_all === "true";
-  const jobs = listSchedules();
+  const inferenceProfile = queryParams.inference_profile?.trim();
+  const jobs = listSchedules(
+    inferenceProfile ? { inferenceProfile } : undefined,
+  );
   const filtered = includeAll
     ? jobs
     : jobs.filter((j) => !isDeferSchedule(j.createdBy));
@@ -298,6 +416,88 @@ function handleGetSchedule(id: string) {
     throw new NotFoundError("Schedule not found");
   }
   return { schedule: serializeSchedule(job, new Map()) };
+}
+
+/**
+ * Move schedules onto the `to` inference profile.
+ *
+ * `from` narrows the move to the schedules pinned to that profile. It is the
+ * companion to deleting an inference profile: without it the profile's
+ * schedules keep a pin that no longer names anything. The dangling pin is not
+ * fatal (the resolver drops a missing override and falls through to the call
+ * site's own selection), so this exists to keep the user's stated model choice
+ * rather than to prevent a failure.
+ *
+ * Omitting `from` selects every schedule that can still run, which is what
+ * re-pinning the whole set onto the current default needs: schedules pinned by
+ * earlier defaults name several different profiles, so there is no single
+ * source to move from. A one-shot that already fired and a cancelled row are
+ * left out: their profile is history, and rewriting them would report a move
+ * larger than the set the user was looking at. An explicit `from` still
+ * selects exactly the rows pinned to it, dead or not, since a deleted profile
+ * has to be swept out of every row that names it. Rows already pinned to `to`
+ * are skipped either way, so the returned count is the number of schedules
+ * whose model actually changed.
+ *
+ * Each row goes through `updateSchedule`, so the store's profile validation
+ * and re-snapshot semantics apply exactly as they do to a single-row PATCH.
+ * Deferred-wake rows are moved too, since a defer inherits the profile of the
+ * conversation it was created in and would otherwise be the one row left
+ * dangling. Callers that warn a user before deleting a profile must count
+ * those rows as well, which is what `include_all` plus the serialized
+ * `isDeferred` flag on the list route are for. Moving one is a guardian-owned
+ * state change, so the whole call requires owner authority as soon as a wake
+ * row is in the selected set.
+ */
+async function handleReassignScheduleInferenceProfile(
+  body: Record<string, unknown>,
+  headers?: Record<string, string>,
+) {
+  const hasFrom = body.from !== undefined && body.from !== null;
+  const from = typeof body.from === "string" ? body.from.trim() : "";
+  const to = typeof body.to === "string" ? body.to.trim() : "";
+  if (hasFrom && !from) {
+    throw new BadRequestError(
+      "from must name an inference profile when provided",
+    );
+  }
+  if (!to) {
+    throw new BadRequestError("to is required");
+  }
+  // `to` must name a configured profile; `from` deliberately is not validated
+  // so an already-deleted profile's leftover pins can still be swept up.
+  const profileError = validateScheduleInferenceProfile(to);
+  if (profileError) {
+    throw new BadRequestError(profileError);
+  }
+
+  const selected = hasFrom
+    ? listSchedules({ inferenceProfile: from })
+    : listSchedules().filter(canScheduleStillRun);
+  const matches = selected.filter((job) => job.inferenceProfile !== to);
+  // The guard depends only on the caller, so its answer is the same for every
+  // row: settle it once for the whole set. Checking per row would spend a
+  // cache-bypassing gateway round trip per matching reminder, and a profile
+  // that many reminders point at would take seconds to move or time out.
+  // All-or-nothing either way: one wake row in scope refuses the whole call
+  // before anything moves.
+  const wakeMatch = matches.find((job) => job.mode === "wake") ?? null;
+  await assertWakeMutationAllowed(wakeMatch, undefined, headers);
+
+  let reassigned = 0;
+  for (const job of matches) {
+    const updated = await updateSchedule(job.id, { inferenceProfile: to });
+    if (updated) {
+      reassigned += 1;
+    }
+  }
+  if (reassigned > 0) {
+    log.info(
+      { from: hasFrom ? from : null, to, reassigned },
+      "Schedules reassigned to new profile",
+    );
+  }
+  return { reassigned };
 }
 
 async function handleCreateSchedule(body: Record<string, unknown>) {
@@ -382,6 +582,7 @@ async function handleCreateSchedule(body: Record<string, unknown>) {
         timezone,
         expression: normalized.expression,
         syntax: normalized.syntax,
+        inferenceProfile,
       });
       log.info(
         { id: job.id, name: job.name, workflowName },
@@ -420,6 +621,7 @@ async function handleCreateSchedule(body: Record<string, unknown>) {
         expression: normalized.expression,
         syntax: normalized.syntax,
         timeoutMs,
+        inferenceProfile,
       });
       log.info({ id: job.id, name: job.name }, "Script schedule created");
       return { schedule: serializeSchedule(job, new Map()) };
@@ -468,7 +670,9 @@ async function handleToggleSchedule(
   // enabled, with no further caller involvement.
   await assertWakeMutationAllowed(getSchedule(id), undefined, headers);
 
-  const updated = await updateSchedule(id, { enabled });
+  // One endpoint serves both kinds of row: imperative schedules take the
+  // plain enabled write, plugin-sourced ones record the user_enabled override.
+  const updated = await setUserEnabled(id, enabled);
   if (!updated) {
     throw new NotFoundError("Schedule not found");
   }
@@ -481,7 +685,18 @@ async function handleDeleteSchedule(
   headers?: Record<string, string>,
 ) {
   await assertWakeMutationAllowed(getSchedule(id), undefined, headers);
-  const removed = await deleteSchedule(id);
+  let removed: boolean;
+  try {
+    removed = await deleteSchedule(id);
+  } catch (err) {
+    // Store-layer refusals (e.g. plugin-sourced rows, which only the plugin's
+    // schedule file can remove) are caller mistakes with an actionable
+    // message, not daemon faults.
+    if (err instanceof UserError) {
+      throw new BadRequestError(err.message);
+    }
+    throw err;
+  }
   if (!removed) {
     throw new NotFoundError("Schedule not found");
   }
@@ -494,7 +709,18 @@ async function handleCancelSchedule(
   headers?: Record<string, string>,
 ) {
   await assertWakeMutationAllowed(getSchedule(id), undefined, headers);
-  const cancelled = await cancelSchedule(id);
+  let cancelled: boolean;
+  try {
+    cancelled = await cancelSchedule(id);
+  } catch (err) {
+    // Store-layer refusals (plugin-sourced rows, for which cancellation is a
+    // permanent latch) are caller mistakes with an actionable message, not
+    // daemon faults.
+    if (err instanceof UserError) {
+      throw new BadRequestError(err.message);
+    }
+    throw err;
+  }
   if (!cancelled) {
     throw new NotFoundError("Schedule not found or not cancellable");
   }
@@ -625,8 +851,8 @@ async function handleUpdateSchedule(
     }
   }
 
-  // Inference profile: null clears the override (back to the default
-  // main-agent model selection); a string must name a configured profile.
+  // Inference profile: null re-pins to the currently resolved default; a
+  // string must name a configured profile.
   if ("inferenceProfile" in body) {
     const inferenceProfile = body.inferenceProfile;
     if (inferenceProfile !== null && typeof inferenceProfile !== "string") {
@@ -761,6 +987,12 @@ export const ROUTES: RouteDefinition[] = [
         description:
           "When 'true', include deferred schedules that are normally hidden.",
       },
+      {
+        name: "inference_profile",
+        schema: { type: "string" },
+        description:
+          "Return only schedules pinned to this inference profile (llm.profiles key).",
+      },
     ],
     responseBody: z.object({
       schedules: z.array(scheduleSchema).describe("Schedule objects"),
@@ -802,8 +1034,38 @@ export const ROUTES: RouteDefinition[] = [
     handler: ({ queryParams }: RouteHandlerArgs) =>
       handleScheduleUsageSummary(queryParams ?? {}),
   },
-  // Must stay after literal `schedules/*` GET siblings (e.g. usage-summary):
-  // the router matches in declaration order and `:id` would shadow them.
+  {
+    operationId: "reassignScheduleInferenceProfile",
+    endpoint: "schedules/reassign-profile",
+    method: "POST",
+    policy: {
+      requiredScopes: ["settings.write"],
+      allowedPrincipalTypes: ACTOR_PRINCIPALS,
+    },
+    summary: "Reassign schedules to another inference profile",
+    description:
+      "Move schedules onto one inference profile. Pass 'from' to move only the schedules pinned to that profile, so deleting a profile does not leave its schedules pointing at a name that no longer exists. Omit 'from' to move every schedule, which re-pins the whole set onto one profile. Schedules already pinned to the target are skipped.",
+    tags: ["schedules"],
+    requestBody: z.object({
+      from: z
+        .string()
+        .optional()
+        .describe(
+          "Inference profile key the schedules are pinned to now; omit to select every schedule",
+        ),
+      to: z
+        .string()
+        .describe("Inference profile key to move them to; must be configured"),
+    }),
+    responseBody: z.object({
+      reassigned: z.number().describe("Number of schedules moved"),
+    }),
+    handler: ({ body, headers }: RouteHandlerArgs) =>
+      handleReassignScheduleInferenceProfile(body ?? {}, headers),
+  },
+  // Must stay after literal `schedules/*` siblings (e.g. usage-summary,
+  // reassign-profile): the router matches in declaration order and `:id`
+  // would shadow them.
   {
     operationId: "getSchedule",
     endpoint: "schedules/:id",
@@ -882,7 +1144,7 @@ export const ROUTES: RouteDefinition[] = [
         .string()
         .nullable()
         .describe(
-          "Inference profile (llm.profiles key) the schedule's runs use. Omitted or null = default, i.e. the mainAgent call-site model selection.",
+          "Inference profile (llm.profiles key) the schedule's runs use. Omitted or null pins the schedule to the currently resolved default profile, so its model does not move when that default changes. Workflow-mode schedules resolve a model per workflow step, so the pin is recorded but does not govern their runs.",
         )
         .optional(),
     }),
@@ -919,7 +1181,8 @@ export const ROUTES: RouteDefinition[] = [
       allowedPrincipalTypes: ACTOR_PRINCIPALS,
     },
     summary: "Toggle schedule",
-    description: "Enable or disable a schedule.",
+    description:
+      "Enable or disable a schedule. On a plugin-managed schedule this records the user's override (userEnabled).",
     tags: ["schedules"],
     requestBody: z.object({
       enabled: z.boolean().describe("New enabled state"),
@@ -1002,7 +1265,7 @@ export const ROUTES: RouteDefinition[] = [
         .string()
         .nullable()
         .describe(
-          "Inference profile (llm.profiles key) the schedule's runs use; null clears it back to the default mainAgent call-site model selection",
+          "Inference profile (llm.profiles key) the schedule's runs use; null re-pins the schedule to the currently resolved default profile. Workflow-mode schedules resolve a model per workflow step, so the pin is recorded but does not govern their runs.",
         )
         .optional(),
     }),
@@ -1038,7 +1301,8 @@ export const ROUTES: RouteDefinition[] = [
       allowedPrincipalTypes: ACTOR_PRINCIPALS,
     },
     summary: "Run schedule now",
-    description: "Trigger an immediate execution of a schedule.",
+    description:
+      "Trigger an immediate execution of a schedule. A plugin-sourced schedule is rejected with a 400 when its plugin is disabled or no longer declares it.",
     tags: ["schedules"],
     responseBody: z.object({
       schedules: z.array(scheduleSchema).describe("Updated schedule list"),
@@ -1055,6 +1319,27 @@ async function handleRunScheduleNow(
   const schedule = getSchedule(id);
   if (!schedule) {
     throw new NotFoundError("Schedule not found");
+  }
+
+  // A plugin-sourced row runs the plugin's own script or prompt, so run-now is
+  // only offered while that plugin is something the runtime would activate.
+  // `pluginScheduleSourceAvailable` covers a plugin the daemon never
+  // activated, a disabled plugin, an unreadable or invalid manifest, and a
+  // declaration that is simply gone. Turning the feature flag off retires the
+  // surface wholesale and takes the same path. The row can still be armed at
+  // this point, because the reconciler that disarms it runs on its own
+  // schedule.
+  // Routes are served by the daemon, so the activation half of the probe reads
+  // a live ledger here. Paths that run in worker processes cannot ask that
+  // question and use the on-disk probe alone.
+  if (
+    schedule.sourceKey !== null &&
+    (!isPluginSchedulesEnabled() ||
+      !(await pluginScheduleSourceAvailable(schedule.sourceKey)))
+  ) {
+    throw new BadRequestError(
+      "This schedule's plugin is disabled or no longer declares it, so it cannot be run.",
+    );
   }
 
   // ── Script mode (shell command, no LLM) ──────────────────────────

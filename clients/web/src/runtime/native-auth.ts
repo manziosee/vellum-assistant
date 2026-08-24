@@ -7,8 +7,10 @@ import {
 } from "@/domains/account/social-auth";
 import { sanitizeReturnTo } from "@/domains/account/return-to";
 import { getSession } from "@/lib/auth/allauth-client";
+import { hasOnboardedAssistant } from "@/domains/onboarding/onboarded-assistant";
 import { resolveSignupCheckoutDestination } from "@/lib/billing/post-auth-checkout";
 import { isPlatformLocal, startLoopbackAuth } from "@/lib/auth/loopback-auth";
+import { useResolvedAssistantsStore } from "@/stores/resolved-assistants-store";
 import { isLocalClient } from "@/lib/local-mode";
 import { isElectron } from "@/runtime/is-electron";
 import { setMenuPlatformSession } from "@/runtime/menu";
@@ -54,6 +56,15 @@ const NativeAuth = registerPlugin<NativeAuthPlugin>("NativeAuth");
 
 /** Fallback destination after a successful native login. */
 const DEFAULT_POST_AUTH_DESTINATION = routes.assistant;
+
+const desktopUpdateRequiredAuthError = (): Error => {
+  const error = new Error(
+    "The desktop auth bridge is unavailable. Update the app to sign in.",
+  ) as Error & { code: string; data: { authError: string } };
+  error.code = "AUTH_ERROR";
+  error.data = { authError: "desktop_update_required" };
+  return error;
+};
 
 // True while the Electron OAuth flow awaits its deep-link callback. The
 // redirect refocuses the window before the code exchange finishes, so the
@@ -275,26 +286,47 @@ export function getSessionTokenFromCookies(): string | null {
 /**
  * Post-auth destination for the native (Capacitor/Electron) flows. Delegates
  * the signup checkout-stash + destination decision to the shared
- * `resolveSignupCheckoutDestination`, which both this path and the web
- * `resolvePostAuth` path use: a signup routes through consent (privacy) first,
- * stashing any pricing-CTA checkout package so the consent screen resumes
- * checkout afterward, and any non-checkout auth discards a stale stash. A login
- * keeps its `returnTo` (the callers below sanitize and apply the fallback).
+ * `resolveSignupCheckoutDestination`. A first-run signup routes through
+ * consent (privacy) first. An already-onboarded assistant skips privacy and
+ * research. A login keeps its `returnTo` unless that target is the first-run
+ * funnel and the assistant is already onboarded.
  */
 export function resolveNativePostAuthDestination(
   intent: string | undefined,
   returnTo: string | null | undefined,
 ): string | null {
   const isSignup = intent === "signup";
+  const alreadyOnboarded = hasOnboardedAssistant(
+    useResolvedAssistantsStore.getState().assistants,
+  );
+  if (alreadyOnboarded) {
+    const skipTarget = isFirstRunOnboardingReturnTo(returnTo)
+      ? routes.assistant
+      : (returnTo ?? (isSignup ? routes.assistant : null));
+    resolveSignupCheckoutDestination({
+      intent: "login",
+      returnTo: skipTarget ?? "",
+    });
+    return skipTarget;
+  }
   const destination = resolveSignupCheckoutDestination({
     intent: isSignup ? "signup" : "login",
     returnTo: returnTo ?? "",
   });
-  // A signup takes the shared destination (privacy, resuming checkout after
-  // consent). A login keeps its raw `returnTo` — the callers below sanitize
-  // and apply the fallback — while still discarding a stale stash via the
-  // shared resolver.
   return isSignup ? destination : (returnTo ?? null);
+}
+
+function isFirstRunOnboardingReturnTo(
+  returnTo: string | null | undefined,
+): boolean {
+  if (!returnTo) {
+    return false;
+  }
+  const pathname = returnTo.split(/[?#]/)[0] ?? returnTo;
+  return (
+    pathname === routes.onboarding.privacy ||
+    pathname === routes.onboarding.research
+  );
 }
 
 /**
@@ -367,12 +399,12 @@ export async function startAuthFlow(
     return;
   }
 
-  // Desktop (Electron): open the system browser for OAuth so the user can
-  // leverage existing Google/Apple sessions. The main process handles the
-  // full flow (nonce, browser, deep-link callback, code exchange, cookie
-  // install) and returns the session token. Falls through to the web
-  // form-POST path when the bridge method is absent (older preload).
-  if (isElectron() && window.vellum?.auth?.startOAuth) {
+  // Electron requires the native OAuth bridge. The web and CLI callback
+  // fallbacks have no receiver inside the desktop shell.
+  if (isElectron()) {
+    if (!window.vellum?.auth?.startOAuth) {
+      throw desktopUpdateRequiredAuthError();
+    }
     oauthFlowInFlight = true;
     try {
       const result = await window.vellum.auth.startOAuth({

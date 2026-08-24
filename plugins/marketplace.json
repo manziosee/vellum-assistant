@@ -215,6 +215,19 @@
       "icon": "📣"
     },
     {
+      "name": "imessage",
+      "source": {
+        "source": "github",
+        "repo": "vellum-ai/imessage",
+        "ref": "069a8375e2a6ed069550866114a653218864bc91"
+      },
+      "description": "iMessage and SMS channel for the Vellum assistant, backed by a Photon line.",
+      "category": "productivity",
+      "homepage": "https://github.com/vellum-ai/imessage",
+      "license": "MIT",
+      "icon": "📲"
+    },
+    {
       "name": "kitchen-companion",
       "source": {
         "source": "github",
@@ -232,7 +245,7 @@
       "source": {
         "source": "github",
         "repo": "vellum-ai/level-up",
-        "ref": "d3cbb50f8aba1f8320cd2d59ea3a85d0a4e9210b"
+        "ref": "4357028acc339c6d6f718d5d6ab279ebf198673b"
       },
       "description": "Surfaces a first-class \"Level Up\" diff card whenever the assistant edits its own skills or plugins, so you can see how it improved itself after the fact.",
       "category": "developer",
@@ -291,6 +304,19 @@
       "homepage": "https://github.com/vellum-ai/motion-design",
       "license": "MIT",
       "icon": "🎬"
+    },
+    {
+      "name": "natural",
+      "source": {
+        "source": "github",
+        "repo": "vellum-ai/natural",
+        "ref": "3cfc8c97c14df311fc64992ab8b172c1b2d64eb0"
+      },
+      "description": "Hosted MCP access to Natural payment operations for Vellum assistants.",
+      "category": "finance",
+      "homepage": "https://www.natural.com",
+      "license": "MIT",
+      "icon": "💳"
     },
     {
       "name": "originkit",
@@ -421,6 +447,19 @@
       "homepage": "https://github.com/AnitaKirkovska/travel-planner",
       "license": "MIT",
       "icon": "✈️"
+    },
+    {
+      "name": "unabyss",
+      "source": {
+        "source": "github",
+        "repo": "Unabyss/unabyss-vellum",
+        "ref": "9f0bb0753dad09dace8578e242961bc2da912af3"
+      },
+      "description": "Personal and company context from Unabyss, available to your agent through the Unabyss MCP server.",
+      "category": "memory",
+      "homepage": "https://unabyss.com",
+      "license": "MIT",
+      "icon": "🌊"
     },
     {
       "name": "vellum-client-qa",

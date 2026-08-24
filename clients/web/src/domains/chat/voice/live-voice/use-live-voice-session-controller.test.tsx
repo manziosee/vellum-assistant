@@ -55,7 +55,24 @@ mock.module("@/runtime/native-audio-session", () => ({
   },
 }));
 
+// Spread over the real module rather than listing three exports, because
+// `mock.module` replaces a module *wholesale*: anything the controller's graph
+// imports from here and this factory omits fails to resolve at import time, as
+// a `SyntaxError` naming an export that plainly does exist. The graph grows on
+// its own — the island's control handler reaching `confirmation-actions` pulled
+// in `api/messages`, and with it `detectClientOs` — so enumerating exports here
+// makes an unrelated import a test failure. Only the three platform predicates
+// need to be steerable; the rest should behave normally.
+const actualPlatformDetection = await import("@/runtime/platform-detection");
+
+// Voice entry preflights readiness before a session opens; stub it ready so
+// the controller's drain tests stay about the starter. See `voice-entry-guards`.
+mock.module("@/domains/chat/voice/live-voice/live-voice-preflight-api", () => ({
+  preflightLiveVoice: async () => ({ status: "ready" }),
+}));
+
 mock.module("@/runtime/platform-detection", () => ({
+  ...actualPlatformDetection,
   isNativeAndroid: () => onNativeAndroid,
   isNativeIOS: () => onNativeIOS,
   isNativeMobile: () => onNativeAndroid || onNativeIOS,
@@ -96,7 +113,9 @@ const { useLiveVoiceStore } =
 // Harness
 // ---------------------------------------------------------------------------
 
-function renderPersistentController() {
+function renderPersistentController(
+  configureCapture?: (capture: FakeCapture) => void,
+) {
   // One client/capture pair per started session, like the real factories.
   const clients: FakeClient[] = [];
   const captures: FakeCapture[] = [];
@@ -115,6 +134,7 @@ function renderPersistentController() {
       createPlayer: () => player as unknown as LiveVoiceAudioPlayer,
       createCapture: (options) => {
         const capture = new FakeCapture(options);
+        configureCapture?.(capture);
         captures.push(capture);
         return capture as unknown as LiveVoiceAudioCapture;
       },
@@ -165,6 +185,10 @@ beforeEach(() => {
   useVoicePrefsStore.setState({
     pauseBeforeReplyMs: null,
     interruptSensitivity: null,
+    // A first-ever voice entry gets the preferences card rather than a session
+    // (see `voice-entry-guards`); the drain tests here are about the starter,
+    // so they run as a user who has entered voice before.
+    firstRunSeen: true,
   });
   __resetPendingDeepLinkForTesting();
   useAssistantIdentityStore.setState({ assistantId: null, version: null });
@@ -405,6 +429,71 @@ describe("native audio session", () => {
       await Promise.resolve();
     });
     expect(deactivateVoiceAudioSession).toHaveBeenCalledTimes(1);
+  });
+
+  test("Android starts background voice only after microphone capture succeeds", async () => {
+    onNativeAndroid = true;
+    const h = renderPersistentController((capture) => {
+      capture.deferStart = true;
+    });
+
+    await act(async () => {
+      useLiveVoiceStore.getState().starter?.start("assistant-1", "conv-1");
+      await Promise.resolve();
+    });
+    expect(useLiveVoiceStore.getState().state).toBe("connecting");
+    expect(activateVoiceAudioSession).not.toHaveBeenCalled();
+
+    await act(async () => {
+      h.lastCapture().resolveStart();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(activateVoiceAudioSession).toHaveBeenCalledTimes(1);
+  });
+
+  test("Android keeps background voice active while reconnecting", async () => {
+    onNativeAndroid = true;
+    const h = renderPersistentController();
+    await startListeningViaStarter(h);
+
+    await act(async () => {
+      useLiveVoiceStore.getState().setMicrophoneActive(false);
+      useLiveVoiceStore.getState().setState("connecting");
+      await Promise.resolve();
+    });
+
+    expect(activateVoiceAudioSession).toHaveBeenCalledTimes(1);
+    expect(deactivateVoiceAudioSession).not.toHaveBeenCalled();
+  });
+
+  test("Android preserves a pending background activation across reconnects", async () => {
+    onNativeAndroid = true;
+    let finishActivation: ((activated: boolean) => void) | undefined;
+    activateVoiceAudioSession.mockImplementation(
+      () =>
+        new Promise<boolean>((resolve) => {
+          finishActivation = resolve;
+        }),
+    );
+    renderPersistentController();
+
+    await act(async () => {
+      useLiveVoiceStore.getState().starter?.start("assistant-1", "conv-1");
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(activateVoiceAudioSession).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      useLiveVoiceStore.getState().setMicrophoneActive(false);
+      useLiveVoiceStore.getState().setState("connecting");
+      await Promise.resolve();
+      finishActivation?.(true);
+      await Promise.resolve();
+    });
+
+    expect(deactivateVoiceAudioSession).not.toHaveBeenCalled();
   });
 
   test("Android caps denied focus retries per session", async () => {

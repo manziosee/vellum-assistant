@@ -7,8 +7,15 @@
  * inode, leaving two daemons in conflict with no error.
  */
 
-import { existsSync, unlinkSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { connect } from "node:net";
+
+import {
+  isNamedPipePath,
+  removeIpcEndpointFile,
+} from "@vellumai/ipc-server-utils";
+
+import { makeAddrInUseError } from "../daemon/startup-error.js";
 
 /**
  * Maximum time to wait for the probe `connect()` to settle before declaring
@@ -19,17 +26,6 @@ import { connect } from "node:net";
  * case.
  */
 const PROBE_CONNECT_TIMEOUT_MS = 2000;
-
-/**
- * Build an `EADDRINUSE`-coded error so callers (and `categorizeDaemonError`)
- * can branch on `err.code` and surface the structured "already running"
- * guidance instead of a generic UNKNOWN.
- */
-function makeAddrInUseError(message: string): NodeJS.ErrnoException {
-  const err = new Error(message) as NodeJS.ErrnoException;
-  err.code = "EADDRINUSE";
-  return err;
-}
 
 /**
  * Probe-connect to `socketPath`. Behavior:
@@ -44,7 +40,8 @@ function makeAddrInUseError(message: string): NodeJS.ErrnoException {
  *   - Any other socket error → propagate.
  */
 export async function ensureSocketPathFree(socketPath: string): Promise<void> {
-  if (!existsSync(socketPath)) {
+  const namedPipe = isNamedPipePath(socketPath);
+  if (!namedPipe && !existsSync(socketPath)) {
     return;
   }
   await new Promise<void>((resolve, reject) => {
@@ -81,11 +78,7 @@ export async function ensureSocketPathFree(socketPath: string): Promise<void> {
     client.once("error", (err: NodeJS.ErrnoException) => {
       if (err.code === "ECONNREFUSED" || err.code === "ENOENT") {
         settle(() => {
-          try {
-            unlinkSync(socketPath);
-          } catch {
-            // Ignore — may already be gone
-          }
+          removeIpcEndpointFile(socketPath);
           resolve();
         });
       } else {

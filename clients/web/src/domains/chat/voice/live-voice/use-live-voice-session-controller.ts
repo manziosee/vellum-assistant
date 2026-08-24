@@ -20,14 +20,15 @@
  * - `starter` — registered here for the lifetime of the mount; the composer's
  *   entry-point mic calls it to start a session. Registering it also drains any
  *   start-voice deep link parked before this mount (see
- *   `start-voice-deep-link.ts`).
+ *   `start-voice-request.ts`).
  * - `controls` (stop/release/interrupt) — registered per-session by
  *   {@link useLiveVoice} itself.
  * - `state`/`error`/transcripts/amplitude — observable session state.
  *
  * It is also where optional native voice accessories are bound to the session:
- * audio focus ({@link useNativeAudioSessionLifecycle}) and the platform status
- * surface ({@link useLiveActivityMirror}).
+ * audio focus ({@link useNativeAudioSessionLifecycle}) and both halves of the
+ * platform status surface — what it shows ({@link useLiveActivityMirror}) and
+ * what its buttons do ({@link useLiveActivityControls}).
  */
 
 import { useEffect } from "react";
@@ -42,7 +43,8 @@ import {
   subscribeSettledLiveVoiceState,
   useLiveVoiceStore,
 } from "@/domains/chat/voice/live-voice/live-voice-store";
-import { drainPendingVoiceStartDeepLink } from "@/domains/chat/voice/live-voice/start-voice-deep-link";
+import { drainPendingVoiceStart } from "@/domains/chat/voice/live-voice/start-voice-request";
+import { useLiveActivityControls } from "@/domains/chat/voice/live-voice/use-live-activity-controls";
 import { useLiveActivityMirror } from "@/domains/chat/voice/live-voice/use-live-activity-mirror";
 import {
   activateVoiceAudioSession,
@@ -69,6 +71,7 @@ function useNativeAudioSessionLifecycle(): void {
   useEffect(() => {
     let wantsAudioFocus = false;
     let hasAudioFocus = false;
+    let activationInFlight = false;
     let reconcilingAudioFocus = false;
     let reconcileRequested = false;
     let activationAttempts = 0;
@@ -88,7 +91,9 @@ function useNativeAudioSessionLifecycle(): void {
               return;
             }
             activationAttempts += 1;
+            activationInFlight = true;
             hasAudioFocus = await activateVoiceAudioSession();
+            activationInFlight = false;
             if (!hasAudioFocus) {
               return;
             }
@@ -106,12 +111,15 @@ function useNativeAudioSessionLifecycle(): void {
     };
 
     const syncAudioFocus = (): void => {
-      const settledState = useLiveVoiceStore.getState().state;
+      const settledSession = useLiveVoiceStore.getState();
+      const settledState = settledSession.state;
       const stateChanged = settledState !== lastSettledState;
       lastSettledState = settledState;
-      const nextWantsAudioFocus = isLiveVoiceSessionActive(
-        settledState,
-      );
+      const nextWantsAudioFocus =
+        isLiveVoiceSessionActive(settledState) &&
+        (settledSession.microphoneActive ||
+          hasAudioFocus ||
+          activationInFlight);
       activationAttempts = nextWantsAudioFocus ? activationAttempts : 0;
       if (
         nextWantsAudioFocus === wantsAudioFocus &&
@@ -183,7 +191,7 @@ export function useLiveVoiceSessionController(
     // A start-voice deep link that arrived before this mount (cold launch from
     // Siri / the Action Button / a Live Activity tap) is parked; now that a
     // starter exists, run it. One-shot, so the re-runs of this effect are free.
-    void drainPendingVoiceStartDeepLink();
+    void drainPendingVoiceStart();
     return () => {
       useLiveVoiceStore.getState().setStarter(null);
     };
@@ -191,4 +199,7 @@ export function useLiveVoiceSessionController(
 
   useNativeAudioSessionLifecycle();
   useLiveActivityMirror();
+  // The island's inbound half. Separate from the mirror because it reaches the
+  // session and the mirror may not; see `use-live-activity-controls.ts`.
+  useLiveActivityControls();
 }

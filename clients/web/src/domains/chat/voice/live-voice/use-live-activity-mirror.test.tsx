@@ -1,6 +1,7 @@
 /**
- * Tests for `useLiveActivityMirror` — the iOS Live Activity mirror of a
- * live-voice session.
+ * Tests for `useLiveActivityMirror`, the out-of-app mirror of a live-voice
+ * session, feeding the iOS Live Activity and the macOS floating panel from one
+ * snapshot.
  *
  * The `runtime/native-live-activity` bridge is stubbed at the module boundary
  * (rather than by faking `isNativeIOS`) so the mirror's own lifecycle and
@@ -32,6 +33,10 @@ import type {
   VoiceLiveActivityContent,
   VoiceLiveActivityStart,
 } from "@/runtime/native-live-activity";
+import type {
+  VoiceActivityContent,
+  VoiceActivityStart,
+} from "@/runtime/is-electron";
 import type { CharacterComponents, CharacterTraits } from "@/types/avatar";
 
 // Typed to the real bridge signatures so the recorded payloads stay checked.
@@ -56,11 +61,13 @@ const subscribeVoiceLiveActivityPushToken = mock(
   },
 );
 const registerLiveActivityPushToken = mock(
-  async (
-    _token: string,
-    _assistantId: string,
-    _conversationId: string,
-  ): Promise<void> => undefined,
+  async (_registration: {
+    token: string;
+    assistantId: string;
+    conversationId: string;
+    accentHex: string;
+    muted: boolean;
+  }): Promise<void> => undefined,
 );
 const unregisterLiveActivityPushToken = mock(
   async (): Promise<void> => undefined,
@@ -96,6 +103,24 @@ mock.module("@/runtime/native-live-activity", () => ({
   updateVoiceLiveActivity,
   endVoiceLiveActivity,
   subscribeVoiceLiveActivityPushToken,
+}));
+
+// The desktop sink: the Electron floating panel's half of the same mirror.
+// Stubbed at the same boundary as the mobile bridge, and for the same reason:
+// its own off-Electron behavior is the runtime module's to pin, while what
+// matters here is that both sinks are driven from one snapshot.
+const startVoiceActivity = mock(
+  (_state: VoiceActivityStart): void => undefined,
+);
+const updateVoiceActivity = mock(
+  (_content: VoiceActivityContent): void => undefined,
+);
+const endVoiceActivity = mock((): void => undefined);
+
+mock.module("@/runtime/desktop-voice-activity", () => ({
+  startVoiceActivity,
+  updateVoiceActivity,
+  endVoiceActivity,
 }));
 
 mock.module(
@@ -188,6 +213,9 @@ beforeEach(() => {
   subscribeVoiceLiveActivityPushToken.mockClear();
   registerLiveActivityPushToken.mockClear();
   unregisterLiveActivityPushToken.mockClear();
+  startVoiceActivity.mockClear();
+  updateVoiceActivity.mockClear();
+  endVoiceActivity.mockClear();
   emitPushToken = null;
 });
 
@@ -221,6 +249,9 @@ describe("starting the activity", () => {
       label: "Connecting…",
       accentHex: ORANGE,
       muted: false,
+      outputMuted: false,
+      detail: "",
+      approvalRequestId: "",
       assistantName: "Ada",
     });
     expect(updateVoiceLiveActivity).not.toHaveBeenCalled();
@@ -332,6 +363,33 @@ describe("starting the activity", () => {
 // ---------------------------------------------------------------------------
 
 describe("updating the activity", () => {
+  test("pushes the activity line the daemon worded", async () => {
+    renderMirror();
+    await setPhase("thinking");
+    updateVoiceLiveActivity.mockClear();
+
+    await settled(() => {
+      useLiveVoiceStore.getState().setActivityLabel("Reading a file");
+    });
+
+    expect(lastUpdatePayload()?.detail).toBe("Reading a file");
+  });
+
+  test("clears the line when the turn stops working", async () => {
+    renderMirror();
+    await setPhase("thinking");
+    await settled(() => {
+      useLiveVoiceStore.getState().setActivityLabel("Reading a file");
+    });
+    updateVoiceLiveActivity.mockClear();
+
+    await settled(() => {
+      useLiveVoiceStore.getState().setActivityLabel("");
+    });
+
+    expect(lastUpdatePayload()?.detail).toBe("");
+  });
+
   test("pushes one update per phase change and none for a repeated phase", async () => {
     renderMirror();
     await setPhase("connecting");
@@ -347,6 +405,9 @@ describe("updating the activity", () => {
       label: "Listening…",
       accentHex: ORANGE,
       muted: false,
+      outputMuted: false,
+      detail: "",
+      approvalRequestId: "",
     });
 
     // Re-publishing the same phase changes no `ContentState` field.
@@ -385,6 +446,26 @@ describe("updating the activity", () => {
     await settled(() => useLiveVoiceStore.getState().setMuted(false));
     expect(updateVoiceLiveActivity).toHaveBeenCalledTimes(2);
     expect(lastUpdatePayload()?.muted).toBe(false);
+  });
+
+  test("pushes the assistant's mute, the other direction of the same pair", async () => {
+    // The island's speaker button is rendered against this. It is the one
+    // content field the APNs path cannot compose (the push registration does
+    // not carry it), which makes the local push the only thing that ever
+    // gets it right.
+    renderMirror();
+    await setPhase("listening");
+
+    await settled(() => useLiveVoiceStore.getState().setOutputMuted(true));
+    expect(updateVoiceLiveActivity).toHaveBeenCalledTimes(1);
+    expect(lastUpdatePayload()?.outputMuted).toBe(true);
+
+    await settled(() => useLiveVoiceStore.getState().setOutputMuted(true));
+    expect(updateVoiceLiveActivity).toHaveBeenCalledTimes(1);
+
+    await settled(() => useLiveVoiceStore.getState().setOutputMuted(false));
+    expect(updateVoiceLiveActivity).toHaveBeenCalledTimes(2);
+    expect(lastUpdatePayload()?.outputMuted).toBe(false);
   });
 
   test("amplitude and transcript churn pushes nothing", async () => {
@@ -489,6 +570,9 @@ describe("a hands-free reconnect", () => {
       label: "Reconnecting…",
       accentHex: ORANGE,
       muted: true,
+      outputMuted: false,
+      detail: "",
+      approvalRequestId: "",
     });
   });
 });
@@ -638,9 +722,13 @@ describe("registering the activity for server-driven updates", () => {
 
     expect(registerLiveActivityPushToken).toHaveBeenCalledTimes(1);
     expect(registerLiveActivityPushToken.mock.calls.at(-1)).toEqual([
-      "token-abc",
-      "assistant-1",
-      "conv-1",
+      {
+        token: "token-abc",
+        assistantId: "assistant-1",
+        conversationId: "conv-1",
+        accentHex: ORANGE,
+        muted: false,
+      },
     ]);
   });
 
@@ -659,7 +747,9 @@ describe("registering the activity for server-driven updates", () => {
     });
 
     expect(registerLiveActivityPushToken).toHaveBeenCalledTimes(1);
-    expect(registerLiveActivityPushToken.mock.calls.at(-1)?.[2]).toBe("conv-9");
+    expect(registerLiveActivityPushToken.mock.calls.at(-1)?.[0]).toMatchObject(
+      { conversationId: "conv-9" },
+    );
   });
 
   // iOS reissues tokens mid-activity and each value invalidates the last, so a
@@ -676,9 +766,31 @@ describe("registering the activity for server-driven updates", () => {
     await emitToken("token-def");
 
     expect(registerLiveActivityPushToken).toHaveBeenCalledTimes(2);
-    expect(registerLiveActivityPushToken.mock.calls.at(-1)?.[0]).toBe(
-      "token-def",
+    expect(registerLiveActivityPushToken.mock.calls.at(-1)?.[0]).toMatchObject(
+      { token: "token-def" },
     );
+  });
+
+  // The platform composes every push from the registration, so a mute the
+  // registration never heard about is a mute the island loses the moment a
+  // server-driven update lands, which is to say the moment it matters.
+  test("re-registers when the mute state changes", async () => {
+    renderMirror();
+    await settled(() => {
+      useLiveVoiceStore.getState().setSessionContext("assistant-1", "conv-1");
+      useLiveVoiceStore.getState().setState("listening");
+    });
+    await emitToken("token-abc");
+    registerLiveActivityPushToken.mockClear();
+
+    await settled(() => {
+      useLiveVoiceStore.getState().setMuted(true);
+    });
+
+    expect(registerLiveActivityPushToken).toHaveBeenCalledTimes(1);
+    expect(registerLiveActivityPushToken.mock.calls.at(-1)?.[0]).toMatchObject({
+      muted: true,
+    });
   });
 
   test("a phase change alone does not re-register", async () => {
@@ -733,5 +845,76 @@ describe("registering the activity for server-driven updates", () => {
     await emitToken("token-abc");
 
     expect(registerLiveActivityPushToken).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The desktop sink
+// ---------------------------------------------------------------------------
+
+/**
+ * The floating panel is fed by the same mirror as the island, from the same
+ * computed snapshot. These pin the fan-out itself (that both sinks see one
+ * payload, on one schedule) rather than re-testing the content rules above,
+ * which are sink-agnostic by construction.
+ */
+describe("the desktop panel sink", () => {
+  test("start reaches both sinks with the identical payload", async () => {
+    renderMirror();
+
+    await setPhase("connecting");
+
+    expect(startVoiceActivity).toHaveBeenCalledTimes(1);
+    expect(startVoiceActivity.mock.calls.at(-1)?.[0]).toEqual(
+      lastStartPayload() as VoiceActivityStart,
+    );
+  });
+
+  test("updates are pushed to the panel on the island's schedule", async () => {
+    renderMirror();
+    await setPhase("connecting");
+
+    await setPhase("listening");
+
+    expect(updateVoiceActivity).toHaveBeenCalledTimes(1);
+    expect(updateVoiceActivity.mock.calls.at(-1)?.[0]).toEqual(
+      lastUpdatePayload() as VoiceActivityContent,
+    );
+  });
+
+  test("content that would not move the island does not reach the panel either", async () => {
+    renderMirror();
+    await setPhase("connecting");
+    updateVoiceActivity.mockClear();
+
+    // A store write the mirror deliberately ignores: same phase, same label,
+    // same everything a surface renders.
+    await settled(() => {
+      useLiveVoiceStore.getState().setState("connecting");
+    });
+
+    expect(updateVoiceActivity).not.toHaveBeenCalled();
+  });
+
+  test("ending the session dismisses the panel", async () => {
+    renderMirror();
+    await setPhase("listening");
+
+    await setPhase("idle");
+
+    expect(endVoiceActivity).toHaveBeenCalledTimes(1);
+  });
+
+  test("unmounting the mirror dismisses the panel", async () => {
+    const view = renderMirror();
+    await setPhase("listening");
+
+    await act(async () => {
+      view.unmount();
+    });
+
+    // A panel that outlives its mirror floats over the desktop showing a phase
+    // nothing is driving.
+    expect(endVoiceActivity).toHaveBeenCalledTimes(1);
   });
 });

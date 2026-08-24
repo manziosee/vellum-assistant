@@ -1,10 +1,14 @@
 import type { ReactNode } from "react";
+import { useTranslation } from "@/i18n";
+
+import { X } from "lucide-react";
 
 import { Button } from "@vellumai/design-library";
 
 interface BillingErrorBannerAction {
   label: string;
   onClick: () => void;
+  disabled?: boolean;
 }
 
 interface BillingErrorBannerProps {
@@ -13,6 +17,14 @@ interface BillingErrorBannerProps {
   title: string;
   subtitle: string;
   action?: BillingErrorBannerAction;
+  /**
+   * Lower-weight action rendered before the primary one. Use it for the escape
+   * hatch that relaxes whatever the banner is enforcing: the filled button
+   * should stay on the route that respects the user's own setting.
+   */
+  secondaryAction?: BillingErrorBannerAction;
+  /** When provided, renders a small dismiss (X) button after the CTA. */
+  onDismiss?: () => void;
   /**
    * Render as a standalone, centered card ~24px narrower than the composer with
    * full rounding, instead of a full-width banner flush-mounted above the
@@ -27,8 +39,11 @@ export function BillingErrorBanner({
   title,
   subtitle,
   action,
+  secondaryAction,
+  onDismiss,
   detached = false,
 }: BillingErrorBannerProps) {
+  const { t } = useTranslation("chat");
   return (
     <div
       className="flex overflow-hidden"
@@ -72,16 +87,40 @@ export function BillingErrorBanner({
           </p>
         </div>
 
-        {action ? (
-          <div className="flex shrink-0 items-center">
-            <Button
-              variant="primary"
-              size="regular"
-              onClick={action.onClick}
-              aria-label={action.label}
-            >
-              {action.label}
-            </Button>
+        {action || secondaryAction || onDismiss ? (
+          <div className="flex items-center gap-1 shrink-0">
+            {secondaryAction ? (
+              <Button
+                variant="ghost"
+                size="regular"
+                onClick={secondaryAction.onClick}
+                disabled={secondaryAction.disabled}
+                aria-label={secondaryAction.label}
+              >
+                {secondaryAction.label}
+              </Button>
+            ) : null}
+            {action ? (
+              <Button
+                variant="primary"
+                size="regular"
+                onClick={action.onClick}
+                disabled={action.disabled}
+                aria-label={action.label}
+              >
+                {action.label}
+              </Button>
+            ) : null}
+            {onDismiss ? (
+              <Button
+                variant="ghost"
+                size="compact"
+                iconOnly={<X />}
+                tooltip={t("billingErrorBanner.dismiss")}
+                aria-label={t("billingErrorBanner.dismiss")}
+                onClick={onDismiss}
+              />
+            ) : null}
           </div>
         ) : null}
       </div>

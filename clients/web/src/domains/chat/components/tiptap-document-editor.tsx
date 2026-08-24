@@ -7,13 +7,8 @@
  * - Text selection tracking with character offset conversion
  */
 
-import { Extension } from "@tiptap/core";
-import Link from "@tiptap/extension-link";
-import { Plugin, PluginKey } from "@tiptap/pm/state";
-import { Decoration, DecorationSet } from "@tiptap/pm/view";
 import { EditorContent, useEditor } from "@tiptap/react";
 import { BubbleMenu } from "@tiptap/react/menus";
-import StarterKit from "@tiptap/starter-kit";
 import { cn } from "@vellumai/design-library";
 import {
   Bold,
@@ -31,13 +26,19 @@ import {
   useRef,
   useState,
 } from "react";
-import { Markdown, type MarkdownStorage } from "tiptap-markdown";
 
+import {
+  activeHighlightPluginKey,
+  buildDocumentEditorExtensions,
+  commentAnchorPluginKey,
+  getEditorMarkdown,
+} from "@/domains/chat/components/tiptap-editor-extensions";
 import type { CommentAnchor } from "@/domains/chat/utils/tiptap-position-map";
 import {
   charOffsetToPmPos,
   pmPosToCharOffset,
 } from "@/domains/chat/utils/tiptap-position-map";
+import { useTranslation } from "@/i18n";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -63,151 +64,6 @@ interface TiptapDocumentEditorProps {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/** Extract the current markdown from a tiptap editor with the Markdown extension. */
-function getEditorMarkdown(editor: import("@tiptap/core").Editor): string {
-  const storage = editor.storage as unknown as { markdown: MarkdownStorage };
-  return storage.markdown.getMarkdown();
-}
-
-// ---------------------------------------------------------------------------
-// Decoration plugin keys
-// ---------------------------------------------------------------------------
-
-const commentAnchorPluginKey = new PluginKey("commentAnchorHighlights");
-const activeHighlightPluginKey = new PluginKey("activeHighlight");
-
-// ---------------------------------------------------------------------------
-// Comment anchor decoration extension
-// ---------------------------------------------------------------------------
-
-const CommentAnchorHighlightExtension = Extension.create<{
-  anchors: CommentAnchor[];
-}>({
-  name: "commentAnchorHighlight",
-
-  addOptions() {
-    return { anchors: [] };
-  },
-
-  addProseMirrorPlugins() {
-    const { anchors } = this.options;
-    return [
-      new Plugin({
-        key: commentAnchorPluginKey,
-        state: {
-          init(_, { doc }) {
-            return buildCommentDecorations(doc, anchors);
-          },
-          apply(tr, oldDecorations) {
-            const meta = tr.getMeta(commentAnchorPluginKey);
-            if (meta) {
-              return buildCommentDecorations(tr.doc, meta.anchors);
-            }
-            if (tr.docChanged) {
-              return oldDecorations.map(tr.mapping, tr.doc);
-            }
-            return oldDecorations;
-          },
-        },
-        props: {
-          decorations(state) {
-            return this.getState(state);
-          },
-        },
-      }),
-    ];
-  },
-});
-
-function buildCommentDecorations(
-  doc: import("@tiptap/pm/model").Node,
-  anchors: CommentAnchor[],
-): DecorationSet {
-  const decorations: Decoration[] = [];
-
-  for (const anchor of anchors) {
-    const from = charOffsetToPmPos(doc, anchor.anchorStart);
-    const to = charOffsetToPmPos(doc, anchor.anchorEnd);
-    if (from < to) {
-      decorations.push(
-        Decoration.inline(from, to, {
-          class: "comment-anchor-highlight",
-        }),
-      );
-    }
-  }
-
-  return DecorationSet.create(doc, decorations);
-}
-
-// ---------------------------------------------------------------------------
-// Active highlight decoration extension
-// ---------------------------------------------------------------------------
-
-const ActiveHighlightExtension = Extension.create<{
-  range: { start: number; end: number } | null;
-}>({
-  name: "activeHighlight",
-
-  addOptions() {
-    return { range: null };
-  },
-
-  addProseMirrorPlugins() {
-    const { range } = this.options;
-    return [
-      new Plugin({
-        key: activeHighlightPluginKey,
-        state: {
-          init(_, { doc }) {
-            return buildActiveHighlightDecorations(doc, range);
-          },
-          apply(tr, oldDecorations) {
-            const meta = tr.getMeta(activeHighlightPluginKey);
-            if (meta) {
-              return buildActiveHighlightDecorations(tr.doc, meta.range);
-            }
-            if (tr.docChanged) {
-              return oldDecorations.map(tr.mapping, tr.doc);
-            }
-            return oldDecorations;
-          },
-        },
-        props: {
-          decorations(state) {
-            return this.getState(state);
-          },
-        },
-      }),
-    ];
-  },
-});
-
-function buildActiveHighlightDecorations(
-  doc: import("@tiptap/pm/model").Node,
-  range: { start: number; end: number } | null,
-): DecorationSet {
-  if (!range) {
-    return DecorationSet.empty;
-  }
-
-  const from = charOffsetToPmPos(doc, range.start);
-  const to = charOffsetToPmPos(doc, range.end);
-  if (from >= to) {
-    return DecorationSet.empty;
-  }
-
-  return DecorationSet.create(doc, [
-    Decoration.inline(from, to, {
-      class: "active-highlight",
-    }),
-  ]);
-}
-
-// ---------------------------------------------------------------------------
 // Bubble toolbar sub-component
 // ---------------------------------------------------------------------------
 
@@ -222,6 +78,7 @@ function BubbleToolbar({
   onCommentSubmit,
   commentSubmitting,
 }: BubbleToolbarProps) {
+  const { t } = useTranslation("chat");
   const [commentOpen, setCommentOpen] = useState(false);
   const [draft, setDraft] = useState("");
 
@@ -356,7 +213,7 @@ function BubbleToolbar({
               type="button"
               className={cn(btnBase, commentOpen && btnActive)}
               onClick={toggleComment}
-              aria-label="Comment"
+              aria-label={t("tiptapDocumentEditor.comment")}
               aria-pressed={commentOpen}
             >
               <MessageSquareText size={14} />
@@ -369,7 +226,7 @@ function BubbleToolbar({
           <textarea
             className="w-full resize-none rounded-md border border-[var(--field-border)] bg-[var(--field-bg)] px-3 py-2 text-body-medium-lighter text-[var(--content-default)] placeholder:text-[var(--content-tertiary)] outline-none transition-[border-color] duration-150 ease-out focus-visible:border-[var(--border-active)]"
             rows={2}
-            placeholder="Add your feedback…"
+            placeholder={t("tiptapDocumentEditor.feedbackPlaceholder")}
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={(e) => {
@@ -392,7 +249,7 @@ function BubbleToolbar({
               onClick={handleSubmitComment}
               disabled={commentSubmitting || !draft.trim()}
             >
-              {commentSubmitting ? "Adding…" : "Comment"}
+              {commentSubmitting ? t("tiptapDocumentEditor.adding") : t("tiptapDocumentEditor.comment")}
             </button>
           </div>
         </div>
@@ -427,15 +284,10 @@ export function TiptapDocumentEditor({
   });
 
   const editor = useEditor({
-    extensions: [
-      StarterKit.configure({
-        // History is included in StarterKit
-      }),
-      Link.configure({ openOnClick: false }),
-      Markdown,
-      CommentAnchorHighlightExtension.configure({ anchors: commentAnchors }),
-      ActiveHighlightExtension.configure({ range: highlightRange }),
-    ],
+    extensions: buildDocumentEditorExtensions({
+      commentAnchors,
+      highlightRange,
+    }),
     content,
     editable,
     onUpdate({ editor: ed }) {

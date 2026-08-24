@@ -7,10 +7,7 @@ import {
   resolveDefaultProfileForProvider,
   USER_PROFILE_TEMPLATES,
 } from "../config/default-profile-catalog.js";
-import {
-  DEFAULT_PROFILE_KEYS,
-  type DefaultProfileKey,
-} from "../config/default-profile-names.js";
+import type { DefaultProfileKey } from "../config/default-profile-names.js";
 import { getIsPlatform } from "../config/env-registry.js";
 import { invalidateConfigCache } from "../config/loader.js";
 import {
@@ -21,6 +18,7 @@ import {
   type LLMProvider,
   type ProfileEntry,
 } from "../config/schemas/llm.js";
+import { ROUTING_IDENTITY_PROVIDERS } from "../providers/inference/auth.js";
 import { getLogger } from "../util/logger.js";
 import { completedProfileBody } from "./custom-profile-ensure.js";
 
@@ -66,6 +64,19 @@ const log = getLogger("byok-default-profile-ensure");
 // stub or copy was removed.
 
 /**
+ * The default keys BYOK hatching writes to disk. `latency-optimized` is absent
+ * by construction: no install carries a hatch stub or a
+ * `custom-latency-optimized` copy for it, and listing it here would make
+ * `uniformCopyProvider` demand a copy that cannot exist and convert nothing.
+ */
+const HATCH_ERA_PROFILE_KEYS = [
+  "balanced",
+  "quality-optimized",
+  "cost-optimized",
+] as const satisfies readonly DefaultProfileKey[];
+type HatchEraProfileKey = (typeof HATCH_ERA_PROFILE_KEYS)[number];
+
+/**
  * The exact stub shapes BYOK hatching left on each default key: thin (only
  * the workspace-owned overlay fields), `source: "managed"`, the frozen
  * per-key label, and a `status` of `"disabled"` (seeded at hatch, #30367),
@@ -82,7 +93,7 @@ const log = getLogger("byok-default-profile-ensure");
  * alone.
  */
 const STUB_ONLY_KEYS = new Set(["source", "status", "label", "thinking"]);
-const HATCH_STUB_LABELS: Record<DefaultProfileKey, string> = {
+const HATCH_STUB_LABELS: Record<HatchEraProfileKey, string> = {
   balanced: "Balanced (Managed)",
   "quality-optimized": "Quality (Managed)",
   "cost-optimized": "Speed (Managed)",
@@ -100,7 +111,7 @@ const HATCH_STUB_LABELS: Record<DefaultProfileKey, string> = {
 const REPAIR_WRITTEN_THINKING = { enabled: true, streamThinking: true };
 
 function isHatchStub(
-  key: DefaultProfileKey,
+  key: HatchEraProfileKey,
   entry: Record<string, unknown>,
 ): boolean {
   return (
@@ -125,9 +136,25 @@ const ERA_COPY_LABEL_SUFFIX = " (Custom Provider)";
 /**
  * Comparison ignores `label` and `status` (user overlay state, preserved via
  * `userOverlayState`) and `model` (checked separately against the current
- * intent resolution and `HISTORICAL_INTENT_MODELS`).
+ * intent resolution and `HISTORICAL_INTENT_MODELS`). The CONVENTIONAL
+ * `<vendor>-personal` binding is normalized away before comparison (it was
+ * machinery-written across several eras); a non-conventional binding is a
+ * user selection and keeps blocking conversion.
  */
 const IGNORED_COMPARISON_KEYS = new Set(["label", "status", "model"]);
+
+/**
+ * Fold the conventional personal entry name back to its vendor. The entries
+ * collapse (migration 145) rewrites a hatch copy's binding into its
+ * provider as `<vendor>-personal`; the matcher folds that shape so every
+ * era of stored copy keeps converting (the same discipline as
+ * `HISTORICAL_INTENT_MODELS`).
+ */
+function foldPersonalEntryName(provider: string): string {
+  return provider.endsWith("-personal")
+    ? provider.slice(0, -"-personal".length)
+    : provider;
+}
 
 /**
  * Per-provider model ids that earlier intent eras pinned onto `custom-*`
@@ -136,16 +163,21 @@ const IGNORED_COMPARISON_KEYS = new Set(["label", "status", "model"]);
  * 2026-05-05, #29755), and the profile-model migrations (100, 103, 109, 113,
  * 123) deliberately rewrite only the managed default entries (`custom-*` is
  * the user's to manage), so an untouched copy still carries whichever value
- * its hatch-era intent resolved to. Migration 136 is the one exception: it
- * rewrote kimi-k2p5 pins (`custom-*` included) to deepseek-v4-flash in
- * place. A model listed here counts as unedited only when every non-model
+ * its hatch-era intent resolved to. Migrations 136 and 146 are the
+ * exceptions: they rewrite stale Fireworks pins (`custom-*` included) in
+ * place, so their targets are machinery-authored values too. A model listed
+ * here counts as unedited only when every non-model
  * field still matches the template.
  */
 const HISTORICAL_INTENT_MODELS: Record<
-  DefaultProfileKey,
+  HatchEraProfileKey,
   Partial<Record<string, readonly string[]>>
 > = {
   balanced: {
+    openai: [
+      // balanced intent 2026-05-05 (#29755) to the 2026-08-10 gpt-5.6 repoint.
+      "gpt-5.4-mini",
+    ],
     fireworks: [
       // balanced intent 2026-05-05 (#29755) to 2026-05-19 (#31068).
       "accounts/fireworks/models/kimi-k2p5",
@@ -153,9 +185,15 @@ const HISTORICAL_INTENT_MODELS: Record<
       "accounts/fireworks/models/kimi-k2p6",
       // migration 136's in-place rewrite of a kimi-k2p5 pin.
       "accounts/fireworks/models/deepseek-v4-flash",
+      // the ID migration 146 writes over stale deepseek-v4-flash pins.
+      "accounts/fireworks/models/deepseek-v4-flash-0731",
     ],
   },
   "quality-optimized": {
+    openai: [
+      // quality intent 2026-05-05 (#29755) to the 2026-08-10 gpt-5.6 repoint.
+      "gpt-5.4",
+    ],
     anthropic: [
       // quality intent 2026-05-05 (#29755) to 2026-06-11 (#34498).
       "claude-opus-4-7",
@@ -173,6 +211,8 @@ const HISTORICAL_INTENT_MODELS: Record<
       "accounts/fireworks/models/kimi-k2p5",
       // migration 136's in-place rewrite of a kimi-k2p5 pin.
       "accounts/fireworks/models/deepseek-v4-flash",
+      // the ID migration 146 writes over stale deepseek-v4-flash pins.
+      "accounts/fireworks/models/deepseek-v4-flash-0731",
     ],
   },
   "cost-optimized": {
@@ -186,10 +226,14 @@ const HISTORICAL_INTENT_MODELS: Record<
     ],
     fireworks: [
       // latency intent 2026-05-05 (#29755) to 2026-07-28 (#39446). On live
-      // configs migration 136 rewrote it to deepseek-v4-flash (the current
-      // intent), so this survives only in configs restored from pre-136
-      // backups.
+      // configs migration 136 rewrites it to deepseek-v4-flash, so this
+      // survives only in configs restored from pre-136 backups.
       "accounts/fireworks/models/kimi-k2p5",
+      // latency intent 2026-07-28 (#39446) to the 2026-08-17 dated-ID
+      // repoint; also the ID migration 136 writes. On live configs migration
+      // 146 rewrites it to the dated ID, so this survives only in pre-146
+      // backups.
+      "accounts/fireworks/models/deepseek-v4-flash",
     ],
   },
 };
@@ -231,7 +275,7 @@ export function ensureByokDefaultProfiles(workspaceDir: string): void {
 
   // Deleting a hatch stub makes the default key resolve active from the
   // default provider's catalog column (and drops the stub's suffixed label).
-  for (const key of DEFAULT_PROFILE_KEYS) {
+  for (const key of HATCH_ERA_PROFILE_KEYS) {
     const entry = readObject(profiles[key]);
     if (entry === null || !isHatchStub(key, entry)) {
       continue;
@@ -249,19 +293,21 @@ export function ensureByokDefaultProfiles(workspaceDir: string): void {
   const completionBase = LLMConfigBase.safeParse(llm.default ?? {}).data;
 
   // The default provider on a BYOK default, or the uniform hatch provider
-  // across the complete copy set on a vellum default; null converts nothing.
-  const candidateProvider =
-    parsedDefault.data.provider !== "vellum"
-      ? parsedDefault.data.provider
-      : uniformCopyProvider(profiles);
+  // across the complete copy set on a routing-identity default (vellum,
+  // chatgpt); null converts nothing.
+  const candidateProvider = ROUTING_IDENTITY_PROVIDERS.has(
+    parsedDefault.data.provider,
+  )
+    ? uniformCopyProvider(profiles)
+    : parsedDefault.data.provider;
   const convertibleProvider =
     candidateProvider !== null && isByokDefaultProviderChoice(candidateProvider)
       ? candidateProvider
       : null;
 
   const retired = new Map<string, string>();
-  const carriedDisables = new Set<DefaultProfileKey>();
-  for (const key of DEFAULT_PROFILE_KEYS) {
+  const carriedDisables = new Set<HatchEraProfileKey>();
+  for (const key of HATCH_ERA_PROFILE_KEYS) {
     const name = `custom-${key}`;
     const entry = readObject(profiles[name]);
     if (
@@ -318,7 +364,7 @@ export function ensureByokDefaultProfiles(workspaceDir: string): void {
 
 function isKnownUneditedBody(
   entry: Record<string, unknown>,
-  key: DefaultProfileKey,
+  key: HatchEraProfileKey,
   convertibleProvider: LLMProvider | null,
   completionBase: LLMConfigBase | undefined,
 ): boolean {
@@ -329,7 +375,11 @@ function isKnownUneditedBody(
   // (hatch materialized it once; the default provider may have changed
   // since); equality with the corroborated provider rules out a user
   // re-provision.
-  if (convertibleProvider === null || entry.provider !== convertibleProvider) {
+  if (
+    convertibleProvider === null ||
+    typeof entry.provider !== "string" ||
+    foldPersonalEntryName(entry.provider) !== convertibleProvider
+  ) {
     return false;
   }
   const copyProvider = convertibleProvider;
@@ -337,11 +387,13 @@ function isKnownUneditedBody(
   if (template === undefined) {
     return false;
   }
-  const materialized = materializeProfile(
-    template,
-    copyProvider,
-    `${copyProvider}-personal`,
-  ) as Record<string, unknown>;
+  // No connection binding: the bare provider means the default entry of
+  // that kind, and a stamped binding would re-introduce the collapsed
+  // field on disk.
+  const materialized = materializeProfile(template, copyProvider) as Record<
+    string,
+    unknown
+  >;
   if (
     entry.model !== materialized.model &&
     !(HISTORICAL_INTENT_MODELS[key][copyProvider] ?? []).includes(entry.model)
@@ -351,11 +403,20 @@ function isKnownUneditedBody(
   // Completion skips managed-source bodies, so a copy from the era whose
   // templates wrote `source: "managed"` (#29755 to #29768, 2026-05-05) is
   // compared as if user-source to keep both sides normalized identically.
+  const normalizedEntry: Record<string, unknown> = {
+    ...entry,
+    provider: copyProvider,
+    ...(entry.source === "managed" ? { source: "user" } : {}),
+  };
+  // The conventional personal binding is machinery-written (hatch stamps,
+  // completion re-stamps); normalize it away. Any other binding is user
+  // state and stays in the comparison, where the unbound template side
+  // makes it block conversion.
+  if (normalizedEntry.provider_connection === `${copyProvider}-personal`) {
+    delete normalizedEntry.provider_connection;
+  }
   const body = comparableBody(
-    withCompletionBaked(
-      entry.source === "managed" ? { ...entry, source: "user" } : entry,
-      completionBase,
-    ),
+    withCompletionBaked(normalizedEntry, completionBase),
   );
   const known = comparableBody(
     withCompletionBaked(materialized, completionBase),
@@ -374,7 +435,7 @@ function isKnownUneditedBody(
  */
 function uniformCopyProvider(profiles: Record<string, unknown>): string | null {
   let provider: string | null = null;
-  for (const key of DEFAULT_PROFILE_KEYS) {
+  for (const key of HATCH_ERA_PROFILE_KEYS) {
     const entry = readObject(profiles[`custom-${key}`]);
     if (entry === null) {
       return null;
@@ -382,9 +443,10 @@ function uniformCopyProvider(profiles: Record<string, unknown>): string | null {
     if (typeof entry.provider !== "string") {
       return null;
     }
+    const entryProvider = foldPersonalEntryName(entry.provider);
     if (provider === null) {
-      provider = entry.provider;
-    } else if (provider !== entry.provider) {
+      provider = entryProvider;
+    } else if (provider !== entryProvider) {
       return null;
     }
   }
@@ -415,7 +477,7 @@ function uniformCopyProvider(profiles: Record<string, unknown>): string | null {
  */
 function hatchBodyVariants(
   known: Record<string, unknown>,
-  key: DefaultProfileKey,
+  key: HatchEraProfileKey,
   copyProvider: string,
 ): Record<string, unknown>[] {
   let variants = [known];
@@ -460,7 +522,7 @@ function withCompletionBaked(
  */
 function userOverlayState(
   entry: Record<string, unknown>,
-  key: DefaultProfileKey,
+  key: HatchEraProfileKey,
 ): Record<string, unknown> | null {
   const overlay: Record<string, unknown> = {};
   const templateLabel = USER_PROFILE_TEMPLATES[`custom-${key}`]?.label;
@@ -566,7 +628,7 @@ function repairProfileSelections(
   llm: Record<string, unknown>,
   profiles: Record<string, unknown>,
   defaultProvider: DefaultProviderConfig,
-  carriedDisables: ReadonlySet<DefaultProfileKey>,
+  carriedDisables: ReadonlySet<HatchEraProfileKey>,
 ): void {
   const effectiveEntry = (name: string): ProfileEntry | undefined =>
     resolveDefaultProfileForProvider(

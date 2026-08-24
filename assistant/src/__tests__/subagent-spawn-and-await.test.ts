@@ -68,6 +68,11 @@ class FakeConversation {
   messages: Message[];
   usageStats = { inputTokens: 10, outputTokens: 5, estimatedCost: 0.001 };
   subagentDeniedToolNames = new Set<string>();
+  subagentToolStats = {
+    calls: 0,
+    succeeded: 0,
+    filesWritten: new Set<string>(),
+  };
   conversationType = "background";
   hasSystemPromptOverride = false;
 
@@ -202,6 +207,7 @@ import {
   setConversation,
 } from "../daemon/conversation-registry.js";
 import { SubagentAbortedError, SubagentManager } from "../subagent/manager.js";
+import { asConversation } from "./helpers/mock-conversation.js";
 
 function makeConfig(overrides: Record<string, unknown> = {}) {
   return {
@@ -224,16 +230,19 @@ function registerFakeParent(parentConversationId: string): {
   enqueuedCount: () => number;
 } {
   let enqueued = 0;
-  setConversation(parentConversationId, {
-    // Accessors read by setUpSubagent when copying trust/auth context.
-    trustContext: undefined,
-    getAuthContext: () => undefined,
-    assistantId: undefined,
-    enqueueMessage: () => {
-      enqueued += 1;
-      return { rejected: false, queued: true };
-    },
-  } as never);
+  setConversation(
+    parentConversationId,
+    asConversation({
+      // Accessors read by setUpSubagent when copying trust/auth context.
+      trustContext: undefined,
+      getAuthContext: () => undefined,
+      assistantId: undefined,
+      enqueueMessage: () => {
+        enqueued += 1;
+        return { rejected: false, queued: true, requestId: "req-fake" };
+      },
+    }),
+  );
   return { enqueuedCount: () => enqueued };
 }
 
@@ -394,6 +403,49 @@ describe("SubagentManager.spawnAndAwait", () => {
     expect(chunks).toEqual(["Hello ", "(pondering) ", "world"]);
   });
 
+  test("reports tool activity via onProgress, which onText never sees", async () => {
+    // A subagent executing a tool streams no delta, so a caller bounding the
+    // run by an idle window has no signal from onText alone. onProgress is that
+    // signal, and it is a strict superset: text deltas count as progress too.
+    nextConversationConfig = {
+      messages: [
+        { role: "assistant", content: [{ type: "text", text: "done" }] },
+      ],
+      emitDeltas: [
+        { type: "assistant_text_delta", text: "Reading " } as AssistantEvent,
+        {
+          type: "tool_use_start",
+          toolName: "file_read",
+          input: { path: "a.ts" },
+        } as unknown as AssistantEvent,
+        {
+          type: "tool_output_chunk",
+          chunk: "export const a = 1;",
+        } as unknown as AssistantEvent,
+        {
+          type: "tool_result",
+          result: "export const a = 1;",
+        } as unknown as AssistantEvent,
+        // Lifecycle chatter is not progress.
+        { type: "subagent_status_changed" } as AssistantEvent,
+      ],
+    };
+
+    const chunks: string[] = [];
+    let progressCount = 0;
+    const manager = new SubagentManager();
+    await manager.spawnAndAwait(makeConfig(), () => {}, {
+      onText: (chunk) => chunks.push(chunk),
+      onProgress: () => {
+        progressCount++;
+      },
+    });
+
+    // One text delta plus three tool events; the status event is excluded.
+    expect(progressCount).toBe(4);
+    expect(chunks).toEqual(["Reading "]);
+  });
+
   test("aborting the provided signal rejects the run", async () => {
     nextConversationConfig = { waitForAbort: true };
 
@@ -537,20 +589,17 @@ describe("SubagentManager — first user message framing", () => {
     await manager.spawnAndAwait(
       makeConfig({
         objective: "Please advise.",
-        fork: true,
         role: "advisor",
+        spawnMode: "advisor_consult",
         // The advisor always supplies its own framing; setUpSubagent uses it
-        // verbatim and never falls back to parentSystemPrompt.
+        // in place of a built subagent preamble.
         systemPromptOverride: "You are a senior advisor.",
-        parentMessages: [
-          { role: "user", content: [{ type: "text", text: "prior turn" }] },
-        ],
       }),
       () => {},
     );
 
-    // The advisor's user turn is the bare advice request — the generic fork
-    // directive would fight the advisor system prompt.
+    // The consult is a regular blocking spawn, so its user turn is the brief
+    // itself: the fork directive would fight the advisor system prompt.
     expect(lastPersistedUserMessage).toBe("Please advise.");
     expect(lastPersistedUserMessage).not.toContain("FORK TASK");
   });

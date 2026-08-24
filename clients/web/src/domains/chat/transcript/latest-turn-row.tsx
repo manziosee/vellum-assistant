@@ -1,3 +1,4 @@
+import type { ResponseArtifact } from "@/domains/chat/transcript/response-artifacts";
 import { Fragment, memo, type ReactNode } from "react";
 
 import type {
@@ -69,6 +70,10 @@ export interface LatestTurnRowProps {
   onWorkflowClick?: (runId: string) => void;
   /** Callback to abort/stop a running workflow from an inline card. */
   onStopWorkflow?: (runId: string) => void;
+  /** Changed-document ids per transcript item key, resolved across whole
+   *  responses by `Transcript`. Only the message that ends a completed response
+   *  has an entry, and the in-flight response has none. */
+  responseArtifactsByKey?: ReadonlyMap<string, ResponseArtifact[]>;
 }
 
 export const LatestTurnRow = memo(function LatestTurnRow({
@@ -94,6 +99,7 @@ export const LatestTurnRow = memo(function LatestTurnRow({
   onStopSubagent,
   onWorkflowClick,
   onStopWorkflow,
+  responseArtifactsByKey,
 }: LatestTurnRowProps) {
   // The response cluster is "streaming" whenever the turn is in flight. This
   // keeps each response message's last tool-call group expanded for the whole
@@ -159,6 +165,7 @@ export const LatestTurnRow = memo(function LatestTurnRow({
             onStopSubagent={onStopSubagent}
             onWorkflowClick={onWorkflowClick}
             onStopWorkflow={onStopWorkflow}
+            responseArtifacts={responseArtifactsByKey?.get(response.key)}
             isStreaming={isStreaming}
             isLatestMessage={response === lastMessageItem}
           />

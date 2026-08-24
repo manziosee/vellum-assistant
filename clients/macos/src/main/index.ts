@@ -1,42 +1,70 @@
 import "./env-seed";
-import { app, net, protocol, shell } from "electron";
-import fs from "node:fs/promises";
+import { app, net, protocol, session, shell } from "electron";
 import { pathToFileURL } from "node:url";
 import path from "node:path";
 
-import { resolveAppProtocolPath } from "@vellumai/electron-utils/app-protocol";
+import { installCsp } from "@vellumai/electron-desktop/csp";
+import { installCommandPaletteWindow } from "@vellumai/electron-desktop/command-palette-window";
+import { getDeviceId } from "@vellumai/electron-desktop/device-id";
+import { installDictationOverlay } from "@vellumai/electron-desktop/dictation-overlay-window";
 import {
+  authorizePairedGatewayForwardPlan,
+  executeGatewayForwardPlan,
+  planGatewayForward,
+  planPairedGatewayForward,
+  type GatewayForwardFetcher,
+} from "@vellumai/electron-desktop/gateway-forward";
+import { installPermissionHandler } from "@vellumai/electron-desktop/permissions";
+import {
+  executePlatformForwardPlan,
+  planPlatformForward,
+} from "@vellumai/electron-desktop/platform-forward";
+import { installPopoutWindows } from "@vellumai/electron-desktop/popout-window";
+import { installQuickInput } from "@vellumai/electron-desktop/quick-input-window";
+import { planAppProtocolAssetRequest } from "@vellumai/electron-utils/app-protocol";
+import {
+  pairedGatewayTargetsFromLockfile,
   readAllowedGatewayPorts,
+  readPairedGatewayTargets,
   resolveLocalConfigFromEnv,
   resolveLockfilePaths,
 } from "@vellumai/local-mode";
 
-import { installAbout, openAboutWindow } from "./about";
-import { installAutoUpdate } from "./auto-update";
-import { APP_HOST, APP_PROTOCOL, BUNDLES_DIR_NAME, VELLUMAPP_PROTOCOL } from "./app-config";
+import { installAbout, openAboutWindow } from "./about.client";
+import { installAutoUpdate } from "./auto-update.client";
+import {
+  BUNDLES_DIR_NAME,
+  VELLUMAPP_PROTOCOL,
+} from "@vellumai/electron-desktop/bundle-platform";
+import { registerVellumAppProtocol } from "@vellumai/electron-desktop/vellumapp-protocol";
+import { APP_HOST, APP_PROTOCOL } from "./app-config";
 import { resolveAllowedOrigin } from "./app-origin";
 import { writeCliLocator } from "./cli-installer";
 import { provisionCliForWrapper } from "./cli-path-installer";
-import { installCsp } from "./csp";
-import { getDeviceId } from "./device-id";
-import { handleSync } from "./ipc";
-import { registerVellumAppProtocol } from "./vellumapp-protocol";
-import { planGatewayForward } from "./gateway-forward";
+import { handle, handleSync, on } from "./ipc";
+import { installPairedGatewayRequestGuard } from "./paired-gateway-request-guard";
+import { hasPendingDeepLinks, installDeepLinks } from "./deep-links.client";
+import { handleBundleFile, installMacBundleWorkflow } from "./bundles";
 import {
-  fetchForwardPlanWithRetry,
-  planPlatformForward,
-} from "./platform-forward";
+  handleFileOpenArgv,
+  hasPendingFiles,
+  installFileOpen,
+  onFileOpen,
+} from "./file-open.client";
+import { installAvatarIpc } from "@vellumai/electron-desktop/avatar";
+import { installConnectivityProbe } from "@vellumai/electron-desktop/connectivity-probe";
+import { installIdentityIpc } from "@vellumai/electron-desktop/identity";
 import {
-  extractDeepLinkFromArgv,
-  handleDeepLink,
-  hasPendingDeepLinks,
-  installDeepLinks,
-} from "./deep-links";
-import { handleBundleFile, installBundleFlow } from "./bundle-flow";
-import { handleFileOpen, hasPendingFiles, installFileOpen, onFileOpen } from "./file-open";
-import { installAvatarIpc } from "./avatar";
-import { installCommandPaletteWindow } from "./command-palette-window";
-import { installDictationOverlay } from "./dictation-overlay-window";
+  configureNotifications,
+  installNotifications,
+} from "@vellumai/electron-desktop/notifications";
+import { installPowerEvents } from "@vellumai/electron-desktop/power-events";
+import { configurePresenceRuntime } from "@vellumai/electron-desktop/presence-runtime";
+import {
+  installConnectivityIpc,
+  installStatusIpc,
+} from "@vellumai/electron-desktop/status";
+import "./auxiliary-windows.client";
 import { installDock } from "./dock";
 import { installDownloads } from "./downloads";
 import { installShare } from "./share";
@@ -44,21 +72,28 @@ import {
   installEscapeMonitor,
   setDictationRecording,
 } from "./escape-monitor";
-import { installDiagnosticsIpc } from "./diagnostics";
-import { installFeatureFlagsIpc } from "./feature-flags";
-import { installFeedbackIpc } from "./feedback";
-import { installGlobalShortcuts } from "./global-shortcuts";
+import {
+  initSentryMain,
+  installDiagnosticsIpc,
+  installFeatureFlagsIpc,
+  installFeedbackIpc,
+} from "./desktop-diagnostics";
+import { installGlobalShortcuts } from "./global-shortcuts.client";
 import { installHotkeyHelper } from "./hotkey-helper";
-import { installHotkeysIpc } from "./hotkeys";
-import { installImageContextMenu } from "./image-context-menu";
-import { installTextContextMenu } from "./text-context-menu";
-import { installPopoutWindows } from "./popout-window";
-import { installQuickInput } from "./quick-input-window";
-import { installLocalMode, resolveCliInvocation } from "./local-mode";
-import { installLoginItem, installLoginItemIpc } from "./login-item";
-import { installLockfileWatcher } from "./lockfile-watcher";
-import { installHostProxyBridge } from "./host-proxy-router";
-import "./executors/host-bash-executor"; // side-effect: registers host_bash executor
+import { installHotkeysIpc } from "./hotkeys.client";
+import { installImageContextMenu } from "@vellumai/electron-desktop/image-context-menu";
+import { installTextContextMenu } from "@vellumai/electron-desktop/text-context-menu";
+import {
+  getPairedGuardianAccessToken,
+  installLocalMode,
+  resolveCliInvocation,
+} from "./local-mode.client";
+import { installLoginItem, installLoginItemIpc } from "./login-item.client";
+import {
+  getWatchedLockfileSnapshot,
+  installLockfileWatcher,
+} from "./lockfile-watcher.client";
+import { installHostProxyBridge } from "./host-proxy-adapter";
 import log from "./logger";
 import {
   ensureVisible as ensureMainWindowVisible,
@@ -66,18 +101,20 @@ import {
   toggleVisibility as toggleMainWindowVisibility,
 } from "./main-window";
 import { installApplicationMenu, refreshCliPathMenuState } from "./menu";
-import { relocateToApplicationsFolder } from "./move-to-applications";
-import { installNativeAuth } from "./native-auth";
-import { installConnectivityProbe } from "./connectivity-probe";
-import { installNotifications } from "./notifications";
-import { installPermissionHandler } from "./permissions";
+import {
+  promptToRelocateIfStranded,
+  relocateToApplicationsFolder,
+} from "./move-to-applications";
+import { markRelocationSkipped } from "./install-location";
+import { installNativeAuth } from "./native-auth.client";
 import { installPermissionsService } from "./permissions-service";
-import { installPowerEvents } from "./power-events";
-import { installIdentityIpc } from "./identity";
-import { installConnectivityIpc, installStatusIpc } from "./status";
+import {
+  installCompanionWindow,
+  syncCompanionSurface,
+} from "./companion-window";
 import { installTextInsertionIpc } from "./textInsertion";
-import { installTray } from "./tray";
-import { hardenedWebPreferences } from "./windows";
+import { installTray } from "./tray.client";
+import { installWebContentsSecurity } from "./windows";
 
 // Dev-only: override the workspace `name` (`@vellumai/macos`) so the
 // menu bar's first submenu reads "Vellum Electron", and — more
@@ -114,7 +151,7 @@ const isDev = !app.isPackaged;
 // Dev-only: skip the real macOS Keychain for Chromium's `os_crypt` /
 // Electron `safeStorage`. Without this, the first `safeStorage` call —
 // e.g. persisting the session token after sign-in via
-// `./session-token-store` — makes Chromium prompt for the login
+// `./session-token-store.client` makes Chromium prompt for the login
 // keychain password ("Vellum Electron Safe Storage"). Denying that
 // prompt surfaces as `keychain_password_mac.mm ... userCanceledErr
 // (-128)` and silently drops token persistence. `--use-mock-keychain`
@@ -150,15 +187,13 @@ if (app.isPackaged) {
   }
 }
 
-import { initSentryMain } from "./sentry";
-
 initSentryMain();
 
 // Single-instance lock: relaunches focus the existing window instead of
 // spawning a parallel main process. The second-instance handler fires on the
-// instance that holds the lock (the primary). The instance that fails to
-// acquire calls app.quit() and never reaches whenReady.
-if (!app.requestSingleInstanceLock()) {
+// instance that holds the lock (the primary).
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
   app.quit();
 }
 
@@ -224,6 +259,14 @@ const registerAppProtocol = (): void => {
   const lockfilePaths = resolveLockfilePaths(process.env);
   const getAllowedGatewayPorts = (): Set<number> =>
     readAllowedGatewayPorts(lockfilePaths);
+  // Prefer the watcher's in-memory snapshot so paired requests never read
+  // disk; the direct read covers only the window before the watcher installs.
+  const getPairedGatewayTargets = (): Map<string, string> => {
+    const watched = getWatchedLockfileSnapshot();
+    return watched
+      ? pairedGatewayTargetsFromLockfile(watched)
+      : readPairedGatewayTargets(lockfilePaths);
+  };
   const { platformUrl } = resolveLocalConfigFromEnv(process.env);
 
   protocol.handle(APP_PROTOCOL, async (request) => {
@@ -232,8 +275,24 @@ const registerAppProtocol = (): void => {
     // secure renderer never touches an insecure `http://127.0.0.1` origin
     // directly; the lockfile allowlist is the security boundary. Mirrors the
     // Vite dev-server proxy (`clients/web/vite-plugin-local-mode.ts`).
-    const proxied = await forwardGatewayRequest(request, getAllowedGatewayPorts);
+    const proxied = await forwardGatewayRequest(
+      request,
+      getAllowedGatewayPorts,
+    );
     if (proxied) return proxied;
+
+    // Paired remote gateways ride the same-origin path too, via
+    // `/assistant/__gateway-paired/{assistantId}/*`: the packaged app's CSP
+    // pins `connect-src` to Vellum origins, so the renderer cannot reach a
+    // paired gateway directly. The WebRequest guard admits only trusted app
+    // frames, and the lockfile's paired entries allowlist the remote targets.
+    const pairedProxied = await forwardPairedGatewayRequest(
+      request,
+      getPairedGatewayTargets,
+    );
+    if (pairedProxied) {
+      return pairedProxied;
+    }
 
     // Platform API routes (`/v1/*`, `/_allauth/*`, `/accounts/*`) forward to
     // the cloud platform so managed mode works in packaged builds. Mirrors the
@@ -241,66 +300,59 @@ const registerAppProtocol = (): void => {
     const platformProxied = await forwardPlatformRequest(request, platformUrl);
     if (platformProxied) return platformProxied;
 
-    const result = resolveAppProtocolPath(
+    const asset = await planAppProtocolAssetRequest({
       rendererRoot,
-      request.url,
-      RENDERER_MOUNT,
-    );
-    if (result.kind === "forbidden") {
+      indexHtml,
+      requestUrl: request.url,
+      mountPrefix: RENDERER_MOUNT,
+      allowedOrigin: { protocol: `${APP_PROTOCOL}:`, host: APP_HOST },
+    });
+    if (asset.kind === "forbidden") {
       return new Response("Forbidden", { status: 403 });
     }
-    const { resolved } = result;
-    if (await fileExists(resolved)) {
-      return net.fetch(pathToFileURL(resolved).toString());
-    }
-    const ext = path.extname(resolved);
-    if (ext === "" || ext === ".html") {
-      return net.fetch(pathToFileURL(indexHtml).toString());
+    if (asset.kind === "fetch") {
+      return net.fetch(pathToFileURL(asset.path).toString());
     }
     return new Response("Not Found", { status: 404 });
   });
 };
 
-const fileExists = async (candidate: string): Promise<boolean> => {
-  try {
-    const stat = await fs.stat(candidate);
-    return stat.isFile();
-  } catch {
-    return false;
-  }
-};
+const gatewayForwardFetcher: GatewayForwardFetcher = (url, init) =>
+  net.fetch(url, init);
 
 /**
  * Forward a gateway data-plane request (`/assistant/__gateway/{port}/*`) to the
  * local gateway on loopback, or return `null` when the URL is not a gateway
- * request so the caller serves it as a static asset. `net.fetch` runs in the
- * main process, so the renderer only ever talks to its own secure `app://`
- * origin — main does the `http://127.0.0.1` hop. The streaming `Response` is
- * returned verbatim, preserving SSE and chunked transfers (Electron's
- * `stream: true` scheme privilege). `planGatewayForward` owns the allowlist and
- * header decisions; this wrapper is just the effect.
+ * request. `net.fetch` runs in the main process, so the renderer only ever
+ * talks to its own secure `app://` origin; main does the `http://127.0.0.1`
+ * hop.
  */
 const forwardGatewayRequest = async (
   request: GlobalRequest,
   getAllowedPorts: () => Set<number>,
+): Promise<Response | null> =>
+  executeGatewayForwardPlan(
+    planGatewayForward(request, getAllowedPorts),
+    request,
+    gatewayForwardFetcher,
+  );
+
+/**
+ * Forward a paired-gateway data-plane request
+ * (`/assistant/__gateway-paired/{assistantId}/*`) to the remote gateway an
+ * imported pairing recorded as its `runtimeUrl`, or return `null` when the URL
+ * is not a paired-gateway request. Main does the remote hop so the renderer
+ * stays same-origin.
+ */
+const forwardPairedGatewayRequest = async (
+  request: GlobalRequest,
+  getTargets: () => Map<string, string>,
 ): Promise<Response | null> => {
-  const plan = planGatewayForward(request, getAllowedPorts);
-  switch (plan.kind) {
-    case "pass":
-      return null;
-    case "reject":
-      return new Response(plan.message, { status: plan.status });
-    case "forward":
-      return net.fetch(plan.url, {
-        method: plan.method,
-        headers: plan.headers,
-        body: plan.hasBody ? request.body : undefined,
-        // Stream the request body instead of buffering it; required by the
-        // fetch spec whenever a `ReadableStream` body is supplied.
-        ...(plan.hasBody ? { duplex: "half" } : {}),
-        redirect: "manual",
-      });
-  }
+  const plan = await authorizePairedGatewayForwardPlan(
+    planPairedGatewayForward(request, getTargets),
+    getPairedGuardianAccessToken,
+  );
+  return executeGatewayForwardPlan(plan, request, gatewayForwardFetcher);
 };
 
 const resolvedConfig = resolveLocalConfigFromEnv(process.env);
@@ -326,33 +378,19 @@ const forwardPlatformRequest = async (
   const plan = planPlatformForward(request, platformUrl, {
     allowedOrigin: resolveAllowedOrigin(),
   });
-  if (plan.kind === "pass") return null;
-  if (plan.kind === "reject") {
-    return new Response(plan.message, { status: plan.status });
-  }
-
+  const target = plan.kind === "forward" ? `${plan.method} ${plan.url}` : "";
   // Transient net-stack failures (e.g. ERR_NETWORK_CHANGED while Wi-Fi
   // reassociates after sleep) retry in-proxy for GET/HEAD; whatever still
   // fails becomes a structured 502 the renderer can classify, never a raw
   // `net::ERR_*` body (LUM-2402).
-  return fetchForwardPlanWithRetry(
+  return executePlatformForwardPlan(
     plan,
-    () =>
-      net.fetch(plan.url, {
-        method: plan.method,
-        headers: plan.headers,
-        body: plan.hasBody ? request.body : undefined,
-        ...(plan.hasBody ? { duplex: "half" } : {}),
-        redirect: "manual",
-        // Auth is header-based (X-Session-Token), not cookie-based.
-        // Omit credentials so stale session cookies in the main process's
-        // default session store never shadow the renderer's token header.
-        credentials: "omit",
-      }),
+    request,
+    (url, init) => net.fetch(url, init),
     {
       onError: (err, attempt) => {
         console.error(
-          `[platform-forward] net.fetch failed (attempt ${attempt + 1}) for ${plan.method} ${plan.url}:`,
+          `[platform-forward] net.fetch failed (attempt ${attempt + 1}) for ${target}:`,
           err,
         );
       },
@@ -367,24 +405,39 @@ const forwardPlatformRequest = async (
 app
   .whenReady()
   .then(async () => {
+    // The instance that lost the single-instance lock is already quitting.
+    // `app.quit()` requests a shutdown rather than halting the module, and a
+    // `ready` that is already queued still fires, so the losing instance gates
+    // its own setup here. Electron's documented single-instance example puts
+    // every `whenReady` side effect behind this same branch.
+    // https://www.electronjs.org/docs/latest/api/app#apprequestsingleinstancelockadditionaldata
+    if (!gotSingleInstanceLock) {
+      return;
+    }
+
+    configurePresenceRuntime({ ipc: { handle, on }, logger: log });
+
     // Install into /Applications before any other setup. On the first packaged
     // launch from a mounted DMG (or ~/Downloads), the app silently moves itself
     // there and relaunches — the "double-click to install" half of the DMG flow.
     // Skip it when a file or deep link triggered the launch: those events are
     // buffered in-process and would be lost during the relaunch.
-    if (!hasPendingFiles() && !hasPendingDeepLinks()) {
-      if (await relocateToApplicationsFolder()) return;
+    if (hasPendingFiles() || hasPendingDeepLinks()) {
+      markRelocationSkipped();
+    } else if (await relocateToApplicationsFolder()) {
+      return;
     }
 
     if (!isDev) {
       registerAppProtocol();
+      installPairedGatewayRequestGuard();
     }
     registerVellumAppProtocol(
       path.join(app.getPath("userData"), BUNDLES_DIR_NAME),
     );
-    installBundleFlow();
+    installMacBundleWorkflow();
     onFileOpen(handleBundleFile);
-    installPermissionHandler();
+    installPermissionHandler(resolveAllowedOrigin);
     installCsp();
     installHotkeysIpc();
     installFeatureFlagsIpc();
@@ -398,7 +451,9 @@ app
       // version bump rewrites the locator now (and prunes old versions)
       // rather than after the next in-app CLI action.
       void provisionCliForWrapper()
-        .then((provisioned) => (provisioned ? refreshCliPathMenuState() : undefined))
+        .then((provisioned) =>
+          provisioned ? refreshCliPathMenuState() : undefined,
+        )
         .catch((err: unknown) => {
           log.error("[app] startup CLI provisioning failed:", err);
         });
@@ -419,6 +474,7 @@ app
     installApplicationMenu();
     installQuickInput();
     installDictationOverlay({ onRecordingLifecycle: setDictationRecording });
+    installCompanionWindow();
     installPopoutWindows();
     installGlobalShortcuts();
     // Register the avatar channel before the Dock and Tray install so their
@@ -431,6 +487,11 @@ app
     // panel. Distinct from `installShare`, which is the "send elsewhere" intent.
     installDownloads();
     installPowerEvents();
+    configureNotifications({
+      ipc: { handle },
+      ensureVisible: ensureMainWindowVisible,
+      logger: log,
+    });
     installNotifications();
     // Register the status channel before the tray installs so the tray's
     // initial render reflects any status the renderer publishes during
@@ -454,6 +515,25 @@ app
     installNativeAuth();
     installMainWindow();
 
+    // After the main window, so the surface opens over a running app rather
+    // than being the first thing on screen at launch. Present from here on,
+    // unless the user has hidden it from the tray: the app being frontmost is
+    // not one of its states.
+    //
+    // A launch that has nobody signed in yet leaves it closed, and the window
+    // that opens it later is the app's own, once it has an assistant to
+    // publish.
+    syncCompanionSurface();
+
+    // Runs after the main window so the recovery dialog has a window to sit in
+    // front of, and so a user who declines lands on a working app rather than
+    // an empty screen. A packaged app outside /Applications cannot update, and
+    // the relocation at the head of this block is the only thing that would
+    // have fixed it.
+    void promptToRelocateIfStranded().catch((err: unknown) => {
+      log.error("[app] relocation prompt failed:", err);
+    });
+
     // Dock-icon click / Cmd-Tab re-activation: bring the main window
     // back to front, recreating it if it was previously closed. The
     // primitive handles both the destroyed-window and the
@@ -473,20 +553,7 @@ app.on("second-instance", (_event, argv) => {
   // we recreate so the user always sees a window in response to
   // re-launching the app.
   ensureMainWindowVisible();
-  // Cross-platform deep-link delivery: macOS routes second-launch
-  // deep links via a fresh `open-url` on the primary instance (argv
-  // is empty). Windows / Linux deliver the URL via argv and
-  // `open-url` never fires. Always check argv here so the buffered
-  // / broadcast pipeline is platform-agnostic.
-  const deepLink = extractDeepLinkFromArgv(argv);
-  if (deepLink) handleDeepLink(deepLink);
-  // Forward .vellum file paths from second-instance argv so the
-  // buffer/broadcast pipeline handles them identically to open-file.
-  for (const arg of argv) {
-    if (/\.vellum$/i.test(arg)) {
-      handleFileOpen(arg);
-    }
-  }
+  handleFileOpenArgv(argv);
 });
 
 app.on("web-contents-created", (_event, contents) => {
@@ -500,69 +567,10 @@ app.on("web-contents-created", (_event, contents) => {
   installImageContextMenu(contents);
   installTextContextMenu(contents);
 
-  // Mirror renderer console output (info and up) into the main log file.
-  // The packaged app has no devtools, so without this the renderer's
-  // diagnostics — voice/dictation fallback decisions especially — are
-  // invisible in the field; `vellum.log` is the only artifact a debugging
-  // session can read.
-  contents.on("console-message", (event) => {
-    if (event.level === "debug") return;
-    // wc id disambiguates which window a line came from — dictation partials
-    // route to a single owner window, so cross-window confusion is invisible
-    // without it.
-    const line = `[renderer wc=${contents.id}] ${event.message}`;
-    if (event.level === "error") log.error(line);
-    else if (event.level === "warning") log.warn(line);
-    else log.info(line);
-  });
-
-  contents.setWindowOpenHandler(({ url, disposition }) => {
-    // Programmatic popups (`window.open(url, name, features)` with size
-    // hints) come through as `new-window` disposition. The web app's OAuth /
-    // connect flows open a blank popup synchronously during the click handler
-    // (`window.open("", "_blank", "width=500,height=600")`), then navigate it
-    // to the OAuth URL after the API call resolves. Chromium resolves the
-    // empty string to `about:blank`, which must be allowed here so the popup
-    // handle is returned to the renderer for the subsequent postMessage
-    // callback chain.
-    if (disposition === "new-window" && url === "about:blank") {
-      return {
-        action: "allow",
-        overrideBrowserWindowOptions: {
-          webPreferences: { ...hardenedWebPreferences(), preload: undefined },
-        },
-      };
-    }
-
-    // Only http(s) is ever opened — file:, javascript:, custom schemes are
-    // denied with no fallback.
-    let parsed: URL;
-    try {
-      parsed = new URL(url);
-    } catch {
-      return { action: "deny" };
-    }
-    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
-      return { action: "deny" };
-    }
-
-    // Programmatic popups with a real URL also come through as `new-window`
-    // disposition and are allowed as in-app child windows.
-    if (disposition === "new-window") {
-      // Child popups inherit the same hardened baseline as every window.
-      // `preload: undefined` explicitly clears the parent's preload so
-      // third-party OAuth pages don't get the Vellum bridge.
-      return {
-        action: "allow",
-        overrideBrowserWindowOptions: {
-          webPreferences: { ...hardenedWebPreferences(), preload: undefined },
-        },
-      };
-    }
-
-    // Plain target=_blank link clicks → system browser.
-    void shell.openExternal(url);
-    return { action: "deny" };
+  installWebContentsSecurity(contents, {
+    cookies: () => session.defaultSession.cookies,
+    logger: log,
+    openExternal: (url) => shell.openExternal(url),
   });
 });
 

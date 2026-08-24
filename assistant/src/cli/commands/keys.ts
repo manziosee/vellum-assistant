@@ -2,6 +2,7 @@ import { createRequire } from "node:module";
 
 import type { Command } from "commander";
 
+import { resolveBundledCliModule } from "../bundled-modules.js";
 import { applyCommandHelp, subcommand } from "../lib/cli-command-help.js";
 import { registerCommand } from "../lib/register-command.js";
 import { log } from "../logger.js";
@@ -16,9 +17,13 @@ const loadModule = createRequire(import.meta.url);
  * callbacks synchronously, so there is no place to await a module load.
  */
 function apiKeyProviders(): readonly string[] {
-  const { API_KEY_PROVIDERS } = loadModule(
-    "../../providers/provider-secret-catalog.js",
-  ) as typeof import("../../providers/provider-secret-catalog.js");
+  const { API_KEY_PROVIDERS } = resolveBundledCliModule(
+    "providerSecretCatalog",
+    () =>
+      loadModule(
+        "../../providers/provider-secret-catalog.js",
+      ) as typeof import("../../providers/provider-secret-catalog.js"),
+  );
   return API_KEY_PROVIDERS;
 }
 
@@ -118,21 +123,32 @@ Examples:
         },
       );
 
-      subcommand(keys, "delete").action(async (provider: string) => {
-        const { deleteSecureKeyViaDaemon } =
-          await import("../lib/daemon-credential-client.js");
-        const delResult = await deleteSecureKeyViaDaemon("api_key", provider);
-        if (delResult.result === "deleted") {
-          log.info(`Deleted API key for "${provider}"`);
-        } else if (delResult.result === "error") {
-          const detail = delResult.error ? `: ${delResult.error}` : "";
-          log.error(`Failed to delete API key for "${provider}"${detail}`);
-          process.exit(1);
-        } else {
-          log.error(`No API key found for "${provider}"`);
-          process.exit(1);
-        }
-      });
+      subcommand(keys, "delete").action(
+        async (provider: string, opts: { force?: boolean }) => {
+          const { deleteSecureKeyViaDaemon } =
+            await import("../lib/daemon-credential-client.js");
+          const delResult = await deleteSecureKeyViaDaemon(
+            "api_key",
+            provider,
+            opts.force === true,
+          );
+          if (delResult.result === "deleted") {
+            log.info(`Deleted API key for "${provider}"`);
+          } else if (delResult.result === "error") {
+            const detail = delResult.error ? `: ${delResult.error}` : "";
+            log.error(`Failed to delete API key for "${provider}"${detail}`);
+            if (delResult.code === "CREDENTIAL_IN_USE") {
+              log.error(
+                `Run 'assistant inference providers list' to inspect those connections, or 'assistant keys delete ${provider} --force' to delete the key anyway.`,
+              );
+            }
+            process.exit(1);
+          } else {
+            log.error(`No API key found for "${provider}"`);
+            process.exit(1);
+          }
+        },
+      );
     },
   });
 }

@@ -21,6 +21,7 @@ import { useNavigate } from "react-router";
 
 import { Button, Menu, Typography } from "@vellumai/design-library";
 
+import { useTranslation } from "@/i18n";
 import { FileMarkdown } from "@/components/file-markdown";
 import { SkillLineageLink } from "@/components/skill-lineage-link";
 import { SkillRemovalDialog } from "@/components/skill-removal-dialog";
@@ -41,6 +42,7 @@ interface SkillDetailPanelProps {
 }
 
 export function SkillDetailPanel({ skillId, onClose }: SkillDetailPanelProps) {
+  const { t } = useTranslation("chat");
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const assistantId = useResolvedAssistantsStore.use.activeAssistantId();
@@ -106,17 +108,21 @@ export function SkillDetailPanel({ skillId, onClose }: SkillDetailPanelProps) {
           ) : undefined
         }
         Glyph={Brain}
-        title={skill?.name ?? "Skill"}
-        closeLabel="Close skill details"
+        title={skill?.name ?? t("skillDetailPanel.titleFallback")}
+        closeLabel={t("skillDetailPanel.closeDetails")}
         onClose={onClose}
         headerActions={
           removable ? (
             <Menu.Root>
               <Menu.Trigger asChild>
                 <Button
-                  variant="ghost"
+                  // Matches the header's Close button: same `outlined`
+                  // variant, same bare `iconOnly` glyph (the Button sizes it),
+                  // and a short tooltip beside the descriptive aria-label.
+                  variant="outlined"
                   iconOnly={<MoreHorizontal />}
-                  aria-label="Skill actions"
+                  aria-label={t("skillDetailPanel.actionsAria")}
+                  tooltip={t("skillDetailPanel.moreTooltip")}
                   className="shrink-0"
                 />
               </Menu.Trigger>
@@ -125,19 +131,18 @@ export function SkillDetailPanel({ skillId, onClose }: SkillDetailPanelProps) {
                   leftIcon={<Trash2 size={14} />}
                   onSelect={() => setConfirmingRemoval(true)}
                 >
-                  Remove skill
+                  {t("skillDetailPanel.removeSkill")}
                 </Menu.Item>
               </Menu.Content>
             </Menu.Root>
           ) : undefined
         }
         footer={
-          <Button
-            fullWidth
-            onClick={() => navigate(routes.skills.detail(skillId))}
-          >
-            Go to Skill
-          </Button>
+          <div className="flex justify-end">
+            <Button onClick={() => navigate(routes.skills.detail(skillId))}>
+              {t("skillDetailPanel.goToSkill")}
+            </Button>
+          </div>
         }
       >
         {/* A failed background/window-focus revalidation sets `isError`
@@ -151,7 +156,7 @@ export function SkillDetailPanel({ skillId, onClose }: SkillDetailPanelProps) {
             as="p"
             className="py-8 text-center text-[var(--content-tertiary)]"
           >
-            This skill could not be loaded. It may have been removed.
+            {t("skillDetailPanel.loadError")}
           </Typography>
         ) : isLoading ? (
           <div className="flex items-center justify-center py-8">

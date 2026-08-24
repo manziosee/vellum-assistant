@@ -15,6 +15,10 @@ import {
 import { rawAll } from "../../persistence/raw-query.js";
 import { getLogger } from "../../util/logger.js";
 import { ACTOR_PRINCIPALS } from "../auth/route-policy.js";
+import {
+  getOriginClientId,
+  publishDocumentsChanged,
+} from "../sync/resource-sync-events.js";
 import { renderMarkdownToPDF } from "./document-pdf-renderer.js";
 import { BadRequestError, InternalError, NotFoundError } from "./errors.js";
 import type { RouteDefinition } from "./types.js";
@@ -63,6 +67,18 @@ function listAllDocuments(): Array<{
     return [];
   }
 }
+
+/** The document payload shape returned by `GET documents/{id}`. */
+const documentPayloadSchema = z.object({
+  success: z.boolean(),
+  surfaceId: z.string(),
+  conversationId: z.string(),
+  title: z.string(),
+  content: z.string(),
+  wordCount: z.number(),
+  createdAt: z.number(),
+  updatedAt: z.number(),
+});
 
 // ---------------------------------------------------------------------------
 // Route definitions
@@ -119,16 +135,7 @@ export const ROUTES: RouteDefinition[] = [
     summary: "Get a document",
     description: "Return a single document by surface ID.",
     tags: ["documents"],
-    responseBody: z.object({
-      success: z.boolean(),
-      surfaceId: z.string(),
-      conversationId: z.string(),
-      title: z.string(),
-      content: z.string(),
-      wordCount: z.number(),
-      createdAt: z.number(),
-      updatedAt: z.number(),
-    }),
+    responseBody: documentPayloadSchema,
     handler: ({ pathParams }) => {
       const doc = getDocumentById(pathParams!.id);
       if (!doc) {
@@ -160,7 +167,7 @@ export const ROUTES: RouteDefinition[] = [
       success: z.literal(true),
       surfaceId: z.string(),
     }),
-    handler: ({ body }) => {
+    handler: ({ body, headers }) => {
       const { surfaceId, conversationId, title, content, wordCount } = (body ??
         {}) as {
         surfaceId?: string;
@@ -197,6 +204,12 @@ export const ROUTES: RouteDefinition[] = [
       if (!result.success) {
         throw new InternalError(result.error);
       }
+      // Every save moves `updated_at`, which both document lists order by and
+      // the Library renders next to the word count, so a content-only save
+      // changes what the list surfaces show. The publish coalesces, which
+      // bounds the web editor's per-keystroke autosave to one broadcast per
+      // second, and the saving client suppresses its own echo by origin id.
+      publishDocumentsChanged(getOriginClientId(headers));
       return result;
     },
   },
@@ -231,6 +244,12 @@ export const ROUTES: RouteDefinition[] = [
         { surfaceId: pathParams!.id, conversationId },
         "Linked document to conversation",
       );
+      // No origin client id: the only caller, `document-viewer-page`, links the
+      // document and then navigates to the conversation whose assets pill must
+      // now list it, without invalidating anything itself. Suppressing its own
+      // echo would land it on a conversation whose pill is missing the document
+      // it just linked.
+      publishDocumentsChanged();
       return { success: true as const };
     },
   },

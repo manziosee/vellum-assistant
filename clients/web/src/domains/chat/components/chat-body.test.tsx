@@ -13,7 +13,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { act, cleanup, render, waitFor } from "@testing-library/react";
+import { cleanup, render } from "@testing-library/react";
 import { type ButtonHTMLAttributes, type ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 
@@ -65,14 +65,24 @@ mock.module("@vellumai/design-library", () => ({
     children,
     actions,
     tone,
+    onDismiss,
   }: {
     children?: ReactNode;
     actions?: ReactNode;
     tone?: string;
+    onDismiss?: () => void;
   }) => (
     <div data-testid="notice" data-tone={tone}>
       {children}
       {actions ? <div data-testid="notice-actions">{actions}</div> : null}
+      {onDismiss ? (
+        <button
+          type="button"
+          aria-label="Dismiss"
+          data-testid="notice-dismiss"
+          onClick={onDismiss}
+        />
+      ) : null}
     </div>
   ),
   Card: {
@@ -220,33 +230,52 @@ describe("ChatBody — banner overlay suppression (LUM-1566)", () => {
     expect(html).toContain("BANNER_CONTENT");
   });
 
-  test("reserves the measured bottom banner height", async () => {
-    const originalGetBoundingClientRect =
-      HTMLElement.prototype.getBoundingClientRect;
-    const originalResizeObserver = globalThis.ResizeObserver;
-    let measuredHeight = 137;
-    let resizeCallback: ResizeObserverCallback | null = null;
+  test("the banner takes its space in flow, and only the pill floats", () => {
+    // The banner is an opaque full-width card that always occupies its own
+    // height, so it belongs in the flex column: the `flex-1` scroll area
+    // gives back exactly that height at every viewport size. Positioning it
+    // absolutely removes it from flow and forces the space to be measured
+    // and reserved in JS, which is what put this component in the error-185
+    // family (LUM-2927) and cost a ResizeObserver, a state, and a prop on
+    // ChatScrollArea. The pill is the opposite: it genuinely floats over the
+    // transcript and reserves nothing.
+    const { container } = render(
+      <ChatBody
+        {...baseProps({
+          showScrollToLatest: true,
+          bannerSlot: <div data-testid="banner">BANNER_CONTENT</div>,
+        })}
+      />,
+    );
+    try {
+      const banner = container.querySelector('[data-testid="banner"]');
+      const pill = container.querySelector('[data-testid="scroll-to-latest"]');
+      expect(banner).not.toBeNull();
+      expect(pill).not.toBeNull();
 
-    HTMLElement.prototype.getBoundingClientRect =
-      function getBoundingClientRect() {
-        if (this.querySelector('[data-testid="banner"]')) {
-          return {
-            bottom: measuredHeight,
-            height: measuredHeight,
-            left: 0,
-            right: 0,
-            top: 0,
-            width: 0,
-            x: 0,
-            y: 0,
-            toJSON: () => ({}),
-          };
-        }
-        return originalGetBoundingClientRect.call(this);
-      };
+      // In flow: no positioned ancestor between the banner and the root.
+      expect(banner?.closest(".absolute")).toBeNull();
+      // Floating: the pill still lives in a positioned, click-through layer.
+      expect(pill?.closest(".absolute")).not.toBeNull();
+      expect(pill?.closest(".pointer-events-none")).not.toBeNull();
+    } finally {
+      cleanup();
+    }
+  });
+
+  test("measures nothing: no ResizeObserver, at mount or across re-renders", () => {
+    // The structural invariant. Any reintroduction of measure-to-reserve
+    // here (a ref'd node, an observer, a height in state) fails this, as
+    // does the subtler regression Codex caught on the first attempt: two
+    // unkeyed sibling divs in one overlay, where mounting the pill lets
+    // React reuse the observed banner node and leaves the observer on the
+    // wrong element.
+    const originalResizeObserver = globalThis.ResizeObserver;
+    let observersConstructed = 0;
+
     globalThis.ResizeObserver = class {
-      constructor(callback: ResizeObserverCallback) {
-        resizeCallback = callback;
+      constructor() {
+        observersConstructed += 1;
       }
       observe() {}
       unobserve() {}
@@ -254,27 +283,28 @@ describe("ChatBody — banner overlay suppression (LUM-1566)", () => {
     } as typeof ResizeObserver;
 
     try {
-      const { container } = render(
+      const { rerender } = render(
         <ChatBody
           {...baseProps({
             bannerSlot: <div data-testid="banner">BANNER_CONTENT</div>,
           })}
         />,
       );
-      await waitFor(() => {
-        expect(container.innerHTML).toContain("padding-bottom: 137px");
-      });
 
-      measuredHeight = 164;
-      act(() => {
-        resizeCallback?.([], {} as ResizeObserver);
-      });
-      await waitFor(() => {
-        expect(container.innerHTML).toContain("padding-bottom: 164px");
-      });
+      // Toggle the pill on and off under a live banner: the case that broke.
+      for (const showScrollToLatest of [true, false, true]) {
+        rerender(
+          <ChatBody
+            {...baseProps({
+              showScrollToLatest,
+              bannerSlot: <div data-testid="banner">BANNER_CONTENT</div>,
+            })}
+          />,
+        );
+      }
+
+      expect(observersConstructed).toBe(0);
     } finally {
-      HTMLElement.prototype.getBoundingClientRect =
-        originalGetBoundingClientRect;
       globalThis.ResizeObserver = originalResizeObserver;
       cleanup();
     }
@@ -452,16 +482,194 @@ describe("ChatBody - docked starters hide while the keyboard is open", () => {
   });
 });
 
-describe("ChatBody - plain empty state bottom-anchors while the keyboard is open", () => {
-  // Before conversation starters arrive, the plain empty state renders the
-  // NON-docked branch with no startersSlot (server-side starter generation
-  // can take a while on a brand-new assistant). While the soft keyboard is
-  // open that branch must bottom-anchor the greeting + composer group just
-  // like the docked branch, so the composer docks to the keyboard edge in
-  // the zero-starters window and the docked/non-docked flip when starters
-  // arrive never moves the composer mid-typing. The app-editing side panel
-  // is the one non-docked state WITH a startersSlot (its inline chips), and
-  // it keeps its centered layout regardless of keyboard state.
+describe("ChatBody - the docked empty state holds the composer still as its dock fills in", () => {
+  // The plain empty state passes a docked starters slot from the first frame,
+  // holding space for chips that have not loaded, and swaps the reserved
+  // content for real chips in place. Neither the composer nor the dock may
+  // remount across that swap, and an open keyboard must still bottom-anchor
+  // the group so the composer reaches the keyboard edge.
+  const reservedSlot = <div data-testid="starters">RESERVED_DOCK</div>;
+  const chipsSlot = <div data-testid="starters">STARTER_CHIPS</div>;
+
+  const dockedWith = (slot: ReactNode) =>
+    withEmptyState({ dockStartersToBottom: true, startersSlot: slot });
+
+  afterEach(() => {
+    keyboardOpen = false;
+    cleanup();
+  });
+
+  test("reserved dock, keyboard open: the group still bottom-anchors and the dock collapses", () => {
+    keyboardOpen = true;
+    const { container } = render(<ChatBody {...dockedWith(reservedSlot)} />);
+
+    expect(container.innerHTML).toContain("justify-end");
+    expect(container.innerHTML).not.toContain("[justify-content:safe_center]");
+    const dock = container.querySelector<HTMLElement>(
+      '[data-slot="docked-starters"]',
+    );
+    expect(dock?.style.gridTemplateRows).toBe("0fr");
+    expect(dock?.hasAttribute("inert")).toBe(true);
+  });
+
+  test("chips replacing the reserved content remount neither the composer nor the dock", () => {
+    const { container, rerender } = render(
+      <ChatBody {...dockedWith(reservedSlot)} />,
+    );
+    const composer = container.querySelector('[data-testid="composer"]');
+    const dock = container.querySelector('[data-slot="docked-starters"]');
+    expect(composer).not.toBeNull();
+    expect(dock).not.toBeNull();
+    expect(container.innerHTML).toContain("RESERVED_DOCK");
+
+    rerender(<ChatBody {...dockedWith(chipsSlot)} />);
+
+    expect(container.innerHTML).toContain("STARTER_CHIPS");
+    expect(container.querySelector('[data-testid="composer"]')).toBe(composer);
+    expect(container.querySelector('[data-slot="docked-starters"]')).toBe(dock);
+  });
+
+  test("the docked group centers at rest whether the dock holds chips or reserved space", () => {
+    const reserved = render(<ChatBody {...dockedWith(reservedSlot)} />);
+    expect(reserved.container.innerHTML).toContain(
+      "[justify-content:safe_center]",
+    );
+    cleanup();
+
+    const chips = render(<ChatBody {...dockedWith(chipsSlot)} />);
+    expect(chips.container.innerHTML).toContain(
+      "[justify-content:safe_center]",
+    );
+  });
+
+  test("the first send does not remount the composer out from under the docked empty state", () => {
+    // The pin that matters most on iOS Safari: a composer that remounts on
+    // send loses focus and the keyboard drops (LUM-1506 / LUM-1516). The
+    // docked branch is the one every fresh chat now takes, so the
+    // empty-to-active transition has to be walked from there, not only the
+    // docked-to-undocked flip a starter arrival used to cause.
+    const { container, rerender } = render(
+      <ChatBody {...dockedWith(chipsSlot)} />,
+    );
+    const composer = container.querySelector('[data-testid="composer"]');
+    expect(composer).not.toBeNull();
+
+    rerender(<ChatBody {...baseProps()} />);
+
+    expect(container.querySelector('[data-slot="docked-starters"]')).toBeNull();
+    expect(container.querySelector('[data-testid="composer"]')).toBe(composer);
+  });
+});
+
+describe("ChatBody - an empty docked starters slot collapses in place", () => {
+  // A starter query that settles with nothing to show leaves the dock with
+  // no reason to hold space. Unmounting it would snap the group down and
+  // snap it back if a later answer arrives, so the dock collapses through
+  // the same transition the keyboard uses. The collapse wraps the docked
+  // COLUMN, not just the slot, so the column's own bottom padding goes with
+  // it: a collapse inside that padding leaves a 12px band behind, which for
+  // an assistant with no starters is a band that never goes away.
+  const startersSlot = <div data-testid="starters">STARTER_CHIPS</div>;
+
+  const dockWrapper = (container: HTMLElement) =>
+    container.querySelector<HTMLElement>('[data-slot="docked-starters"]');
+
+  afterEach(() => {
+    keyboardOpen = false;
+    cleanup();
+  });
+
+  test("collapses, fades, goes inert, and clips while keeping the slot mounted", () => {
+    const { container } = render(
+      <ChatBody
+        {...withEmptyState({
+          dockStartersToBottom: true,
+          startersDockCollapsed: true,
+          startersSlot,
+        })}
+      />,
+    );
+
+    const dock = dockWrapper(container);
+    expect(dock).not.toBeNull();
+    expect(container.innerHTML).toContain("STARTER_CHIPS");
+    expect(dock?.style.gridTemplateRows).toBe("0fr");
+    expect(dock?.className).toContain("opacity-0");
+    expect(dock?.className).toContain("pointer-events-none");
+    expect(dock?.hasAttribute("inert")).toBe(true);
+    expect(dock?.firstElementChild?.className).toContain("overflow-hidden");
+  });
+
+  test("the collapse encloses the docked column, padding and all", () => {
+    // Structural pin, since happy-dom performs no layout: the padded column
+    // must sit INSIDE the collapsing wrapper. Move it outside and the
+    // wrapper can only ever give back the slot's height, never the padding
+    // framing it.
+    const { container } = render(
+      <ChatBody
+        {...withEmptyState({
+          dockStartersToBottom: true,
+          startersDockCollapsed: true,
+          startersSlot,
+        })}
+      />,
+    );
+
+    const slot = container.querySelector('[data-testid="starters"]');
+    const column = slot?.closest(".pb-3");
+    expect(column).not.toBeNull();
+    expect(column?.closest('[data-slot="docked-starters"]')).toBe(
+      dockWrapper(container),
+    );
+  });
+
+  test("a later answer expands the same wrapper instead of mounting a new one", () => {
+    const collapsed = () =>
+      withEmptyState({
+        dockStartersToBottom: true,
+        startersDockCollapsed: true,
+        startersSlot,
+      });
+    const { container, rerender } = render(<ChatBody {...collapsed()} />);
+    const dock = dockWrapper(container);
+    expect(dock?.style.gridTemplateRows).toBe("0fr");
+
+    rerender(
+      <ChatBody
+        {...withEmptyState({ dockStartersToBottom: true, startersSlot })}
+      />,
+    );
+
+    expect(dockWrapper(container)).toBe(dock as HTMLElement);
+    expect(dock?.style.gridTemplateRows).toBe("1fr");
+    expect(dock?.hasAttribute("inert")).toBe(false);
+  });
+
+  test("an open keyboard collapses the dock whatever the slot says", () => {
+    keyboardOpen = true;
+    const { container } = render(
+      <ChatBody
+        {...withEmptyState({
+          dockStartersToBottom: true,
+          startersDockCollapsed: false,
+          startersSlot,
+        })}
+      />,
+    );
+
+    expect(dockWrapper(container)?.style.gridTemplateRows).toBe("0fr");
+  });
+});
+
+describe("ChatBody - the undocked empty state bottom-anchors while the keyboard is open", () => {
+  // An undocked empty state with nothing at all below the composer must
+  // bottom-anchor the greeting + composer group while the soft keyboard is
+  // up, so the composer reaches the keyboard edge instead of floating in the
+  // middle of the band above it. The app-editing side panel is the undocked
+  // state WITH a startersSlot (its inline chips), and it keeps its centered
+  // layout regardless of keyboard state. The flip between the two branches
+  // must not move the composer either, since a caller can pass a docked slot
+  // at any point in a render.
   const startersSlot = <div data-testid="starters">STARTER_CHIPS</div>;
 
   afterEach(() => {
@@ -469,7 +677,7 @@ describe("ChatBody - plain empty state bottom-anchors while the keyboard is open
     cleanup();
   });
 
-  test("keyboard open, zero starters: the group bottom-anchors instead of centering", () => {
+  test("keyboard open, nothing below the composer: the group bottom-anchors instead of centering", () => {
     keyboardOpen = true;
     const { container } = render(<ChatBody {...withEmptyState()} />);
 
@@ -477,7 +685,7 @@ describe("ChatBody - plain empty state bottom-anchors while the keyboard is open
     expect(container.innerHTML).not.toContain("[justify-content:safe_center]");
   });
 
-  test("starters arriving under an open keyboard keep the bottom anchor across the branch flip", () => {
+  test("a docked slot appearing under an open keyboard keeps the bottom anchor across the branch flip", () => {
     keyboardOpen = true;
     const { container, rerender } = render(<ChatBody {...withEmptyState()} />);
     expect(container.innerHTML).toContain("justify-end");
@@ -490,6 +698,20 @@ describe("ChatBody - plain empty state bottom-anchors while the keyboard is open
     );
     expect(container.innerHTML).toContain("justify-end");
     expect(container.innerHTML).not.toContain("[justify-content:safe_center]");
+  });
+
+  test("flipping docked/undocked keeps the composer DOM node mounted", () => {
+    keyboardOpen = false;
+    const { container, rerender } = render(<ChatBody {...withEmptyState()} />);
+    const composer = container.querySelector('[data-testid="composer"]');
+    expect(composer).not.toBeNull();
+
+    rerender(
+      <ChatBody
+        {...withEmptyState({ dockStartersToBottom: true, startersSlot })}
+      />,
+    );
+    expect(container.querySelector('[data-testid="composer"]')).toBe(composer);
   });
 
   test("app-editing (non-docked with inline starters) stays centered with the keyboard open", () => {
@@ -727,10 +949,10 @@ describe("ChatBody — channel footer slot", () => {
 
 describe("ChatBody — generic chat error Notice (dismiss UX)", () => {
   // The Notice is rendered as an inline error banner above the composer.
-  // The banner has a "Go to Doctor" action and a "Dismiss" button as a
-  // second action (so the user has a real way to close the banner).
+  // The banner carries its own action ("Go to Doctor") plus the notice's
+  // dismiss control, so the user has a real way to close the banner.
 
-  test("renders a Dismiss button when genericChatError + onDismissChatError are both provided", () => {
+  test("renders the dismiss control when genericChatError + onDismissChatError are both provided", () => {
     const html = renderToStaticMarkup(
       <ChatBody
         {...baseProps({
@@ -746,7 +968,7 @@ describe("ChatBody — generic chat error Notice (dismiss UX)", () => {
     );
 
     expect(html).toContain("Go to Doctor");
-    expect(html).toContain("Dismiss");
+    expect(html).toContain('data-testid="notice-dismiss"');
   });
 
   test("renders warning-tone generic notices as status banners", () => {
@@ -766,8 +988,8 @@ describe("ChatBody — generic chat error Notice (dismiss UX)", () => {
     expect(html).toContain('data-tone="warning"');
   });
 
-  test("does NOT render the Dismiss button when onDismissChatError is omitted", () => {
-    // Defensive: don't silently show a Dismiss button that does nothing.
+  test("does NOT render the dismiss control when onDismissChatError is omitted", () => {
+    // Defensive: don't silently show a dismiss control that does nothing.
     const html = renderToStaticMarkup(
       <ChatBody
         {...baseProps({
@@ -776,7 +998,7 @@ describe("ChatBody — generic chat error Notice (dismiss UX)", () => {
       />,
     );
 
-    expect(html).not.toContain("Dismiss");
+    expect(html).not.toContain("notice-dismiss");
   });
 
   test("does not render the error banner at all when genericChatError is null", () => {
@@ -784,6 +1006,6 @@ describe("ChatBody — generic chat error Notice (dismiss UX)", () => {
       <ChatBody {...baseProps({ genericChatError: null })} />,
     );
 
-    expect(html).not.toContain(">Dismiss<");
+    expect(html).not.toContain('data-testid="notice"');
   });
 });

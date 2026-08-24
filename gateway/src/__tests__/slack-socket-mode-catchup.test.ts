@@ -24,7 +24,8 @@ mock.module("../fetch.js", () => ({
 }));
 
 const { SlackSocketModeClient } = await import("../slack/socket-mode.js");
-const { clearUserInfoCache } = await import("../slack/user-directory.js");
+const { clearUserInfoCache, clearChannelInfoCache, clearInFlightFetches } =
+  await import("../slack/user-directory.js");
 import type { SlackSocketModeConfig } from "../slack/socket-mode.js";
 
 type CatchupHarness = {
@@ -74,7 +75,8 @@ function createSlackStore(): { rawDb: Database; store: SlackStore } {
       channel_id TEXT,
       tracked_at INTEGER NOT NULL,
       expires_at INTEGER NOT NULL,
-      detached_at INTEGER
+      detached_at INTEGER,
+      speculative_root_at INTEGER
     );
     CREATE TABLE slack_seen_events (
       event_id TEXT PRIMARY KEY,
@@ -157,6 +159,12 @@ function makeHistoryResponse(messages: unknown[]): Response {
 
 beforeEach(() => {
   clearUserInfoCache();
+  // The channel-kind cache outlives a test otherwise, so one test's failed
+  // `conversations.info` leaves an unresolved marker the next test reads
+  // instead of its own mock. Kind is now a permission input, which makes that
+  // leak the difference between resolving a room and declining to.
+  clearChannelInfoCache();
+  clearInFlightFetches();
   fetchMock = mock(async () => makeHistoryResponse([]));
 });
 
@@ -624,6 +632,49 @@ describe("replayMissedEvents", () => {
     }
   });
 
+  test("recovers a missed unmentioned thread_broadcast from an active thread", async () => {
+    const { rawDb, store } = createSlackStore();
+    const emitted: NormalizedSlackEvent[] = [];
+    const client = createHarness(store, (event) => emitted.push(event));
+    const ws = makeOpenSocket();
+    client.ws = ws;
+
+    store.setLastSeenTsIfGreater("1700000000.000000");
+    store.trackThread("1700000000.000000", "CROUTED01", 24 * 60 * 60 * 1_000);
+
+    fetchMock = mock(async (input) => {
+      const url = String(input);
+      if (url.includes("conversations.replies")) {
+        return makeHistoryResponse([
+          {
+            type: "message",
+            subtype: "thread_broadcast",
+            user: "U-reply",
+            text: "also sending this to the channel",
+            ts: "1700000065.000000",
+            thread_ts: "1700000000.000000",
+          },
+        ]);
+      }
+      return makeHistoryResponse([]);
+    });
+
+    try {
+      await client.replayMissedEvents(ws);
+      await flushAsyncEventEmission();
+      expect(emitted).toHaveLength(1);
+      expect(emitted[0].event.source.updateId).toBe(
+        "replay:CROUTED01:1700000065.000000",
+      );
+      expect(emitted[0].event.message.content).toBe(
+        "also sending this to the channel",
+      );
+      expect(emitted[0].threadTs).toBe("1700000000.000000");
+    } finally {
+      rawDb.close();
+    }
+  });
+
   test("recovers a missed @-mention in a thread the bot posted to first (JARVIS-1086)", async () => {
     const { rawDb, store } = createSlackStore();
     const emitted: NormalizedSlackEvent[] = [];
@@ -698,6 +749,99 @@ describe("replayMissedEvents", () => {
       const raw = emitted[0].event.raw as { type?: string };
       expect(raw.type).toBe("app_mention");
       expect(emitted[0].threadTs).toBe(parentTs);
+    } finally {
+      rawDb.close();
+    }
+  });
+
+  test("does not fan out over a speculative root until a human replies (LUM-2941)", async () => {
+    const { rawDb, store } = createSlackStore();
+    const emitted: NormalizedSlackEvent[] = [];
+    const client = createHarness(store, (event) => emitted.push(event));
+    const ws = makeOpenSocket();
+    client.ws = ws;
+
+    store.setLastSeenTsIfGreater("1700000000.000000");
+
+    // The assistant posts top-level into an unrouted channel (a heartbeat
+    // turn). The echo arms the post's ts as a speculative thread root.
+    const rootTs = "1700000020.000000";
+    const post = (eventId: string) =>
+      client.handleMessage(
+        JSON.stringify({
+          envelope_id: `env-${eventId}`,
+          type: "events_api",
+          payload: {
+            event_id: eventId,
+            event: {
+              type: "message",
+              user: "UBOT",
+              text: "three PRs are waiting on review",
+              ts: rootTs,
+              channel: "CUNROUTED1",
+              channel_type: "channel",
+            },
+          },
+        }),
+        ws,
+      );
+
+    post("Ev-bot-top-level");
+    await flushAsyncEventEmission();
+    expect(emitted).toHaveLength(0);
+    expect(store.hasThread(rootTs)).toBe(true);
+
+    const calls: string[] = [];
+    fetchMock = mock(async (input) => {
+      calls.push(String(input));
+      return makeHistoryResponse([]);
+    });
+
+    try {
+      await client.replayMissedEvents(ws);
+      await flushAsyncEventEmission();
+
+      // The assistant posts continuously; one tier-3 conversations.replies
+      // call per never-engaged root on every reconnect would burn the rate
+      // limit that recovery of genuinely missed messages depends on.
+      expect(calls.some((u) => u.includes("conversations.replies"))).toBe(
+        false,
+      );
+
+      // A human replies live, which promotes the root to a tracked thread.
+      client.handleMessage(
+        JSON.stringify({
+          envelope_id: "env-human-reply",
+          type: "events_api",
+          payload: {
+            event_id: "Ev-human-reply",
+            event: {
+              type: "message",
+              user: "U-human",
+              text: "which one is blocking the release?",
+              ts: "1700000040.000000",
+              channel: "CUNROUTED1",
+              channel_type: "channel",
+              thread_ts: rootTs,
+            },
+          },
+        }),
+        ws,
+      );
+      await flushAsyncEventEmission();
+      expect(emitted).toHaveLength(1);
+
+      calls.length = 0;
+      await client.replayMissedEvents(ws);
+      await flushAsyncEventEmission();
+
+      expect(
+        calls.some(
+          (u) =>
+            u.includes("conversations.replies") &&
+            u.includes(encodeURIComponent(rootTs)),
+        ),
+      ).toBe(true);
     } finally {
       rawDb.close();
     }
@@ -937,6 +1081,115 @@ describe("replayMissedEvents", () => {
       await client.replayMissedEvents(ws);
       await flushAsyncEventEmission();
       expect(emitted).toHaveLength(0);
+    } finally {
+      rawDb.close();
+    }
+  });
+});
+
+describe("catch-up preserves room visibility", () => {
+  test("a recovered private-channel message is not stamped public", async () => {
+    // `conversations.history` carries no `channel_type`, so the replay path
+    // classifies what it can from the conversation id and leaves the rest
+    // unstamped. Synthesizing `"channel"` here would read downstream as proof
+    // of a public room, and the authoritative lookup that would have corrected
+    // it is skipped once visibility is already set. A private channel's
+    // recovered message would then select the public permission cell.
+    const { rawDb, store } = createSlackStore();
+    const emitted: NormalizedSlackEvent[] = [];
+    const client = createHarness(store, (event) => emitted.push(event));
+    const ws = makeOpenSocket();
+    client.ws = ws;
+    // Scoped to this test: a routed private room. Adding it to the shared
+    // config would make every replay test fetch a second channel.
+    client.config.gatewayConfig.routingEntries = [
+      { type: "conversation_id", key: "GPRIVATE01", assistantId: "ast-slack" },
+    ];
+
+    store.setLastSeenTsIfGreater("1700000000.000000");
+
+    fetchMock = mock(async (input) => {
+      const url = String(input);
+      if (url.includes("conversations.history")) {
+        return makeHistoryResponse(
+          url.includes("GPRIVATE01")
+            ? [
+                {
+                  type: "message",
+                  user: "U-author",
+                  text: "<@UBOT> recovered from a private room",
+                  ts: "1700000060.000000",
+                },
+              ]
+            : [],
+        );
+      }
+      return makeHistoryResponse([]);
+    });
+
+    try {
+      await client.replayMissedEvents(ws);
+      await flushAsyncEventEmission();
+
+      const recovered = emitted.find(
+        (event) => event.event.message.conversationExternalId === "GPRIVATE01",
+      );
+      expect(recovered).toBeDefined();
+      expect(recovered?.event.source.conversationType).toBe("private");
+    } finally {
+      rawDb.close();
+    }
+  });
+
+  test("a recovered message from an ambiguous room claims no visibility", async () => {
+    // A `C` is a public channel or a modern multi-person IM, and the replay
+    // path cannot tell which. Claiming public would hand a group DM a
+    // public-channel rule, so it says nothing and lets the socket path resolve
+    // it against Slack before emitting.
+    const { rawDb, store } = createSlackStore();
+    const emitted: NormalizedSlackEvent[] = [];
+    const client = createHarness(store, (event) => emitted.push(event));
+    const ws = makeOpenSocket();
+    client.ws = ws;
+
+    store.setLastSeenTsIfGreater("1700000000.000000");
+
+    fetchMock = mock(async (input) => {
+      const url = String(input);
+      if (url.includes("conversations.history")) {
+        return makeHistoryResponse(
+          url.includes("CROUTED01")
+            ? [
+                {
+                  type: "message",
+                  user: "U-author",
+                  text: "<@UBOT> recovered",
+                  ts: "1700000070.000000",
+                },
+              ]
+            : [],
+        );
+      }
+      if (url.includes("conversations.info")) {
+        return new Response(
+          JSON.stringify({ ok: true, channel: { is_private: false } }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      return makeHistoryResponse([]);
+    });
+
+    try {
+      await client.replayMissedEvents(ws);
+      await flushAsyncEventEmission();
+
+      const recovered = emitted.find(
+        (event) => event.event.message.conversationExternalId === "CROUTED01",
+      );
+      expect(recovered).toBeDefined();
+      // Resolved by asking Slack rather than by the replay's own inference,
+      // which is the distinction this whole shape rests on.
+      expect(recovered?.event.source.conversationType).toBe("public");
     } finally {
       rawDb.close();
     }

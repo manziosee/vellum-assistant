@@ -8,32 +8,35 @@
  * - {@link renderGroupMenuItems} — Radix `ContextMenu` / `Menu` items, used
  *   for the desktop right-click menu on a section header.
  * - {@link renderGroupMenuItemsAsPanelItems} — the same item set flattened
- *   into `PanelItem` rows for the popover and the mobile bottom sheet.
- * - {@link GroupActionsMenu} — the trailing "…" button on custom-group
- *   headers, which renders the PanelItem set in a Popover (desktop) or a
- *   BottomSheet (mobile).
+ *   into `PanelItem` rows for the popover and the touch bottom sheet.
+ * - {@link GroupActionsMenu} — the trailing "…" button on a section header,
+ *   which renders the PanelItem set in a Popover (desktop) or a BottomSheet
+ *   (mobile). Every section carries one, so a section's actions never depend
+ *   on the user knowing to right-click.
  *
  * `conversation-actions-menu.tsx` splits the per-conversation menu the same
  * way; the `PanelItem` row primitives both use live in `panel-menu-item.tsx`.
  */
 
 import {
-    Archive,
-    ArrowDown,
-    ArrowUp,
-    CircleCheck,
-    Copy,
-    MoreHorizontal,
-    Pencil,
-    Trash2,
+  Archive,
+  ArrowDown,
+  ArrowUp,
+  Copy,
+  Layers,
+  Pencil,
+  Trash2,
 } from "lucide-react";
 import { type ReactNode, useState } from "react";
 
-import { useIsMobile } from "@/hooks/use-is-mobile";
+import { useTouchMobile } from "@/hooks/use-touch-mobile";
+import { useTranslation, type TFunction } from "@/i18n";
+import { SectionActionsButton } from "@/components/section-actions-button";
 import {
   buildPanelMenuItem,
   PanelMenuDivider,
 } from "@/domains/chat/components/panel-menu-item";
+import { MARK_ALL_READ_ICON } from "@/utils/read-state-icon";
 import {
   BottomSheet,
   ContextMenu,
@@ -75,6 +78,16 @@ export interface GroupMenuItemsProps {
    */
   onMoveUp?: () => void;
   onMoveDown?: () => void;
+  /**
+   * Switch the sidebar between one flat chat list and one section per origin
+   * channel. Offered by the sections the switch actually changes (Chats and
+   * the channel sections), which is why it sits beside their bulk actions
+   * rather than in a sidebar-wide header: the section carrying the toggle is
+   * the section it reshapes.
+   */
+  onToggleGroupByChannel?: () => void;
+  /** Whether channel grouping is on, which decides the toggle's label. */
+  isGroupedByChannel?: boolean;
 }
 
 /**
@@ -87,6 +100,7 @@ export function hasAnyGroupMenuAction({
   onRename,
   onDelete,
   onCopyGroupId,
+  onToggleGroupByChannel,
   onMoveUp,
   onMoveDown,
 }: GroupMenuItemsProps): boolean {
@@ -96,6 +110,7 @@ export function hasAnyGroupMenuAction({
     onRename != null ||
     onDelete != null ||
     onCopyGroupId != null ||
+    onToggleGroupByChannel != null ||
     onMoveUp != null ||
     onMoveDown != null
   );
@@ -110,12 +125,21 @@ export function renderGroupMenuItems({
   onRename,
   onDelete,
   onCopyGroupId,
+  onToggleGroupByChannel,
+  isGroupedByChannel = false,
   onMoveUp,
   onMoveDown,
-}: GroupMenuItemsProps & { Primitive: GroupMenuPrimitive }): ReactNode {
+  t,
+}: GroupMenuItemsProps & {
+  Primitive: GroupMenuPrimitive;
+  t: TFunction<"chat">;
+}): ReactNode {
   const hasBulkActions = onMarkAllRead != null || onArchiveAll != null;
   const hasIndividualActions =
-    onRename != null || onDelete != null || onCopyGroupId != null;
+    onRename != null ||
+    onDelete != null ||
+    onCopyGroupId != null ||
+    onToggleGroupByChannel != null;
   const hasMoveActions = onMoveUp != null || onMoveDown != null;
 
   return (
@@ -125,12 +149,15 @@ export function renderGroupMenuItems({
           section (no rename/delete) and a custom group. */}
       {onMoveUp ? (
         <Primitive.Item leftIcon={<ArrowUp size={14} />} onSelect={onMoveUp}>
-          Move Section Up
+          {t("groupActions.moveSectionUp")}
         </Primitive.Item>
       ) : null}
       {onMoveDown ? (
-        <Primitive.Item leftIcon={<ArrowDown size={14} />} onSelect={onMoveDown}>
-          Move Section Down
+        <Primitive.Item
+          leftIcon={<ArrowDown size={14} />}
+          onSelect={onMoveDown}
+        >
+          {t("groupActions.moveSectionDown")}
         </Primitive.Item>
       ) : null}
       {hasMoveActions && (hasBulkActions || hasIndividualActions) ? (
@@ -138,11 +165,11 @@ export function renderGroupMenuItems({
       ) : null}
       {onMarkAllRead ? (
         <Primitive.Item
-          leftIcon={<CircleCheck size={14} />}
+          leftIcon={<MARK_ALL_READ_ICON size={14} />}
           onSelect={onMarkAllRead}
           disabled={!hasUnreadConversations}
         >
-          Mark All as Read
+          {t("groupActions.markAllRead")}
         </Primitive.Item>
       ) : null}
       {onArchiveAll ? (
@@ -151,23 +178,35 @@ export function renderGroupMenuItems({
           onSelect={onArchiveAll}
           disabled={!hasConversations}
         >
-          Archive All…
+          {t("groupActions.archiveAll")}
         </Primitive.Item>
       ) : null}
       {hasBulkActions && hasIndividualActions ? <Primitive.Separator /> : null}
       {onRename ? (
         <Primitive.Item leftIcon={<Pencil size={14} />} onSelect={onRename}>
-          Rename
+          {t("groupActions.rename")}
         </Primitive.Item>
       ) : null}
       {onDelete ? (
         <Primitive.Item leftIcon={<Trash2 size={14} />} onSelect={onDelete}>
-          {hasConversations ? "Delete group…" : "Delete group"}
+          {hasConversations
+            ? t("groupActions.deleteGroupWithConversations")
+            : t("groupActions.deleteGroup")}
         </Primitive.Item>
       ) : null}
       {onCopyGroupId ? (
         <Primitive.Item leftIcon={<Copy size={14} />} onSelect={onCopyGroupId}>
-          Copy group ID
+          {t("groupActions.copyGroupId")}
+        </Primitive.Item>
+      ) : null}
+      {onToggleGroupByChannel ? (
+        <Primitive.Item
+          leftIcon={<Layers size={14} />}
+          onSelect={onToggleGroupByChannel}
+        >
+          {isGroupedByChannel
+            ? t("groupActions.ungroup")
+            : t("groupActions.groupByChannel")}
         </Primitive.Item>
       ) : null}
     </>
@@ -186,13 +225,22 @@ export function renderGroupMenuItemsAsPanelItems({
   onRename,
   onDelete,
   onCopyGroupId,
+  onToggleGroupByChannel,
+  isGroupedByChannel = false,
   onMoveUp,
   onMoveDown,
   onClose,
-}: GroupMenuItemsProps & { onClose: () => void }): ReactNode {
+  t,
+}: GroupMenuItemsProps & {
+  onClose: () => void;
+  t: TFunction<"chat">;
+}): ReactNode {
   const hasBulkActions = onMarkAllRead != null || onArchiveAll != null;
   const hasIndividualActions =
-    onRename != null || onDelete != null || onCopyGroupId != null;
+    onRename != null ||
+    onDelete != null ||
+    onCopyGroupId != null ||
+    onToggleGroupByChannel != null;
   const hasMoveActions = onMoveUp != null || onMoveDown != null;
 
   return (
@@ -201,7 +249,7 @@ export function renderGroupMenuItemsAsPanelItems({
         ? buildPanelMenuItem({
             key: "move-section-up",
             icon: ArrowUp,
-            label: "Move Section Up",
+            label: t("groupActions.moveSectionUp"),
             run: onMoveUp,
             onClose,
           })
@@ -210,7 +258,7 @@ export function renderGroupMenuItemsAsPanelItems({
         ? buildPanelMenuItem({
             key: "move-section-down",
             icon: ArrowDown,
-            label: "Move Section Down",
+            label: t("groupActions.moveSectionDown"),
             run: onMoveDown,
             onClose,
           })
@@ -221,8 +269,8 @@ export function renderGroupMenuItemsAsPanelItems({
       {onMarkAllRead
         ? buildPanelMenuItem({
             key: "mark-all-read",
-            icon: CircleCheck,
-            label: "Mark All as Read",
+            icon: MARK_ALL_READ_ICON,
+            label: t("groupActions.markAllRead"),
             disabled: !hasUnreadConversations,
             run: onMarkAllRead,
             onClose,
@@ -232,7 +280,7 @@ export function renderGroupMenuItemsAsPanelItems({
         ? buildPanelMenuItem({
             key: "archive-all",
             icon: Archive,
-            label: "Archive All…",
+            label: t("groupActions.archiveAll"),
             disabled: !hasConversations,
             run: onArchiveAll,
             onClose,
@@ -243,7 +291,7 @@ export function renderGroupMenuItemsAsPanelItems({
         ? buildPanelMenuItem({
             key: "rename",
             icon: Pencil,
-            label: "Rename",
+            label: t("groupActions.rename"),
             run: onRename,
             onClose,
           })
@@ -252,7 +300,9 @@ export function renderGroupMenuItemsAsPanelItems({
         ? buildPanelMenuItem({
             key: "delete",
             icon: Trash2,
-            label: hasConversations ? "Delete group…" : "Delete group",
+            label: hasConversations
+              ? t("groupActions.deleteGroupWithConversations")
+              : t("groupActions.deleteGroup"),
             run: onDelete,
             onClose,
           })
@@ -261,8 +311,19 @@ export function renderGroupMenuItemsAsPanelItems({
         ? buildPanelMenuItem({
             key: "copy-group-id",
             icon: Copy,
-            label: "Copy group ID",
+            label: t("groupActions.copyGroupId"),
             run: onCopyGroupId,
+            onClose,
+          })
+        : null}
+      {onToggleGroupByChannel
+        ? buildPanelMenuItem({
+            key: "toggle-group-by-channel",
+            icon: Layers,
+            label: isGroupedByChannel
+              ? t("groupActions.ungroup")
+              : t("groupActions.groupByChannel"),
+            run: onToggleGroupByChannel,
             onClose,
           })
         : null}
@@ -271,7 +332,7 @@ export function renderGroupMenuItemsAsPanelItems({
 }
 
 // ---------------------------------------------------------------------------
-// GroupActionsMenu — the trailing "…" button on a custom group header
+// GroupActionsMenu — the trailing "…" button on a section header
 // ---------------------------------------------------------------------------
 
 export interface GroupActionsMenuProps extends GroupMenuItemsProps {
@@ -280,46 +341,42 @@ export interface GroupActionsMenuProps extends GroupMenuItemsProps {
 }
 
 /**
- * Trailing "…" affordance on a custom-group header. Renders the shared group
- * menu items, so this menu and the header's right-click menu always offer the
- * same actions.
+ * Trailing "…" affordance on a section header. Renders the shared group menu
+ * items, so this menu, the header's right-click menu and the mobile long-press
+ * sheet always offer the same actions - the reachability the sidebar's grouping
+ * toggle depends on (LUM-3120).
  */
 export function GroupActionsMenu({
   label,
   ...menuProps
 }: GroupActionsMenuProps) {
   const [open, setOpen] = useState(false);
-  const isMobile = useIsMobile();
+  const isTouchMobile = useTouchMobile();
+  const { t } = useTranslation("chat");
   const closeMenu = () => setOpen(false);
+  const hasItems = hasAnyGroupMenuAction(menuProps);
 
-  if (!hasAnyGroupMenuAction(menuProps)) {
+  if (!hasItems) {
     return null;
   }
 
   const items = renderGroupMenuItemsAsPanelItems({
     ...menuProps,
     onClose: closeMenu,
+    t,
   });
 
-  const trigger = (
-    <button
-      type="button"
-      aria-label={`${label} actions`}
-      aria-haspopup="menu"
-      onClick={(event) => event.stopPropagation()}
-      className="flex h-5 w-5 items-center justify-center rounded-[4px] text-[var(--content-tertiary)] transition-colors hover:bg-[var(--surface-hover)] hover:text-[var(--content-secondary)] aria-[expanded=true]:bg-[var(--surface-active)] aria-[expanded=true]:text-[var(--content-emphasised)]"
-    >
-      <MoreHorizontal size={14} aria-hidden />
-    </button>
-  );
+  const trigger = <SectionActionsButton label={label} />;
 
-  if (isMobile) {
+  if (isTouchMobile) {
     return (
       <BottomSheet.Root open={open} onOpenChange={setOpen}>
         <BottomSheet.Trigger asChild>{trigger}</BottomSheet.Trigger>
         <BottomSheet.Content aria-describedby={undefined}>
           <BottomSheet.Header className="sr-only">
-            <BottomSheet.Title>{label} actions</BottomSheet.Title>
+            <BottomSheet.Title>
+              {t("groupActionsSheet.title", { name: label })}
+            </BottomSheet.Title>
           </BottomSheet.Header>
           <BottomSheet.Body className="pt-0">{items}</BottomSheet.Body>
         </BottomSheet.Content>
