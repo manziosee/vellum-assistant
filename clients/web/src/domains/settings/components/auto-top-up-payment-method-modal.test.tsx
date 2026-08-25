@@ -69,6 +69,8 @@ mock.module("@stripe/stripe-js", () => ({
 }));
 
 import * as sdkGen from "@/generated/api/sdk.gen";
+import * as platformDetection from "@/runtime/platform-detection";
+import * as runtimeBrowser from "@/runtime/browser";
 
 mock.module("@/generated/api/sdk.gen", () => ({
   ...sdkGen,
@@ -77,6 +79,21 @@ mock.module("@/generated/api/sdk.gen", () => ({
       data: { client_secret: "seti_123_secret_456" },
       response: { ok: true },
     }),
+}));
+
+let nativeAndroid = false;
+mock.module("@/runtime/platform-detection", () => ({
+  ...platformDetection,
+  useIsNativeAndroid: () => nativeAndroid,
+}));
+
+let openedUrl: string | null = null;
+mock.module("@/runtime/browser", () => ({
+  ...runtimeBrowser,
+  openUrl: (url: string) => {
+    openedUrl = url;
+    return Promise.resolve();
+  },
 }));
 
 // The modal reads VITE_STRIPE_PUBLISHABLE_KEY into module-scope `STRIPE_PK`
@@ -104,7 +121,11 @@ afterAll(() => {
 // ---------------------------------------------------------------------------
 
 /** Wait for the SetupIntent mutation to resolve and the card form to mount. */
-async function renderModalWithForm(): Promise<ReturnType<typeof render>> {
+async function renderModalWithForm(
+  onSavedOptimistic: (args: {
+    setupIntentId: string | null;
+  }) => void = () => {},
+): Promise<ReturnType<typeof render>> {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
@@ -113,7 +134,7 @@ async function renderModalWithForm(): Promise<ReturnType<typeof render>> {
       <AutoTopUpPaymentMethodModal
         open
         onClose={() => {}}
-        onSavedOptimistic={() => {}}
+        onSavedOptimistic={onSavedOptimistic}
       />
     </QueryClientProvider>,
   );
@@ -139,6 +160,8 @@ beforeEach(() => {
   paymentElementProps = null;
   addressElementProps = null;
   confirmSetupCalls = [];
+  nativeAndroid = false;
+  openedUrl = null;
 });
 
 afterEach(cleanup);
@@ -146,6 +169,36 @@ afterEach(cleanup);
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+describe("AutoTopUpPaymentMethodModal on native Android", () => {
+  test("opens the web billing page and closes instead of mounting Stripe Elements", async () => {
+    nativeAndroid = true;
+    const closes: number[] = [];
+    const client = new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    });
+    const { queryByTestId } = render(
+      <QueryClientProvider client={client}>
+        <AutoTopUpPaymentMethodModal
+          open
+          onClose={() => closes.push(1)}
+          onSavedOptimistic={() => {}}
+        />
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() =>
+      expect(openedUrl).toBe(
+        `${window.location.origin}/assistant/settings/usage?tab=billing`,
+      ),
+    );
+    expect(closes.length).toBe(1);
+    expect(queryByTestId("stripe-address-element")).toBeNull();
+  });
+});
 
 describe("AutoTopUpPaymentMethodModal billing address", () => {
   test("renders a billing-mode AddressElement alongside the PaymentElement once the client_secret loads", async () => {
@@ -211,5 +264,26 @@ describe("AutoTopUpPaymentMethodModal billing address", () => {
     expect(
       (call.confirmParams as Record<string, unknown>).payment_method_data,
     ).toBeUndefined();
+  });
+
+  test("reports the SetupIntent id derived from the client secret on save", async () => {
+    const savedArgs: Array<{ setupIntentId: string | null }> = [];
+    const { getByTestId } = await renderModalWithForm((args) => {
+      savedArgs.push(args);
+    });
+    fireOnReady(paymentElementProps);
+    fireOnReady(addressElementProps);
+
+    fireEvent.submit(
+      getByTestId("auto-top-up-pm-save-button").closest("form")!,
+    );
+
+    await waitFor(() => {
+      if (savedArgs.length === 0) {
+        throw new Error("onSavedOptimistic not called");
+      }
+    });
+    // The mocked client_secret is `seti_123_secret_456`.
+    expect(savedArgs[0]).toEqual({ setupIntentId: "seti_123" });
   });
 });

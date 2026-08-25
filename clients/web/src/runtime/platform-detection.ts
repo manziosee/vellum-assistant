@@ -123,15 +123,31 @@ export function isAndroidBrowser(): boolean {
 export type ClientOs = ElectronHostOS | "ios" | "android" | "web";
 export type { ElectronHostOS };
 
+const CLIENT_OS_DISPLAY_NAMES: Readonly<Record<ClientOs, string>> = {
+  macos: "macOS",
+  windows: "Windows",
+  ios: "iOS",
+  android: "Android",
+  web: "Web",
+};
+
+/** User-facing name for a detected client OS. */
+export function clientOsDisplayName(clientOs: ClientOs): string {
+  return CLIENT_OS_DISPLAY_NAMES[clientOs];
+}
+
 /**
- * Detect the Electron host OS. A bridge without `hostOS` is a macOS host:
- * every Electron preload with that legacy shape is macOS-only.
+ * Detect the Electron host OS. Older preloads omit `hostOS`, so use the
+ * renderer platform to distinguish their Windows hosts from macOS.
  */
 export function detectElectronHostOS(): ElectronHostOS | null {
   if (!isElectron()) {
     return null;
   }
-  return window.vellum?.hostOS ?? "macos";
+  if (window.vellum?.hostOS) {
+    return window.vellum.hostOS;
+  }
+  return navigator.platform.toLowerCase().includes("win") ? "windows" : "macos";
 }
 
 /**

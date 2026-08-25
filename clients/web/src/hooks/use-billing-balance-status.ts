@@ -24,8 +24,30 @@ export interface BillingBalanceStatus {
    * proactively, without waiting for a send to fail.
    */
   dailyLimitReached: boolean;
+  /**
+   * Server-computed: the daily limit has been skipped for the current UTC day,
+   * so it is configured but not being enforced. Mutually exclusive with
+   * {@link BillingBalanceStatus.dailyLimitReached} by construction: the
+   * platform derives `daily_limit_reached` as false while a skip is active.
+   */
+  dailyLimitSnoozed: boolean;
+  /** The configured daily limit as a decimal string, or null when unset. */
+  dailyLimit: string | null;
+  /** Today's (UTC) credit spend as a decimal string, or null when unknown. */
+  dailySpend: string | null;
   /** Effective balance as a decimal string, or null when unknown. */
   balance: string | null;
+  /**
+   * Unused credit still sitting on the unexpired usage grants (the initial
+   * credit and a Pro sub's monthly bundle), as a decimal string. This is what
+   * the Usage Balance bar measures, and what the credit figures net out.
+   */
+  availableUsageBalance: string | null;
+  /**
+   * What those same grants were originally worth, as a decimal string. The
+   * denominator of a free plan's Usage Balance bar.
+   */
+  totalUsageBalance: string | null;
   /** Whether the billing summary query is allowed to run at all. */
   enabled: boolean;
 }
@@ -34,7 +56,12 @@ const INERT_STATUS: Omit<BillingBalanceStatus, "enabled"> = {
   isExhausted: false,
   isLowBalance: false,
   dailyLimitReached: false,
+  dailyLimitSnoozed: false,
+  dailyLimit: null,
+  dailySpend: null,
   balance: null,
+  availableUsageBalance: null,
+  totalUsageBalance: null,
 };
 
 /**
@@ -99,7 +126,14 @@ export function useBillingBalanceStatus(
     isExhausted: isExhausted && !suppressed,
     isLowBalance: isLowBalance && !suppressed,
     dailyLimitReached: summary.daily_limit_reached === true,
+    dailyLimitSnoozed: summary.daily_limit_snoozed === true,
+    dailyLimit: summary.daily_credit_limit_usd ?? null,
+    dailySpend: summary.daily_spend_usd ?? null,
     balance: summary.effective_balance,
+    // A platform that predates the usage-grant fields reports neither, which
+    // reads as no grant information rather than a zeroed one.
+    availableUsageBalance: summary.available_usage_balance ?? null,
+    totalUsageBalance: summary.total_usage_balance ?? null,
     enabled,
   };
 }

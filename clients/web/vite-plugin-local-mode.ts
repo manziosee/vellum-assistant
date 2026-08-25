@@ -14,11 +14,14 @@ import {
   connectImport,
   getLockfileData,
   getLocalAssistantStatus,
+  renameLockfileAssistantIfPresent,
   upsertRendererLockfileAssistant,
   replacePlatformAssistants,
   isActiveAssistant,
   isPairedLockfileEntry,
   PAIRED_GUARDIAN_TOKEN_HOST_ONLY_ERROR,
+  runDevicesList,
+  runDevicesRevoke,
   runHatch,
   runRetire,
   runSleep,
@@ -72,6 +75,9 @@ export function localModePlugin(env: Record<string, string>): Plugin {
   const config = resolveLocalConfigFromEnv(env);
   const baseDir = path.resolve(import.meta.dirname, "..", "..");
 
+  // The `/assistant/__config` document, also injected into the index. No
+  // `assistantId`: the dev server fronts every assistant in the lockfile at
+  // once, so it has no single identity to report the way an nginx edge does.
   const configJson = JSON.stringify({
     webUrl: config.webUrl,
     platformUrl: config.platformUrl,
@@ -88,9 +94,7 @@ export function localModePlugin(env: Record<string, string>): Plugin {
     configureServer(server) {
       server.middlewares.use(loopbackCallbackMiddleware());
       server.middlewares.use(platformSessionMiddleware());
-      server.middlewares.use(
-        configMiddleware(config.webUrl, config.platformUrl),
-      );
+      server.middlewares.use(configMiddleware(configJson));
       server.middlewares.use(lockfileMiddleware(config.lockfilePaths));
       server.middlewares.use(hatchMiddleware(baseDir));
       server.middlewares.use(retireMiddleware(baseDir, config.lockfilePaths));
@@ -102,6 +106,7 @@ export function localModePlugin(env: Record<string, string>): Plugin {
       );
       server.middlewares.use(sleepMiddleware(baseDir));
       server.middlewares.use(wakeMiddleware(baseDir));
+      server.middlewares.use(devicesMiddleware(baseDir));
       const upgradingLocalAssistantIds = new Set<string>();
       server.middlewares.use(
         upgradeMiddleware(
@@ -260,18 +265,13 @@ function platformSessionMiddleware(): Connect.NextHandleFunction {
   };
 }
 
-function configMiddleware(
-  webUrl: string,
-  platformUrl: string,
-): Connect.NextHandleFunction {
-  const body = JSON.stringify({ webUrl, platformUrl });
-
+function configMiddleware(configJson: string): Connect.NextHandleFunction {
   return (req, res, next) => {
     if (req.url !== "/assistant/__config" && req.url !== "/__config") {
       return next();
     }
     res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(body);
+    res.end(configJson);
   };
 }
 
@@ -348,6 +348,13 @@ function lockfileMiddleware(
             lockfilePaths,
             body.platformAssistants as Array<Record<string, unknown>>,
             body.organizationId as string | undefined,
+          );
+        } else if (body.rename && typeof body.rename === "object") {
+          const rename = body.rename as Record<string, unknown>;
+          result = renameLockfileAssistantIfPresent(
+            lockfilePaths,
+            rename.assistantId as string,
+            rename.name as string,
           );
         } else {
           result = upsertRendererLockfileAssistant(
@@ -704,6 +711,80 @@ function wakeMiddleware(baseDir: string): Connect.NextHandleFunction {
           );
         },
       );
+    });
+  };
+}
+
+// Paired-device management via the CLI (`vellum devices … --json`). POST-only
+// (the renderer's postLocalCommand always POSTs); run-helper results respond
+// 200 with `ok` discriminating success so all hosts share one wire shape.
+function devicesMiddleware(baseDir: string): Connect.NextHandleFunction {
+  return (req, res, next) => {
+    const isRevoke =
+      req.url === "/assistant/__local/devices-revoke" ||
+      req.url === "/__local/devices-revoke";
+    if (
+      !isRevoke &&
+      req.url !== "/assistant/__local/devices" &&
+      req.url !== "/__local/devices"
+    ) {
+      return next();
+    }
+
+    if (rejectUnlessLocalEndpointRequest(req, res)) {
+      return;
+    }
+
+    if (req.method !== "POST") {
+      res.statusCode = 405;
+      res.end();
+      return;
+    }
+
+    void readJsonBody(req).then((body) => {
+      if (!body) {
+        respondJson(res, 400, { ok: false, error: "Invalid JSON body" });
+        return;
+      }
+
+      const assistantId = body.assistantId;
+      if (typeof assistantId !== "string" || !assistantId) {
+        respondJson(res, 400, { ok: false, error: "Missing assistantId" });
+        return;
+      }
+
+      let revokeHash: string | null = null;
+      if (isRevoke) {
+        const hashedDeviceId = body.hashedDeviceId;
+        if (typeof hashedDeviceId !== "string" || !hashedDeviceId) {
+          respondJson(res, 400, { ok: false, error: "Missing hashedDeviceId" });
+          return;
+        }
+        revokeHash = hashedDeviceId;
+      }
+
+      let invocation: CliInvocation;
+      try {
+        invocation = resolveDevCliInvocation(baseDir, import.meta.url);
+      } catch (err) {
+        respondJson(res, 500, {
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        return;
+      }
+
+      if (revokeHash !== null) {
+        void runDevicesRevoke(invocation, assistantId, revokeHash).then(
+          (result) => {
+            respondJson(res, 200, result);
+          },
+        );
+        return;
+      }
+      void runDevicesList(invocation, assistantId).then((result) => {
+        respondJson(res, 200, result);
+      });
     });
   };
 }

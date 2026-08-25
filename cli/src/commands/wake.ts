@@ -29,7 +29,11 @@ import {
   startLocalDaemon,
   startGateway,
 } from "../lib/local";
-import { restoreTunnelEdgeAndAutoTunnel } from "../lib/tunnel-edge.js";
+import {
+  DOCKER_GATEWAY_READY_TIMEOUT_MS,
+  restoreContainerTunnelEdge,
+  restoreTunnelEdgeAndAutoTunnel,
+} from "../lib/tunnel-edge.js";
 
 export async function wake(): Promise<void> {
   const args = process.argv.slice(3);
@@ -82,6 +86,7 @@ export async function wake(): Promise<void> {
     const res = dockerResourceNames(entry.assistantId);
     await wakeContainers(res);
     console.log("Docker containers started.");
+    await restoreContainerTunnelEdge(entry, DOCKER_GATEWAY_READY_TIMEOUT_MS);
     console.log("Wake complete.");
     return;
   }
@@ -134,11 +139,24 @@ export async function wake(): Promise<void> {
     "readyz",
   );
   if (daemonState.status !== "needs_start") {
-    if (watch && isAssistantWatchModeAvailable()) {
+    if (daemonState.status === "stuck") {
+      daemonRunning = true;
+      daemonUnready = true;
+      console.log(
+        `Assistant running (pid ${daemonState.pid}) but is not responding and could not be stopped.`,
+      );
+    } else if (watch && isAssistantWatchModeAvailable()) {
       console.log(
         `Assistant running (pid ${daemonState.pid}) — restarting in watch mode...`,
       );
-      await stopProcessByPidFile(pidFile, "assistant");
+      const stopped = await stopProcessByPidFile(pidFile, "assistant");
+      if (!stopped && isProcessAlive(pidFile).alive) {
+        daemonRunning = true;
+        daemonUnready = true;
+        console.log(
+          `Assistant running (pid ${daemonState.pid}) but could not be stopped for watch mode.`,
+        );
+      }
     } else {
       daemonRunning = true;
       daemonUnready = daemonState.status !== "healthy";
@@ -216,7 +234,19 @@ export async function wake(): Promise<void> {
       startCes(watch, resources),
       startLocalDaemon(watch, resources, { foreground, signingKey }),
     ]);
-    // startLocalDaemon's post-spawn wait is bounded (60s) — a longer
+    // A daemon that aborts during startup (an occupied runtime HTTP port, a
+    // fatal subsystem failure) leaves no process behind, and readiness alone
+    // cannot see that: whatever foreign listener holds the port answers the
+    // probe in its place. Liveness is the authoritative signal, so check it
+    // first and fail the command instead of reporting a successful wake for
+    // an assistant that is not running.
+    if (!isProcessAlive(pidFile).alive) {
+      console.error(
+        `Error: the assistant exited during startup and is not running. Its runtime HTTP port ${resources.daemonPort} may be held by another process (check \`lsof -i :${resources.daemonPort}\`); the daemon log records the startup error it reported.`,
+      );
+      process.exit(1);
+    }
+    // startLocalDaemon's post-spawn wait is bounded (60s), and a longer
     // migration outlives it. Classify the fresh spawn the same way the
     // attach path does, so the gateway-coordination wait below applies to
     // both paths and wake's closing summary stays honest.
@@ -249,8 +279,29 @@ export async function wake(): Promise<void> {
       "Gateway",
     );
     const gatewayAlive = gatewayState.status === "healthy";
+    const gatewayStuck = gatewayState.status === "stuck";
+    const restartGateway = async (
+      restartWithWatch: boolean,
+    ): Promise<boolean> => {
+      const stopped = await stopProcessByPidFile(gatewayPidFile, "gateway");
+      if (!stopped && isProcessAlive(gatewayPidFile).alive) {
+        console.log(
+          `Gateway running (pid ${gatewayState.pid}) but could not be stopped.`,
+        );
+        return false;
+      }
+      await startGateway(restartWithWatch, resources, {
+        signingKey,
+        bootstrapSecret,
+      });
+      return true;
+    };
     const needsRestart = bootstrapSecretBackfilled && gatewayAlive;
-    if (needsRestart) {
+    if (gatewayStuck) {
+      console.log(
+        `Gateway running (pid ${gatewayState.pid}) but is not responding and could not be stopped.`,
+      );
+    } else if (needsRestart) {
       const restartWithWatch = watch && isGatewayWatchModeAvailable();
       if (restartWithWatch) {
         console.log(
@@ -261,20 +312,13 @@ export async function wake(): Promise<void> {
           `Gateway running (pid ${gatewayState.pid}) — restarting without watch mode to apply bootstrap secret...`,
         );
       }
-      await stopProcessByPidFile(gatewayPidFile, "gateway");
-      await startGateway(restartWithWatch, resources, {
-        signingKey,
-        bootstrapSecret,
-      });
-      gatewayStarted = true;
+      gatewayStarted = await restartGateway(restartWithWatch);
     } else if (gatewayAlive) {
       if (watch && isGatewayWatchModeAvailable()) {
         console.log(
           `Gateway running (pid ${gatewayState.pid}) — restarting in watch mode...`,
         );
-        await stopProcessByPidFile(gatewayPidFile, "gateway");
-        await startGateway(watch, resources, { signingKey, bootstrapSecret });
-        gatewayStarted = true;
+        gatewayStarted = await restartGateway(watch);
       } else {
         if (watch) {
           console.log(

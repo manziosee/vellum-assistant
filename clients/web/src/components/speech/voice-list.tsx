@@ -24,16 +24,13 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { Check, Square, Volume2 } from "lucide-react";
 
-import {
-  cn,
-  hoverRevealClasses,
-  hoverRevealYieldClasses,
-} from "@vellumai/design-library";
+import { cn, CrossfadeStack } from "@vellumai/design-library";
 import { Button } from "@vellumai/design-library/components/button";
 import { Select } from "@vellumai/design-library/components/select";
 
 import { useManagedVoiceSelection } from "@/components/speech/use-managed-voice-selection";
 import { useVoiceSamplePreview } from "@/components/speech/use-voice-sample-preview";
+import { useTranslation } from "@/i18n";
 import {
   groupVoicesByAccent,
   MANAGED_VOICE_SOURCE_LABELS,
@@ -71,6 +68,13 @@ export interface VoiceListProps {
   /** Optional section heading (shown above the list, with a top divider). */
   heading?: string;
   className?: string;
+  /**
+   * Extra classes for the scrolling listbox, merged after its own `max-h-*` so
+   * a cap passed here wins. Where a height belongs: `className` lands on the
+   * outer wrapper, which also holds the provider dropdown, and capping that
+   * scrolls the dropdown out of view instead of the voices.
+   */
+  listClassName?: string;
   /** Called after a voice is chosen — e.g. to close the picker modal. */
   onSelect?: () => void;
   /**
@@ -96,18 +100,30 @@ export interface VoiceListProps {
    * height. The dropdown hides itself when the catalog has a single provider.
    */
   filterBySource?: boolean;
+  /**
+   * Bring the current voice into view on mount. Grouping means it may sit in a
+   * lower section rather than at the top, so hosts whose nearest scrollport is
+   * the list itself want this on: the picker modal, the first-run card, the
+   * Models & Services popover. Off by default because `scrollIntoView` scrolls
+   * *every* scrollable ancestor, so a list rendered inline in the chat
+   * transcript would drag the transcript to itself on each load.
+   */
+  autoScrollToSelected?: boolean;
 }
 
 export function VoiceList({
   assistantId,
   heading,
   className,
+  listClassName,
   onSelect,
   value,
   onChange,
   showSource = false,
   filterBySource = false,
+  autoScrollToSelected = false,
 }: VoiceListProps) {
+  const { t } = useTranslation();
   const {
     available,
     voices,
@@ -168,13 +184,14 @@ export function VoiceList({
   );
   const { previewingModel, play, stop } = useVoiceSamplePreview();
 
-  // Bring the current voice into view on open — grouping means it may sit in a
-  // lower section rather than at the top.
   const selectedRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
+    if (!autoScrollToSelected) {
+      return;
+    }
     // `?.` on the method too — not every environment implements scrollIntoView.
     selectedRef.current?.scrollIntoView?.({ block: "nearest" });
-  }, []);
+  }, [autoScrollToSelected]);
 
   // Render nothing when there's no catalog, so the surrounding chrome collapses
   // with it. Uncontrolled surfaces also require the assistant to be managed
@@ -209,17 +226,18 @@ export function VoiceList({
               value: s,
               label: MANAGED_VOICE_SOURCE_LABELS[s] ?? s,
             }))}
-            aria-label="Voice provider"
+            aria-label={t("voiceList.providerAriaLabel")}
           />
         </div>
       )}
       <div
         role="listbox"
-        aria-label="Assistant voice"
+        aria-label={t("voiceList.assistantVoiceAriaLabel")}
         className={cn(
           "flex flex-col overflow-y-auto",
           filterBySource ? "max-h-[60vh]" : "max-h-80",
           selecting && "pointer-events-none opacity-70",
+          listClassName,
         )}
       >
         {groups.map((group) => (
@@ -238,8 +256,12 @@ export function VoiceList({
                   role="option"
                   aria-selected={isSelected}
                   onClick={() => choose(voice.model)}
+                  data-reveal-row=""
+                  /* A row mid-preview holds the speaker open: during preview
+                     the speaker is the stop control. */
+                  data-reveal-hold={isPreviewing ? "" : undefined}
                   className={cn(
-                    "group flex cursor-pointer items-center gap-2 rounded-md px-3 py-2.5 transition-colors",
+                    "flex cursor-pointer items-center gap-2 rounded-md px-3 py-2.5 transition-colors",
                     // Selected reads as a soft persistent fill + a trailing
                     // check — not a form-field border.
                     isSelected
@@ -252,7 +274,7 @@ export function VoiceList({
                     {isDefault && (
                       <span className="text-[var(--content-tertiary)]">
                         {" "}
-                        (default)
+                        {t("voiceList.defaultSuffix")}
                       </span>
                     )}
                   </span>
@@ -262,12 +284,15 @@ export function VoiceList({
                         voice.source}
                     </span>
                   )}
-                  {/* One fixed-width trailing slot the preview button and the
-                      selected-check share, so the provider badge never shifts
-                      between rows. At rest: the check on the selected row, empty
-                      otherwise. On hover/focus (or while previewing) the speaker
-                      takes over — so the selected row is previewable too. */}
-                  <div className="relative flex size-7 shrink-0 items-center justify-center">
+                  {/* One trailing slot the preview button and the selected-check
+                      share, floored at the row's icon width so the provider
+                      badge lines up between rows. At rest: the check on the
+                      selected row, empty otherwise. On hover, on focus, and
+                      while previewing, the speaker takes over, so the selected
+                      row is previewable too. Where there is no hover the slot
+                      seats both, so it sizes to them rather than clipping the
+                      check outside the row. */}
+                  <CrossfadeStack className="min-h-7 min-w-7">
                     {voice.sampleUrl !== "" && (
                       <Button
                         variant="ghost"
@@ -275,13 +300,13 @@ export function VoiceList({
                         iconOnly={isPreviewing ? <Square /> : <Volume2 />}
                         aria-label={
                           isPreviewing
-                            ? "Stop preview"
-                            : `Preview ${voice.description}`
+                            ? t("voiceList.stopPreview")
+                            : t("voiceList.previewVoice", {
+                                description: voice.description,
+                              })
                         }
-                        className={cn(
-                          "absolute inset-0 transition-opacity",
-                          isPreviewing ? "opacity-100" : hoverRevealClasses,
-                        )}
+                        data-reveal=""
+                        className="size-full"
                         // Preview / stop only — don't let the row's select fire.
                         onClick={(event) => {
                           event.stopPropagation();
@@ -296,19 +321,16 @@ export function VoiceList({
                     {isSelected && (
                       <Check
                         aria-hidden
-                        className={cn(
-                          "pointer-events-none size-4 text-[var(--system-positive-strong)]",
-                          // The check yields the slot whenever the speaker is
-                          // showing, so they never stack.
-                          isPreviewing
-                            ? "opacity-0 transition-opacity"
-                            : voice.sampleUrl !== ""
-                              ? hoverRevealYieldClasses
-                              : "opacity-100",
-                        )}
+                        /* The check yields the slot whenever the speaker is
+                           showing, so they never stack. A voice with no sample
+                           has no speaker to yield to. */
+                        data-reveal-yield={
+                          voice.sampleUrl !== "" ? "" : undefined
+                        }
+                        className="pointer-events-none size-4 text-[var(--system-positive-strong)]"
                       />
                     )}
-                  </div>
+                  </CrossfadeStack>
                 </div>
               );
             })}

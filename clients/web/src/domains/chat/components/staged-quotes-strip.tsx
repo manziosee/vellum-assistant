@@ -19,8 +19,6 @@ import {
   ScrollShadow,
   Typography,
 } from "@vellumai/design-library";
-import { cn } from "@vellumai/design-library/utils/cn";
-import { hoverRevealClasses } from "@vellumai/design-library/utils/hover-reveal";
 import {
   quoteBlockquoteAccentClassName,
   quoteBlockquoteClassName,
@@ -31,6 +29,7 @@ import {
   type StagedQuote,
   useQuoteReplyStore,
 } from "@/domains/chat/quote-reply-store";
+import { useTranslation } from "@/i18n";
 
 function truncate(text: string, maxLen: number): string {
   if (text.length <= maxLen) {
@@ -40,6 +39,7 @@ function truncate(text: string, maxLen: number): string {
 }
 
 function StagedQuoteChip({ quote }: { quote: StagedQuote }) {
+  const { t } = useTranslation("chat");
   const removeStagedQuote = useQuoteReplyStore.use.removeStagedQuote();
   const updateStagedQuoteReply =
     useQuoteReplyStore.use.updateStagedQuoteReply();
@@ -56,7 +56,12 @@ function StagedQuoteChip({ quote }: { quote: StagedQuote }) {
   }, [quote.replyText]);
 
   return (
-    <Card.Root padding="sm" bordered className="group bg-[var(--surface-lift)]">
+    <Card.Root
+      padding="sm"
+      bordered
+      data-reveal-row=""
+      className="bg-[var(--surface-lift)]"
+    >
       <Card.Body padding="md" className="relative flex flex-col gap-2 pr-8">
         <Typography
           as="div"
@@ -73,8 +78,8 @@ function StagedQuoteChip({ quote }: { quote: StagedQuote }) {
           value={quote.replyText}
           onChange={(e) => updateStagedQuoteReply(quote.id, e.target.value)}
           rows={1}
-          placeholder="Type your reply…"
-          aria-label="Edit reply"
+          placeholder={t("stagedQuotesStrip.typeReplyPlaceholder")}
+          aria-label={t("stagedQuotesStrip.editReplyAria")}
           className="w-full resize-none overflow-hidden border-none bg-transparent p-0 text-body-medium-lighter text-[var(--content-default)] placeholder:text-[var(--content-tertiary)] focus:outline-none"
         />
         <Button
@@ -83,8 +88,9 @@ function StagedQuoteChip({ quote }: { quote: StagedQuote }) {
           iconOnly={<X />}
           expandOnMobile={false}
           onClick={() => removeStagedQuote(quote.id)}
-          className={cn("absolute right-1 top-1 shrink-0", hoverRevealClasses)}
-          aria-label="Remove quote"
+          data-reveal=""
+          className="absolute right-1 top-1 shrink-0"
+          aria-label={t("stagedQuotesStrip.removeQuoteAria")}
         />
       </Card.Body>
     </Card.Root>

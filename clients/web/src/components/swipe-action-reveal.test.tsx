@@ -49,6 +49,42 @@ describe("SwipeActionReveal", () => {
     expect(html).toContain("Test");
   });
 
+  test("the content layer takes its opaque fill from the surface it sits on", () => {
+    const html = renderToStaticMarkup(
+      <SwipeActionReveal enabled={true} trailingActions={[noopAction]}>
+        <div>Row content</div>
+      </SwipeActionReveal>,
+    );
+    // The layer hides the actions until a swipe reveals them, so it can never
+    // be transparent. Reading `--swipe-reveal-bg` is what lets a host that
+    // rests its rows on something other than the panel surface (the sidebar's
+    // section card) hand down its own fill instead of banding every row.
+    expect(html).toContain(
+      "bg-[var(--swipe-reveal-bg,var(--surface-overlay))]",
+    );
+  });
+
+  test("the row a list lays out is not the element that clips", () => {
+    const html = renderToStaticMarkup(
+      <SwipeActionReveal enabled={true} trailingActions={[noopAction]}>
+        <div>Row content</div>
+      </SwipeActionReveal>,
+    );
+
+    // A flex or grid item whose overflow is not `visible` has its automatic
+    // minimum size resolved to zero rather than to its content, so a container
+    // that is out of room squashes it away entirely: to a border in a capped
+    // column, to nothing at all in a row. The root is what a list lays out, so
+    // the clip that hides the action layers has to sit inside it.
+    const host = document.createElement("div");
+    host.innerHTML = html;
+    const root = host.firstElementChild;
+
+    expect(root?.getAttribute("data-slot")).toBe("swipe-action-row");
+    expect(root?.className).not.toContain("overflow-hidden");
+    expect(root?.firstElementChild?.className).toContain("overflow-hidden");
+  });
+
   test("renders leading and trailing action buttons", () => {
     const leadingAction: SwipeAction = {
       id: "pin",

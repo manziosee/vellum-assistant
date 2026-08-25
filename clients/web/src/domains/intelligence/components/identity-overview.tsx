@@ -13,7 +13,7 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Brain,
-  CalendarClock,
+  Calendar,
   ChevronRight,
   FolderOpen,
   LayoutGrid,
@@ -71,7 +71,7 @@ import { PersonalitySignature } from "./personality-signature";
 
 const SECTION_ICONS: Record<string, LucideIcon> = {
   personality: Sparkles,
-  schedules: CalendarClock,
+  schedules: Calendar,
   superpowers: Zap,
   memory: Brain,
   library: LayoutGrid,
@@ -250,6 +250,7 @@ export function IdentityOverview({ assistantId }: IdentityOverviewProps) {
             label: t("identityOverview.memoryCountLabel", {
               count: memories,
             }),
+            text: t("identityOverview.memoryCount", { count: memories }),
           },
   };
 
@@ -379,6 +380,7 @@ function SectionCard({
   cardStyle,
   hoverFill,
   mini,
+  compact = false,
   flooded = false,
   floodOrigin,
   photoBackdrop = false,
@@ -396,6 +398,13 @@ function SectionCard({
   /** Compact one-row variant for the bottom-strip and stacked-grid
    *  sections. */
   mini?: boolean;
+  /**
+   * The stacked layout's tighter tile metrics (Figma 7907-9239). The bento's
+   * bottom strip keeps its own (6944-89405), which is why this is a variant
+   * rather than a change to {@link mini}: the two surfaces are specced
+   * separately and a shared edit would quietly restyle the desktop strip.
+   */
+  compact?: boolean;
   /** The avatar has poured itself over this card — fill it with the
    *  avatar color and flip the content to the contrast tone. */
   flooded?: boolean;
@@ -449,8 +458,6 @@ function SectionCard({
   );
 
   if (mini) {
-    const miniStat =
-      stat?.value !== undefined ? `${stat.value} ${stat.label}` : stat?.text;
     // Bottom-strip tile per Figma (New-App 6944-89405): left-aligned,
     // 12px radius, 40px icon slot in the secondary tone, 16px title over
     // an 11px tertiary stat.
@@ -467,14 +474,16 @@ function SectionCard({
           ref={linkRef}
           onMouseEnter={() => onHoverChange?.(true)}
           onMouseLeave={() => onHoverChange?.(false)}
-          className={`relative flex h-full flex-1 cursor-pointer items-center gap-2 px-4 py-2.5 transition-all duration-150 active:scale-[0.98] ${
-            hoverFill ? "hover:bg-[var(--card-hover)]" : ""
-          }`}
+          className={`relative flex h-full flex-1 cursor-pointer items-center transition-all duration-150 active:scale-[0.98] ${
+            compact ? "gap-1 py-3 pr-3 pl-2" : "gap-2 px-4 py-2.5"
+          } ${hoverFill ? "hover:bg-[var(--card-hover)]" : ""}`}
         >
           {floodOverlay}
           <span className="relative flex h-10 w-10 shrink-0 items-center justify-center">
+            {/* The stacked tiles keep the 40px slot but sit a smaller glyph
+                in it, so the title leads the row rather than the icon. */}
             <Icon
-              className={`h-5 w-5 transition-colors duration-300 ${fgMuted}`}
+              className={`${compact ? "h-3.5 w-3.5" : "h-5 w-5"} transition-colors duration-300 ${fgMuted}`}
               aria-hidden
             />
           </span>
@@ -484,7 +493,7 @@ function SectionCard({
             >
               {section.label}
             </span>
-            {miniStat && (
+            {stat?.text && (
               <span
                 className={`truncate text-[11px] leading-normal font-medium transition-colors duration-300 ${
                   flooded
@@ -492,7 +501,7 @@ function SectionCard({
                     : "text-[var(--content-tertiary)]"
                 }`}
               >
-                {miniStat}
+                {stat.text}
               </span>
             )}
           </span>
@@ -935,13 +944,11 @@ function OverviewBento({
       ? schedulesStat.items.length + schedulesStat.more
       : undefined;
     const signature = stats["personality"]?.signature;
-    // Same feature-card chrome as the bento's Personality/Schedules
-    // cards: translucent glass on the photo backdrop, themed otherwise.
-    const featureCardClass = `w-full rounded-[12px] border bg-[var(--card-feature-bg,var(--card-bg))] ${
-      photoBackdrop
-        ? "border-transparent backdrop-blur-[32px]"
-        : "border-[var(--border-base)]"
-    }`;
+    // A translucent face needs the blur to read as a card rather than a dimmed
+    // patch of whatever sits behind it, and needs no drawn edge, which would
+    // compete with the one the blur implies.
+    const featureCardClass =
+      "w-full rounded-[12px] border border-transparent bg-[var(--card-feature-bg,var(--card-bg))] backdrop-blur-[32px]";
 
     return (
       <div
@@ -949,10 +956,29 @@ function OverviewBento({
         className="identity-bento relative flex min-h-0 flex-1 flex-col items-center gap-6 overflow-y-auto px-2 py-4"
         style={
           photoBackdrop
-            ? // The mobile grid tiles sit on the deeper dark base (Figma
-              // 7259-169066) rather than the desktop strip's lift color.
-              ({ ...tintStyle, "--card-bg": "#17191c" } as CSSProperties)
-            : tintStyle
+            ? // The photo backdrop's palette is fixed light-on-dark in every
+              // theme, so these stay literals: `var(--surface-base)` would
+              // resolve to the light theme's near-white and put white text on
+              // a white tile.
+              ({
+                ...tintStyle,
+                "--card-feature-bg": "rgba(23, 25, 28, 0.3)",
+                "--card-bg": "#17191c",
+                "--card-hover": "#24292e",
+              } as CSSProperties)
+            : // Figma 7907-9239: the stacked layout steps its cards off the
+              // avatar tint and onto the surface ramp. The two feature cards
+              // take a 30% wash of the base that lets the tinted page through;
+              // the tiles below take the base itself. `--card-hover` follows
+              // them onto that ramp, so a hover reads as a lift rather than a
+              // colour flash from the avatar.
+              ({
+                ...tintStyle,
+                "--card-feature-bg":
+                  "color-mix(in srgb, var(--surface-base) 30%, transparent)",
+                "--card-bg": "var(--surface-base)",
+                "--card-hover": "var(--surface-lift)",
+              } as CSSProperties)
         }
       >
         {centerCell}
@@ -969,12 +995,12 @@ function OverviewBento({
                 to={schedulesSection.to}
                 className="flex w-full cursor-pointer items-center gap-2 p-4 transition-all duration-150 hover:bg-[var(--card-hover)] active:scale-[0.98]"
               >
-                <CalendarClock
-                  className="h-5 w-5 shrink-0 text-[var(--content-default)]"
+                <Calendar
+                  className="h-6 w-6 shrink-0 text-[var(--content-default)]"
                   aria-hidden
                 />
                 <span className="flex min-w-0 flex-1 items-center gap-2">
-                  <span className="truncate text-body-medium-default text-[var(--content-default)]">
+                  <span className="truncate text-title-small leading-normal text-[var(--content-default)]">
                     {schedulesSection.label}
                   </span>
                   {scheduleCount !== undefined && (
@@ -983,14 +1009,14 @@ function OverviewBento({
                         className="h-[3px] w-[3px] shrink-0 rounded-full bg-[var(--content-tertiary)]"
                         aria-hidden
                       />
-                      <span className="text-body-medium-default text-[var(--content-tertiary)]">
+                      <span className="text-title-small leading-normal text-[var(--content-tertiary)]">
                         {scheduleCount}
                       </span>
                     </>
                   )}
                 </span>
                 <ChevronRight
-                  className="h-4 w-4 shrink-0 text-[var(--content-default)]"
+                  className="h-6 w-6 shrink-0 text-[var(--content-default)]"
                   aria-hidden
                 />
               </Link>
@@ -1008,12 +1034,12 @@ function OverviewBento({
                 to={personalitySection.to}
                 className="flex w-full cursor-pointer flex-col gap-4 px-4 pt-4 pb-6 transition-all duration-150 hover:bg-[var(--card-hover)] active:scale-[0.98]"
               >
-                <span className="flex items-center gap-2">
+                <span className="flex w-full items-center gap-2">
                   <Sparkles
-                    className="h-5 w-5 text-[var(--content-default)]"
+                    className="h-6 w-6 shrink-0 text-[var(--content-default)]"
                     aria-hidden
                   />
-                  <span className="text-body-medium-default text-[var(--content-default)]">
+                  <span className="text-title-small leading-normal text-[var(--content-default)]">
                     {personalitySection.label}
                   </span>
                 </span>
@@ -1025,8 +1051,13 @@ function OverviewBento({
                         : "text-[var(--content-secondary)]"
                     }`}
                   >
+                    {/* The mark's height follows its width, so the full frame
+                        at card width runs past 250px and the card swallows
+                        the tiles below it. The compact frame holds the band
+                        near 110px without shrinking the labels. */}
                     <PersonalitySignature
                       values={signature}
+                      compact
                       className="h-auto w-full"
                     />
                   </span>
@@ -1042,6 +1073,7 @@ function OverviewBento({
                 stat={stats[section.key]}
                 hoverFill
                 mini
+                compact
               />
             ))}
           </div>

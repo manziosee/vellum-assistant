@@ -29,11 +29,14 @@ import {
 } from "../lib/client-identity";
 import {
   getLockfileData,
+  renameLockfileAssistantIfPresent,
   upsertRendererLockfileAssistant,
   replacePlatformAssistants,
   isActiveAssistant,
   isPairedLockfileEntry,
   PAIRED_GUARDIAN_TOKEN_HOST_ONLY_ERROR,
+  runDevicesList,
+  runDevicesRevoke,
   runHatch,
   runRetire,
   connectImport,
@@ -72,6 +75,7 @@ import { loopbackSafeFetch } from "../lib/loopback-fetch.js";
 import { probePort } from "../lib/port-probe.js";
 import { openBrowser } from "../lib/open-browser";
 import { isCompiledCli } from "../lib/local.js";
+import { findWebDistDir } from "../lib/web-dist.js";
 import { getLogDir, openLogFile, resetLogFile } from "../lib/xdg-log.js";
 
 const SUPPORTED_INTERFACES = ["cli", "web"] as const;
@@ -404,37 +408,6 @@ async function maybeHydratePlatformAssistantName(
 const SPA_BASE = "/assistant/";
 
 /**
- * Locate the pre-built @vellumai/web dist directory.
- *
- * Resolution order:
- *   1. npm-installed package — require.resolve('@vellumai/web/package.json')
- *   2. Source checkout — walk up from cli/ to find clients/web/dist/
- */
-function findWebDistDir(): string | null {
-  try {
-    const pkgPath = require.resolve("@vellumai/web/package.json");
-    const distDir = path.join(path.dirname(pkgPath), "dist");
-    if (existsSync(path.join(distDir, "index.html"))) {
-      return distDir;
-    }
-  } catch {
-    // Package not installed; try source checkout.
-  }
-
-  let dir = import.meta.dir;
-  for (let depth = 0; depth < 8; depth++) {
-    const candidate = path.join(dir, "clients", "web", "dist", "index.html");
-    if (existsSync(candidate)) {
-      return path.dirname(candidate);
-    }
-    const parent = path.dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
-  }
-  return null;
-}
-
-/**
  * Locate the clients/web source directory for running the Vite dev server.
  * Only works from a source checkout (not npm-installed).
  */
@@ -456,6 +429,8 @@ const LOCKFILE_PATTERN = /^(?:\/assistant)?\/__local\/lockfile$/;
 const HATCH_PATTERN = /^(?:\/assistant)?\/__local\/hatch$/;
 const RETIRE_PATTERN = /^(?:\/assistant)?\/__local\/retire$/;
 const UNPAIR_PATTERN = /^(?:\/assistant)?\/__local\/unpair$/;
+const DEVICES_PATTERN = /^(?:\/assistant)?\/__local\/devices$/;
+const DEVICES_REVOKE_PATTERN = /^(?:\/assistant)?\/__local\/devices-revoke$/;
 const CONNECT_IMPORT_PATTERN = /^(?:\/assistant)?\/__local\/connect-import$/;
 const GUARDIAN_TOKEN_PATTERN =
   /^(?:\/assistant)?\/__local\/guardian-token\/([^/]+)$/;
@@ -512,6 +487,8 @@ async function handleLocalEndpoints(
     HATCH_PATTERN.test(pathname) ||
     RETIRE_PATTERN.test(pathname) ||
     UNPAIR_PATTERN.test(pathname) ||
+    DEVICES_PATTERN.test(pathname) ||
+    DEVICES_REVOKE_PATTERN.test(pathname) ||
     CONNECT_IMPORT_PATTERN.test(pathname) ||
     GUARDIAN_TOKEN_PATTERN.test(pathname) ||
     PLATFORM_SESSION_PATTERN.test(pathname) ||
@@ -585,6 +562,13 @@ async function handleLocalEndpoints(
           lockfilePaths,
           body.platformAssistants as Array<Record<string, unknown>>,
           body.organizationId as string | undefined,
+        );
+      } else if (body.rename && typeof body.rename === "object") {
+        const rename = body.rename as Record<string, unknown>;
+        result = renameLockfileAssistantIfPresent(
+          lockfilePaths,
+          rename.assistantId as string,
+          rename.name as string,
         );
       } else {
         result = upsertRendererLockfileAssistant(
@@ -726,6 +710,60 @@ async function handleLocalEndpoints(
       { ok: false, error: result.error },
       { status: result.status },
     );
+  }
+
+  // Paired devices: list and revoke via the CLI (`vellum devices … --json`).
+  // Always 200 with `ok` discriminating success, matching the other hosts.
+  const isDevicesRevoke = DEVICES_REVOKE_PATTERN.test(pathname);
+  if (DEVICES_PATTERN.test(pathname) || isDevicesRevoke) {
+    if (req.method !== "POST") {
+      return new Response(null, { status: 405 });
+    }
+
+    let body: { assistantId?: unknown; hashedDeviceId?: unknown };
+    try {
+      body = (await req.json()) as typeof body;
+    } catch {
+      return Response.json(
+        { ok: false, error: "Invalid JSON body" },
+        { status: 400 },
+      );
+    }
+
+    const { assistantId, hashedDeviceId } = body;
+    if (typeof assistantId !== "string" || !assistantId) {
+      return Response.json(
+        { ok: false, error: "Missing assistantId" },
+        { status: 400 },
+      );
+    }
+    let revokeHash: string | null = null;
+    if (isDevicesRevoke) {
+      if (typeof hashedDeviceId !== "string" || !hashedDeviceId) {
+        return Response.json(
+          { ok: false, error: "Missing hashedDeviceId" },
+          { status: 400 },
+        );
+      }
+      revokeHash = hashedDeviceId;
+    }
+
+    let invocation: CliInvocation;
+    try {
+      invocation = resolveDevCliInvocation(_baseDir);
+    } catch (err) {
+      return Response.json(
+        { ok: false, error: err instanceof Error ? err.message : String(err) },
+        { status: 500 },
+      );
+    }
+
+    if (revokeHash !== null) {
+      return Response.json(
+        await runDevicesRevoke(invocation, assistantId, revokeHash),
+      );
+    }
+    return Response.json(await runDevicesList(invocation, assistantId));
   }
 
   // Connect-import: register a pairing bundle from another machine (guardian
@@ -1170,6 +1208,27 @@ async function spawnBackgroundWebInterface(
   console.log(`Stop with: kill ${child.pid}`);
 }
 
+/**
+ * Config the local web host injects as `window.__VELLUM_CONFIG__` and serves at
+ * `/assistant/__config`, the document a caller probes to learn which assistant
+ * an origin fronts.
+ *
+ * It carries no `assistantId`: this host also serves `handleLocalEndpoints`, so
+ * the SPA on it switches between every assistant in the lockfile, exactly like
+ * the Vite dev server (`clients/web/vite-plugin-local-mode.ts`, which omits the
+ * id for the same reason). An id here would be the launch-time one, and a probe
+ * for any other assistant this origin serves would read it as a mismatch and
+ * report a false `foreign`. An absent id is deliberately benign to the probe.
+ */
+export function buildWebInterfaceConfig(opts: {
+  webUrl: string;
+  platformUrl: string;
+  disablePlatform: boolean;
+}): Record<string, unknown> {
+  const { webUrl, platformUrl, disablePlatform } = opts;
+  return { webUrl, platformUrl, disablePlatform };
+}
+
 async function runWebInterface(
   flagEnvVars: Record<string, string>,
   parsedFlagOverrides: Record<string, boolean | string>,
@@ -1209,7 +1268,9 @@ async function runWebInterface(
   const webUrl = getWebUrl();
   const safeJson = (v: unknown) =>
     JSON.stringify(v).replace(/</g, "\\u003c").replace(/>/g, "\\u003e");
-  const configJson = safeJson({ webUrl, platformUrl, disablePlatform });
+  const configJson = safeJson(
+    buildWebInterfaceConfig({ webUrl, platformUrl, disablePlatform }),
+  );
   const hasOverrides = Object.keys(parsedFlagOverrides).length > 0;
   const flagOverridesSnippet = hasOverrides
     ? `;window.__VELLUM_FLAG_OVERRIDES__=${safeJson(parsedFlagOverrides)}`

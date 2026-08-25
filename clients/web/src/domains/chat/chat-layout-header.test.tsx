@@ -28,12 +28,18 @@ mock.module("@/stores/command-palette-store", () => ({
 const setInlineTitleBarActiveSpy = mock((_active: boolean) => {});
 mock.module("@/stores/title-bar-store", () => ({
   useTitleBarStore: {
-    use: { setInlineTitleBarActive: () => setInlineTitleBarActiveSpy },
+    use: {
+      setInlineTitleBarActive: () => setInlineTitleBarActiveSpy,
+      windowsMenuBarSuppressed: () => false,
+    },
   },
 }));
 
 let mockIsNativeMobile = false;
+let mockElectronHostOS: "macos" | "windows" | null = null;
 mock.module("@/runtime/platform-detection", () => ({
+  detectElectronHostOS: () =>
+    mockIsElectron ? (mockElectronHostOS ?? "macos") : null,
   isNativeMobile: () => mockIsNativeMobile,
 }));
 
@@ -43,6 +49,7 @@ const { ChatLayoutHeader } = await import("@/domains/chat/chat-layout-header");
 beforeEach(() => {
   mockIsElectron = false;
   mockIsNativeMobile = false;
+  mockElectronHostOS = null;
   usePageSurfaceStore.getState().setSurface(null);
   toggleCommandPaletteSpy.mockClear();
 });
@@ -132,5 +139,18 @@ describe("ChatLayoutHeader page surface", () => {
     renderHeader();
 
     expect(headerElement()?.style.background).toBe("var(--surface-base)");
+  });
+});
+
+describe("ChatLayoutHeader desktop chrome", () => {
+  test("reserves the Windows title-bar control area", () => {
+    mockIsElectron = true;
+    mockElectronHostOS = "windows";
+    renderHeader();
+
+    const header = document.querySelector<HTMLElement>(
+      '[data-slot="chat-layout-header"]',
+    );
+    expect(header?.style.paddingRight).toBe("150px");
   });
 });

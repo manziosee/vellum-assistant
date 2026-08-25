@@ -28,11 +28,15 @@ import {
   MOBILE_CONTROL_CLASS,
   MOBILE_GHOST_WASH_CLASS,
   MOBILE_GLYPH_CLASS,
+  preventPressFocusTransfer,
 } from "@/domains/chat/components/chat-composer/composer-mobile-chrome";
 import { useIsNativePlatform } from "@/runtime/native-auth";
 import { useVellumCommands } from "@/runtime/vellum-commands";
 import { getVoiceInputMediaStream } from "@/utils/voice-input-device";
 import { Button, cn } from "@vellumai/design-library";
+
+const RECORDING_GLYPH_CLASS =
+  "[&_svg]:size-5 touch-mobile:[&_svg]:size-5";
 
 // ---------------------------------------------------------------------------
 // MIME type selection
@@ -259,6 +263,14 @@ interface VoiceInputButtonProps {
    * in charge.
    */
   mobileRow?: boolean;
+  /**
+   * Cancel the press that would move focus off the composer's textarea, so the
+   * click behind it survives the row's focus gating. Separate from `mobileRow`,
+   * which is about chrome: the row's structure follows the window's width, while
+   * whether a press carries focus follows the input driving it. The composer
+   * owns that compound. See `preventPressFocusTransfer`.
+   */
+  holdComposerFocus?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -279,6 +291,7 @@ export const VoiceInputButton = forwardRef<
     onBeforeStart,
     renderButton = true,
     mobileRow = false,
+    holdComposerFocus = false,
   },
   ref,
 ) {
@@ -1066,10 +1079,10 @@ export const VoiceInputButton = forwardRef<
         processing ? (
           <Loader2 className="animate-spin" strokeWidth={2} />
         ) : recording ? (
-          // Filled rounded-square "stop" glyph (matches the detail-panel stop
-          // button + the design in Figma 6764:6744). Sized to 20px via
+          // Rounded-square "stop" glyph, stroked to match the detail-panel
+          // stop button and the rest of the icon set. Sized to 20px via
           // `iconOnlyGlyphClassName` below.
-          <Square fill="currentColor" strokeWidth={2} />
+          <Square strokeWidth={2} />
         ) : (
           <Mic strokeWidth={2} />
         )
@@ -1081,11 +1094,16 @@ export const VoiceInputButton = forwardRef<
         mobileRow
           ? MOBILE_GLYPH_CLASS
           : recording
-            ? "[&_svg]:size-5 touch-mobile:[&_svg]:size-5"
+            ? RECORDING_GLYPH_CLASS
             : undefined
       }
       // The row sizes its own controls when it owns this one.
       expandOnMobile={!mobileRow}
+      // The row this stands in is focus-gated, so the press has to leave the
+      // composer's focus alone until the click arrives. Dictation wants it
+      // there anyway: the transcript lands in the textarea, which the flow
+      // focuses again on its way out.
+      onMouseDown={holdComposerFocus ? preventPressFocusTransfer : undefined}
       onClick={() => {
         if (processing) {
           return;

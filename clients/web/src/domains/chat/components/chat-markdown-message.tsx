@@ -4,7 +4,6 @@
  * media for external URLs, message attachments, and workspace files.
  */
 
-import { ExternalLink } from "lucide-react";
 import {
   type AnchorHTMLAttributes,
   isValidElement,
@@ -26,6 +25,11 @@ import {
 import type { DisplayAttachment } from "@/types/attachment-types";
 import { useAttachmentPreview } from "@/domains/chat/components/chat-attachments/use-attachment-preview";
 import { defaultUrlTransform } from "react-markdown";
+import {
+  EXTERNAL_LINK_CLASS,
+  ExternalLinkGlyph,
+  isWebUrl,
+} from "@/components/external-anchor";
 import { handleNativeAnchorClick } from "@/utils/native-anchor";
 
 import {
@@ -52,7 +56,7 @@ import { LocalFileEmbed } from "@/domains/chat/components/local-file/local-file-
 import { LocalFileLink } from "@/domains/chat/components/local-file/local-file-link";
 import { resolveLocalFileTarget } from "@/domains/chat/components/local-file/local-file-target";
 import { toggleLocalFile } from "@/domains/chat/components/local-file/open-local-file";
-import { useConversationStore } from "@/stores/conversation-store";
+import { useTranslation } from "@/i18n";
 
 /** Returns true when `href` is a known `vellum://` attachment link. */
 export function isVellumLink(href: string | undefined): boolean {
@@ -80,7 +84,6 @@ function OAuthAwareLink({
   children,
 }: Pick<AnchorHTMLAttributes<HTMLAnchorElement>, "href" | "children">) {
   const opensOAuthPopup = shouldOpenMarkdownLinkInOAuthPopup(href);
-  const isWebUrl = /^https?:\/\//i.test(href ?? "");
 
   return (
     <a
@@ -96,17 +99,10 @@ function OAuthAwareLink({
         // route through the native opener there (no-op elsewhere).
         handleNativeAnchorClick(event, href);
       }}
-      className="text-[var(--system-positive-strong)] underline hover:opacity-80"
+      className={EXTERNAL_LINK_CLASS}
     >
       {children}
-      {/* Inline (not inline-flex) anchor so long link text still wraps; the
-          icon aligns via a small baseline shift instead. */}
-      {isWebUrl ? (
-        <ExternalLink
-          aria-hidden
-          className="ml-0.5 inline h-3.5 w-3.5 shrink-0 align-[-0.125em]"
-        />
-      ) : null}
+      {isWebUrl(href) ? <ExternalLinkGlyph /> : null}
     </a>
   );
 }
@@ -137,9 +133,12 @@ const IMAGE_CLASSES =
   "my-2 max-w-full max-h-[400px] rounded-lg border border-[var(--border-element)] object-contain";
 
 function ImageErrorFallback({ alt }: { alt: string }) {
+  const { t } = useTranslation("chat");
   return (
     <span className="inline-flex items-center gap-1 rounded bg-[var(--surface-sunken)] px-1.5 py-0.5 text-body-small-default text-[var(--content-tertiary)]">
-      Image failed to load{alt ? ` (${alt})` : ""}
+      {alt
+        ? t("chatMarkdownMessage.imageFailedWithAlt", { alt })
+        : t("chatMarkdownMessage.imageFailed")}
     </span>
   );
 }
@@ -209,6 +208,7 @@ function WorkspaceInlineImage({
   assistantId: string | null | undefined;
   onOpenPreview?: (attachment: DisplayAttachment) => void;
 }) {
+  const { t } = useTranslation("chat");
   const [objectUrl, setObjectUrl] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
 
@@ -263,7 +263,9 @@ function WorkspaceInlineImage({
   if (!objectUrl) {
     return (
       <span className="inline-flex items-center gap-1 rounded bg-[var(--surface-sunken)] px-1.5 py-0.5 text-body-small-default text-[var(--content-tertiary)]">
-        Loading image…{alt ? ` (${alt})` : ""}
+        {alt
+          ? t("chatMarkdownMessage.loadingImageWithAlt", { alt })
+          : t("chatMarkdownMessage.loadingImage")}
       </span>
     );
   }
@@ -279,7 +281,11 @@ function WorkspaceInlineImage({
       type="button"
       onClick={() => onOpenPreview(attachment)}
       className="cursor-zoom-in appearance-none border-0 bg-transparent p-0"
-      aria-label={alt ? `Expand image: ${alt}` : "Expand image"}
+      aria-label={
+              alt
+                ? t("chatMarkdownMessage.expandImageAriaWithAlt", { alt })
+                : t("chatMarkdownMessage.expandImageAria")
+            }
     >
       {image}
     </button>
@@ -355,26 +361,23 @@ export const ChatMarkdownMessage = memo(function ChatMarkdownMessage({
     assistantId,
     attachments,
   );
-  // Markdown opens as a document bound to the conversation it was opened from,
-  // so the active conversation decides where a click on a code-span path lands.
-  const conversationId = useConversationStore.use.activeConversationId();
 
   /**
    * Click handler for a code span that resolved to a real workspace file. The
    * affordance is a file link, so it lands where an explicit file link lands:
-   * the document drawer, through the same toggle. The modal is the fallback
-   * for the references the drawer cannot reach.
+   * the drawer, through the same toggle. The modal is the fallback for the
+   * references the drawer cannot reach.
    */
   const handleWorkspacePathOpen = useCallback(
     (href: string, linkText: string) => {
       const { workspacePath, filename } = resolveLocalFileTarget(href);
       if (assistantId && workspacePath !== null) {
-        toggleLocalFile(workspacePath, filename, assistantId, conversationId);
+        toggleLocalFile(workspacePath, filename, assistantId);
         return;
       }
       onVellumLinkClick?.(href, linkText);
     },
-    [assistantId, conversationId, onVellumLinkClick],
+    [assistantId, onVellumLinkClick],
   );
 
   const linkComponent = useCallback(

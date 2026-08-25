@@ -71,7 +71,10 @@ import type {
   SttStreamServerEvent,
 } from "../stt/types.js";
 import { getSubagentManager } from "../subagent/index.js";
-import { liveVoiceEndScreen } from "../telemetry/live-voice-funnel.js";
+import {
+  liveVoiceEndScreen,
+  liveVoiceSilenceReason,
+} from "../telemetry/live-voice-funnel.js";
 import { getToolOwner } from "../tools/registry.js";
 import {
   createReasoningTagFilter,
@@ -447,6 +450,13 @@ interface UtteranceCycle {
   // to the silence-boundary path and stays there: a late event must not
   // commit a boundary the fallback already owns.
   providerTurnEndTimedOut: boolean;
+  // The provider's own end-of-turn released this cycle, so its transcript is
+  // already complete. A provider that decides turn ends commits the transcript
+  // in the same event, so such a release needs no caller-side flush and must
+  // not tear the stream down. False on every caller-side release (the fail-open
+  // deadline, a max-duration force-end, barge-in), where a turn may still be
+  // open provider-side and only a stream close can make it answer.
+  providerClosedTurn: boolean;
   // `vadSpeechGeneration` as of the local silence boundary that handed this
   // cycle to the provider, or null while no boundary has fired yet (a turn
   // model routinely beats the trailing-silence countdown, and that fast commit
@@ -948,6 +958,7 @@ function createUtteranceCycle(): UtteranceCycle {
     latestPartialText: null,
     endpointExtensionCount: 0,
     providerTurnEndTimedOut: false,
+    providerClosedTurn: false,
     turnBoundaryGeneration: null,
     openProviderTurnIndex: null,
     heldSpeculativeContent: null,
@@ -1118,6 +1129,20 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
    * session that never failed.
    */
   private failureCode: LiveVoiceProtocolErrorCode | null = null;
+  /**
+   * How far a session that never produced a turn actually got. Latched rather
+   * than derived at close, because every one of these is a transient the
+   * teardown has already destroyed by then: `state` has moved on, the current
+   * utterance is gone, and the turn detector is disposed.
+   *
+   * A quarter of sessions end with no turn at all, and these three booleans are
+   * what separate a microphone that never opened from one that was muted from a
+   * user who simply left. See `telemetry/live-voice-funnel.ts`.
+   */
+  private reachedActive = false;
+  private receivedAudio = false;
+  private detectedSpeech = false;
+  private dispatchedTurn = false;
   // Non-null iff the start frame requested turnDetection "server_vad".
   private readonly turnDetector: MediaTurnDetector | null;
   // Base energy gate for server-VAD speech classification. During estimated
@@ -1216,12 +1241,14 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
   // replayed once the parked speech flushes into the next armed utterance.
   private vadPendingTurnEnd: "silence" | "max-duration" | null = null;
   private readonly metricsClock: LiveVoiceMetricsClock;
-  // Persistent mode: server-VAD sessions with a finalize-capable provider
-  // keep one streaming transcriber for the whole session. Utterance release
-  // flushes via finalizeUtterance() instead of tearing the stream down, and
-  // re-arm reuses this instance synchronously. Null in manual mode, for
-  // providers without finalizeUtterance, and after an unexpected stream
-  // close (the next arm resolves a fresh transcriber).
+  // Persistent mode: a server-VAD session keeps one streaming transcriber for
+  // the whole session when the stream can be sealed per utterance without
+  // closing it. Either the provider is finalize-capable (release flushes via
+  // finalizeUtterance()) or the provider decides turn ends itself (release is
+  // already sealed by the end-of-turn that triggered it). Re-arm reuses this
+  // instance synchronously. Null in manual mode, for a stream that offers
+  // neither seal, and after an unexpected stream close (the next arm resolves
+  // a fresh transcriber).
   private sharedTranscriber: StreamingTranscriber | null = null;
   // The `services.stt.language` value the shared stream was dialed with.
   // Providers pin the language per connection, so the persistent re-arm
@@ -1409,6 +1436,7 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
     // through the pending/pre-roll paths and flushes on arm. An arm failure
     // surfaces as a non-recoverable error frame instead of a start rejection.
     this.state = "active";
+    this.reachedActive = true;
     void this.armUtterance().catch(() => {});
     this.metrics.markReady();
     await this.sendFrame({
@@ -1512,9 +1540,22 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
     // `recorded_at` minus the started row's, so it must be written before the
     // teardown below, which awaits a pending continuation and can run long.
     const failed = this.state === "failed";
+    // Only a session that never dispatched a turn gets a silence reason; for
+    // every other session the question is meaningless.
+    const silenceReason = this.dispatchedTurn
+      ? null
+      : liveVoiceSilenceReason({
+          reachedActive: this.reachedActive,
+          receivedAudio: this.receivedAudio,
+          detectedSpeech: this.detectedSpeech,
+        });
     recordLiveVoiceSessionEnded({
       sessionId: this.context.sessionId,
-      screen: liveVoiceEndScreen(reason, failed ? this.failureCode : null),
+      screen: liveVoiceEndScreen(
+        reason,
+        failed ? this.failureCode : null,
+        silenceReason,
+      ),
       outcome: failed ? "failed" : "completed",
     });
 
@@ -1635,7 +1676,15 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
       );
       if (
         this.turnDetector &&
-        typeof transcriber.finalizeUtterance === "function"
+        (typeof transcriber.finalizeUtterance === "function" ||
+          // A provider that owns the turn boundary needs no caller-side flush
+          // on the normal path: its end-of-turn IS the flush, and it commits
+          // the transcript in the same event. Gating persistence on
+          // `finalizeUtterance` alone asks "can the caller flush this stream"
+          // when the question is "will the caller ever have to", and answering
+          // it wrong costs a socket per utterance, which drops the audio that
+          // arrives while the next one dials.
+          this.providerTurnEndActive)
       ) {
         // Adopt persistent mode: this stream serves the whole session, so
         // its events route by cycle ownership instead of binding to this
@@ -1813,6 +1862,11 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
   }
 
   private async handleAudio(chunk: Buffer): Promise<void> {
+    // Both transports funnel through here, and this runs before any of the
+    // early returns below. The question it answers is "did the microphone ever
+    // open", which a chunk arriving at all settles regardless of what the
+    // session then does with it.
+    this.receivedAudio = true;
     if (this.turnDetector) {
       await this.handleServerVadAudio(this.turnDetector, chunk);
       return;
@@ -1831,6 +1885,10 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
     // The chunk belongs to an utterance the user is still holding the button
     // for, whether or not the transcriber has produced any text for it yet.
     utterance.manualAudioCaptured = true;
+    // Manual sessions have no VAD, so the user holding the talk button is
+    // the only speech signal available. Without this every abandoned manual
+    // session would be misfiled as `no_turn` instead of `no_speech`.
+    this.detectedSpeech = true;
     this.collectUserAudio(utterance, chunk);
     if (utterance.phase === "pending") {
       // The transcriber is still arming (session start overlaps the STT
@@ -1950,6 +2008,7 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
     // resets it.
     if (hasSpeech || this.vadPreRollHasSpeech) {
       utterance.speechRouted = true;
+      this.detectedSpeech = true;
     }
     for (const preRollChunk of this.takeVadPreRoll()) {
       await this.routeVadAudio(utterance, preRollChunk);
@@ -2203,6 +2262,7 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
     }
     if (preRollHadSpeech) {
       utterance.speechRouted = true;
+      this.detectedSpeech = true;
     }
   }
 
@@ -3455,6 +3515,10 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
       "provider",
     );
     await this.sendFrame({ type: "utterance_end", reason: "silence" });
+    // The provider committed this cycle's transcript in the event being
+    // handled, so the release below seals it in place instead of flushing or
+    // closing the stream.
+    utterance.providerClosedTurn = true;
     await this.releaseUtterance();
     // Leave the local detector idle, which is where every other commit path
     // leaves it. A provider can close a turn while the trailing-silence
@@ -3723,8 +3787,24 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
   ): Promise<void> {
     const shared = this.sharedTranscriber;
     if (shared && utterance.transcriber === shared) {
-      await this.finalizeUtteranceForRelease(utterance);
-      return;
+      if (typeof shared.finalizeUtterance === "function") {
+        await this.finalizeUtteranceForRelease(utterance);
+        return;
+      }
+      if (utterance.providerClosedTurn) {
+        await this.sealProviderClosedUtterance(utterance);
+        return;
+      }
+      // A caller-side boundary on a stream with no flush: only closing it can
+      // make the provider answer for a turn still open, so this one release
+      // costs the stream. The stream stays installed as the shared one across
+      // the close: its flush `final` and its `closed` both arrive after
+      // `stop()`, and the shared router drops events from a stream it no
+      // longer recognizes. `closed` is what retires it, seals this cycle and
+      // dispatches the turn, so clearing the reference here would strand the
+      // cycle in `released` with the flushed transcript discarded. Nothing can
+      // re-arm onto the closing stream in the meantime: the next arm waits on
+      // the assistant turn, which waits on that same `closed`.
     }
 
     utterance.phase = "released";
@@ -3740,6 +3820,22 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
       });
       utterance.phase = "transcriber_closed";
     }
+    await this.startAssistantTurnIfReady();
+    await this.drainOutboundFrames();
+  }
+
+  // Persistent-mode release for a provider-decided turn end: the event that
+  // released this cycle already carried its final transcript, so there is
+  // nothing to flush and no reason to close the stream. Sealing the phase is
+  // the whole of the teardown: the same "transcript complete, stream open"
+  // state the `finalized` path reaches, arrived at without a round trip.
+  private async sealProviderClosedUtterance(
+    utterance: UtteranceCycle,
+  ): Promise<void> {
+    if (utterance.phase === "transcriber_closed") {
+      return;
+    }
+    utterance.phase = "transcriber_closed";
     await this.startAssistantTurnIfReady();
     await this.drainOutboundFrames();
   }
@@ -4671,6 +4767,14 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
     };
 
     try {
+      // Latched before the await, not after: this flag only decides whether the
+      // end event carries a silence classification, and the dashboard decides
+      // silence from persisted turn rows instead. Setting it after would let a
+      // dispatch that persisted a turn and then threw stamp "this session was
+      // silent" onto a session that has turns, a contradictory row. Setting it
+      // before can at worst leave a silent session unexplained, which is a gap
+      // rather than a false statement.
+      this.dispatchedTurn = true;
       const handle = await this.startVoiceTurn({
         conversationId: this.conversationId,
         voiceSessionId: this.context.sessionId,

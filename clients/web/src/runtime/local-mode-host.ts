@@ -1,6 +1,9 @@
 import type {
   LocalAssistantStatusResult,
   LocalConnectImportResult,
+  LocalListDevicesResult,
+  LocalPairedDeviceRecord,
+  LocalRevokeDeviceResult,
   LocalUpgradeOptions,
   LocalWakeOptions,
 } from "@vellumai/ipc-contract";
@@ -86,6 +89,9 @@ export interface LocalUpgradeResult {
 
 export type { LocalAssistantStatusResult };
 export type { LocalConnectImportResult };
+export type { LocalListDevicesResult };
+export type { LocalPairedDeviceRecord };
+export type { LocalRevokeDeviceResult };
 export type { LocalUpgradeOptions };
 
 /**
@@ -257,6 +263,38 @@ export async function saveLockfileAssistantHost(
 }
 
 /**
+ * Rename an existing lockfile entry through the host's rename-if-present
+ * operation. Unlike {@link saveLockfileAssistantHost}'s upsert, the host
+ * decides against its current on-disk registry and refuses when the entry is
+ * missing or the file is unreadable, so a stale renderer cache can never
+ * resurrect a retired assistant or replace a registry the host could not
+ * read. Older Electron hosts that predate the IPC channel degrade to a
+ * structured failure rather than falling back to the upsert (which would
+ * reintroduce the hazard); the name sync simply waits for the app update.
+ */
+export async function renameLockfileAssistantHost(
+  assistantId: string,
+  name: string,
+): Promise<LockfileWriteResult> {
+  if (isElectron()) {
+    const rename = window.vellum!.localMode.renameLockfileAssistant;
+    if (!rename) {
+      return {
+        ok: false,
+        error: "Renaming is not supported by this app version",
+      };
+    }
+    return rename(assistantId, name);
+  }
+
+  return postLocalCommand<LockfileWriteResult>(
+    "/assistant/__local/lockfile",
+    { rename: { assistantId, name } },
+    LOCAL_HOST_UNAVAILABLE_ERROR,
+  );
+}
+
+/**
  * Replace the platform (`cloud === "vellum"`) assistants in the lockfile with
  * the provided set, preserving local assistants. When `organizationId` is
  * given, only that org's platform entries are replaced — other orgs' entries
@@ -362,6 +400,60 @@ export async function connectImportHost(
   );
 }
 
+/** Shared fallback for Electron preloads that predate the devices channels. */
+const DEVICE_MANAGEMENT_UNSUPPORTED_ERROR =
+  "Device management is not supported by this app version";
+
+/**
+ * List the devices holding pairing tokens for a local assistant. Device
+ * management is host-side only: the gateway's devices routes reject browser
+ * origins by design, so the trusted host (Electron main, the Vite dev
+ * middleware, or the `vellum client` server) spawns the CLI's `devices
+ * --json` and returns its result over this seam. Older Electron hosts that
+ * predate the IPC channel degrade to a structured unsupported error, which
+ * doubles as the UI's visibility gate on those app shells.
+ */
+export async function listPairedDevicesHost(
+  assistantId: string,
+): Promise<LocalListDevicesResult> {
+  if (isElectron()) {
+    const listDevices = window.vellum!.localMode.listDevices;
+    if (!listDevices) {
+      return { ok: false, error: DEVICE_MANAGEMENT_UNSUPPORTED_ERROR };
+    }
+    return listDevices(assistantId);
+  }
+
+  return postLocalCommand<LocalListDevicesResult>(
+    "/assistant/__local/devices",
+    { assistantId },
+    LOCAL_HOST_UNAVAILABLE_ERROR,
+  );
+}
+
+/**
+ * Revoke one paired device's tokens; write counterpart of
+ * {@link listPairedDevicesHost} (same host-side-only rule and unsupported fallback).
+ */
+export async function revokePairedDeviceHost(
+  assistantId: string,
+  hashedDeviceId: string,
+): Promise<LocalRevokeDeviceResult> {
+  if (isElectron()) {
+    const revokeDevice = window.vellum!.localMode.revokeDevice;
+    if (!revokeDevice) {
+      return { ok: false, error: DEVICE_MANAGEMENT_UNSUPPORTED_ERROR };
+    }
+    return revokeDevice(assistantId, hashedDeviceId);
+  }
+
+  return postLocalCommand<LocalRevokeDeviceResult>(
+    "/assistant/__local/devices-revoke",
+    { assistantId, hashedDeviceId },
+    LOCAL_HOST_UNAVAILABLE_ERROR,
+  );
+}
+
 /**
  * Stop a local assistant's daemon and gateway. Both hosts drive the Vellum
  * CLI's `sleep --force` in a trusted process and return the same `{ ok, error }`
@@ -386,15 +478,18 @@ export async function sleepLocalAssistantHost(
 }
 
 /**
- * Wake (start/restart) a local assistant's daemon and gateway, re-seeding its
- * guardian token. Both hosts drive the Vellum CLI's `wake` in a trusted
- * process and return the same `{ ok, error }` contract.
+ * Wake (start/restart) a local assistant's daemon and gateway. Both hosts
+ * drive the Vellum CLI's `wake` in a trusted process and return the same
+ * `{ ok, error }` contract.
  *
  * This is the non-destructive repair primitive: it revives a stopped or
- * mis-seeded assistant in place without touching its data or identity, the
+ * unresolved assistant in place without touching its data or identity, the
  * counterpart to {@link retireLocalAssistantHost}'s destructive removal.
- * A plain wake (no options) is the safe auto-repair primitive. Passing
- * `repairGuardian: true` re-provisions the guardian token and revokes the
+ * A plain wake (no options) is the safe auto-repair primitive. It restores a
+ * guardian token only when the current environment's config dir has none
+ * (copied from a sibling environment); a token the gateway rejects at the
+ * `/auth/token` mint survives it untouched, and only `repairGuardian: true`
+ * clears that. That option re-provisions the guardian token and revokes the
  * assistant's other device-bound tokens, so it must only be passed from
  * explicitly user-confirmed flows — never from silent auto-repair paths.
  * Older Electron hosts that predate this IPC channel resolve `wake` as

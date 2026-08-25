@@ -1,4 +1,10 @@
-import { execFileSync, execSync, spawn, spawnSync } from "child_process";
+import {
+  type ChildProcess,
+  execFileSync,
+  execSync,
+  spawn,
+  spawnSync,
+} from "child_process";
 import { createHash, randomBytes } from "crypto";
 import {
   existsSync,
@@ -10,7 +16,7 @@ import {
 import { createRequire } from "module";
 import { Socket } from "net";
 import { homedir, networkInterfaces, platform, tmpdir } from "os";
-import { basename, dirname, join } from "path";
+import { basename, dirname, isAbsolute, join } from "path";
 
 import {
   findAssistantCommand,
@@ -39,6 +45,9 @@ import {
 import { stopIngressNginx } from "./nginx-ingress.js";
 import {
   type ProcessState,
+  executableName,
+  isProcessAlive,
+  pathListDelimiter,
   resolveProcessState,
   stopProcess,
   stopProcessByPidFile,
@@ -55,6 +64,11 @@ const DARWIN_UNIX_SOCKET_MAX_PATH_BYTES = 103;
 // assistant.sock = 14 chars, plus 1 for the "/" separator = 15 overhead.
 const LONGEST_SOCKET_FILENAME = "assistant.sock";
 const LOCAL_RUNTIME_PACKAGE = "vellum";
+const PATH_DELIMITER = pathListDelimiter(platform());
+const DEFAULT_EXECUTABLE_PATH =
+  platform() === "win32"
+    ? "C:\\Windows\\System32;C:\\Windows"
+    : "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 
 export interface LocalRuntimeInstall {
   version: string;
@@ -116,10 +130,14 @@ function hasLocalRuntimeComponents(installDir: string): boolean {
  * and point at whatever version happens to be installed globally.
  */
 export function isCompiledCli(): boolean {
-  const execBase = basename(process.execPath);
+  const execBase = basename(process.execPath).replace(/\.exe$/i, "");
   return (
     execBase !== "bun" && execBase !== "bunx" && !execBase.startsWith("bun-")
   );
+}
+
+function compiledSibling(name: string): string {
+  return join(dirname(process.execPath), executableName(name, platform()));
 }
 
 function resolveBunExecutable(): string {
@@ -130,16 +148,22 @@ function resolveBunExecutable(): string {
   const envBun = process.env.VELLUM_BUN;
   if (envBun && existsSync(envBun)) return envBun;
 
-  const siblingBun = join(dirname(process.execPath), "bun");
+  const bunName = executableName("bun", platform());
+  const siblingBun = compiledSibling("bun");
   if (existsSync(siblingBun)) return siblingBun;
 
-  const bundledBun = join(dirname(process.execPath), "..", "Resources", "bun");
+  const bundledBun = join(
+    dirname(process.execPath),
+    "..",
+    "Resources",
+    bunName,
+  );
   if (existsSync(bundledBun)) return bundledBun;
 
-  const homeBun = join(homedir(), ".bun", "bin", "bun");
+  const homeBun = join(homedir(), ".bun", "bin", bunName);
   if (existsSync(homeBun)) return homeBun;
 
-  return "bun";
+  return bunName;
 }
 
 function envWithBunPath(
@@ -147,16 +171,16 @@ function envWithBunPath(
   commandDirs: string[] = [],
 ): Record<string, string | undefined> {
   const bunPath = resolveBunExecutable();
-  const basePath = env.PATH || "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+  const basePath = env.PATH || DEFAULT_EXECUTABLE_PATH;
   const extraDirs = [
-    bunPath.includes("/") ? dirname(bunPath) : "",
+    isAbsolute(bunPath) ? dirname(bunPath) : "",
     ...commandDirs,
     join(homedir(), ".bun", "bin"),
     join(homedir(), ".local", "bin"),
-  ].filter((dir) => dir && !basePath.split(":").includes(dir));
+  ].filter((dir) => dir && !basePath.split(PATH_DELIMITER).includes(dir));
   return {
     ...env,
-    PATH: [...extraDirs, basePath].filter(Boolean).join(":"),
+    PATH: [...extraDirs, basePath].filter(Boolean).join(PATH_DELIMITER),
   };
 }
 
@@ -620,12 +644,12 @@ function logDaemonReadiness(
       break;
     case "migrating":
       console.log(
-        "   Assistant is up — database migrations still running; DB-backed commands return 503 until they finish\n",
+        "   Assistant is up. Database migrations still running; DB-backed commands return 503 until they finish\n",
       );
       break;
     case "failed":
       console.log(
-        "   ⚠️  Assistant database migrations FAILED — DB-backed commands return 503 until the assistant is restarted\n",
+        "   ⚠️  Assistant database migrations FAILED. DB-backed commands return 503 until the assistant is restarted\n",
       );
       break;
     default:
@@ -635,9 +659,98 @@ function logDaemonReadiness(
         );
       }
       console.log(
-        "   ⚠️  Assistant did not become ready within 60s — continuing anyway\n",
+        "   ⚠️  Assistant did not become ready within 60s, continuing anyway\n",
       );
   }
+}
+
+/**
+ * Handle to a daemon this process spawned, reporting whether that child has
+ * since exited. Attach paths have no handle, since the daemon they found is
+ * not a child of this process.
+ */
+export type DaemonSpawn = { hasExited: () => boolean };
+
+function trackDaemonSpawn(child: ChildProcess): DaemonSpawn {
+  let exited = false;
+  child.once("exit", () => {
+    exited = true;
+  });
+  return { hasExited: () => exited };
+}
+
+/** How long a fresh spawn gets to abort before its readiness is trusted. */
+const FRESH_SPAWN_SETTLE_MS = 2000;
+const FRESH_SPAWN_POLL_MS = 100;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * True when a freshly spawned daemon is the process serving its runtime HTTP
+ * port.
+ *
+ * A readiness answer proves only that something listens on the port: a foreign
+ * listener holding it answers in the daemon's place, so a daemon aborting over
+ * the collision still reads as "up" or "migrating". Ownership is confirmed
+ * from the listening PID where the platform can report it. Otherwise the spawn
+ * gets a short settle window, which is long enough because transports bind
+ * before migrations run, so an address collision aborts the daemon early.
+ */
+async function freshSpawnServesRuntimePort(
+  spawn: DaemonSpawn,
+  pidFile: string,
+  daemonPort: number,
+): Promise<boolean> {
+  const spawnPid = (): number | null => {
+    if (spawn.hasExited()) {
+      return null;
+    }
+    return isProcessAlive(pidFile).pid;
+  };
+
+  const pid = spawnPid();
+  if (pid === null) {
+    return false;
+  }
+  if (findPidListeningOnPort(daemonPort) === pid) {
+    return true;
+  }
+
+  const deadline = Date.now() + FRESH_SPAWN_SETTLE_MS;
+  while (Date.now() < deadline) {
+    await sleep(FRESH_SPAWN_POLL_MS);
+    if (spawnPid() === null) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Report a freshly spawned daemon's readiness, gated on that daemon serving
+ * the runtime HTTP port the readiness was probed on.
+ *
+ * A daemon that aborts during startup (an occupied runtime HTTP port, a fatal
+ * subsystem failure) is reported as the startup failure it is instead of an
+ * optimistic line about an assistant that is not running.
+ */
+export async function reportFreshSpawnReadiness(
+  spawn: DaemonSpawn,
+  pidFile: string,
+  daemonPort: number,
+  readiness: DaemonReadiness,
+  requireReady = false,
+): Promise<void> {
+  if (!(await freshSpawnServesRuntimePort(spawn, pidFile, daemonPort))) {
+    if (requireReady) {
+      throw new Error("Assistant exited during startup and is not running.");
+    }
+    console.log("   ⚠️  Assistant exited during startup and is not running\n");
+    return;
+  }
+  logDaemonReadiness(readiness, requireReady);
 }
 
 function logAssistantAlreadyRunning(
@@ -649,7 +762,9 @@ function logAssistantAlreadyRunning(
       ? " but its database migrations failed — restart to recover"
       : status === "unready"
         ? " — database migrations still running"
-        : "";
+        : status === "stuck"
+          ? " but is not responding and could not be stopped"
+          : "";
   console.log(`   Assistant already running (pid ${pid})${suffix}\n`);
 }
 
@@ -657,7 +772,7 @@ async function startDaemonFromSource(
   assistantIndex: string,
   resources: LocalInstanceResources,
   options?: DaemonStartOptions,
-): Promise<boolean> {
+): Promise<DaemonSpawn | null> {
   const foreground = options?.foreground ?? false;
   const daemonMainPath = resolveDaemonMainPath(assistantIndex);
 
@@ -667,7 +782,9 @@ async function startDaemonFromSource(
   mkdirSync(dirname(pidFile), { recursive: true });
 
   // --- Lifecycle guard: prevent split-brain daemon state ---
-  if (await awaitStartingSentinel(pidFile, resources.daemonPort)) return false;
+  if (await awaitStartingSentinel(pidFile, resources.daemonPort)) {
+    return null;
+  }
 
   const daemonState = await resolveProcessState(
     pidFile,
@@ -678,10 +795,12 @@ async function startDaemonFromSource(
   );
   if (daemonState.status !== "needs_start") {
     logAssistantAlreadyRunning(daemonState.pid, daemonState.status);
-    return false;
+    return null;
   }
 
-  if (await checkOrphanedDaemon(pidFile, resources.daemonPort)) return false;
+  if (await checkOrphanedDaemon(pidFile, resources.daemonPort)) {
+    return null;
+  }
 
   const env: Record<string, string | undefined> = {
     ...process.env,
@@ -718,6 +837,7 @@ async function startDaemonFromSource(
         const c = spawn(bunPath, ["run", daemonMainPath], {
           detached: true,
           stdio: ["ignore", "pipe", "pipe"],
+          windowsHide: true,
           env: spawnEnv,
         });
         pipeToLogFile(c, daemonLogFd, "daemon");
@@ -725,14 +845,14 @@ async function startDaemonFromSource(
         return c;
       })();
 
-  if (child.pid) {
-    writeFileSync(pidFile, String(child.pid), "utf-8");
-  } else {
+  if (!child.pid) {
     try {
       unlinkSync(pidFile);
     } catch {}
+    return null;
   }
-  return true;
+  writeFileSync(pidFile, String(child.pid), "utf-8");
+  return trackDaemonSpawn(child);
 }
 
 // NOTE: startDaemonWatchFromSource() is the CLI-side watch-mode daemon
@@ -743,7 +863,7 @@ async function startDaemonWatchFromSource(
   assistantIndex: string,
   resources: LocalInstanceResources,
   options?: DaemonStartOptions,
-): Promise<boolean> {
+): Promise<DaemonSpawn | null> {
   const mainPath = resolveDaemonMainPath(assistantIndex);
   if (!existsSync(mainPath)) {
     throw new Error(`Daemon main.ts not found at ${mainPath}`);
@@ -753,7 +873,9 @@ async function startDaemonWatchFromSource(
   mkdirSync(dirname(pidFile), { recursive: true });
 
   // --- Lifecycle guard: prevent split-brain daemon state ---
-  if (await awaitStartingSentinel(pidFile, resources.daemonPort)) return false;
+  if (await awaitStartingSentinel(pidFile, resources.daemonPort)) {
+    return null;
+  }
 
   const daemonState = await resolveProcessState(
     pidFile,
@@ -764,10 +886,12 @@ async function startDaemonWatchFromSource(
   );
   if (daemonState.status !== "needs_start") {
     logAssistantAlreadyRunning(daemonState.pid, daemonState.status);
-    return false;
+    return null;
   }
 
-  if (await checkOrphanedDaemon(pidFile, resources.daemonPort)) return false;
+  if (await checkOrphanedDaemon(pidFile, resources.daemonPort)) {
+    return null;
+  }
 
   const env: Record<string, string | undefined> = {
     ...process.env,
@@ -785,6 +909,7 @@ async function startDaemonWatchFromSource(
   const child = spawn(resolveBunExecutable(), ["--watch", "run", mainPath], {
     detached: true,
     stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
     env: envWithBunPath(env),
   });
   pipeToLogFile(child, daemonLogFd, "daemon");
@@ -792,16 +917,16 @@ async function startDaemonWatchFromSource(
   const daemonPid = child.pid;
 
   // Overwrite sentinel with real PID, or clean up on spawn failure.
-  if (daemonPid) {
-    writeFileSync(pidFile, String(daemonPid), "utf-8");
-  } else {
+  if (!daemonPid) {
     try {
       unlinkSync(pidFile);
     } catch {}
+    return null;
   }
+  writeFileSync(pidFile, String(daemonPid), "utf-8");
 
   console.log("   Assistant started in watch mode (bun --watch)");
-  return true;
+  return trackDaemonSpawn(child);
 }
 
 function resolveGatewayDir(resources?: LocalInstanceResources): string {
@@ -968,13 +1093,14 @@ export async function startCes(
 
   let ces;
   const runtimeCesDir = !watch ? localRuntimeCesDir(resources) : undefined;
-  const cesBinary = join(dirname(process.execPath), "credential-executor");
+  const cesBinary = compiledSibling("credential-executor");
   if (!runtimeCesDir && isCompiledCli() && existsSync(cesBinary) && !watch) {
     // Compiled binary alongside the CLI (desktop app / compiled CLI).
     const cesLogFd = openLogFile("hatch.log");
     ces = spawn(cesBinary, [], {
       detached: true,
       stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
       env: cesEnv,
     });
     pipeToLogFile(ces, cesLogFd, "credential-executor");
@@ -989,6 +1115,7 @@ export async function startCes(
       cwd: cesDir,
       detached: true,
       stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
       env: envWithBunPath(cesEnv),
     });
     pipeToLogFile(ces, cesLogFd, "credential-executor");
@@ -1328,7 +1455,10 @@ export function isGatewayWatchModeAvailable(): boolean {
  * The wrapper is idempotent: safe to call on every daemon wake.
  */
 function writeAssistantWrapper(resources: LocalInstanceResources): void {
-  const assistantBinary = join(dirname(process.execPath), "assistant");
+  if (platform() === "win32") {
+    return;
+  }
+  const assistantBinary = compiledSibling("assistant");
   if (!isCompiledCli() || !existsSync(assistantBinary)) return;
 
   const workspaceDir = join(resources.instanceDir, ".vellum", "workspace");
@@ -1372,10 +1502,16 @@ export async function startLocalDaemon(
     // already-running daemon was classified and logged inside
     // startDaemonFromSource, and re-waiting would just block on a migration
     // the user was already told about.
-    if (
-      await startDaemonFromSource(runtimeAssistantIndex, resources, options)
-    ) {
-      logDaemonReadiness(
+    const runtimeSpawn = await startDaemonFromSource(
+      runtimeAssistantIndex,
+      resources,
+      options,
+    );
+    if (runtimeSpawn) {
+      await reportFreshSpawnReadiness(
+        runtimeSpawn,
+        getDaemonPidPath(resources),
+        resources.daemonPort,
         await waitForDaemonMigrationsReady(
           resources.daemonPort,
           Date.now() + 60000,
@@ -1391,7 +1527,7 @@ export async function startLocalDaemon(
   // This covers both the desktop app (VELLUM_DESKTOP_APP) and the case where
   // the user runs the compiled CLI directly from the terminal (e.g. via a
   // /usr/local/bin/vellum symlink into the app bundle).
-  const daemonBinary = join(dirname(process.execPath), "vellum-daemon");
+  const daemonBinary = compiledSibling("vellum-daemon");
   if (isCompiledCli() && existsSync(daemonBinary) && !watch) {
     // In watch mode, skip the bundled binary and use source (bun --watch
     // only works with source files, not compiled binaries).
@@ -1415,6 +1551,7 @@ export async function startLocalDaemon(
     if (daemonAlive) {
       logAssistantAlreadyRunning(daemonState.pid, daemonState.status);
     }
+    let daemonSpawn: DaemonSpawn | null = null;
 
     if (!daemonAlive) {
       if (await checkOrphanedDaemon(pidFile, resources.daemonPort)) {
@@ -1443,21 +1580,39 @@ export async function startLocalDaemon(
       const home = homedir();
       const bunBinDir = join(home, ".bun", "bin");
       const localBinDir = join(home, ".local", "bin");
-      const basePath =
-        process.env.PATH || "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+      const basePath = process.env.PATH || DEFAULT_EXECUTABLE_PATH;
       // The compiled `assistant` ships beside the daemon binary, so its
       // directory is what puts `assistant …` on PATH for agent-run commands.
       const daemonBinaryDir = dirname(daemonBinary);
-      const assistantBinaryDir = existsSync(join(daemonBinaryDir, "assistant"))
+      const assistantBinaryDir = existsSync(
+        join(daemonBinaryDir, executableName("assistant", platform())),
+      )
         ? [daemonBinaryDir]
         : [];
       const extraDirs = [...assistantBinaryDir, bunBinDir, localBinDir].filter(
-        (d) => !basePath.split(":").includes(d),
+        (d) => !basePath.split(PATH_DELIMITER).includes(d),
       );
       const daemonEnv: Record<string, string> = {
         HOME: process.env.HOME || home,
-        PATH: [...extraDirs, basePath].filter(Boolean).join(":"),
+        PATH: [...extraDirs, basePath].filter(Boolean).join(PATH_DELIMITER),
       };
+      if (platform() === "win32") {
+        for (const key of [
+          "APPDATA",
+          "COMSPEC",
+          "LOCALAPPDATA",
+          "PATHEXT",
+          "SystemDrive",
+          "SystemRoot",
+          "TEMP",
+          "TMP",
+          "USERPROFILE",
+        ]) {
+          if (process.env[key]) {
+            daemonEnv[key] = process.env[key];
+          }
+        }
+      }
       // Forward optional config env vars the daemon may need.
       // `VELLUM_ENVIRONMENT` must be forwarded so the daemon resolves
       // env-scoped paths (device ID, platform/guardian tokens, XDG
@@ -1507,6 +1662,7 @@ export async function startLocalDaemon(
               cwd: dirname(daemonBinary),
               detached: true,
               stdio: ["ignore", "pipe", "pipe"],
+              windowsHide: true,
               env: daemonEnv,
             });
             pipeToLogFile(c, daemonLogFd, "daemon");
@@ -1518,6 +1674,7 @@ export async function startLocalDaemon(
       // Overwrite sentinel with real PID, or clean up on spawn failure.
       if (daemonPid) {
         writeFileSync(pidFile, String(daemonPid), "utf-8");
+        daemonSpawn = trackDaemonSpawn(child);
       } else {
         try {
           unlinkSync(pidFile);
@@ -1556,19 +1713,17 @@ export async function startLocalDaemon(
         const assistantIndex = resolveAssistantIndexPath(resources);
         if (assistantIndex) {
           console.log(
-            "   Bundled assistant not healthy after 60s — falling back to source assistant...",
+            "   Bundled assistant not healthy after 60s, falling back to source assistant...",
           );
           // Kill the bundled daemon to avoid two processes competing for the same port
           await stopProcessByPidFile(pidFile, "bundled daemon");
-          if (watch) {
-            await startDaemonWatchFromSource(
-              assistantIndex,
-              resources,
-              options,
-            );
-          } else {
-            await startDaemonFromSource(assistantIndex, resources, options);
-          }
+          daemonSpawn = watch
+            ? await startDaemonWatchFromSource(
+                assistantIndex,
+                resources,
+                options,
+              )
+            : await startDaemonFromSource(assistantIndex, resources, options);
           readiness = await waitForDaemonMigrationsReady(
             resources.daemonPort,
             Date.now() + 60000,
@@ -1581,7 +1736,17 @@ export async function startLocalDaemon(
         readiness = await probeDaemonReadiness(resources.daemonPort);
       }
 
-      logDaemonReadiness(readiness, options?.requireReady);
+      if (daemonSpawn) {
+        await reportFreshSpawnReadiness(
+          daemonSpawn,
+          pidFile,
+          resources.daemonPort,
+          readiness,
+          options?.requireReady,
+        );
+      } else {
+        logDaemonReadiness(readiness, options?.requireReady);
+      }
     }
   } else {
     console.log("🔨 Starting local assistant...");
@@ -1593,12 +1758,15 @@ export async function startLocalDaemon(
           "  Ensure the daemon binary is bundled alongside the CLI, or run from the source tree.",
       );
     }
-    const spawned = watch
+    const sourceSpawn = watch
       ? await startDaemonWatchFromSource(assistantIndex, resources, options)
       : await startDaemonFromSource(assistantIndex, resources, options);
     // Attach case was classified and logged inside the start function.
-    if (spawned) {
-      logDaemonReadiness(
+    if (sourceSpawn) {
+      await reportFreshSpawnReadiness(
+        sourceSpawn,
+        getDaemonPidPath(resources),
+        resources.daemonPort,
         await waitForDaemonMigrationsReady(
           resources.daemonPort,
           Date.now() + 60000,
@@ -1692,7 +1860,7 @@ export async function startGateway(
   const runtimeGatewayDir = !watch
     ? localRuntimeGatewayDir(resources)
     : undefined;
-  const gatewayBinary = join(dirname(process.execPath), "vellum-gateway");
+  const gatewayBinary = compiledSibling("vellum-gateway");
   if (
     !runtimeGatewayDir &&
     isCompiledCli() &&
@@ -1706,6 +1874,7 @@ export async function startGateway(
     gateway = spawn(gatewayBinary, [], {
       detached: true,
       stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
       env: gatewayEnv,
     });
     pipeToLogFile(gateway, gatewayLogFd, "gateway");
@@ -1720,6 +1889,7 @@ export async function startGateway(
       cwd: gatewayDir,
       detached: true,
       stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
       env: envWithBunPath(gatewayEnv),
     });
     pipeToLogFile(gateway, gwLogFd, "gateway");

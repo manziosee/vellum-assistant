@@ -72,18 +72,18 @@ mock.module("@vellumai/design-library", () => {
 });
 
 import { PinnedAppNavItem } from "@/domains/chat/components/pinned-app-nav-item";
+import { viewportAxesStub } from "@/hooks/viewport-axes.test-helper";
 import { getPinColorHex } from "@/domains/chat/utils/pin-color-registry";
-import { usePinnedAppsStore } from "@/stores/pinned-apps-store";
-import type { PinnableApp, PinnedAppEntry } from "@/utils/app-pin-storage";
+import { makeAppSummary } from "@/types/app-summary.test-helper";
 
-const APP: PinnedAppEntry = {
-  appId: "app-1",
-  pinnedOrder: 1,
+const APP = makeAppSummary({
+  id: "app-1",
   name: "My App",
   icon: "🚀",
-};
+  pinSortPosition: 1,
+});
 
-const TEAL_APP: PinnedAppEntry = { ...APP, color: "teal" };
+const TEAL_APP = { ...APP, pinColor: "teal" };
 
 /* Read from the registry rather than restated, so the palette stays the one
    place a colour's hex is written down and a repalette does not fail tests
@@ -107,22 +107,28 @@ function tintOf(element: HTMLElement): {
   };
 }
 
-function seedPin(entry: PinnedAppEntry): void {
-  const app: PinnableApp = {
-    id: entry.appId,
-    name: entry.name,
-    icon: entry.icon,
-  };
-  usePinnedAppsStore.getState().togglePin(app);
+/* The row reports what the user asked for and renders what it is given; the
+   pin itself lives with the daemon. So these assert the call, which is the
+   whole of this component's side of that contract. */
+let onUnpin = mock((_appId: string) => {});
+let onSetColor = mock((_appId: string, _color: string | null) => {});
+
+/** The two required action props, so a case names only what it is about. */
+function actions() {
+  return { onUnpin, onSetColor };
 }
 
+const viewport = viewportAxesStub();
+
 beforeEach(() => {
-  localStorage.clear();
-  usePinnedAppsStore.setState({ pinnedApps: [], pinnedAppIds: new Set() });
+  onUnpin = mock((_appId: string) => {});
+  onSetColor = mock((_appId: string, _color: string | null) => {});
+  viewport.set({ narrow: false, coarsePointer: false });
 });
 
 afterEach(() => {
   cleanup();
+  viewport.restore();
 });
 
 describe("PinnedAppNavItem", () => {
@@ -134,6 +140,7 @@ describe("PinnedAppNavItem", () => {
         active={false}
         collapsed={false}
         onOpen={onOpen}
+        {...actions()}
       />,
     );
 
@@ -151,40 +158,66 @@ describe("PinnedAppNavItem", () => {
   });
 
   test("expanded: Unpin action clears the pin (the sidebar escape hatch)", () => {
-    seedPin(APP);
-    expect(usePinnedAppsStore.getState().isPinned("app-1")).toBe(true);
-
-    render(<PinnedAppNavItem app={APP} active={false} collapsed={false} />);
+    render(
+      <PinnedAppNavItem
+        app={APP}
+        active={false}
+        collapsed={false}
+        {...actions()}
+      />,
+    );
     fireEvent.click(screen.getByRole("button", { name: "Unpin" }));
 
-    expect(usePinnedAppsStore.getState().isPinned("app-1")).toBe(false);
+    expect(onUnpin).toHaveBeenCalledWith("app-1");
   });
 
   test("expanded: the hover-revealed unpin button also clears the pin", () => {
-    seedPin(APP);
-    expect(usePinnedAppsStore.getState().isPinned("app-1")).toBe(true);
-
-    render(<PinnedAppNavItem app={APP} active={false} collapsed={false} />);
+    render(
+      <PinnedAppNavItem
+        app={APP}
+        active={false}
+        collapsed={false}
+        {...actions()}
+      />,
+    );
     fireEvent.click(screen.getByRole("button", { name: "Unpin My App" }));
 
-    expect(usePinnedAppsStore.getState().isPinned("app-1")).toBe(false);
+    expect(onUnpin).toHaveBeenCalledWith("app-1");
   });
 
-  // Regression: the hover-revealed button has no hover to reveal it on
-  // touch, so it must not sit clickable-but-invisible over the row's
-  // right edge, or a tap there unpins instead of opening the app.
-  test("expanded: the hover-revealed unpin button disables its hit target on coarse pointers", () => {
-    render(<PinnedAppNavItem app={APP} active={false} collapsed={false} />);
+  /* The row's one command stays a named, focusable control where the device
+     cannot hover: the swipe button behind the row is out of the accessibility
+     tree until a swipe reveals it, and a long press is not something a screen
+     reader or switch control can announce. */
+  test("expanded: keeps the trailing unpin button where the device cannot hover", () => {
+    viewport.set({ narrow: true, coarsePointer: true });
 
-    const button = screen.getByRole("button", { name: "Unpin My App" });
-    expect(button.className).toContain("pointer-coarse:pointer-events-none");
+    const { container } = render(
+      <PinnedAppNavItem
+        app={APP}
+        active={false}
+        collapsed={false}
+        {...actions()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Unpin My App" }));
+    expect(onUnpin).toHaveBeenCalledWith("app-1");
+
+    // Behind the row until a swipe slides it away, hence found by attribute:
+    // it is `aria-hidden` and out of the tab path while it is back there.
+    expect(
+      container.querySelector('button[aria-label="Unpin"][aria-hidden="true"]'),
+    ).not.toBeNull();
   });
 
   /* The tile is the shape with the most riding on the menu: no hover button,
      nothing to swipe, so this is its only route to an unpin. Collapsing the
      rail changes what a pinned app looks like, not what can be done to it. */
   test("collapsed rail: keeps the context menu", () => {
-    render(<PinnedAppNavItem app={APP} active={false} collapsed />);
+    render(
+      <PinnedAppNavItem app={APP} active={false} collapsed {...actions()} />,
+    );
 
     expect(screen.getByTestId("app-row").textContent).toBe("My App");
     expect(screen.getByTestId("ctx-root")).toBeTruthy();
@@ -192,17 +225,23 @@ describe("PinnedAppNavItem", () => {
   });
 
   test("collapsed rail: Unpin clears the pin", () => {
-    seedPin(APP);
-    expect(usePinnedAppsStore.getState().isPinned("app-1")).toBe(true);
-
-    render(<PinnedAppNavItem app={APP} active={false} collapsed />);
+    render(
+      <PinnedAppNavItem app={APP} active={false} collapsed {...actions()} />,
+    );
     fireEvent.click(screen.getByRole("button", { name: "Unpin" }));
 
-    expect(usePinnedAppsStore.getState().isPinned("app-1")).toBe(false);
+    expect(onUnpin).toHaveBeenCalledWith("app-1");
   });
 
   test("collapsed rail: the colour row rides along with the menu", () => {
-    render(<PinnedAppNavItem app={TEAL_APP} active={false} collapsed />);
+    render(
+      <PinnedAppNavItem
+        app={TEAL_APP}
+        active={false}
+        collapsed
+        {...actions()}
+      />,
+    );
 
     expect(
       screen
@@ -215,7 +254,9 @@ describe("PinnedAppNavItem", () => {
      trailing slot, and a 20px button inside a 30px tile would sit on the glyph
      it is meant to sit beside. */
   test("collapsed rail: omits the hover unpin button", () => {
-    render(<PinnedAppNavItem app={APP} active={false} collapsed />);
+    render(
+      <PinnedAppNavItem app={APP} active={false} collapsed {...actions()} />,
+    );
 
     expect(screen.queryByRole("button", { name: "Unpin My App" })).toBeNull();
   });
@@ -231,6 +272,7 @@ describe("PinnedAppNavItem", () => {
         active={false}
         collapsed={false}
         onOpen={() => {}}
+        {...actions()}
       />,
     );
 
@@ -248,6 +290,7 @@ describe("PinnedAppNavItem", () => {
         active={false}
         collapsed={false}
         onOpen={() => {}}
+        {...actions()}
       />,
     );
 
@@ -272,12 +315,20 @@ describe("PinnedAppNavItem", () => {
         active={false}
         collapsed={false}
         onOpen={() => {}}
+        {...actions()}
       />,
     );
     const expanded = tintOf(screen.getByRole("button", { name: "My App" }));
 
     cleanup();
-    render(<PinnedAppNavItem app={TEAL_APP} active={false} collapsed />);
+    render(
+      <PinnedAppNavItem
+        app={TEAL_APP}
+        active={false}
+        collapsed
+        {...actions()}
+      />,
+    );
 
     expect(tintOf(screen.getByTestId("app-row"))).toEqual(expanded);
   });
@@ -287,10 +338,11 @@ describe("PinnedAppNavItem", () => {
   test("a colour id the registry does not know paints no tint", () => {
     render(
       <PinnedAppNavItem
-        app={{ ...APP, color: "not-a-real-color" }}
+        app={{ ...APP, pinColor: "not-a-real-color" }}
         active={false}
         collapsed={false}
         onOpen={() => {}}
+        {...actions()}
       />,
     );
 
@@ -298,24 +350,31 @@ describe("PinnedAppNavItem", () => {
   });
 
   test("picking a swatch stores the colour on the pin", () => {
-    seedPin(APP);
-
-    render(<PinnedAppNavItem app={APP} active={false} collapsed={false} />);
+    render(
+      <PinnedAppNavItem
+        app={APP}
+        active={false}
+        collapsed={false}
+        {...actions()}
+      />,
+    );
     fireEvent.click(screen.getByRole("menuitemradio", { name: "Teal" }));
 
-    expect(usePinnedAppsStore.getState().pinnedApps[0]!.color).toBe("teal");
+    expect(onSetColor).toHaveBeenCalledWith("app-1", "teal");
   });
 
   test("picking No color clears a colour the pin already had", () => {
-    seedPin(APP);
-    usePinnedAppsStore.getState().setColor(APP.appId, "teal");
-
     render(
-      <PinnedAppNavItem app={TEAL_APP} active={false} collapsed={false} />,
+      <PinnedAppNavItem
+        app={TEAL_APP}
+        active={false}
+        collapsed={false}
+        {...actions()}
+      />,
     );
     fireEvent.click(screen.getByRole("menuitemradio", { name: "No color" }));
 
-    expect(usePinnedAppsStore.getState().pinnedApps[0]!.color).toBeUndefined();
+    expect(onSetColor).toHaveBeenCalledWith("app-1", null);
   });
 
   /* Selection is carried by `aria-checked` on a radio, so a screen reader
@@ -324,7 +383,12 @@ describe("PinnedAppNavItem", () => {
      is always checked marks every colour as the current one. */
   test("marks the pin's current colour as the checked swatch", () => {
     render(
-      <PinnedAppNavItem app={TEAL_APP} active={false} collapsed={false} />,
+      <PinnedAppNavItem
+        app={TEAL_APP}
+        active={false}
+        collapsed={false}
+        {...actions()}
+      />,
     );
 
     expect(
@@ -345,7 +409,14 @@ describe("PinnedAppNavItem", () => {
   });
 
   test("an uncoloured pin checks the No color swatch", () => {
-    render(<PinnedAppNavItem app={APP} active={false} collapsed={false} />);
+    render(
+      <PinnedAppNavItem
+        app={APP}
+        active={false}
+        collapsed={false}
+        {...actions()}
+      />,
+    );
 
     expect(
       screen
@@ -358,7 +429,12 @@ describe("PinnedAppNavItem", () => {
      copy is what fails if the label ever falls back to announcing `teal`. */
   test("announces a translated colour name rather than the stored id", () => {
     render(
-      <PinnedAppNavItem app={TEAL_APP} active={false} collapsed={false} />,
+      <PinnedAppNavItem
+        app={TEAL_APP}
+        active={false}
+        collapsed={false}
+        {...actions()}
+      />,
     );
 
     expect(screen.getByRole("menuitemradio", { name: "Teal" })).toBeTruthy();
@@ -371,7 +447,12 @@ describe("PinnedAppNavItem", () => {
      asserting it covers both. Both states, because an attribute that is always
      set marks every row as the current one. */
   test("marks the row as the current page only while active", () => {
-    const props = { app: APP, collapsed: false, onOpen: () => {} };
+    const props = {
+      app: APP,
+      collapsed: false,
+      onOpen: () => {},
+      ...actions(),
+    };
 
     render(<PinnedAppNavItem {...props} active />);
     expect(

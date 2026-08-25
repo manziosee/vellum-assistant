@@ -20,6 +20,7 @@ import { localFileKindFromFilename } from "@/domains/chat/components/local-file/
 import { MAX_INLINE_MEDIA_BYTES } from "@/domains/chat/components/local-file/local-file-limits";
 import { LocalFileMenu } from "@/domains/chat/components/local-file/local-file-menu";
 import { resolveLocalFileTarget } from "@/domains/chat/components/local-file/local-file-target";
+import { useTranslation } from "@/i18n";
 import {
   useLocalFileInfo,
   useLocalFileObjectUrl,
@@ -27,13 +28,6 @@ import {
 
 const MEDIA_CLASSES =
   "max-h-[400px] max-w-full rounded-lg border border-[var(--border-element)] object-contain";
-
-const MENU_OVERLAY_CLASSES = [
-  "pointer-events-none absolute right-2 top-2 rounded-md bg-[var(--surface-lift)] opacity-0 transition-opacity",
-  "group-hover/local-media:pointer-events-auto group-hover/local-media:opacity-100",
-  "group-focus-within/local-media:pointer-events-auto group-focus-within/local-media:opacity-100",
-  "[@media(pointer:coarse)]:pointer-events-auto [@media(pointer:coarse)]:opacity-100",
-].join(" ");
 
 /** False where the API is missing or policy-disabled (Firefox, some embeds). */
 function supportsPictureInPicture(): boolean {
@@ -60,9 +54,17 @@ function MediaFrame({
   menu: ReactNode;
 }) {
   return (
-    <span className="group/local-media relative my-2 inline-block max-w-full align-top">
+    <span
+      data-reveal-row=""
+      className="relative my-2 inline-block max-w-full align-top"
+    >
       {children}
-      <span className={MENU_OVERLAY_CLASSES}>{menu}</span>
+      <span
+        data-reveal=""
+        className="absolute right-2 top-2 rounded-md bg-[var(--surface-lift)]"
+      >
+        {menu}
+      </span>
     </span>
   );
 }
@@ -72,6 +74,7 @@ export function LocalFileEmbed({
   alt,
   assistantId,
 }: LocalFileEmbedProps): ReactNode {
+  const { t } = useTranslation("chat");
   const target = useMemo(() => resolveLocalFileTarget(href), [href]);
   const info = useLocalFileInfo(target.workspacePath, assistantId);
   // Keyed by href so a reference that changes underneath the same tree
@@ -99,7 +102,7 @@ export function LocalFileEmbed({
       await el.requestPictureInPicture();
     } catch {
       el.disablePictureInPicture = true;
-      toast.error("Picture in Picture isn't available");
+      toast.error(t("localFileEmbed.pictureInPictureUnavailable"));
       return;
     }
     el.addEventListener(
@@ -109,7 +112,7 @@ export function LocalFileEmbed({
       },
       { once: true },
     );
-  }, []);
+  }, [t]);
 
   const ready = info.status === "ready" ? info : null;
   const filename = ready?.filename ?? target.filename;
@@ -148,7 +151,7 @@ export function LocalFileEmbed({
     <Skeleton
       as="span"
       role="status"
-      aria-label={`Loading ${mediaLabel}`}
+      aria-label={t("localFileEmbed.loadingAria", { label: mediaLabel })}
       className="my-2 inline-block h-7 w-40 rounded-lg align-middle"
     />
   );
@@ -243,6 +246,8 @@ export function LocalFileEmbed({
           ref={videoRef}
           src={url}
           controls
+          // Browser media-control tokens, not user-facing copy.
+          // eslint-disable-next-line local/no-untranslated-strings -- HTML controlsList tokens
           controlsList="nodownload noplaybackrate"
           disablePictureInPicture
           playsInline
@@ -260,6 +265,7 @@ export function LocalFileEmbed({
         <audio
           src={url}
           controls
+          // eslint-disable-next-line local/no-untranslated-strings -- HTML controlsList tokens
           controlsList="nodownload noplaybackrate"
           preload="metadata"
           aria-label={mediaLabel}

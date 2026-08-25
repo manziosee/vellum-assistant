@@ -12,6 +12,7 @@ import {
 import {
   clearGatewayToken,
   ensureGatewayToken,
+  type EnsureGatewayTokenOptions,
   GatewayTokenError,
   getGatewayToken,
   getLocalTokenUrl,
@@ -21,15 +22,18 @@ import {
   getSelfHostedIngressUrl,
   setSelfHostedConnection,
 } from "@/lib/self-hosted/connection";
+import { useAssistantIdentityStore } from "@/stores/assistant-identity-store";
 import { useLockfileStore } from "@/stores/lockfile-store";
 import {
   connectImportHost,
   fetchGuardianTokenHost,
   GuardianTokenError,
+  isLocalModeHostAvailable,
   loadLockfileHost,
   parseLockfile,
   replacePlatformAssistantsHost,
   retireLocalAssistantHost,
+  renameLockfileAssistantHost,
   saveLockfileAssistantHost,
   unpairAssistantHost,
   wakeLocalAssistantHost,
@@ -112,6 +116,12 @@ export function getRemoteGatewayAssistantName(): string | undefined {
   return nonEmptyString(getInjectedConfig().assistantName);
 }
 
+/** Live persona name when hydrated, else the (possibly stale) name the edge injected at tunnel start. */
+export function getRemoteAssistantDisplayName(): string | undefined {
+  const live = useAssistantIdentityStore.getState().name?.trim();
+  return live || getRemoteGatewayAssistantName();
+}
+
 /**
  * The cloud hub SPA's assistant-root URL (`<origin>/assistant`), when the
  * served remote-gateway config carries one. Older served configs omit it, so
@@ -126,7 +136,7 @@ function getRemoteGatewayLockfile(): Lockfile {
     assistants: [
       {
         assistantId: "self",
-        name: "Local Assistant",
+        name: getRemoteGatewayAssistantName() ?? "Local Assistant",
         cloud: "local",
         runtimeUrl: window.location.origin,
         hatchedAt: "1970-01-01T00:00:00.000Z",
@@ -292,6 +302,43 @@ export async function updateLockfileAssistant(
   if (result.ok) {
     commitLockfile(result.lockfile);
   }
+}
+
+/**
+ * Rename an existing assistant entry without touching its other fields or the
+ * active assistant pointer. Runs through the host's rename-if-present
+ * operation, which decides against the on-disk registry and refuses missing
+ * entries and unreadable files instead of upserting, so a stale renderer
+ * cache can never resurrect a retired assistant. The renderer-side guards
+ * below are cheap early-outs, not the safety boundary.
+ *
+ * Resolves `true` when there is nothing left to do (converged, no-op guard,
+ * or a successful write); `false` when the host write failed or refused, so
+ * callers can retry.
+ */
+export async function renameLockfileAssistant(
+  assistantId: string,
+  name: string,
+): Promise<boolean> {
+  const trimmed = name.trim();
+  if (!trimmed) {
+    // Fresh assistants report "": never write an empty name.
+    return true;
+  }
+  if (isRemoteGatewayMode() || !isLocalModeHostAvailable()) {
+    return true;
+  }
+  const entry = getLockfileAssistant(assistantId);
+  if (!entry || entry.name === trimmed) {
+    // Rename-only: never create an entry, never write redundantly.
+    return true;
+  }
+  const result = await renameLockfileAssistantHost(assistantId, trimmed);
+  if (result.ok) {
+    commitLockfile(result.lockfile);
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -631,6 +678,27 @@ export function getLockfileAssistant(
 }
 
 /**
+ * React subscription to one lockfile entry's `name`: `undefined` while the
+ * lockfile hasn't hydrated or the id has no entry, `null` when the entry
+ * exists but is unnamed. Distinguishing absence from an unnamed entry lets
+ * effects depending on this value re-fire even when the appearing entry
+ * carries no name.
+ */
+export function useLockfileAssistantName(
+  assistantId: string | null,
+): string | null | undefined {
+  return useLockfileStore((s) => {
+    if (assistantId === null) {
+      return undefined;
+    }
+    const entry = s.lockfile?.assistants.find(
+      (a) => a.assistantId === assistantId,
+    );
+    return entry === undefined ? undefined : (entry.name ?? null);
+  });
+}
+
+/**
  * Reconcile the selection key against the lockfile registry: if the selected id
  * no longer names a lockfile entry, clear it so `getSelectedAssistant` falls
  * back to `getActiveAssistant`. The store's own reconcile (on `setFromLockfile`)
@@ -821,9 +889,20 @@ export class UnresolvedPairedGatewayError extends Error {
  * paired assistants use a same-origin proxy whose trusted host injects its
  * guardian bearer. Passing `target` lets connect flows prime the new
  * assistant before the selection write becomes observable.
+ *
+ * `options.forceMint` re-mints a local assistant's renderer token even when
+ * the cache holds an unexpired one, for callers recovering from the gateway
+ * rejecting that token. Paired assistants mint no renderer token, so the
+ * option is a no-op for them.
  */
+export type PrimeLocalGatewayConnectionOptions = Pick<
+  EnsureGatewayTokenOptions,
+  "forceMint"
+>;
+
 export async function primeLocalGatewayConnection(
   target?: LockfileAssistant,
+  options: PrimeLocalGatewayConnectionOptions = {},
 ): Promise<void> {
   const assistant = target ?? getSelectedAssistant();
   if (assistant && expectsPairedGateway(assistant)) {
@@ -834,22 +913,32 @@ export async function primeLocalGatewayConnection(
     const ingressUrl = getAuthGatewayIngressUrl(assistant)!;
     // A request through the paired proxy forces the trusted host to resolve
     // the credential and proves the remote gateway is reachable. The renderer
-    // sends no bearer. It also clears credentials persisted by older clients
-    // that placed paired guardian tokens in the gateway-session cache.
-    if (getSelfHostedIngressUrl() === ingressUrl) {
-      setSelfHostedConnection(null);
-    }
-    const response = await fetch(`${pairedUrl}/readyz`);
-    if (!response.ok) {
-      const message = await response.text();
-      throw new GuardianTokenError(
-        response.status,
-        message || `Paired gateway request failed: ${response.status}`,
-      );
-    }
-    const readiness: unknown = await response.json().catch(() => null);
-    if (!isReadyzResponseReady(readiness)) {
-      throw new Error("Paired assistant is not ready");
+    // sends no bearer. A connection to this same paired gateway stays live
+    // while the probe is in flight (a re-prime must not open a window in
+    // which requests fall through to the platform and gateway-auth predicates
+    // read false) and is dropped only if the probe fails, so a failed prime
+    // never leaves the app believing it is connected. A slot pointing at some
+    // other assistant is left alone either way. It also clears credentials
+    // persisted by older clients that placed paired guardian tokens in the
+    // gateway-session cache.
+    try {
+      const response = await fetch(`${pairedUrl}/readyz`);
+      if (!response.ok) {
+        const message = await response.text();
+        throw new GuardianTokenError(
+          response.status,
+          message || `Paired gateway request failed: ${response.status}`,
+        );
+      }
+      const readiness: unknown = await response.json().catch(() => null);
+      if (!isReadyzResponseReady(readiness)) {
+        throw new Error("Paired assistant is not ready");
+      }
+    } catch (error) {
+      if (getSelfHostedIngressUrl() === ingressUrl) {
+        setSelfHostedConnection(null);
+      }
+      throw error;
     }
     clearGatewayToken();
     setSelfHostedConnection({
@@ -871,7 +960,9 @@ export async function primeLocalGatewayConnection(
   const guardianToken = assistant
     ? await fetchGuardianTokenHost(assistant.assistantId)
     : undefined;
-  await ensureGatewayToken(tokenUrl, guardianToken);
+  await ensureGatewayToken(tokenUrl, guardianToken, {
+    forceMint: options.forceMint,
+  });
   const ingressUrl = getAuthGatewayIngressUrl(assistant);
   if (!ingressUrl) {
     return;
@@ -933,14 +1024,17 @@ function isGatewayStillStarting(error: unknown): boolean {
 /**
  * A `wake`-restarted gateway that hasn't finished coming back up: it refuses
  * connections (a thrown transport error), answers `503`/`5xx`, or rejects the
- * mint with a repairable `401` while it re-provisions its guardian binding. A
- * `403` loopback-boundary refusal is terminal, and a missing/expired guardian
- * token or an unresolved gateway won't heal by waiting (the just-run `wake`
- * already re-seeded the token and recorded the port), so those fall through.
+ * mint with a repairable `401` while it re-provisions its guardian binding.
+ * A guardian refresh `5xx` is the same window: the host shells out to
+ * `vellum gateway token refresh`, which cannot reach a gateway that is still
+ * binding its port. A `403` loopback-boundary refusal is terminal, and a
+ * missing (`404`) or rejected (`401`) guardian token will not heal by
+ * waiting (the just-run `wake` already re-seeded the token and recorded the
+ * port), so those fall through.
  */
 function isGatewayRestartTransient(error: unknown): boolean {
   if (error instanceof GuardianTokenError) {
-    return false;
+    return error.status >= 500;
   }
   if (error instanceof UnresolvedLocalGatewayError) {
     return false;
@@ -965,11 +1059,12 @@ function isGatewayRestartTransient(error: unknown): boolean {
 async function primeLocalGatewayWithStartupRideout(
   target: LockfileAssistant | undefined,
   shouldRideOut: (error: unknown) => boolean,
+  options: PrimeLocalGatewayConnectionOptions = {},
 ): Promise<void> {
   const { attempts, intervalMs } = LOCAL_GATEWAY_STARTUP_RETRY;
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
-      await primeLocalGatewayConnection(target);
+      await primeLocalGatewayConnection(target, options);
       return;
     } catch (error) {
       if (attempt >= attempts || !shouldRideOut(error)) {
@@ -999,20 +1094,27 @@ export async function primeLocalGatewayConnectionWithStartupRetry(
  * Prime the local gateway connection, transparently repairing the assistant in
  * place when the first attempt fails for a repairable reason.
  *
- * This mirrors the native client's bootstrap, which re-pairs a stopped,
- * expired, or mis-seeded local assistant before the failure ever reaches the
- * user: on a repairable failure it runs `wake` (re-seeds the guardian token
- * and restarts the daemon + gateway, leaving the assistant's data and identity
- * untouched), then primes the connection once more. A non-repairable failure,
- * a wake that itself fails, or a still-failing retry propagate the original
- * error so the existing connect-error UI surfaces it unchanged.
+ * This mirrors the native client's bootstrap, which revives a stopped or
+ * unresolved local assistant before the failure ever reaches the user: on a
+ * repairable failure it runs a plain `wake` (restarts the daemon + gateway,
+ * leaving the assistant's data and identity untouched), then primes the
+ * connection once more. A non-repairable failure, a wake that itself fails, or
+ * a still-failing retry propagate the original error so the existing
+ * connect-error UI surfaces it unchanged.
+ *
+ * A plain wake cannot re-lease a guardian token the gateway rejects at the
+ * `/auth/token` mint, so a `401` that survives the retry propagates as a
+ * {@link GatewayTokenError} for callers to route to the guardian re-provision
+ * (`wakeLocalAssistantHost` with `repairGuardian`), the one repair that clears
+ * it and the one this path must never run on its own.
  */
 export async function primeLocalGatewayConnectionWithRepair(
   target?: LockfileAssistant,
+  options: PrimeLocalGatewayConnectionOptions = {},
 ): Promise<void> {
   const assistant = target ?? getSelectedAssistant();
   try {
-    await primeLocalGatewayConnection(assistant);
+    await primeLocalGatewayConnection(assistant, options);
     return;
   } catch (error) {
     // Wake operates only on plain local assistants (see
@@ -1043,6 +1145,7 @@ export async function primeLocalGatewayConnectionWithRepair(
     await primeLocalGatewayWithStartupRideout(
       refreshed ?? assistant,
       isGatewayRestartTransient,
+      options,
     );
   }
 }

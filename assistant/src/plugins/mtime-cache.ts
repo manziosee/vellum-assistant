@@ -212,6 +212,23 @@ export function getDiscoveredUserPluginNames(): Iterable<string> {
   return discoveredPluginDirs.values();
 }
 
+/**
+ * True when this daemon process brought the plugin directory `dir` up:
+ * {@link bringUpPlugin} ran for it and its `init` was attempted. An `init` that
+ * threw still counts, because activation never aborts on init failure (see
+ * {@link activatePlugin}), and that is deliberate: an init-failed plugin's
+ * hooks and tools stay live, so its schedules must too. What membership
+ * excludes is a directory dropped in out-of-band that no boot scan and no
+ * reconcile pass has activated yet.
+ *
+ * The backing map is per-process, so a process that runs no plugin loader (the
+ * schedule worker, sidecar turn workers) reads `false` for every directory.
+ * Only code that provably runs in the main daemon may treat this as an answer.
+ */
+export function isPluginDirActivated(dir: string): boolean {
+  return discoveredPluginDirs.has(dir);
+}
+
 // ─── Source-versions reconcile ───────────────────────────────────────────────
 
 /**
@@ -273,6 +290,17 @@ export async function reconcilePluginSourcesNow(): Promise<void> {
       await reconcilePluginMcpServers();
     } catch (err) {
       log.error({ err }, "plugin MCP reconcile failed");
+    }
+    // Converge sidebar pins the same way: an uninstalled plugin's app stops
+    // existing, and its id is a stable path identity, so a pin left behind
+    // would return to the sidebar when the plugin does. Lazily imported and
+    // self-contained for the same reasons as the two reconciles above.
+    try {
+      const { reconcileAppPins } =
+        await import("../apps/app-pin-reconciler.js");
+      reconcileAppPins();
+    } catch (err) {
+      log.error({ err }, "app pin reconcile failed");
     }
   })().finally(() => {
     reconcileInFlight = null;
@@ -1054,7 +1082,7 @@ async function deactivatePlugin(
  * Called by `loadUserPlugins()` during daemon startup. After boot, the same
  * `activatePlugin`/`deactivatePlugin` reconciliation runs only through the
  * imperative poke ({@link reconcilePluginSourcesNow}) the install/uninstall/
- * enable/disable routes call, so plugin lifecycle stays confined to the main
+ * upgrade/enable routes call, so plugin lifecycle stays confined to the main
  * daemon — dispatch-time hook and tool reads never activate anything.
  */
 export async function populateCacheAtBoot(

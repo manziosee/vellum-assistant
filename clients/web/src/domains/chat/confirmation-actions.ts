@@ -6,12 +6,20 @@
  * tool-call confirmation prompts.
  */
 
+import { t } from "@/i18n";
 import { captureError } from "@/lib/sentry/capture-error";
 
 import type { DisplayMessage } from "@/domains/chat/types/types";
 import { useChatSessionStore } from "@/domains/chat/chat-session-store";
+import { offersRuleOption } from "@/domains/chat/confirmation-decisions";
 import { patchTranscriptMessages } from "@/domains/chat/transcript/patch-transcript-messages";
 import { useInteractionStore } from "@/domains/chat/interaction-store";
+import {
+  clearSubmissionFailure,
+  captureSubmissionRejection,
+  reportSubmissionFailure,
+  stillOwnsSubmission,
+} from "@/domains/chat/prompt-submission";
 import { useStreamStore } from "@/domains/chat/stream-store";
 import { useConversationStore } from "@/stores/conversation-store";
 import { useRuleEditorStore } from "@/domains/chat/rule-editor-store";
@@ -19,7 +27,6 @@ import type { RuleEditorContext } from "@/domains/chat/rule-editor-store";
 import { clearConfirmationByRequestId } from "@/domains/chat/utils/send-message-utils";
 import { deriveCommandText } from "@/domains/chat/utils/chat";
 import { toRiskLevel } from "@/domains/chat/utils/risk";
-import { isToolCallRunning } from "@/domains/chat/utils/tool-call-status";
 import { mapMessageToolCalls } from "@/domains/chat/utils/map-message-tool-calls";
 import { submitConfirmation } from "@/domains/chat/api/interactions";
 import { fireSuggestion } from "@/domains/chat/rule-editor-actions";
@@ -44,8 +51,10 @@ function cleanupAfterConfirmationDecision(
 ): void {
   const confirmationDecisionValue =
     decision === "allow" ? "approved" : "denied";
-  useInteractionStore.getState().dismissConfirmation();
-  useInteractionStore.getState().setInlineConfirmationToolCallId(null);
+  useInteractionStore
+    .getState()
+    .dismissConfirmationIfMatches(snapshot.requestId);
+  useInteractionStore.getState().releaseInlineAnchorIfMatches(mappedToolCallId);
   const convKey = useConversationStore.getState().activeConversationId;
   if (convKey) {
     useConversationStore.getState().removeAttentionConversationId(convKey);
@@ -66,27 +75,17 @@ function cleanupAfterConfirmationDecision(
   let nudgeTcId: string | null = null;
 
   patchTranscriptMessages((prev: DisplayMessage[]) => {
-    // Resolve stamp target: explicit mapping or heuristic fallback
-    let stampTargetId = mappedToolCallId;
-    if (!stampTargetId) {
-      for (let i = prev.length - 1; i >= 0; i--) {
-        const msg = prev[i];
-        if (msg?.role !== "assistant" || !msg.toolCalls?.length) {
-          continue;
-        }
-        const tc = msg.toolCalls.findLast(
-          (tc) => !isToolCallRunning(tc) && !tc.riskLevel,
-        );
-        if (tc) {
-          stampTargetId = tc.id;
-          break;
-        }
-      }
-    }
+    // The risk metadata describes a tool call, so it goes on the tool call the
+    // prompt named and nowhere else. A prompt that named none (an ACP route
+    // approval has no tool call of its own) has nothing to describe: stamping
+    // whichever call happens to be last would label an unrelated, already
+    // finished step with this decision's risk level, and point the
+    // unknown-risk nudge at it too.
+    const stampTargetId = mappedToolCallId;
 
-    // Compute nudge target from pre-stamp state (riskLevel not yet applied)
-    if (snapshot.riskLevel?.toLowerCase() === "unknown") {
-      nudgeTcId = stampTargetId ?? null;
+    // Computed from pre-stamp state, before `riskLevel` is applied.
+    if (stampTargetId && snapshot.riskLevel?.toLowerCase() === "unknown") {
+      nudgeTcId = stampTargetId;
     }
 
     let anyChanged = false;
@@ -113,7 +112,9 @@ function cleanupAfterConfirmationDecision(
   }
 
   useChatSessionStore.getState().deleteConfirmationToolCall(snapshot.requestId);
-  useInteractionStore.getState().submitConfirmationEnd();
+  useInteractionStore
+    .getState()
+    .releaseSubmission("confirmation", snapshot.requestId);
 }
 
 /**
@@ -132,9 +133,14 @@ function cleanupAfterConfirmationDecision(
  * stranded. No decision is stamped on the tool call — none was applied; the
  * transcript already reflects the tool call's own outcome.
  */
-function clearStaleConfirmation(snapshot: PendingConfirmationState): void {
-  useInteractionStore.getState().dismissConfirmation();
-  useInteractionStore.getState().setInlineConfirmationToolCallId(null);
+function clearStaleConfirmation(
+  snapshot: PendingConfirmationState,
+  mappedToolCallId: string | undefined,
+): void {
+  useInteractionStore
+    .getState()
+    .dismissConfirmationIfMatches(snapshot.requestId);
+  useInteractionStore.getState().releaseInlineAnchorIfMatches(mappedToolCallId);
   const convKey = useConversationStore.getState().activeConversationId;
   if (convKey) {
     useConversationStore.getState().removeAttentionConversationId(convKey);
@@ -143,8 +149,11 @@ function clearStaleConfirmation(snapshot: PendingConfirmationState): void {
     clearConfirmationByRequestId(prev, snapshot.requestId),
   );
   useChatSessionStore.getState().deleteConfirmationToolCall(snapshot.requestId);
-  useChatSessionStore.getState().setError(null);
-  useInteractionStore.getState().submitConfirmationEnd();
+  // Before the release below, which is what the clear's own door reads.
+  clearSubmissionFailure("confirmation", snapshot.requestId);
+  useInteractionStore
+    .getState()
+    .releaseSubmission("confirmation", snapshot.requestId);
 }
 
 // ---------------------------------------------------------------------------
@@ -159,24 +168,30 @@ export async function handleConfirmationSubmit(
   decision: ConfirmationDecision,
   toolCall?: ChatMessageToolCall,
 ): Promise<void> {
-  const { pendingConfirmation, isSubmittingConfirmation } =
+  const { pendingConfirmation, submittingByKind } =
     useInteractionStore.getState();
   const snapshot = toolCall?.pendingConfirmation ?? pendingConfirmation;
   if (!snapshot) {
     return;
   }
-  if (!toolCall && isSubmittingConfirmation) {
+  // Guards double-submitting this prompt, not any prompt; see
+  // `prompt-submission.ts` for why that is not "anything in flight".
+  if (submittingByKind.confirmation === snapshot.requestId) {
     return;
   }
-  useInteractionStore.getState().submitConfirmationStart();
+  useInteractionStore
+    .getState()
+    .claimSubmission("confirmation", snapshot.requestId);
   useChatSessionStore.getState().setError(null);
 
   const ctx = useStreamStore.getState().streamContext;
   if (!ctx) {
     useChatSessionStore
       .getState()
-      .setError({ message: "No active session. Please try again." });
-    useInteractionStore.getState().submitConfirmationEnd();
+      .setError({ message: t("chat:promptSubmission.noActiveSession") });
+    useInteractionStore
+      .getState()
+      .releaseSubmission("confirmation", snapshot.requestId);
     return;
   }
 
@@ -186,11 +201,11 @@ export async function handleConfirmationSubmit(
       .getState()
       .confirmationToolCallMap.get(snapshot.requestId);
 
-  // Auto-select first pattern/scope when persistent decisions are allowed
+  // Auto-select first pattern/scope when the request permits a durable rule.
+  // Same predicate the cards render from, so the hint cannot be sent for a
+  // request whose card withheld the option (or withheld for one that offered).
   const ruleHint =
-    decision === "allow" &&
-    snapshot.persistentDecisionsAllowed !== false &&
-    (snapshot.allowlistOptions?.length ?? 0) > 0
+    decision === "allow" && offersRuleOption(snapshot)
       ? {
           selectedPattern: snapshot.allowlistOptions![0]!.pattern,
           selectedScope:
@@ -212,20 +227,32 @@ export async function handleConfirmationSubmit(
       if (result.status === 404) {
         // Pending interaction already gone server-side — retire the stale
         // prompt instead of stranding the user on an un-actionable card.
-        clearStaleConfirmation(snapshot);
+        clearStaleConfirmation(snapshot, mappedToolCallId);
         return;
       }
-      useChatSessionStore.getState().setError({ message: result.error });
-      useInteractionStore.getState().submitConfirmationEnd();
+      captureSubmissionRejection("submit_confirmation", result);
+      reportSubmissionFailure(
+        "confirmation",
+        snapshot.requestId,
+        "confirmationActions.submitFailed",
+      );
+      useInteractionStore
+        .getState()
+        .releaseSubmission("confirmation", snapshot.requestId);
       return;
     }
     cleanupAfterConfirmationDecision(snapshot, mappedToolCallId, decision);
   } catch (err) {
+    // Always recorded; only shown while its own prompt is the one on screen.
     captureError(err, { context: "submit_confirmation" });
-    useChatSessionStore.getState().setError({
-      message: "Failed to submit confirmation. Please try again.",
-    });
-    useInteractionStore.getState().submitConfirmationEnd();
+    reportSubmissionFailure(
+      "confirmation",
+      snapshot.requestId,
+      "confirmationActions.submitFailed",
+    );
+    useInteractionStore
+      .getState()
+      .releaseSubmission("confirmation", snapshot.requestId);
   }
 }
 
@@ -237,24 +264,32 @@ export async function handleConfirmationSubmit(
 export async function handleAllowAndCreateRule(
   toolCall?: ChatMessageToolCall,
 ): Promise<void> {
-  const { pendingConfirmation, isSubmittingConfirmation } =
+  const { pendingConfirmation, submittingByKind } =
     useInteractionStore.getState();
   const snapshot = toolCall?.pendingConfirmation ?? pendingConfirmation;
   if (!snapshot) {
     return;
   }
-  if (!toolCall && isSubmittingConfirmation) {
+  // Guards double-submitting this prompt, not any prompt; see
+  // `prompt-submission.ts` for why that is not "anything in flight".
+  if (submittingByKind.confirmation === snapshot.requestId) {
     return;
   }
   const ctx = useStreamStore.getState().streamContext;
   if (!ctx) {
     useChatSessionStore
       .getState()
-      .setError({ message: "No active session. Please try again." });
+      .setError({ message: t("chat:promptSubmission.noActiveSession") });
     return;
   }
 
-  useInteractionStore.getState().submitConfirmationStart();
+  useInteractionStore
+    .getState()
+    .claimSubmission("confirmation", snapshot.requestId);
+  // Same entry clear as every other submit path: the prompt is on screen and
+  // the claim is synchronous, so a banner still up here is this prompt's own
+  // stale one.
+  useChatSessionStore.getState().setError(null);
 
   const mappedToolCallId =
     toolCall?.id ??
@@ -287,6 +322,10 @@ export async function handleAllowAndCreateRule(
     });
   };
 
+  // The rule editor is this user's own request and the transcript patch names
+  // its own requestId, so both stay outside every guard below: neither can
+  // touch a newer prompt, and withholding the editor would swallow the click.
+
   try {
     const result = await submitConfirmation(
       ctx.assistantId,
@@ -298,11 +337,22 @@ export async function handleAllowAndCreateRule(
       // A 404 means the pending interaction is already gone server-side; the
       // user can still create a rule, so retire the prompt quietly rather than
       // surfacing a blocking "No pending interaction" error they can't act on.
-      useChatSessionStore
+      if (result.status === 404) {
+        clearSubmissionFailure("confirmation", snapshot.requestId);
+      } else {
+        captureSubmissionRejection("allow_and_create_rule", result);
+        reportSubmissionFailure(
+          "confirmation",
+          snapshot.requestId,
+          "confirmationActions.submitFailedRuleAvailable",
+        );
+      }
+      useInteractionStore
         .getState()
-        .setError(result.status === 404 ? null : { message: result.error });
-      useInteractionStore.getState().submitConfirmationEnd();
-      useInteractionStore.getState().setInlineConfirmationToolCallId(null);
+        .releaseSubmission("confirmation", snapshot.requestId);
+      useInteractionStore
+        .getState()
+        .releaseInlineAnchorIfMatches(mappedToolCallId);
       patchTranscriptMessages((prev: DisplayMessage[]) =>
         clearConfirmationByRequestId(prev, snapshot.requestId),
       );
@@ -310,20 +360,27 @@ export async function handleAllowAndCreateRule(
       return;
     }
 
-    cleanupAfterConfirmationDecision(snapshot, mappedToolCallId, "allow");
+    if (stillOwnsSubmission("confirmation", snapshot.requestId)) {
+      cleanupAfterConfirmationDecision(snapshot, mappedToolCallId, "allow");
+    }
 
     openCreateEditor({ ...editorContext, requestId: "" });
   } catch (err) {
     captureError(err, { context: "allow_and_create_rule" });
-    useInteractionStore.getState().setInlineConfirmationToolCallId(null);
+    reportSubmissionFailure(
+      "confirmation",
+      snapshot.requestId,
+      "confirmationActions.submitFailedRuleAvailable",
+    );
+    useInteractionStore
+      .getState()
+      .releaseSubmission("confirmation", snapshot.requestId);
+    useInteractionStore
+      .getState()
+      .releaseInlineAnchorIfMatches(mappedToolCallId);
     patchTranscriptMessages((prev: DisplayMessage[]) =>
       clearConfirmationByRequestId(prev, snapshot.requestId),
     );
     openCreateEditor({ ...editorContext, requestId: "" });
-    useChatSessionStore.getState().setError({
-      message:
-        "Failed to submit confirmation, but you can still create a rule.",
-    });
-    useInteractionStore.getState().submitConfirmationEnd();
   }
 }

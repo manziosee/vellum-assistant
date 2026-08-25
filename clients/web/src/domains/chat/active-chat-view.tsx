@@ -1,3 +1,5 @@
+
+import { useTranslation } from "@/i18n";
 /**
  * ActiveChatView — chat orchestration, mounted only when the assistant is usable.
  *
@@ -34,6 +36,7 @@ import { useAssistantAvatar } from "@/hooks/use-assistant-avatar";
 import { useAssistantReachability } from "@/assistant/use-assistant-reachability";
 import { useDiskPressureMonitor } from "@/assistant/use-disk-pressure-monitor";
 import { getDiskPressureChatBlockReason } from "@/assistant/disk-pressure";
+import { useResourcePressureMonitor } from "@/assistant/use-resource-pressure-monitor";
 import { useActiveAssistantIsPlatformHosted } from "@/hooks/use-platform-gate";
 import { useComposerStore } from "@/domains/chat/composer-store";
 
@@ -43,13 +46,15 @@ import { useOnboardingOrchestrator } from "@/domains/chat/hooks/use-onboarding-o
 
 import { useConversationSecondaryActions } from "@/domains/chat/hooks/use-conversation-secondary-actions";
 import { useAssistantCapability } from "@/hooks/use-assistant-capability";
+import { useSupportsResourcePressureStatus } from "@/lib/backwards-compat/use-supports-resource-pressure-status";
 import { useSupportsSummarizeUpToHere } from "@/lib/backwards-compat/use-supports-summarize-up-to-here";
-import { useCanUseLlmInspector } from "@/domains/chat/inspector/access";
+import { useCanUseInternalThreadActions } from "@/lib/auth/internal-thread-actions";
 import { useSendMessage } from "@/domains/chat/hooks/use-send-message";
 import { useMessageLifecycle } from "@/domains/chat/hooks/use-message-lifecycle";
 import { useActiveAppPinSync } from "@/domains/chat/hooks/use-active-app-pin-sync";
 import { useAcpAutoContinue } from "@/domains/chat/hooks/use-acp-auto-continue";
 import { useDeepLinkConsumer } from "@/domains/chat/hooks/use-deep-link-consumer";
+import { useDeepLinkThreadSend } from "@/domains/chat/hooks/use-deep-link-thread-send";
 import { ACP_CONNECT_CONTINUE_PROMPT } from "@/domains/chat/utils/acp-connect";
 
 import { useChatDebugRegistration } from "@/domains/chat/hooks/use-chat-debug-registration";
@@ -84,7 +89,8 @@ import type { ChatMainPanelProps } from "@/domains/chat/components/chat-route-co
 // ---------------------------------------------------------------------------
 
 export function ActiveChatView() {
-  const showLlmInspector = useCanUseLlmInspector();
+  const { t } = useTranslation("chat");
+  const canUseInternalActions = useCanUseInternalThreadActions();
   const [searchParams, setSearchParams] = useSearchParams();
   const { conversationId: urlConversationId } = useParams<{
     conversationId?: string;
@@ -122,6 +128,7 @@ export function ActiveChatView() {
   // Pin-sync side-effect
   // -------------------------------------------------------------------------
   useActiveAppPinSync(
+    assistantId,
     useCallback((appId: string) => {
       const didClose = useViewerStore.getState().handleAppUnpinned(appId);
       if (didClose) {
@@ -180,6 +187,13 @@ export function ActiveChatView() {
     hasResolvedStatus: diskPressure.hasResolvedStatus,
     status: diskPressure.status,
   });
+  // Daemons below the gate's floor lack the status route; the gate keeps
+  // the poller from 404ing against them every tick and app resume.
+  const supportsResourcePressureStatus = useSupportsResourcePressureStatus();
+  const resourcePressure = useResourcePressureMonitor({
+    assistantId,
+    enabled: isPlatformHosted && supportsResourcePressureStatus,
+  });
 
   // -------------------------------------------------------------------------
   // Composer store — load drafts for the active assistant on mount / switch.
@@ -198,9 +212,6 @@ export function ActiveChatView() {
 
   // Keyboard focus: Electron host focus relay + typing auto-focus.
   useComposerKeyboard(inputRef);
-
-  // Inbound deep links: pre-fill composer with `deeplink.send` text.
-  useDeepLinkConsumer();
 
   // -------------------------------------------------------------------------
   // Derived state
@@ -238,6 +249,15 @@ export function ActiveChatView() {
     reachabilityReadyEpoch,
     onboardingDraftConversationIdRef,
   });
+
+  // Inbound deep links: pre-fill the composer with parked `deeplink.send` /
+  // `deeplink.sendToThread` / start-voice-prompt text. Registered AFTER
+  // useConversationLoader on purpose: its consume effect and the loader's
+  // switchToConversation effect can fire in the same commit (park + navigate
+  // happen in one bus callback), and effects run in registration order — were
+  // this hook first, handleConversationSwitch would read the just-set input
+  // and misfile the parked message as the *outgoing* conversation's draft.
+  useDeepLinkConsumer();
 
   // Persist the composer draft across reloads (debounced autosave + unload
   // flush) and restore it on cold load. Mounted after useConversationLoader
@@ -285,6 +305,18 @@ export function ActiveChatView() {
     startReconciliationLoop,
     cancelReconciliation,
     refreshConversations,
+  });
+
+  // A proven iOS "Send Message to Chat" intent parks a send request rather
+  // than a pre-fill; fulfil it here once the target thread is confirmed (or
+  // demote it to a pre-fill when the target is gone). Needs the loader's
+  // existence verdict and `sendMessage`, hence this placement.
+  useDeepLinkThreadSend({
+    assistantId,
+    isAssistantActive: assistantState.kind === "active",
+    activeConversationId,
+    conversationExistsOnServer,
+    sendMessage,
   });
 
   // Auto-send: URL ?prompt=, pre-chat reachability probe, onboarding message.
@@ -429,29 +461,43 @@ export function ActiveChatView() {
   // "Summarize up to here" confirm dialog. The hover action only records the
   // target message; the POST fires from the dialog's confirm button — a
   // misfired summarize mutates the assistant's live context with no undo, so
-  // it always goes through an explicit confirmation. Version-gated at the
-  // callback source: assistants below the endpoint's release get no
-  // `onSummarizeUpToHere`, so the hover button never renders and the dialog
-  // is unreachable.
+  // it always goes through an explicit confirmation. Gated at the callback
+  // source on both the endpoint version and the internal-thread-actions
+  // audience: without either, no `onSummarizeUpToHere` is provided, so the
+  // hover button never renders and the dialog is unreachable.
   const supportsSummarizeUpToHere = useSupportsSummarizeUpToHere();
   const [pendingSummarizeMessageId, setPendingSummarizeMessageId] = useState<
     string | null
   >(null);
   const [summarizePending, setSummarizePending] = useState(false);
+  // A pending target only counts while the viewer still qualifies, so a flag
+  // sync that revokes the gate mid-dialog closes it and takes its confirm
+  // button with it rather than leaving one summarize reachable. The derived
+  // value closes the dialog in the same render the gate drops; the effect
+  // below discards the target itself, so restoring the flag cannot resurrect
+  // a confirmation the viewer never re-opened.
+  const activeSummarizeMessageId = canUseInternalActions
+    ? pendingSummarizeMessageId
+    : null;
+  useEffect(() => {
+    if (!canUseInternalActions) {
+      setPendingSummarizeMessageId(null);
+    }
+  }, [canUseInternalActions]);
   const handleSummarizeUpToHere = useCallback((messageId: string) => {
     setPendingSummarizeMessageId(messageId);
   }, []);
   const handleConfirmSummarize = useCallback(() => {
-    if (!pendingSummarizeMessageId) {
+    if (!activeSummarizeMessageId) {
       return;
     }
     setSummarizePending(true);
     // Errors toast inside the handler; the dialog just closes.
-    void handleSummarizeUpToMessage(pendingSummarizeMessageId).finally(() => {
+    void handleSummarizeUpToMessage(activeSummarizeMessageId).finally(() => {
       setSummarizePending(false);
       setPendingSummarizeMessageId(null);
     });
-  }, [pendingSummarizeMessageId, handleSummarizeUpToMessage]);
+  }, [activeSummarizeMessageId, handleSummarizeUpToMessage]);
   const handleCancelSummarize = useCallback(() => {
     setPendingSummarizeMessageId(null);
   }, []);
@@ -493,7 +539,9 @@ export function ActiveChatView() {
   // -------------------------------------------------------------------------
   useChatHeaderRegistration({
     assetsRefreshKey,
-    handleForkConversationFromMenu,
+    handleForkConversationFromMenu: canUseInternalActions
+      ? handleForkConversationFromMenu
+      : undefined,
     handleOpenInNewWindow,
     handleInspectConversation,
     handleCopyConversation,
@@ -512,9 +560,9 @@ export function ActiveChatView() {
         <p className="text-[var(--text-secondary)]">
           {autoGreet.timedOut
             ? turnActive
-              ? "Your assistant is still working…"
-              : "Your assistant is taking longer than expected."
-            : "Starting your first conversation…"}
+              ? t("activeChatView.stillWorking")
+              : t("activeChatView.takingLonger")
+            : t("activeChatView.startingFirst")}
         </p>
         {autoGreet.timedOut && !turnActive && (
           <Button
@@ -522,7 +570,7 @@ export function ActiveChatView() {
             size="regular"
             onClick={handleAutoGreetRetry}
           >
-            Try again
+            {t("activeChatView.tryAgain")}
           </Button>
         )}
       </div>
@@ -543,20 +591,28 @@ export function ActiveChatView() {
     handleEditQueueTail,
 
     // Conversation secondary actions
-    handleForkConversation,
-    onSummarizeUpToHere: supportsSummarizeUpToHere
-      ? handleSummarizeUpToHere
+    handleForkConversation: canUseInternalActions
+      ? handleForkConversation
       : undefined,
+    onSummarizeUpToHere:
+      supportsSummarizeUpToHere && canUseInternalActions
+        ? handleSummarizeUpToHere
+        : undefined,
     onRetryLatestTurn: supportsRetryTurn
       ? handleRetryLatestTurnRequested
       : undefined,
-    handleInspectMessage: showLlmInspector ? handleInspectMessage : undefined,
+    handleInspectMessage: canUseInternalActions
+      ? handleInspectMessage
+      : undefined,
 
     // History pagination
     historyPagination: historyResult.pagination,
 
     // Disk pressure (single instance — avoids duplicate polling/subscriptions)
     diskPressure,
+
+    // Resource pressure (single instance, same reasoning as disk pressure)
+    resourcePressure,
 
     // Upward signals
     setRefreshEpoch,
@@ -588,19 +644,19 @@ export function ActiveChatView() {
         </LazyBoundary>
       ) : null}
       <ConfirmDialog
-        open={pendingSummarizeMessageId !== null}
-        title="Summarize up to here?"
-        message="The assistant will summarize the conversation before this point and carry only the summary in its working memory going forward. Messages stay visible and are never deleted."
-        confirmLabel="Summarize"
+        open={activeSummarizeMessageId !== null}
+        title={t("activeChatView.summarizeTitle")}
+        message={t("activeChatView.summarizeMessage")}
+        confirmLabel={t("activeChatView.summarizeConfirm")}
         isPending={summarizePending}
         onConfirm={handleConfirmSummarize}
         onCancel={handleCancelSummarize}
       />
       <ConfirmDialog
         open={retryConfirmOpen}
-        title="Retry this response?"
-        message="The latest response will be discarded and regenerated. This can't be undone."
-        confirmLabel="Retry"
+        title={t("activeChatView.retryTitle")}
+        message={t("activeChatView.retryMessage")}
+        confirmLabel={t("activeChatView.retryConfirm")}
         isPending={retryPending}
         onConfirm={handleConfirmRetry}
         onCancel={handleCancelRetry}

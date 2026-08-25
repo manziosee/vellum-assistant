@@ -1,3 +1,8 @@
+import type {
+  ChannelConversationType,
+  RiskAllowlistOption,
+  RiskDirectoryScopeOption,
+} from "@vellumai/gateway-client";
 import { z } from "zod";
 
 import type { AnsweredQuestion } from "../api/events/question-answered.js";
@@ -124,13 +129,9 @@ export interface ToolExecutionResult {
    * wildcards) — what the gateway actually matches against. Mirrors
    * the `allowlistOptions` field on `ConfirmationRequest` SSE events.
    */
-  riskAllowlistOptions?: Array<{
-    label: string;
-    description: string;
-    pattern: string;
-  }>;
+  riskAllowlistOptions?: RiskAllowlistOption[];
   /** Directory scope ladder for the rule editor (narrowest to broadest). */
-  riskDirectoryScopeOptions?: Array<{ scope: string; label: string }>;
+  riskDirectoryScopeOptions?: RiskDirectoryScopeOption[];
   /** Structured activity metadata for client rendering (web search, web fetch, etc).
    *  Populated by daemon-internal tools; plugins must not set this. */
   activityMetadata?: ToolActivityMetadata;
@@ -377,7 +378,7 @@ export interface ToolContext {
    * resolution; undefined when the chat type is unknown or ambiguous.
    * @legacy
    */
-  channelConversationType?: "dm" | "private" | "public";
+  channelConversationType?: ChannelConversationType;
   /**
    * External channel/conversation ID of the current chat (the binding's
    * external chat id — Slack channel, Telegram chat, …). Keys the channel

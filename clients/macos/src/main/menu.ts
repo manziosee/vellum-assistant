@@ -1,8 +1,14 @@
 import { Menu, type MenuItemConstructorOptions, app, shell } from "electron";
 import { z } from "zod";
 
+import {
+  onSettingChange,
+  readSetting,
+} from "@vellumai/electron-desktop/settings";
+import { readOnboardingActive } from "@vellumai/electron-desktop/window-state";
+
 import { openAboutWindow } from "./about.client";
-import { checkForUpdates } from "./auto-update";
+import { checkForUpdates } from "./auto-update.client";
 import {
   isCliPathFlowInFlight,
   runInstallCliCommandFlow,
@@ -21,12 +27,10 @@ import {
   closeCommandPaletteWindow,
   isCommandPaletteWindowFocused,
   openCommandPaletteWindow,
-} from "./command-palette-window";
+} from "./command-palette.client";
 import { areChromeDevToolsEnabled } from "./devtools";
 import { handle } from "./ipc";
 import { dispatchToMain } from "./main-window";
-import { onSettingChange, readSetting } from "./settings";
-import { readOnboardingActive } from "./window-state";
 
 interface MenuState {
   hasPlatformSession: boolean;
@@ -189,6 +193,7 @@ const buildTemplate = (): MenuItemConstructorOptions[] => {
         fileItem("New Conversation", { kind: "newConversation" }),
         fileItem("Current Conversation", { kind: "currentConversation" }),
         { type: "separator" },
+        fileItem("Pin Current Conversation", { kind: "togglePinConversation" }),
         fileItem("Mark Current as Unread", { kind: "markCurrentUnread" }),
         { type: "separator" },
         fileItem("Previous Conversation", { kind: "previousConversation" }),
@@ -230,7 +235,10 @@ const buildTemplate = (): MenuItemConstructorOptions[] => {
         { role: "zoomIn" },
         { role: "zoomOut" },
         { type: "separator" },
-        { role: "togglefullscreen" },
+        {
+          role: "togglefullscreen",
+          accelerator: "Control+Command+F",
+        },
       ],
     },
     {

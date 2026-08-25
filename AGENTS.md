@@ -4,7 +4,7 @@
 
 Bun + TypeScript monorepo with multiple packages:
 
-- `clients/`: End-user app surfaces: `clients/web/` (Vite + React Router v7 SPA), `clients/ios/` (Capacitor iOS shell that loads the web app in a WKWebView), `clients/android/` (Capacitor Android shell that loads the web app in a WebView), `clients/macos/` (Electron desktop shell that wraps `clients/web/`; daemon/gateway lifecycle is owned by the `vellum` CLI, which the app invokes as a subprocess; auto-update via `electron-updater`; CI workflows are `pr-macos.yaml` / `ci-main-macos.yaml`), `clients/windows/` (bootstrap Electron shell around `clients/web/`; CI workflows are `pr-windows.yaml` / `ci-main-windows.yaml`), and `clients/chrome-extension/` (MV3 Chrome browser extension). See [`clients/README.md`](clients/README.md) and [`clients/AGENTS.md`](clients/AGENTS.md).
+- `clients/`: End-user app surfaces: `clients/web/` (Vite + React Router v7 SPA), `clients/ios/` (Capacitor iOS shell that loads the web app in a WKWebView), `clients/android/` (Capacitor Android shell that loads the web app in a WebView), `clients/macos/` (Electron desktop shell that wraps `clients/web/`; daemon/gateway lifecycle is owned by the `vellum` CLI, which the app invokes as a subprocess; auto-update via `electron-updater`; CI workflows are `pr-macos.yaml` / `ci-main-macos.yaml`), `clients/windows/` (Electron desktop shell around `clients/web/` at capability parity with macOS, see `clients/windows/docs/parity-matrix.md`; CI workflows are `pr-windows.yaml` / `ci-main-windows.yaml`), and `clients/chrome-extension/` (MV3 Chrome browser extension). See [`clients/README.md`](clients/README.md) and [`clients/AGENTS.md`](clients/AGENTS.md).
 - `assistant/` — Main backend service (Bun + TypeScript)
 - `cli/` — Multi-assistant management CLI (Bun + TypeScript). See `cli/AGENTS.md`.
 - `gateway/` — Channel ingress gateway (Bun + TypeScript)
@@ -349,7 +349,7 @@ The Electron renderer uses `@sentry/react` (not `@sentry/electron/renderer`): `@
 
 ## CLI ↔ Daemon Communication
 
-CLI commands that need to invoke daemon-side state (conversations, wake, in-memory lookups) call into the daemon over the Unix domain socket via `cliIpcCall()` from `assistant/src/ipc/cli-client.ts`. Add a route file in `assistant/src/ipc/routes/` and register it in `routes/index.ts` — `AssistantIpcServer` auto-registers from the index. File-based signals and the daemon HTTP port are deprecated for new CLI→daemon interactions.
+CLI commands that need to invoke daemon-side state (conversations, wake, in-memory lookups) call into the daemon over the Unix domain socket via `cliIpcCall()` from `assistant/src/ipc/cli-client.ts`. Add a route file in `assistant/src/ipc/routes/` that exports a `*_IPC_METHODS` map, and add that map to the list `AssistantIpcServer` iterates in `assistant/src/ipc/assistant-server.ts` (there is no index file; each map is imported by hand). File-based signals and the daemon HTTP port are deprecated for new CLI→daemon interactions.
 
 For routes shared between HTTP and IPC, and for the current wire-protocol details (length-prefixed binary framing with JSON envelopes, plus binary/chunked response shapes), see `assistant/CLAUDE.md` § Route architecture and § CLI ↔ daemon communication protocol.
 

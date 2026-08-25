@@ -37,6 +37,7 @@ export {
 } from "./environment";
 export {
   getLockfileData,
+  renameLockfileAssistantIfPresent,
   upsertLockfileAssistant,
   upsertRendererLockfileAssistant,
   replacePlatformAssistants,
@@ -44,6 +45,8 @@ export {
   isPairedLockfileEntry,
 } from "./lockfile";
 export type { LockfileResult, WriteResult } from "./lockfile";
+export { withLockfileLock } from "./lockfile-lock";
+export type { LockfileLockResult } from "./lockfile-lock";
 export { parseLockfile } from "./lockfile-contract";
 export type {
   Lockfile,
@@ -61,6 +64,12 @@ export { runSleep } from "./sleep";
 export type { SleepResult } from "./sleep";
 export { runWake } from "./wake";
 export type { WakeOptions, WakeResult } from "./wake";
+export { runDevicesList, runDevicesRevoke } from "./devices";
+export type {
+  DeviceRecord,
+  DevicesListResult,
+  DevicesRevokeResult,
+} from "./devices";
 export { runUpgrade, isValidReleaseVersion } from "./upgrade";
 export type { UpgradeOptions, UpgradeResult } from "./upgrade";
 export { getLocalAssistantStatus } from "./status";
@@ -72,8 +81,11 @@ export {
   getGuardianAccessToken,
   getPairedGuardianAccessToken,
   isConfidentialRefreshUrl,
+  formatGuardianRefreshCliFailure,
+  parseGuardianRefreshCliFailure,
   PAIRED_GUARDIAN_TOKEN_HOST_ONLY_ERROR,
   PAIRED_GUARDIAN_TARGET_MISMATCH_ERROR,
+  GUARDIAN_REFRESH_ERROR_PREFIX,
   saveGuardianToken,
 } from "./guardian-token";
 export type {

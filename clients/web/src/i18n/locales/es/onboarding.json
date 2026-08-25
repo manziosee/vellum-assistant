@@ -27,9 +27,10 @@
   "startScreen": {
     "createAssistant": "Crear tu asistente"
   },
-  "privacyScreen": {
+    "privacyScreen": {
     "title": "Antes de empezar",
-    "body": "Elige tus preferencias de privacidad. Puedes cambiarlas cuando quieras en los ajustes."
+    "body": "Elige tus preferencias de privacidad. Puedes cambiarlas cuando quieras en los ajustes.",
+    "skipToChat": "Ir al chat"
   },
   "hostingScreen": {
     "title": "Alojamiento",
@@ -60,7 +61,11 @@
     "unnamedAssistant": "el asistente",
     "connectingToAssistant": "Conectando con tu asistente…",
     "rowActionsAriaLabel": "Acciones de {name}",
-    "removeFromDevice": "Quitar de este dispositivo…"
+    "removeFromDevice": "Quitar de este dispositivo…",
+    "selfHosted": "Autoalojado",
+    "selfHostedWithHost": "Autoalojado · {host}",
+    "currentWithHost": "Actual · {host}",
+    "remoteWithHost": "Remoto · {host}"
   },
   "hatchingScreen": {
     "apiKeyFailed": "Tu clave de API no ha funcionado",

@@ -15,10 +15,10 @@ import { createElement, type ReactNode } from "react";
 
 import * as sdkGen from "@/generated/daemon/sdk.gen";
 import type { Conversation } from "@/types/conversation-types";
-import {
-  conversationsQueryKey,
-  unreadConversationCountQueryKey,
-} from "@/utils/conversation-list-fetchers";
+import type { ConversationListPage } from "@/utils/conversation-list-fetchers";
+import { unreadConversationCountQueryKey } from "@/utils/conversation-list-fetchers";
+import { conversationListQueryKey } from "@/utils/conversation-list-keys";
+import { listPage } from "@/utils/conversation-list.test-helper";
 
 const seenCalls: Array<{ conversationId: string }> = [];
 let seenImpl: () => Promise<unknown> = async () => ({
@@ -40,9 +40,8 @@ mock.module("@sentry/react", () => ({
   addBreadcrumb: () => {},
 }));
 
-const { useMarkSeenOnOpen } = await import(
-  "@/domains/chat/hooks/use-mark-seen-on-open"
-);
+const { useMarkSeenOnOpen } =
+  await import("@/domains/chat/hooks/use-mark-seen-on-open");
 
 const ASSISTANT_ID = "asst-1";
 
@@ -53,13 +52,17 @@ function unreadConversation(): Conversation {
   } as Conversation;
 }
 
-function setup(conversation: Conversation | undefined, unreadCount: number) {
+function setup(
+  conversation: Conversation | undefined,
+  unreadCount: number,
+  isTranscriptOnScreen = true,
+) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
   client.setQueryData(
-    conversationsQueryKey(ASSISTANT_ID),
-    conversation ? [conversation] : [],
+    conversationListQueryKey(ASSISTANT_ID),
+    listPage(conversation ? [conversation] : []),
   );
   client.setQueryData(
     unreadConversationCountQueryKey(ASSISTANT_ID),
@@ -73,6 +76,7 @@ function setup(conversation: Conversation | undefined, unreadCount: number) {
         assistantStateKind: "active",
         activeConversationId: conversation?.conversationId ?? null,
         activeConversation: conversation,
+        isTranscriptOnScreen,
       }),
     {
       wrapper: ({ children }: { children: ReactNode }) =>
@@ -91,8 +95,8 @@ function readCount(client: QueryClient): number | null | undefined {
 
 function readUnseen(client: QueryClient): boolean | undefined {
   return client
-    .getQueryData<Conversation[]>(conversationsQueryKey(ASSISTANT_ID))
-    ?.find((c) => c.conversationId === "conv-1")
+    .getQueryData<ConversationListPage>(conversationListQueryKey(ASSISTANT_ID))
+    ?.conversations.find((c) => c.conversationId === "conv-1")
     ?.hasUnseenLatestAssistantMessage;
 }
 
@@ -167,5 +171,24 @@ describe("useMarkSeenOnOpen", () => {
     });
     await new Promise((resolve) => setTimeout(resolve, 50));
     expect(seenCalls.length).toBe(1);
+  });
+});
+
+describe("useMarkSeenOnOpen only marks what the user can see", () => {
+  test("leaves the reply unread while the transcript is off screen", async () => {
+    const { client } = setup(unreadConversation(), 1, false);
+
+    await waitFor(() => {
+      expect(readUnseen(client)).toBe(true);
+    });
+    expect(seenCalls).toHaveLength(0);
+  });
+
+  test("marks it seen once the transcript is on screen", async () => {
+    setup(unreadConversation(), 1, true);
+
+    await waitFor(() => {
+      expect(seenCalls).toHaveLength(1);
+    });
   });
 });

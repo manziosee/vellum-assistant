@@ -1,6 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
 
-import { setDockBadge } from "@/runtime/dock";
+import { useTranslation, type TFunction } from "@/i18n";
+import {
+  getUnreadBadgeSurface,
+  setDockBadge,
+  supportsUnreadBadges,
+} from "@/runtime/dock";
+import { detectElectronHostOS } from "@/runtime/platform-detection";
 import {
   openSystemPermissionSettings,
   requestSystemPermission,
@@ -23,15 +29,12 @@ interface SystemPermissionRowMeta {
   id: SystemPermissionKind;
   type: "system";
   sourceKind: SystemPermissionKind;
-  label: string;
-  description: string;
+  availableOnWindows?: boolean;
 }
 
 interface LocalPermissionRowMeta {
   id: LocalPermissionRowId;
   type: "local";
-  label: string;
-  description: string;
 }
 
 interface PermissionRowViewModel {
@@ -48,41 +51,30 @@ const SYSTEM_PERMISSION_ROWS: SystemPermissionRowMeta[] = [
     id: "accessibility",
     type: "system",
     sourceKind: "accessibility",
-    label: "Accessibility",
-    description:
-      "Allows your assistant to click, type, and control apps on your behalf.",
   },
   {
     id: "screen",
     type: "system",
     sourceKind: "screen",
-    label: "Screen Recording",
-    description:
-      "Allows your assistant to capture screen context during computer-use tasks.",
+    availableOnWindows: true,
   },
   {
     id: "microphone",
     type: "system",
     sourceKind: "microphone",
-    label: "Microphone",
-    description:
-      "Allows your assistant to capture audio for voice input and recordings.",
+    availableOnWindows: true,
   },
   {
     id: "speechRecognition",
     type: "system",
     sourceKind: "speechRecognition",
-    label: "Speech Recognition",
-    description:
-      "Allows your assistant to transcribe your speech into text on-device.",
+    availableOnWindows: true,
   },
   {
     id: "notifications",
     type: "system",
     sourceKind: "notifications",
-    label: "Notifications",
-    description:
-      "Allows your assistant to send macOS alerts for approvals, messages, and task updates.",
+    availableOnWindows: true,
   },
 ];
 
@@ -90,11 +82,53 @@ const LOCAL_PERMISSION_ROWS: LocalPermissionRowMeta[] = [
   {
     id: "notificationBadges",
     type: "local",
-    label: "Notification Badges",
-    description:
-      "Allows your assistant to show unseen conversation counts on the Dock icon.",
   },
 ];
+
+type SystemPermissionRowId = (typeof SYSTEM_PERMISSION_ROWS)[number]["id"];
+
+function systemPermissionCopy(
+  id: SystemPermissionRowId,
+  t: TFunction,
+  isWindowsHost: boolean,
+): { label: string; description: string } {
+  switch (id) {
+    case "accessibility":
+      return {
+        label: t("systemPermissionsCard.accessibilityLabel"),
+        description: t("systemPermissionsCard.accessibilityDescription"),
+      };
+    case "screen":
+      return {
+        label: t("systemPermissionsCard.screenLabel"),
+        description: t("systemPermissionsCard.screenDescription"),
+      };
+    case "microphone":
+      return {
+        label: t("systemPermissionsCard.microphoneLabel"),
+        description: t("systemPermissionsCard.microphoneDescription"),
+      };
+    case "speechRecognition":
+      return {
+        label: t("systemPermissionsCard.speechRecognitionLabel"),
+        description: isWindowsHost
+          ? t("systemPermissionsCard.speechRecognitionWindowsDescription")
+          : t("systemPermissionsCard.speechRecognitionDescription"),
+      };
+    case "notifications":
+      return {
+        label: t("systemPermissionsCard.notificationsLabel"),
+        description: isWindowsHost
+          ? t("systemPermissionsCard.notificationsWindowsDescription")
+          : t("systemPermissionsCard.notificationsDescription"),
+      };
+    default: {
+      // Rows only use the kinds above; other SystemPermissionKind values
+      // (inputMonitoring, automation) are not shown in this card.
+      throw new Error(`Unsupported system permission row: ${id}`);
+    }
+  }
+}
 
 function usePendingKind() {
   const [pendingKind, setPendingKind] = useState<PermissionRowId | null>(null);
@@ -194,11 +228,21 @@ export function SystemPermissionsCard({
 }: {
   compact?: boolean;
 }) {
+  const { t } = useTranslation();
   const { state, loading, error, supported, refresh } =
     useSystemPermissionsState();
   const { pendingKind, run } = usePendingKind();
   const [notificationBadgesEnabled, setNotificationBadgesEnabled] =
     useNotificationBadgesEnabled();
+
+  const isWindowsHost = detectElectronHostOS() === "windows";
+  const visibleSystemRows = useMemo(
+    () =>
+      SYSTEM_PERMISSION_ROWS.filter(
+        (meta) => !isWindowsHost || meta.availableOnWindows,
+      ),
+    [isWindowsHost],
+  );
 
   const systemRowsById = useMemo(() => {
     const rows = new Map<
@@ -209,45 +253,66 @@ export function SystemPermissionsCard({
       return rows;
     }
 
-    for (const meta of SYSTEM_PERMISSION_ROWS) {
+    for (const meta of visibleSystemRows) {
       const item = state[meta.sourceKind];
-      if (item) {
+      if (item && item.status !== "not-applicable") {
         rows.set(meta.id, { meta, item });
       }
     }
 
     return rows;
-  }, [state]);
+  }, [state, visibleSystemRows]);
 
   const rows = useMemo<PermissionRowViewModel[]>(() => {
-    const systemRows = SYSTEM_PERMISSION_ROWS.map((meta) => {
-      const item = systemRowsById.get(meta.id)?.item;
-      if (!item) {
-        return null;
-      }
+    const systemRows = visibleSystemRows
+      .map((meta) => {
+        const item = systemRowsById.get(meta.id)?.item;
+        if (!item) {
+          return null;
+        }
 
-      return {
-        id: meta.id,
-        label: meta.label,
-        description: meta.description,
-        checked: item.status === "granted",
-        disabled: pendingKind === meta.id || item.status === "restricted",
-        ...(item.error ? { error: item.error } : {}),
-      };
-    }).filter(Boolean) as PermissionRowViewModel[];
+        const copy = systemPermissionCopy(meta.id, t, isWindowsHost);
 
-    const localRows = LOCAL_PERMISSION_ROWS.map((meta) => ({
-      id: meta.id,
-      label: meta.label,
-      description: meta.description,
-      checked: notificationBadgesEnabled,
-      disabled: pendingKind === meta.id,
-    }));
+        return {
+          id: meta.id,
+          label: copy.label,
+          description: copy.description,
+          checked: item.status === "granted",
+          disabled: pendingKind === meta.id || item.status === "restricted",
+          ...(item.error ? { error: item.error } : {}),
+        };
+      })
+      .filter(Boolean) as PermissionRowViewModel[];
+
+    const badgeSurface =
+      getUnreadBadgeSurface() === "taskbar icon"
+        ? t("systemPermissionsCard.taskbarIcon")
+        : t("systemPermissionsCard.dockIcon");
+
+    const localRows = supportsUnreadBadges()
+      ? LOCAL_PERMISSION_ROWS.map((meta) => ({
+          id: meta.id,
+          label: t("systemPermissionsCard.notificationBadgesLabel"),
+          description: t(
+            "systemPermissionsCard.notificationBadgesDescription",
+            { surface: badgeSurface },
+          ),
+          checked: notificationBadgesEnabled,
+          disabled: pendingKind === meta.id,
+        }))
+      : [];
 
     return [...systemRows, ...localRows];
-  }, [notificationBadgesEnabled, pendingKind, systemRowsById]);
+  }, [
+    isWindowsHost,
+    notificationBadgesEnabled,
+    pendingKind,
+    systemRowsById,
+    t,
+    visibleSystemRows,
+  ]);
 
-  if (!supported) {
+  if (!supported && rows.length === 0) {
     return null;
   }
 
@@ -284,12 +349,12 @@ export function SystemPermissionsCard({
   return (
     <section className="w-full rounded-[20px] border border-[var(--border-hover)] bg-[var(--surface-lift)] px-4 pb-3 pt-5">
       <h2 className="text-[18px] font-semibold leading-[22px] text-[var(--content-emphasised)]">
-        System Permissions
+        {t("systemPermissionsCard.title")}
       </h2>
       {loading && rows.length === 0 ? (
         <div className="mt-6 flex items-center gap-2 text-body-medium-lighter text-[var(--content-tertiary)]">
           <LoadingSpinner />
-          Checking permissions...
+          {t("systemPermissionsCard.checking")}
         </div>
       ) : (
         <div className="mt-3 space-y-2">

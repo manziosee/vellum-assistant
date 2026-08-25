@@ -25,6 +25,7 @@
  */
 
 import type { AssistantEventEnvelope } from "@vellumai/assistant-api";
+import type { CommandUrlProvenance } from "@/runtime/native-deep-link";
 
 /**
  * Source of a synthetic `"app.resume"` event.
@@ -32,10 +33,10 @@ import type { AssistantEventEnvelope } from "@vellumai/assistant-api";
  * `"visibility"`: `document.visibilitychange` fired with
  * `visibilityState === "visible"` on a web client.
  * `"app_state"`: Capacitor `App.appStateChange` fired with `isActive`
- * in the iOS native shell. Web + Capacitor consumers must dedup
- * `"visibility"` and `"app_state"` themselves when both arrive in
- * close succession (the bus does not — its purpose is to deliver
- * every signal it sees).
+ * in the iOS native shell. Both describe the same physical edge on iOS,
+ * where they fire milliseconds apart, so
+ * `runtime/event-sources/lifecycle-edge.ts` publishes the pair once and
+ * consumers see either label depending on which source arrived first.
  * `"online"`: `window.online` fired after `navigator.onLine` flipped
  * back to true; surfaced as a resume so consumers that just want
  * "we're probably stale, refresh" can subscribe to a single channel.
@@ -153,6 +154,27 @@ export interface BusEventMap {
   "deeplink.send": { message: string };
   "deeplink.openThread": { threadId: string };
   /**
+   * Open a conversation with a message staged in its composer:
+   * `<scheme>://thread/<id>?message=…`, produced by the iOS
+   * `SendMessageToChatIntent` (the "Send Message to Chat" Shortcuts
+   * action). Split from `deeplink.openThread` because the consumer does
+   * more than navigate. With `provenance: "intent"` it parks a
+   * send-on-arrival request that the chat domain fulfils once the target
+   * thread is confirmed to exist; otherwise it parks `message` as a
+   * composer pre-fill and requests focus, so the user lands one tap from
+   * sent (a custom-scheme link with no proven origin carries no caller
+   * identity; see `useGlobalDeepLinkConsumer`). `message` is
+   * bounded and sanitized by `parseOpenThreadDeepLink`; a thread link
+   * whose message fails sanitization publishes plain `deeplink.openThread`
+   * instead.
+   */
+  "deeplink.sendToThread": {
+    threadId: string;
+    message: string;
+    /** As on `deeplink.startVoice`: proven intent origin, or `null`. */
+    provenance: CommandUrlProvenance;
+  };
+  /**
    * Stripe Checkout finished for a checkout a native shell started
    * (the Electron shell's system browser or Capacitor iOS's in-app
    * SFSafariViewController). The platform bounces the browser to
@@ -186,7 +208,37 @@ export interface BusEventMap {
    * untrusted: it pre-fills the composer and is never auto-sent, and no
    * voice session starts for it (see `useGlobalDeepLinkConsumer`).
    */
-  "deeplink.startVoice": { mode: "new" | "resume"; prompt: string | null };
+  "deeplink.startVoice": {
+    mode: "new" | "resume";
+    prompt: string | null;
+    /**
+     * `"intent"` when the iOS shell proved an App Intent produced the URL
+     * (`CommandURLProvenance.swift`); `null` for any other origin. A
+     * proven prompt may be sent on the user's behalf; an unproven one is
+     * only staged. See `CommandUrlProvenance` in `native-deep-link.ts`.
+     */
+    provenance: CommandUrlProvenance;
+  };
+  /**
+   * A Home Screen widget's camera button was tapped: `<scheme>://camera`.
+   * `useGlobalDeepLinkConsumer` navigates to the assistant and parks the
+   * request, which the composer's attachment layer drains when it mounts
+   * (the composer does not exist yet on a cold launch, and never exists on
+   * settings / logs / account routes).
+   */
+  "deeplink.openCamera": {
+    /** As on `deeplink.startVoice`; no consumer gates on it today. */
+    provenance: CommandUrlProvenance;
+  };
+  /**
+   * A Home Screen widget's New Chat button was tapped:
+   * `<scheme>://new-chat`. `useGlobalDeepLinkConsumer` navigates to a fresh
+   * draft conversation through `navigateToNewConversation`.
+   */
+  "deeplink.newChat": {
+    /** As on `deeplink.startVoice`; no consumer gates on it today. */
+    provenance: CommandUrlProvenance;
+  };
   /**
    * Electron host only: inbound `<scheme>://connect` URL from the pair
    * page's "Open in the Vellum app" button or a `vellum pair --qr --app`
@@ -210,6 +262,34 @@ export interface BusEventMap {
   "connectivity.state": {
     state: "online" | "device-offline" | "backend-unreachable";
   };
+  /**
+   * A daemon SDK request came back with a gateway-class status (502/503/504):
+   * it reached the platform but could not reach the assistant's runtime, which
+   * is restarting or not yet ready. Published by `daemonUnreachableInterceptor`
+   * so the connecting overlay appears even when the failure lands on an
+   * incidental request (a page load, a background refetch) rather than on the
+   * SSE stream. The lifecycle service subscribes and kicks its retry probe.
+   *
+   * Distinct from `connectivity.state`, which is the Electron host's fused
+   * view of device and backend health and never fires off Electron. This one
+   * is derived from a response the client actually received, so it reports on
+   * every platform.
+   */
+  "assistant.unreachable": Record<string, never>;
+  /**
+   * The local gateway rejects the guardian token behind this session, past
+   * what the renderer can repair on its own: the `/auth/token` mint still
+   * answers 401 after the wake `primeLocalGatewayConnectionWithRepair` ran,
+   * and a plain wake never re-leases a guardian token. Only a guardian
+   * re-provision clears it, and that revokes the assistant's other
+   * device-bound tokens, so no automatic path may run it.
+   *
+   * Published by `localGatewayAuthRecoveryInterceptor`, which has no route
+   * to the user, once it has given up. `useGuardianRepairRoute` sends the
+   * session to the assistant chooser, whose connect path owns the
+   * re-provision.
+   */
+  "gateway.guardian-repair-required": Record<string, never>;
 }
 
 export type BusEventName = keyof BusEventMap;

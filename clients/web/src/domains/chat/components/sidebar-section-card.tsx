@@ -35,6 +35,7 @@ import { useLayoutEffect, useRef, type ComponentProps } from "react";
 import { Card } from "@vellumai/design-library";
 import { cn } from "@vellumai/design-library/utils/cn";
 
+import { useConversationListContext } from "@/domains/chat/components/conversation-list-context";
 import { ConversationNavSection } from "@/domains/chat/components/conversation-nav-section";
 
 export type SidebarSectionCardProps = ComponentProps<
@@ -50,6 +51,7 @@ export function SidebarSectionCard({
   ...section
 }: SidebarSectionCardProps) {
   const cardRef = useRef<HTMLDivElement>(null);
+  const { overlayCards } = useConversationListContext();
 
   /* `width` toggling between the sizing keywords `fit-content` and a
      percentage doesn't animate smoothly on its own - measured directly,
@@ -104,11 +106,17 @@ export function SidebarSectionCard({
       bordered={false}
       noPadding
       className={cn(
-        /* No padding of its own: the header row is already a self-contained
-           pill (its own height, its own 12px/6px inset) per Figma, and
-           wrapping it in another layer of padding would inflate the pill
-           past its spec. The row list picks up the matching horizontal
-           inset directly (see `CollapsibleNavSection.Section`'s Content). */
+        /* A swipeable row inside this card paints an opaque layer of its own
+           so its actions stay hidden until swiped, so the card names the
+           surface that layer has to match. Declared here rather than on the
+           row: the card is what owns the fill, and every swipeable thing it
+           holds inherits the one value. */
+        "[--swipe-reveal-bg:var(--surface-lift)]",
+        /* No padding of its own: the overlay class branch below owns the
+           card's inset, and wrapping it in another layer of Card padding
+           would inflate the pill past its spec. The row list picks up the
+           matching horizontal inset directly (see
+           `CollapsibleNavSection.Section`'s Content). */
         /* Collapsed, a section is a pill that hugs its own header: nothing
            inside it needs the full rail width. Its own `Collapsible.Item`
            descendant carries Radix's `data-state`, so `has-[]` reads that
@@ -122,7 +130,18 @@ export function SidebarSectionCard({
            `rounded-full` and a smaller radius. Same value means nothing
            needs to transition or interpolate for it at all: it can never
            lag behind the width/height change since it never moves. */
-        "w-[var(--section-collapsed-width,fit-content)] rounded-[18px]",
+        "w-[var(--section-collapsed-width,fit-content)]",
+        /* The overlay's card is squarer than the rail's pill and carries the
+           inset its header and row list sit flush inside (Figma 7842-83305).
+           The 12px vertical inset plus the 20px header row makes the
+           collapsed pill exactly the overlay tile size (44px), so it stands
+           level with the assistant pill above it. `border-0` drops the
+           Card's default transparent 1px border, which would otherwise grow
+           the border-box to 46px. The rail keeps that border and the radius
+           that makes its header read as fully round. */
+        overlayCards
+          ? "rounded-[16px] border-0 pt-3 pr-3 pb-3 pl-2"
+          : "rounded-[18px]",
         "has-[[data-state=open]]:w-full",
         /* `width` toggles between the measured `--section-collapsed-width`
            (a real length - see the `ResizeObserver` above) and a percentage,

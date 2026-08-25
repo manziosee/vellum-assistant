@@ -1,7 +1,10 @@
 import { DocumentViewerContainer } from "@/domains/chat/components/document-viewer-container";
 import { FilePreviewContainer } from "@/domains/chat/components/local-file/preview/file-preview-container";
 import { useMobileOverlayViewportStyle } from "@/hooks/use-mobile-overlay-viewport-style";
-import type { OpenedDocumentState } from "@/stores/viewer-store";
+import {
+  useViewerStore,
+  type OpenedDocumentState,
+} from "@/stores/viewer-store";
 
 interface MobileDocumentOverlayProps {
   /** When `null`, the overlay renders nothing. */
@@ -16,8 +19,7 @@ interface MobileDocumentOverlayProps {
 
 /**
  * Mobile-only full-screen overlay that hosts the document viewer for a surface
- * referenced from chat, or the read-only preview for a workspace file the
- * editor cannot round-trip.
+ * referenced from chat, or the read-only preview for a workspace file.
  *
  * **Mounting constraint**: must render inside `RootLayout`'s
  * `#viewport-overlays` portal, outside the main content wrapper.
@@ -65,7 +67,11 @@ export function MobileDocumentOverlay({
         assistantId={assistantId}
         surfaceId={openedDocumentState.surfaceId}
         conversationId={openedDocumentState.conversationId}
-        workspacePath={openedDocumentState.workspacePath}
+        onRenamed={(documentName) =>
+          useViewerStore
+            .getState()
+            .renameOpenedDocument(openedDocumentState.surfaceId, documentName)
+        }
         onSubmitFeedback={onSubmitFeedback}
       />
     </div>

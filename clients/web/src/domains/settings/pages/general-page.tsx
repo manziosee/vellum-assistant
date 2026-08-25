@@ -38,7 +38,7 @@ import {
 } from "@/hooks/use-platform-gate";
 import { remoteGatewayPublicBaseUrl } from "@/lib/auth/remote-gateway-session";
 import {
-  getRemoteGatewayAssistantName,
+  getRemoteAssistantDisplayName,
   getRemoteGatewayHubUrl,
   getSelectedAssistant,
   isLocalAssistant,
@@ -46,16 +46,15 @@ import {
   isRemoteGatewayMode,
 } from "@/lib/local-mode";
 import { isElectron } from "@/runtime/is-electron";
-import {
-  useIsNativeAndroid,
-  useIsNativeMobile,
-} from "@/runtime/platform-detection";
+import { useIsNativeMobile } from "@/runtime/platform-detection";
 import { useAssistantFeatureFlagStore } from "@/stores/assistant-feature-flag-store";
 import { useIsAuthenticated } from "@/stores/auth-store";
 import { useClientFeatureFlagStore } from "@/stores/client-feature-flag-store";
+import { useTranslation } from "@/i18n";
 import { routes } from "@/utils/routes";
 
 export function GeneralPage() {
+  const { t } = useTranslation("settings");
   const {
     assistant,
     healthz,
@@ -66,33 +65,26 @@ export function GeneralPage() {
   } = useAssistantWithHealthz();
   const multiPlatformAssistant =
     useClientFeatureFlagStore.use.multiPlatformAssistant();
-  const assistantSwitcher = useClientFeatureFlagStore.use.assistantSwitcher();
   const teleportEnabled = useClientFeatureFlagStore.use.teleport();
   const accountMfaEnabled = useClientFeatureFlagStore.use.accountMfa();
   const settingsSleepPolicy =
     useAssistantFeatureFlagStore.use.settingsSleepPolicy();
   const isAuthenticated = useIsAuthenticated();
   const isNativeMobile = useIsNativeMobile();
-  // The assistant-switcher flag gates every chooser surface; the card
-  // supersedes the in-page picker so the two never render together. On
-  // remote-gateway origins and native shells the client flag store settles to
-  // registry defaults (no LD fetch), so the registry default / env /
-  // localStorage override governs there, not per-user LD targeting.
+  // The card supersedes the in-page picker so the two never render together.
   //
   // Deliberately wider than `useGatedSelectedAssistantId` in
   // `assistant/selection.ts`: that gate closes under `isGatewayAuthMode()`,
   // which is exactly where this card hands off to the hub chooser.
   const showAssistantSwitcherCard =
-    assistantSwitcher &&
-    (isLocalClient() ||
-      isAuthenticated ||
-      isRemoteGatewayMode() ||
-      isNativeMobile);
+    isLocalClient() ||
+    isAuthenticated ||
+    isRemoteGatewayMode() ||
+    isNativeMobile;
   const navigate = useNavigate();
   const platformGate = usePlatformGate();
   const infraGate = usePlatformGate({ platformHostedOnly: true });
   const isPlatformHosted = useActiveAssistantIsPlatformHosted();
-  const isNativeAndroid = useIsNativeAndroid();
   const diskPressure = useDiskPressureMonitor({
     assistantId: assistant?.id ?? null,
     enabled: infraGate === "full" && isPlatformHosted,
@@ -156,7 +148,7 @@ export function GeneralPage() {
       const params = new URLSearchParams({
         register: remoteGatewayPublicBaseUrl(),
       });
-      const assistantName = getRemoteGatewayAssistantName();
+      const assistantName = getRemoteAssistantDisplayName();
       if (assistantName) {
         params.set("name", assistantName);
       }
@@ -189,9 +181,7 @@ export function GeneralPage() {
             void navigate(`${routes.workspace}?sort=size`)
           }
           onUpgradeStorage={
-            infraGate === "full" && !isNativeAndroid
-              ? () => void navigate(routes.plans)
-              : null
+            infraGate === "full" ? () => void navigate(routes.plans) : null
           }
         />
       )}
@@ -207,16 +197,15 @@ export function GeneralPage() {
             <div className="border-t border-[var(--border-subtle)]" />
             <section className="flex flex-col gap-2">
               <h3 className="text-title-small text-[var(--content-emphasised)]">
-                Two-Factor Authentication
+                {t("generalPage.twoFactorTitle")}
               </h3>
               <p className="text-body-medium-default text-[var(--content-tertiary)]">
-                Require a code from an authenticator app when you sign in.
+                {t("generalPage.twoFactorDescription")}
               </p>
               <div className="mt-1">
                 {platformGate === "disabled" ? (
                   <PlatformLoginNotice>
-                    Log in to the Vellum platform to manage two-factor
-                    authentication.
+                    {t("generalPage.twoFactorLoginNotice")}
                   </PlatformLoginNotice>
                 ) : (
                   <TwoFactorSection />
@@ -228,15 +217,15 @@ export function GeneralPage() {
       </ProfileCard>
 
       <DetailCard
-        title="Version"
-        subtitle="Manage your assistant's software version and updates."
+        title={t("generalPage.versionTitle")}
+        subtitle={t("generalPage.versionSubtitle")}
         accessory={
           infraGate === "full" && platformAssistant ? (
             <Button
               variant="outlined"
               onClick={() => setUpdateWindowOpen(true)}
             >
-              Update Window
+              {t("generalPage.updateWindow")}
             </Button>
           ) : undefined
         }
@@ -272,7 +261,7 @@ export function GeneralPage() {
           {!showsUpgradePanel && assistant && (
             <div className="grid grid-cols-[140px_minmax(0,1fr)] gap-y-3">
               <span className="text-body-medium-default text-[var(--content-tertiary)]">
-                Current
+                {t("generalPage.current")}
               </span>
               <DevModeVersionUnlock
                 version={versionValue}
@@ -283,7 +272,7 @@ export function GeneralPage() {
           )}
           {infraGate === "disabled" && !canUpgradeLocally && (
             <PlatformLoginNotice>
-              Log in to the Vellum platform to manage software updates.
+              {t("generalPage.updatesLoginNotice")}
             </PlatformLoginNotice>
           )}
         </div>
@@ -309,21 +298,21 @@ export function GeneralPage() {
       {infraGate === "disabled" && (
         <DetailCard
           id="storage-resources"
-          title="Compute & Resources"
-          subtitle="Monitor resource usage and manage your assistant's compute profile."
+          title={t("generalPage.computeResourcesTitle")}
+          subtitle={t("generalPage.computeResourcesSubtitle")}
         >
           <PlatformLoginNotice>
-            Log in to the Vellum platform to manage compute resources.
+            {t("generalPage.computeResourcesLoginNotice")}
           </PlatformLoginNotice>
         </DetailCard>
       )}
 
       <DetailCard
-        title="Preferences"
-        subtitle="Customize how Vellum looks and behaves on this device."
+        title={t("generalPage.preferencesTitle")}
+        subtitle={t("generalPage.preferencesSubtitle")}
         accessory={
           <Button variant="outlined" onClick={() => setPreferencesOpen(true)}>
-            Customize
+            {t("generalPage.customize")}
           </Button>
         }
       >
@@ -346,19 +335,19 @@ export function GeneralPage() {
 
       {infraGate === "full" && platformAssistant && settingsSleepPolicy && (
         <DetailCard
-          title="Sleep Policy"
-          subtitle="Control how long this assistant stays awake when idle."
+          title={t("generalPage.sleepPolicyTitle")}
+          subtitle={t("generalPage.sleepPolicySubtitle")}
         >
           <AssistantSleepPolicy assistantId={platformAssistant.id} />
         </DetailCard>
       )}
       {infraGate === "disabled" && settingsSleepPolicy && (
         <DetailCard
-          title="Sleep Policy"
-          subtitle="Control how long this assistant stays awake when idle."
+          title={t("generalPage.sleepPolicyTitle")}
+          subtitle={t("generalPage.sleepPolicySubtitle")}
         >
           <PlatformLoginNotice>
-            Log in to the Vellum platform to manage sleep policy.
+            {t("generalPage.sleepPolicyLoginNotice")}
           </PlatformLoginNotice>
         </DetailCard>
       )}
@@ -369,27 +358,26 @@ export function GeneralPage() {
 
       {showAssistantSwitcherCard && (
         <DetailCard
-          title="Switch Assistant"
-          subtitle="Choose which assistant this device is connected to."
+          title={t("generalPage.switchAssistantTitle")}
+          subtitle={t("generalPage.switchAssistantSubtitle")}
           accessory={
             <Button variant="outlined" onClick={openAssistantChooser}>
-              Choose Assistant
+              {t("generalPage.chooseAssistant")}
             </Button>
           }
         />
       )}
 
       {(showRetire || showDeleteAccount) && (
-        <DetailCard variant="danger" title="Danger Zone">
+        <DetailCard variant="danger" title={t("generalPage.dangerZoneTitle")}>
           <div className="flex flex-col gap-6">
             {showRetire && (
               <section className="flex flex-col gap-2">
                 <h3 className="text-title-small text-[var(--content-emphasised)]">
-                  Retire Assistant
+                  {t("generalPage.retireAssistantTitle")}
                 </h3>
                 <p className="text-body-medium-default text-[var(--content-tertiary)]">
-                  Permanently retire this assistant and delete all associated
-                  data.
+                  {t("generalPage.retireAssistantDescription")}
                 </p>
                 <div className="mt-1">
                   {(platformGate === "full" || canRetireLocally) &&
@@ -397,7 +385,7 @@ export function GeneralPage() {
                     <RetireAssistant assistantId={platformAssistant.id} />
                   ) : (
                     <PlatformLoginNotice>
-                      Log in to the Vellum platform to retire this assistant.
+                      {t("generalPage.retireAssistantLoginNotice")}
                     </PlatformLoginNotice>
                   )}
                 </div>

@@ -22,7 +22,9 @@ import { createPortal } from "react-dom";
 
 import { CommandPaletteItem } from "@/components/command-palette/command-palette-item";
 import { useIsMobile } from "@/hooks/use-is-mobile";
+import { useTranslation } from "@/i18n";
 import { useIsNativeMobile } from "@/runtime/platform-detection";
+import { usePointerCoarse } from "@/utils/pointer";
 
 // z-50 keeps the full-screen palette above the navigation drawer (fixed z-40
 // in chat-layout), which stays mounted underneath so dismissing search returns
@@ -108,6 +110,7 @@ interface MobileSheetProps {
  * and releases focus.
  */
 const MobileSheet: FC<MobileSheetProps> = ({ onKeyDown, children }) => {
+  const { t } = useTranslation();
   const isPresent = useIsPresent();
   const reduceMotion = useReducedMotion();
   const sheetRef = useRef<HTMLDivElement>(null);
@@ -135,7 +138,7 @@ const MobileSheet: FC<MobileSheetProps> = ({ onKeyDown, children }) => {
       role="dialog"
       aria-modal={isPresent ? true : undefined}
       aria-hidden={isPresent ? undefined : true}
-      aria-label="Search"
+      aria-label={t("commandPalette.searchAriaLabel")}
       onKeyDown={onKeyDown}
       initial={{ y: "100%", opacity: 0 }}
       animate={{ y: 0, opacity: 1 }}
@@ -158,9 +161,15 @@ const MobileSheet: FC<MobileSheetProps> = ({ onKeyDown, children }) => {
 /**
  * macOS Spotlight-style command palette overlay on desktop, swapping to a
  * full-area inline overlay on mobile (`max-width: 767px`). Dismissable by
- * Escape or backdrop click. Keyboard-shortcut hints (per-item and the ⌘K
- * badge) are suppressed on mobile since there is no physical keyboard to
- * invoke them.
+ * Escape or backdrop click.
+ *
+ * Two independent questions, two signals. How much room there is decides the
+ * container (`useIsMobile()`); whether a chord can be pressed at all decides
+ * the keyboard hints, per-item and the ⌘K cap (`usePointerCoarse()`). They come
+ * apart on shipped hardware in both directions: a tablet is roomy with no ⌘
+ * key, and a desktop window narrowed past the breakpoint still has the whole
+ * keyboard. See `docs/PLATFORM_ADAPTATION.md`, and `docs/CAPACITOR.md`
+ * § Keyboard-only affordances for why the pointer is the signal for the second.
  *
  * Accepts items/sections as props — no data fetching is performed internally.
  */
@@ -177,8 +186,13 @@ export const CommandPalette: FC<CommandPaletteProps> = ({
   onKeyDown,
   surface = "overlay",
 }) => {
+  const { t } = useTranslation();
   const isMobile = useIsMobile();
   const isNativeMobileShell = useIsNativeMobile();
+  // Subscribed rather than read once: the palette outlives any one pointer, so
+  // a convertible whose keyboard comes off has to stop advertising ⌘K without
+  // a reload, and a tablet docked into one has to start.
+  const pointerCoarse = usePointerCoarse();
   const overlayRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
@@ -216,6 +230,11 @@ export const CommandPalette: FC<CommandPaletteProps> = ({
 
   const isWindowSurface = surface === "window";
   const useMobileLayout = isMobile && !isWindowSurface;
+  // A soft keyboard offers no ⌘ and no chord, so on a coarse pointer every
+  // hint here names a gesture the device cannot make. Width would answer the
+  // wrong question: it hides the hints on a narrowed desktop window that can
+  // still press all of them, and shows them on a tablet that cannot press any.
+  const showKeyboardHints = !pointerCoarse;
   // Native mobile shells keep the sheet mounted while AnimatePresence plays
   // the slide-out exit.
   const animateMobileSheet = isNativeMobileShell && useMobileLayout;
@@ -247,13 +266,13 @@ export const CommandPalette: FC<CommandPaletteProps> = ({
         type="text"
         value={query}
         onChange={(e) => onQueryChange(e.target.value)}
-        placeholder="Search conversations, memories…"
+        placeholder={t("commandPalette.placeholder")}
         className={
           isWindowSurface
             ? "min-w-0 flex-1 bg-transparent text-sm font-medium text-[var(--content-default)] placeholder:text-[var(--content-tertiary)] outline-none"
             : "min-w-0 flex-1 bg-transparent text-body-medium-lighter text-[var(--content-default)] placeholder:text-[var(--content-tertiary)] outline-none"
         }
-        aria-label="Search"
+        aria-label={t("commandPalette.searchAriaLabel")}
       />
       {query ? (
         useMobileLayout ? (
@@ -261,15 +280,15 @@ export const CommandPalette: FC<CommandPaletteProps> = ({
             type="button"
             className="shrink-0 text-body-medium-lighter text-[var(--content-tertiary)]"
             onClick={() => onQueryChange("")}
-            aria-label="Clear search"
+            aria-label={t("commandPalette.clearSearch")}
           >
-            Clear
+            {t("commandPalette.clear")}
           </button>
         ) : isWindowSurface ? (
           <button
             type="button"
             className="flex size-7 shrink-0 items-center justify-center rounded-md text-[var(--content-tertiary)] transition-colors hover:bg-[var(--surface-overlay)] hover:text-[var(--content-default)]"
-            aria-label="Clear search"
+            aria-label={t("commandPalette.clearSearch")}
             onClick={() => onQueryChange("")}
           >
             <X size={16} aria-hidden />
@@ -279,12 +298,12 @@ export const CommandPalette: FC<CommandPaletteProps> = ({
             variant="ghost"
             size="compact"
             iconOnly={<X />}
-            aria-label="Clear search"
+            aria-label={t("commandPalette.clearSearch")}
             onClick={() => onQueryChange("")}
             tintColor="var(--content-tertiary)"
           />
         )
-      ) : useMobileLayout ? null : (
+      ) : showKeyboardHints ? (
         <kbd
           className={
             isWindowSurface
@@ -292,16 +311,16 @@ export const CommandPalette: FC<CommandPaletteProps> = ({
               : "shrink-0 rounded-md border border-[var(--border-base)] bg-[var(--surface-active)] px-1.5 py-0.5 text-label-small-default text-[var(--content-tertiary)]"
           }
         >
-          ⌘K
+          {t("commandPalette.shortcutHint")}
         </kbd>
-      )}
+      ) : null}
       {useMobileLayout ? (
         <Button
           variant="ghost"
           size="compact"
           iconOnly={<X />}
           expandOnMobile={false}
-          aria-label="Close search"
+          aria-label={t("commandPalette.closeSearch")}
           onClick={onClose}
           tintColor="var(--content-tertiary)"
         />
@@ -325,7 +344,9 @@ export const CommandPalette: FC<CommandPaletteProps> = ({
             variant="body-medium-lighter"
             className="text-[var(--content-tertiary)]"
           >
-            {isSearching ? "Searching…" : "No results"}
+            {isSearching
+              ? t("commandPalette.searching")
+              : t("commandPalette.noResults")}
           </Typography>
         </div>
       ) : (
@@ -354,7 +375,9 @@ export const CommandPalette: FC<CommandPaletteProps> = ({
                   subtitle={item.subtitle}
                   snippet={item.snippet}
                   highlightTokens={highlightTokens}
-                  shortcutHint={useMobileLayout ? undefined : item.shortcutHint}
+                  shortcutHint={
+                    showKeyboardHints ? item.shortcutHint : undefined
+                  }
                   isSelected={currentIndex === selectedIndex}
                   onClick={() => onItemSelect?.(item, currentIndex)}
                   surface={surface}
@@ -386,7 +409,7 @@ export const CommandPalette: FC<CommandPaletteProps> = ({
         className={MOBILE_SHEET_CLASSES}
         role="dialog"
         aria-modal="true"
-        aria-label="Search"
+        aria-label={t("commandPalette.searchAriaLabel")}
         onKeyDown={onKeyDown}
         style={MOBILE_SHEET_SAFE_AREA_STYLE}
       >
@@ -401,7 +424,7 @@ export const CommandPalette: FC<CommandPaletteProps> = ({
       ref={overlayRef}
       role="dialog"
       aria-modal="true"
-      aria-label="Command palette"
+      aria-label={t("commandPalette.ariaLabel")}
       className={
         surface === "window"
           ? "flex h-full w-full items-start justify-center bg-transparent p-3"

@@ -31,6 +31,14 @@ mock.module("../../daemon/conversation-store.js", () => ({
   getOrCreateConversation: async () => fakeConversation,
 }));
 
+// Vision capability of the image pin's target profile. Install-dependent in
+// production (a BYO provider resolves the profile key through its own column
+// of the intent matrix), so it is scripted rather than read from a catalog.
+let pinProfileSupportsVision = true;
+mock.module("../../plugin-api/vision-support.js", () => ({
+  doesSupportVision: () => pinProfileSupportsVision,
+}));
+
 // Conversation-CRUD doubles for the teardown transcript-hygiene pass. The
 // real module is spread so every other export keeps its production behavior;
 // only the functions the hygiene pass (and discard) touch are recorded.
@@ -72,6 +80,7 @@ mock.module("../../persistence/conversation-crud.js", () => ({
 
 import { setConfig } from "../../__tests__/helpers/set-config.js";
 import { ABORT_WATCHDOG_MS } from "../../daemon/abort-watchdog.js";
+import { VOICE_ESCALATION_CONTINUATION_MESSAGE_KIND } from "../../plugin-api/constants.js";
 import { assistantEventHub } from "../../runtime/assistant-event-hub.js";
 import {
   CALL_OPENING_MARKER,
@@ -125,13 +134,14 @@ interface FakeConversation {
     metadata?: Record<string, unknown>;
   }) => Promise<{ id: string }>;
   workingDir: string;
-  updateClient: (cb: unknown, reset?: boolean) => void;
+  addEventObserver: (observer: unknown) => () => void;
   handleConfirmationResponse: (
     requestId: string,
     decision: string,
     opts?: { decisionContext?: string },
   ) => void;
   runAgentLoop: (...args: unknown[]) => Promise<void>;
+  getMessages: () => Array<{ role: string; content: unknown[] }>;
   abort: (reason?: unknown) => void;
   loadFromDb: () => Promise<void>;
   toolsDisabledDepth: number;
@@ -148,6 +158,8 @@ function makeFakeConversation(opts: {
   onPersist?: (attempt: number) => void;
   /** Workspace root; pass empty to model a missing boundary. */
   workingDir?: string;
+  /** In-memory history the profile pin reads; undefined models a text-only call. */
+  messages?: Array<{ role: string; content: unknown[] }>;
 }) {
   const waitForIdleCalls: WaitForIdleCall[] = [];
   const confirmationDecisions: Array<{ requestId: string; decision: string }> =
@@ -191,18 +203,21 @@ function makeFakeConversation(opts: {
       opts.onPersist?.(persistCount);
       return { id: `msg-${persistCount}` };
     },
-    // The install (reset falsy) / reset (reset true) pair marks a turn
-    // taking ownership of the conversation vs a turn's cleanup releasing it.
-    updateClient: (cb, reset) => {
-      opts.events?.push(reset ? "client:reset" : "client:install");
-      if (reset !== true) {
-        clientCallback = cb as (msg: unknown) => Promise<void>;
-      }
+    // The install / reset pair marks a turn taking ownership of the
+    // conversation (observer registered) vs a turn's cleanup releasing it
+    // (the returned disposer invoked).
+    addEventObserver: (observer) => {
+      opts.events?.push("client:install");
+      clientCallback = observer as (msg: unknown) => Promise<void>;
+      return () => {
+        opts.events?.push("client:reset");
+      };
     },
     handleConfirmationResponse: (requestId, decision) => {
       confirmationDecisions.push({ requestId, decision });
     },
     runAgentLoop: () => (opts.runAgentLoop ?? (async () => {}))(),
+    getMessages: () => opts.messages ?? [],
     abort: () => {},
     loadFromDb: async () => {
       opts.events?.push("loadFromDb");
@@ -213,7 +228,7 @@ function makeFakeConversation(opts: {
     conversation,
     waitForIdleCalls,
     confirmationDecisions,
-    /** Deliver an event the way the conversation would, to the installed handler. */
+    /** Deliver an event the way the conversation would, to the installed observer. */
     emitToClient: async (msg: unknown) => {
       await clientCallback?.(msg);
     },
@@ -360,6 +375,10 @@ describe("startVoiceTurn escalation-continuation persistence", () => {
     // not merely echo-suppressed live.
     const fake = makeFakeConversation({ processing: false });
     fakeConversation = fake.conversation;
+    let runOptions: Record<string, unknown> | undefined;
+    fake.conversation.runAgentLoop = async (...args: unknown[]) => {
+      runOptions = args[2] as Record<string, unknown>;
+    };
 
     await startVoiceTurn({
       ...makeTurnOptions(),
@@ -372,7 +391,11 @@ describe("startVoiceTurn escalation-continuation persistence", () => {
     expect(fake.lastPersistOpts()?.metadata).toEqual({
       voiceSessionTurn: true,
       hidden: true,
+      messageKind: VOICE_ESCALATION_CONTINUATION_MESSAGE_KIND,
     });
+    expect(runOptions?.messageKind).toBe(
+      VOICE_ESCALATION_CONTINUATION_MESSAGE_KIND,
+    );
   });
 
   test("the opener prompt is persisted un-hidden (unchanged)", async () => {
@@ -967,7 +990,7 @@ describe("startVoiceTurn prior-turn teardown barrier", () => {
     expect(events).toEqual(["persist", "client:install"]);
 
     // Turn 2 arrives during the teardown window: it must not persist or
-    // install its client callback until turn 1's cleanup has run.
+    // install its event observer until turn 1's cleanup has run.
     const turn2 = startVoiceTurn(
       makeTurnOptions(undefined, "conv-teardown-order"),
     );
@@ -2152,5 +2175,107 @@ describe("transcript hygiene (teardown pass)", () => {
     await flushMicrotasks();
 
     expect(crudLog.deletes).toContain("assistant-row-1");
+  });
+});
+
+describe("startVoiceTurn image-bearing profile pin", () => {
+  /** A persisted user message carrying a photo taken mid-call. */
+  const PHOTO_HISTORY = [
+    { role: "user", content: [{ type: "text", text: "here's a photo:" }] },
+    {
+      role: "user",
+      content: [
+        { type: "text", text: "here's a photo:" },
+        { type: "image", source: { type: "base64", data: "abc" } },
+      ],
+    },
+  ];
+
+  beforeEach(() => {
+    pinProfileSupportsVision = true;
+  });
+
+  async function runOptionsFor(opts: {
+    messages?: Array<{ role: string; content: unknown[] }>;
+    turn?: Record<string, unknown>;
+  }): Promise<Record<string, unknown>> {
+    const fake = makeFakeConversation({
+      processing: false,
+      ...(opts.messages ? { messages: opts.messages } : {}),
+    });
+    fakeConversation = fake.conversation;
+    let runOptions: Record<string, unknown> = {};
+    fake.conversation.runAgentLoop = async (...args: unknown[]) => {
+      runOptions = args[2] as Record<string, unknown>;
+    };
+    await startVoiceTurn({ ...makeTurnOptions(), ...(opts.turn ?? {}) });
+    return runOptions;
+  }
+
+  test("a text-only call keeps the call-site profile", async () => {
+    const runOptions = await runOptionsFor({});
+
+    expect(runOptions.overrideProfile).toBeUndefined();
+    expect(runOptions.forceOverrideProfile).toBeUndefined();
+  });
+
+  test("an image in history pins the image-capable profile", async () => {
+    // `callAgent`'s balanced profile carries no guarantee that its model takes
+    // an image, and a model that rejects one fails the whole leg.
+    const runOptions = await runOptionsFor({ messages: PHOTO_HISTORY });
+
+    expect(runOptions.overrideProfile).toBe("latency-optimized");
+    // callAgent is not `mainAgent`, so an unforced override would sit below
+    // the call-site profile and never apply.
+    expect(runOptions.forceOverrideProfile).toBe(true);
+  });
+
+  test("an image nested in a tool result counts too", async () => {
+    const runOptions = await runOptionsFor({
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              contentBlocks: [{ type: "image", source: { data: "abc" } }],
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(runOptions.overrideProfile).toBe("latency-optimized");
+  });
+
+  test("a front-door leg is left alone — its own call site pins it", async () => {
+    const runOptions = await runOptionsFor({
+      messages: PHOTO_HISTORY,
+      turn: { routingLeg: "front-door" },
+    });
+
+    expect(runOptions.overrideProfile).toBeUndefined();
+    expect(runOptions.callSite).toBe("voiceFrontDoor");
+  });
+
+  test("no pin when the pin target can't take an image either", async () => {
+    // Fireworks: `latency-optimized` resolves to a text-only model while
+    // `balanced` is vision-capable, so pinning would break the very turn the
+    // pin exists to save.
+    pinProfileSupportsVision = false;
+
+    const runOptions = await runOptionsFor({ messages: PHOTO_HISTORY });
+
+    expect(runOptions.overrideProfile).toBeUndefined();
+    expect(runOptions.forceOverrideProfile).toBeUndefined();
+  });
+
+  test("an explicit routing pin wins over the image pin", async () => {
+    const runOptions = await runOptionsFor({
+      messages: PHOTO_HISTORY,
+      turn: { overrideProfile: "quality-optimized" },
+    });
+
+    expect(runOptions.overrideProfile).toBe("quality-optimized");
   });
 });

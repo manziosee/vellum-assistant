@@ -131,6 +131,7 @@ function plansResponse(): PlanListResponse {
             machine_size: null,
             storage_gib: 10,
             credits_usd: 50,
+            usage_label: "Mighty Usage",
             include_platform_fee: false,
             base_price_cents: 4000,
             machine_price_cents: 0,
@@ -286,7 +287,7 @@ describe("waiting / resizing", () => {
       </QueryClientProvider>,
     );
     expect(
-      getByText("Still working — this can take a minute or two."),
+      getByText("Still working. This can take a minute or two."),
     ).toBeTruthy();
   });
 

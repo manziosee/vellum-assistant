@@ -1,4 +1,5 @@
 import { useMemo, useRef, useState, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 
 import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@vellumai/design-library/components/button";
@@ -38,7 +39,9 @@ import {
   connectionAuthTypeForProvider,
   connectionSaveErrorMessage,
   parseCredentialRef,
+  providerAllowsCustomBaseUrl,
   validationErrorMessage,
+  warnOnFailedEndpointCheck,
 } from "@/domains/settings/ai/provider-editor-constants";
 import { useSelectableConnectionProviders } from "@/domains/settings/ai/provider-availability";
 import { secretPlaceholder } from "@/domains/settings/ai/secret-placeholder";
@@ -75,6 +78,14 @@ export interface ProviderCreateFormProps {
   onCancel: () => void;
   /** "modal" wraps the form in Modal chrome; "inline" drops it for embedding. */
   variant?: "modal" | "inline";
+  /**
+   * Where the Cancel/Add row renders, for `variant="inline"` hosts that pin
+   * their actions outside the scrollable body (see `DetailShell`'s `footer`).
+   * Omit to keep the row inline at the end of the fields; pass the element to
+   * portal into it. `null` means the host's slot has not mounted yet, so the
+   * row is withheld for that one commit rather than rendered in both places.
+   */
+  actionsSlot?: HTMLElement | null;
 }
 
 export function ProviderCreateForm({
@@ -86,6 +97,7 @@ export function ProviderCreateForm({
   onCreated,
   onCancel,
   variant = "modal",
+  actionsSlot,
 }: ProviderCreateFormProps) {
   const { t } = useTranslation("settings");
   const selectableConnectionProviders = useSelectableConnectionProviders();
@@ -137,6 +149,7 @@ export function ProviderCreateForm({
   const [isDetailsExpanded, setIsDetailsExpanded] = useState(false);
 
   const isOpenAICompatible = provider === "openai-compatible";
+  const allowsCustomBaseUrl = providerAllowsCustomBaseUrl(provider);
   const connectionProviderOptions = useMemo<
     Array<ConnectionProvider | "chatgpt">
   >(() => {
@@ -277,8 +290,10 @@ export function ProviderCreateForm({
         provider,
         auth,
         ...(labelValue !== null && { label: labelValue }),
-        ...(isOpenAICompatible && {
+        ...(allowsCustomBaseUrl && {
           base_url: baseUrl.trim() || null,
+        }),
+        ...(isOpenAICompatible && {
           models: connectionModels.trim()
             ? connectionModels
                 .split(",")
@@ -309,6 +324,7 @@ export function ProviderCreateForm({
       // Single success confirmation for both the standalone and inline
       // surfaces; failures above already surface inline via `error` (no toast).
       toast.success(t("providerCreateForm.providerConnectedToast"));
+      warnOnFailedEndpointCheck(created, t);
       onCreated(created);
     } catch {
       setError(t("providerCreateForm.failedSaveProvider"));
@@ -419,8 +435,9 @@ export function ProviderCreateForm({
             }}
             options={[
               // Catalog providers first; the custom-provider entry closes the
-              // list. "OpenAI-compatible" is the protocol a custom provider
-              // must speak, not the provider's identity.
+              // list, pinned to the menu's bottom edge so the catalog can
+              // scroll past it. "OpenAI-compatible" is the protocol a custom
+              // provider must speak, not the provider's identity.
               ...connectionProviderOptions
                 .filter((p) => p !== "openai-compatible")
                 .map((p) => ({
@@ -432,6 +449,7 @@ export function ProviderCreateForm({
                     {
                       value: "openai-compatible" as ConnectionProvider,
                       label: t("providerCreateForm.customProviderOption"),
+                      sticky: true,
                     },
                   ]
                 : []),
@@ -449,60 +467,76 @@ export function ProviderCreateForm({
         </div>
       )}
 
-      {/* Name + Base URL + Models — custom providers only. Name leads:
-          the user is adding "xAI", not configuring a URL. */}
+      {/* Name + Models: custom providers only. Name leads: the user is
+          adding "xAI", not configuring a URL. Base URL is shared with
+          ollama, which treats an empty value as the local default. */}
       {isOpenAICompatible && (
-        <>
-          <div className="space-y-1">
-            <label className="block text-body-small-default text-[var(--content-tertiary)]">
-              {t("providerCreateForm.nameLabel")}
-            </label>
-            <Input
-              value={label}
-              onChange={(e) => handleLabelChange(e.target.value)}
-              placeholder={t("providerCreateForm.namePlaceholder")}
-              fullWidth
-            />
-            {nameConflict ? (
-              <Typography
-                variant="body-small-default"
-                as="p"
-                className="text-(--system-negative-strong)"
-              >
-                {CUSTOM_PROVIDER_NAME_ERRORS[nameConflict]}
-              </Typography>
-            ) : null}
-          </div>
-          <div className="space-y-1">
-            <label className="block text-body-small-default text-[var(--content-tertiary)]">
-              {t("providerCreateForm.baseUrlLabel")}
-            </label>
-            <Input
-              value={baseUrl}
-              onChange={(e) => setBaseUrl(e.target.value)}
-              placeholder={t("providerCreateForm.baseUrlPlaceholder")}
-              fullWidth
-            />
-          </div>
-          <div className="space-y-1">
-            <label className="block text-body-small-default text-[var(--content-tertiary)]">
-              {t("providerCreateForm.modelsLabel")}
-            </label>
-            <Input
-              value={connectionModels}
-              onChange={(e) => setConnectionModels(e.target.value)}
-              placeholder={t("providerCreateForm.modelsPlaceholder")}
-              fullWidth
-            />
+        <div className="space-y-1">
+          <label className="block text-body-small-default text-[var(--content-tertiary)]">
+            {t("providerCreateForm.nameLabel")}
+          </label>
+          <Input
+            value={label}
+            onChange={(e) => handleLabelChange(e.target.value)}
+            placeholder={t("providerCreateForm.namePlaceholder")}
+            fullWidth
+          />
+          {nameConflict ? (
+            <Typography
+              variant="body-small-default"
+              as="p"
+              className="text-(--system-negative-strong)"
+            >
+              {CUSTOM_PROVIDER_NAME_ERRORS[nameConflict]}
+            </Typography>
+          ) : null}
+        </div>
+      )}
+      {allowsCustomBaseUrl && (
+        <div className="space-y-1">
+          <label className="block text-body-small-default text-[var(--content-tertiary)]">
+            {t("providerCreateForm.baseUrlLabel")}
+          </label>
+          <Input
+            value={baseUrl}
+            onChange={(e) => setBaseUrl(e.target.value)}
+            placeholder={
+              provider === "ollama"
+                ? t("providerCreateForm.baseUrlPlaceholderOllama")
+                : t("providerCreateForm.baseUrlPlaceholder")
+            }
+            fullWidth
+          />
+          {provider === "ollama" ? (
             <Typography
               variant="body-small-default"
               as="p"
               className="text-[var(--content-tertiary)]"
             >
-              {t("providerCreateForm.modelsHint")}
+              {t("providerCreateForm.baseUrlHintOllama")}
             </Typography>
-          </div>
-        </>
+          ) : null}
+        </div>
+      )}
+      {isOpenAICompatible && (
+        <div className="space-y-1">
+          <label className="block text-body-small-default text-[var(--content-tertiary)]">
+            {t("providerCreateForm.modelsLabel")}
+          </label>
+          <Input
+            value={connectionModels}
+            onChange={(e) => setConnectionModels(e.target.value)}
+            placeholder={t("providerCreateForm.modelsPlaceholder")}
+            fullWidth
+          />
+          <Typography
+            variant="body-small-default"
+            as="p"
+            className="text-[var(--content-tertiary)]"
+          >
+            {t("providerCreateForm.modelsHint")}
+          </Typography>
+        </div>
       )}
 
       {/* API Key + Advanced disclosure — only shown for key-based providers */}
@@ -578,7 +612,11 @@ export function ProviderCreateForm({
     return (
       <div className="space-y-4">
         {body}
-        <div className="flex justify-end gap-2">{footer}</div>
+        {actionsSlot === undefined ? (
+          <div className="flex justify-end gap-2">{footer}</div>
+        ) : (
+          actionsSlot && createPortal(footer, actionsSlot)
+        )}
       </div>
     );
   }

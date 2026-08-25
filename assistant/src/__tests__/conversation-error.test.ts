@@ -521,6 +521,23 @@ describe("classifyConversationError", () => {
       expect(result.userMessage.toLowerCase()).toContain("image");
     });
 
+    it("classifies an OpenAI-compatible 400 for an unreadable image as image_unsupported_format (non-retryable)", () => {
+      // The rejection an OpenAI-compatible endpoint returns when any image in
+      // the request is not one of the formats it decodes (a HEIC photo renamed
+      // to .png, say). It names no index, so the whole turn dies unless it is
+      // classified for the image-recovery path with actionable copy.
+      const err = new ProviderError(
+        "The image data you provided does not represent a valid image. Please check your input and try again with one of the supported image formats: [image/jpeg, image/png, image/gif, image/webp]",
+        "openai",
+        400,
+      );
+      const result = classifyConversationError(err, baseCtx);
+      expect(result.code).toBe("IMAGE_TOO_LARGE");
+      expect(result.errorCategory).toBe("image_unsupported_format");
+      expect(result.retryable).toBe(false);
+      expect(result.userMessage.toLowerCase()).toContain("image");
+    });
+
     it("does not steal generic 400s that happen to mention 'image'", () => {
       const err = new ProviderError(
         "invalid request: image source is missing",
@@ -564,6 +581,23 @@ describe("classifyConversationError", () => {
       expect(result.code).toBe("PROVIDER_ORDERING");
       expect(result.retryable).toBe(true);
       expect(result.errorCategory).toBe("tool_ordering");
+    });
+
+    it("classifies user-terminal history rejections separately", () => {
+      /** User-terminal provider rejections receive a dedicated category. */
+
+      // GIVEN a provider error whose history ends with a model turn
+      const error = new Error(
+        "Requests ending with a model turn are not supported.",
+      );
+
+      // WHEN the conversation error is classified
+      const result = classifyConversationError(error, baseCtx);
+
+      // THEN it is a retryable ordering error in the user-terminal category
+      expect(result.code).toBe("PROVIDER_ORDERING");
+      expect(result.retryable).toBe(true);
+      expect(result.errorCategory).toBe("history_user_terminal");
     });
   });
 

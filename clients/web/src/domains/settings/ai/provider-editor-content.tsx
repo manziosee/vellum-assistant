@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { createPortal } from "react-dom";
 
 import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "@vellumai/design-library/components/button";
@@ -32,9 +33,11 @@ import { ProviderCreateForm } from "@/domains/settings/ai/provider-create-form";
 import { ProviderEditorApiKeySection } from "@/domains/settings/ai/provider-editor-api-key-section";
 import {
   connectionSaveErrorMessage,
-  validationErrorMessage,
   parseCredentialRef,
+  providerAllowsCustomBaseUrl,
   providerConnectionDisplayName,
+  validationErrorMessage,
+  warnOnFailedEndpointCheck,
 } from "@/domains/settings/ai/provider-editor-constants";
 import { secretPlaceholder } from "@/domains/settings/ai/secret-placeholder";
 import { useProviderCredentialsList } from "@/domains/settings/ai/use-provider-credentials-list";
@@ -57,6 +60,14 @@ export interface ProviderEditorContentProps {
    * the settings sidepanel (DetailShell body).
    */
   variant?: "modal" | "panel";
+  /**
+   * Where the Cancel/Save row renders, for `variant="panel"` hosts that pin
+   * their actions outside the scrollable body (see `DetailShell`'s `footer`).
+   * Omit to keep the row inline at the end of the fields; pass the element to
+   * portal into it. `null` means the host's slot has not mounted yet, so the
+   * row is withheld for that one commit rather than rendered in both places.
+   */
+  actionsSlot?: HTMLElement | null;
   onSave: (connection: ProviderConnection) => void;
   onCancel: () => void;
 }
@@ -68,6 +79,7 @@ export function ProviderEditorContent({
   existingNames,
   connections,
   variant = "modal",
+  actionsSlot,
   onSave,
   onCancel,
 }: ProviderEditorContentProps) {
@@ -98,6 +110,7 @@ export function ProviderEditorContent({
   const [error, setError] = useState<string | null>(null);
 
   const isOpenAICompatible = provider === "openai-compatible";
+  const allowsCustomBaseUrl = providerAllowsCustomBaseUrl(provider);
 
   const [apiKeyValue, setApiKeyValue] = useState("");
   const [isSavingKey, setIsSavingKey] = useState(false);
@@ -243,8 +256,10 @@ export function ProviderEditorContent({
       const input: InferenceProviderconnectionsByNamePatchData["body"] = {
         auth,
         label: labelValue,
-        ...(isOpenAICompatible && {
+        ...(allowsCustomBaseUrl && {
           base_url: baseUrl.trim() || null,
+        }),
+        ...(isOpenAICompatible && {
           models: connectionModels.trim()
             ? connectionModels
                 .split(",")
@@ -275,6 +290,7 @@ export function ProviderEditorContent({
         setError(t("providerEditorContent.emptyServerResponse"));
         return;
       }
+      warnOnFailedEndpointCheck(updated, t);
       onSave(updated);
     } catch {
       setError(t("providerEditorContent.failedSaveProvider"));
@@ -313,6 +329,7 @@ export function ProviderEditorContent({
     return (
       <ProviderCreateForm
         variant={variant === "panel" ? "inline" : "modal"}
+        actionsSlot={actionsSlot}
         assistantId={assistantId}
         existingNames={existingNames}
         connections={connections}
@@ -355,39 +372,51 @@ export function ProviderEditorContent({
           ) : null}
         </div>
 
-        {/* Base URL + Models — openai-compatible only */}
-        {isOpenAICompatible && (
-          <>
-            <div className="space-y-1">
-              <label className="block text-body-small-default text-[var(--content-tertiary)]">
-                {t("providerEditorContent.baseUrlLabel")}
-              </label>
-              <Input
-                value={baseUrl}
-                onChange={(e) => setBaseUrl(e.target.value)}
-                placeholder={t("providerEditorContent.baseUrlPlaceholder")}
-                fullWidth
-              />
-            </div>
-            <div className="space-y-1">
-              <label className="block text-body-small-default text-[var(--content-tertiary)]">
-                {t("providerEditorContent.modelsLabel")}
-              </label>
-              <Input
-                value={connectionModels}
-                onChange={(e) => setConnectionModels(e.target.value)}
-                placeholder={t("providerEditorContent.modelsPlaceholder")}
-                fullWidth
-              />
+        {allowsCustomBaseUrl && (
+          <div className="space-y-1">
+            <label className="block text-body-small-default text-[var(--content-tertiary)]">
+              {t("providerEditorContent.baseUrlLabel")}
+            </label>
+            <Input
+              value={baseUrl}
+              onChange={(e) => setBaseUrl(e.target.value)}
+              placeholder={
+                provider === "ollama"
+                  ? t("providerEditorContent.baseUrlPlaceholderOllama")
+                  : t("providerEditorContent.baseUrlPlaceholder")
+              }
+              fullWidth
+            />
+            {provider === "ollama" ? (
               <Typography
                 variant="body-small-default"
                 as="p"
                 className="text-[var(--content-tertiary)]"
               >
-                {t("providerEditorContent.modelsHint")}
+                {t("providerEditorContent.baseUrlHintOllama")}
               </Typography>
-            </div>
-          </>
+            ) : null}
+          </div>
+        )}
+        {isOpenAICompatible && (
+          <div className="space-y-1">
+            <label className="block text-body-small-default text-[var(--content-tertiary)]">
+              {t("providerEditorContent.modelsLabel")}
+            </label>
+            <Input
+              value={connectionModels}
+              onChange={(e) => setConnectionModels(e.target.value)}
+              placeholder={t("providerEditorContent.modelsPlaceholder")}
+              fullWidth
+            />
+            <Typography
+              variant="body-small-default"
+              as="p"
+              className="text-[var(--content-tertiary)]"
+            >
+              {t("providerEditorContent.modelsHint")}
+            </Typography>
+          </div>
         )}
 
         {/* API Key + Advanced disclosure — only shown for api_key auth */}
@@ -444,7 +473,11 @@ export function ProviderEditorContent({
     return (
       <div className="space-y-4">
         {body}
-        <div className="flex justify-end gap-2">{footer}</div>
+        {actionsSlot === undefined ? (
+          <div className="flex justify-end gap-2">{footer}</div>
+        ) : (
+          actionsSlot && createPortal(footer, actionsSlot)
+        )}
       </div>
     );
   }

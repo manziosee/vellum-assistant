@@ -10,6 +10,10 @@ import {
   useBillingPortalSession,
 } from "@/domains/settings/hooks/use-billing-portal-session";
 import { organizationsBillingSubscriptionRetrieveOptions } from "@/generated/api/@tanstack/react-query.gen";
+import { useTranslation } from "@/i18n";
+import { openBillingPathInBrowser } from "@/lib/billing/android-billing-handoff";
+import { useIsNativeAndroid } from "@/runtime/platform-detection";
+import { routes } from "@/utils/routes";
 import { Button } from "@vellumai/design-library/components/button";
 import { Notice } from "@vellumai/design-library/components/notice";
 
@@ -23,6 +27,10 @@ import { Notice } from "@vellumai/design-library/components/notice";
  * post-portal-return toast can diff old → new state.
  */
 export function GracePeriodBanner() {
+  const { t } = useTranslation("settings");
+  // Native Android reactivates on the web app's billing page in the browser
+  // instead of opening a portal session from the app.
+  const isNativeAndroid = useIsNativeAndroid();
   const { data } = useQuery(organizationsBillingSubscriptionRetrieveOptions());
 
   const snapshot = useMemo(() => buildPortalReturnSnapshot(data), [data]);
@@ -46,12 +54,18 @@ export function GracePeriodBanner() {
   return (
     <Notice
       tone="info"
-      title={`Your Pro plan will end on ${formatted}.`}
+      title={t("gracePeriodBanner.title", { date: formatted })}
       actions={
         <Button
           variant="outlined"
           size="compact"
-          onClick={() => portalMutation.mutate({})}
+          onClick={() => {
+            if (isNativeAndroid) {
+              openBillingPathInBrowser(routes.settings.usageBilling);
+              return;
+            }
+            portalMutation.mutate({});
+          }}
           disabled={portalMutation.isPending}
           leftIcon={
             portalMutation.isPending ? (
@@ -60,12 +74,12 @@ export function GracePeriodBanner() {
           }
           data-testid="grace-period-reactivate-button"
         >
-          Reactivate
+          {t("gracePeriodBanner.reactivate")}
         </Button>
       }
       data-testid="grace-period-banner"
     >
-      You&apos;ll keep Pro features until then.
+      {t("gracePeriodBanner.body")}
     </Notice>
   );
 }

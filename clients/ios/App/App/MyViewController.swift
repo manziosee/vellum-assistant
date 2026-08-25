@@ -6,7 +6,8 @@ import WebKit
 ///
 /// 1. Registers `NativeAuthPlugin`, `NativeBiometricPlugin`,
 ///    `VoiceAudioSessionPlugin`, `VoiceLiveActivityPlugin`,
-///    `ApnsEnvironmentPlugin`, and `SelfHostedServersPlugin` as local plugin
+///    `ApnsEnvironmentPlugin`, `SelfHostedServersPlugin`,
+///    `RecentChatsPlugin`, and `WidgetSnapshotPlugin` as local plugin
 ///    instances at bridge init time.
 ///    These plugins live inside the App target (no SPM module) so the bridge
 ///    won't discover them automatically.
@@ -81,12 +82,21 @@ class MyViewController: CAPBridgeViewController {
     /// scoped to exactly the baked cloud host plus the configured origin, never a
     /// wildcard — so its pages load as the main document instead of being handed
     /// off to Safari.
+    ///
+    /// This is also where a launch reports the origin it is applying to the
+    /// widget snapshot, which is what makes the origin-change invariant on
+    /// `SelfHostedServer` survive a change made against a terminated app: the
+    /// iOS Settings pane can rewrite the preference with no process to observe
+    /// it, and this is the first point at which the origin for this launch is
+    /// known. The report happens ahead of the early return so a launch back on
+    /// the baked cloud origin is recorded too.
     override open func instanceDescriptor() -> InstanceDescriptor {
         let descriptor = super.instanceDescriptor()
         bakedServerURL = descriptor.serverURL.flatMap { URL(string: $0) }
 
         let configured = SelfHostedServer.configuredURL()
         appliedServerURL = configured ?? bakedServerURL
+        WidgetSnapshotPlugin.recordAppliedOrigin(SelfHostedServer.activeOriginIdentity())
         guard let configured else {
             return descriptor
         }
@@ -168,6 +178,8 @@ class MyViewController: CAPBridgeViewController {
         bridge?.registerPluginInstance(VoiceLiveActivityPlugin())
         bridge?.registerPluginInstance(ApnsEnvironmentPlugin())
         bridge?.registerPluginInstance(SelfHostedServersPlugin())
+        bridge?.registerPluginInstance(RecentChatsPlugin())
+        bridge?.registerPluginInstance(WidgetSnapshotPlugin())
         installNavigationDelegateProxy()
         installInputZoomPreventionUserScript()
         installViewportZoomLockUserScript()
@@ -197,6 +209,14 @@ class MyViewController: CAPBridgeViewController {
     /// last applied. Comparing the full URL — not just the origin — catches a
     /// same-host path change. A full reload is sufficient; the assistant has no
     /// useful offline state.
+    ///
+    /// This is the running-app half of the one native origin change
+    /// `SelfHostedServer.setActive` cannot see: the iOS Settings pane writes the
+    /// active slot straight to `UserDefaults`. The guard below is the change
+    /// predicate, so the widget snapshot recording that every other path
+    /// inherits from that setter hangs off it here, leaving a foreground with no
+    /// change alone. The same pane can also be used while the app is terminated,
+    /// which `instanceDescriptor()` covers.
     @objc private func reloadIfConfiguredOriginChanged() {
         let destination = SelfHostedServer.configuredURL() ?? bakedServerURL
         guard let destination,
@@ -204,20 +224,21 @@ class MyViewController: CAPBridgeViewController {
         else {
             return
         }
+        WidgetSnapshotPlugin.recordAppliedOrigin(SelfHostedServer.activeOriginIdentity())
         applyConfiguredOrigin()
     }
 
     /// Apply any deep link that arrived before the web view was ready. A cold
-    /// launch stashes the connect pair-page navigation and any voice command in
+    /// launch stashes the connect pair-page navigation and any command URL in
     /// `AppDelegate`; both are delivered here, once the bridge web view is live
     /// and on screen. Connect goes first: it can swap the origin out from under
-    /// the web view, and the voice command survives that reload because
+    /// the web view, and the command survives that reload because
     /// Capacitor retains `appUrlOpen` until a JS listener consumes it.
     override open func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         let appDelegate = UIApplication.shared.delegate as? AppDelegate
         appDelegate?.deliverPendingConnectNavigation()
-        appDelegate?.deliverPendingVoiceCommand()
+        appDelegate?.deliverPendingCommandURL()
     }
 
     /// Bind foreground change detection to the currently-configured self-hosted

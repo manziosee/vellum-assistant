@@ -15,8 +15,10 @@
 
 import { beforeEach, describe, expect, mock, test } from "bun:test";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
+import * as reactRouter from "react-router";
 
 import {
   SIDEBAR_SECTION_MAX_HEIGHT,
@@ -26,6 +28,15 @@ import {
 mock.module("@/hooks/use-is-mobile", () => ({
   useIsMobile: () => false,
   MOBILE_MEDIA_QUERY: "(max-width: 767px)",
+}));
+
+/* `AssistantSwitcher` (inside `SideMenuBuiltInNav`) reads the route and
+   navigates after a successful switch, and its hooks run on every sidebar
+   render; these tests mount no router, so hand it no-ops. */
+mock.module("react-router", () => ({
+  ...reactRouter,
+  useNavigate: () => () => {},
+  useLocation: () => ({ pathname: "/assistant", search: "", hash: "" }),
 }));
 
 // The sidebar owns its Background/Scheduled lazy queries; stub both so static
@@ -47,10 +58,7 @@ function setSectionRows(conversations: Conversation[]) {
  * for "no group claimed it" AND its own `origin_channel`. Honoring only the
  * group would hand every channel card the whole ungrouped bucket.
  */
-function rowsMatching(filter: {
-  groupId?: string;
-  originChannel?: string;
-}): Conversation[] {
+function rowsMatching(filter: ConversationListFilter): Conversation[] {
   if (filter.groupId === "system:pinned") {
     return sectionSource.filter((c) => c.isPinned);
   }
@@ -83,16 +91,22 @@ mock.module(
     useSidebarSectionsQuery: () => null,
     useSectionConversationListQuery: (
       _assistantId: string | null,
-      filter: { groupId?: string; originChannel?: string },
-    ) => ({
-      conversations: rowsMatching(filter),
+      filter: ConversationListFilter | null,
+    ): ConversationQueries.ConversationListQueryResult => ({
+      conversations: filter === null ? [] : rowsMatching(filter),
       isLoading: false,
       isPending: false,
       isError: false,
+      error: null,
       // A resolved query. Omitting this reads as falsy, which would send every
       // section back to its derived rows and pass these tests for the wrong
       // reason: green because nothing is filtered, not because it is.
       hasData: true,
+      // A complete list: these tests exercise section rendering, not the
+      // load-more path, and a stub window would mount sentinels under every
+      // section.
+      hasMore: false,
+      refetch: () => {},
     }),
   }),
 );
@@ -106,6 +120,25 @@ mock.module(
   "@/assistant/operational-status",
   (): Partial<typeof OperationalStatus> => ({
     useAssistantIsServing: () => true,
+  }),
+);
+
+/* Pinned apps come from the daemon's app list. The pin list is a plain
+   variable rather than seeded query data because `SideMenuUnderTest` builds its
+   own QueryClient per render, so a test has nothing to seed. */
+let pinnedAppsFixture: AppSummary[] = [];
+
+mock.module(
+  "@/hooks/use-pinned-apps",
+  (): Partial<typeof UsePinnedApps> => ({
+    usePinnedApps: () => ({
+      pinnedApps: pinnedAppsFixture,
+      pinnedAppIds: new Set(pinnedAppsFixture.map((app) => app.id)),
+      source: "daemon" as const,
+      togglePin: () => {},
+      unpin: () => {},
+      setColor: () => {},
+    }),
   }),
 );
 
@@ -127,10 +160,13 @@ import type {
   Conversation,
   ConversationGroup,
 } from "@/types/conversation-types";
+import type { ConversationListFilter } from "@/utils/conversation-list-keys";
 import { AssistantSideMenu } from "@/domains/chat/components/assistant-side-menu";
+import { CONVERSATION_LIST_VIRTUALIZE_THRESHOLD } from "@/domains/chat/components/conversation-nav-section";
 import { useSidebarLayoutStore } from "@/domains/chat/sidebar-layout-store";
-import { usePinnedAppsStore } from "@/stores/pinned-apps-store";
-import type { PinnedAppEntry } from "@/utils/app-pin-storage";
+import type * as UsePinnedApps from "@/hooks/use-pinned-apps";
+import { makeAppSummary } from "@/types/app-summary.test-helper";
+import type { AppSummary } from "@/types/app-types";
 
 // Most of what follows describes the Grouped view's composition: the Chats
 // section, the per-channel sections, and the peer treatment they share with
@@ -157,6 +193,27 @@ function makeConversation(overrides: Partial<Conversation>): Conversation {
   };
 }
 
+/**
+ * The component under test behind a QueryClientProvider.
+ * `useSectionConversations` reads the query client for load-more and the
+ * bulk-path drain, so every render needs the context even though the query
+ * hooks themselves are mocked; a per-render client keeps tests isolated,
+ * and hooks resolve under `renderToStaticMarkup` too.
+ */
+function SideMenuUnderTest(
+  props: Parameters<typeof AssistantSideMenu>[0],
+): ReturnType<typeof AssistantSideMenu> {
+  return createElement(
+    QueryClientProvider,
+    {
+      client: new QueryClient({
+        defaultOptions: { queries: { retry: false } },
+      }),
+    },
+    createElement(AssistantSideMenu, props),
+  );
+}
+
 function renderMenu(props: {
   conversations: Conversation[];
   conversationGroups?: ConversationGroup[];
@@ -169,11 +226,12 @@ function renderMenu(props: {
   conversationsFailed?: boolean;
   onRetryConversations?: () => void;
   onWidthChange?: (width: number) => void;
+  includeNotificationsAction?: boolean;
 }): string {
   setSectionRows(props.conversations);
   const includeFooterAction = props.includeFooterAction ?? true;
   const { container } = render(
-    createElement(AssistantSideMenu, {
+    createElement(SideMenuUnderTest, {
       assistantId: "asst-1",
       collapsed: props.collapsed ?? false,
       variant: props.variant ?? "rail",
@@ -191,6 +249,9 @@ function renderMenu(props: {
         : undefined,
       tipCard: props.includeTipCard
         ? createElement("span", null, "TipSentinel")
+        : undefined,
+      notificationsAction: props.includeNotificationsAction
+        ? createElement("span", { "data-testid": "bell-stub" }, "Bell")
         : undefined,
     }),
   );
@@ -697,7 +758,7 @@ describe("AssistantSideMenu · overlay bottom scroll reserve", () => {
 
     try {
       const { container } = render(
-        createElement(AssistantSideMenu, {
+        createElement(SideMenuUnderTest, {
           assistantId: "asst-1",
           collapsed: false,
           variant: "overlay",
@@ -757,7 +818,7 @@ describe("AssistantSideMenu · new conversation affordance", () => {
 
   test("renders the New Chat row (below the assistant row) when onStartNewConversation is supplied", () => {
     const html = renderToStaticMarkup(
-      createElement(AssistantSideMenu, {
+      createElement(SideMenuUnderTest, {
         ...baseProps,
         onStartNewConversation: () => {},
       }),
@@ -774,7 +835,7 @@ describe("AssistantSideMenu · new conversation affordance", () => {
 
   test("omits the New Chat row when onStartNewConversation is absent", () => {
     const html = renderToStaticMarkup(
-      createElement(AssistantSideMenu, { ...baseProps }),
+      createElement(SideMenuUnderTest, { ...baseProps }),
     );
 
     expect(html).not.toContain(">New Chat<");
@@ -782,7 +843,7 @@ describe("AssistantSideMenu · new conversation affordance", () => {
 
   test("the overlay drawer omits the New Chat row — its floating pill owns the action", () => {
     const html = renderToStaticMarkup(
-      createElement(AssistantSideMenu, {
+      createElement(SideMenuUnderTest, {
         ...baseProps,
         variant: "overlay" as const,
         onStartNewConversation: () => {},
@@ -845,10 +906,14 @@ describe("AssistantSideMenu · native mobile floating glyph row", () => {
 
   test("the glyph row carries the floating placement utilities", () => {
     const container = overlayDom();
-    const row = classTokens(glyph(container, "Close navigation").parentElement);
+    // Queried by its own marker rather than walked up from a glyph, so the
+    // row keeps its contract when the clusters inside it are regrouped.
+    const row = classTokens(
+      container.querySelector('[data-slot="side-menu-glyph-row"]'),
+    );
 
     expect(row).toContain("native-mobile:absolute");
-    expect(row).toContain("native-mobile:inset-x-4");
+    expect(row).toContain("native-mobile:inset-x-3");
     expect(row).toContain("native-mobile:top-4");
     expect(row).toContain("native-mobile:z-10");
     expect(row).toContain("native-mobile:pointer-events-none");
@@ -865,20 +930,71 @@ describe("AssistantSideMenu · native mobile floating glyph row", () => {
     );
   });
 
+  test("search sits in the right cluster beside the notifications bell", () => {
+    const container = document.createElement("div");
+    container.innerHTML = renderMenu({
+      conversations,
+      variant: "overlay",
+      includeNotificationsAction: true,
+    });
+
+    // Mirrors the chat header's right cluster: search directly left of the
+    // bell, with the close glyph alone on the other side of the row.
+    const cluster = glyph(container, "Search (⌘K)").parentElement;
+    expect(cluster?.querySelector('[data-testid="bell-stub"]')).not.toBeNull();
+    expect(
+      cluster?.querySelector('[aria-label="Close navigation"]'),
+    ).toBeNull();
+  });
+
   test("the scroll body reserves the glyph band and carries both mask declarations", () => {
     const body = classTokens(
       overlayDom().querySelector('[data-slot="side-menu-body"]'),
     );
 
-    expect(body).toContain("native-mobile:pt-14");
+    // The reserve is the glyph row's own extent, measured off the 40px touch
+    // target an icon-only Button takes on a coarse pointer (its 16px offset
+    // plus that height, less the overlay inset this scrollport already sits
+    // behind). Sizing it off the mock's 32px box instead leaves the bottom
+    // 8px of each glyph over fully opaque content.
+    expect(body).toContain("native-mobile:pt-11");
     // Complete declarations, so the fade geometry is pinned too: a different
-    // stop or gradient direction is a different token.
+    // stop or gradient direction is a different token. The stop tracks the
+    // reserve, so a row is clear of the glyphs exactly when it is opaque.
     expect(body).toContain(
-      "native-mobile:[mask-image:linear-gradient(to_bottom,transparent,black_3.5rem)]",
+      "native-mobile:[mask-image:linear-gradient(to_bottom,transparent,black_2.75rem)]",
     );
     expect(body).toContain(
-      "native-mobile:[-webkit-mask-image:linear-gradient(to_bottom,transparent,black_3.5rem)]",
+      "native-mobile:[-webkit-mask-image:linear-gradient(to_bottom,transparent,black_2.75rem)]",
     );
+  });
+});
+
+describe("AssistantSideMenu · overlay section card geometry", () => {
+  // Class-presence pins: 12px vertical inset + 20px header row put the
+  // collapsed section pill at the overlay tile size (44px), level with the
+  // assistant pill.
+  test("the overlay card and its header carry the 44px pill geometry", () => {
+    const container = document.createElement("div");
+    container.innerHTML = renderMenu({
+      conversations: [makeConversation({ conversationId: "a", title: "Alpha" })],
+      variant: "overlay",
+    });
+
+    const card = container.querySelector('[data-slot="card"]');
+    const cardTokens = card ? Array.from(card.classList) : [];
+    expect(cardTokens).toContain("rounded-[16px]");
+    expect(cardTokens).toContain("pt-3");
+    expect(cardTokens).toContain("pb-3");
+    // Without this the Card's default transparent 1px border grows the
+    // border-box to 46px.
+    expect(cardTokens).toContain("border-0");
+
+    const header = container.querySelector(
+      '[data-slot="collapsible-nav-section-header"]',
+    );
+    const headerTokens = header ? Array.from(header.classList) : [];
+    expect(headerTokens).toContain("h-5");
   });
 });
 
@@ -906,7 +1022,7 @@ describe("AssistantSideMenu · section header menus", () => {
     archiveAll?: (label: string, conversations: Conversation[]) => void;
   }) {
     return render(
-      createElement(AssistantSideMenu, {
+      createElement(SideMenuUnderTest, {
         assistantId: "asst-1",
         collapsed: false,
         variant: "rail" as const,
@@ -957,8 +1073,15 @@ describe("AssistantSideMenu · section header menus", () => {
       ).find((el) => el.textContent?.includes("Archive All"));
       expect(item).toBeDefined();
     });
+    const before = received.length;
     act(() => {
       item!.click();
+    });
+    /* The handler fires after getAllRows() resolves (the section's full
+       membership, LUM-2444), one microtask after the click; wait for it
+       rather than reading synchronously. */
+    await waitFor(() => {
+      expect(received.length).toBeGreaterThan(before);
     });
     const last = received.at(-1);
     if (!last) {
@@ -1090,7 +1213,7 @@ describe("AssistantSideMenu · channel grouping toggle", () => {
     useSidebarLayoutStore.setState({ assistantId: null });
     setSectionRows(conversations);
     return render(
-      createElement(AssistantSideMenu, {
+      createElement(SideMenuUnderTest, {
         assistantId: "asst-1",
         collapsed: false,
         variant: "rail" as const,
@@ -1294,6 +1417,30 @@ describe("AssistantSideMenu · section spacing", () => {
   });
 });
 
+describe("AssistantSideMenu · section card surface", () => {
+  /* A conversation row rests transparent, so on touch the swipe layer wrapping
+     it is what actually paints behind the label. Left to its own default that
+     layer takes the panel surface, which is a different colour from the card,
+     and every row in the card reads as a sunken band. The card publishes its
+     own fill so the layer matches whatever the card is. */
+  test("every section card names the fill its swipeable rows sit on", () => {
+    const container = parse(
+      renderMenu({
+        conversations: LAYOUT_CONVERSATIONS,
+        conversationGroups: LAYOUT_GROUPS,
+      }),
+    );
+
+    const cards = sectionCards(container);
+    expect(cards).toHaveLength(4);
+    for (const card of cards) {
+      expect(card.className).toContain(
+        "[--swipe-reveal-bg:var(--surface-lift)]",
+      );
+    }
+  });
+});
+
 describe("AssistantSideMenu · default section order", () => {
   // The point of LUM-2909: groups are the deliberate organization layer, so
   // they lead rather than sitting under channel sections that come and go.
@@ -1332,12 +1479,11 @@ describe("AssistantSideMenu · default section order", () => {
   });
 });
 
-/* Membership in `sidebar.sections` and what renders have to be decided by
-   one predicate. When they were two - the list built unconditionally, the
-   section returning `null` when its query came back empty - `curatedSectionCount`
-   counted an entry nothing drew, so the curated rule appeared over an empty
-   tier and the header menu offered a move that swapped with an off-screen
-   section. */
+/* Membership in `sidebar.sections` and what renders are decided by one
+   predicate. Were they two, a section could be listed while drawing
+   nothing, and the header menu's move-up/move-down nudges count listed
+   entries: the menu would offer a move that swapped with a section the
+   user cannot see. */
 describe("AssistantSideMenu · a listed section is a rendered section", () => {
   test("a custom group with no conversations still renders its header", () => {
     const html = renderMenu({
@@ -1418,13 +1564,10 @@ describe("AssistantSideMenu · equal section treatment", () => {
   // used to be conditional on them.
   test("the collapsed rail's header carries no separator, pinned apps or not", () => {
     for (const pinnedApps of [
-      [] as PinnedAppEntry[],
-      [{ appId: "app-1", pinnedOrder: 0, name: "Vex Ops" }],
+      [],
+      [makeAppSummary({ id: "app-1", name: "Vex Ops", pinSortPosition: 1 })],
     ]) {
-      usePinnedAppsStore.setState({
-        pinnedApps,
-        pinnedAppIds: new Set(pinnedApps.map((a) => a.appId)),
-      });
+      pinnedAppsFixture = pinnedApps;
 
       const container = parse(
         renderMenu({
@@ -1446,7 +1589,7 @@ describe("AssistantSideMenu · equal section treatment", () => {
       ).toHaveLength(0);
     }
 
-    usePinnedAppsStore.setState({ pinnedApps: [], pinnedAppIds: new Set() });
+    pinnedAppsFixture = [];
   });
 
   // Pinned is the one section that doesn't cap: it grows to fit its own
@@ -1460,7 +1603,7 @@ describe("AssistantSideMenu · equal section treatment", () => {
     // A real DOM render, not `parse`: `scrollParent` only takes effect once
     // the sidebar body's ref has mounted.
     const { container } = render(
-      createElement(AssistantSideMenu, {
+      createElement(SideMenuUnderTest, {
         assistantId: "asst-1",
         collapsed: false,
         variant: "rail",
@@ -1507,7 +1650,7 @@ describe("AssistantSideMenu · equal section treatment", () => {
    */
   function renderRail(openSections: string[] = []) {
     const { container } = render(
-      createElement(AssistantSideMenu, {
+      createElement(SideMenuUnderTest, {
         assistantId: "asst-1",
         collapsed: false,
         variant: "rail",
@@ -1582,6 +1725,60 @@ describe("AssistantSideMenu · equal section treatment", () => {
     }
   });
 
+  /*
+   * Past CONVERSATION_LIST_VIRTUALIZE_THRESHOLD the bottom-most section
+   * windows its rows through virtuoso, and a windowed list renders only what
+   * fits its viewport: unlike mounted rows, it has no natural height of its
+   * own. Its box therefore needs two things, and losing either blanks the
+   * whole list while the caches stay fully populated: the accordion root must
+   * forward the sidebar body's height down to the card's flex-fill, and the
+   * box itself must floor at the section cap so a squeezed (or broken) chain
+   * still yields a scrollable section rather than a zero-height one.
+   */
+  test("past the virtualize threshold, Chats windows into a bounded, filling box", () => {
+    localStorage.setItem("vellum:sidebar-view-mode:asst-1", "all");
+    const container = parse(
+      renderMenu({
+        conversations: Array.from(
+          { length: CONVERSATION_LIST_VIRTUALIZE_THRESHOLD + 1 },
+          (_, index) =>
+            makeConversation({
+              conversationId: `r${index}`,
+              title: `Recent ${index}`,
+            }),
+        ),
+      }),
+    );
+
+    const sections = sectionElements(container);
+    const labels = sectionLabels(container);
+    const chats = sections[labels.indexOf("Chats")];
+    if (!chats) {
+      throw new Error("expected the Chats section");
+    }
+
+    // The windowed path: virtuoso owns the rows, no mounted scroller.
+    expect(chats.querySelector(".overflow-y-auto")).toBeNull();
+    const windowed = chats.querySelector<HTMLElement>(
+      '[data-slot="virtual-list"]',
+    );
+    if (!windowed?.parentElement) {
+      throw new Error("expected the windowed row list and its sizing box");
+    }
+
+    const box = windowed.parentElement;
+    expect(box.classList.contains("flex-1")).toBe(true);
+    expect(box.style.minHeight).toBe(`${SIDEBAR_SECTION_MAX_HEIGHT}px`);
+
+    // The fill above the floor only resolves if the accordion root passes
+    // the body's height to the card's flex-fill.
+    const root = container.querySelector<HTMLElement>(
+      '[data-slot="collapsible"]',
+    );
+    expect(root?.classList.contains("flex-1")).toBe(true);
+    expect(root?.classList.contains("min-h-0")).toBe(true);
+  });
+
   test("every section renders through the same component with the same affordances", () => {
     const container = parse(
       renderMenu({
@@ -1646,7 +1843,7 @@ describe("AssistantSideMenu · section reordering", () => {
      `onDragLeave`) - the guard, not the position, is what holds this. */
   test("the card is the drag handle, the drag image and the drop edge", async () => {
     const { container } = render(
-      createElement(AssistantSideMenu, {
+      createElement(SideMenuUnderTest, {
         assistantId: "asst-1",
         collapsed: false,
         variant: "rail" as const,
@@ -1753,7 +1950,7 @@ describe("AssistantSideMenu · section reordering", () => {
     "%s offers the move actions its position allows",
     async (label, expected) => {
       const { container } = render(
-        createElement(AssistantSideMenu, {
+        createElement(SideMenuUnderTest, {
           assistantId: "asst-1",
           collapsed: false,
           variant: "rail" as const,

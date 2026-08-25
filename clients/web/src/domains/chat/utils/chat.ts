@@ -5,15 +5,11 @@ import {
 import type { IdentityGetResponse } from "@/generated/daemon/types.gen";
 import type { Conversation } from "@/types/conversation-types";
 import type { AssistantEvent } from "@/types/event-types";
-import { isToolCallRunning } from "@/domains/chat/utils/tool-call-status";
 import { mapMessageToolCalls } from "@/domains/chat/utils/map-message-tool-calls";
 import type {
-  AllowlistOption,
-  DirectoryScopeOption,
   PendingAcpConnectState,
   PendingConfirmationState,
   PendingQuestionState,
-  ScopeOption,
 } from "@/types/interaction-ui-types";
 import {
   ACP_CLAUDE_AUTH_REQUIRED_CODE,
@@ -22,6 +18,11 @@ import {
 import type { ChatMessageToolCall } from "@/domains/chat/api/event-types";
 import type { PendingToolConfirmation } from "@vellumai/assistant-api";
 import type { ToolCallRuleContext } from "@/domains/chat/rule-editor-actions";
+import { t } from "@/i18n";
+import {
+  clientOsDisplayName,
+  detectClientOs,
+} from "@/runtime/platform-detection";
 
 export const ERROR_MESSAGES: Record<string, string> = {
   rate_limit_exceeded: "Too many requests. Please wait a moment and try again.",
@@ -47,6 +48,8 @@ const GLOBAL_STREAM_EVENT_TYPE_NAMES = [
   "avatar_updated",
   "sync_changed",
   "disk_pressure_status_changed",
+  // Workspace-wide resource-pressure broadcast, no `conversationId`.
+  "resource_pressure_status_changed",
   // App source-file change broadcast — carries an `appId`, not a
   // `conversationId`; clients re-read the app on receipt.
   "app_files_changed",
@@ -144,6 +147,11 @@ const GLOBAL_STREAM_EVENT_TYPE_NAMES = [
   // *different* conversation), so gate them as global rather than through the
   // conversation-id filter.
   "notification_conversation_created",
+  // A watch session's retrospective finishing announces a conversation other
+  // than the active one: the report lands in the session's own background
+  // thread, and the user is by definition working somewhere else when a session
+  // ends. Routed by session id rather than against the open conversation.
+  "watch_retro_completed",
   "recording_start",
   "recording_stop",
   "recording_pause",
@@ -262,8 +270,6 @@ const VOICE_ERROR_MESSAGES: Readonly<Record<string, string>> = {
   "stt-unavailable":
     "Speech-to-text is temporarily unavailable. Try again in a moment.",
   "stt-timeout": "Transcription took too long. Try a shorter recording.",
-  "native-stt-no-transcript":
-    "macOS dictation didn’t return a transcript. Make sure Dictation is turned on in System Settings → Keyboard → Dictation, then try again.",
   "dictation-automation-denied":
     "Dictation needs Automation permission to paste into other apps.",
   "dictation-paste-blocked":
@@ -271,6 +277,11 @@ const VOICE_ERROR_MESSAGES: Readonly<Record<string, string>> = {
 };
 
 export function formatVoiceError(code: string): string {
+  if (code === "native-stt-no-transcript") {
+    return t("chat:voiceErrors.nativeSttNoTranscript", {
+      clientName: clientOsDisplayName(detectClientOs()),
+    });
+  }
   return (
     VOICE_ERROR_MESSAGES[code] ??
     `Voice input failed (${code}). Try again or type your message.`
@@ -350,30 +361,21 @@ function applyConfirmationToToolCall(
 }
 
 /**
- * Attach a pending confirmation to the best-matching tool call in `messages`.
+ * Attach a pending confirmation to the tool call it names, if it names one.
  *
- * Search order:
- * 1. Exact `toolUseId` match (conf.toolUseId === toolCall.id)
- * 2. Fallback: last running tool call in the latest assistant message with tool calls
+ * A confirmation carries `toolUseId` when it belongs to a specific tool call
+ * and omits it when it belongs to none: `permissions/prompter.ts` passes the
+ * LLM's tool_use block id, while the ACP route approvals in
+ * `runtime/routes/acp-routes.ts` have no tool call of their own. So an absent
+ * `toolUseId` is an answer, not a gap, and this makes no attempt to guess one.
+ * Prompts that name no tool call stay unattached and render in the transcript's
+ * trailer row, which exists for exactly them.
  *
  * Returns updated messages and the id of the attached tool call (or undefined).
  */
 export function attachConfirmationToToolCall(
   messages: DisplayMessage[],
-  conf: {
-    requestId: string;
-    title?: string;
-    description?: string;
-    toolName?: string;
-    riskLevel?: string;
-    riskReason?: string;
-    input?: Record<string, unknown>;
-    allowlistOptions?: AllowlistOption[];
-    scopeOptions?: ScopeOption[];
-    directoryScopeOptions?: DirectoryScopeOption[];
-    persistentDecisionsAllowed?: boolean;
-    toolUseId?: string;
-  },
+  conf: PendingConfirmationState,
 ): {
   updatedMessages: DisplayMessage[];
   attachedToolCallId: string | undefined;
@@ -381,7 +383,6 @@ export function attachConfirmationToToolCall(
   const { toolUseId, ...pendingFields } = conf;
   const pending: PendingToolConfirmation = pendingFields;
 
-  // 1. Exact toolUseId match — search all messages with tool calls
   if (toolUseId) {
     for (let mi = messages.length - 1; mi >= 0; mi--) {
       const msg = messages[mi];
@@ -393,22 +394,6 @@ export function attachConfirmationToToolCall(
         return applyConfirmationToToolCall(messages, mi, tcIdx, pending);
       }
     }
-  }
-
-  // 2. Fallback: last running tool call in the latest assistant message with tool calls
-  for (let mi = messages.length - 1; mi >= 0; mi--) {
-    const msg = messages[mi];
-    if (msg?.role !== "assistant" || !msg.toolCalls?.length) {
-      continue;
-    }
-
-    for (let ti = msg.toolCalls.length - 1; ti >= 0; ti--) {
-      const tc = msg.toolCalls[ti];
-      if (tc && isToolCallRunning(tc)) {
-        return applyConfirmationToToolCall(messages, mi, ti, pending);
-      }
-    }
-    break;
   }
 
   return { updatedMessages: messages, attachedToolCallId: undefined };

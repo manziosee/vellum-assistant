@@ -104,6 +104,7 @@ const ASSISTANT_SUPPORTED_COMMAND_PATHS = [
   "conversations defer list",
   "conversations defer cancel",
   "conversations list",
+  "conversations search",
   "conversations new",
   "conversations rename",
   "conversations export",
@@ -174,6 +175,7 @@ const ASSISTANT_SUPPORTED_COMMAND_PATHS = [
   "mcp remove",
   "memory",
   "memory ingest",
+  "memory validate",
   "memory nodes",
   "memory nodes stats",
   "memory nodes list",
@@ -671,6 +673,11 @@ const riskOverrides: AssistantRiskOverride[] = [
     path: "memory v2 activation",
     risk: "medium",
     reason: "Enqueues recompute of persisted activation state",
+  },
+  {
+    path: "memory validate",
+    risk: "low",
+    reason: "Read-only diagnostic walk over concept pages and links",
   },
   {
     path: "memory v2 validate",

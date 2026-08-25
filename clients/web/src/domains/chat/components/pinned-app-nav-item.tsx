@@ -3,21 +3,22 @@ import { PinOff, Rocket } from "lucide-react";
 import { SwipeActionReveal } from "@/components/swipe-action-reveal";
 import { PinnedAppColorSwatches } from "@/domains/chat/components/pinned-app-color-swatches";
 import { pinTintStyle } from "@/domains/chat/utils/pin-color-registry";
-import { usePinnedAppsStore } from "@/stores/pinned-apps-store";
-import type { PinnedAppEntry } from "@/utils/app-pin-storage";
-import { isPointerCoarse } from "@/utils/pointer";
+import { useTranslation } from "@/i18n";
+import type { PinnedAppView } from "@/hooks/pinned-apps";
 import type { SwipeAction } from "@/hooks/use-swipe-to-reveal";
-import {
-  ContextMenu,
-  PanelItem,
-  SideMenu,
-} from "@vellumai/design-library";
+import { ContextMenu, PanelItem, SideMenu } from "@vellumai/design-library";
 
 export interface PinnedAppNavItemProps {
-  app: PinnedAppEntry;
+  app: PinnedAppView;
   active: boolean;
   collapsed: boolean;
   onOpen?: (appId: string) => void;
+  /**
+   * Pin actions, owned by the block that lists the pins. It holds the assistant
+   * id the pin is written against, so a row never has to know one.
+   */
+  onUnpin: (appId: string) => void;
+  onSetColor: (appId: string, color: string | null) => void;
 }
 
 /**
@@ -31,9 +32,8 @@ export interface PinnedAppNavItemProps {
  * with the row, because collapsing changes the shape of a thing and not what
  * colour it is.
  *
- * The unpin lives here because it is the only place a stale pin can be
- * cleared: a deleted app never appears in the Library, so its card-level
- * unpin is unreachable, leaving the sidebar entry orphaned.
+ * The unpin lives here as well as on the Library card so a pin can be cleared
+ * from the place it is showing, without first finding the app it points at.
  *
  * Both shapes carry the menu, because the rail changes what a pinned app
  * looks like and not what can be done to it. The collapsed tile depends on it
@@ -44,21 +44,22 @@ export interface PinnedAppNavItemProps {
  * swipe. The tile omits that: it has nowhere to swipe to, and the actions a
  * swipe reveals are sized for a full-width row.
  *
- * On desktop, a third path: a hover-revealed unpin button on the row's
- * trailing edge. `SideMenu.Item` has no `trailingAction` slot (unlike
- * `PanelItem`), and it renders as a real `<button>` when `onSelect` is
- * given, so the unpin button can't nest inside it: it's a sibling,
- * absolutely positioned over the row's right edge by their shared
- * `relative` wrapper.
+ * A third path on the expanded row: an unpin button on its trailing edge,
+ * revealed with the row where the device can hover and standing there where it
+ * cannot. The row has one command, so hiding it would leave a screen reader and
+ * a switch control nothing to announce: a swipe's buttons are outside the
+ * accessibility tree until the swipe reveals them, and neither a swipe nor a
+ * long press is a control anything can name.
  */
 export function PinnedAppNavItem({
   app,
   active,
   collapsed,
   onOpen,
+  onUnpin,
+  onSetColor,
 }: PinnedAppNavItemProps) {
-  const unpin = usePinnedAppsStore.use.unpin();
-  const setColor = usePinnedAppsStore.use.setColor();
+  const { t } = useTranslation("chat");
 
   /* The pin's colour, as the three custom properties both shapes read, and
      `undefined` on an uncoloured pin so neither shape sees a declaration and
@@ -69,7 +70,7 @@ export function PinnedAppNavItem({
      rail column, and a wrapper would become the thing it centres in. A custom
      property resolves on the element that declares it, so one mechanism
      covers both shapes. */
-  const tintStyle = pinTintStyle(app.color);
+  const tintStyle = pinTintStyle(app.pinColor);
 
   const sideMenuItem = (
     <SideMenu.Item
@@ -83,7 +84,7 @@ export function PinnedAppNavItem({
       shape="tile"
       showCollapsedTooltip
       active={active}
-      onSelect={onOpen ? () => onOpen(app.appId) : undefined}
+      onSelect={onOpen ? () => onOpen(app.id) : undefined}
       className="text-[color:var(--content-default)]"
     />
   );
@@ -95,15 +96,15 @@ export function PinnedAppNavItem({
   const menu = (
     <ContextMenu.Content onClick={(event) => event.stopPropagation()}>
       <PinnedAppColorSwatches
-        value={app.color}
-        onChange={(color) => setColor(app.appId, color)}
+        value={app.pinColor}
+        onChange={(color) => onSetColor(app.id, color)}
       />
       <ContextMenu.Separator />
       <ContextMenu.Item
         leftIcon={<PinOff size={14} />}
-        onSelect={() => unpin(app.appId)}
+        onSelect={() => onUnpin(app.id)}
       >
-        Unpin
+        {t("pinnedAppNavItem.unpin")}
       </ContextMenu.Item>
     </ContextMenu.Content>
   );
@@ -146,21 +147,16 @@ export function PinnedAppNavItem({
       }
       label={app.name}
       active={active}
-      onSelect={onOpen ? () => onOpen(app.appId) : undefined}
+      onSelect={onOpen ? () => onOpen(app.id) : undefined}
       trailingAction={
         <button
           type="button"
-          aria-label={`Unpin ${app.name}`}
+          aria-label={t("pinnedAppNavItem.unpinAria", { name: app.name })}
           onClick={(event) => {
             event.stopPropagation();
-            unpin(app.appId);
+            onUnpin(app.id);
           }}
-          /* Desktop-only affordance: touch has no hover to reveal it first,
-             so without this a tap in this corner would unpin the app instead
-             of opening it. Touch has the swipe and long-press paths below.
-             `focus-visible:pointer-events-auto` keeps it reachable for
-             keyboard and switch-control on a touch device. */
-          className="flex h-5 w-5 items-center justify-center rounded-[4px] text-[var(--content-tertiary)] opacity-0 transition-opacity hover:bg-[var(--surface-hover)] hover:text-[var(--content-secondary)] group-hover/panel-item:opacity-100 focus-visible:opacity-100 pointer-coarse:pointer-events-none pointer-coarse:focus-visible:pointer-events-auto"
+          className="flex h-5 w-5 items-center justify-center rounded-[4px] text-[var(--content-tertiary)] hover:bg-[var(--surface-hover)] hover:text-[var(--content-secondary)]"
         >
           <PinOff size={12} aria-hidden />
         </button>
@@ -168,17 +164,17 @@ export function PinnedAppNavItem({
     />
   );
 
-  const trailingActions: SwipeAction[] = isPointerCoarse()
-    ? [
-        {
-          id: "unpin",
-          label: "Unpin",
-          icon: PinOff,
-          variant: "destructive",
-          onSelect: () => unpin(app.appId),
-        },
-      ]
-    : [];
+  /* Ungated: `SwipeActionReveal` arms the gesture only where a swipe is the
+     input, and passes through untouched everywhere else. */
+  const trailingActions: SwipeAction[] = [
+    {
+      id: "unpin",
+      label: t("pinnedAppNavItem.unpin"),
+      icon: PinOff,
+      variant: "destructive",
+      onSelect: () => onUnpin(app.id),
+    },
+  ];
 
   return (
     <ContextMenu.Root>

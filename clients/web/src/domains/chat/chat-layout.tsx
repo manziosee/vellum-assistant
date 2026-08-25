@@ -40,24 +40,30 @@ import {
 
 import { useChatLayoutSlotsStore } from "@/components/layout/chat-layout-slots-store";
 import { useElectronDockSync } from "@/domains/chat/hooks/use-electron-dock-sync";
+import { useNativeRecentChatsSync } from "@/domains/chat/hooks/use-native-recent-chats-sync";
+import { useNativeWidgetSnapshotSync } from "@/domains/chat/hooks/use-native-widget-snapshot-sync";
 import { useOpenAppFromChat } from "@/domains/chat/hooks/use-open-app-from-chat";
+import { DRAWER_SURFACE_BACKGROUND } from "@/domains/chat/utils/drawer-surface";
 import {
   EDGE_SWIPE_EASING,
   EDGE_SWIPE_SLIDE_MS,
 } from "@/hooks/edge-swipe-motion";
-import { useEdgeSwipeDrawer } from "@/hooks/use-edge-swipe-drawer";
+import { useSoftKeyboardOpen } from "@/hooks/use-keyboard-open";
+import { useSwipeDownDismissKeyboard } from "@/hooks/use-swipe-down-dismiss-keyboard";
 import { useCommandPaletteStore } from "@/stores/command-palette-store";
 import { useMobileDrawerStore } from "@/stores/mobile-drawer-store";
-import { useEdgeSwipeArbiterStore } from "@/stores/edge-swipe-arbiter-store";
 
 import { useActiveConversation } from "@/domains/chat/hooks/use-active-conversation";
 import { useAttentionTracking } from "@/domains/chat/hooks/use-attention-tracking";
+import { isTranscriptOnScreen } from "@/domains/chat/utils/transcript-visibility";
 import { useChatLayoutDrawer } from "@/domains/chat/hooks/use-chat-layout-drawer";
+import { useChatLayoutDrawerGestures } from "@/domains/chat/hooks/use-chat-layout-drawer-gestures";
 import { useChatLayoutShortcuts } from "@/domains/chat/hooks/use-chat-layout-shortcuts";
 import { useConversationActions } from "@/domains/chat/hooks/use-conversation-actions";
 import { useConversationGroupActions } from "@/domains/chat/hooks/use-conversation-group-actions";
+import { useMaterializedDraftReconcile } from "@/domains/chat/hooks/use-materialized-draft-reconcile";
 import { useGroupNameRequestStore } from "@/domains/chat/group-name-request-store";
-import { useCanUseLlmInspector } from "@/domains/chat/inspector/access";
+import { useCanUseInternalThreadActions } from "@/lib/auth/internal-thread-actions";
 import {
   navigateToConversation,
   navigateToNewConversation,
@@ -102,8 +108,13 @@ import {
   ArchiveAllConfirmDialog,
   useArchiveAllConfirmation,
 } from "./components/archive-all-confirm-dialog";
+import {
+  DeleteConversationConfirmDialog,
+  useDeleteConversationConfirmation,
+} from "./components/delete-conversation-confirm-dialog";
 import { GroupNameDialogFromStore } from "./group-name-dialog-from-store";
 import { RenameDialogFromStore } from "./rename-dialog-from-store";
+import { useTranslation } from "@/i18n";
 
 const CommandPalette = lazy(() =>
   import("@/components/command-palette/command-palette").then((m) => ({
@@ -160,6 +171,7 @@ export function ChatLayout({
    */
   topBarAccessory?: ReactNode;
 } = {}) {
+  const { t } = useTranslation("chat");
   const navigate = useNavigate();
   const location = useLocation();
   const navigationType = useNavigationType();
@@ -214,13 +226,34 @@ export function ChatLayout({
   const {
     conversations,
     isLoading: isLoadingConversations,
+    isPending: isConversationListPending,
     isError: conversationsFailed,
     refetch: retryConversations,
   } = useConversationListQuery(assistantId, isAssistantActive);
-  const { conversationGroups } = useConversationGroupsQuery(
-    assistantId,
-    isAssistantActive,
-  );
+  const {
+    conversationGroups,
+    isPending: isGroupsPending,
+    isError: groupsFailed,
+  } = useConversationGroupsQuery(assistantId, isAssistantActive);
+
+  // A client-minted conversation key stops being a draft once the server's own
+  // list carries a row for it. Mounted against the list this layout already
+  // subscribes to, so it costs no request. See
+  // `./hooks/use-materialized-draft-reconcile.ts`.
+  useMaterializedDraftReconcile(conversations);
+
+  // Whether the transcript is on screen, resolved here because this is where
+  // the route, the viewer and the viewport are all in hand. One owner, so
+  // consumers cannot disagree about it.
+  const isMobile = useIsMobile();
+  const viewerMainView = useViewerStore.use.mainView();
+  const viewerAppMinimized = useViewerStore.use.isAppMinimized();
+  const transcriptOnScreen = isTranscriptOnScreen({
+    pathname: location.pathname,
+    mainView: viewerMainView,
+    isAppMinimized: viewerAppMinimized,
+    isNarrow: isMobile,
+  });
 
   // Track processing/attention indicators for every conversation in
   // the sidebar, on every chat-layout child route. Mounted at layout
@@ -230,6 +263,7 @@ export function ChatLayout({
   useAttentionTracking({
     assistantId,
     assistantStateKind,
+    isTranscriptOnScreen: transcriptOnScreen,
   });
 
   // Group CRUD handlers live at the layout level since the sidebar's
@@ -248,6 +282,38 @@ export function ChatLayout({
   // `./hooks/use-electron-dock-sync.ts`.
   useElectronDockSync(assistantId, conversations, isAssistantActive);
 
+  // Mirror the same list into the iOS shell's recent-chats cache, which backs
+  // the Shortcuts app's chat picker ("Send Message to Chat"). No-op off
+  // Capacitor iOS. Resolved means the query has actually SUCCEEDED: pending
+  // (loading, or gated on the assistant/pod) and error both serve the `[]`
+  // fallback, and either would wipe the last-known-good native cache. The
+  // error case is live, not theoretical: a pod that is waking 503s the list
+  // through its whole retry budget into a terminal error (#40621).
+  useNativeRecentChatsSync(
+    conversations,
+    !isConversationListPending && !conversationsFailed,
+  );
+
+  // And into the iOS shell's widget snapshot, which backs the Home Screen
+  // widgets (unread and in-progress counts, the three most recent chats).
+  // No-op off Capacitor iOS, and resolved carries the same meaning it does
+  // for the recent-chats sync above: an unresolved `[]` would blank the
+  // widgets for as long as the list failed to load. It covers BOTH queries
+  // here, because the widget snapshot carries group subtitles as well as the
+  // rows, and the groups query serves its own `[]` fallback while pending,
+  // gated, or errored: either input resolving alone would overwrite a valid
+  // snapshot with one whose subtitles are all missing.
+  useNativeWidgetSnapshotSync(
+    assistantId,
+    conversations,
+    conversationGroups,
+    isAssistantActive,
+    !isConversationListPending &&
+      !conversationsFailed &&
+      !isGroupsPending &&
+      !groupsFailed,
+  );
+
   // Header slots come from a module-level store so gated routes
   // (which see `ActiveAssistantGate`'s `<Outlet />` as their
   // nearest outlet) can register content without the lost-Provider
@@ -262,7 +328,7 @@ export function ChatLayout({
   const topBarCenterSlot = useChatLayoutSlotsStore.use.topBarCenter();
   const headerSupplements = useChatLayoutSlotsStore.use.headerSupplements();
   const topBarRightSlot = useChatLayoutSlotsStore.use.topBarRightSlot();
-  const showLlmInspector = useCanUseLlmInspector();
+  const showInternalActions = useCanUseInternalThreadActions();
   const isNative = useIsNativePlatform();
   const electron = isElectron();
   // In-chat onboarding prototype: the tour's opening beats hide the sidebar
@@ -414,7 +480,9 @@ export function ChatLayout({
       // without the design library's own padding and border (the page draws
       // that chrome), and the collapsed rail sizes its tile as content, so
       // nothing is added around it.
-      const targetWidth = effectiveCollapsed ? SIDE_MENU_TILE_SIZE : sidebarWidth;
+      const targetWidth = effectiveCollapsed
+        ? SIDE_MENU_TILE_SIZE
+        : sidebarWidth;
       railFocusAnimationsRef.current = [
         aside.animate(
           [
@@ -431,17 +499,11 @@ export function ChatLayout({
     }
   }, [chatFocusActive, sideMenuAside, effectiveCollapsed, sidebarWidth]);
 
-  const isMobile = useIsMobile();
   const [drawerOpen, setDrawerOpen] = useState<boolean>(false);
-  // True while a left-edge swipe is dragging the drawer in from off-screen but
-  // has not yet committed open; keeps the panel mounted so its transform can
-  // track the finger before `drawerOpen` flips.
-  const [drawerDragging, setDrawerDragging] = useState<boolean>(false);
 
   useEffect(() => {
     if (!isMobile) {
       setDrawerOpen(false);
-      setDrawerDragging(false);
     }
   }, [isMobile]);
 
@@ -482,23 +544,6 @@ export function ChatLayout({
   const voiceRoomVisible = useIsVoiceRoomVisible();
 
   const drawerVisible = isMobile && drawerOpen;
-
-  // Publish for surfaces that render outside this tree and would otherwise
-  // paint over the drawer; see `mobile-drawer-store`. Mirrors the same
-  // condition the drawer itself mounts on, so the two can't disagree.
-  //
-  // Layout effect, not passive: a passive effect runs after the browser can
-  // paint, so the drawer's first frame would go up with the store still
-  // reporting false and the peek still portaled over it. Publishing before
-  // paint means the two never disagree on screen.
-  const drawerPresented = drawerVisible || drawerDragging;
-  const setDrawerPresented = useMobileDrawerStore.use.setPresented();
-  useLayoutEffect(() => {
-    setDrawerPresented(drawerPresented);
-    return () => {
-      setDrawerPresented(false);
-    };
-  }, [drawerPresented, setDrawerPresented]);
 
   const toggleSidebar = useCallback(() => {
     // The tour forces the rail expanded; a toggle would only flip the
@@ -545,34 +590,54 @@ export function ChatLayout({
     onClose: closeDrawer,
   });
 
-  // Swipe-to-open-menu: track the drawer in from the left edge, committing open
-  // past threshold. Suppressed whenever a back-swipe owner is active (a pushed
-  // page under this layout) so a single left-edge swipe resolves to exactly one
-  // action — back-navigation on detail pages, open-menu at the stack root.
-  // Also suppressed while a swipe-action row is revealed anywhere under the
-  // layout (e.g. a library card showing Pin/Delete): swiping the open row back
-  // toward centre must close it, matching the iOS table-row model where the
-  // open row owns the gesture and the enclosing container yields.
-  const backSwipeOwnerCount = useEdgeSwipeArbiterStore.use.backOwnerCount();
-  const openRowCount = useEdgeSwipeArbiterStore.use.openRowCount();
-  useEdgeSwipeDrawer({
+  // Swipe-to-open from the left edge and swipe-to-close on the panel, plus the
+  // presence the closing slide needs. See the hook for where each gesture
+  // yields and why the panel outlives `drawerOpen`.
+  const drawerGestures = useChatLayoutDrawerGestures({
     panelRef: drawerRef,
-    enabled:
-      isMobile &&
-      !drawerOpen &&
-      backSwipeOwnerCount === 0 &&
-      openRowCount === 0,
-    onDragStart: () => setDrawerDragging(true),
+    isMobile,
+    open: drawerOpen,
     onOpen: () => {
       // Same as the button path: swiping the drawer in over a focused
       // composer must blur it so iOS dismisses the soft keyboard, otherwise
       // the drawer slides in behind a raised keyboard and looks stuck.
       (document.activeElement as HTMLElement | null)?.blur();
       setDrawerOpen(true);
-      setDrawerDragging(false);
     },
-    onSettle: () => setDrawerDragging(false),
+    onClose: closeDrawer,
   });
+
+  // Publish for surfaces that render outside this tree and would otherwise
+  // paint over the drawer; see `mobile-drawer-store`. Mirrors the same
+  // condition the drawer itself mounts on, so the two can't disagree: the
+  // panel is still on screen through its closing slide, so the peek stays
+  // parked until the slide ends.
+  //
+  // Layout effect, not passive: a passive effect runs after the browser can
+  // paint, so the drawer's first frame would go up with the store still
+  // reporting false and the peek still portaled over it. Publishing before
+  // paint means the two never disagree on screen.
+  const drawerPresented = isMobile && drawerGestures.present;
+  const setDrawerPresented = useMobileDrawerStore.use.setPresented();
+  useLayoutEffect(() => {
+    setDrawerPresented(drawerPresented);
+    return () => {
+      setDrawerPresented(false);
+    };
+  }, [drawerPresented, setDrawerPresented]);
+
+  // Swipe-down-to-dismiss-keyboard. Armed only while the soft keyboard is up,
+  // so it costs nothing the rest of the time and cannot shadow the drawer
+  // gestures above. It listens on `document` rather than on a container
+  // because the whole surface over the keyboard should answer to it: the
+  // thread, the banners, the composer chrome and the header alike, not just
+  // the one scrollable strip a drag happens to land in.
+  //
+  // Gated on the keyboard alone, not on `useKeyboardOpen()`'s phone-width
+  // variant: an iPad in landscape sits far above the mobile breakpoint and
+  // still raises a soft keyboard. The hook's own coarse-pointer check is what
+  // keeps the gesture off pointer devices.
+  useSwipeDownDismissKeyboard({ enabled: useSoftKeyboardOpen() });
 
   const activeConversationId = useConversationStore.use.activeConversationId();
   const processingConversationIds =
@@ -588,7 +653,7 @@ export function ChatLayout({
     [navigate],
   );
 
-  // --- Sidebar conversation actions (pin / rename / archive / mark / move) ---
+  // --- Sidebar conversation actions (pin / rename / archive / delete / mark / move) ---
   //
   // The sidebar's hover-revealed "…" menu reads its items from these
   // handlers; without them the popover renders empty (every menu item
@@ -601,6 +666,7 @@ export function ChatLayout({
   const {
     handleArchiveConversation,
     handleUnarchiveConversation,
+    handleDeleteConversation,
     handleMarkConversationUnread,
     handleMarkConversationRead,
     handleTogglePinConversation,
@@ -629,6 +695,16 @@ export function ChatLayout({
   } = useArchiveAllConfirmation({
     assistantId,
     archiveAllInGroup: handleArchiveAllInGroup,
+  });
+
+  const {
+    pending: pendingDeleteConversation,
+    requestDelete,
+    confirmDelete,
+    cancelDelete,
+  } = useDeleteConversationConfirmation({
+    assistantId,
+    deleteConversation: handleDeleteConversation,
   });
 
   // The move-to-group menu's "New group…" item and the group actions menu's
@@ -687,17 +763,14 @@ export function ChatLayout({
         assistantId={assistantId}
         activeConversation={activeConversation}
         headerSupplements={headerSupplements}
-        showLlmInspector={showLlmInspector}
-        conversationGroups={conversationGroups}
+        showInternalActions={showInternalActions}
         onArchive={handleArchiveConversation}
         onUnarchive={handleUnarchiveConversation}
+        onDelete={requestDelete}
         onMarkUnread={handleMarkConversationUnread}
         onMarkRead={handleMarkConversationRead}
         onPinToggle={handleTogglePinConversation}
         onRename={handleRenameConversation}
-        onMoveToGroup={handleMoveToGroup}
-        onCreateGroupInto={handleRequestCreateGroup}
-        onRemoveFromGroup={handleRemoveFromGroup}
       />
     ) : null);
 
@@ -726,6 +799,17 @@ export function ChatLayout({
     }
   }, [commandPalette.isOpen, paletteEverOpened]);
 
+  // Menu commands that act on the open conversation take the row from
+  // `activeConversation`, which resolves background, scheduled, and archived
+  // threads the foreground `conversations` list deliberately omits. They
+  // no-op while no conversation is open.
+  const withActiveConversation =
+    (action: (conversation: Conversation) => void) => () => {
+      if (activeConversation) {
+        action(activeConversation);
+      }
+    };
+
   // Electron host commands (File menu / global hotkeys). The hook is a
   // no-op on the web host. Handlers close over the latest state via an
   // internal ref, so we don't need to memoize them. Composer focus is
@@ -747,17 +831,8 @@ export function ChatLayout({
       }
       requestComposerFocus();
     },
-    markCurrentUnread: () => {
-      if (!activeConversationId) {
-        return;
-      }
-      const conversation = conversations.find(
-        (c) => c.conversationId === activeConversationId,
-      );
-      if (conversation) {
-        handleMarkConversationUnread(conversation);
-      }
-    },
+    markCurrentUnread: withActiveConversation(handleMarkConversationUnread),
+    togglePinConversation: withActiveConversation(handleTogglePinConversation),
     markAllRead: () => {
       void handleMarkAllReadInGroup(conversations);
     },
@@ -933,6 +1008,7 @@ export function ChatLayout({
       onRenameConversation={handleRenameConversation}
       onArchiveConversation={handleArchiveConversation}
       onUnarchiveConversation={handleUnarchiveConversation}
+      onDeleteConversation={requestDelete}
       onMarkConversationUnread={handleMarkConversationUnread}
       onMarkConversationRead={handleMarkConversationRead}
       onCreateGroup={handleRequestCreateEmptyGroup}
@@ -941,10 +1017,17 @@ export function ChatLayout({
       onMarkAllReadInGroup={handleMarkAllReadInGroup}
       onArchiveAllInGroup={requestArchiveAll}
       onOpenInNewWindow={isNative ? undefined : handleOpenInNewWindow}
-      onInspect={showLlmInspector ? handleInspectConversation : undefined}
+      onInspect={showInternalActions ? handleInspectConversation : undefined}
+      showInternalActions={showInternalActions}
       onMoveToGroup={handleMoveToGroup}
       onCreateGroupInto={handleRequestCreateGroup}
       onRemoveFromGroup={handleRemoveFromGroup}
+      /* The same injected control the header carries, restated in the
+         drawer's glyph row where the mock puts it. Sourced from the prop
+         rather than imported, because it lives in another domain. */
+      notificationsAction={
+        args.variant === "overlay" ? topBarAccessory : undefined
+      }
       footerAction={
         <PreferencesMenu
           assistantId={assistantId}
@@ -1078,26 +1161,51 @@ export function ChatLayout({
               `<main>`'s box instead of the viewport, and sealed below the
               room by its parent's tier: the menu button read as dead. Out
               here its z-40 sorts against the room directly. */}
-          {drawerVisible || drawerDragging ? (
+          {drawerGestures.present ? (
             <div
               ref={drawerRef}
               className="fixed inset-0"
               style={{
                 zIndex: 40,
-                transform: drawerOpen ? "translateX(0)" : "translateX(-100%)",
-                transition: `transform ${EDGE_SWIPE_SLIDE_MS}ms ${EDGE_SWIPE_EASING}`,
+                // The close drag rides on the open resting transform, so the
+                // panel tracks the finger from where it sits. Releasing short
+                // returns it here under the standard transition; releasing past
+                // the threshold flips `drawerOpen`, and the same transition
+                // carries it the rest of the way out while the panel stays
+                // mounted for the slide.
+                transform: drawerOpen
+                  ? `translateX(${drawerGestures.dragOffset}px)`
+                  : "translateX(-100%)",
+                transition: drawerGestures.isDragging
+                  ? "none"
+                  : `transform ${EDGE_SWIPE_SLIDE_MS}ms ${EDGE_SWIPE_EASING}`,
+                // Vertical panning stays native for the menu's scrollport while
+                // the horizontal axis belongs to this gesture.
+                touchAction: "pan-y",
+                // A panel on its way out still covers the viewport for the
+                // length of the slide. Let taps through to the page it is
+                // uncovering rather than swallowing them.
+                pointerEvents: drawerGestures.exiting ? "none" : undefined,
               }}
+              onTouchStart={drawerGestures.onTouchStart}
+              onTouchMove={drawerGestures.onTouchMove}
+              onTouchEnd={drawerGestures.onTouchEnd}
+              onTouchCancel={drawerGestures.onTouchCancel}
               role="dialog"
               aria-modal="true"
-              aria-label="Navigation"
+              aria-label={t("chatLayout.navigationAria")}
               data-state={drawerOpen ? "open" : "closed"}
             >
-              {/* The aside must paint the same token as the SideMenu it
-                  hosts (`--surface-overlay`): its safe-area padding ring is
-                  the only part of it that shows around the full-bleed menu,
-                  and a mismatched background renders as tinted strips along
-                  the notch / home-indicator edges on iOS. No border — the
-                  sheet covers the full screen, so there is no edge to draw.
+              {/* The aside is the drawer's only painted surface: the menu it
+                  hosts is transparent, so this one fill covers both the menu
+                  and the safe-area padding ring around it, which is what
+                  keeps tinted strips off the notch / home-indicator edges on
+                  iOS. The fill is fully opaque (Figma 7842-83305), so the
+                  chat never bleeds through the sheet. Painting it here
+                  rather than on the menu keeps one owner of the surface
+                  color; a second fill on the menu would composite over this
+                  one and shift the drawn color off its token. No border:
+                  the sheet covers the full screen, so there is no edge to draw.
                   No bottom padding either: the SideMenu root clips its
                   children (`overflow-hidden`), so a bottom inset places the
                   clip boundary at the home-indicator line and guillotines
@@ -1109,7 +1217,7 @@ export function ChatLayout({
                 id="chat-side-menu"
                 className="relative flex h-full w-full flex-col shadow-xl"
                 style={{
-                  background: "var(--surface-overlay)",
+                  background: DRAWER_SURFACE_BACKGROUND,
                   zIndex: 50,
                   paddingTop:
                     "var(--safe-area-inset-top, env(safe-area-inset-top, 0px))",
@@ -1151,7 +1259,7 @@ export function ChatLayout({
             // this element imperatively; overflow-hidden clips the nav
             // mid-slide.
             className="w-fit shrink-0 overflow-hidden"
-            aria-label="Navigation"
+            aria-label={t("chatLayout.navigationAria")}
           >
             {renderSideMenu({
               collapsed: effectiveCollapsed,
@@ -1200,6 +1308,11 @@ export function ChatLayout({
         pending={pendingArchiveAll}
         onConfirm={confirmArchiveAll}
         onCancel={cancelArchiveAll}
+      />
+      <DeleteConversationConfirmDialog
+        pending={pendingDeleteConversation}
+        onConfirm={confirmDelete}
+        onCancel={cancelDelete}
       />
       <GroupNameDialogFromStore
         createGroup={createGroup}

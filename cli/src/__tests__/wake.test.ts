@@ -14,8 +14,8 @@ import { join } from "node:path";
 
 import * as assistantConfig from "../lib/assistant-config.js";
 import * as docker from "../lib/docker.js";
-import * as featureFlags from "../lib/feature-flags.js";
 import * as guardianToken from "../lib/guardian-token.js";
+import * as httpClient from "../lib/http-client.js";
 import * as ingressConfig from "../lib/ingress-config.js";
 import * as local from "../lib/local.js";
 import * as nginxIngress from "../lib/nginx-ingress.js";
@@ -32,6 +32,12 @@ const realProcessLib = { ...processLib };
 
 const resolveTargetAssistantMock =
   mock<typeof assistantConfig.resolveTargetAssistant>();
+const loadAllAssistantsMock = mock<typeof assistantConfig.loadAllAssistants>(
+  () => [],
+);
+const loadAllAssistantsAcrossEnvsMock = mock<
+  typeof assistantConfig.loadAllAssistantsAcrossEnvs
+>(() => []);
 const saveAssistantEntryMock = mock<typeof assistantConfig.saveAssistantEntry>(
   () => {},
 );
@@ -42,6 +48,8 @@ const getDaemonPidPathMock = mock<typeof assistantConfig.getDaemonPidPath>(
 mock.module("../lib/assistant-config.js", () => ({
   ...realAssistantConfig,
   resolveTargetAssistant: resolveTargetAssistantMock,
+  loadAllAssistants: loadAllAssistantsMock,
+  loadAllAssistantsAcrossEnvs: loadAllAssistantsAcrossEnvsMock,
   saveAssistantEntry: saveAssistantEntryMock,
   getDaemonPidPath: getDaemonPidPathMock,
 }));
@@ -141,18 +149,8 @@ mock.module("../lib/ngrok", () => ({
   maybeStartNgrokTunnel: maybeStartNgrokTunnelMock,
 }));
 
-const realFeatureFlags = { ...featureFlags };
 const realIngressConfig = { ...ingressConfig };
 const realNginxIngress = { ...nginxIngress };
-
-const isAssistantFeatureFlagEnabledMock = mock<
-  typeof featureFlags.isAssistantFeatureFlagEnabled
->(async () => true);
-
-mock.module("../lib/feature-flags.js", () => ({
-  ...realFeatureFlags,
-  isAssistantFeatureFlagEnabled: isAssistantFeatureFlagEnabledMock,
-}));
 
 const loadRawConfigMock = mock<typeof ingressConfig.loadRawConfig>(() => ({}));
 
@@ -178,13 +176,33 @@ mock.module("../lib/nginx-ingress.js", () => ({
   readIngressState: readIngressStateMock,
 }));
 
+const realHttpClient = { ...httpClient };
+
+const probeDaemonReadinessWithRetryMock = mock<
+  typeof httpClient.probeDaemonReadinessWithRetry
+>(async () => "ready");
+const waitForDaemonMigrationsReadyMock = mock<
+  typeof httpClient.waitForDaemonMigrationsReady
+>(async () => "ready");
+const waitForDaemonReadyMock = mock<typeof httpClient.waitForDaemonReady>(
+  async () => true,
+);
+
+mock.module("../lib/http-client.js", () => ({
+  ...realHttpClient,
+  probeDaemonReadinessWithRetry: probeDaemonReadinessWithRetryMock,
+  waitForDaemonMigrationsReady: waitForDaemonMigrationsReadyMock,
+  waitForDaemonReady: waitForDaemonReadyMock,
+}));
+
 const { wake } = await import("../commands/wake.js");
-const { WEB_INGRESS_FLAG_RETRY } = await import("../lib/tunnel-edge.js");
 
 let tempDir: string;
 let originalArgv: string[];
 let logSpy: ReturnType<typeof spyOn>;
 let warnSpy: ReturnType<typeof spyOn>;
+let errorSpy: ReturnType<typeof spyOn>;
+let localEntry: AssistantEntry;
 
 function makeLocalEntry(): AssistantEntry {
   tempDir = mkdtempSync(join(tmpdir(), "vellum-wake-test-"));
@@ -210,10 +228,15 @@ beforeEach(() => {
   process.argv = ["bun", "vellum", "wake", "--watch", "local-assistant"];
   logSpy = spyOn(console, "log").mockImplementation(() => {});
   warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+  errorSpy = spyOn(console, "error").mockImplementation(() => {});
 
-  const entry = makeLocalEntry();
+  localEntry = makeLocalEntry();
   resolveTargetAssistantMock.mockReset();
-  resolveTargetAssistantMock.mockReturnValue(entry);
+  resolveTargetAssistantMock.mockReturnValue(localEntry);
+  loadAllAssistantsMock.mockReset();
+  loadAllAssistantsMock.mockReturnValue([]);
+  loadAllAssistantsAcrossEnvsMock.mockReset();
+  loadAllAssistantsAcrossEnvsMock.mockReturnValue([]);
   saveAssistantEntryMock.mockReset();
   getDaemonPidPathMock.mockReset();
   getDaemonPidPathMock.mockImplementation((resources) =>
@@ -242,6 +265,13 @@ beforeEach(() => {
   startCesMock.mockResolvedValue(undefined);
   isProcessAliveMock.mockReset();
   isProcessAliveMock.mockReturnValue({ alive: false, pid: null });
+  probeDaemonReadinessWithRetryMock.mockReset();
+  probeDaemonReadinessWithRetryMock.mockResolvedValue("ready");
+  waitForDaemonMigrationsReadyMock.mockReset();
+  waitForDaemonMigrationsReadyMock.mockImplementation(async () => "ready");
+  waitForDaemonReadyMock.mockReset();
+  waitForDaemonReadyMock.mockImplementation(async () => true);
+  waitForDaemonMigrationsReadyMock.mockResolvedValue("ready");
   seedGuardianTokenFromSiblingEnvMock.mockReset();
   seedGuardianTokenFromSiblingEnvMock.mockReturnValue(false);
   loadGuardianTokenMock.mockReset();
@@ -256,8 +286,6 @@ beforeEach(() => {
   );
   maybeStartNgrokTunnelMock.mockReset();
   maybeStartNgrokTunnelMock.mockResolvedValue(null);
-  isAssistantFeatureFlagEnabledMock.mockReset();
-  isAssistantFeatureFlagEnabledMock.mockResolvedValue(true);
   loadRawConfigMock.mockReset();
   loadRawConfigMock.mockReturnValue({});
   ensureTunnelEdgeMock.mockReset();
@@ -276,6 +304,7 @@ afterEach(() => {
   process.argv = originalArgv;
   logSpy.mockRestore();
   warnSpy.mockRestore();
+  errorSpy.mockRestore();
   if (tempDir) {
     rmSync(tempDir, { recursive: true, force: true });
   }
@@ -288,9 +317,9 @@ afterAll(() => {
   mock.module("../lib/process", () => realProcessLib);
   mock.module("../lib/local", () => realLocal);
   mock.module("../lib/ngrok", () => realNgrok);
-  mock.module("../lib/feature-flags.js", () => realFeatureFlags);
   mock.module("../lib/ingress-config.js", () => realIngressConfig);
   mock.module("../lib/nginx-ingress.js", () => realNginxIngress);
+  mock.module("../lib/http-client.js", () => realHttpClient);
 });
 
 describe("vellum wake", () => {
@@ -402,8 +431,169 @@ describe("vellum wake", () => {
     // startLocalDaemon should NOT be called (daemon already running).
     expect(startLocalDaemonMock).not.toHaveBeenCalled();
   });
+
+  test("does not duplicate an assistant already classified as stuck", async () => {
+    localEntry.guardianBootstrapSecret = "existing-bootstrap-secret";
+    resolveProcessStateMock.mockImplementation(
+      async (_pidFile, _port, label) =>
+        label === "Assistant"
+          ? { status: "stuck", pid: 123 }
+          : { status: "healthy", pid: 456 },
+    );
+
+    await wake();
+
+    expect(startLocalDaemonMock).not.toHaveBeenCalled();
+    expect(logSpy).toHaveBeenCalledWith(
+      expect.stringContaining("could not be stopped"),
+    );
+  });
+
+  test("does not duplicate an assistant when a watch restart cannot stop it", async () => {
+    localEntry.guardianBootstrapSecret = "existing-bootstrap-secret";
+    isAssistantWatchModeAvailableMock.mockReturnValue(true);
+    stopProcessByPidFileMock.mockResolvedValue(false);
+    isProcessAliveMock.mockReturnValue({ alive: true, pid: 123 });
+
+    await wake();
+
+    expect(startLocalDaemonMock).not.toHaveBeenCalled();
+    expect(logSpy).toHaveBeenCalledWith(
+      expect.stringContaining("could not be stopped for watch mode"),
+    );
+  });
+
+  test("does not duplicate a gateway already classified as stuck", async () => {
+    localEntry.guardianBootstrapSecret = "existing-bootstrap-secret";
+    resolveProcessStateMock.mockImplementation(
+      async (_pidFile, _port, label) =>
+        label === "Gateway"
+          ? { status: "stuck", pid: 456 }
+          : { status: "healthy", pid: 123 },
+    );
+
+    await wake();
+
+    expect(startGatewayMock).not.toHaveBeenCalled();
+    expect(logSpy).toHaveBeenCalledWith(
+      expect.stringContaining("Gateway running"),
+    );
+  });
+
+  test("does not duplicate a gateway when a watch restart cannot stop it", async () => {
+    localEntry.guardianBootstrapSecret = "existing-bootstrap-secret";
+    isGatewayWatchModeAvailableMock.mockReturnValue(true);
+    stopProcessByPidFileMock.mockResolvedValue(false);
+    isProcessAliveMock.mockImplementation((pidFile) =>
+      pidFile.endsWith("gateway.pid")
+        ? { alive: true, pid: 456 }
+        : { alive: false, pid: null },
+    );
+
+    await wake();
+
+    expect(startGatewayMock).not.toHaveBeenCalled();
+    expect(logSpy).toHaveBeenCalledWith(
+      expect.stringContaining("Gateway running"),
+    );
+  });
 });
 
+describe("vellum wake: daemon startup failure", () => {
+  const daemonPidOf = (dir: string) => join(dir, ".vellum", "daemon.pid");
+
+  beforeEach(() => {
+    process.argv = ["bun", "vellum", "wake", "local-assistant"];
+    // The daemon needs starting; the gateway is already serving.
+    resolveProcessStateMock.mockImplementation(
+      async (_pidFile, _port, label) =>
+        label === "Gateway"
+          ? { status: "healthy", pid: 456 }
+          : { status: "needs_start", pid: null },
+    );
+  });
+
+  test("fails when the freshly spawned daemon is not running", async () => {
+    /**
+     * Tests that a daemon which aborts during startup (an occupied runtime
+     * HTTP port) fails the command instead of reporting a successful wake.
+     */
+
+    // GIVEN the spawned daemon left no live process behind
+    isProcessAliveMock.mockReturnValue({ alive: false, pid: null });
+
+    // AND a foreign listener on the runtime HTTP port answers readiness in
+    // the dead daemon's place
+    probeDaemonReadinessWithRetryMock.mockResolvedValue("ready");
+    const exitSpy = spyOn(process, "exit").mockImplementation(((
+      code?: number,
+    ) => {
+      throw new Error(`process.exit:${code}`);
+    }) as never);
+
+    // WHEN wake runs
+    const result = wake();
+
+    // THEN it exits nonzero, names the port on stderr, and never claims
+    // the wake completed
+    await expect(result).rejects.toThrow("process.exit:1");
+    expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining("exited during startup"),
+    );
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("7821"));
+    expect(logSpy).not.toHaveBeenCalledWith("Wake complete.");
+    expect(startGatewayMock).not.toHaveBeenCalled();
+    exitSpy.mockRestore();
+  });
+
+  test("completes when the freshly spawned daemon is running", async () => {
+    /**
+     * Tests that a healthy fresh spawn still reports a completed wake.
+     */
+
+    // GIVEN the spawned daemon is alive and ready
+    isProcessAliveMock.mockImplementation((pidFile) =>
+      pidFile === daemonPidOf(tempDir)
+        ? { alive: true, pid: 123 }
+        : { alive: false, pid: null },
+    );
+    probeDaemonReadinessWithRetryMock.mockResolvedValue("ready");
+
+    // WHEN wake runs
+    await wake();
+
+    // THEN it reports success and starts the gateway
+    expect(logSpy).toHaveBeenCalledWith("Wake complete.");
+    expect(errorSpy).not.toHaveBeenCalled();
+    expect(startLocalDaemonMock).toHaveBeenCalledTimes(1);
+  });
+
+  test("completes when the freshly spawned daemon is still migrating", async () => {
+    /**
+     * Tests that a live daemon running database migrations is reported as a
+     * degraded success, not a failure.
+     */
+
+    // GIVEN the spawned daemon is alive but still migrating past the
+    // gateway-coordination wait
+    isProcessAliveMock.mockImplementation((pidFile) =>
+      pidFile === daemonPidOf(tempDir)
+        ? { alive: true, pid: 123 }
+        : { alive: false, pid: null },
+    );
+    probeDaemonReadinessWithRetryMock.mockResolvedValue("migrating");
+    waitForDaemonMigrationsReadyMock.mockResolvedValue("migrating");
+
+    // WHEN wake runs
+    await wake();
+
+    // THEN it reports the migration state and completes
+    expect(logSpy).toHaveBeenCalledWith(
+      "Assistant is still running database migrations; DB-backed routes return 503 until they finish.",
+    );
+    expect(logSpy).toHaveBeenCalledWith("Wake complete.");
+  });
+});
 
 describe("vellum wake — tunnel edge restore", () => {
   const webhookConfig = { telegram: { botUsername: "bot" } };
@@ -416,7 +606,7 @@ describe("vellum wake — tunnel edge restore", () => {
     process.argv = ["bun", "vellum", "wake", "local-assistant"];
   });
 
-  test("webhook-configured wake ensures the edge with the startup flag retry and tunnels the edge port", async () => {
+  test("webhook-configured wake ensures the edge and tunnels the edge port", async () => {
     loadRawConfigMock.mockReturnValue(webhookConfig);
 
     await wake();
@@ -425,11 +615,11 @@ describe("vellum wake — tunnel edge restore", () => {
       assistantId: "local-assistant",
       workspaceDir: workspaceDirOf(tempDir),
       gatewayPort: 7830,
-      flagRetry: WEB_INGRESS_FLAG_RETRY,
     });
     expect(maybeStartNgrokTunnelMock).toHaveBeenCalledWith(
       7840,
       workspaceDirOf(tempDir),
+      "local-assistant",
     );
     expect(logSpy).toHaveBeenCalledWith("Wake complete.");
   });
@@ -443,23 +633,423 @@ describe("vellum wake — tunnel edge restore", () => {
       assistantId: "local-assistant",
       workspaceDir: workspaceDirOf(tempDir),
       gatewayPort: 7830,
-      flagRetry: WEB_INGRESS_FLAG_RETRY,
     });
     expect(maybeStartNgrokTunnelMock).toHaveBeenCalledWith(
       7840,
       workspaceDirOf(tempDir),
+      "local-assistant",
     );
     expect(logSpy).toHaveBeenCalledWith("Wake complete.");
+  });
+
+  test("a docker wake restores the shared default-workspace edge", async () => {
+    const defaultWorkspace = mkdtempSync(
+      join(tmpdir(), "vellum-wake-default-"),
+    );
+    const originalWorkspaceDir = process.env.VELLUM_WORKSPACE_DIR;
+    process.env.VELLUM_WORKSPACE_DIR = defaultWorkspace;
+    resolveTargetAssistantMock.mockReturnValue({
+      assistantId: "docker-1",
+      runtimeUrl: "http://localhost:7930",
+      cloud: "docker",
+      ingressUrl: "https://assistant.example.com",
+    } as AssistantEntry);
+    loadRawConfigMock.mockReturnValue(enabledConfig);
+    process.argv = ["bun", "vellum", "wake", "docker-1"];
+
+    try {
+      await wake();
+
+      expect(ensureTunnelEdgeMock).toHaveBeenCalledWith({
+        assistantId: "docker-1",
+        workspaceDir: defaultWorkspace,
+        gatewayPort: 7930,
+      });
+      // Container wakes never tracked a spawned ngrok PID, so the auto-tunnel
+      // stays out of this path.
+      expect(maybeStartNgrokTunnelMock).not.toHaveBeenCalled();
+      expect(logSpy).toHaveBeenCalledWith("Wake complete.");
+    } finally {
+      if (originalWorkspaceDir === undefined) {
+        delete process.env.VELLUM_WORKSPACE_DIR;
+      } else {
+        process.env.VELLUM_WORKSPACE_DIR = originalWorkspaceDir;
+      }
+      rmSync(defaultWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  test("a docker wake leaves an edge fronting another container alone", async () => {
+    const defaultWorkspace = mkdtempSync(
+      join(tmpdir(), "vellum-wake-default-"),
+    );
+    const originalWorkspaceDir = process.env.VELLUM_WORKSPACE_DIR;
+    process.env.VELLUM_WORKSPACE_DIR = defaultWorkspace;
+    resolveTargetAssistantMock.mockReturnValue({
+      assistantId: "docker-1",
+      runtimeUrl: "http://localhost:7930",
+      cloud: "docker",
+      ingressUrl: "https://assistant.example.com",
+    } as AssistantEntry);
+    loadRawConfigMock.mockReturnValue(enabledConfig);
+    isIngressRunningMock.mockReturnValue(true);
+    readIngressStateMock.mockReturnValue({
+      listenPort: 7840,
+      includeWebApp: true,
+      gatewayPort: 8030,
+    });
+    process.argv = ["bun", "vellum", "wake", "docker-1"];
+
+    try {
+      await wake();
+
+      expect(ensureTunnelEdgeMock).not.toHaveBeenCalled();
+      expect(logSpy).toHaveBeenCalledWith("Wake complete.");
+    } finally {
+      if (originalWorkspaceDir === undefined) {
+        delete process.env.VELLUM_WORKSPACE_DIR;
+      } else {
+        process.env.VELLUM_WORKSPACE_DIR = originalWorkspaceDir;
+      }
+      rmSync(defaultWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  test("a docker wake adopts an edge that already fronts it", async () => {
+    const defaultWorkspace = mkdtempSync(
+      join(tmpdir(), "vellum-wake-default-"),
+    );
+    const originalWorkspaceDir = process.env.VELLUM_WORKSPACE_DIR;
+    process.env.VELLUM_WORKSPACE_DIR = defaultWorkspace;
+    resolveTargetAssistantMock.mockReturnValue({
+      assistantId: "docker-1",
+      runtimeUrl: "http://localhost:7930",
+      cloud: "docker",
+      ingressUrl: "https://assistant.example.com",
+    } as AssistantEntry);
+    loadRawConfigMock.mockReturnValue(enabledConfig);
+    isIngressRunningMock.mockReturnValue(true);
+    readIngressStateMock.mockReturnValue({
+      listenPort: 7840,
+      includeWebApp: true,
+      gatewayPort: 7930,
+    });
+    // Ownership clears the restore, and `ensureTunnelEdge` is what decides the
+    // running edge still matches: it reports the reuse rather than a restart.
+    ensureTunnelEdgeMock.mockResolvedValue({
+      port: 7840,
+      started: false,
+      includesWebApp: true,
+    });
+    process.argv = ["bun", "vellum", "wake", "docker-1"];
+
+    try {
+      await wake();
+
+      expect(ensureTunnelEdgeMock).toHaveBeenCalledWith({
+        assistantId: "docker-1",
+        workspaceDir: defaultWorkspace,
+        gatewayPort: 7930,
+      });
+      expect(logSpy).toHaveBeenCalledWith(
+        expect.stringContaining("already running on 127.0.0.1:7840"),
+      );
+    } finally {
+      if (originalWorkspaceDir === undefined) {
+        delete process.env.VELLUM_WORKSPACE_DIR;
+      } else {
+        process.env.VELLUM_WORKSPACE_DIR = originalWorkspaceDir;
+      }
+      rmSync(defaultWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  test("a failed docker edge restore does not claim webhooks still work", async () => {
+    const defaultWorkspace = mkdtempSync(
+      join(tmpdir(), "vellum-wake-default-"),
+    );
+    const originalWorkspaceDir = process.env.VELLUM_WORKSPACE_DIR;
+    process.env.VELLUM_WORKSPACE_DIR = defaultWorkspace;
+    resolveTargetAssistantMock.mockReturnValue({
+      assistantId: "docker-1",
+      runtimeUrl: "http://localhost:7930",
+      cloud: "docker",
+      ingressUrl: "https://assistant.example.com",
+    } as AssistantEntry);
+    loadRawConfigMock.mockReturnValue(enabledConfig);
+    ensureTunnelEdgeMock.mockRejectedValue(
+      new Error("nginx is not installed."),
+    );
+    process.argv = ["bun", "vellum", "wake", "docker-1"];
+
+    try {
+      await wake();
+
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("webhook delivery are unavailable"),
+      );
+      expect(warnSpy).not.toHaveBeenCalledWith(
+        expect.stringContaining("Webhooks still work"),
+      );
+    } finally {
+      if (originalWorkspaceDir === undefined) {
+        delete process.env.VELLUM_WORKSPACE_DIR;
+      } else {
+        process.env.VELLUM_WORKSPACE_DIR = originalWorkspaceDir;
+      }
+      rmSync(defaultWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  test("a docker wake leaves a saved ingress owned by another container alone", async () => {
+    const defaultWorkspace = mkdtempSync(
+      join(tmpdir(), "vellum-wake-default-"),
+    );
+    const originalWorkspaceDir = process.env.VELLUM_WORKSPACE_DIR;
+    process.env.VELLUM_WORKSPACE_DIR = defaultWorkspace;
+    // The edge is stopped, so its gatewayPort record is gone; only the saved
+    // publicBaseUrl and its owner's `ingressUrl` say whose endpoint this is.
+    resolveTargetAssistantMock.mockReturnValue({
+      assistantId: "docker-1",
+      runtimeUrl: "http://localhost:7930",
+      cloud: "docker",
+      ingressUrl: "https://other.example.com",
+    } as AssistantEntry);
+    loadAllAssistantsMock.mockReturnValue([
+      {
+        assistantId: "docker-2",
+        runtimeUrl: "http://localhost:8030",
+        cloud: "docker",
+        ingressUrl: "https://assistant.example.com",
+      } as AssistantEntry,
+    ]);
+    loadRawConfigMock.mockReturnValue(enabledConfig);
+    isIngressRunningMock.mockReturnValue(false);
+    process.argv = ["bun", "vellum", "wake", "docker-1"];
+
+    try {
+      await wake();
+
+      expect(ensureTunnelEdgeMock).not.toHaveBeenCalled();
+      expect(logSpy).toHaveBeenCalledWith("Wake complete.");
+    } finally {
+      if (originalWorkspaceDir === undefined) {
+        delete process.env.VELLUM_WORKSPACE_DIR;
+      } else {
+        process.env.VELLUM_WORKSPACE_DIR = originalWorkspaceDir;
+      }
+      rmSync(defaultWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  test("a docker wake waits for the gateway before restoring the edge", async () => {
+    const defaultWorkspace = mkdtempSync(
+      join(tmpdir(), "vellum-wake-default-"),
+    );
+    const originalWorkspaceDir = process.env.VELLUM_WORKSPACE_DIR;
+    process.env.VELLUM_WORKSPACE_DIR = defaultWorkspace;
+    resolveTargetAssistantMock.mockReturnValue({
+      assistantId: "docker-1",
+      runtimeUrl: "http://localhost:7930",
+      cloud: "docker",
+      ingressUrl: "https://assistant.example.com",
+    } as AssistantEntry);
+    loadRawConfigMock.mockReturnValue(enabledConfig);
+    process.argv = ["bun", "vellum", "wake", "docker-1"];
+
+    try {
+      await wake();
+
+      expect(waitForDaemonReadyMock).toHaveBeenCalledWith(7930, 5 * 60_000);
+      expect(ensureTunnelEdgeMock).toHaveBeenCalled();
+    } finally {
+      if (originalWorkspaceDir === undefined) {
+        delete process.env.VELLUM_WORKSPACE_DIR;
+      } else {
+        process.env.VELLUM_WORKSPACE_DIR = originalWorkspaceDir;
+      }
+      rmSync(defaultWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  test("a docker wake skips the edge when the gateway never comes up", async () => {
+    const defaultWorkspace = mkdtempSync(
+      join(tmpdir(), "vellum-wake-default-"),
+    );
+    const originalWorkspaceDir = process.env.VELLUM_WORKSPACE_DIR;
+    process.env.VELLUM_WORKSPACE_DIR = defaultWorkspace;
+    resolveTargetAssistantMock.mockReturnValue({
+      assistantId: "docker-1",
+      runtimeUrl: "http://localhost:7930",
+      cloud: "docker",
+      ingressUrl: "https://assistant.example.com",
+    } as AssistantEntry);
+    loadRawConfigMock.mockReturnValue(enabledConfig);
+    waitForDaemonReadyMock.mockImplementation(async () => false);
+    process.argv = ["bun", "vellum", "wake", "docker-1"];
+
+    try {
+      await wake();
+
+      expect(ensureTunnelEdgeMock).not.toHaveBeenCalled();
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("did not come up"),
+      );
+      expect(logSpy).toHaveBeenCalledWith("Wake complete.");
+    } finally {
+      if (originalWorkspaceDir === undefined) {
+        delete process.env.VELLUM_WORKSPACE_DIR;
+      } else {
+        process.env.VELLUM_WORKSPACE_DIR = originalWorkspaceDir;
+      }
+      rmSync(defaultWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  test("a docker wake with no ingress config never waits for the gateway", async () => {
+    const defaultWorkspace = mkdtempSync(
+      join(tmpdir(), "vellum-wake-default-"),
+    );
+    const originalWorkspaceDir = process.env.VELLUM_WORKSPACE_DIR;
+    process.env.VELLUM_WORKSPACE_DIR = defaultWorkspace;
+    resolveTargetAssistantMock.mockReturnValue({
+      assistantId: "docker-1",
+      runtimeUrl: "http://localhost:7930",
+      cloud: "docker",
+    } as AssistantEntry);
+    process.argv = ["bun", "vellum", "wake", "docker-1"];
+
+    try {
+      await wake();
+
+      expect(waitForDaemonReadyMock).not.toHaveBeenCalled();
+      expect(ensureTunnelEdgeMock).not.toHaveBeenCalled();
+    } finally {
+      if (originalWorkspaceDir === undefined) {
+        delete process.env.VELLUM_WORKSPACE_DIR;
+      } else {
+        process.env.VELLUM_WORKSPACE_DIR = originalWorkspaceDir;
+      }
+      rmSync(defaultWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  test("a docker wake restores a saved ingress that no entry claims", async () => {
+    const defaultWorkspace = mkdtempSync(
+      join(tmpdir(), "vellum-wake-default-"),
+    );
+    const originalWorkspaceDir = process.env.VELLUM_WORKSPACE_DIR;
+    process.env.VELLUM_WORKSPACE_DIR = defaultWorkspace;
+    // Tunneled before the lockfile mirror existed: publicBaseUrl is saved but
+    // no entry carries `ingressUrl`. The sole container still owns it.
+    resolveTargetAssistantMock.mockReturnValue({
+      assistantId: "docker-1",
+      runtimeUrl: "http://localhost:7930",
+      cloud: "docker",
+    } as AssistantEntry);
+    loadAllAssistantsMock.mockReturnValue([
+      {
+        assistantId: "docker-1",
+        runtimeUrl: "http://localhost:7930",
+        cloud: "docker",
+      } as AssistantEntry,
+    ]);
+    loadRawConfigMock.mockReturnValue(enabledConfig);
+    isIngressRunningMock.mockReturnValue(false);
+    process.argv = ["bun", "vellum", "wake", "docker-1"];
+
+    try {
+      await wake();
+
+      expect(ensureTunnelEdgeMock).toHaveBeenCalledWith({
+        assistantId: "docker-1",
+        workspaceDir: defaultWorkspace,
+        gatewayPort: 7930,
+      });
+    } finally {
+      if (originalWorkspaceDir === undefined) {
+        delete process.env.VELLUM_WORKSPACE_DIR;
+      } else {
+        process.env.VELLUM_WORKSPACE_DIR = originalWorkspaceDir;
+      }
+      rmSync(defaultWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  test("a docker wake respects an ingress claim from another environment", async () => {
+    const defaultWorkspace = mkdtempSync(
+      join(tmpdir(), "vellum-wake-default-"),
+    );
+    const originalWorkspaceDir = process.env.VELLUM_WORKSPACE_DIR;
+    process.env.VELLUM_WORKSPACE_DIR = defaultWorkspace;
+    resolveTargetAssistantMock.mockReturnValue({
+      assistantId: "docker-1",
+      runtimeUrl: "http://localhost:7930",
+      cloud: "docker",
+    } as AssistantEntry);
+    loadAllAssistantsAcrossEnvsMock.mockReturnValue([
+      {
+        assistantId: "docker-2",
+        runtimeUrl: "http://localhost:8030",
+        cloud: "docker",
+        ingressUrl: "https://assistant.example.com",
+      } as AssistantEntry,
+    ]);
+    loadRawConfigMock.mockReturnValue(enabledConfig);
+    isIngressRunningMock.mockReturnValue(false);
+    process.argv = ["bun", "vellum", "wake", "docker-1"];
+
+    try {
+      await wake();
+
+      expect(ensureTunnelEdgeMock).not.toHaveBeenCalled();
+    } finally {
+      if (originalWorkspaceDir === undefined) {
+        delete process.env.VELLUM_WORKSPACE_DIR;
+      } else {
+        process.env.VELLUM_WORKSPACE_DIR = originalWorkspaceDir;
+      }
+      rmSync(defaultWorkspace, { recursive: true, force: true });
+    }
+  });
+
+  test("a docker wake without an ingress config leaves the edge alone", async () => {
+    const defaultWorkspace = mkdtempSync(
+      join(tmpdir(), "vellum-wake-default-"),
+    );
+    const originalWorkspaceDir = process.env.VELLUM_WORKSPACE_DIR;
+    process.env.VELLUM_WORKSPACE_DIR = defaultWorkspace;
+    resolveTargetAssistantMock.mockReturnValue({
+      assistantId: "docker-1",
+      runtimeUrl: "http://localhost:7930",
+      cloud: "docker",
+      ingressUrl: "https://assistant.example.com",
+    } as AssistantEntry);
+    process.argv = ["bun", "vellum", "wake", "docker-1"];
+
+    try {
+      await wake();
+
+      expect(ensureTunnelEdgeMock).not.toHaveBeenCalled();
+      expect(logSpy).toHaveBeenCalledWith("Wake complete.");
+    } finally {
+      if (originalWorkspaceDir === undefined) {
+        delete process.env.VELLUM_WORKSPACE_DIR;
+      } else {
+        process.env.VELLUM_WORKSPACE_DIR = originalWorkspaceDir;
+      }
+      rmSync(defaultWorkspace, { recursive: true, force: true });
+    }
   });
 
   test("skips the edge and tunnels the gateway port when nothing wants an edge", async () => {
     await wake();
 
-    expect(isAssistantFeatureFlagEnabledMock).not.toHaveBeenCalled();
     expect(ensureTunnelEdgeMock).not.toHaveBeenCalled();
     expect(maybeStartNgrokTunnelMock).toHaveBeenCalledWith(
       7830,
       workspaceDirOf(tempDir),
+      "local-assistant",
     );
   });
 
@@ -472,6 +1062,7 @@ describe("vellum wake — tunnel edge restore", () => {
     expect(maybeStartNgrokTunnelMock).toHaveBeenCalledWith(
       7830,
       workspaceDirOf(tempDir),
+      "local-assistant",
     );
   });
 
@@ -483,61 +1074,109 @@ describe("vellum wake — tunnel edge restore", () => {
     expect(ensureTunnelEdgeMock).not.toHaveBeenCalled();
   });
 
-  test("a running edge recorded against this gateway port is reused with zero flag calls", async () => {
+  test("a running edge is rebuilt through ensureTunnelEdge, never adopted at its recorded port", async () => {
+    // Recorded mode and gateway port are not a licence to reuse: only
+    // ensureTunnelEdge compares the injected-config fingerprint, so an edge
+    // predating the current edge template (one serving no assistantId, which
+    // makes the identity probe degrade to always-healthy) must be rebuilt
+    // rather than carried across the wake at its recorded listen port.
     loadRawConfigMock.mockReturnValue(webhookConfig);
     isIngressRunningMock.mockReturnValue(true);
     readIngressStateMock.mockReturnValue({
       listenPort: 7845,
       includeWebApp: true,
       gatewayPort: 7830,
+      remoteWebConfigHash: "fingerprint-of-an-older-edge-template",
     });
 
     await wake();
 
-    expect(isAssistantFeatureFlagEnabledMock).not.toHaveBeenCalled();
-    expect(ensureTunnelEdgeMock).not.toHaveBeenCalled();
-    expect(logSpy).toHaveBeenCalledWith(
-      "   Tunnel edge already running on 127.0.0.1:7845 (remote web + webhooks).",
-    );
-    expect(maybeStartNgrokTunnelMock).toHaveBeenCalledWith(
-      7845,
-      workspaceDirOf(tempDir),
-    );
-  });
-
-  test("a running edge recorded against a different gateway port goes through ensureTunnelEdge", async () => {
-    loadRawConfigMock.mockReturnValue(webhookConfig);
-    isIngressRunningMock.mockReturnValue(true);
-    readIngressStateMock.mockReturnValue({
-      listenPort: 7845,
-      includeWebApp: true,
-      gatewayPort: 7900,
+    expect(ensureTunnelEdgeMock).toHaveBeenCalledWith({
+      assistantId: "local-assistant",
+      workspaceDir: workspaceDirOf(tempDir),
+      gatewayPort: 7830,
     });
-
-    await wake();
-
-    expect(ensureTunnelEdgeMock).toHaveBeenCalledWith(
-      expect.objectContaining({ gatewayPort: 7830 }),
-    );
     expect(maybeStartNgrokTunnelMock).toHaveBeenCalledWith(
       7840,
       workspaceDirOf(tempDir),
+      "local-assistant",
     );
   });
 
-  test("a running edge without a recorded gateway port goes through ensureTunnelEdge", async () => {
-    // An unverified upstream must not be reused blindly; ensureTunnelEdge
-    // restarts it so the running config provably targets the requested port.
+  test("a failed rebuild keeps tunneling the SPA edge that is still running", async () => {
+    // web-dist-missing bails before the running edge is stopped, and a drifted
+    // edge whose stop fails reports staleRemoteWebConfig; both throw while the
+    // edge keeps serving. Tunneling the gateway directly would put the
+    // sensitive-route denylist behind the tunnel instead of in front of it.
     loadRawConfigMock.mockReturnValue(webhookConfig);
     isIngressRunningMock.mockReturnValue(true);
     readIngressStateMock.mockReturnValue({
       listenPort: 7845,
       includeWebApp: true,
+      gatewayPort: 7830,
+      remoteWebConfigHash: "fingerprint-of-an-older-edge-template",
     });
+    ensureTunnelEdgeMock.mockRejectedValue(
+      new Error(
+        "The nginx edge is still serving an outdated remote web config and could not be restarted with the updated one. Vellum could not stop the nginx process (PID 4242), even with SIGKILL. Stop it by hand and retry, or run `vellum sleep` to shut the assistant down entirely.",
+      ),
+    );
 
     await wake();
 
-    expect(ensureTunnelEdgeMock).toHaveBeenCalled();
+    expect(maybeStartNgrokTunnelMock).toHaveBeenCalledWith(
+      7845,
+      workspaceDirOf(tempDir),
+      "local-assistant",
+    );
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("127.0.0.1:7845"),
+    );
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("Stop it by hand and retry"),
+    );
+  });
+
+  test("a failed rebuild falls back to the gateway port when the running edge fronts another gateway", async () => {
+    loadRawConfigMock.mockReturnValue(webhookConfig);
+    isIngressRunningMock.mockReturnValue(true);
+    readIngressStateMock.mockReturnValue({
+      listenPort: 7845,
+      includeWebApp: true,
+      gatewayPort: 7831,
+    });
+    ensureTunnelEdgeMock.mockRejectedValue(
+      new Error("The nginx edge is still proxying gateway port 7831."),
+    );
+
+    await wake();
+
+    expect(maybeStartNgrokTunnelMock).toHaveBeenCalledWith(
+      7830,
+      workspaceDirOf(tempDir),
+      "local-assistant",
+    );
+  });
+
+  test("a failed rebuild falls back to the gateway port when only a webhooks-only edge survives", async () => {
+    loadRawConfigMock.mockReturnValue(webhookConfig);
+    isIngressRunningMock.mockReturnValue(true);
+    readIngressStateMock.mockReturnValue({
+      listenPort: 7845,
+      includeWebApp: false,
+      gatewayPort: 7830,
+    });
+    ensureTunnelEdgeMock.mockRejectedValue(
+      new Error("The nginx edge is still running in webhooks-only mode."),
+    );
+
+    await wake();
+
+    expect(maybeStartNgrokTunnelMock).toHaveBeenCalledWith(
+      7830,
+      workspaceDirOf(tempDir),
+      "local-assistant",
+    );
   });
 
   test("nginx-missing falls back to the gateway-port tunnel with a warning", async () => {
@@ -554,35 +1193,14 @@ describe("vellum wake — tunnel edge restore", () => {
       expect.stringContaining("brew install nginx"),
     );
     expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining("vellum nginx-ingress up"),
+      expect.stringContaining("Run `vellum tunnel` to rebuild the edge."),
     );
     expect(maybeStartNgrokTunnelMock).toHaveBeenCalledWith(
       7830,
       workspaceDirOf(tempDir),
+      "local-assistant",
     );
     expect(logSpy).toHaveBeenCalledWith("Wake complete.");
-  });
-
-  test("flag-off + webhooks-on produces a webhooks-only edge fronting the tunnel", async () => {
-    loadRawConfigMock.mockReturnValue(webhookConfig);
-    ensureTunnelEdgeMock.mockResolvedValue({
-      port: 7840,
-      started: true,
-      includesWebApp: false,
-    });
-
-    await wake();
-
-    expect(ensureTunnelEdgeMock).toHaveBeenCalledWith(
-      expect.objectContaining({ assistantId: "local-assistant" }),
-    );
-    expect(logSpy).toHaveBeenCalledWith(
-      expect.stringContaining("webhooks only"),
-    );
-    expect(maybeStartNgrokTunnelMock).toHaveBeenCalledWith(
-      7840,
-      workspaceDirOf(tempDir),
-    );
   });
 
   test("a reused edge still points the tunnel at its listen port", async () => {
@@ -598,29 +1216,7 @@ describe("vellum wake — tunnel edge restore", () => {
     expect(maybeStartNgrokTunnelMock).toHaveBeenCalledWith(
       7841,
       workspaceDirOf(tempDir),
+      "local-assistant",
     );
-  });
-
-  test("an exhausted flag lookup warns and falls back to the gateway-port tunnel", async () => {
-    loadRawConfigMock.mockReturnValue(webhookConfig);
-    ensureTunnelEdgeMock.mockRejectedValue(
-      new Error(
-        "Could not verify the `web-remote-ingress` feature flag before starting the edge. Is the assistant running? Try `vellum wake` and retry. gateway unreachable",
-      ),
-    );
-
-    await wake();
-
-    expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining("web-remote-ingress"),
-    );
-    expect(warnSpy).toHaveBeenCalledWith(
-      expect.stringContaining("vellum nginx-ingress up"),
-    );
-    expect(maybeStartNgrokTunnelMock).toHaveBeenCalledWith(
-      7830,
-      workspaceDirOf(tempDir),
-    );
-    expect(logSpy).toHaveBeenCalledWith("Wake complete.");
   });
 });

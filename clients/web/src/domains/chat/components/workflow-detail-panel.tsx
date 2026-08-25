@@ -1,7 +1,7 @@
 import {
   ArrowDownToLine,
-  ArrowLeft,
   ArrowUpFromLine,
+  ChevronLeft,
   ChevronRight,
   Users,
   Workflow,
@@ -29,6 +29,7 @@ import { subagentTraits } from "@/utils/avatar-subagent";
 import { isActiveStatus } from "@/utils/workflow-status";
 import { useBundledAvatarComponents } from "@/utils/use-bundled-avatar-components";
 import { Button, Typography } from "@vellumai/design-library";
+import { useTranslation } from "@/i18n";
 
 // ---------------------------------------------------------------------------
 // Props
@@ -51,6 +52,7 @@ export function WorkflowDetailPanel({
   onStop,
   onRequestJournal,
 }: WorkflowDetailPanelProps) {
+  const { t } = useTranslation("chat");
   const isRunning = isActiveStatus(entry.status);
   const reduce = useReducedMotion();
   const title = entry.label ?? entry.runId;
@@ -137,10 +139,10 @@ export function WorkflowDetailPanel({
           {selectedLeaf && (
             <Button
               variant="outlined"
-              iconOnly={<ArrowLeft />}
+              iconOnly={<ChevronLeft />}
               onClick={handleBack}
-              aria-label="Back to subagents"
-              tooltip="Back"
+              aria-label={t("workflowDetailPanel.backToSubagentsAria")}
+              tooltip={t("workflowDetailPanel.back")}
               className="shrink-0"
             />
           )}
@@ -157,12 +159,13 @@ export function WorkflowDetailPanel({
               <div style={{ width: 32, height: 32, flexShrink: 0 }} aria-hidden />
             )
           ) : (
-            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-[6px] bg-[var(--surface-overlay)]">
-              <Workflow
-                className="h-4 w-4"
-                style={{ color: "var(--content-secondary)" }}
-              />
-            </div>
+            // Bare 20px glyph, matching what `DetailShellHeader` renders for a
+            // `Glyph` prop, so this header's icon box lines up with the other
+            // panels'. The leaf branch above keeps its 32px avatar.
+            <Workflow
+              className="h-5 w-5 shrink-0 text-[var(--content-secondary)]"
+              aria-hidden
+            />
           )}
         </>
       }
@@ -178,11 +181,11 @@ export function WorkflowDetailPanel({
         isRunning && onStop ? (
           <DetailPanelStopButton
             onStop={() => onStop(entry.runId)}
-            ariaLabel="Stop workflow"
+            ariaLabel={t("workflowDetailPanel.stopWorkflow")}
           />
         ) : undefined
       }
-      closeLabel="Close workflow detail"
+      closeLabel={t("workflowDetailPanel.closeDetail")}
       onClose={onClose}
     >
       {/* Body: swaps to a leaf's nested detail when one is open, keeping the
@@ -212,7 +215,7 @@ export function WorkflowDetailPanel({
                   }
                   target={entry.inputTokens}
                   format={(n) => formatNumber(Math.round(n))}
-                  label="Input"
+                  label={t("workflowDetailPanel.input")}
                 />
                 <AnimatedMetricCard
                   icon={
@@ -223,7 +226,7 @@ export function WorkflowDetailPanel({
                   }
                   target={entry.outputTokens}
                   format={(n) => formatNumber(Math.round(n))}
-                  label="Output"
+                  label={t("workflowDetailPanel.output")}
                 />
                 <AnimatedMetricCard
                   icon={
@@ -234,7 +237,7 @@ export function WorkflowDetailPanel({
                   }
                   target={agentCount}
                   format={(n) => formatNumber(Math.round(n))}
-                  label="Agents"
+                  label={t("workflowDetailPanel.agents")}
                 />
               </div>
 
@@ -245,14 +248,14 @@ export function WorkflowDetailPanel({
                   as="h3"
                   className="mb-4 text-[var(--content-emphasised)]"
                 >
-                  Subagents
+                  {t("workflowDetailPanel.subagents")}
                 </Typography>
                 {sortedLeaves.length === 0 ? (
                   <Typography
                     variant="body-small-default"
                     className="py-4 text-center text-[var(--content-tertiary)]"
                   >
-                    No subagents yet
+                    {t("workflowDetailPanel.noSubagentsYet")}
                   </Typography>
                 ) : (
                   <div className="flex flex-col gap-1">

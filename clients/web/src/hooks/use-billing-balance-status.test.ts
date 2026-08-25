@@ -91,6 +91,7 @@ function summary(
     daily_credit_limit_usd: null,
     daily_spend_usd: "0.00",
     daily_limit_reached: false,
+    daily_limit_snoozed: false,
     low_balance_threshold_usd: "5.00",
     low_balance_warning: false,
     credits_expiring_soon_usd: "0.00",
@@ -148,9 +149,33 @@ describe("useBillingBalanceStatus", () => {
       isExhausted: false,
       isLowBalance: false,
       dailyLimitReached: false,
+      dailyLimitSnoozed: false,
+      dailyLimit: null,
+      dailySpend: "0.00",
       balance: "20.00",
+      availableUsageBalance: null,
+      totalUsageBalance: null,
       enabled: true,
     });
+  });
+
+  test("usage grants: passed through as the summary reports them", () => {
+    const { result } = setup({
+      seed: summary({
+        available_usage_balance: "1.60",
+        total_usage_balance: "5.00",
+      }),
+    });
+    expect(result.current.availableUsageBalance).toBe("1.60");
+    expect(result.current.totalUsageBalance).toBe("5.00");
+  });
+
+  test("usage grants: a platform reporting neither reads as unknown", () => {
+    // An older self-hosted platform omits both fields, which has to read as
+    // "no grant information" rather than a zeroed one.
+    const { result } = setup({ seed: summary() });
+    expect(result.current.availableUsageBalance).toBeNull();
+    expect(result.current.totalUsageBalance).toBeNull();
   });
 
   test("low balance: reflects the server-computed warning flag", () => {
@@ -161,7 +186,12 @@ describe("useBillingBalanceStatus", () => {
       isExhausted: false,
       isLowBalance: true,
       dailyLimitReached: false,
+      dailyLimitSnoozed: false,
+      dailyLimit: null,
+      dailySpend: "0.00",
       balance: "3.00",
+      availableUsageBalance: null,
+      totalUsageBalance: null,
       enabled: true,
     });
   });
@@ -207,7 +237,12 @@ describe("useBillingBalanceStatus", () => {
       isExhausted: false,
       isLowBalance: false,
       dailyLimitReached: true,
+      dailyLimitSnoozed: false,
+      dailyLimit: null,
+      dailySpend: "0.00",
       balance: "20.00",
+      availableUsageBalance: null,
+      totalUsageBalance: null,
       enabled: true,
     });
   });
@@ -299,7 +334,12 @@ describe("useBillingBalanceStatus", () => {
       isExhausted: false,
       isLowBalance: false,
       dailyLimitReached: false,
+      dailyLimitSnoozed: false,
+      dailyLimit: null,
+      dailySpend: null,
       balance: null,
+      availableUsageBalance: null,
+      totalUsageBalance: null,
       enabled: true,
     });
   });
@@ -337,7 +377,12 @@ describe("useBillingBalanceStatus", () => {
       isExhausted: false,
       isLowBalance: false,
       dailyLimitReached: false,
+      dailyLimitSnoozed: false,
+      dailyLimit: null,
+      dailySpend: null,
       balance: null,
+      availableUsageBalance: null,
+      totalUsageBalance: null,
       enabled: false,
     });
   });
@@ -354,7 +399,12 @@ describe("useBillingBalanceStatus", () => {
       isExhausted: false,
       isLowBalance: false,
       dailyLimitReached: true,
+      dailyLimitSnoozed: false,
+      dailyLimit: null,
+      dailySpend: "0.00",
       balance: "0.00",
+      availableUsageBalance: null,
+      totalUsageBalance: null,
       enabled: true,
     });
   });
@@ -390,7 +440,12 @@ describe("useBillingBalanceStatus", () => {
       isExhausted: false,
       isLowBalance: false,
       dailyLimitReached: false,
+      dailyLimitSnoozed: false,
+      dailyLimit: null,
+      dailySpend: null,
       balance: null,
+      availableUsageBalance: null,
+      totalUsageBalance: null,
       enabled: false,
     });
   });

@@ -6,6 +6,7 @@
  * and persisting rules via the trust-rules API.
  */
 
+import { t } from "@/i18n";
 import { captureError } from "@/lib/sentry/capture-error";
 
 import {
@@ -18,6 +19,10 @@ import type { DisplayMessage } from "@/domains/chat/types/types";
 import { useChatSessionStore } from "@/domains/chat/chat-session-store";
 import { patchTranscriptMessages } from "@/domains/chat/transcript/patch-transcript-messages";
 import { useInteractionStore } from "@/domains/chat/interaction-store";
+import {
+  captureSubmissionRejection,
+  reportSubmissionFailure,
+} from "@/domains/chat/prompt-submission";
 import { useStreamStore } from "@/domains/chat/stream-store";
 import { useRuleEditorStore } from "@/domains/chat/rule-editor-store";
 import type { RuleEditorContext } from "@/domains/chat/rule-editor-store";
@@ -159,7 +164,9 @@ async function executeSaveRule(
   // Confirmation path: resolve via the interaction API rather than direct save.
   if (strategy === "update-or-create" && context.requestId) {
     useRuleEditorStore.getState().setIsSavingRule(true);
-    useInteractionStore.getState().submitConfirmationStart();
+    useInteractionStore
+      .getState()
+      .claimSubmission("confirmation", context.requestId);
     try {
       const result = await submitConfirmation(
         ctx.assistantId,
@@ -169,25 +176,40 @@ async function executeSaveRule(
       );
       if (!result.ok) {
         useRuleEditorStore.getState().dismissRuleEditor();
-        useChatSessionStore.getState().setError({ message: result.error });
+        captureSubmissionRejection("save_trust_rule", result);
+        reportSubmissionFailure(
+          "confirmation",
+          context.requestId,
+          "ruleEditorActions.saveFailed",
+        );
         return;
       }
     } catch (err) {
       captureError(err, { context: "save_trust_rule" });
       useRuleEditorStore.getState().dismissRuleEditor();
-      useChatSessionStore
-        .getState()
-        .setError({ message: "Failed to save trust rule. Please try again." });
+      reportSubmissionFailure(
+        "confirmation",
+        context.requestId,
+        "ruleEditorActions.saveFailed",
+      );
       return;
     } finally {
       useRuleEditorStore.getState().setIsSavingRule(false);
-      useInteractionStore.getState().submitConfirmationEnd();
+      useInteractionStore
+        .getState()
+        .releaseSubmission("confirmation", context.requestId);
     }
 
     useInteractionStore
       .getState()
       .dismissConfirmationIfMatches(context.requestId);
-    useInteractionStore.getState().setInlineConfirmationToolCallId(null);
+    useInteractionStore
+      .getState()
+      .releaseInlineAnchorIfMatches(
+        useChatSessionStore
+          .getState()
+          .confirmationToolCallMap.get(context.requestId),
+      );
     useChatSessionStore
       .getState()
       .deleteConfirmationToolCall(context.requestId);
@@ -223,7 +245,7 @@ async function executeSaveRule(
     });
     useChatSessionStore
       .getState()
-      .setError({ message: "Failed to save trust rule. Please try again." });
+      .setError({ message: t("chat:ruleEditorActions.saveFailed") });
   } finally {
     useRuleEditorStore.getState().setIsSavingRule(false);
     useRuleEditorStore.getState().dismissRuleEditor();
@@ -311,9 +333,9 @@ export function handleOpenRuleEditorForToolCall(
   // Cancel any previous suggestion fetch.
   useRuleEditorStore.getState().abortSuggestion();
 
-  // Only `riskAllowlistOptions` (minimatch globs) are valid save-path
-  // patterns. `riskScopeOptions` are regex-flavored, display-only and
-  // must NOT be persisted as trust rules.
+  // Only `riskAllowlistOptions` are valid save-path patterns: a trust rule is
+  // matched by exact string, and these are minted for that. `riskScopeOptions`
+  // are display-only and must NOT be persisted as trust rules.
   const resolvedAllowlistOptions: AllowlistOption[] =
     context.allowlistOptions.length > 0 ? context.allowlistOptions : [];
 

@@ -22,7 +22,9 @@ import { SurfaceContainer } from "@/domains/chat/components/surfaces/surface-con
 import { TableSurface } from "@/domains/chat/components/surfaces/table-surface";
 import { TaskPreferencesSurface } from "@/domains/chat/components/surfaces/task-preferences-surface";
 import { VisualSurface } from "@/domains/chat/components/surfaces/visual-surface";
+import { VoicePickerSurface } from "@/domains/chat/components/surfaces/voice-picker-surface";
 import { WorkResultSurface } from "@/domains/chat/components/surfaces/work-result-surface";
+import { useTranslation } from "@/i18n";
 
 export interface SurfaceRouterProps {
   surface: Surface;
@@ -60,6 +62,7 @@ function SurfaceRouterInner({
   toolCalls,
   onVellumLinkClick,
 }: SurfaceRouterProps) {
+  const { t } = useTranslation("chat");
   if (
     surface.completed &&
     INHERENTLY_INTERACTIVE_SURFACE_TYPES.includes(surface.surfaceType)
@@ -69,14 +72,14 @@ function SurfaceRouterInner({
       return (
         <div className="flex items-center gap-2 rounded-lg border border-[var(--border-element)] bg-[var(--surface-base)] px-3 py-2 text-body-medium-lighter text-[var(--content-secondary)]">
           <XCircle className="h-4 w-4 shrink-0" />
-          Cancelled
+          {t("surfaceRouter.cancelled")}
         </div>
       );
     }
     return (
       <div className="flex items-center gap-2 rounded-lg bg-[var(--system-positive-weak)] px-3 py-2 text-body-medium-lighter text-[var(--system-positive-strong)]">
         <CheckCircle className="h-4 w-4 shrink-0" />
-        {surface.completionSummary ?? surface.title ?? "Done"}
+        {surface.completionSummary ?? surface.title ?? t("surfaceRouter.done")}
       </div>
     );
   }
@@ -170,6 +173,20 @@ function SurfaceRouterInner({
     case "task_preferences":
       return <TaskPreferencesSurface surface={surface} onAction={onAction} />;
 
+    // Deliberately absent from `INHERENTLY_INTERACTIVE_SURFACE_TYPES` and
+    // `OPTIMISTIC_COMPLETION_SURFACE_TYPES`. A settings card has no terminal
+    // action and so never completes: listing it in the first would block the
+    // composer indefinitely, and in the second would collapse the card into a
+    // "Done" chip on the first pick.
+    case "voice_picker":
+      return (
+        <VoicePickerSurface
+          surface={surface}
+          onAction={onAction}
+          assistantId={assistantId ?? null}
+        />
+      );
+
     case "work_result":
       return <WorkResultSurface surface={surface} onAction={onAction} />;
 
@@ -191,8 +208,8 @@ function SurfaceRouterInner({
         <SurfaceContainer surface={surface} onAction={onAction}>
           <p className="text-body-medium-lighter text-[var(--content-quiet)]">
             {surface.surfaceType
-              ? `Unsupported surface type: ${surface.surfaceType}`
-              : "Unknown surface"}
+              ? t("surfaceRouter.unsupportedType", { type: surface.surfaceType })
+              : t("surfaceRouter.unknownSurface")}
           </p>
         </SurfaceContainer>
       );
@@ -214,6 +231,7 @@ function SurfaceRouterInner({
  */
 export function SurfaceRouter(props: SurfaceRouterProps) {
   const { surface } = props;
+  const { t } = useTranslation("chat");
   return (
     <Sentry.ErrorBoundary
       key={surface.surfaceId}
@@ -228,8 +246,8 @@ export function SurfaceRouter(props: SurfaceRouterProps) {
         >
           <AlertTriangle className="h-4 w-4 shrink-0" />
           {surface.title
-            ? `"${surface.title}" couldn't be displayed.`
-            : "This content couldn't be displayed."}
+            ? t("surfaceRouter.displayFailedNamed", { title: surface.title })
+            : t("surfaceRouter.displayFailed")}
         </div>
       }
     >

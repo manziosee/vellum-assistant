@@ -96,7 +96,8 @@
       "workspace": "Todos los archivos que me hacen funcionar"
     },
     "defaultAssistantName": "Asistente",
-    "memoryCountLabel": "{count, plural, one {# recuerdo} other {# recuerdos}}",
+    "memoryCount": "{count, plural, one {# recuerdo} other {# recuerdos}}",
+    "memoryCountLabel": "{count, plural, one {recuerdo} other {recuerdos}}",
     "renameErrorToast": "El cambio de nombre no se completó. Vuelve a intentarlo.",
     "renameSuccessToast": "¡Saluda a {newName}!",
     "scheduleCadence": "{cadence} · próxima {nextRun}",
@@ -130,7 +131,7 @@
     },
     "superpowers": {
       "description": "Lo que puedo hacer",
-      "label": "Mis superpoderes"
+      "label": "Superpoderes"
     },
     "workspace": {
       "description": "Mis archivos",
@@ -382,14 +383,18 @@
     "upgradePluginAriaLabel": "Actualizar plugin"
   },
   "useIdentitySectionStats": {
+    "activeCount": "{count, plural, one {# activa} other {# activas}}",
     "activeLabel": "{count, plural, one {activa} other {activas}}",
+    "appAndDocCount": "{count, plural, one {# app o documento} other {# apps y documentos}}",
     "appCount": "{count, plural, one {# app} other {# apps}}",
+    "connectedCount": "{count, plural, one {# conectado} other {# conectados}}",
     "connectedLabel": "{count, plural, one {conectado} other {conectados}}",
-    "docCount": "{count, plural, one {# documento} other {# documentos}}",
+    "itemCount": "{count, plural, one {# elemento} other {# elementos}}",
     "itemLabel": "{count, plural, one {elemento} other {elementos}}",
     "noSchedulesText": "Todavía no hay nada programado",
+    "personCount": "{count, plural, one {# persona} other {# personas}}",
     "personLabel": "{count, plural, one {persona} other {personas}}",
-    "pluginCount": "{count, plural, one {# plugin} other {# plugins}}",
+    "skillAndPluginCount": "{count, plural, one {# habilidad o plugin} other {# habilidades y plugins}}",
     "skillCount": "{count, plural, one {# habilidad} other {# habilidades}}"
   },
   "usePluginsList": {

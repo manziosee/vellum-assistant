@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  MAX_OPEN_THREAD_MESSAGE_LENGTH,
   MAX_START_VOICE_PROMPT_LENGTH,
+  parseNewChatDeepLink,
+  parseOpenCameraDeepLink,
+  parseOpenThreadDeepLink,
   parseStartVoiceDeepLink,
 } from "@/runtime/native-deep-link";
 
@@ -15,6 +19,7 @@ describe("parseStartVoiceDeepLink", () => {
       expect(parseStartVoiceDeepLink(`${scheme}://voice?mode=new`)).toEqual({
         mode: "new",
         prompt: null,
+        provenance: null,
       });
     }
   });
@@ -22,20 +27,21 @@ describe("parseStartVoiceDeepLink", () => {
   test("parses mode=resume", () => {
     expect(
       parseStartVoiceDeepLink("vellum-assistant://voice?mode=resume"),
-    ).toEqual({ mode: "resume", prompt: null });
+    ).toEqual({ mode: "resume", prompt: null, provenance: null });
   });
 
   test("defaults a missing mode to new — a bare link still means 'start talking'", () => {
     expect(parseStartVoiceDeepLink("vellum-assistant://voice")).toEqual({
       mode: "new",
       prompt: null,
+      provenance: null,
     });
   });
 
   test("defaults an unrecognized mode to new", () => {
     expect(
       parseStartVoiceDeepLink("vellum-assistant://voice?mode=teleport"),
-    ).toEqual({ mode: "new", prompt: null });
+    ).toEqual({ mode: "new", prompt: null, provenance: null });
   });
 
   test("rejects look-alike schemes — a prefix match would let a hostile app in", () => {
@@ -77,9 +83,9 @@ function askLink(prompt: string, mode = "new"): string {
 
 describe("parseStartVoiceDeepLink - prompt", () => {
   test("a link with no prompt is identical to a plain mode=new link", () => {
-    expect(parseStartVoiceDeepLink("vellum-assistant://voice?mode=new")).toEqual(
-      parseStartVoiceDeepLink("vellum-assistant://voice"),
-    );
+    expect(
+      parseStartVoiceDeepLink("vellum-assistant://voice?mode=new"),
+    ).toEqual(parseStartVoiceDeepLink("vellum-assistant://voice"));
     expect(
       parseStartVoiceDeepLink("vellum-assistant://voice?mode=new")?.prompt,
     ).toBeNull();
@@ -132,6 +138,7 @@ describe("parseStartVoiceDeepLink - prompt", () => {
     expect(parseStartVoiceDeepLink(askLink(tooLong))).toEqual({
       mode: "new",
       prompt: null,
+      provenance: null,
     });
   });
 
@@ -156,9 +163,9 @@ describe("parseStartVoiceDeepLink - prompt", () => {
 
   test("a rejected prompt still yields a usable voice command", () => {
     // The user did ask for voice; only the text is untrustworthy.
-    expect(
-      parseStartVoiceDeepLink(askLink("bad\u0000text", "resume")),
-    ).toEqual({ mode: "resume", prompt: null });
+    expect(parseStartVoiceDeepLink(askLink("bad\u0000text", "resume"))).toEqual(
+      { mode: "resume", prompt: null, provenance: null },
+    );
   });
 
   test("still rejects the link itself for a bad scheme or host, prompt or not", () => {
@@ -207,6 +214,305 @@ describe("parseStartVoiceDeepLink - prompt", () => {
       expect(parseStartVoiceDeepLink(link)).toEqual({
         mode: "new",
         prompt: expected,
+        provenance: null,
+      });
+    }
+  });
+});
+
+/**
+ * Build the link exactly the way `ThreadDeepLink.url(message:)` does on the
+ * Swift side, with the same encoding agreement `askLink` documents above.
+ */
+function threadLink(threadId: string, message?: string): string {
+  const base = `vellum-assistant://thread/${threadId}`;
+  return message === undefined
+    ? base
+    : `${base}?message=${encodeURIComponent(message)}`;
+}
+
+describe("parseOpenThreadDeepLink", () => {
+  const THREAD_ID = "0198f2f7-6c4e-7a31-b552-9c4d1a2b3c4d";
+
+  test("accepts every registered build-target scheme", () => {
+    for (const scheme of [
+      "vellum-assistant",
+      "vellum-assistant-staging",
+      "vellum-assistant-dev",
+    ]) {
+      expect(
+        parseOpenThreadDeepLink(`${scheme}://thread/${THREAD_ID}`),
+      ).toEqual({ threadId: THREAD_ID, message: null, provenance: null });
+    }
+  });
+
+  test("rejects look-alike schemes - a prefix match would let a hostile app in", () => {
+    expect(
+      parseOpenThreadDeepLink(`vellum-assistant-evil://thread/${THREAD_ID}`),
+    ).toBeNull();
+    expect(parseOpenThreadDeepLink(`vellum://thread/${THREAD_ID}`)).toBeNull();
+    expect(parseOpenThreadDeepLink(`https://thread/${THREAD_ID}`)).toBeNull();
+  });
+
+  test("rejects other hosts on a valid scheme", () => {
+    expect(
+      parseOpenThreadDeepLink(`vellum-assistant://threads/${THREAD_ID}`),
+    ).toBeNull();
+    expect(
+      parseOpenThreadDeepLink(`vellum-assistant://voice/${THREAD_ID}`),
+    ).toBeNull();
+  });
+
+  test("rejects a missing, multi-segment, or malformed id", () => {
+    expect(parseOpenThreadDeepLink("vellum-assistant://thread")).toBeNull();
+    expect(parseOpenThreadDeepLink("vellum-assistant://thread/")).toBeNull();
+    expect(
+      parseOpenThreadDeepLink(`vellum-assistant://thread/${THREAD_ID}/extra`),
+    ).toBeNull();
+    // Percent-encoding in the id is structure-smuggling, not an id.
+    expect(
+      parseOpenThreadDeepLink("vellum-assistant://thread/abc%2Fdef"),
+    ).toBeNull();
+    expect(
+      parseOpenThreadDeepLink(`vellum-assistant://thread/${"a".repeat(129)}`),
+    ).toBeNull();
+  });
+
+  test("accepts an id exactly at the length cap", () => {
+    const atCap = "a".repeat(128);
+    expect(
+      parseOpenThreadDeepLink(`vellum-assistant://thread/${atCap}`),
+    ).toEqual({ threadId: atCap, message: null, provenance: null });
+  });
+
+  test("round-trips a message with query-breaking characters", () => {
+    for (const message of [
+      "log: gym done & stretching",
+      "what is 2 + 2 = ?",
+      "ship it #now, at 100%",
+    ]) {
+      expect(
+        parseOpenThreadDeepLink(threadLink(THREAD_ID, message))?.message,
+      ).toBe(message);
+    }
+  });
+
+  test("keeps typed line breaks, normalizing CRLF and lone CR to LF", () => {
+    expect(
+      parseOpenThreadDeepLink(threadLink(THREAD_ID, "log:\n- gym\n- stretch"))
+        ?.message,
+    ).toBe("log:\n- gym\n- stretch");
+    expect(
+      parseOpenThreadDeepLink(threadLink(THREAD_ID, "one\r\ntwo\rthree"))
+        ?.message,
+    ).toBe("one\ntwo\nthree");
+  });
+
+  test("still rejects the other control characters a hand-built link could carry", () => {
+    for (const control of ["\u0000", "\u000b", "\u001f", "\u007f", "\u2028"]) {
+      expect(
+        parseOpenThreadDeepLink(threadLink(THREAD_ID, `one${control}two`)),
+      ).toEqual({ threadId: THREAD_ID, message: null, provenance: null });
+    }
+  });
+
+  test("degrades a rejected message to a message-less open rather than dropping the link", () => {
+    const tooLong = "a".repeat(MAX_OPEN_THREAD_MESSAGE_LENGTH + 1);
+    for (const link of [
+      threadLink(THREAD_ID, tooLong),
+      threadLink(THREAD_ID, "   "),
+      threadLink(THREAD_ID, ""),
+    ]) {
+      expect(parseOpenThreadDeepLink(link)).toEqual({
+        threadId: THREAD_ID,
+        message: null,
+        provenance: null,
+      });
+    }
+  });
+
+  test("accepts a message exactly at the cap and rejects one character more", () => {
+    const atCap = "b".repeat(MAX_OPEN_THREAD_MESSAGE_LENGTH);
+    expect(parseOpenThreadDeepLink(threadLink(THREAD_ID, atCap))?.message).toBe(
+      atCap,
+    );
+    expect(
+      parseOpenThreadDeepLink(threadLink(THREAD_ID, `${atCap}b`))?.message,
+    ).toBeNull();
+  });
+
+  test("rejects unparseable URLs", () => {
+    expect(parseOpenThreadDeepLink("::not-a-url")).toBeNull();
+    expect(parseOpenThreadDeepLink("")).toBeNull();
+  });
+});
+
+describe("command URL provenance", () => {
+  const THREAD_ID = "0198f2f7-6c4e-7a31-b552-9c4d1a2b3c4d";
+  const voiceIntent = "vellum-assistant://voice?mode=new&prompt=hi&src=intent";
+  const threadIntent = `vellum-assistant://thread/${THREAD_ID}?message=hi&src=intent`;
+
+  test("is null by default even when the marker is present: trust is opt-in", () => {
+    // A caller that has not said its shell strips the marker at external
+    // entry points must not be able to trust it by omission.
+    expect(parseStartVoiceDeepLink(voiceIntent)?.provenance).toBeNull();
+    expect(parseOpenThreadDeepLink(threadIntent)?.provenance).toBeNull();
+    expect(
+      parseStartVoiceDeepLink(voiceIntent, { acceptProvenance: false })
+        ?.provenance,
+    ).toBeNull();
+  });
+
+  test("is 'intent' only for the exact marker when the caller opts in", () => {
+    const opts = { acceptProvenance: true };
+    expect(parseStartVoiceDeepLink(voiceIntent, opts)?.provenance).toBe(
+      "intent",
+    );
+    expect(parseOpenThreadDeepLink(threadIntent, opts)?.provenance).toBe(
+      "intent",
+    );
+    // Absent, or any other value, is unknown origin.
+    expect(
+      parseStartVoiceDeepLink("vellum-assistant://voice?prompt=hi", opts)
+        ?.provenance,
+    ).toBeNull();
+    expect(
+      parseStartVoiceDeepLink(
+        "vellum-assistant://voice?prompt=hi&src=shortcut",
+        opts,
+      )?.provenance,
+    ).toBeNull();
+    expect(
+      parseOpenThreadDeepLink(
+        `vellum-assistant://thread/${THREAD_ID}?src=INTENT`,
+        opts,
+      )?.provenance,
+    ).toBeNull();
+  });
+
+  test("honors only the raw `src=intent` item, never a percent-encoded spelling", () => {
+    // `URLSearchParams` decodes each of these to `src` / `intent`; the shell
+    // and this parser are different URL parsers over the same string, so the
+    // only spelling this side may honor is the raw item both see identically
+    // (ATL-1293).
+    const opts = { acceptProvenance: true };
+    const encodedSpellings = [
+      "vellum-assistant://voice?s%72c=intent&prompt=hi",
+      "vellum-assistant://voice?%73%72%63=intent&prompt=hi",
+      "vellum-assistant://voice?%FF=1&s%72c=intent&prompt=hi",
+      "vellum-assistant://voice?src=%69ntent&prompt=hi",
+    ];
+    for (const link of encodedSpellings) {
+      expect(parseStartVoiceDeepLink(link, opts)?.provenance).toBeNull();
+    }
+    expect(
+      parseOpenThreadDeepLink(
+        `vellum-assistant://thread/${THREAD_ID}?message=hi&s%72c=intent`,
+        opts,
+      )?.provenance,
+    ).toBeNull();
+    // Position and neighbours do not matter, only the item itself.
+    expect(
+      parseStartVoiceDeepLink(
+        "vellum-assistant://voice?src=intent&prompt=hi&&mode=new&",
+        opts,
+      )?.provenance,
+    ).toBe("intent");
+    expect(
+      parseStartVoiceDeepLink("vellum-assistant://voice?src=intent#frag", opts)
+        ?.provenance,
+    ).toBe("intent");
+  });
+
+  test("the marker never rescues a link the parser would otherwise reject", () => {
+    const opts = { acceptProvenance: true };
+    expect(
+      parseStartVoiceDeepLink("vellum-assistant-evil://voice?src=intent", opts),
+    ).toBeNull();
+    expect(
+      parseOpenThreadDeepLink("vellum-assistant://thread/?src=intent", opts),
+    ).toBeNull();
+    // Text sanitization is independent of provenance: a proven link with an
+    // unusable message still parses, message-less.
+    const tooLong = "a".repeat(MAX_OPEN_THREAD_MESSAGE_LENGTH + 1);
+    expect(
+      parseOpenThreadDeepLink(
+        `${threadLink(THREAD_ID, tooLong)}&src=intent`,
+        opts,
+      ),
+    ).toEqual({ threadId: THREAD_ID, message: null, provenance: "intent" });
+  });
+});
+
+describe("parseOpenCameraDeepLink / parseNewChatDeepLink", () => {
+  const hosts = [
+    ["camera", parseOpenCameraDeepLink],
+    ["new-chat", parseNewChatDeepLink],
+  ] as const;
+
+  test("accepts every registered build-target scheme", () => {
+    for (const [host, parse] of hosts) {
+      for (const scheme of [
+        "vellum-assistant",
+        "vellum-assistant-staging",
+        "vellum-assistant-dev",
+      ]) {
+        expect(parse(`${scheme}://${host}`)).toEqual({ provenance: null });
+      }
+    }
+  });
+
+  test("rejects look-alike schemes, as a prefix match would let a hostile app in", () => {
+    for (const [host, parse] of hosts) {
+      expect(parse(`vellum-assistant-evil://${host}`)).toBeNull();
+      expect(parse(`vellum://${host}`)).toBeNull();
+      expect(parse(`https://${host}`)).toBeNull();
+    }
+  });
+
+  test("rejects other hosts on a valid scheme, including each other's", () => {
+    expect(parseOpenCameraDeepLink("vellum-assistant://new-chat")).toBeNull();
+    expect(parseNewChatDeepLink("vellum-assistant://camera")).toBeNull();
+    for (const [, parse] of hosts) {
+      expect(parse("vellum-assistant://voice")).toBeNull();
+      expect(parse("vellum-assistant://cameras")).toBeNull();
+      expect(parse("not a url")).toBeNull();
+    }
+  });
+
+  test("accepts a trailing slash, which is the same bare command", () => {
+    for (const [host, parse] of hosts) {
+      expect(parse(`vellum-assistant://${host}/`)).toEqual({
+        provenance: null,
+      });
+      expect(parse(`vellum-assistant://${host}/?src=intent`)).toEqual({
+        provenance: null,
+      });
+    }
+  });
+
+  test("rejects a path, since the host is the whole request", () => {
+    for (const [host, parse] of hosts) {
+      expect(parse(`vellum-assistant://${host}/unrelated`)).toBeNull();
+      expect(parse(`vellum-assistant://${host}/unrelated?x=1`)).toBeNull();
+      expect(parse(`vellum-assistant://${host}//`)).toBeNull();
+    }
+  });
+
+  test("ignores extra params, so a producer that grows one degrades to the plain command", () => {
+    for (const [host, parse] of hosts) {
+      expect(parse(`vellum-assistant://${host}?mode=new&x=1#frag`)).toEqual({
+        provenance: null,
+      });
+    }
+  });
+
+  test("reads the provenance marker only when the caller opts in", () => {
+    for (const [host, parse] of hosts) {
+      const link = `vellum-assistant://${host}?src=intent`;
+      expect(parse(link)).toEqual({ provenance: null });
+      expect(parse(link, { acceptProvenance: true })).toEqual({
+        provenance: "intent",
       });
     }
   });

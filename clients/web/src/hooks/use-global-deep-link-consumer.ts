@@ -1,6 +1,6 @@
 import { useLayoutEffect, useRef } from "react";
 import * as Sentry from "@sentry/react";
-import { useNavigate } from "react-router";
+import { useLocation, useNavigate } from "react-router";
 
 import { useQueryClient } from "@tanstack/react-query";
 
@@ -19,9 +19,10 @@ import { useConversationStore } from "@/stores/conversation-store";
 import { usePendingDeepLinkStore } from "@/stores/pending-deep-link-store";
 import {
   navigateToConversation,
+  navigateToNewConversation,
   revealConversationView,
 } from "@/utils/conversation-navigation";
-import { routes } from "@/utils/routes";
+import { conversationIdForPath, routes } from "@/utils/routes";
 
 /**
  * Global deep-link consumer — mounted at `RootLayout` so it's alive
@@ -33,6 +34,10 @@ import { routes } from "@/utils/routes";
  *
  * - `deeplink.openThread` → `ensureMainWindowVisible()` +
  *   `navigateToConversation()`
+ * - `deeplink.sendToThread` → same navigation into the *target* thread.
+ *   With proven provenance the message is parked as a send request the
+ *   chat domain fulfils on arrival; otherwise it is parked as a composer
+ *   pre-fill with focus requested. See the provenance note below.
  * - `deeplink.send` → `ensureMainWindowVisible()` + navigate to
  *   `/assistant` + park the message in `usePendingDeepLinkStore`
  *   for `ChatPage`'s composer-domain hook to consume on mount.
@@ -50,7 +55,16 @@ import { routes } from "@/utils/routes";
  *   cold-launch case, see `start-voice-request.ts`). `mode: "resume"`
  *   just navigates back to a running session's conversation. A `prompt`
  *   (Siri's "Ask …" intent, which collects the question before the app is
- *   up) pre-fills the composer, and no session starts for it; see below.
+ *   up) is asked as a text turn when its provenance is proven and
+ *   pre-fills the composer otherwise; no session starts for it either
+ *   way. See below.
+ * - `deeplink.newChat` → `ensureMainWindowVisible()` +
+ *   `navigateToNewConversation()`, the Home Screen widgets' New Chat button.
+ * - `deeplink.openCamera` → `ensureMainWindowVisible()`, then reveal the chat
+ *   and stay put on a conversation route, or land on a fresh draft from
+ *   anywhere else, and park the request in `usePendingDeepLinkStore` addressed
+ *   to whichever conversation that was, for its composer's attachment layer to
+ *   drain (`useCameraDeepLink`).
  * - `deeplink.connect` → `ensureMainWindowVisible()` + park the request
  *   in the connect-dialog store + navigate to the assistant chooser,
  *   which opens its Connect a Remote Assistant dialog off that store: a
@@ -59,11 +73,31 @@ import { routes } from "@/utils/routes";
  *   pairing) gets guidance naming the host instead.
  * - `deeplink.unknown` → Sentry breadcrumb.
  *
- * ## Why a start-voice `prompt` pre-fills the composer and starts nothing
+ * ## Deep-link text: proven provenance sends, anything else pre-fills
  *
- * Two independent constraints shape the prompt branch.
+ * A custom URL scheme carries no caller identity: any installed app or web
+ * page can open `<scheme>://voice?prompt=…` or `<scheme>://thread/<id>?message=…`,
+ * so acting on such text automatically would let an arbitrary link put words
+ * in the user's mouth and run a tool-capable turn with them. The parser
+ * bounds the *shape* of the text (`sanitizeDeepLinkText`); it cannot vouch
+ * for its *intent*. So by default deep-linked text lands visibly in the
+ * composer (the `deeplink.send` park) with focus requested, one tap from
+ * sent, and only the user sends it.
  *
- * No voice session starts for it, because a live-voice session has no
+ * The iOS shell can prove one origin, though. App Intents (a Shortcut, Siri,
+ * the Action Button) run in-process on the user's explicit action and hand
+ * their URL to the delegate directly; every URL from outside the process
+ * enters through two methods where the shell strips the provenance marker
+ * (`CommandURLProvenance.swift`, LUM-3281). The Capacitor source honors the
+ * marker only on iOS, so `provenance: "intent"` on a payload means exactly
+ * "the user ran an intent". That text may be sent for them: a voice prompt
+ * as a text turn in a fresh conversation, a thread message into its thread
+ * once the chat domain confirms the target exists (`useDeepLinkThreadSend`).
+ * Everything with `provenance: null` keeps the pre-fill contract.
+ *
+ * ## Why a start-voice `prompt` starts no session, even when proven
+ *
+ * A live-voice session has no
  * representation of a *text* user turn. Its wire protocol
  * (`domains/chat/voice/live-voice/protocol.ts`, mirroring
  * `assistant/src/live-voice/protocol.ts`) carries control frames plus raw PCM
@@ -76,22 +110,14 @@ import { routes } from "@/utils/routes";
  * a bug class of its own (missing `user_message_echo`, an unpersisted
  * conversation row, a missing `trustContext`). A session started alongside
  * the prompt could not hear the question, and its full-screen room would
- * hide the pre-fill.
+ * hide the pre-fill. So a proven prompt is asked as a *text* turn; the
+ * spoken answer waits on JARVIS-1522's seed-turn seam, and the
+ * `deeplink.startVoice` handler marks the line that changes when it lands.
  *
- * And the prompt is never auto-sent. A custom URL scheme carries no caller
- * identity: any installed app or web page can open `<scheme>://voice?prompt=…`,
- * so an automatic send would let an arbitrary link put words in the user's
- * mouth and run a tool-capable turn with them. The parser bounds the *shape*
- * of the text (`sanitizeStartVoicePrompt`); only the user can vouch for its
- * *intent*. The question therefore lands visibly in the composer (the
- * `deeplink.send` park) with focus requested, one tap from sent. Auto-asking
- * becomes safe only when the native shell can prove a link came from the Siri
- * intent rather than an external open; that provenance seam and the
- * voice-first spoken answer are both JARVIS-1522 design space.
- *
- * A prompt arriving while a call is already live parks the same way, minus
- * the navigation and focus: the call is surfaced and the text waits in the
- * owning composer. The composer pre-fill itself stays in the chat domain
+ * A prompt arriving while a call is already live parks as a pre-fill
+ * regardless of provenance, minus the navigation and focus: the call is
+ * surfaced and the text waits in the owning composer, because there is no
+ * way to hand it to the running session. The composer pre-fill itself stays in the chat domain
  * (`useDeepLinkConsumer`) because it owns `setInput`. This hook stays
  * generic; chat-specific store handling lives in the shared
  * `navigateToConversation` util.
@@ -123,6 +149,7 @@ function connectGuidanceMessage(url: string | null): string {
 
 export function useGlobalDeepLinkConsumer(): void {
   const navigate = useNavigate();
+  const { pathname, search, hash } = useLocation();
   const queryClient = useQueryClient();
   const navigateRef = useRef(navigate);
   useLayoutEffect(() => {
@@ -150,6 +177,32 @@ export function useGlobalDeepLinkConsumer(): void {
     openThread(threadId);
   });
 
+  // The iOS "Send Message to Chat" Shortcuts action. What happens to the
+  // message depends on whether the shell proved an App Intent produced the
+  // link (see the provenance note above the hook):
+  //
+  // - Proven: park a send request and land in the thread. The chat domain
+  //   (`useDeepLinkThreadSend`) sends it once the target is confirmed to
+  //   exist and pre-fills instead when it is not, so a stale picker id
+  //   cannot mint a new conversation. Nothing sends from here directly.
+  // - Unproven: pre-fill and focus, one tap from sent, exactly as before.
+  useBusSubscription(
+    "deeplink.sendToThread",
+    ({ threadId, message, provenance }) => {
+      void ensureMainWindowVisible();
+      if (provenance === "intent") {
+        usePendingDeepLinkStore
+          .getState()
+          .setPendingThreadSend(threadId, message);
+        openThread(threadId);
+        return;
+      }
+      usePendingDeepLinkStore.getState().setPendingComposerMessage(message);
+      openThread(threadId);
+      requestComposerFocus();
+    },
+  );
+
   // `mode` is deliberately not read. The two modes have collapsed onto the
   // same behavior — `resume` degrades to `new` with nothing running, and `new`
   // degrades to surfacing the call with something running — so consulting it
@@ -157,7 +210,7 @@ export function useGlobalDeepLinkConsumer(): void {
   // back the moment there is a product answer for what "new conversation"
   // should do to a call in progress; the field stays on the payload for that,
   // and because the URL contract is shared with the native producers.
-  useBusSubscription("deeplink.startVoice", ({ prompt }) => {
+  useBusSubscription("deeplink.startVoice", ({ prompt, provenance }) => {
     void ensureMainWindowVisible();
     const session = useLiveVoiceStore.getState();
     // A running session is surfaced, never doubled — for *either* mode. The
@@ -209,19 +262,90 @@ export function useGlobalDeepLinkConsumer(): void {
       }
       return;
     }
-    // A prompt with no call in progress: pre-fill and focus, never auto-send,
-    // and start no session. Both constraints are explained in the note above
-    // the hook.
+    // A prompt with no call in progress starts no session either way (the
+    // protocol has no text turn; see the note above the hook). What happens
+    // to the text depends on provenance:
+    //
+    // - Proven intent (Siri collected it on the user's explicit action):
+    //   ask it as a text turn in a fresh conversation. `navigateToNewConversation`
+    //   mints a *registered* draft and rides the `?prompt=` auto-send, the
+    //   pathway quick input and the launch buttons use, so no target-integrity
+    //   question arises. The answer is text, not speech, until JARVIS-1522
+    //   gives the voice session a seed turn.
+    // - Unproven: pre-fill and focus, one tap from sent.
     if (prompt !== null) {
+      if (provenance === "intent") {
+        navigateToNewConversation(navigateRef.current, { prompt });
+        return;
+      }
       usePendingDeepLinkStore.getState().setPendingComposerMessage(prompt);
       navigateRef.current(routes.assistant);
       requestComposerFocus();
       return;
     }
-    // The draft composer (no conversation): the session starts without one and
-    // the server assigns it on `ready`.
+    // The chat, so the layout that registers the starter is mounted. The drain
+    // mints the fresh conversation the session binds to and lands on it from
+    // there, reading the ref because it navigates after its own awaits.
     navigateRef.current(routes.assistant);
-    requestVoiceStart();
+    requestVoiceStart((to, options) => navigateRef.current(to, options));
+  });
+
+  // The Home Screen widgets' New Chat buttons. `navigateToNewConversation` is
+  // the same helper the in-app new-chat controls use, so the widget lands on a
+  // registered draft with the composer focused rather than on a route the app
+  // has no other way of reaching.
+  useBusSubscription("deeplink.newChat", () => {
+    void ensureMainWindowVisible();
+    navigateToNewConversation(navigateRef.current);
+  });
+
+  // The Quick Actions widget's camera button. The camera input belongs to the
+  // composer's attachment layer, which does not exist yet on a cold launch, so
+  // the request is parked in the same one-shot inbox the voice start uses and
+  // the composer drains it when it mounts (`useCameraDeepLink`).
+  //
+  // The landing has to be a route the composer *stays* mounted on, and a view
+  // that mounts one at all. A composer already on screen keeps the photo in the
+  // conversation the user is looking at, so the tap navigates nowhere and only
+  // reveals the chat, which the full-screen app viewer would otherwise be
+  // holding with `ChatMainPanel` swapped out (`ChatContentLayout`): the park
+  // would sit there with no consumer, the tap would read as doing nothing, and
+  // the camera would open by itself whenever the app was dismissed inside the
+  // TTL. `revealConversationView` is the reveal `navigateToNewConversation`
+  // runs below, so an app open beside the chat is kept either way. From
+  // anywhere else the tap lands on a fresh draft, the same registered-draft
+  // landing the New Chat button gets, silent because the tap was for the camera
+  // and not for a new chat's flourish.
+  useBusSubscription("deeplink.openCamera", () => {
+    void ensureMainWindowVisible();
+    // A named conversation only. The `/assistant` index mounts a composer too,
+    // but `useConversationLoader` replace-navigates off it to a conversation
+    // key on arrival, so a composer mounted there is remounted a beat later and
+    // anything it holds in local state goes with it.
+    const settledId = conversationIdForPath(pathname);
+    let targetId: string;
+    if (settledId !== null) {
+      revealConversationView(settledId);
+      // Re-navigating to the settled conversation is a no-op when the router
+      // is at rest, and cancels any in-flight transition away from it that
+      // would otherwise unmount the composer this park is addressed to. The
+      // search and hash ride along so pending query-driven effects survive.
+      navigateRef.current(
+        { pathname: routes.conversation(settledId), search, hash },
+        { replace: true },
+      );
+      targetId = settledId;
+    } else {
+      targetId = navigateToNewConversation(navigateRef.current, {
+        silent: true,
+      });
+    }
+    // Addressed to the conversation the tap lands on rather than broadcast to
+    // whichever composer wakes first. The draft branch above has only *started*
+    // its route transition, so a composer on the outgoing route is still
+    // mounted and would otherwise spend this one-shot park on a viewfinder the
+    // navigation takes down with it, leaving the draft's composer nothing.
+    usePendingDeepLinkStore.getState().setPendingCamera(targetId);
   });
 
   useBusSubscription(
@@ -256,11 +380,13 @@ export function useGlobalDeepLinkConsumer(): void {
     void ensureMainWindowVisible();
     // Park before navigating so the chooser mounts with the dialog
     // already open (its auto-skip stands down while it is).
-    useConnectDialogStore.getState().openConnectDialog(
-      bundle !== null
-        ? { initialBundle: bundle }
-        : { guidanceMessage: connectGuidanceMessage(url) },
-    );
+    useConnectDialogStore
+      .getState()
+      .openConnectDialog(
+        bundle !== null
+          ? { initialBundle: bundle }
+          : { guidanceMessage: connectGuidanceMessage(url) },
+      );
     navigateRef.current(routes.selectAssistant);
   });
 

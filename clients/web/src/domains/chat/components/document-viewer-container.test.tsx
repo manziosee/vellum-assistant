@@ -1,6 +1,6 @@
 /**
- * Tests for the document viewer's autosave: where a pending edit goes when the
- * container is taken down, and what it refreshes once it lands.
+ * Tests for the document viewer's writes: where a pending edit goes when the
+ * container is taken down, and what a rename sends along with the new title.
  *
  * The editor and the comment panel are stubbed. What this covers is the
  * container's own job (debounce, flush, cache invalidation), not Tiptap's.
@@ -14,8 +14,8 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import type { QueryKey } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 
 const saveDocumentContent = mock(
@@ -58,23 +58,14 @@ const { DocumentViewerContainer } = await import(
 
 interface RenderResult {
   unmount: () => void;
-  invalidatedKeys: QueryKey[];
 }
 
 function renderViewer(
-  props: { workspacePath?: string | null } = {},
+  props: { onRenamed?: (documentName: string) => void } = {},
 ): RenderResult {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
-  const invalidatedKeys: QueryKey[] = [];
-  const realInvalidate = queryClient.invalidateQueries.bind(queryClient);
-  queryClient.invalidateQueries = ((filters?: { queryKey?: QueryKey }) => {
-    if (filters?.queryKey) {
-      invalidatedKeys.push(filters.queryKey);
-    }
-    return realInvalidate(filters);
-  }) as typeof queryClient.invalidateQueries;
 
   const { unmount } = render(
     <DocumentViewerContainer
@@ -85,7 +76,7 @@ function renderViewer(
       onClose={() => {}}
       surfaceId="surf-1"
       conversationId="conv-1"
-      workspacePath={props.workspacePath ?? null}
+      onRenamed={props.onRenamed}
     />,
     {
       wrapper: ({ children }: { children: ReactNode }) => (
@@ -95,7 +86,7 @@ function renderViewer(
       ),
     },
   );
-  return { unmount, invalidatedKeys };
+  return { unmount };
 }
 
 /** Emit one editor update and wait for the editor stub to have mounted. */
@@ -109,7 +100,22 @@ async function typeIntoEditor(): Promise<void> {
 afterEach(() => {
   cleanup();
   saveDocumentContent.mockClear();
+  // Radix locks body pointer events while a menu is open; a test that leaves
+  // one open must not disable pointers for the next one.
+  document.body.style.pointerEvents = "";
 });
+
+/** Walk the overflow menu into the rename dialog and submit `name`. */
+async function renameTo(name: string): Promise<void> {
+  const user = userEvent.setup();
+  await user.click(screen.getByRole("button", { name: "Document options" }));
+  await user.click(await screen.findByRole("menuitem", { name: "Rename" }));
+
+  const input = await screen.findByLabelText("Name");
+  await user.clear(input);
+  await user.type(input, name);
+  await user.click(screen.getByRole("button", { name: "Save" }));
+}
 
 describe("DocumentViewerContainer autosave", () => {
   test("an edit still pending when the container goes away is flushed", async () => {
@@ -147,28 +153,50 @@ describe("DocumentViewerContainer autosave", () => {
 
     expect(saveDocumentContent).not.toHaveBeenCalled();
   });
+});
 
-  test("a file-backed save refreshes every query holding the file's bytes", async () => {
-    const { unmount, invalidatedKeys } = renderViewer({
-      workspacePath: "drafts/notes.md",
-    });
+describe("DocumentViewerContainer rename", () => {
+  test("the rename writes the new title with the body the editor holds", async () => {
+    const onRenamed = mock((_documentName: string) => {});
+    renderViewer({ onRenamed });
     await typeIntoEditor();
-    unmount();
 
-    await waitFor(() => expect(invalidatedKeys.length).toBe(3));
-    expect(invalidatedKeys).toEqual([
-      ["assistantsWorkspaceFileRetrieve"],
-      ["local-file-blob", "asst-1", "drafts/notes.md"],
-      ["local-file-info", "asst-1", "drafts/notes.md"],
-    ]);
-  });
+    await renameTo("meeting notes");
 
-  test("a document with no file behind it refreshes nothing", async () => {
-    const { unmount, invalidatedKeys } = renderViewer();
-    await typeIntoEditor();
-    unmount();
+    // The caller takes the name straight away, the way a conversation rename
+    // does, rather than after the round trip.
+    expect(onRenamed).toHaveBeenCalledTimes(1);
+    expect(onRenamed.mock.calls[0]![0]).toBe("meeting notes");
 
     await waitFor(() => expect(saveDocumentContent).toHaveBeenCalledTimes(1));
-    expect(invalidatedKeys).toEqual([]);
+    expect(saveDocumentContent.mock.calls[0]![0]).toEqual({
+      source: "document",
+      assistantId: "asst-1",
+      surfaceId: "surf-1",
+      conversationId: "conv-1",
+      title: "meeting notes",
+    });
+    // The edit was still inside the debounce window: the rename carries it
+    // instead of leaving it to a save that would restore the old title.
+    expect(saveDocumentContent.mock.calls[0]![1]).toBe("edited body");
+  });
+
+  test("the folded-in edit is not written a second time by the dead timer", async () => {
+    renderViewer();
+    await typeIntoEditor();
+    await renameTo("meeting notes");
+
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    expect(saveDocumentContent).toHaveBeenCalledTimes(1);
+  });
+
+  test("the name it already has is not a rename, and writes nothing", async () => {
+    const onRenamed = mock((_documentName: string) => {});
+    renderViewer({ onRenamed });
+
+    await renameTo("notes.md");
+
+    expect(onRenamed).not.toHaveBeenCalled();
+    expect(saveDocumentContent).not.toHaveBeenCalled();
   });
 });

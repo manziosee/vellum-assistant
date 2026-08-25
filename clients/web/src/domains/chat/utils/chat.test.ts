@@ -1,9 +1,11 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
 
 import {
+  attachConfirmationToToolCall,
   extractWirePendingAcpConnect,
   extractWirePendingConfirmation,
   extractWirePendingQuestion,
+  formatVoiceError,
   hasAssistantMessage,
   isConversationScopedStreamEvent,
   shouldClearFirstMessageGateOnConversationChange,
@@ -30,7 +32,37 @@ function assistantWithToolCalls(
   return { id, role: "assistant", toolCalls };
 }
 
+afterEach(() => {
+  delete (window as unknown as { vellum?: unknown }).vellum;
+});
+
 describe("chat utilities", () => {
+  describe("formatVoiceError", () => {
+    test("names the Windows client in native dictation errors", () => {
+      (
+        window as unknown as {
+          vellum?: { platform: "electron"; hostOS: "windows" };
+        }
+      ).vellum = { platform: "electron", hostOS: "windows" };
+
+      expect(formatVoiceError("native-stt-no-transcript")).toBe(
+        "Windows Native Dictation didn’t return a transcript. Check native speech recognition in system settings, then try again.",
+      );
+    });
+
+    test("names the macOS client in native dictation errors", () => {
+      (
+        window as unknown as {
+          vellum?: { platform: "electron"; hostOS: "macos" };
+        }
+      ).vellum = { platform: "electron", hostOS: "macos" };
+
+      expect(formatVoiceError("native-stt-no-transcript")).toBe(
+        "macOS Native Dictation didn’t return a transcript. Check native speech recognition in system settings, then try again.",
+      );
+    });
+  });
+
   describe("isConversationScopedStreamEvent", () => {
     const scoped = (type: string) =>
       isConversationScopedStreamEvent({ type } as AssistantEvent);
@@ -333,5 +365,69 @@ describe("chat utilities", () => {
       // THEN there is nothing to restore
       expect(restored).toBeNull();
     });
+  });
+});
+
+describe("attachConfirmationToToolCall", () => {
+  const conf = {
+    requestId: "req-1",
+    toolName: "bash",
+    input: { command: "ls" },
+  };
+
+  test("attaches to the tool call named by toolUseId", () => {
+    const messages = [
+      assistantWithToolCalls("m1", [
+        { id: "tc-1", name: "bash", input: {} },
+        { id: "tc-2", name: "file_read", input: {} },
+      ]),
+    ];
+
+    const { updatedMessages, attachedToolCallId } =
+      attachConfirmationToToolCall(messages, { ...conf, toolUseId: "tc-2" });
+
+    expect(attachedToolCallId).toBe("tc-2");
+    const attached = updatedMessages[0]!.toolCalls!.filter(
+      (tc) => tc.pendingConfirmation?.requestId === "req-1",
+    );
+    // Exactly one call carries it: a prompt that lands on two chips renders
+    // two approve/deny pairs for one decision.
+    expect(attached.map((tc) => tc.id)).toEqual(["tc-2"]);
+  });
+
+  test("does not attach when the confirmation names no tool call, even with a running one present", () => {
+    const messages = [
+      assistantWithToolCalls("m1", [
+        // Running: no result yet. The deleted fallback used to seize on this.
+        { id: "tc-running", name: "bash", input: {} },
+      ]),
+    ];
+
+    const { updatedMessages, attachedToolCallId } =
+      attachConfirmationToToolCall(messages, conf);
+
+    // An absent toolUseId means the daemon has no tool call for this prompt
+    // (ACP route approvals). Guessing one hides the prompt whenever the guess
+    // lands on a call the transcript does not draw; leaving it unattached
+    // routes it to the trailer row instead.
+    expect(attachedToolCallId).toBeUndefined();
+    expect(
+      updatedMessages.some((m) =>
+        m.toolCalls?.some((tc) => tc.pendingConfirmation !== undefined),
+      ),
+    ).toBe(false);
+  });
+
+  test("does not attach when toolUseId names a call that is not present", () => {
+    const messages = [
+      assistantWithToolCalls("m1", [{ id: "tc-1", name: "bash", input: {} }]),
+    ];
+
+    const { attachedToolCallId } = attachConfirmationToToolCall(messages, {
+      ...conf,
+      toolUseId: "tc-absent",
+    });
+
+    expect(attachedToolCallId).toBeUndefined();
   });
 });

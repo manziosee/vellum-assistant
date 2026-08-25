@@ -16,11 +16,7 @@
 
 import { z } from "zod";
 
-import {
-  ACP_SERVICE,
-  AcpCredentialFormatError,
-  assertAcpCredentialFormat,
-} from "../../acp/acp-credentials.js";
+import { AcpCredentialFormatError } from "../../acp/acp-credentials.js";
 import { isAssistantFeatureFlagEnabled } from "../../config/assistant-feature-flags.js";
 import {
   fetchManagedCatalog,
@@ -28,25 +24,17 @@ import {
 } from "../../credential-execution/managed-catalog.js";
 import { buildForChatSentinel } from "../../daemon/chat-credential-redaction.js";
 import {
-  isNonSecretPlatformField,
-  scrubStoredCredentialFromTranscripts,
-} from "../../daemon/credential-transcript-scrub.js";
-import { syncManualTokenConnection } from "../../oauth/manual-token-connection.js";
-import {
   disconnectOAuthProvider,
   getConnectionByProvider,
   listConnections,
   type OAuthConnectionRow,
 } from "../../oauth/oauth-store.js";
 import { credentialKey } from "../../security/credential-key.js";
-import { normalizeSecretValue } from "../../security/secret-normalize.js";
 import {
   deleteSecureKeyAsync,
   getActiveBackendInfoAsync,
-  getActiveBackendName,
   getSecureKeyAsync,
   getSecureKeyResultAsync,
-  setSecureKeyAsync,
 } from "../../security/secure-keys.js";
 import {
   assertMetadataWritable,
@@ -55,18 +43,23 @@ import {
   getCredentialMetadata,
   getCredentialMetadataById,
   listCredentialMetadata,
-  upsertCredentialMetadata,
 } from "../../tools/credentials/metadata-store.js";
 import type { CredentialInjectionTemplate } from "../../tools/credentials/policy-types.js";
-import { getLogger } from "../../util/logger.js";
+import {
+  CredentialStorageError,
+  InvalidCredentialInputError,
+  storeCredentialValue,
+} from "../../tools/credentials/store.js";
 import { ACTOR_PRINCIPALS } from "../auth/route-policy.js";
 import { recordForChatMint } from "../for-chat-mint-registry.js";
 import { recordRevealSuccess } from "../reveal-success-registry.js";
+import {
+  assertCredentialNotInUse,
+  invalidateConnectionsAfterCredentialDelete,
+} from "./credential-in-use.js";
 import { InjectionTemplateSchema } from "./credential-prompt-routes.js";
 import { BadRequestError, InternalError } from "./errors.js";
 import type { RouteDefinition, RouteHandlerArgs } from "./types.js";
-
-const log = getLogger("credential-routes");
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -458,74 +451,29 @@ async function handleCredentialsSet({ body }: RouteHandlerArgs) {
     throw new BadRequestError("value is required");
   }
 
-  const normalizedValue = normalizeSecretValue(value);
-  if (normalizedValue.length === 0) {
-    throw new BadRequestError("value is required");
-  }
-
-  // Reject an Anthropic API key pasted into the ACP OAuth-token field (a 401
-  // footgun) as a 400 rather than letting the guard surface as a 500.
-  if (service === ACP_SERVICE) {
-    try {
-      assertAcpCredentialFormat(field, normalizedValue);
-    } catch (err) {
-      if (err instanceof AcpCredentialFormatError) {
-        throw new BadRequestError(err.message);
-      }
-      throw err;
+  try {
+    return await storeCredentialValue({
+      service,
+      field,
+      value,
+      alias: label,
+      usageDescription: description,
+      allowedTools,
+      allowedDomains,
+      injectionTemplates,
+    });
+  } catch (err) {
+    if (
+      err instanceof InvalidCredentialInputError ||
+      err instanceof AcpCredentialFormatError
+    ) {
+      throw new BadRequestError(err.message);
     }
-  }
-
-  assertMetadataWritable();
-
-  const key = credentialKey(service, field);
-  const stored = await setSecureKeyAsync(key, normalizedValue);
-  if (!stored) {
-    throw new InternalError(
-      `Failed to store credential in secure storage (backend: ${getActiveBackendName()})`,
-    );
-  }
-
-  // The stored plaintext may already sit in recent transcripts: the user
-  // message that pasted it, the persisted tool_use input, the tool result
-  // echoing the command. This route is the scrub seam — not
-  // setSecureKeyAsync, which also fires on OAuth refresh rotations and MCP
-  // header writes whose values never transited a transcript. The scrub runs
-  // immediately after the secure-store write, BEFORE the metadata upsert and
-  // connection sync: those side effects can throw (oauth-store work), and a
-  // stored-but-unscrubbed secret must not depend on them succeeding. The
-  // credential IS stored at this point; the scrub is best-effort hygiene and
-  // must stay invisible to the caller.
-  if (!isNonSecretPlatformField(service, field)) {
-    try {
-      const scrubbed =
-        await scrubStoredCredentialFromTranscripts(normalizedValue);
-      log.info(
-        { service, field, ...scrubbed },
-        "Credential stored; scrubbed value from recent transcripts",
-      );
-    } catch (err) {
-      log.warn(
-        { err, service, field },
-        "Credential stored, but transcript scrub failed",
-      );
+    if (err instanceof CredentialStorageError) {
+      throw new InternalError(err.message);
     }
+    throw err;
   }
-
-  const metadata = upsertCredentialMetadata(service, field, {
-    alias: label,
-    usageDescription: description,
-    allowedTools,
-    allowedDomains,
-    injectionTemplates,
-  });
-  await syncManualTokenConnection(service);
-
-  return {
-    credentialId: metadata.credentialId,
-    service,
-    field,
-  };
 }
 
 async function handleCredentialsDelete({ body }: RouteHandlerArgs) {
@@ -533,9 +481,10 @@ async function handleCredentialsDelete({ body }: RouteHandlerArgs) {
     throw new BadRequestError("Request body is required");
   }
 
-  const { service, field } = body as {
+  const { service, field, force } = body as {
     service?: string;
     field?: string;
+    force?: boolean;
   };
 
   if (!service || typeof service !== "string") {
@@ -557,6 +506,7 @@ async function handleCredentialsDelete({ body }: RouteHandlerArgs) {
     service === "slack_channel" && field === "user_token";
 
   const key = credentialKey(service, field);
+  const affectedConnections = assertCredentialNotInUse(key, force === true);
   const existing = await getSecureKeyAsync(key);
   const deleteResult =
     existing != null ? await deleteSecureKeyAsync(key) : "not-found";
@@ -566,6 +516,11 @@ async function handleCredentialsDelete({ body }: RouteHandlerArgs) {
       `Failed to delete credential from secure storage: ${service}:${field}`,
     );
   }
+
+  // Cached provider adapters hold the deleted credential, so they are dropped
+  // as soon as the secure vault no longer has it: a later failure in this
+  // handler must not leave them dispatching with a credential that is gone.
+  invalidateConnectionsAfterCredentialDelete(affectedConnections);
 
   const metadataDeleted = deleteCredentialMetadata(service, field);
 
@@ -593,7 +548,9 @@ async function handleCredentialsDelete({ body }: RouteHandlerArgs) {
     throw new BadRequestError("Credential not found");
   }
 
-  return { service, field };
+  invalidateConnectionsAfterCredentialDelete(affectedConnections);
+
+  return { service, field, affectedConnections };
 }
 
 async function handleCredentialsStatus() {
@@ -746,15 +703,28 @@ export const ROUTES: RouteDefinition[] = [
     },
     summary: "Delete a credential",
     description:
-      "Remove a secret, its metadata, and any associated OAuth connection from the vault.",
+      "Remove a secret, its metadata, and any associated OAuth connection from the vault. " +
+      "Refused with CREDENTIAL_IN_USE while an LLM provider connection resolves its auth " +
+      "through the credential, unless `force` is set.",
     tags: ["credentials"],
     requestBody: z.object({
       service: z.string().describe("Service namespace"),
       field: z.string().describe("Field name"),
+      force: z
+        .boolean()
+        .optional()
+        .describe(
+          "Delete even when provider connections depend on the credential",
+        ),
     }),
     responseBody: z.object({
       service: z.string(),
       field: z.string(),
+      affectedConnections: z
+        .array(z.string())
+        .describe(
+          "Provider connections that depended on the deleted credential",
+        ),
     }),
     handler: handleCredentialsDelete,
   },

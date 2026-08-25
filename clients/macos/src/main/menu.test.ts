@@ -11,6 +11,7 @@ type TemplateItem = {
   role?: string;
   type?: string;
   enabled?: boolean;
+  accelerator?: string;
   click?: () => void | Promise<void>;
   submenu?: TemplateItem[];
 };
@@ -43,7 +44,7 @@ mock.module("./about.client", () => ({
   openAboutWindow: () => undefined,
 }));
 
-mock.module("./auto-update", () => ({
+mock.module("./auto-update.client", () => ({
   checkForUpdates: () => undefined,
 }));
 
@@ -52,7 +53,7 @@ mock.module("./commands.client", () => ({
   dispatchToFocused: () => undefined,
 }));
 
-mock.module("./command-palette-window", () => ({
+mock.module("./command-palette.client", () => ({
   closeCommandPaletteWindow: () => undefined,
   isCommandPaletteWindowFocused: () => false,
   openCommandPaletteWindow: () => undefined,
@@ -72,13 +73,13 @@ mock.module("./main-window", () => ({
 
 // Full `./settings` surface so this mock — which leaks into co-run test files
 // via the global module registry — doesn't break sibling modules.
-mock.module("./settings", () => ({
+mock.module("@vellumai/electron-desktop/settings", () => ({
   readSetting: () => null,
   writeSetting: () => {},
   onSettingChange: () => () => {},
 }));
 
-mock.module("./window-state", () => ({
+mock.module("@vellumai/electron-desktop/window-state", () => ({
   readOnboardingActive: () => false,
 }));
 
@@ -359,6 +360,22 @@ describe("CLI path menu items in unpackaged builds", () => {
     expect(getCliPathInstallStateMock).not.toHaveBeenCalled();
     expect(appMenuLabels()).not.toContain(INSTALL_LABEL);
     expect(appMenuLabels()).not.toContain(UNINSTALL_LABEL);
+  });
+});
+
+describe("View menu native fullscreen", () => {
+  const viewSubmenu = (): TemplateItem[] =>
+    lastTemplate().find((item) => item.label === "View")?.submenu ?? [];
+
+  test("registers Toggle Full Screen with the macOS Control+Command+F equivalent", async () => {
+    await refreshCliPathMenuState();
+    const toggleFullscreen = viewSubmenu().find(
+      (item) => item.role === "togglefullscreen",
+    );
+    expect(toggleFullscreen).toEqual({
+      role: "togglefullscreen",
+      accelerator: "Control+Command+F",
+    });
   });
 });
 

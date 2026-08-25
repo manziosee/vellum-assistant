@@ -102,6 +102,7 @@ import {
   RecordingStopEventSchema,
 } from "./events/recording.js";
 import { RelationshipStateUpdatedEventSchema } from "./events/relationship-state-updated.js";
+import { ResourcePressureStatusChangedEventSchema } from "./events/resource-pressure-status-changed.js";
 import { ScheduleConversationCreatedEventSchema } from "./events/schedule-conversation-created.js";
 import { SecretRequestEventSchema } from "./events/secret-request.js";
 import { ServiceGroupUpdateCompleteEventSchema } from "./events/service-group-update-complete.js";
@@ -128,12 +129,18 @@ import { UISurfaceUpdateEventSchema } from "./events/ui-surface-update.js";
 import { UsageProgressEventSchema } from "./events/usage-progress.js";
 import { UsageUpdateEventSchema } from "./events/usage-update.js";
 import { UserMessageEchoEventSchema } from "./events/user-message-echo.js";
+import { WatchRetroCompletedEventSchema } from "./events/watch-retro-completed.js";
 import { WorkflowCompletedEventSchema } from "./events/workflow-completed.js";
 import { WorkflowLeafFinishedEventSchema } from "./events/workflow-leaf-finished.js";
 import { WorkflowLeafStartedEventSchema } from "./events/workflow-leaf-started.js";
 import { WorkflowProgressEventSchema } from "./events/workflow-progress.js";
 import { WorkflowStartedEventSchema } from "./events/workflow-started.js";
 
+export {
+  APP_MUTATION_TOOL_NAMES,
+  APP_MUTATION_TOOLS,
+  type AppMutationTool,
+} from "./constants/app-tools.js";
 export {
   CALL_SITE_COMPACTION_AGENT,
   CALL_SITE_SYNTHETIC_AGENT_ERROR_MESSAGE,
@@ -145,6 +152,11 @@ export {
   type DocumentMutationTool,
   REOPENABLE_DOCUMENT_MUTATION_TOOL_NAMES,
 } from "./constants/document-tools.js";
+export {
+  MIN_INPUT_RESERVE_TOKENS,
+  type ProfileConfigIssue,
+  validateInferenceProfileConfig,
+} from "./constants/profile-config-validation.js";
 export {
   SSE_REPLAY_RING_AGE_LIMIT_MS,
   SSE_REPLAY_RING_COUNT_LIMIT,
@@ -537,6 +549,14 @@ export {
   RelationshipStateUpdatedEventSchema,
 } from "./events/relationship-state-updated.js";
 export {
+  type ResourcePressureState,
+  ResourcePressureStateSchema,
+  type ResourcePressureStatus,
+  type ResourcePressureStatusChangedEvent,
+  ResourcePressureStatusChangedEventSchema,
+  ResourcePressureStatusSchema,
+} from "./events/resource-pressure-status-changed.js";
+export {
   type ScheduleConversationCreatedEvent,
   ScheduleConversationCreatedEventSchema,
 } from "./events/schedule-conversation-created.js";
@@ -662,6 +682,10 @@ export {
   type UserMessageEchoEvent,
   UserMessageEchoEventSchema,
 } from "./events/user-message-echo.js";
+export {
+  type WatchRetroCompletedEvent,
+  WatchRetroCompletedEventSchema,
+} from "./events/watch-retro-completed.js";
 export {
   type WorkflowCompletedEvent,
   WorkflowCompletedEventSchema,
@@ -802,6 +826,10 @@ export {
   type MemoryV3SelectionRow,
   MemoryV3SelectionRowSchema,
 } from "./responses/memory-v3-selection-log.js";
+export {
+  type ResourcePressureStatusResponse,
+  ResourcePressureStatusResponseSchema,
+} from "./responses/resource-pressure-status.js";
 export {
   type SubagentDetailEvent,
   SubagentDetailEventSchema,
@@ -987,6 +1015,7 @@ export const AssistantEventSchema = z.discriminatedUnion("type", [
   RecordingStartEventSchema,
   RecordingStopEventSchema,
   RelationshipStateUpdatedEventSchema,
+  ResourcePressureStatusChangedEventSchema,
   ScheduleConversationCreatedEventSchema,
   SecretRequestEventSchema,
   ServiceGroupUpdateCompleteEventSchema,
@@ -1013,6 +1042,7 @@ export const AssistantEventSchema = z.discriminatedUnion("type", [
   UsageProgressEventSchema,
   UsageUpdateEventSchema,
   UserMessageEchoEventSchema,
+  WatchRetroCompletedEventSchema,
   WorkflowCompletedEventSchema,
   WorkflowLeafFinishedEventSchema,
   WorkflowLeafStartedEventSchema,

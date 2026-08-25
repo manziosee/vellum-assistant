@@ -1,4 +1,5 @@
 import {
+  isUserTerminalHistoryError,
   ORDERING_ERROR_PATTERNS,
   WEB_SEARCH_ORDERING_PATTERNS,
 } from "../agent/history-repair/history-repair.js";
@@ -11,6 +12,7 @@ import {
   isImageDimensionsTooLargeError,
   isImageMediaTypeMismatchError,
   isImageUnprocessableError,
+  isImageUnsupportedFormatError,
 } from "../plugins/defaults/image-recovery/detect.js";
 import { ConnectionResolutionError } from "../providers/connection-resolution.js";
 import { PROVIDER_CATALOG } from "../providers/model-catalog.js";
@@ -479,6 +481,14 @@ function classifyCore(
           errorCategory: "stale_web_search_content",
         };
       }
+      if (isUserTerminalHistoryError(message)) {
+        return {
+          code: "PROVIDER_ORDERING",
+          userMessage: "An internal error occurred. Please try again.",
+          retryable: true,
+          errorCategory: "history_user_terminal",
+        };
+      }
       if (isOrderingError(message)) {
         return {
           code: "PROVIDER_ORDERING",
@@ -537,6 +547,18 @@ function classifyCore(
             "An image in this conversation is in a format the AI provider can't read, and it couldn't be converted automatically. Re-save it as PNG or JPEG and upload it again.",
           retryable: false,
           errorCategory: "image_media_type_mismatch",
+        };
+      }
+      if (isImageUnsupportedFormatError(message)) {
+        // Same wire-code reuse as image_unprocessable above. The provider read
+        // the bytes and found no image it accepts, so no relabel or resize can
+        // rescue the attachment: name the accepted formats instead.
+        return {
+          code: "IMAGE_TOO_LARGE",
+          userMessage:
+            "An image in this conversation is not in a format the AI provider accepts (PNG, JPEG, GIF, and WebP are). Remove or convert it and send your message again.",
+          retryable: false,
+          errorCategory: "image_unsupported_format",
         };
       }
       if (isVisionNotSupportedError(message)) {
@@ -632,13 +654,17 @@ function reasonToClassification(
       return contextTooLargeClassification();
     case "vision_unsupported":
       return visionNotSupportedClassification();
+    // Two producers share this reason: SDK transport failures that never got
+    // a response (OpenAI APIConnectionError), and Gemini responses whose empty
+    // body reveals a proxy/egress filter intercepting the request. The copy
+    // must stay broad enough for both.
     case "network_error":
       return {
         code: "PROVIDER_NETWORK",
         userMessage:
-          "The provider returned an empty response with no body — this typically indicates a network proxy or egress filter intercepting the request, not a genuine provider error. Check your network configuration.",
+          "The request could not reach the provider: the connection failed before a real response arrived. Check that the endpoint is reachable and that no proxy or egress filter is intercepting the request, then try again.",
         retryable: true,
-        errorCategory: "provider_network_proxy_intercepted",
+        errorCategory: "provider_network_error",
       };
     case "model_not_found":
       return {
@@ -1083,6 +1109,15 @@ function classifyByMessage(
         "Stale web-search results in conversation history. Please try again.",
       retryable: true,
       errorCategory: "stale_web_search_content",
+    };
+  }
+
+  if (isUserTerminalHistoryError(message)) {
+    return {
+      code: "PROVIDER_ORDERING",
+      userMessage: "An internal error occurred. Please try again.",
+      retryable: true,
+      errorCategory: "history_user_terminal",
     };
   }
 

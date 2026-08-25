@@ -14,6 +14,7 @@ import { Button, Typography } from "@vellumai/design-library";
 import { HeaderStepCarousel } from "@/domains/chat/components/tool-progress-card/header-step-carousel";
 import { InlineCardStatusIcon } from "@/domains/chat/process-registry/inline-card-status-icon";
 import type { CardSummary } from "@/domains/chat/process-registry/types";
+import { useTranslation } from "@/i18n";
 
 export interface InlineProcessCardProps {
   /** Pre-projected summary driving the status icon, title, info, and count. */
@@ -47,6 +48,7 @@ export function InlineProcessCard({
   countSlot,
   testId,
 }: InlineProcessCardProps) {
+  const { t } = useTranslation("chat");
   const handleStop = useCallback(
     (e: MouseEvent) => {
       e.stopPropagation();
@@ -110,8 +112,8 @@ export function InlineProcessCard({
           <Button
             variant="dangerGhost"
             size="compact"
-            iconOnly={<Square fill="currentColor" />}
-            aria-label={stopAriaLabel ?? "Stop"}
+            iconOnly={<Square />}
+            aria-label={stopAriaLabel ?? t("inlineProcessCard.stop")}
             data-testid="inline-process-card-stop"
             onClick={handleStop}
           />

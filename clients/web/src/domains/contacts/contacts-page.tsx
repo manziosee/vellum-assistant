@@ -4,10 +4,8 @@ import { Navigate, useSearchParams } from "react-router";
 
 import { toast } from "@vellumai/design-library/components/toast";
 
-import {
-  MobileSidebarDrawer,
-  MobileSidebarTrigger,
-} from "@/components/mobile-sidebar-drawer";
+import { SideListDrawer, SideListTrigger } from "@/components/side-list-drawer";
+import { useSideListRoom } from "@/hooks/use-side-list-room";
 import { isVerifiedContactChannel } from "@/domains/contacts/channel-linking";
 import { channelTypeLabel } from "@/domains/contacts/channel-type-labels";
 import { DRAFT_CONTACT_NAME } from "@/domains/contacts/draft-contact";
@@ -52,9 +50,11 @@ import { toastOnError } from "@/utils/mutation-error";
 import { routes } from "@/utils/routes";
 
 /**
- * Hardcoded fallback for assistants that don't expose
- * `/v1/channels/available` yet. Needed for backward compatibility
- * with older gateway versions.
+ * The channel set for an assistant that serves no `/v1/channels/available`.
+ *
+ * Holds only channels such an assistant can actually run, which is why it does
+ * not track the daemon's list: a row here for a channel that assistant lacks
+ * would offer a setup flow that goes nowhere.
  */
 const DEFAULT_CHANNELS: ChannelInfo[] = [
   {
@@ -130,7 +130,13 @@ export function ContactsPage({
   });
 
   const inviteDialog = useInviteLinkDialog(assistantId);
-  const [drawerOpen, setDrawerOpen] = useState(false);
+  const { paneRef, hasRoomForList, drawerOpen, openDrawer, closeDrawer } =
+    useSideListRoom();
+  // Above the inline/drawer branch below, which remounts whichever list
+  // surface it swaps to: held inside `ContactsList` the filter would be
+  // dropped whenever the pane crosses the threshold, and dragging the chat
+  // sidebar is enough to cross it.
+  const [contactSearch, setContactSearch] = useState("");
   const [mergeDialogOpen, setMergeDialogOpen] = useState(false);
 
   const assistantName = assistantDisplayName(identityName);
@@ -167,10 +173,17 @@ export function ContactsPage({
         signal,
         throwOnError: false,
       });
-      if (!response || response.status === 404) {
+      // The fallback answers one case: an assistant with no availability
+      // route, which serves 404. Any other failure means the channel set is
+      // unknown, and a list rendered from a failed request reads as
+      // authoritative while naming channels this assistant may not have.
+      if (response?.status === 404) {
         return {
           channels: DEFAULT_CHANNELS,
         } satisfies ChannelsAvailableGetResponse;
+      }
+      if (!response) {
+        throw error ?? new Error("Failed to fetch channel availability");
       }
       if (!response.ok) {
         throw error ?? new Error("Failed to fetch channel availability");
@@ -181,6 +194,10 @@ export function ContactsPage({
   });
 
   const availableChannels = availabilityQuery.data ?? EMPTY_CHANNELS;
+  // An empty list and a failed lookup both render no channels, so the failure
+  // has to say so. Without this the page claims the assistant has no channels
+  // to set up, which is a different and wrong statement.
+  const channelsLoadFailed = availabilityQuery.isError;
 
   const contactsData = contactsQuery.data;
   const guardian = useMemo(
@@ -321,11 +338,11 @@ export function ContactsPage({
   const handleSelect = useCallback(
     (sel: ContactSelection) => {
       setSelection(sel);
-      setDrawerOpen(false);
+      closeDrawer();
       setMergeDialogOpen(false);
       mergeMutation.reset();
     },
-    [mergeMutation],
+    [closeDrawer, mergeMutation],
   );
 
   const handleOpenMerge = useCallback(() => {
@@ -431,11 +448,13 @@ export function ContactsPage({
     select: (data) => data.users,
   });
 
-  // Without configured Slack credentials the roster can only 503, so the
-  // Link action is offered only when the Slack connection is ready —
-  // otherwise the row keeps Invite as its sole (working) action.
+  // Without configured Slack credentials the roster can only 503, so the Link
+  // action is offered only once Slack is set up. Configuration, not liveness:
+  // the roster is an outbound Web API call, so it answers perfectly well while
+  // the inbound Socket Mode connection is down, and gating on the connection
+  // state would hide a working action during a reconnect.
   const slackReady = channelsController.channels.some(
-    (channel) => channel.key === "slack" && channel.status === "ready",
+    (channel) => channel.key === "slack" && channel.configured,
   );
 
   const handleLinkAccount = useCallback(
@@ -510,25 +529,36 @@ export function ContactsPage({
     selection,
     onAddContact: handleAddContact,
     addingContact: createMutation.isPending,
+    search: contactSearch,
+    onSearchChange: setContactSearch,
   };
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-hidden sm:flex-row sm:gap-6">
-      <div className="flex items-center sm:hidden">
-        <MobileSidebarTrigger onClick={() => setDrawerOpen(true)} />
-      </div>
+    <div
+      ref={paneRef}
+      className={`flex min-h-0 flex-1 overflow-hidden ${
+        hasRoomForList ? "flex-row gap-6" : "flex-col gap-4"
+      }`}
+    >
+      {hasRoomForList ? (
+        <aside className="min-h-0 w-[320px] shrink-0 overflow-y-auto self-stretch">
+          <ContactsList {...contactsListProps} onSelect={handleSelect} />
+        </aside>
+      ) : (
+        <>
+          <div className="flex items-center">
+            <SideListTrigger onClick={openDrawer} />
+          </div>
 
-      <MobileSidebarDrawer
-        open={drawerOpen}
-        onClose={() => setDrawerOpen(false)}
-        title={t("contactsPage.title")}
-      >
-        <ContactsList {...contactsListProps} onSelect={handleSelect} />
-      </MobileSidebarDrawer>
-
-      <aside className="hidden min-h-0 w-[320px] shrink-0 overflow-y-auto self-stretch sm:block">
-        <ContactsList {...contactsListProps} onSelect={handleSelect} />
-      </aside>
+          <SideListDrawer
+            open={drawerOpen}
+            onClose={closeDrawer}
+            title={t("contactsPage.title")}
+          >
+            <ContactsList {...contactsListProps} onSelect={handleSelect} />
+          </SideListDrawer>
+        </>
+      )}
 
       <section className="min-h-0 min-w-0 flex-1 overflow-y-auto">
         {selection.kind === "assistant" ||
@@ -550,6 +580,7 @@ export function ContactsPage({
               mergePending={mergeMutation.isPending}
               canMerge={canMerge}
               availableChannels={availableChannels}
+              channelsLoadFailed={channelsLoadFailed}
               a2aEnabled={a2aChannel}
               onSave={(patch) => {
                 updateMutation.mutate({
@@ -576,6 +607,7 @@ export function ContactsPage({
               mergePending={mergeMutation.isPending}
               canMerge={canMerge}
               availableChannels={availableChannels}
+              channelsLoadFailed={channelsLoadFailed}
               a2aEnabled={a2aChannel}
               onSave={(patch) => {
                 updateMutation.mutate({

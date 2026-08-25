@@ -10,10 +10,14 @@ import {
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router";
 
+import { refreshPlatformAssistantsIfStale } from "@/assistant/platform-assistants-sync";
 import { resolveSelectedAssistantId } from "@/assistant/selection";
 import { retireAssistant } from "@/assistant/retire-service";
 import { isCurrentOrigin, switchToOrigin } from "@/assistant/switch-origin";
-import { removePairedAssistant } from "@/assistant/switch-service";
+import {
+  removePairedAssistant,
+  switchToResolvedAssistant,
+} from "@/assistant/switch-service";
 import { RemoveFromDeviceDialog } from "@/components/remove-from-device-dialog";
 import {
   clearGatewayToken,
@@ -28,7 +32,7 @@ import {
 import { AddRemoteOriginDialog } from "@/domains/onboarding/components/add-remote-origin-dialog";
 import { ConnectAssistantDialog } from "@/domains/onboarding/components/connect-assistant-dialog";
 import { ConnectRecoveryDialog } from "@/domains/onboarding/components/connect-recovery-dialog";
-import { OnboardingLayout } from "@/domains/onboarding/components/onboarding-layout";
+import { OnboardingLayout } from "@/components/onboarding-layout";
 import { handleRadioCardArrowNav } from "@/domains/onboarding/components/radio-card-nav";
 import { formatRelativeDate } from "@/utils/format-date";
 import { useOnboardingLogin } from "@/hooks/use-onboarding-login";
@@ -44,8 +48,7 @@ import {
   nativeSwitchToOrigin,
   nativeVellumCloudOrigin,
 } from "@/runtime/self-hosted-servers";
-import { useAuthStore, useHasPlatformSession } from "@/stores/auth-store";
-import { useClientFeatureFlagStore } from "@/stores/client-feature-flag-store";
+import { useHasPlatformSession } from "@/stores/auth-store";
 import { useConnectDialogStore } from "@/stores/connect-dialog-store";
 import { useOrganizationStore } from "@/stores/organization-store";
 import {
@@ -54,6 +57,7 @@ import {
   type RememberedOrigin,
 } from "@/stores/remembered-origins-store";
 import {
+  isConnectableFromThisDevice,
   useResolvedAssistantsStore,
   type ResolvedAssistant,
 } from "@/stores/resolved-assistants-store";
@@ -62,6 +66,7 @@ import { pairedHostLabel } from "@vellumai/local-mode/contract";
 import { Button } from "@vellumai/design-library/components/button";
 import { Menu } from "@vellumai/design-library/components/menu";
 import { useTranslation } from "@/i18n";
+import type { TFunction } from "i18next";
 
 function assistantLabel(a: ResolvedAssistant): string {
   if (a.name) {
@@ -70,14 +75,44 @@ function assistantLabel(a: ResolvedAssistant): string {
   if (a.isPaired) {
     return "Paired Assistant";
   }
-  return a.isLocal ? "Local Assistant" : "Cloud Assistant";
+  if (a.isLocal && a.cloud === "local") {
+    // Lockfile-sourced local ids are friendly generated instance names;
+    // API-sourced hub registrations carry platform UUIDs instead.
+    return a.id;
+  }
+  if (a.isLocal) {
+    return "Local Assistant";
+  }
+  return "Cloud Assistant";
 }
 
-function assistantSubtitle(a: ResolvedAssistant): string {
+/** A hub-listed self-hosted entry lives on another machine; name its host. */
+function selfHostedHostLabel(
+  ingressUrl: string | null | undefined,
+  t: TFunction<"onboarding">,
+): string {
+  if (ingressUrl) {
+    try {
+      return t("selectAssistantScreen.selfHostedWithHost", {
+        host: new URL(ingressUrl).hostname,
+      });
+    } catch {
+      // Unparseable ingress url: plain label.
+    }
+  }
+  return t("selectAssistantScreen.selfHosted");
+}
+
+function assistantSubtitle(
+  a: ResolvedAssistant,
+  t: TFunction<"onboarding">,
+): string {
   const hosting = a.isPaired
     ? pairedHostLabel(a.runtimeUrl)
     : a.isLocal
-      ? "On this computer"
+      ? isLocalClient()
+        ? "On this computer"
+        : selfHostedHostLabel(a.ingressUrl, t)
       : "Cloud-hosted";
   if (!a.hatchedAt) {
     return hosting;
@@ -111,10 +146,6 @@ function originSelectionKey(origin: OriginCardEntry): string {
 /** Selection key for the native shell's baked Vellum Cloud card. */
 const CLOUD_SELECTION_KEY = "origin:vellum-cloud";
 
-// Stable empty list for the flag-off render so effects keyed on the origin
-// entries do not re-run every render.
-const NO_ORIGINS: RememberedOrigin[] = [];
-
 /**
  * The consumed `register`/`name` handoff params dropped from `params`,
  * preserving everything else, so a reload does not re-run the registration.
@@ -138,15 +169,9 @@ export function SelectAssistantScreen() {
   const assistants = useResolvedAssistantsStore.use.assistants();
   const currentOrganizationId =
     useOrganizationStore.use.currentOrganizationId();
-  const assistantSwitcher = useClientFeatureFlagStore.use.assistantSwitcher();
-  const flagsHydrated = useClientFeatureFlagStore.use.hydrated();
-  const origins = useRememberedOriginsStore.use.origins();
+  const originEntries = useRememberedOriginsStore.use.origins();
   const originsHydrated = useRememberedOriginsStore.use.hydrated();
   const nativeMobile = useIsNativeMobile();
-  // Origin-UI gate: every remembered-origin surface renders only behind the
-  // flag, in every mode, so the flag-off screen is pixel-identical to a
-  // build without origin support.
-  const originEntries = assistantSwitcher ? origins : NO_ORIGINS;
   const {
     loading: loginLoading,
     error: loginError,
@@ -155,21 +180,27 @@ export function SelectAssistantScreen() {
   } = useOnboardingLogin();
 
   // The native shell's baked Vellum Cloud origin, present only while the shell
-  // is pointed somewhere else and only on a build carrying the plugin. Behind
-  // the same origin-UI gate as the remembered entries.
+  // is pointed somewhere else and only on a build carrying the plugin.
   const [cloudOriginUrl, setCloudOriginUrl] = useState<string | null>(null);
   const cloudOrigin: OriginCardEntry | null =
-    assistantSwitcher && cloudOriginUrl !== null
+    cloudOriginUrl !== null
       ? { url: cloudOriginUrl, name: "Vellum Cloud" }
       : null;
   // Stable dep for the selection effect: `cloudOrigin` is a fresh object each
   // render.
   const cloudOriginOffered = cloudOrigin !== null;
 
+  // A local entry is session-free only where a local transport exists; on
+  // the hub it connects through the platform path, so like a managed entry
+  // it needs the platform session.
   const isAccessible = (a: ResolvedAssistant): boolean =>
-    a.isLocal || a.isPaired || hasPlatformSession;
+    a.isPaired || (a.isLocal && localClient) || hasPlatformSession;
 
-  const accessibleAssistants = assistants.filter(isAccessible);
+  // `setFromApi` already drops unreachable local registrations, but a
+  // lifecycle upsert of a stale persisted selection can still land one in the
+  // store; keep dead entries off the chooser regardless of how they arrived.
+  const visibleAssistants = assistants.filter(isConnectableFromThisDevice);
+  const accessibleAssistants = visibleAssistants.filter(isAccessible);
   // Origin cards are always selectable, so any kind of entry gives Continue
   // something to act on.
   const hasSelectableEntries =
@@ -228,32 +259,24 @@ export function SelectAssistantScreen() {
   // the auto-skip stands down for the rest of the visit.
   const removedThisVisitRef = useRef(false);
 
-  // Platform-mode access gate: the hub chooser exists only behind the
-  // assistant-switcher flag, whose real value lands asynchronously, so a
-  // flag-off decision waits for hydration before bouncing. Local clients
-  // (including the packaged remote-gateway dist) skip this gate.
-  const platformGateBlocked =
-    !localClient && (!flagsHydrated || !assistantSwitcher);
+  // Post-hatch ingress provisioning can land after the last list fetch;
+  // refresh on mount so the new assistant shows up. Session and mode guards
+  // live in the sync module, so this is a no-op off a logged-in hub.
   useEffect(() => {
-    if (!localClient && flagsHydrated && !assistantSwitcher) {
-      void navigate(routes.assistant, { replace: true });
-    }
-  }, [localClient, flagsHydrated, assistantSwitcher, navigate]);
+    void refreshPlatformAssistantsIfStale();
+  }, []);
 
   useEffect(() => {
-    if (assistantSwitcher) {
-      // Native mobile keeps its origins in the shell rather than in web
-      // storage, so the provider swap happens before the first load. Both
-      // calls sit behind the flag so nothing reaches the bridge with it off.
-      installNativeRememberedOrigins();
-      void useRememberedOriginsStore.getState().hydrate();
-    }
-  }, [assistantSwitcher]);
+    // Native mobile keeps its origins in the shell rather than in web
+    // storage, so the provider swap happens before the first load.
+    installNativeRememberedOrigins();
+    void useRememberedOriginsStore.getState().hydrate();
+  }, []);
 
   // The way back to Vellum Cloud, offered only by a shell that is currently
   // serving a self-hosted origin.
   useEffect(() => {
-    if (!assistantSwitcher || !nativeMobile) {
+    if (!nativeMobile) {
       return;
     }
     let cancelled = false;
@@ -265,21 +288,20 @@ export function SelectAssistantScreen() {
     return () => {
       cancelled = true;
     };
-  }, [assistantSwitcher, nativeMobile]);
+  }, [nativeMobile]);
 
   // `?register=<url>&name=<label>` handoff: another origin's Switch
   // Assistant action self-registers here so the hub lists it. Records the
   // entry (renaming an existing one) and strips the params through the
   // router, so router state and the address bar stay in step; it never
   // navigates away, so the user sees the updated list. Consumed at most
-  // once, and only once the flag is known on: with the flag off the params
-  // are ignored and left untouched. Only a name and an https URL ride the
-  // params; anything failing `normalizeOriginUrl` is dropped silently
-  // (and stripped, since retrying cannot fix it). A failed add keeps the
-  // params and releases the ref so a reload can retry the registration.
+  // once. Only a name and an https URL ride the params; anything failing
+  // `normalizeOriginUrl` is dropped silently (and stripped, since retrying
+  // cannot fix it). A failed add keeps the params and releases the ref so a
+  // reload can retry the registration.
   const registerHandledRef = useRef(false);
   useEffect(() => {
-    if (!assistantSwitcher || registerHandledRef.current) {
+    if (registerHandledRef.current) {
       return;
     }
     registerHandledRef.current = true;
@@ -310,7 +332,7 @@ export function SelectAssistantScreen() {
       .catch(() => {
         registerHandledRef.current = false;
       });
-  }, [assistantSwitcher, searchParams, setSearchParams]);
+  }, [searchParams, setSearchParams]);
 
   // Default selection: the app's known selected assistant when accessible,
   // else the first accessible assistant, else the first origin card. Also
@@ -363,13 +385,7 @@ export function SelectAssistantScreen() {
     setConnecting(true);
     setError(null);
     try {
-      if (assistant.isPaired) {
-        await useAuthStore.getState().connectPairedAssistant(assistant.id);
-      } else if (assistant.isLocal) {
-        await useAuthStore.getState().connectLocalAssistant(assistant.id);
-      } else {
-        await useAuthStore.getState().connectPlatformAssistant(assistant.id);
-      }
+      await switchToResolvedAssistant(assistant);
       void navigate(routes.assistant, { replace: true });
     } catch (err) {
       console.error("selectAssistant.handleConnect failed", err);
@@ -583,13 +599,9 @@ export function SelectAssistantScreen() {
       return;
     }
     // Remembered origins are alternatives a sole assistant does not account
-    // for, so the chooser stays up whenever any exist. Both the flag and the
-    // entries land after mount, and the flag store boots to its registry
-    // default, so the origin hold below is inert until this one clears.
-    if (!flagsHydrated) {
-      return;
-    }
-    if (assistantSwitcher && !originsHydrated) {
+    // for, so the chooser stays up whenever any exist. The entries land after
+    // mount, so hold the skip until they have.
+    if (!originsHydrated) {
       return;
     }
     if (originEntries.length > 0) {
@@ -604,22 +616,20 @@ export function SelectAssistantScreen() {
     if (connecting || autoSkipping || connectDialogOpen) {
       return;
     }
-    if (assistants.length === 0) {
+    if (visibleAssistants.length === 0) {
       return;
     }
-    if (assistants.length === 1 && accessibleAssistants.length === 1) {
+    if (visibleAssistants.length === 1 && accessibleAssistants.length === 1) {
       setAutoSkipping(true);
       void handleConnect(accessibleAssistants[0]);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
-    assistants.length,
+    visibleAssistants.length,
     accessibleAssistants.length,
     deepLinkDrainSettled,
     localClient,
     originEntries.length,
-    assistantSwitcher,
-    flagsHydrated,
     originsHydrated,
   ]);
 
@@ -647,7 +657,7 @@ export function SelectAssistantScreen() {
       }
       return;
     }
-    const assistant = assistants.find((a) => a.id === selected);
+    const assistant = visibleAssistants.find((a) => a.id === selected);
     if (assistant) {
       void handleConnect(assistant);
     }
@@ -660,13 +670,6 @@ export function SelectAssistantScreen() {
 
   const displayError = loginError ?? error;
 
-  // Holding state while the platform gate waits on flag hydration (and while
-  // the flag-off redirect above lands), so a direct URL on the cloud origin
-  // shows nothing new when the flag is off.
-  if (platformGateBlocked) {
-    return <ConnectingHold />;
-  }
-
   // Loading state during auto-skip. A pending recovery falls through to the
   // chooser so the dialog can render.
   if (autoSkipping && !displayError && !recoveryAssistant) {
@@ -674,7 +677,7 @@ export function SelectAssistantScreen() {
   }
 
   return (
-    <OnboardingLayout showAvatarWave>
+    <OnboardingLayout avatarWave="beside">
       <div
         className={`mx-auto flex w-full max-w-xl flex-col items-center ${electron ? "min-h-full px-8 pt-21 pb-4 electron-prechat-type" : "min-h-screen px-6 pb-40 pt-6 md:min-h-full md:pb-6"} text-[var(--content-default)]`}
       >
@@ -706,7 +709,7 @@ export function SelectAssistantScreen() {
           className={`flex w-full flex-col ${electron ? "mt-8 gap-2" : "mt-10 gap-3"}`}
           style={{ animation: "fadeInUp 0.5s ease-out 0.3s both" }}
         >
-          {assistants.map((assistant) => {
+          {visibleAssistants.map((assistant) => {
             const accessible = isAccessible(assistant);
             return (
               <AssistantCard
@@ -729,7 +732,9 @@ export function SelectAssistantScreen() {
                 }
                 loginDisabled={connecting}
                 onLogin={
-                  !accessible && assistant.isPlatformHosted
+                  // Locked platform-hosted and hub-local cards both unlock
+                  // with a platform login (both connect via the platform).
+                  !accessible && (assistant.isPlatformHosted || assistant.isLocal)
                     ? loginLoading
                       ? cancelLogin
                       : () => void login()
@@ -813,7 +818,7 @@ export function SelectAssistantScreen() {
           {/* Hostless surfaces (hub browser, remote-gateway mode, native
               mobile) add origins by URL; local desktop clients keep the
               bundle-paste connect flow above instead. */}
-          {assistantSwitcher && !localModeHostAvailable && (
+          {!localModeHostAvailable && (
             <DashedActionButton
               icon={<Globe className="h-4 w-4" />}
               label={t("selectAssistantScreen.addRemote")}
@@ -913,7 +918,7 @@ export function SelectAssistantScreen() {
 function ConnectingHold() {
   const { t } = useTranslation("onboarding");
   return (
-    <OnboardingLayout showAvatarWave>
+    <OnboardingLayout avatarWave="beside">
       <div className="mx-auto flex min-h-screen w-full max-w-xl flex-col items-center justify-center px-6 text-[var(--content-default)]">
         <p className="text-body-medium-lighter text-[var(--content-tertiary)]">
           {t("selectAssistantScreen.connectingToAssistant")}
@@ -1144,11 +1149,12 @@ function AssistantCard({
   onSelect: () => void;
   loginLabel: string;
   loginDisabled: boolean;
-  /** Present only on locked platform cards: log in to unlock this assistant. */
+  /** Present only on locked platform-routed cards: log in to unlock. */
   onLogin?: () => void;
   /** Present when the entry can be forgotten on this device: opens the confirm. */
   onRemove?: () => void;
 }) {
+  const { t } = useTranslation("onboarding");
   const label = assistantLabel(assistant);
   return (
     <ChooserCard
@@ -1162,7 +1168,7 @@ function AssistantCard({
         )
       }
       title={label}
-      subtitle={assistantSubtitle(assistant)}
+      subtitle={assistantSubtitle(assistant, t)}
       selected={selected}
       locked={locked}
       tabStop={tabStop}
@@ -1214,12 +1220,16 @@ function RemoteOriginCard({
   /** Opens the remove-from-this-device confirmation, when there is one. */
   onRemove?: () => void;
 }) {
+  const { t } = useTranslation("onboarding");
   const label = originLabel(origin);
+  const subtitleKey = current
+    ? "selectAssistantScreen.currentWithHost"
+    : "selectAssistantScreen.remoteWithHost";
   return (
     <ChooserCard
       icon={icon ?? <Globe className="h-5 w-5" />}
       title={label}
-      subtitle={`${current ? "Current" : "Remote"} · ${originHostname(origin)}`}
+      subtitle={t(subtitleKey, { host: originHostname(origin) })}
       selected={selected}
       tabStop={tabStop}
       onSelect={onSelect}

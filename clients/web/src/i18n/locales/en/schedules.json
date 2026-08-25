@@ -44,6 +44,7 @@
     "noRunsYet": "No runs yet.",
     "recentRuns": "Recent runs",
     "managedByPlugin": "Managed by plugin {plugin}",
+    "managedByPluginPaused": "Managed by plugin {plugin} · off, {reason}",
     "delete": "Delete",
     "deleteConfirmMessage": "Delete \"{name}\"? This can't be undone.",
     "cancel": "Cancel",
@@ -64,6 +65,7 @@
     "turnOnMemory": "Turn on Memory",
     "memorySettings": "Memory settings",
     "fallbackModelProfile": "Default (system task model)",
+    "repeats": "Repeats",
     "nameHeartbeat": "Heartbeat",
     "nameConsolidation": "Consolidation",
     "nameRetrospective": "Memory retrospective",
@@ -75,5 +77,12 @@
   },
   "scheduleRow": {
     "toggleAria": "Toggle {name}"
+  },
+  "scheduleDisarmReason": {
+    "userDisabled": "turned off by you",
+    "pluginRemoved": "plugin removed",
+    "pluginDisabled": "plugin disabled",
+    "declarationRemoved": "removed from plugin",
+    "declarationDisabled": "paused by plugin"
   }
 }

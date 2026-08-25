@@ -53,9 +53,14 @@ const meta: Meta<typeof AssistantChannelsList> = {
     assistantId: "assistant-1",
     assistantName: "Example Assistant",
     channels: [
-      { key: "slack", status: "ready", address: "@example-assistant" },
-      { key: "telegram", status: "not_configured" },
-      { key: "phone", status: "not_configured" },
+      {
+        key: "slack",
+        status: "ready",
+        configured: true,
+        address: "@example-assistant",
+      },
+      { key: "telegram", status: "not_configured", configured: false },
+      { key: "phone", status: "not_configured", configured: false },
     ],
     onSetup: () => {},
     onDisconnect: () => {},
@@ -106,14 +111,32 @@ export const ChannelsTabSlackConnected: Story = {
   },
 };
 
+/**
+ * The pane this tab actually gets on a 768px window: the chat layout's sidebar
+ * and the page shell's padding leave roughly 470px, which is not enough for the
+ * adapter rail beside a detail panel. The rail moves behind the hamburger,
+ * decided on the pane rather than the window, so it does not matter that the
+ * window itself is wide. Storybook's own frame is the window here.
+ */
+export const ChannelsTabInNarrowPane: Story = {
+  parameters: selectedAdapter("slack"),
+  decorators: [
+    (Story) => (
+      <div style={{ width: 470 }}>
+        <Story />
+      </div>
+    ),
+  ],
+};
+
 /** Disconnected Slack: the setup wizard in the "Slack setup" card. */
 export const ChannelsTabSlackDisconnected: Story = {
   parameters: selectedAdapter("slack"),
   args: {
     channels: [
-      { key: "slack", status: "not_configured" },
-      { key: "telegram", status: "not_configured" },
-      { key: "phone", status: "not_configured" },
+      { key: "slack", status: "not_configured", configured: false },
+      { key: "telegram", status: "not_configured", configured: false },
+      { key: "phone", status: "not_configured", configured: false },
     ],
   },
 };
@@ -137,9 +160,19 @@ export const ChannelsTabTelegramConnected: Story = {
   parameters: selectedAdapter("telegram"),
   args: {
     channels: [
-      { key: "slack", status: "ready", address: "@example-assistant" },
-      { key: "telegram", status: "ready", address: "@example_bot" },
-      { key: "phone", status: "not_configured" },
+      {
+        key: "slack",
+        status: "ready",
+        configured: true,
+        address: "@example-assistant",
+      },
+      {
+        key: "telegram",
+        status: "ready",
+        configured: true,
+        address: "@example_bot",
+      },
+      { key: "phone", status: "not_configured", configured: false },
     ],
     channelPolicies: { telegram: "trusted_contacts" },
     onChannelPolicyChange: () => {},
@@ -154,9 +187,14 @@ export const ChannelsTabPhoneConnected: Story = {
   parameters: selectedAdapter("phone"),
   args: {
     channels: [
-      { key: "slack", status: "ready", address: "@example-assistant" },
-      { key: "telegram", status: "not_configured" },
-      { key: "phone", status: "ready", address: "+15550100" },
+      {
+        key: "slack",
+        status: "ready",
+        configured: true,
+        address: "@example-assistant",
+      },
+      { key: "telegram", status: "not_configured", configured: false },
+      { key: "phone", status: "ready", configured: true, address: "+15550100" },
     ],
     channelPolicies: { phone: "trusted_contacts" },
     onChannelPolicyChange: () => {},

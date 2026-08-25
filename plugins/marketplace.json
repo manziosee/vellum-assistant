@@ -215,6 +215,19 @@
       "icon": "📣"
     },
     {
+      "name": "imessage",
+      "source": {
+        "source": "github",
+        "repo": "vellum-ai/imessage",
+        "ref": "069a8375e2a6ed069550866114a653218864bc91"
+      },
+      "description": "iMessage and SMS channel for the Vellum assistant, backed by a Photon line.",
+      "category": "productivity",
+      "homepage": "https://github.com/vellum-ai/imessage",
+      "license": "MIT",
+      "icon": "📲"
+    },
+    {
       "name": "kitchen-companion",
       "source": {
         "source": "github",
@@ -232,7 +245,7 @@
       "source": {
         "source": "github",
         "repo": "vellum-ai/level-up",
-        "ref": "d3cbb50f8aba1f8320cd2d59ea3a85d0a4e9210b"
+        "ref": "4357028acc339c6d6f718d5d6ab279ebf198673b"
       },
       "description": "Surfaces a first-class \"Level Up\" diff card whenever the assistant edits its own skills or plugins, so you can see how it improved itself after the fact.",
       "category": "developer",
@@ -291,6 +304,19 @@
       "homepage": "https://github.com/vellum-ai/motion-design",
       "license": "MIT",
       "icon": "🎬"
+    },
+    {
+      "name": "natural",
+      "source": {
+        "source": "github",
+        "repo": "vellum-ai/natural",
+        "ref": "e71880d144337d1b8b6d3e65ab98006b7d015ef6"
+      },
+      "description": "Hosted MCP access to Natural payment operations for Vellum assistants.",
+      "category": "finance",
+      "homepage": "https://www.natural.com",
+      "license": "MIT",
+      "icon": "💳"
     },
     {
       "name": "originkit",

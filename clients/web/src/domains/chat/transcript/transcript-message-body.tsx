@@ -14,7 +14,8 @@ import { resolveAttachmentFilename } from "@vellumai/service-contracts/attachmen
 import { downloadAttachment } from "@/domains/chat/components/chat-attachments/download-attachment";
 import { MessageAttachments } from "@/domains/chat/components/chat-attachments/message-attachments";
 import {
-  hasToolResultImages,
+  embeddedImageFileNames,
+  resolveToolResultImages,
   ToolResultImages,
 } from "@/domains/chat/components/chat-attachments/tool-result-images";
 import { ChatMarkdownMessage } from "@/domains/chat/components/chat-markdown-message";
@@ -36,19 +37,24 @@ import { SingleActivity } from "@/domains/chat/components/single-activity/single
 import { MultiActivityGroup } from "@/domains/chat/components/multi-activity-group/multi-activity-group";
 import { WEB_TOOL_NAMES } from "@/domains/chat/utils/tool-call-card-utils";
 import {
+  deriveStepLabel,
+  type IconName,
+} from "@/domains/chat/components/tool-progress-card/derive-step-label";
+import {
   activityItemsToCardData,
   type ContentBlockActivityItem,
   groupContentBlocks,
   isSubagentSpawnCall,
 } from "@/domains/chat/transcript/message-content";
 import { AcpConnectAffordance } from "@/domains/chat/transcript/acp-connect-affordance";
-import { DocumentReopenLink } from "@/domains/chat/transcript/document-reopen-link";
+import { ResponseArtifactCard } from "@/domains/chat/transcript/response-artifact-card";
 import { hasRenderableAnswer } from "@/domains/chat/answered-question";
 import { AnsweredQuestionCard } from "@/domains/chat/components/answered-question-card";
 import { useCoarsePointerReveal } from "@/domains/chat/transcript/use-coarse-pointer-reveal";
 import { AssistantContentDisclosure } from "@/domains/chat/transcript/assistant-content-disclosure";
 import { parseInlineSurfaces } from "@/domains/chat/utils/parse-inline-surfaces";
 import { useSmoothStreamText } from "@/domains/chat/hooks/use-smooth-stream-text";
+import { useTranslation } from "@/i18n";
 import { useSupportsRedactedCredentialChips } from "@/lib/backwards-compat/use-supports-redacted-credential-chips";
 import { stopAcpRun } from "@/domains/chat/utils/acp-run-actions";
 import { stopBackgroundTask } from "@/domains/chat/utils/background-task-actions";
@@ -98,6 +104,17 @@ import { saveFile } from "@/runtime/native-file";
  */
 const STREAM_WORD_FADE_MAX_CHARS = 12000;
 
+/**
+ * Prose inside the "Earlier activity" disclosure. It is superseded by the final
+ * response, so it drops to the size of the activity rows around it (they are
+ * off-scale 13px too) and to the secondary tone — the revealed run reads as
+ * context rather than a second answer.
+ *
+ * typography: off-scale — matches `SingleActivity`'s 13px inline rows.
+ */
+const COLLAPSED_MARKDOWN_CLASS =
+  "text-[13px] leading-[20px] text-[var(--content-secondary)]";
+
 /** Percent-decodes `value`, returning it unchanged on malformed encoding. */
 function safeDecodeURIComponent(value: string): string {
   try {
@@ -139,12 +156,13 @@ export function TranscriptMessageBody({
   onStopSubagent,
   onWorkflowClick,
   onStopWorkflow,
-  changedDocumentIds,
+  responseArtifacts,
   isStreaming = false,
   isLatestMessage = false,
 }: TranscriptMessageBodyProps) {
-  const collapseAssistantIntermediates =
-    useClientFeatureFlagStore.use.collapseAssistantIntermediates();
+  const { t } = useTranslation("chat");
+  const inlineAssistantIntermediates =
+    useClientFeatureFlagStore.use.inlineAssistantIntermediates();
   const isSlackMessage = Boolean(message.slackMessage);
   const isSlackReaction = message.slackMessage?.eventKind === "reaction";
   const isUser = message.role === "user";
@@ -175,11 +193,24 @@ export function TranscriptMessageBody({
   // widget lands, its call resolves, or the turn ends.
   const pendingVisualToolUseIds = message.pendingVisualToolUseIds ?? [];
 
+  // The images this message's own prose presents with a markdown embed. A media
+  // skill asks the model to show its result that way, so the mid-turn strip owes
+  // nothing for the same file. Read by the strip and by the collapse rule that
+  // pins the group holding it, so the two agree on what renders.
+  const embeddedImageNames = useMemo(
+    () => embeddedImageFileNames(message.contentBlocks),
+    [message.contentBlocks],
+  );
+
   const isTouch = isPointerCoarse();
 
-  const textBubbleClass = isSlackMessage
-    ? "max-w-[80%] text-[var(--content-default)] sm:max-w-[640px]"
-    : "w-full text-[var(--content-default)]";
+  // Width and color are split so the collapsed variant below can restate the
+  // color without the two arbitrary-value `text-[…]` utilities racing on
+  // stylesheet order.
+  const textBubbleWidthClass = isSlackMessage
+    ? "max-w-[80%] sm:max-w-[640px]"
+    : "w-full";
+  const textBubbleClass = `${textBubbleWidthClass} text-[var(--content-default)]`;
   // On touch devices, the long-press gesture opens the message actions sheet.
   // iOS's native text selection (blue highlight + callout bar) otherwise races
   // the 500ms long-press timer, so both surface at once. Suppress native
@@ -191,6 +222,9 @@ export function TranscriptMessageBody({
   const segmentClass = isUser
     ? "break-words text-[15px]"
     : `break-words text-[15px] ${textBubbleClass}`;
+  // The collapsed variant leaves size and color to `COLLAPSED_MARKDOWN_CLASS`
+  // on the markdown container itself (see `renderTextWithInlineSurfaces`).
+  const collapsedSegmentClass = `break-words ${textBubbleWidthClass}`;
 
   const forkMessageId = message.id;
   const forkHandler =
@@ -499,16 +533,18 @@ export function TranscriptMessageBody({
           }
           await saveFile(data, filename);
         } catch {
-          toast.error("Failed to download file", { description: filename });
+          toast.error(t("fileDownload.failed"), { description: filename });
         }
       })();
     } else {
       toast.error(
-        `File not available for download${pending.isHost ? " (host file approval may have timed out)" : ""}`,
+        pending.isHost
+          ? t("transcriptMessageBody.fileUnavailableHostTimeout")
+          : t("transcriptMessageBody.fileUnavailable"),
         { description: pending.filename },
       );
     }
-  }, [pendingVellumFile, assistantId]);
+  }, [pendingVellumFile, assistantId, t]);
 
   const vellumFileModal = (
     <VellumFileActionModal
@@ -523,7 +559,14 @@ export function TranscriptMessageBody({
     text: string,
     key: string,
     streamWordFade?: "revealing" | "caughtUp",
+    collapsed = false,
   ) => {
+    const textClass = collapsed ? collapsedSegmentClass : segmentClass;
+    // `MarkdownMessage` sets its own `text-chat text-[var(--content-default)]`
+    // on its container, so a color on the wrapper alone never reaches the
+    // prose. The override rides the component's own `className` (merged via
+    // `cn`, so it drops the base size and color).
+    const markdownClass = collapsed ? COLLAPSED_MARKDOWN_CLASS : undefined;
     const inlineSegments = parseInlineSurfaces(text);
     if (inlineSegments) {
       return (
@@ -549,10 +592,11 @@ export function TranscriptMessageBody({
               <div
                 key={`inline-text-${si}`}
                 data-message-text=""
-                className={segmentClass}
+                className={textClass}
               >
                 <ChatMarkdownMessage
                   content={seg.content}
+                  className={markdownClass}
                   hardLineBreaks
                   onVellumLinkClick={handleVellumLinkClick}
                   attachments={message.attachments}
@@ -570,9 +614,10 @@ export function TranscriptMessageBody({
       );
     }
     return (
-      <div key={key} data-message-text="" className={segmentClass}>
+      <div key={key} data-message-text="" className={textClass}>
         <ChatMarkdownMessage
           content={text}
+          className={markdownClass}
           hardLineBreaks
           onVellumLinkClick={handleVellumLinkClick}
           attachments={message.attachments}
@@ -622,7 +667,7 @@ export function TranscriptMessageBody({
             id={runId}
             onOpen={onWorkflowClick ? () => onWorkflowClick(runId) : undefined}
             onStop={onStopWorkflow ? () => onStopWorkflow(runId) : undefined}
-            stopAriaLabel="Stop workflow"
+            stopAriaLabel={t("transcriptMessageBody.stopWorkflow")}
             testId="inline-process-card"
           />
         ))}
@@ -654,7 +699,7 @@ export function TranscriptMessageBody({
                 });
               })
             }
-            stopAriaLabel="Stop run"
+            stopAriaLabel={t("transcriptMessageBody.stopRun")}
             testId="inline-process-card"
           />
         ))}
@@ -721,7 +766,7 @@ export function TranscriptMessageBody({
                 });
               })
             }
-            stopAriaLabel="Stop command"
+            stopAriaLabel={t("transcriptMessageBody.stopCommand")}
             testId="inline-process-card"
           />
         ))}
@@ -732,7 +777,8 @@ export function TranscriptMessageBody({
   const renderToolResultImages = (toolCalls: ChatMessageToolCall[]) => (
     <ToolResultImages
       toolCalls={toolCalls}
-      hasAttachments={hasAttachments}
+      messageAttachments={message.attachments}
+      embeddedImageNames={embeddedImageNames}
       assistantId={assistantId}
     />
   );
@@ -870,8 +916,7 @@ export function TranscriptMessageBody({
     items: Array<{ kind: "text" | "nonText"; node: ReactNode }>,
   ): ReactNode => {
     type Slot =
-      | { kind: "bubble"; nodes: ReactNode[] }
-      | { kind: "raw"; node: ReactNode };
+      { kind: "bubble"; nodes: ReactNode[] } | { kind: "raw"; node: ReactNode };
     const slots: Slot[] = [];
     let textRun: ReactNode[] = [];
 
@@ -924,10 +969,62 @@ export function TranscriptMessageBody({
     );
   };
 
+  /**
+   * Whether a group renders a visible row at all. A thinking run whose
+   * reasoning never arrived renders nothing once settled (`SingleActivity`
+   * collapses an empty, settled thought), and a timeline slot for it would show
+   * a lone glyph against blank space. While streaming, the trailing group still
+   * renders the shimmering "Thinking" row before any text lands.
+   */
+  const groupRendersRow = (
+    group: (typeof groups)[number],
+    groupIndex: number,
+  ): boolean => {
+    if (group.type === "text") {
+      return group.text.trim().length > 0;
+    }
+    if (group.type === "surface") {
+      return true;
+    }
+    const { cardItems, toolCalls } = activityItemsToCardData(group.items);
+    if (toolCalls.some((tc) => !isSubagentSpawnCall(tc) && !isCardBacked(tc))) {
+      return true;
+    }
+    const hasThinking = cardItems.some(
+      (it) => it.kind === "thinking" && it.text.length > 0,
+    );
+    return hasThinking || (isStreaming && groupIndex === groups.length - 1);
+  };
+
+  /**
+   * Timeline glyph for one group inside an "Earlier activity" disclosure: the
+   * first renderable step's icon, a globe for a web run (`deriveStepLabel`
+   * covers non-web tools only), a brain for a thinking-only run, and none for
+   * prose — which keeps its gutter slot but shows no glyph.
+   */
+  const disclosureIconForGroup = (
+    group: (typeof groups)[number],
+  ): IconName | undefined => {
+    if (group.type !== "activity") {
+      return undefined;
+    }
+    const { toolCalls } = activityItemsToCardData(group.items);
+    const leadCall = toolCalls.find(
+      (tc) => !isSubagentSpawnCall(tc) && !isCardBacked(tc),
+    );
+    if (!leadCall) {
+      return "brain";
+    }
+    return WEB_TOOL_NAMES.has(leadCall.name)
+      ? "globe"
+      : deriveStepLabel(leadCall).iconName;
+  };
+
   const lastGroupIndex = groups.length - 1;
   const renderGroupNode = (
     group: (typeof groups)[number],
     gi: number,
+    collapsed = false,
   ): ReactNode => {
     if (group.type === "text") {
       const isSmoothedTrailing =
@@ -945,6 +1042,7 @@ export function TranscriptMessageBody({
         isSmoothedTrailing ? smoothedTrailingText : group.text,
         `b-text-${gi}`,
         fadeMode,
+        collapsed,
       );
     }
     if (group.type === "surface") {
@@ -1046,99 +1144,134 @@ export function TranscriptMessageBody({
   const finalResponseGroupIndex = groups.findLastIndex(
     (group) => group.type === "text" && group.text.trim().length > 0,
   );
-  const renderedGroups = groups.map((group, gi) => renderGroupNode(group, gi));
-  const collapsibleGroupIndexes = collapseAssistantIntermediates
-    ? groups.flatMap((group, groupIndex) => {
-        if (groupIndex >= finalResponseGroupIndex) {
-          return [];
-        }
-        if (group.type === "surface") {
-          return [];
-        }
-        if (group.type === "text") {
-          const isSurfaceAdjacent =
-            groups[groupIndex - 1]?.type === "surface" ||
-            groups[groupIndex + 1]?.type === "surface";
-          return parseInlineSurfaces(group.text) || isSurfaceAdjacent
-            ? []
-            : [groupIndex];
-        }
-
-        const { toolCalls } = activityItemsToCardData(group.items);
-        const hasVisibleOutputOrControl =
-          hasToolResultImages(toolCalls) ||
-          toolCalls.some(
-            (toolCall) =>
-              isToolCallRunning(toolCall) ||
-              toolCall.pendingConfirmation !== undefined ||
-              isSubagentSpawnCall(toolCall) ||
-              isCardBacked(toolCall) ||
-              acpConnectToolUseId === toolCall.id ||
-              unknownNudgeToolCallIds?.has(toolCall.id) === true,
-          );
-        return hasVisibleOutputOrControl ? [] : [groupIndex];
-      })
-    : [];
-  // One entry per contiguous run a single disclosure would cover. Relies on
-  // `collapsibleGroupIndexes` being ascending (it is built by walking `groups`
-  // in order), so a gap means a new run. `end` is exclusive, matching `slice`.
-  const collapsibleRuns: Array<{ start: number; end: number }> = [];
-  for (const groupIndex of collapsibleGroupIndexes) {
-    const openRun = collapsibleRuns[collapsibleRuns.length - 1];
-    if (openRun?.end === groupIndex) {
-      openRun.end = groupIndex + 1;
-    } else {
-      collapsibleRuns.push({ start: groupIndex, end: groupIndex + 1 });
+  // Per-user opt-out of the "Earlier activity" disclosure: with the flag on,
+  // no group is collapsible, so the whole response renders inline at full
+  // size and none of the collapsed styling applies.
+  const collapsibleGroupIndexes = groups.flatMap((group, groupIndex) => {
+    if (inlineAssistantIntermediates) {
+      return [];
     }
-  }
-  // A run that is one lone activity group does not earn a disclosure. Every
-  // activity rendering is already a single one-line row (`SingleActivity`'s
-  // bare "Thinking" / tool link, or `MultiActivityGroup`'s header) that keeps
-  // its reasoning and step timeline in a drawer rather than inline. Collapsing
-  // one swaps a one-line row for the one-line "Earlier activity" trigger:
-  // chrome with no text wall removed. Runs spanning two or more groups, and
-  // any run containing prose, still collapse.
-  const disclosedRuns = collapsibleRuns.filter(
-    (run) => run.end - run.start > 1 || groups[run.start]?.type !== "activity",
+    if (groupIndex >= finalResponseGroupIndex) {
+      return [];
+    }
+    if (group.type === "surface") {
+      return [];
+    }
+    if (group.type === "text") {
+      const isSurfaceAdjacent =
+        groups[groupIndex - 1]?.type === "surface" ||
+        groups[groupIndex + 1]?.type === "surface";
+      return parseInlineSurfaces(group.text) || isSurfaceAdjacent
+        ? []
+        : [groupIndex];
+    }
+
+    const { toolCalls } = activityItemsToCardData(group.items);
+    const hasVisibleOutputOrControl =
+      // Pinned only when the strip actually draws something. A group whose
+      // images the end-of-turn attachments already show draws nothing, so it
+      // has no reason to sit outside "Earlier activity".
+      resolveToolResultImages(
+        toolCalls,
+        message.attachments,
+        embeddedImageNames,
+      ).length > 0 ||
+      toolCalls.some(
+        (toolCall) =>
+          isToolCallRunning(toolCall) ||
+          toolCall.pendingConfirmation !== undefined ||
+          isSubagentSpawnCall(toolCall) ||
+          isCardBacked(toolCall) ||
+          acpConnectToolUseId === toolCall.id ||
+          unknownNudgeToolCallIds?.has(toolCall.id) === true,
+      );
+    return hasVisibleOutputOrControl ? [] : [groupIndex];
+  });
+  // Which collapsible groups actually render a row. A group that renders
+  // nothing is still swallowed by the disclosure, but claims no timeline slot,
+  // which would otherwise put a lone glyph against blank space.
+  const collapsibleRowIndexes = collapsibleGroupIndexes.filter((groupIndex) =>
+    groupRendersRow(groups[groupIndex]!, groupIndex),
   );
-  const disclosedRunByStart = new Map(
-    disclosedRuns.map((run) => [run.start, run.end]),
+  // A disclosure over one lone activity row does not earn its keep: that row is
+  // already a single one-line link (`SingleActivity`'s bare "Thinking" / tool
+  // link, or `MultiActivityGroup`'s header) whose reasoning and step timeline
+  // live in a drawer, so collapsing it swaps one line of chrome for another.
+  // Two or more rows, or a single row of prose, still collapse.
+  const earnsDisclosure =
+    collapsibleRowIndexes.length > 1 ||
+    (collapsibleRowIndexes.length === 1 &&
+      groups[collapsibleRowIndexes[0]!]?.type !== "activity");
+  // Every group the disclosure swallows, collected message-wide rather than per
+  // contiguous run, and resolved before the render pass so a group knows it is
+  // collapsed while it renders: prose reads that to drop to the muted, smaller
+  // collapsed tone.
+  //
+  // Collecting per contiguous run instead would let a pinned group (a surface,
+  // a running tool, a result image, an inline process card) split the run
+  // around it, and a run stranded on the far side often renders a single
+  // activity row, which does not earn a disclosure of its own: one message
+  // would show the same kind of row twice over, indented inside a disclosure
+  // and flush at the margin below it. Message-wide there is exactly one
+  // disclosure, anchored where the first collapsible group sits, and pinned
+  // groups keep their positions around it.
+  //
+  // The trade is ordering: a collapsed group that ran *after* a pinned one
+  // still reads above it once the disclosure is open, because one disclosure
+  // cannot interleave with what it does not contain. Closed, which is how a
+  // settled turn renders, nothing moves.
+  const disclosedGroupIndexes = new Set<number>(
+    earnsDisclosure ? collapsibleGroupIndexes : [],
+  );
+  const disclosureAnchorIndex = earnsDisclosure
+    ? collapsibleGroupIndexes[0]
+    : undefined;
+
+  const renderedGroups = groups.map((group, gi) =>
+    renderGroupNode(group, gi, disclosedGroupIndexes.has(gi)),
   );
   const assistantContent: ReactNode[] = [];
-  for (let groupIndex = 0; groupIndex < renderedGroups.length; ) {
-    const runEndIndex = disclosedRunByStart.get(groupIndex);
-    if (runEndIndex === undefined) {
-      assistantContent.push(renderedGroups[groupIndex]);
-      groupIndex += 1;
+  for (
+    let groupIndex = 0;
+    groupIndex < renderedGroups.length;
+    groupIndex += 1
+  ) {
+    if (groupIndex === disclosureAnchorIndex) {
+      assistantContent.push(
+        <AssistantContentDisclosure
+          key={`earlier-activity-${groupIndex}`}
+          isStreaming={isStreaming}
+          items={collapsibleRowIndexes.map((rowIndex) => ({
+            key: `earlier-activity-item-${rowIndex}`,
+            node: renderedGroups[rowIndex],
+            iconName: disclosureIconForGroup(groups[rowIndex]!),
+          }))}
+        />,
+      );
       continue;
     }
-    assistantContent.push(
-      <AssistantContentDisclosure
-        key={`earlier-activity-${groupIndex}`}
-        isStreaming={isStreaming}
-      >
-        {renderedGroups.slice(groupIndex, runEndIndex)}
-      </AssistantContentDisclosure>,
-    );
-    // The disclosure renders the rest of its run, so resume past it.
-    groupIndex = runEndIndex;
+    // Rendered inside the disclosure at the anchor above.
+    if (disclosedGroupIndexes.has(groupIndex)) {
+      continue;
+    }
+    assistantContent.push(renderedGroups[groupIndex]);
   }
 
   // Resolved across the whole response by `Transcript` and handed only to the
-  // message that ends it. Without a handler the link opens nothing, so it does
-  // not render.
-  const documentReopenLinks =
-    isAssistant && onOpenDocument
-      ? changedDocumentIds?.map((surfaceId) => (
-          <DocumentReopenLink
-            key={`document-reopen-${surfaceId}`}
-            surfaceId={surfaceId}
-            assistantId={assistantId}
-            conversationId={conversationId}
-            onOpenDocument={onOpenDocument}
-          />
-        ))
-      : null;
+  // message that ends it. Each kind's card decides for itself whether it can
+  // render. Without an opener it opens nothing, so it does not.
+  const responseArtifactCards = isAssistant
+    ? responseArtifacts?.map((artifact) => (
+        <ResponseArtifactCard
+          key={`artifact-${artifact.kind}-${artifact.id}`}
+          artifact={artifact}
+          assistantId={assistantId}
+          conversationId={conversationId}
+          onOpenDocument={onOpenDocument}
+          onOpenApp={onOpenApp}
+        />
+      ))
+    : null;
 
   return (
     <div
@@ -1167,8 +1300,8 @@ export function TranscriptMessageBody({
           />
         )}
         {/* Outside the `AssistantContentDisclosure` collapse, so a turn whose
-            document edit lands in "Earlier activity" still ends with the link. */}
-        {documentReopenLinks}
+            asset work lands in "Earlier activity" still ends with its cards. */}
+        {responseArtifactCards}
         {trailer}
       </div>
       {vellumFileModal}

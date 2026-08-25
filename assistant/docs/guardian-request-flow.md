@@ -54,6 +54,41 @@ anti-pattern was retired in #35642 and again in the ask_question redesign).
 | Kind-specific follow-through            | resolver registry (`kind` → resolver)                    | switch statements in the router     |
 | Reply understanding                     | guardian reply router (codes, buttons, reactions, modes) | per-feature inbound intercepts      |
 
+## Cards are not conversation history
+
+`pairDeliveryWithConversation` persists one message row per delivery so the
+card renders and deep-links. For a guardian card that row is addressed to a
+conversation the request is _about_, not one the assistant is speaking in:
+`buildVellumCardAffinity` pins the vellum card to the originating
+conversation, and a channel card lands in whatever conversation the guardian's
+chat binds to. Either way the row is written straight to the DB by the
+notification pipeline, so the live turn's in-memory history never sees it.
+
+That row must never be replayed to the model. The conversation it lands in is
+typically parked mid-approval, with its last assistant message carrying the
+`tool_use` still waiting on this very decision. Replayed, the card sits
+between that `tool_use` and its `tool_result`; history repair reads the pair
+as broken, synthesizes a stub result, and downgrades the real one to text. A
+card left as the tail row instead ends the history on an assistant message,
+which extended-thinking models reject outright ("does not support assistant
+message prefill").
+
+`isGuardianCardRow` (`notifications/approval-card-data.ts`) is the one
+definition of which rows those are, read off the card's own `ui_surface` id
+using the same prefixes `approvalCardSurfaceId` recomputes for withdrawal. It
+is derived rather than stored so a row written before the rule existed is
+recognized on the same terms as a new one, with no marker to backfill.
+
+**Both history assemblers must consult it.** `Conversation.loadFromDb` builds
+`this.messages`, but Slack conversations do not use that list:
+`loadSlackChronologicalContext` re-reads the rows. A rule applied to only one
+exempts the other channel. Each applies it _after_ its own compaction boundary,
+since both boundaries are computed against unfiltered row lists.
+
+Surface state is deliberately NOT filtered this way. `restoreSurfaceStateFromHistory`
+takes the pre-filter window, because a card's Approve/Reject buttons must keep
+routing after a restart even though the card is absent from the model's history.
+
 Two instruction modes exist per request kind (`notifications/guardian-question-mode.ts`):
 **approval** ("CODE approve" / approve–reject buttons) and **answer**
 ("CODE <your answer>" / option buttons). `pending_question` is answer-mode.
@@ -106,7 +141,18 @@ at the wrong level.
 
 `routes/guardian-approval-interception.ts` + the approval prompt watcher in
 `background-dispatch.ts` predate this pipeline: they deliver a guardian's own
-tool-approval prompt in-channel mid-turn and resolve `apr:` taps against the
-in-memory confirmation directly. They remain load-bearing for that flow, and
+tool-approval prompt mid-turn and resolve `apr:` taps against the in-memory
+confirmation directly. That prompt is addressed to the guardian, not to the
+chat the turn is running in. On Slack that chat can be a shared room, and the
+card carries the tool, a command preview and live buttons.
+`resolveGuardianPromptDelivery` addresses it to the guardian's bound DM
+instead, by chat id rather than user id because that address is written to the
+delivery row and read back to match reactions, scope plain-text replies and
+edit the decided card. It returns the address and its route together, since
+the turn's own callback carries a `threadTs` naming a thread that does not
+exist in the DM. When no private address resolves it returns nothing and the
+prompt is left to the in-app confirmation, because the room is the disclosure
+this exists to prevent. Telegram group chats carry the same exposure and are
+not covered: only Slack has a chat whose privacy can be read off its id. They remain load-bearing for that flow, and
 the reply router runs first for everything the pipeline owns. Converge new
 work on the pipeline; do not extend the legacy interception.

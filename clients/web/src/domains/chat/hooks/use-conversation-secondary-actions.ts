@@ -4,9 +4,10 @@
  *
  * These are the "utility" actions surfaced in the conversation header chevron
  * menu and sidebar context menu. The primary CRUD-like actions (archive,
- * unarchive, pin, rename, mark read/unread) live in `useConversationActions`.
+ * unarchive, delete, pin, rename, mark read/unread) live in `useConversationActions`.
  */
 
+import { t } from "@/i18n";
 import { copyToClipboard } from "@/lib/copy-to-clipboard";
 import { captureError } from "@/lib/sentry/capture-error";
 import { useCallback, useEffect, useRef } from "react";
@@ -158,8 +159,8 @@ export function useConversationSecondaryActions({
         captureError(err, { context: "summarize_up_to_here" });
         toast.error(
           err instanceof ApiError && err.status === 409
-            ? "Your assistant is busy. Try again when it finishes replying."
-            : "Couldn't summarize the conversation",
+            ? t("chat:useConversationSecondaryActions.assistantBusy")
+            : t("chat:useConversationSecondaryActions.summarizeFailed"),
         );
       }
     },
@@ -189,8 +190,8 @@ export function useConversationSecondaryActions({
       captureError(err, { context: "retry_latest_turn" });
       toast.error(
         err instanceof ApiError && err.status === 409
-          ? "Your assistant is busy. Try again when it finishes replying."
-          : "Couldn't retry the response",
+          ? t("chat:useConversationSecondaryActions.assistantBusy")
+          : t("chat:useConversationSecondaryActions.retryFailed"),
       );
     }
   }, []);

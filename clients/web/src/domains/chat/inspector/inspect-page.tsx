@@ -4,7 +4,7 @@ import { useMemo, useRef, useState, type ReactNode } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router";
 
 import { useActiveAssistantId } from "@/assistant/use-active-assistant-id";
-import { useCanUseLlmInspector } from "@/domains/chat/inspector/access";
+import { useCanUseInternalThreadActions } from "@/lib/auth/internal-thread-actions";
 import {
   isLlmRequestLogsDisabledError,
   useConversationCallNumbering,
@@ -28,7 +28,7 @@ import {
   useSupportsLlmContextSummaryView,
 } from "@/lib/backwards-compat/llm-context-summary-view";
 import { isElectron } from "@/runtime/is-electron";
-import { useAssistantFeatureFlagStore } from "@/stores/assistant-feature-flag-store";
+import { useClientFeatureFlagStore } from "@/stores/client-feature-flag-store";
 import { useIsSessionInitializing } from "@/stores/auth-store";
 import { routes } from "@/utils/routes";
 import { t, useTranslation } from "@/i18n";
@@ -40,6 +40,7 @@ import type {
 } from "@vellumai/assistant-api";
 import { Button } from "@vellumai/design-library";
 import { toast } from "@vellumai/design-library/components/toast";
+import { Tabs } from "@vellumai/design-library/components/tabs";
 import { Toggle } from "@vellumai/design-library/components/toggle";
 
 import { CallRail } from "./components/call-rail";
@@ -48,7 +49,12 @@ import {
   type ExportPhase,
 } from "./components/export-progress-modal";
 import { MobileCallSelector } from "./components/mobile-call-selector";
-import { TabBar, type InspectorTab } from "./components/tab-bar";
+import {
+  TABS,
+  TabBar,
+  isInspectorTab,
+  type InspectorTab,
+} from "./components/tab-bar";
 import { CompactionTab } from "./components/tabs/compaction-tab";
 import { MemoryTab } from "./components/tabs/memory-tab";
 import { OverviewTab } from "./components/tabs/overview-tab";
@@ -76,12 +82,12 @@ import { SkillsTab } from "./components/tabs/skills-tab";
  */
 export function InspectPage(): ReactNode {
   const { t: tChat } = useTranslation("chat");
-  const canInspect = useCanUseLlmInspector();
-  // The developer-nav flag reads as registry-default `false` until the
-  // `/feature-flags` response lands, so flag-gated sessions (e.g. local
-  // gateway) would flash the denial on deep links. Treat the pre-hydration
-  // window as loading instead.
-  const flagsHydrated = useAssistantFeatureFlagStore.use.hasHydrated();
+  const canInspect = useCanUseInternalThreadActions();
+  // The internal-thread-actions flag reads as registry-default `false` until
+  // the `/feature-flags` response lands, so an enabled session would flash
+  // the denial on deep links. Treat the pre-hydration window as loading
+  // instead.
+  const flagsHydrated = useClientFeatureFlagStore.use.hydrated();
   const authLoading = useIsSessionInitializing();
   // React Router's :conversationId segment is the source of truth; the
   // route definition guarantees it's present, but useParams still types
@@ -758,29 +764,48 @@ function Loaded({
             conversationCallCount={conversationCallCount}
           />
         </div>
-        <TabBar selected={tab} onSelect={setTab} />
-        <div className="min-h-0 min-w-0 flex-1 overflow-y-auto">
-          {selectedEntry ? (
-            <TabContent
-              tab={tab}
-              entry={selectedEntry}
-              previousLog={previousLog}
-              detailState={detailState}
-              logs={logs}
-              buildCallHref={buildCallHref}
-              assistantId={assistantId}
-              conversationId={conversationId}
-              context={context}
-              conversationTotalEstimatedCostUsd={
-                context?.conversationTotalEstimatedCostUsd
-              }
-            />
-          ) : (
-            <CenteredMessage tone="muted">
-              {tChat("inspectPage.chooseCall")}
-            </CenteredMessage>
-          )}
-        </div>
+        <Tabs.Root
+          value={tab}
+          onValueChange={(next) => {
+            if (isInspectorTab(next)) {
+              setTab(next);
+            }
+          }}
+          className="flex min-h-0 min-w-0 flex-1 flex-col"
+        >
+          <TabBar />
+          {/* One panel per tab, so each trigger points at the pane it drives.
+              Radix fills only the selected one and hides the rest, so the map
+              still renders a single call's worth of content. */}
+          {TABS.map(({ id }) => (
+            <Tabs.Panel
+              key={id}
+              value={id}
+              className="min-h-0 min-w-0 flex-1 overflow-y-auto"
+            >
+              {selectedEntry ? (
+                <TabContent
+                  tab={id}
+                  entry={selectedEntry}
+                  previousLog={previousLog}
+                  detailState={detailState}
+                  logs={logs}
+                  buildCallHref={buildCallHref}
+                  assistantId={assistantId}
+                  conversationId={conversationId}
+                  context={context}
+                  conversationTotalEstimatedCostUsd={
+                    context?.conversationTotalEstimatedCostUsd
+                  }
+                />
+              ) : (
+                <CenteredMessage tone="muted">
+                  {tChat("inspectPage.chooseCall")}
+                </CenteredMessage>
+              )}
+            </Tabs.Panel>
+          ))}
+        </Tabs.Root>
       </main>
     </>
   );

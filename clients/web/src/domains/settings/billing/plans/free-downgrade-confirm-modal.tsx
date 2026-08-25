@@ -1,5 +1,6 @@
 import { AlertTriangle } from "lucide-react";
 
+import { useTranslation } from "@/i18n";
 import { Button } from "@vellumai/design-library/components/button";
 import { Modal } from "@vellumai/design-library/components/modal";
 import { Typography } from "@vellumai/design-library/components/typography";
@@ -12,7 +13,12 @@ export interface FreeDowngradeConfirmModalProps {
    * omitted and the dialog shows just the cancellation note.
    */
   lostFeatures: string[];
-  /** A billing-portal session is being created — disable the actions. */
+  /**
+   * Confirming hands off to the Stripe billing portal instead of cancelling
+   * in-app (a Pro sub the cancel endpoint rejects); the body copy says so.
+   */
+  viaPortal: boolean;
+  /** The cancellation request is in flight; the actions are disabled. */
   pending: boolean;
   onCancel: () => void;
   onConfirm: () => void;
@@ -21,17 +27,19 @@ export interface FreeDowngradeConfirmModalProps {
 /**
  * Reconfirm dialog for cancelling Pro ("Downgrade to Base") from the plans
  * takeover. Mirrors the adjust-plan modal's step of the same name: it lists
- * the Pro features that will be lost before handing off to the Stripe billing
- * portal, where the actual cancellation happens. Layout-only — the parent owns
- * the portal mutation.
+ * the Pro features that will be lost before the cancellation is scheduled via
+ * the subscription-cancel endpoint. Layout-only; the parent owns the cancel
+ * mutation.
  */
 export function FreeDowngradeConfirmModal({
   open,
   lostFeatures,
+  viaPortal,
   pending,
   onCancel,
   onConfirm,
 }: FreeDowngradeConfirmModalProps) {
+  const { t } = useTranslation("settings");
   const hasLostFeatures = lostFeatures.length > 0;
   return (
     <Modal.Root
@@ -44,7 +52,7 @@ export function FreeDowngradeConfirmModal({
     >
       <Modal.Content size="md" hideCloseButton>
         <Modal.Header icon={AlertTriangle}>
-          <Modal.Title>Downgrade to Base?</Modal.Title>
+          <Modal.Title>{t("freeDowngradeConfirmModal.title")}</Modal.Title>
         </Modal.Header>
         <Modal.Body>
           <Typography
@@ -52,9 +60,13 @@ export function FreeDowngradeConfirmModal({
             variant="body-medium-default"
             className="text-(--content-secondary)"
           >
-            {hasLostFeatures
-              ? "Downgrading removes the following Pro features. You'll be taken to Stripe to cancel your subscription."
-              : "You'll be taken to Stripe to cancel your subscription."}
+            {viaPortal
+              ? hasLostFeatures
+                ? t("freeDowngradeConfirmModal.bodyWithFeaturesPortal")
+                : t("freeDowngradeConfirmModal.bodyCancelOnlyPortal")
+              : hasLostFeatures
+                ? t("freeDowngradeConfirmModal.bodyWithFeatures")
+                : t("freeDowngradeConfirmModal.bodyCancelOnly")}
           </Typography>
           {hasLostFeatures ? (
             <ul className="mt-4 list-disc space-y-2 pl-5">
@@ -70,7 +82,7 @@ export function FreeDowngradeConfirmModal({
         </Modal.Body>
         <Modal.Footer>
           <Button variant="outlined" onClick={onCancel} disabled={pending}>
-            Cancel
+            {t("freeDowngradeConfirmModal.cancel")}
           </Button>
           <Button
             variant="danger"
@@ -78,7 +90,7 @@ export function FreeDowngradeConfirmModal({
             disabled={pending}
             data-testid="confirm-free-downgrade-button"
           >
-            Downgrade to Base
+            {t("freeDowngradeConfirmModal.confirm")}
           </Button>
         </Modal.Footer>
       </Modal.Content>
