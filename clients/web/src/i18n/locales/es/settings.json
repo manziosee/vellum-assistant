@@ -34,7 +34,9 @@
     "title": "Asesor"
   },
   "aiProviderPicker": {
-    "defaultEntryMeta": "Predeterminado"
+    "defaultEntryMeta": "Predeterminado",
+    "selfHostedOnlyMeta": "Solo autoalojado",
+    "selfHostedOnlyTooltip": "{name} se ejecuta en tu propia máquina, por lo que solo está disponible para asistentes autoalojados."
   },
   "allConversationsView": {
     "archive": "Archivar",
@@ -1651,6 +1653,7 @@
     "dimensionsComplete": "{dimensions} completado",
     "goToBilling": "Ir a facturación",
     "machineLabel": "Máquina",
+    "noExtraUsage": "Sin uso adicional",
     "packageChip": "paquete {name}",
     "planReadyStatus": "Tu plan está listo",
     "retryInBackground": "Reintentar en segundo plano",
@@ -1661,6 +1664,7 @@
     "storageLabel": "Almacenamiento",
     "takingLongerStatus": "Esto está tardando más de lo esperado",
     "tryAgain": "Intentar de nuevo",
+    "usageLabel": "Uso",
     "waitingCaptionLong": "Seguimos trabajando. Esto puede tardar uno o dos minutos.",
     "waitingCaptionShort": "Esto puede tardar unos segundos."
   },

@@ -34,7 +34,9 @@
     "title": "Советник"
   },
   "aiProviderPicker": {
-    "defaultEntryMeta": "По умолчанию"
+    "defaultEntryMeta": "По умолчанию",
+    "selfHostedOnlyMeta": "Только свой хостинг",
+    "selfHostedOnlyTooltip": "{name} работает на вашей машине, поэтому доступен только ассистентам на своём хостинге."
   },
   "allConversationsView": {
     "archive": "В архив",
@@ -1651,6 +1653,7 @@
     "dimensionsComplete": "{dimensions} готово",
     "goToBilling": "К оплате",
     "machineLabel": "Машина",
+    "noExtraUsage": "Без дополнительного использования",
     "packageChip": "пакет {name}",
     "planReadyStatus": "План готов",
     "retryInBackground": "Повторить в фоне",
@@ -1661,6 +1664,7 @@
     "storageLabel": "Хранилище",
     "takingLongerStatus": "Это занимает больше времени, чем ожидалось",
     "tryAgain": "Попробовать снова",
+    "usageLabel": "Использование",
     "waitingCaptionLong": "Ещё работаем. Это может занять минуту или две.",
     "waitingCaptionShort": "Это может занять пару секунд."
   },
