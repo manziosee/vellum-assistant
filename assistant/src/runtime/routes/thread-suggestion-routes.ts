@@ -367,7 +367,7 @@ function resolveStatus(
   req: StaticRequirement,
   connected: Set<string>,
 ): RequirementStatus {
-  if (!req.provider) return "ready";
+  if (!req.provider) { return "ready"; }
   return connected.has(req.provider) ? "ready" : "install";
 }
 
