@@ -1,7 +1,7 @@
 /**
  * Route handler for the thread-suggestions catalog endpoint.
  *
- * GET /v1/thread-suggestions — returns grouped suggestion cards for the
+ * GET /v1/thread-suggestions: returns grouped suggestion cards for the
  * new-thread empty state, with requirement statuses annotated based on
  * which OAuth providers are actually connected for this assistant.
  *
@@ -14,11 +14,24 @@
  *
  * The featured row (always-visible above the fold) is the first
  * `featuredCount` suggestions flattened across all groups in order.
+ *
+ * The catalog content here mirrors clients/web/src/domains/chat/suggestions/
+ * mock-suggestions.ts, which serves as the client-side fallback while the
+ * fetch is in flight. The server-side copy stores `provider` keys for
+ * dynamic status resolution; the client copy stores pre-resolved statuses
+ * for the static fallback. Both must be kept in sync by hand when catalog
+ * content changes.
  */
 
 import { z } from "zod";
 
-import { listConnections } from "../../oauth/oauth-store.js";
+import { getConfig } from "../../config/loader.js";
+import {
+  getServiceMode,
+  type Services,
+  ServicesSchema,
+} from "../../config/schemas/services.js";
+import { getProvider, listConnections } from "../../oauth/oauth-store.js";
 import { ACTOR_PRINCIPALS } from "../auth/route-policy.js";
 import type { RouteDefinition } from "./types.js";
 
@@ -70,7 +83,9 @@ const threadSuggestionsResponseSchema = z.object({
   featuredCount: z
     .number()
     .int()
-    .describe("How many suggestions from the start of groups form the featured row"),
+    .describe(
+      "How many suggestions from the start of groups form the featured row",
+    ),
 });
 
 type RequirementStatus = "ready" | "install";
@@ -121,7 +136,7 @@ const CATALOG: StaticGroup[] = [
         title: "Clean the inbox",
         iconKey: "gmail",
         prompt:
-          "Help me clean up my Gmail inbox — triage what's important, " +
+          "Help me clean up my Gmail inbox: triage what's important, " +
           "unsubscribe from noise, and archive what I don't need.",
         detail: {
           heading: "Email Helper",
@@ -130,9 +145,23 @@ const CATALOG: StaticGroup[] = [
             "that actually need a reply, clearing out newsletters and " +
             "receipts, and keeping the important threads front and center.",
           requirements: [
-            { id: "email-calendar:clean-inbox:gmail", label: "Gmail connected", provider: "gmail" },
-            { id: "email-calendar:clean-inbox:contacts", label: "Contacts plugin", provider: "contacts", hint: INSTALL_HINT },
-            { id: "email-calendar:clean-inbox:calendar", label: "Google Calendar", provider: "google-calendar", hint: INSTALL_HINT },
+            {
+              id: "email-calendar:clean-inbox:gmail",
+              label: "Gmail connected",
+              provider: "gmail",
+            },
+            {
+              id: "email-calendar:clean-inbox:contacts",
+              label: "Contacts plugin",
+              provider: "contacts",
+              hint: INSTALL_HINT,
+            },
+            {
+              id: "email-calendar:clean-inbox:calendar",
+              label: "Google Calendar",
+              provider: "google-calendar",
+              hint: INSTALL_HINT,
+            },
           ],
           capabilities: [
             "Triage unread mail into reply-now, later, and archive",
@@ -157,9 +186,23 @@ const CATALOG: StaticGroup[] = [
             "slot, and set up the event with the right reminders so the call " +
             "actually happens every week.",
           requirements: [
-            { id: "email-calendar:meetings-with-dad:calendar", label: "Google Calendar connected", provider: "google-calendar" },
-            { id: "email-calendar:meetings-with-dad:contacts", label: "Contacts plugin", provider: "contacts", hint: INSTALL_HINT },
-            { id: "email-calendar:meetings-with-dad:gmail", label: "Gmail", provider: "gmail", hint: INSTALL_HINT },
+            {
+              id: "email-calendar:meetings-with-dad:calendar",
+              label: "Google Calendar connected",
+              provider: "google-calendar",
+            },
+            {
+              id: "email-calendar:meetings-with-dad:contacts",
+              label: "Contacts plugin",
+              provider: "contacts",
+              hint: INSTALL_HINT,
+            },
+            {
+              id: "email-calendar:meetings-with-dad:gmail",
+              label: "Gmail",
+              provider: "gmail",
+              hint: INSTALL_HINT,
+            },
           ],
           capabilities: [
             "Find recurring slots that dodge your existing events",
@@ -182,18 +225,32 @@ const CATALOG: StaticGroup[] = [
         title: "Organize my Drive",
         iconKey: "google-drive",
         prompt:
-          "Help me organize my Google Drive — group loose files into folders " +
+          "Help me organize my Google Drive: group loose files into folders " +
           "and flag duplicates I can delete.",
         detail: {
           heading: "Drive Helper",
           description:
             "I'll scan your Drive, propose a folder structure that matches " +
             "how you actually work, and move files into place once you sign " +
-            "off — no surprises.",
+            "off - no surprises.",
           requirements: [
-            { id: "files-docs:organize-drive:drive", label: "Google Drive connected", provider: "google-drive" },
-            { id: "files-docs:organize-drive:docs", label: "Docs plugin", provider: "docs", hint: INSTALL_HINT },
-            { id: "files-docs:organize-drive:gmail", label: "Gmail", provider: "gmail", hint: INSTALL_HINT },
+            {
+              id: "files-docs:organize-drive:drive",
+              label: "Google Drive connected",
+              provider: "google-drive",
+            },
+            {
+              id: "files-docs:organize-drive:docs",
+              label: "Docs plugin",
+              provider: "docs",
+              hint: INSTALL_HINT,
+            },
+            {
+              id: "files-docs:organize-drive:gmail",
+              label: "Gmail",
+              provider: "gmail",
+              hint: INSTALL_HINT,
+            },
           ],
           capabilities: [
             "Propose a folder structure from your existing files",
@@ -216,7 +273,7 @@ const CATALOG: StaticGroup[] = [
         title: "Build a website",
         iconKey: "vellum",
         prompt:
-          "Help me build a simple personal website — gather the pages and " +
+          "Help me build a simple personal website. Gather the pages and " +
           "content I need and scaffold it out.",
         detail: {
           heading: "Website Builder",
@@ -224,7 +281,10 @@ const CATALOG: StaticGroup[] = [
             "Tell me what the site is for and I'll plan the pages, draft the " +
             "copy, and scaffold a clean starting point you can refine.",
           requirements: [
-            { id: "vellum-picks:build-website:vellum", label: "Vellum assistant" },
+            {
+              id: "vellum-picks:build-website:vellum",
+              label: "Vellum assistant",
+            },
           ],
           capabilities: [
             "Plan the pages and structure for your site",
@@ -249,7 +309,10 @@ const CATALOG: StaticGroup[] = [
             "and turn them into a tight recap of what shipped and what's " +
             "still in flight.",
           requirements: [
-            { id: "vellum-picks:summarize-week:vellum", label: "Vellum assistant" },
+            {
+              id: "vellum-picks:summarize-week:vellum",
+              label: "Vellum assistant",
+            },
           ],
           capabilities: [
             "Roll up what you worked on across the week",
@@ -264,14 +327,17 @@ const CATALOG: StaticGroup[] = [
         id: "vellum-picks:draft-email",
         title: "Draft an email",
         iconKey: "vellum",
-        prompt: "Help me draft an email — I'll tell you who it's to and why.",
+        prompt: "Help me draft an email. I'll tell you who it's to and why.",
         detail: {
           heading: "Email Drafting",
           description:
             "Give me the gist and the recipient, and I'll draft an email in " +
             "the right tone that you can tweak and send.",
           requirements: [
-            { id: "vellum-picks:draft-email:vellum", label: "Vellum assistant" },
+            {
+              id: "vellum-picks:draft-email:vellum",
+              label: "Vellum assistant",
+            },
           ],
           capabilities: [
             "Draft an email from a quick description",
@@ -287,7 +353,7 @@ const CATALOG: StaticGroup[] = [
         title: "Plan a trip",
         iconKey: "vellum",
         prompt:
-          "Help me plan a trip — gather options for where to go, where to " +
+          "Help me plan a trip: gather options for where to go, where to " +
           "stay, and what to do.",
         detail: {
           heading: "Trip Planner",
@@ -319,7 +385,10 @@ const CATALOG: StaticGroup[] = [
             "Name a topic and I'll dig into it, pull together the key " +
             "findings, and cite where each one came from so you can trust it.",
           requirements: [
-            { id: "vellum-picks:research-topic:vellum", label: "Vellum assistant" },
+            {
+              id: "vellum-picks:research-topic:vellum",
+              label: "Vellum assistant",
+            },
           ],
           capabilities: [
             "Gather findings from multiple sources",
@@ -337,26 +406,104 @@ const CATALOG: StaticGroup[] = [
 const FEATURED_COUNT = 3;
 
 // ---------------------------------------------------------------------------
-// Handler
+// Google product scope keywords: a granted scope string containing one of
+// these substrings gives access to the corresponding product.
 // ---------------------------------------------------------------------------
 
+const GMAIL_SCOPE_KEYWORD = "gmail";
+const CALENDAR_SCOPE_KEYWORD = "calendar";
+const DRIVE_SCOPE_KEYWORD = "drive";
+
+// ---------------------------------------------------------------------------
+// Handler helpers
+// ---------------------------------------------------------------------------
+
+function parseGrantedScopes(raw: string | null | undefined): string[] {
+  if (!raw) {
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    return Array.isArray(parsed) ? (parsed as string[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Returns true when Google is configured in platform-managed mode.
+ * Managed connections hold credentials on the platform side and do not
+ * produce local SQLite rows, so they are detected via the service mode
+ * config rather than the oauth-store.
+ */
+function isGoogleManagedMode(): boolean {
+  try {
+    const providerRow = getProvider("google");
+    const managedKey = providerRow?.managedServiceConfigKey;
+    if (!managedKey || !(managedKey in ServicesSchema.shape)) {
+      return false;
+    }
+    const services: Services = getConfig().services;
+    return getServiceMode(services, managedKey as keyof Services) === "managed";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Builds the set of connected provider keys, used by `resolveStatus` to
+ * determine whether a suggestion's requirement is already met.
+ *
+ * Local BYO connections are read from the oauth-store. For Google connections
+ * the granted scopes are inspected so that a Calendar-only grant does not
+ * incorrectly mark Gmail and Drive as ready.
+ *
+ * Platform-managed Google connections bypass local SQLite entirely. When
+ * Google is in managed mode the platform handles all three products, so all
+ * three product keys are added unconditionally (the platform enforces its
+ * own scope grants).
+ */
 function getConnectedProviders(): Set<string> {
   try {
-    const rows = listConnections();
     const connected = new Set<string>();
-    for (const row of rows) {
-      if (row.status === "active") {
-        connected.add(row.provider);
-      }
-    }
-    // "google" is the generic Google OAuth connection — treat it as a proxy
-    // for Gmail, Google Calendar, and Google Drive so users who connected
-    // the generic Google integration get "ready" on all three.
-    if (connected.has("google")) {
+
+    if (isGoogleManagedMode()) {
+      connected.add("google");
       connected.add("gmail");
       connected.add("google-calendar");
       connected.add("google-drive");
     }
+
+    const rows = listConnections();
+    for (const row of rows) {
+      if (row.status !== "active") {
+        continue;
+      }
+      connected.add(row.provider);
+
+      if (row.provider === "google") {
+        // Expand to product-level keys only for the scopes actually granted.
+        const scopes = parseGrantedScopes(row.grantedScopes);
+        if (scopes.length === 0) {
+          // Unknown scope data: conservatively grant all three products so
+          // we don't block users who connected Google before scope tracking.
+          connected.add("gmail");
+          connected.add("google-calendar");
+          connected.add("google-drive");
+        } else {
+          if (scopes.some((s) => s.includes(GMAIL_SCOPE_KEYWORD))) {
+            connected.add("gmail");
+          }
+          if (scopes.some((s) => s.includes(CALENDAR_SCOPE_KEYWORD))) {
+            connected.add("google-calendar");
+          }
+          if (scopes.some((s) => s.includes(DRIVE_SCOPE_KEYWORD))) {
+            connected.add("google-drive");
+          }
+        }
+      }
+    }
+
     return connected;
   } catch {
     return new Set<string>();
@@ -367,7 +514,9 @@ function resolveStatus(
   req: StaticRequirement,
   connected: Set<string>,
 ): RequirementStatus {
-  if (!req.provider) { return "ready"; }
+  if (!req.provider) {
+    return "ready";
+  }
   return connected.has(req.provider) ? "ready" : "install";
 }
 
