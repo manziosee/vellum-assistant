@@ -143,6 +143,7 @@ import { ROUTES as SOUNDS_CONFIG_ROUTES } from "./sounds-config-routes.js";
 import { ROUTES as STT_ROUTES } from "./stt-routes.js";
 import { ROUTES as SUBAGENT_ROUTES } from "./subagents-routes.js";
 import { ROUTES as SUGGEST_TRUST_RULE_ROUTES } from "./suggest-trust-rule-routes.js";
+import { ROUTES as THREAD_SUGGESTION_ROUTES } from "./thread-suggestion-routes.js";
 import { ROUTES as SURFACE_ACTION_ROUTES } from "./surface-action-routes.js";
 import { ROUTES as SURFACE_CONTENT_ROUTES } from "./surface-content-routes.js";
 import { ROUTES as TELEMETRY_ROUTES } from "./telemetry-routes.js";
@@ -295,6 +296,7 @@ export const ROUTES: RouteDefinition[] = [
   ...STT_ROUTES,
   ...SUGGEST_TRUST_RULE_ROUTES,
   ...SUBAGENT_ROUTES,
+  ...THREAD_SUGGESTION_ROUTES,
   ...SURFACE_ACTION_ROUTES,
   ...SURFACE_CONTENT_ROUTES,
   ...TELEGRAM_ROUTES,
