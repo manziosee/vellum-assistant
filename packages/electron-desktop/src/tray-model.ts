@@ -19,7 +19,7 @@ import {
 } from "@vellumai/ipc-contract";
 
 import { onAvatarChange } from "./avatar";
-import { GLOBAL_SHORTCUT_DEFAULTS } from "./commands";
+import { resolveGlobalAcceleratorOption } from "./commands";
 import { getName, onNameChange } from "./identity";
 import {
   getStatus,
@@ -325,7 +325,7 @@ const buildTrayMenu = (
       ? [
           {
             label: "Quick Input",
-            accelerator: GLOBAL_SHORTCUT_DEFAULTS.quickInput,
+            ...resolveGlobalAcceleratorOption("quickInput"),
             click: handlers.toggleQuickInput,
           },
         ]
