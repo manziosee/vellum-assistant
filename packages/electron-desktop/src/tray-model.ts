@@ -19,6 +19,7 @@ import {
 } from "@vellumai/ipc-contract";
 
 import { onAvatarChange } from "./avatar";
+import { GLOBAL_SHORTCUT_DEFAULTS } from "./commands";
 import { getName, onNameChange } from "./identity";
 import {
   getStatus,
@@ -133,6 +134,11 @@ export interface TrayHandlers {
    * Open (or focus the existing) About window.
    */
   openAbout(): void;
+  /**
+   * Toggle the Quick Input popover panel. Optional — only wired on builds
+   * where the quick-input feature flag can be enabled (Electron desktop).
+   */
+  toggleQuickInput?(): void;
 }
 
 /**
@@ -176,6 +182,15 @@ const isMultiAssistantEnabled = (): boolean => {
  */
 const isDeveloperMenuEnabled = (): boolean => {
   return getRuntime().featureEnabled("developer-menu-items");
+};
+
+/**
+ * Whether the quick-input feature flag is currently enabled.
+ * Checked at menu-build time so toggling the flag takes effect on the next
+ * right-click without requiring an app restart.
+ */
+const isQuickInputEnabled = (): boolean => {
+  return getRuntime().featureEnabled("quick-input");
 };
 
 const buildTrayMenu = (
@@ -303,6 +318,18 @@ const buildTrayMenu = (
         trayRuntime.dispatch({ kind: "newConversation" });
       },
     },
+    // Quick Input: a floating panel the user can type into without switching
+    // to the main window. Gated by the quick-input feature flag; the handler
+    // is optional so this block safely compiles on builds that don't wire it.
+    ...(isQuickInputEnabled() && handlers.toggleQuickInput
+      ? [
+          {
+            label: "Quick Input",
+            accelerator: GLOBAL_SHORTCUT_DEFAULTS.quickInput,
+            click: handlers.toggleQuickInput,
+          },
+        ]
+      : []),
     {
       label: "Current Conversation",
       icon: trayRuntime.icon("conversation"),
