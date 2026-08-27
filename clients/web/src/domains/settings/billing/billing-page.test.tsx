@@ -167,6 +167,7 @@ function makeSubscription(
     plan_id: planId,
     status: "active",
     renewal_date: null,
+    current_period_start: null,
     current_period_end: "2026-08-01T00:00:00Z",
     cancel_at_period_end: false,
     cancel_at: null,
@@ -246,14 +247,15 @@ afterEach(() => {
 });
 
 describe("BillingTab on native Android", () => {
-  test("shows website guidance without billing controls", () => {
+  test("renders the full billing surface, same as iOS", () => {
     nativeAndroid = true;
-    const { getByText, queryByRole, queryByTestId } = renderPage();
+    const { getByTestId, queryByText } = renderPage();
 
-    expect(getByText("Manage your subscription on our website.")).toBeTruthy();
-    expect(queryByRole("link")).toBeNull();
-    expect(queryByTestId("plan-card-tier-upgraded")).toBeNull();
-    expect(queryByTestId("onboarding-modal")).toBeNull();
+    expect(getByTestId("plan-card-tier-upgraded")).toBeTruthy();
+    expect(getByTestId("onboarding-modal")).toBeTruthy();
+    expect(
+      queryByText("Manage your subscription on our website."),
+    ).toBeNull();
   });
 });
 

@@ -9,10 +9,13 @@
  * Extracted from inbound-message-handler.ts to keep the top-level handler
  * focused on orchestration.
  */
+import type { InboundReactionPayload } from "@vellumai/gateway-client";
+
 import {
   listGuardianRequestsOrEmpty,
   listPendingRequestsByDestinationOrEmpty,
 } from "../../../channels/gateway-guardian-requests.js";
+import { audienceForReader } from "../../../channels/message-audience.js";
 import type { ChannelId } from "../../../channels/types.js";
 import { getLogger } from "../../../util/logger.js";
 import { DAEMON_INTERNAL_ASSISTANT_ID } from "../../assistant-scope.js";
@@ -34,6 +37,7 @@ export interface GuardianReplyInterceptParams {
   trimmedContent: string;
   hasCallbackData: boolean;
   callbackData: string | undefined;
+  reaction?: InboundReactionPayload;
   /**
    * For emoji-reaction decisions: the channel-native id (Slack `ts`) of the
    * message the reaction was attached to. Threaded to the router so it can
@@ -80,6 +84,7 @@ export async function handleGuardianReplyIntercept(
     trimmedContent,
     hasCallbackData,
     callbackData,
+    reaction,
     reactedMessageTs,
     rawSenderId,
     canonicalSenderId,
@@ -135,7 +140,7 @@ export async function handleGuardianReplyIntercept(
   // Reactions address one specific request by the reacted card's message id,
   // so they bypass the pending-request list scoping that the text/NL paths
   // need — the router's reaction branch resolves the target directly.
-  const isReaction = callbackData?.startsWith("reaction:") === true;
+  const isReaction = reaction !== undefined;
   let pendingScope: GuardianPendingScope | undefined;
   if (!isReaction) {
     // Hint reads degrade to empty on gateway failure: Slack then blocks the
@@ -177,6 +182,7 @@ export async function handleGuardianReplyIntercept(
     },
     conversationId,
     callbackData,
+    ...(reaction ? { reaction } : {}),
     reactedMessageTs,
     pendingScope,
     approvalConversationGenerator,
@@ -196,11 +202,13 @@ export async function handleGuardianReplyIntercept(
         assistantId: DAEMON_INTERNAL_ASSISTANT_ID,
       };
       // On Slack, send guardian management replies (disambiguation, pending
-      // request lists, etc.) as ephemeral so only the guardian sees them.
-      if (sourceChannel === "slack" && (canonicalSenderId ?? rawSenderId)) {
-        routerReplyPayload.ephemeral = true;
-        routerReplyPayload.user = (canonicalSenderId ?? rawSenderId)!;
-      }
+      // request lists, etc.) so only the guardian sees them where a room is
+      // shared.
+      routerReplyPayload.audience = audienceForReader(
+        sourceChannel,
+        conversationExternalId,
+        canonicalSenderId ?? rawSenderId,
+      );
       try {
         await deliverChannelReply(replyCallbackUrl, routerReplyPayload);
       } catch (err) {

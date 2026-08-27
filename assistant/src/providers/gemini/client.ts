@@ -694,8 +694,11 @@ export class GeminiProvider implements Provider {
     model: string,
   ): Promise<genai.Content[]> {
     // Swap any persisted attachment references back to inline base64 before
-    // building parts, so the transforms below can read `source.data`.
-    messages = await resolveMediaReferences(messages);
+    // building parts, so the transforms below can read `source.data`. Gemini
+    // decodes HEIF itself, so an untranscoded HEIC photo stays an image here
+    // rather than being replaced by an omission note:
+    // https://ai.google.dev/gemini-api/docs/image-understanding
+    messages = await resolveMediaReferences(messages, { acceptsHeif: true });
     const result: genai.Content[] = [];
 
     // Build a map from tool_use id → function name so tool_result blocks
@@ -717,14 +720,22 @@ export class GeminiProvider implements Provider {
         model,
         role,
       );
-      if (parts.length > 0) {
-        result.push({ role, parts });
+      // Gemini keeps functionResponse parts separate from other parts. Tool
+      // result media follows the function response before any remaining text.
+      const functionResponseParts = parts.filter(
+        (part) => part.functionResponse !== undefined,
+      );
+      const otherParts = parts.filter(
+        (part) => part.functionResponse === undefined,
+      );
+      if (functionResponseParts.length > 0) {
+        result.push({ role, parts: functionResponseParts });
       }
-      // Gemini requires that a Content with functionResponse parts must not
-      // contain non-functionResponse parts. Emit tool-result images in a
-      // separate user Content entry.
       if (toolResultMediaParts.length > 0) {
         result.push({ role: "user", parts: toolResultMediaParts });
+      }
+      if (otherParts.length > 0) {
+        result.push({ role, parts: otherParts });
       }
     }
 

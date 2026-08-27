@@ -29,6 +29,13 @@ export type VellumCommand =
   | { kind: "newConversation" }
   | { kind: "currentConversation" }
   | { kind: "markCurrentUnread" }
+  /**
+   * Pin the conversation the user is looking at, or unpin it when it is
+   * already pinned. One kind for both edges because the renderer owns the
+   * pinned state; main builds a single static menu item and never learns
+   * which edge a press is.
+   */
+  | { kind: "togglePinConversation" }
   | { kind: "openSettings" }
   | { kind: "shareFeedback" }
   | { kind: "find" }
@@ -66,6 +73,37 @@ export type VellumCommand =
    * running is a no-op, because the running session is the one the user is in.
    */
   | { kind: "startVoice" }
+  /**
+   * Turn a watch session on or off, the way the companion surface's Watch
+   * option asks.
+   *
+   * One command for both edges rather than a start and a stop: the surface
+   * draws a single toggle, and the window that owns the session is the only
+   * side that knows which edge a press is. A press that lands while a session
+   * is running ends that session.
+   *
+   * Like `startVoice`, this does not raise the app. The user reached for a
+   * floating surface precisely because they are working somewhere else, and
+   * here that work is the subject: raising the app would cover the very thing
+   * the session exists to observe.
+   */
+  | { kind: "toggleWatch" }
+  /**
+   * Answer the question the surface asks once a watch session's summary is
+   * written: open it now, or not.
+   *
+   * `open: true` is the one press on this surface that deliberately raises the
+   * app, and it is the exception `toggleWatch` above explains: the session is
+   * over, so there is no longer any work of the user's for Vellum to cover, and
+   * a "show me" that left the report where it was would be a promise the
+   * surface cannot keep.
+   *
+   * `open: false` still travels rather than being handled where it was pressed.
+   * The window that holds the session holds the question too, and a dismissal
+   * the surface kept to itself would leave that window waiting on an answer
+   * that already happened, ready to redraw the prompt on the next push.
+   */
+  | { kind: "answerWatchRetro"; open: boolean }
   /**
    * Start a live-voice session, or end the one that is running.
    *
@@ -138,7 +176,8 @@ export interface HotkeyEvent {
 }
 
 export type FnPushToTalkResult =
-  { ok: true; enabled: boolean } | { ok: false; reason: string };
+  | { ok: true; enabled: boolean }
+  | { ok: false; reason: string };
 
 // ---------------------------------------------------------------------------
 // System permissions
@@ -158,6 +197,7 @@ export type SystemPermissionKind = (typeof SYSTEM_PERMISSION_KINDS)[number];
 
 export const SYSTEM_PERMISSION_STATUSES = [
   "unknown",
+  "not-applicable",
   "restricted",
   "denied",
   "not-determined",
@@ -213,10 +253,32 @@ export type ConnectivityState = (typeof CONNECTIVITY_STATES)[number];
 // ---------------------------------------------------------------------------
 
 export type PowerEventKind =
-  "suspend" | "resume" | "lock" | "unlock" | "active";
+  | "suspend"
+  | "resume"
+  | "lock"
+  | "unlock"
+  | "active";
 
 export interface PowerEvent {
   kind: PowerEventKind;
+}
+
+// ---------------------------------------------------------------------------
+// Downloads
+// ---------------------------------------------------------------------------
+
+/**
+ * Terminal report for one renderer-initiated download, pushed to the
+ * originating window. `id` is an opaque main-process token: the renderer
+ * hands it back to `downloads.reveal` and main resolves it to the saved
+ * path itself, so no filesystem path ever travels renderer-to-main.
+ * `id` is only present when `state` is `"completed"`: an interrupted
+ * download has no file to reveal.
+ */
+export interface DownloadDoneEvent {
+  id?: string;
+  filename: string;
+  state: "completed" | "interrupted";
 }
 
 // ---------------------------------------------------------------------------
@@ -256,13 +318,16 @@ export type DeepLink =
     }
   /**
    * `<scheme>://connect`: the pair-page "Open in the Vellum app" hand-off
-   * and `vellum pair --qr --app` QR codes. `url` is a validated https server
-   * base; `bundle` (pairing bundle) is secret material and must never be
-   * logged or breadcrumbed. Fields absent when their query params were
-   * missing or malformed. The link never carries the `code` query param
-   * (device code): the renderer has no consumer for it.
+   * and `vellum pair --app` QR codes. `url` is a validated https server
+   * base and `code` the device code it carries, which the local-mode host
+   * exchanges for pairing credentials. `code` is credential material and
+   * must never be logged or breadcrumbed; it rides only alongside a usable
+   * `url`. `legacy` marks a link that carried a `bundle` param from an app
+   * version whose connect dialog took a pasted pairing bundle: only the
+   * presence crosses this seam, never the payload. Fields absent when
+   * their query params were missing or malformed.
    */
-  | { kind: "connect"; url?: string; bundle?: string }
+  | { kind: "connect"; url?: string; code?: string; legacy?: true }
   | { kind: "unknown"; url: string };
 
 // ---------------------------------------------------------------------------
@@ -270,10 +335,16 @@ export type DeepLink =
 // ---------------------------------------------------------------------------
 
 export type DictationPartialsResult =
-  { ok: true; enabled: boolean } | { ok: false; reason: string };
+  | { ok: true; enabled: boolean }
+  | { ok: false; reason: string };
 
 export interface DictationPartialEvent {
   text: string;
+}
+
+export interface DictationTranscribeResult {
+  ok: boolean;
+  reason?: string;
 }
 
 /**
@@ -287,7 +358,21 @@ export type DictationOverlayState =
   | { kind: "error"; message: string };
 
 export type DictationOverlayMessage =
-  DictationOverlayState | { kind: "dismiss" };
+  | DictationOverlayState
+  | { kind: "dismiss" };
+
+/**
+ * Where the overlay's Stop control sits, in window-relative CSS pixels.
+ * The overlay renderer reports it so main can hit-test the cursor against
+ * it on platforms where forwarded mouse moves never reach a click-through
+ * window.
+ */
+export type DictationOverlayHitRegion = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
 
 // ---------------------------------------------------------------------------
 // Voice activity (the floating live-voice session surface)
@@ -512,7 +597,12 @@ export interface BundleScanData {
 // ---------------------------------------------------------------------------
 
 export type UpdateStatus =
-  "idle" | "checking" | "available" | "downloading" | "downloaded" | "error";
+  | "idle"
+  | "checking"
+  | "available"
+  | "downloading"
+  | "downloaded"
+  | "error";
 
 export interface UpdateState {
   status: UpdateStatus;
@@ -575,7 +665,8 @@ export interface Lockfile {
 }
 
 export type LockfileWriteResult =
-  { ok: true; lockfile: Lockfile } | { ok: false; error: string };
+  | { ok: true; lockfile: Lockfile }
+  | { ok: false; error: string };
 
 export type LocalAssistantRuntimeState =
   | "healthy"
@@ -645,13 +736,22 @@ export type CompanionCardGrowth = (typeof COMPANION_CARD_GROWTHS)[number];
  * Named rather than free, because the avatar's box is not a style: it is the
  * geometry both sides of the bridge agree on, and everything derives from it:
  * the pill's reach, the card's height, and the canvas sized to hold the largest
- * state. A continuous scale would be a layout nobody had ever looked at; four
- * steps are four layouts, each checkable in Storybook.
+ * state. A continuous scale would be a layout nobody had ever looked at; five
+ * steps are five layouts, each checkable in Storybook.
  *
- * `large` is the default. `small` is the size the surface's layout is authored
- * at, which every other step scales from.
+ * `medium` is the default. `small` is the size the surface's layout is authored
+ * at, which every other step scales from. `ridiculous` is the joke at the end
+ * of the scale, and it is a real step rather than a gag drawn some other way:
+ * every length on the surface is stated in `small`, so the largest step costs
+ * one number here and is drawn by the same code as the other four.
  */
-export const COMPANION_SIZES = ["small", "medium", "large", "huge"] as const;
+export const COMPANION_SIZES = [
+  "small",
+  "medium",
+  "large",
+  "huge",
+  "ridiculous",
+] as const;
 
 export type CompanionSize = (typeof COMPANION_SIZES)[number];
 
@@ -661,10 +761,39 @@ export const COMPANION_SIZE_BOXES: Record<CompanionSize, number> = {
   medium: 66,
   large: 88,
   huge: 110,
+  // Five times the authored size, which puts the canvas well past the width of
+  // any display it will be shown on. That is allowed: a canvas may hang off the
+  // left and right freely, and the card flips to growing downward when the
+  // display is too short for it, so the oversize step lands on paths the other
+  // four already take near an edge.
+  ridiculous: 220,
 };
 
-/** What the surface is drawn at when nothing has been chosen. */
-export const DEFAULT_COMPANION_SIZE: CompanionSize = "large";
+/**
+ * What the surface is drawn at when nothing has been chosen.
+ *
+ * The second step rather than the third. The companion arrives on the desktop
+ * without anyone having asked for it, over whatever the user was already
+ * working in, so it arrives at the size of an uninvited guest: big enough to be
+ * recognised as the creature it is, small enough that nobody has to move it
+ * before they can carry on. The steps above are for the users who then want it
+ * bigger, and the introduction's last beat is where they are told to find
+ * them (see {@link COMPANION_INTRO_BEATS}).
+ */
+export const DEFAULT_COMPANION_SIZE: CompanionSize = "medium";
+
+/**
+ * The two things on the surface a user sizes, sized separately.
+ *
+ * An avatar big enough to read from across the room does not mean a pill that
+ * wide, and both axes take the same five steps ({@link COMPANION_SIZES}), so
+ * there is one vocabulary and two answers rather than two scales to learn.
+ * `avatar` sizes the creature, its glow and its bob; `options` sizes the pill,
+ * the typing card, the call's body and the introduction's card.
+ */
+export const COMPANION_SIZE_AXES = ["avatar", "options"] as const;
+
+export type CompanionSizeAxis = (typeof COMPANION_SIZE_AXES)[number];
 
 /**
  * The avatar's box the companion's layout is authored at, and the size every
@@ -676,12 +805,103 @@ export const DEFAULT_COMPANION_SIZE: CompanionSize = "large";
  */
 export const COMPANION_BASE_AVATAR_BOX = COMPANION_SIZE_BOXES.small;
 
-/** Room the pill's shadow paints outside its box, at the base size. */
+/**
+ * Room the pill's shadow and the avatar's glow paint outside their own boxes,
+ * at the base size.
+ */
 export const COMPANION_BASE_CANVAS_PAD = 24;
 
 /**
+ * The tallest the surface draws at the base size, which is the typing card.
+ *
+ * Every other state is a pill exactly {@link COMPANION_BASE_AVATAR_BOX} tall.
+ * The card stacks the conversation above that row in a viewport that scrolls
+ * once it is full, so it has a ceiling rather than growing with the exchange,
+ * and this is that ceiling rounded up: the card's text is laid out in the
+ * renderer, and a canvas a few points short clips the top of it off.
+ *
+ * Matched to `CompanionSurface`'s card, and held here rather than beside the
+ * placement rules because {@link companionCardSideFor} sizes the canvas from
+ * it.
+ */
+export const COMPANION_BASE_CARD_HEIGHT = 290;
+
+/**
+ * The widest the pill draws at the base size, measured from its avatar-facing
+ * edge.
+ *
+ * An outer width, padding included: the renderer draws a pill as its measured
+ * body plus its own clearance at either end, and that whole width is what has
+ * to fit. The typing card is exactly this wide, being the one state that states
+ * a width rather than measuring one.
+ *
+ * A ceiling rather than a width, since every other state is as wide as its
+ * content. Main sizes the canvas to hold this much beyond the gap, so a state
+ * that wanted more would be clipped by the window.
+ */
+export const COMPANION_BASE_MAX_PILL_WIDTH = 316;
+
+/**
+ * The room between the avatar's edge and the options pill beside it, at the
+ * base size.
+ *
+ * A gap rather than a shared edge. The avatar is a creature standing on the
+ * desktop and the pill is what it is holding out, so the two read as one
+ * surface by sitting near each other rather than by being fused into a single
+ * outline. It is also what gives the glow somewhere to fall off into, instead
+ * of ending against the pill's border.
+ */
+export const COMPANION_BASE_GAP = 12;
+
+/**
+ * The scale a box is drawn at: the box over the size the layout is authored at.
+ *
+ * The one conversion from points into the units every length on the surface is
+ * stated in, so neither side of the bridge divides by the base box on its own.
+ */
+export const companionScaleFor = (box: number): number =>
+  box / COMPANION_BASE_AVATAR_BOX;
+
+/**
+ * That gap for a given pair of boxes.
+ *
+ * Scaled by the smaller of the two, because the gap is breathing room and the
+ * smaller object is the one that decides how much of it there is: a modest
+ * avatar beside an enormous pill wants the modest avatar's clearance, not the
+ * chasm the pill's own scale would ask for.
+ *
+ * Derived here rather than on each side of the bridge, for the reason
+ * {@link companionNearEdgeFor} is: main sizes the canvas to hold the pill's
+ * reach past the avatar and the renderer positions the pill by the same
+ * distance, so two copies of this drifting is a pill drawn somewhere main did
+ * not leave room for.
+ */
+export const companionGapFor = (
+  avatarBox: number,
+  optionsBox: number,
+): number =>
+  (COMPANION_BASE_GAP * Math.min(avatarBox, optionsBox)) /
+  COMPANION_BASE_AVATAR_BOX;
+
+/**
+ * The room the canvas keeps outside everything drawn into it, for a given pair
+ * of boxes.
+ *
+ * The larger of the two scales, because the pad holds two overflows and either
+ * one can be the bigger: the pill's shadow grows with the options size and the
+ * avatar's glow with the avatar's. Sizing it from the smaller would clip
+ * whichever of the two the user made large.
+ */
+export const companionPadFor = (
+  avatarBox: number,
+  optionsBox: number,
+): number =>
+  COMPANION_BASE_CANVAS_PAD *
+  Math.max(companionScaleFor(avatarBox), companionScaleFor(optionsBox));
+
+/**
  * How far the avatar's centre sits from the canvas edge the card does *not*
- * grow into: its own half-box, plus the shadow's room.
+ * grow into, for a given pair of boxes.
  *
  * **The cross-process invariant.** Main places the window by it and the
  * renderer anchors the avatar by it, so the two agreeing is what makes the
@@ -689,11 +909,52 @@ export const COMPANION_BASE_CANVAS_PAD = 24;
  * side, because two copies of this formula drifting is the avatar drawn
  * somewhere other than where main believes it is.
  *
- * The far edge is however far away the canvas is, which neither side has to
- * state: `100%` names the canvas in the renderer, and main sizes it.
+ * What has to clear that edge depends on which way the card grows, because the
+ * pill's bottom edge is the avatar's: growing up, the near side holds the
+ * avatar's own half box and nothing else; growing down, the pill stands on that
+ * line and reaches a whole options box back past it, which pokes above a
+ * smaller creature. The larger of the two is taken so the answer is the same
+ * either way, since a flip moves the canvas rather than resizing it, and a near
+ * edge that changed with the direction would shift the avatar by the
+ * difference.
+ *
+ * The far edge is {@link companionCardSideFor}, which the renderer never has to
+ * state: `100%` names the canvas there, and main sizes it.
  */
-export const COMPANION_NEAR_EDGE =
-  COMPANION_BASE_AVATAR_BOX / 2 + COMPANION_BASE_CANVAS_PAD;
+export const companionNearEdgeFor = (
+  avatarBox: number,
+  optionsBox: number,
+): number =>
+  Math.max(avatarBox / 2, optionsBox - avatarBox / 2) +
+  companionPadFor(avatarBox, optionsBox);
+
+/**
+ * How far the avatar's centre sits from the canvas edge the card *does* grow
+ * into, for a given pair of boxes.
+ *
+ * The far half of {@link companionNearEdgeFor}, taken over both growths for the
+ * same reason. Growing up, the card stands on the avatar's bottom line and
+ * rises its whole height from there; growing down, its composer row holds that
+ * line and the rest of the card falls away below it. The avatar's own half box
+ * is the floor under both, for a creature taller than the card beside it.
+ *
+ * Only main consumes this: the renderer names that edge with `100%` and lets
+ * main size the canvas. It lives here to sit beside the constants it reads.
+ */
+export const companionCardSideFor = (
+  avatarBox: number,
+  optionsBox: number,
+): number => {
+  const scale = companionScaleFor(optionsBox);
+  return (
+    Math.max(
+      COMPANION_BASE_CARD_HEIGHT * scale - avatarBox / 2,
+      (COMPANION_BASE_CARD_HEIGHT - COMPANION_BASE_AVATAR_BOX) * scale +
+        avatarBox / 2,
+      avatarBox / 2,
+    ) + companionPadFor(avatarBox, optionsBox)
+  );
+};
 
 /**
  * The assistant's character, as the three trait ids it is composed from.
@@ -728,6 +989,25 @@ export interface CompanionTurn {
 }
 
 /**
+ * Where a finished watch session's summary has got to.
+ *
+ * A session ends the moment the user presses stop, and the account of it does
+ * not: the runtime spends a full turn reading the timeline back before there is
+ * anything to show. Those are the two states worth a surface, and neither is
+ * `watching`, which is over by the time either is true.
+ *
+ * - `pending`: the turn is running. The surface says so, because a session that
+ *   ends into silence reads as one that was thrown away.
+ * - `ready`: there is a report to read, and the surface asks whether to open
+ *   it.
+ *
+ * Absent is the resting answer, and covers both ends of the life: no session
+ * has finished, or the last one that did was answered, dismissed, or produced
+ * nothing to read.
+ */
+export type CompanionWatchRetro = "pending" | "ready";
+
+/**
  * What the app's own window knows that the surface cannot.
  *
  * The surface is a renderer with no assistant and no conversation in it, so
@@ -759,7 +1039,99 @@ export interface CompanionContext {
    * on screen is no proof the turn behind it has ended.
    */
   working: boolean;
+  /**
+   * Whether a watch session is running, when the publisher knows.
+   *
+   * Optional here, and defaulted in `companionContextSchema`, because a
+   * publisher that runs no watch session has nothing to report, and an omitted
+   * value reads as no session of its running. Publishers that do run sessions
+   * always send it.
+   */
+  watching?: boolean;
+  /**
+   * Where the last session's summary has got to, when the publisher knows.
+   *
+   * Optional for the same reason `watching` is, and answered by the same
+   * window: the runtime reports the retrospective on the assistant's event
+   * stream, which the app's window is subscribed to and the surface's is not.
+   *
+   * See {@link CompanionWatchRetro}. Omitted means there is nothing to say.
+   */
+  watchRetro?: CompanionWatchRetro;
+
+  /**
+   * How many times the running session has read the screen, counted from the
+   * moment it started.
+   *
+   * A count rather than a timestamp: it crosses a process boundary, and two
+   * sides comparing "when" would be two clocks, where comparing "how many"
+   * only ever asks whether the number moved. Reset to zero by the session that
+   * owns it, so a fresh session never inherits the last one's total and its
+   * first read is unambiguously its first.
+   *
+   * Optional and defaulted for the same reason {@link CompanionContext.watching}
+   * is: a publisher with no session to report says nothing, and zero reads is
+   * the truthful reading of silence.
+   */
+  captureCount?: number;
 }
+
+/**
+ * The feature flag key Teach is behind, as the app's window wrote it into
+ * settings (`useElectronFeatureFlagBridge`).
+ *
+ * The constant's name and the key it holds spell the feature differently: the
+ * symbols around it say Watch, everything a person reads says Teach. A flag key
+ * is one of the things a person reads, in the LaunchDarkly dashboard.
+ *
+ * Here rather than in either client, because two clients read the same
+ * evaluation for two halves of one gate: Electron main reads it to decide
+ * whether the companion surface draws the Teach control at all, and the web
+ * app's `toggleWatch` command reads it to decide whether a press may start a
+ * session. A second copy of the string is a gate that can disagree with
+ * itself, and both ways it can disagree are bad: a visible control that
+ * nothing will start, or a command open with no control that says so.
+ *
+ * The evaluated value travels to the surface on
+ * {@link CompanionSurfaceState.watchEnabled}; this is only the key it is
+ * evaluated under.
+ */
+export const WATCH_FLAG = "teach";
+
+/**
+ * The beats of the surface's one-time introduction, in order.
+ *
+ * The companion is the only thing this app puts on a user's desktop rather than
+ * in its own window, and it arrives already there rather than being opened. So
+ * it says what it is once, on itself, where the thing being described actually
+ * is: the alternative was describing it in the app window, which is the one
+ * place the user is not looking when the surface matters.
+ *
+ * A list rather than a count, because each beat names the control it sits over
+ * and the renderer spotlights that control by name. Two of them have no
+ * control to spotlight: `meet` is the avatar itself, and `menu` is about a
+ * press rather than a control drawn on the pill.
+ *
+ * `menu` is last and is the answer to "how do I make this go away" and "how do
+ * I make it a different size". A surface that sits above every other window has
+ * to say where its own off switch is, and the right-click menu it points at is
+ * the only part of this the user cannot find by looking at the pill.
+ */
+export const COMPANION_INTRO_BEATS = ["meet", "talk", "type", "menu"] as const;
+
+export type CompanionIntroBeat = (typeof COMPANION_INTRO_BEATS)[number];
+
+/**
+ * What a press on the introduction asks for.
+ *
+ * Two intents rather than a beat to jump to, because the renderer does not hold
+ * the running position: main does, so the renderer says which way to go and
+ * main resolves it against the beat it is actually on. A stale press from a
+ * renderer a beat behind then lands where the user could see it would.
+ */
+export const COMPANION_INTRO_ACTIONS = ["next", "dismiss"] as const;
+
+export type CompanionIntroAction = (typeof COMPANION_INTRO_ACTIONS)[number];
 
 /** What main tells the companion renderer. */
 export interface CompanionSurfaceState {
@@ -771,14 +1143,25 @@ export interface CompanionSurfaceState {
    */
   cardGrowth: CompanionCardGrowth;
   /**
-   * The avatar's box in points, which is the whole of the surface's scale.
+   * The avatar's box in points, which is the creature's whole scale.
    *
-   * One number rather than the named size, because the name is a lookup both
-   * sides would then have to hold the same copy of. Everything the surface
-   * draws derives from this, so the renderer scales itself by this over the
-   * size the layout is authored at. See {@link COMPANION_SIZE_BOXES}.
+   * Numbers rather than the named sizes, because a name is a lookup both sides
+   * would then have to hold the same copy of. See {@link COMPANION_SIZE_BOXES},
+   * and {@link COMPANION_SIZE_AXES} for why there are two of them.
    */
   avatarBox: number;
+  /**
+   * The pill's box in points, which is the scale of everything that is not the
+   * creature: the pill, the typing card, the call's body and the introduction.
+   *
+   * The renderer draws the surface at this over the size its layout is authored
+   * at and scales the creature inside that by the ratio between the two boxes,
+   * so every length beside the avatar stays stated once, at the base size.
+   *
+   * Optional, and absence means a shell that predates the second axis, which
+   * the renderer reads as {@link CompanionSurfaceState.avatarBox}.
+   */
+  optionsBox?: number;
   /**
    * The assistant's display name, for the composer's placeholder.
    *
@@ -806,6 +1189,73 @@ export interface CompanionSurfaceState {
    */
   working: boolean;
   /**
+   * Whether a watch session is running, from the toggle until it ends.
+   *
+   * Pushed by the window that owns the session for the same reason
+   * {@link CompanionSurfaceState.working} is: the session lives in the app's
+   * window and the surface is only where it was asked for. Held here rather
+   * than kept in the surface's own renderer for the same reason the turns are,
+   * and with more riding on it: the surface can reload mid-session, and a
+   * screen being read with nothing on screen saying so is a capture the user
+   * has no way to stop.
+   *
+   * Optional, and absence means not watching. Read it as `watching === true`
+   * rather than for truthiness: every state that is not a positive answer is
+   * the answer "no session", including a state pushed by a main process that
+   * tracks no watch sessions. The same bargain `companion-window.ts` makes for
+   * the surface flag, and for the same reason: not knowing has to read as not
+   * running, because the alternative is drawing a capture indicator over a
+   * machine that is not being captured.
+   */
+  watching?: boolean;
+  /**
+   * Where the last session's summary has got to, as the window that ran it
+   * last reported. See {@link CompanionWatchRetro}.
+   *
+   * Held here rather than in the surface's own renderer for the reason the
+   * turns are: the retrospective runs long enough that the surface can reload
+   * inside it, and a prompt that came back empty would be a question the user
+   * was asked and then never got to answer.
+   *
+   * Optional, and absence means there is nothing to draw.
+   */
+  watchRetro?: CompanionWatchRetro;
+
+  /**
+   * How many screen reads the running session has taken, from the window that
+   * owns it. See {@link CompanionContext.captureCount}.
+   *
+   * {@link CompanionSurfaceState.watching} says a session is open, which is a
+   * state that holds for minutes; this is what lets the surface mark the
+   * discrete moments inside it. Each increment is one read that reached the
+   * runtime's timeline, so a surface may treat a step in this number as proof
+   * the screen was read and the flat stretches between as proof it was not.
+   *
+   * Optional, and absence reads as no reads yet, the same bargain
+   * {@link CompanionSurfaceState.watching} makes with absence.
+   */
+  captureCount?: number;
+
+  /**
+   * Whether Watch is offered at all, as the flag was last evaluated for the
+   * signed-in user.
+   *
+   * Carried on the state rather than read where it is drawn, because the
+   * surface is a floating route: it has no session, no auth, and no flag store
+   * that ever hydrates, so a value it read for itself would be the registry
+   * default forever. Main reads the evaluation the app's window wrote into
+   * settings and pushes it here with everything else, which is the same path
+   * `companion-window.ts` already takes for the surface's own flag.
+   *
+   * Optional, and absence means not offered. Read it as `watchEnabled === true`
+   * for the reason {@link CompanionSurfaceState.watching} is read that way: a
+   * shell that predates the field, a window whose flags have not synced yet,
+   * and an environment where the flag was never provisioned are all states of
+   * not knowing, and a control that reads a user's screen is not something to
+   * offer while the answer is unknown.
+   */
+  watchEnabled?: boolean;
+  /**
    * The character to render live, or `undefined` when there is none to
    * compose. See {@link CompanionCharacter}; `avatarBase64` is the fallback.
    */
@@ -828,6 +1278,16 @@ export interface CompanionSurfaceState {
    * surface, so the companion cannot drift from the icon in the Dock beside it.
    */
   avatarBase64?: string;
+  /**
+   * Which beat of the introduction the surface is on, or `null` when it is not
+   * running, which is every launch after the first.
+   *
+   * Held by main rather than the renderer, for the reason the session is: this
+   * window reloads, and an introduction anchored in it would start again from
+   * the top each time it did. Main also owns the "already seen" record, so the
+   * renderer never has to decide whether a run is due.
+   */
+  intro: CompanionIntroBeat | null;
 }
 
 // ---------------------------------------------------------------------------

@@ -6,10 +6,15 @@
  * submit/cancel lifecycle for the contact-request interaction.
  */
 
+import { t } from "@/i18n";
 import { captureError } from "@/lib/sentry/capture-error";
 
 import { useChatSessionStore } from "@/domains/chat/chat-session-store";
 import { useInteractionStore } from "@/domains/chat/interaction-store";
+import {
+  captureSubmissionRejection,
+  reportSubmissionFailure,
+} from "@/domains/chat/prompt-submission";
 import { useStreamStore } from "@/domains/chat/stream-store";
 import { useConversationStore } from "@/stores/conversation-store";
 import { endTurn } from "@/domains/chat/turn-coordinator";
@@ -23,20 +28,29 @@ export async function handleContactPromptSubmit(
   address: string,
   channelType: string,
 ): Promise<void> {
-  const { pendingContactRequest, isSubmittingContactRequest } =
+  const { pendingContactRequest, submittingByKind } =
     useInteractionStore.getState();
-  if (!pendingContactRequest || isSubmittingContactRequest) {
+  // Guards double-submitting this prompt, not any prompt; see
+  // `prompt-submission.ts` for why that is not "anything in flight".
+  if (
+    !pendingContactRequest ||
+    submittingByKind.contactRequest === pendingContactRequest.requestId
+  ) {
     return;
   }
-  useInteractionStore.getState().submitContactRequestStart();
+  useInteractionStore
+    .getState()
+    .claimSubmission("contactRequest", pendingContactRequest.requestId);
   useChatSessionStore.getState().setError(null);
 
   const ctx = useStreamStore.getState().streamContext;
   if (!ctx) {
     useChatSessionStore
       .getState()
-      .setError({ message: "No active session. Please try again." });
-    useInteractionStore.getState().submitContactRequestEnd();
+      .setError({ message: t("chat:promptSubmission.noActiveSession") });
+    useInteractionStore
+      .getState()
+      .releaseSubmission("contactRequest", pendingContactRequest.requestId);
     return;
   }
 
@@ -49,25 +63,38 @@ export async function handleContactPromptSubmit(
       pendingContactRequest.role,
     );
     if (!result.ok) {
-      useChatSessionStore.getState().setError({ message: result.error });
-      useInteractionStore.getState().submitContactRequestEnd();
+      captureSubmissionRejection("submit_contact_prompt", result);
+      reportSubmissionFailure(
+        "contactRequest",
+        pendingContactRequest.requestId,
+        "contactActions.saveFailed",
+      );
+      useInteractionStore
+        .getState()
+        .releaseSubmission("contactRequest", pendingContactRequest.requestId);
       return;
     }
 
     useInteractionStore.getState().acceptContactRequest();
+    useInteractionStore
+      .getState()
+      .releaseSubmission("contactRequest", pendingContactRequest.requestId);
     const savedRequestId = pendingContactRequest.requestId;
     setTimeout(() => {
-      const current = useInteractionStore.getState().pendingContactRequest;
-      if (current?.requestId === savedRequestId) {
-        useInteractionStore.getState().dismissContactRequest();
-      }
+      useInteractionStore
+        .getState()
+        .dismissContactRequestIfMatches(savedRequestId);
     }, 1500);
   } catch (err) {
     captureError(err, { context: "submit_contact_prompt" });
-    useChatSessionStore
+    reportSubmissionFailure(
+      "contactRequest",
+      pendingContactRequest.requestId,
+      "contactActions.saveFailed",
+    );
+    useInteractionStore
       .getState()
-      .setError({ message: "Failed to save contact. Please try again." });
-    useInteractionStore.getState().submitContactRequestEnd();
+      .releaseSubmission("contactRequest", pendingContactRequest.requestId);
   }
 }
 
@@ -75,7 +102,11 @@ export async function handleContactPromptSubmit(
  * Cancel the contact prompt — dismisses local state and ends the turn.
  */
 export function handleContactPromptCancel(): void {
-  useInteractionStore.getState().dismissContactRequest();
+  const requestId =
+    useInteractionStore.getState().pendingContactRequest?.requestId;
+  if (requestId) {
+    useInteractionStore.getState().dismissContactRequestIfMatches(requestId);
+  }
   endTurn({
     conversationId: useConversationStore.getState().activeConversationId,
     reason: "error",

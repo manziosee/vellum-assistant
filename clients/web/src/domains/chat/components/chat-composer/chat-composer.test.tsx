@@ -40,6 +40,7 @@ import {
   isDraftPastOneLine,
   shouldSubmitOnEnter,
 } from "@/domains/chat/components/chat-composer/chat-composer-utils";
+import { useInteractionStore } from "@/domains/chat/interaction-store";
 import { useQuoteReplyStore } from "@/domains/chat/quote-reply-store";
 
 // The two device-side axes are driven by stubbing `window.matchMedia`, not by
@@ -111,7 +112,11 @@ import {
 } from "@/domains/chat/voice/live-voice/live-voice-store";
 
 const liveStarterSpy = mock(
-  (_assistantId: string, _conversationId: string | null) => {},
+  (
+    _assistantId: string,
+    _conversationId: string | null,
+    _options?: { seedText?: string },
+  ) => {},
 );
 const livePrewarmSpy = mock(() => {});
 const liveCancelPrewarmSpy = mock(() => {});
@@ -206,6 +211,19 @@ mock.module("@/domains/chat/voice/live-voice/live-voice-preflight-api", () => ({
   preflightLiveVoice: preflightSpy,
 }));
 
+// Out-of-band session end, behind the failure notice's reclaim action. Mocked
+// so the action can be driven without a daemon; the wrapper's own shape mirrors
+// `preflightLiveVoice` above.
+const sessionEndSpy = mock((_assistantId: string): Promise<boolean> =>
+  Promise.resolve(true),
+);
+mock.module(
+  "@/domains/chat/voice/live-voice/live-voice-session-end-api",
+  () => ({
+    endLiveVoiceSessionOnAssistant: sessionEndSpy,
+  }),
+);
+
 // Backwards-compat version gate for the voice entry point. Mocked (rather
 // than driving the identity store) so these tests stay about composer
 // behavior; the gate's own semver truth-table lives in
@@ -261,7 +279,10 @@ mock.module("react-router", () => ({
   useNavigate: () => navigateSpy,
   // The composer captures pop-out mode once at mount from the URL search
   // string; a plain window (no `?popout=1`) is the default test context.
-  useLocation: () => ({ search: "" }),
+  // `pathname` is what the camera deep link's drain reads to know which
+  // conversation it is bound to; the assistant index names none, which is the
+  // honest stand-in for a composer rendered outside the route tree.
+  useLocation: () => ({ pathname: "/assistant", search: "" }),
 }));
 
 // "Add to chat" sheet, kept for the Android shell. Stubbed to a probe that
@@ -432,7 +453,7 @@ describe("shouldSubmitOnEnter — guards still preventDefault but skip submit", 
       shouldSubmitOnEnter(ENTER, false, {
         input: "",
         canSendAttachments: true,
-        hasStagedQuotes: false,
+        hasStagedContext: false,
         sendDisabled: false,
         attachmentsUploadingCount: 0,
         cmdEnterMode: false,
@@ -440,12 +461,12 @@ describe("shouldSubmitOnEnter — guards still preventDefault but skip submit", 
     ).toBe("submit");
   });
 
-  test("input is empty but staged quote context is ready", () => {
+  test("input is empty but staged context (quote or channel reference) is ready", () => {
     expect(
       shouldSubmitOnEnter(ENTER, false, {
         input: "",
         canSendAttachments: false,
-        hasStagedQuotes: true,
+        hasStagedContext: true,
         sendDisabled: false,
         attachmentsUploadingCount: 0,
         cmdEnterMode: false,
@@ -717,6 +738,7 @@ beforeEach(() => {
     stagedQuotes: [],
     replyBubble: null,
   });
+  useInteractionStore.setState({ pendingQuestion: null });
 });
 
 /**
@@ -1518,6 +1540,51 @@ describe("ChatComposer: a banner standing over the card", () => {
     );
   });
 
+  test("a pending question card takes the row down with it", async () => {
+    // GIVEN a standing row in an app shell
+    mockIsNativeMobile = true;
+    const { container } = renderPhoneComposer(SETTINGS_SLOTS);
+    expect(pillsRow(container)?.hasAttribute("hidden")).toBe(false);
+
+    // WHEN the agent raises a question, whose card docks in the same strip
+    await act(async () => {
+      useInteractionStore.setState({
+        pendingQuestion: {
+          requestId: "req-1",
+          entries: [{ id: "q1", question: "Which one?", options: [] }],
+        },
+      });
+    });
+
+    // THEN the row stands down, the way it does under a banner
+    expect(pillsRow(container)?.hasAttribute("hidden")).toBe(true);
+
+    // AND comes back once the question is answered
+    await act(async () => {
+      useInteractionStore.setState({ pendingQuestion: null });
+    });
+
+    expect(pillsRow(container)?.hasAttribute("hidden")).toBe(false);
+  });
+
+  test("focus does not buy the row back from a question card", () => {
+    // GIVEN a browser phone composer under a question card, where focus is
+    // normally what raises the row
+    useInteractionStore.setState({
+      pendingQuestion: {
+        requestId: "req-1",
+        entries: [{ id: "q1", question: "Which one?", options: [] }],
+      },
+    });
+    const { container } = renderPhoneComposer(SETTINGS_SLOTS);
+
+    // WHEN the user taps into it
+    fireEvent.focusIn(textareaOf(container));
+
+    // THEN the card still wins
+    expect(pillsRow(container)?.hasAttribute("hidden")).toBe(true);
+  });
+
   test("a banner leaving gives the row back", async () => {
     // GIVEN a shell composer whose row is down under a banner
     mockIsNativeMobile = true;
@@ -2304,8 +2371,53 @@ describe("ChatComposer — live-voice integration", () => {
     // THEN the layout-owned controller starts with the bound context after the
     // ready verdict (the composer holds no controller of its own).
     expect(liveStarterSpy).toHaveBeenCalledTimes(1);
-    expect(liveStarterSpy).toHaveBeenCalledWith("asst_test", "conv_test");
+    expect(liveStarterSpy).toHaveBeenCalledWith("asst_test", "conv_test", {
+      // No greeting: this composer is bound to a conversation already
+      // underway (JARVIS-1649).
+      seedText: undefined,
+    });
     expect(liveCancelPrewarmSpy).not.toHaveBeenCalled();
+  });
+
+  test("on a blank conversation the start carries a seed so the assistant speaks first", async () => {
+    // GIVEN a composer bound to a conversation with nothing in it (JARVIS-1649)
+    useTurnStore.setState(INITIAL_TURN_STATE);
+    mockPreflightVerdict = { status: "ready" };
+
+    // WHEN the user enters voice mode
+    const { getByLabelText } = renderVoiceComposer({
+      conversationIsEmpty: true,
+    });
+    fireEvent.click(getByLabelText("Start voice mode"));
+    await flushPreflight();
+
+    // THEN the session is started with a first turn to take on the user's
+    // behalf, so the room does not open in silence waiting for them.
+    expect(liveStarterSpy).toHaveBeenCalledTimes(1);
+    const [, , options] = liveStarterSpy.mock.calls[0] ?? [];
+    expect(options?.seedText).toBeString();
+    expect((options?.seedText ?? "").length).toBeGreaterThan(0);
+  });
+
+  test("a conversation that fills up during the preflight is not seeded", async () => {
+    // GIVEN a blank conversation at click time
+    useTurnStore.setState(INITIAL_TURN_STATE);
+    mockPreflightVerdict = { status: "ready" };
+    const { getByLabelText, rerenderWith } = renderVoiceComposer({
+      conversationIsEmpty: true,
+    });
+    fireEvent.click(getByLabelText("Start voice mode"));
+
+    // WHEN a message lands while the readiness round trip is still in flight
+    rerenderWith({ conversationIsEmpty: false });
+    await flushPreflight();
+
+    // THEN the start goes ahead (an emptiness change is not a reason to
+    // abandon the press) but opens silent: the thread is underway now, so a
+    // seed would be a line the user never wrote.
+    expect(liveStarterSpy).toHaveBeenCalledTimes(1);
+    const [, , options] = liveStarterSpy.mock.calls[0] ?? [];
+    expect(options?.seedText).toBeUndefined();
   });
 
   test("entering voice mode drops the composer's focus, and only that", async () => {
@@ -2434,7 +2546,11 @@ describe("ChatComposer — live-voice integration", () => {
     // THEN a preflight outage does not block voice — the session starts and
     // the WS-level handshake surfaces any real credential problem
     expect(liveStarterSpy).toHaveBeenCalledTimes(1);
-    expect(liveStarterSpy).toHaveBeenCalledWith("asst_test", "conv_test");
+    expect(liveStarterSpy).toHaveBeenCalledWith("asst_test", "conv_test", {
+      // No greeting: this composer is bound to a conversation already
+      // underway (JARVIS-1649).
+      seedText: undefined,
+    });
     expect(livePrewarmSpy).toHaveBeenCalledTimes(1);
     expect(liveCancelPrewarmSpy).not.toHaveBeenCalled();
   });
@@ -2501,7 +2617,11 @@ describe("ChatComposer — live-voice integration", () => {
     expect(useVoicePrefsStore.getState().firstRunSeen).toBe(true);
     expect(queryByTestId("first-run-card")).toBeNull();
     expect(liveStarterSpy).toHaveBeenCalledTimes(1);
-    expect(liveStarterSpy).toHaveBeenCalledWith("asst_test", "conv_test");
+    expect(liveStarterSpy).toHaveBeenCalledWith("asst_test", "conv_test", {
+      // No greeting: this composer is bound to a conversation already
+      // underway (JARVIS-1649).
+      seedText: undefined,
+    });
     expect(livePrewarmSpy).toHaveBeenCalledTimes(1);
   });
 
@@ -2561,7 +2681,11 @@ describe("ChatComposer — live-voice integration", () => {
     // THEN it behaves exactly like the returning-user path on any platform
     expect(queryByTestId("first-run-card")).toBeNull();
     expect(liveStarterSpy).toHaveBeenCalledTimes(1);
-    expect(liveStarterSpy).toHaveBeenCalledWith("asst_test", "conv_test");
+    expect(liveStarterSpy).toHaveBeenCalledWith("asst_test", "conv_test", {
+      // No greeting: this composer is bound to a conversation already
+      // underway (JARVIS-1649).
+      seedText: undefined,
+    });
     expect(livePrewarmSpy).toHaveBeenCalledTimes(1);
   });
 
@@ -2772,6 +2896,71 @@ describe("ChatComposer — live-voice integration", () => {
     // THEN the store is reset back to idle (which clears the error)
     expect(useLiveVoiceStore.getState().state).toBe("idle");
     expect(useLiveVoiceStore.getState().error).toBeNull();
+  });
+
+  test("a busy failure offers to end the other session and to go to it", async () => {
+    // GIVEN a session refused because another one holds the slot, in a
+    // different conversation
+    useTurnStore.setState(INITIAL_TURN_STATE);
+    seedLiveVoiceSession("listening");
+    sessionEndSpy.mockClear();
+    navigateSpy.mockClear();
+    useLiveVoiceStore
+      .getState()
+      .fail("Voice is already active in the Mac app.", {
+        kind: "reclaim",
+        holderConversationId: "conversation-elsewhere",
+      });
+
+    // WHEN the composer renders
+    const { getByText } = renderVoiceComposer();
+
+    // THEN the notice says where the session is, and offers both ways out
+    expect(getByText("Voice is already active in the Mac app.")).toBeTruthy();
+    expect(getByText("Go to it")).toBeTruthy();
+
+    // WHEN the user takes the slot
+    await act(async () => {
+      fireEvent.click(getByText("End it and start here"));
+    });
+
+    // THEN the holding session is ended out of band and the failure clears,
+    // which is what lets the start below happen at all
+    expect(sessionEndSpy).toHaveBeenCalledTimes(1);
+    expect(useLiveVoiceStore.getState().error).toBeNull();
+  });
+
+  test("a busy failure in this conversation offers no destination", () => {
+    // GIVEN the blocking session is in the conversation already on screen
+    useTurnStore.setState(INITIAL_TURN_STATE);
+    seedLiveVoiceSession("listening");
+    useLiveVoiceStore
+      .getState()
+      .fail("Voice is already active in the iOS app.", {
+        kind: "reclaim",
+        holderConversationId: null,
+      });
+
+    // WHEN the composer renders
+    const { getByText, queryByText } = renderVoiceComposer();
+
+    // THEN it can still be taken over, but there is nowhere to navigate
+    expect(getByText("End it and start here")).toBeTruthy();
+    expect(queryByText("Go to it")).toBeNull();
+  });
+
+  test("a failure with no recovery offers no actions", () => {
+    // GIVEN an ordinary failure
+    useTurnStore.setState(INITIAL_TURN_STATE);
+    seedLiveVoiceSession("listening");
+    useLiveVoiceStore.getState().fail("Microphone capture could not start.");
+
+    // WHEN the composer renders
+    const { queryByText } = renderVoiceComposer();
+
+    // THEN the notice is dismiss-only, as it was before reclaim existed
+    expect(queryByText("End it and start here")).toBeNull();
+    expect(queryByText("Go to it")).toBeNull();
   });
 
   test("no live-voice error notice while idle or without an error", () => {

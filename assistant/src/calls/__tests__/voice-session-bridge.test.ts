@@ -31,6 +31,14 @@ mock.module("../../daemon/conversation-store.js", () => ({
   getOrCreateConversation: async () => fakeConversation,
 }));
 
+// Vision capability of the image pin's target profile. Install-dependent in
+// production (a BYO provider resolves the profile key through its own column
+// of the intent matrix), so it is scripted rather than read from a catalog.
+let pinProfileSupportsVision = true;
+mock.module("../../plugin-api/vision-support.js", () => ({
+  doesSupportVision: () => pinProfileSupportsVision,
+}));
+
 // Conversation-CRUD doubles for the teardown transcript-hygiene pass. The
 // real module is spread so every other export keeps its production behavior;
 // only the functions the hygiene pass (and discard) touch are recorded.
@@ -133,6 +141,7 @@ interface FakeConversation {
     opts?: { decisionContext?: string },
   ) => void;
   runAgentLoop: (...args: unknown[]) => Promise<void>;
+  getMessages: () => Array<{ role: string; content: unknown[] }>;
   abort: (reason?: unknown) => void;
   loadFromDb: () => Promise<void>;
   toolsDisabledDepth: number;
@@ -149,6 +158,8 @@ function makeFakeConversation(opts: {
   onPersist?: (attempt: number) => void;
   /** Workspace root; pass empty to model a missing boundary. */
   workingDir?: string;
+  /** In-memory history the profile pin reads; undefined models a text-only call. */
+  messages?: Array<{ role: string; content: unknown[] }>;
 }) {
   const waitForIdleCalls: WaitForIdleCall[] = [];
   const confirmationDecisions: Array<{ requestId: string; decision: string }> =
@@ -206,6 +217,7 @@ function makeFakeConversation(opts: {
       confirmationDecisions.push({ requestId, decision });
     },
     runAgentLoop: () => (opts.runAgentLoop ?? (async () => {}))(),
+    getMessages: () => opts.messages ?? [],
     abort: () => {},
     loadFromDb: async () => {
       opts.events?.push("loadFromDb");
@@ -378,6 +390,7 @@ describe("startVoiceTurn escalation-continuation persistence", () => {
     );
     expect(fake.lastPersistOpts()?.metadata).toEqual({
       voiceSessionTurn: true,
+      scripted: true,
       hidden: true,
       messageKind: VOICE_ESCALATION_CONTINUATION_MESSAGE_KIND,
     });
@@ -392,8 +405,11 @@ describe("startVoiceTurn escalation-continuation persistence", () => {
 
     await startVoiceTurn(makeTurnOptions()); // content: CALL_OPENING_MARKER
 
+    // Visible AND scripted: the opener is shown, but the assistant wrote it,
+    // so it is not the user taking a turn.
     expect(fake.lastPersistOpts()?.metadata).toEqual({
       voiceSessionTurn: true,
+      scripted: true,
     });
   });
 
@@ -413,6 +429,7 @@ describe("startVoiceTurn escalation-continuation persistence", () => {
     // analytics already read.
     expect(fake.lastPersistOpts()?.metadata).toEqual({
       voiceSessionTurn: true,
+      scripted: true,
       client: {
         voice: true,
         voice_session_id: "session-123",
@@ -432,8 +449,39 @@ describe("startVoiceTurn escalation-continuation persistence", () => {
 
     expect(fake.lastPersistOpts()?.metadata).toEqual({
       voiceSessionTurn: true,
+      scripted: true,
       client: { voice: true, voice_session_id: "session-123" },
     });
+  });
+
+  test("a turn the user really spoke is left unmarked, not marked false", async () => {
+    // Absent means UNKNOWN and falls through to the legacy classifier, which
+    // is the safe answer here. Stamping `false` would assert this turn was
+    // typed by the user, and a wrong `false` is trusted downstream.
+    const fake = makeFakeConversation({ processing: false });
+    fakeConversation = fake.conversation;
+
+    await startVoiceTurn({
+      ...makeTurnOptions(),
+      content: "what is on my calendar",
+    });
+
+    expect(fake.lastPersistOpts()?.metadata).not.toHaveProperty("scripted");
+  });
+
+  test("scripted is not derived from hidden", async () => {
+    // The two answer different questions, and the opener is the case that
+    // separates them: shown to the user, written by the assistant. Deriving
+    // one from the other lets every visible-but-scripted turn count as
+    // activation, which is the largest single source of funnel inflation.
+    const fake = makeFakeConversation({ processing: false });
+    fakeConversation = fake.conversation;
+
+    await startVoiceTurn(makeTurnOptions()); // content: CALL_OPENING_MARKER
+
+    const metadata = fake.lastPersistOpts()?.metadata;
+    expect(metadata?.scripted).toBe(true);
+    expect(metadata).not.toHaveProperty("hidden");
   });
 
   test("a phone turn carries no client bag", async () => {
@@ -489,6 +537,7 @@ describe("startVoiceTurn hiddenSyntheticPrompt", () => {
     expect(fake.lastPersistOpts()?.content).toBe(SYNTHETIC_CONTENT);
     expect(fake.lastPersistOpts()?.metadata).toEqual({
       voiceSessionTurn: true,
+      scripted: true,
       hidden: true,
     });
     expect(echoes).toHaveLength(0);
@@ -619,6 +668,26 @@ describe("default call protocol numbered rules", () => {
       expect(preSpeechLanguageRuleFragment(autoDetect, "deepgram")).toBe(
         "use the language the Task context implies, if any; otherwise default to English",
       );
+    }
+  });
+
+  test("the pre-speech pin reads the telephony role, not the global provider", async () => {
+    // Whisper ignores services.stt.language, so reading the global provider
+    // drops the pin and opens in English. The caller is transcribed by the
+    // telephony role's deepgram, which is listening in Spanish.
+    setConfig("services", {
+      stt: {
+        provider: "openai-whisper",
+        language: "es",
+        roles: { telephony: { provider: "deepgram" } },
+      },
+    });
+    try {
+      const installed = captureInstalledPrompt();
+      await startVoiceTurn(makeTurnOptions());
+      expect(installed()).toContain('configured listening language ("es")');
+    } finally {
+      setConfig("services", {});
     }
   });
 
@@ -2163,5 +2232,107 @@ describe("transcript hygiene (teardown pass)", () => {
     await flushMicrotasks();
 
     expect(crudLog.deletes).toContain("assistant-row-1");
+  });
+});
+
+describe("startVoiceTurn image-bearing profile pin", () => {
+  /** A persisted user message carrying a photo taken mid-call. */
+  const PHOTO_HISTORY = [
+    { role: "user", content: [{ type: "text", text: "here's a photo:" }] },
+    {
+      role: "user",
+      content: [
+        { type: "text", text: "here's a photo:" },
+        { type: "image", source: { type: "base64", data: "abc" } },
+      ],
+    },
+  ];
+
+  beforeEach(() => {
+    pinProfileSupportsVision = true;
+  });
+
+  async function runOptionsFor(opts: {
+    messages?: Array<{ role: string; content: unknown[] }>;
+    turn?: Record<string, unknown>;
+  }): Promise<Record<string, unknown>> {
+    const fake = makeFakeConversation({
+      processing: false,
+      ...(opts.messages ? { messages: opts.messages } : {}),
+    });
+    fakeConversation = fake.conversation;
+    let runOptions: Record<string, unknown> = {};
+    fake.conversation.runAgentLoop = async (...args: unknown[]) => {
+      runOptions = args[2] as Record<string, unknown>;
+    };
+    await startVoiceTurn({ ...makeTurnOptions(), ...(opts.turn ?? {}) });
+    return runOptions;
+  }
+
+  test("a text-only call keeps the call-site profile", async () => {
+    const runOptions = await runOptionsFor({});
+
+    expect(runOptions.overrideProfile).toBeUndefined();
+    expect(runOptions.forceOverrideProfile).toBeUndefined();
+  });
+
+  test("an image in history pins the image-capable profile", async () => {
+    // `callAgent`'s balanced profile carries no guarantee that its model takes
+    // an image, and a model that rejects one fails the whole leg.
+    const runOptions = await runOptionsFor({ messages: PHOTO_HISTORY });
+
+    expect(runOptions.overrideProfile).toBe("latency-optimized");
+    // callAgent is not `mainAgent`, so an unforced override would sit below
+    // the call-site profile and never apply.
+    expect(runOptions.forceOverrideProfile).toBe(true);
+  });
+
+  test("an image nested in a tool result counts too", async () => {
+    const runOptions = await runOptionsFor({
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              contentBlocks: [{ type: "image", source: { data: "abc" } }],
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(runOptions.overrideProfile).toBe("latency-optimized");
+  });
+
+  test("a front-door leg is left alone — its own call site pins it", async () => {
+    const runOptions = await runOptionsFor({
+      messages: PHOTO_HISTORY,
+      turn: { routingLeg: "front-door" },
+    });
+
+    expect(runOptions.overrideProfile).toBeUndefined();
+    expect(runOptions.callSite).toBe("voiceFrontDoor");
+  });
+
+  test("no pin when the pin target can't take an image either", async () => {
+    // Fireworks: `latency-optimized` resolves to a text-only model while
+    // `balanced` is vision-capable, so pinning would break the very turn the
+    // pin exists to save.
+    pinProfileSupportsVision = false;
+
+    const runOptions = await runOptionsFor({ messages: PHOTO_HISTORY });
+
+    expect(runOptions.overrideProfile).toBeUndefined();
+    expect(runOptions.forceOverrideProfile).toBeUndefined();
+  });
+
+  test("an explicit routing pin wins over the image pin", async () => {
+    const runOptions = await runOptionsFor({
+      messages: PHOTO_HISTORY,
+      turn: { overrideProfile: "quality-optimized" },
+    });
+
+    expect(runOptions.overrideProfile).toBe("quality-optimized");
   });
 });

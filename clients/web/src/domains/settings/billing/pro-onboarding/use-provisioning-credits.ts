@@ -1,22 +1,26 @@
 import { useQuery } from "@tanstack/react-query";
 
 import { organizationsBillingPlansRetrieveOptions } from "@/generated/api/@tanstack/react-query.gen";
-import type {
-  CreditTier,
-  CreditTierEnum,
-  ProPlan,
-} from "@/generated/api/types.gen";
+import type { CreditTierEnum, ProPlan } from "@/generated/api/types.gen";
 import { useIsOrgReady } from "@/hooks/use-is-org-ready";
 import type { CheckoutIntent } from "@/lib/billing/checkout-intent";
-import { creditTierKeyUsd } from "@/lib/billing/credit-tiers";
+import { creditTierKeyUsd, findCreditTier } from "@/lib/billing/credit-tiers";
 
 /**
  * A credit bundle change as monthly dollar amounts. Both sides always carry a
  * number: "No extra credits" is $0, not an absent side.
+ *
+ * Each side also carries the bundle's catalog label ("Mighty Usage", the
+ * Stripe product name, so it matches the invoice line), which the
+ * `obscure-credits` rendering shows in place of the dollar rate. `null` marks
+ * the explicit no-bundle side, worded by the caller; `undefined` a bundle the
+ * catalog can't label, which the obscured chip leaves unstated.
  */
 export interface CreditsChange {
   fromUsd: number;
   toUsd: number;
+  fromLabel: string | null | undefined;
+  toLabel: string | null | undefined;
 }
 
 /**
@@ -26,22 +30,6 @@ export interface CreditsChange {
 export interface CreditTierChange {
   fromTier: CreditTierEnum | null;
   toTier: CreditTierEnum | null;
-}
-
-/**
- * Finds a Pro plan's `credit_tiers` entry for a tier, the single source of the
- * credit-tier lookup shared by the dollar resolution here and the plans-page
- * custom row summary. Returns undefined for a null/undefined tier or when the
- * tier can't be resolved (no Pro plan, no matching tier).
- */
-export function findCreditTier(
-  proPlan: ProPlan | undefined,
-  tier: string | null | undefined,
-): CreditTier | undefined {
-  if (tier == null) {
-    return undefined;
-  }
-  return proPlan?.credit_tiers?.find((t) => t.tier === tier);
 }
 
 /**
@@ -80,6 +68,23 @@ function creditTierUsd(
 }
 
 /**
+ * The catalog label for a tier, with the same null-tier reading as
+ * `creditTierUsd`: a null tier is the explicit "No extra credits" choice
+ * (`null` here), and a tier the catalog doesn't list has no label to give
+ * (`undefined`); unlike the dollars, a key like `credits_115` carries no
+ * wording to fall back to.
+ */
+function creditTierLabel(
+  proPlan: ProPlan | undefined,
+  tier: CreditTierEnum | null,
+): string | null | undefined {
+  if (tier == null) {
+    return null;
+  }
+  return findCreditTier(proPlan, tier)?.label;
+}
+
+/**
  * The credits a post-Stripe checkout buys, as a from-to dollar pair. The base
  * plan bundles none, so the from-side is $0. Returns null while the catalog
  * loads, when the intent carries no credits, or when the amount can't be
@@ -95,16 +100,24 @@ export function useProvisioningCredits(
   }
 
   let toUsd: number | null | undefined;
+  let toLabel: string | null | undefined;
   if (intent.kind === "package") {
     const pkg = proPlan.packages.find((p) => p.key === intent.packageKey);
-    toUsd =
-      pkg?.credits_usd ??
-      findCreditTier(proPlan, pkg?.credit_tier)?.credits_usd;
+    const tier = findCreditTier(proPlan, pkg?.credit_tier);
+    toUsd = pkg?.credits_usd ?? tier?.credits_usd;
+    // The package's customer-facing usage_label is preferred: a tier label
+    // can be dollar-denominated ("$50 credits/mo"), which the obscured chip
+    // must never render. The tier label covers a package without one.
+    toLabel = pkg?.usage_label ?? tier?.label ?? undefined;
   } else {
-    toUsd = findCreditTier(proPlan, intent.creditTier)?.credits_usd;
+    const tier = findCreditTier(proPlan, intent.creditTier);
+    toUsd = tier?.credits_usd;
+    toLabel = tier?.label;
   }
 
-  return toUsd != null ? { fromUsd: 0, toUsd } : null;
+  // The base plan bundles no credits, so the from-side is the explicit
+  // no-bundle choice, not an unlabelled one.
+  return toUsd != null ? { fromUsd: 0, toUsd, fromLabel: null, toLabel } : null;
 }
 
 /**
@@ -127,5 +140,10 @@ export function useResizeCreditsChange(
   if (fromUsd == null || toUsd == null) {
     return null;
   }
-  return { fromUsd, toUsd };
+  return {
+    fromUsd,
+    toUsd,
+    fromLabel: creditTierLabel(proPlan, change.fromTier),
+    toLabel: creditTierLabel(proPlan, change.toTier),
+  };
 }

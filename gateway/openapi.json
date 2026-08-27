@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Vellum Gateway API",
-    "version": "0.11.2",
+    "version": "0.11.6",
     "description": "Auto-generated OpenAPI specification for the Vellum Gateway HTTP endpoints."
   },
   "servers": [{ "url": "", "description": "Same-origin (gateway)" }],
@@ -1047,6 +1047,16 @@
                   "notes": {
                     "anyOf": [{ "type": "string" }, { "type": "null" }]
                   },
+                  "autoApproveThreshold": {
+                    "description": "Per-contact auto-approve ceiling. Omit to preserve; null clears.",
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "enum": ["none", "low", "medium", "high"]
+                      },
+                      { "type": "null" }
+                    ]
+                  },
                   "contactType": { "type": "string" },
                   "assistantMetadata": {
                     "description": "Required when contactType is 'assistant'",
@@ -1121,6 +1131,16 @@
                         "interactionCount": { "type": "number" },
                         "lastInteraction": {
                           "anyOf": [{ "type": "number" }, { "type": "null" }]
+                        },
+                        "autoApproveThreshold": {
+                          "anyOf": [
+                            {
+                              "type": "string",
+                              "enum": ["none", "low", "medium", "high"]
+                            },
+                            { "type": "null" }
+                          ],
+                          "description": "Per-contact auto-approve ceiling. Null means unset (inherit cascade)."
                         },
                         "assistantMetadata": {
                           "anyOf": [
@@ -1270,6 +1290,7 @@
                         "updatedAt",
                         "interactionCount",
                         "lastInteraction",
+                        "autoApproveThreshold",
                         "assistantMetadata",
                         "channels"
                       ],
@@ -1801,8 +1822,9 @@
                   },
                   "description": { "type": "string", "minLength": 1 },
                   "scope": {
-                    "description": "Directory scope selected in the rule editor. Accepted on the wire but not yet persisted by the gateway.",
-                    "type": "string"
+                    "description": "Compatibility field. Trust rules apply workspace-wide: the engine matches on (tool, pattern) only, so a narrower scope cannot be honored and any value other than \"everywhere\" is rejected rather than stored broader than the consent it records.",
+                    "type": "string",
+                    "const": "everywhere"
                   }
                 },
                 "required": ["tool", "pattern", "risk", "description"]

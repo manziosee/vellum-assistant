@@ -44,11 +44,10 @@ const CreateTrustRuleRequestSchema = z.object({
   risk: TrustRuleRiskSchema,
   description: z.string().min(1),
   scope: z
-    .string()
-    .nullable()
+    .literal("everywhere")
     .optional()
     .describe(
-      "Optional directory scope. When set, the rule applies only when the tool is invoked from within this directory or a subdirectory of it. Null or omitted means global.",
+      'Compatibility field. Trust rules apply workspace-wide: the engine matches on (tool, pattern) only, so a narrower scope cannot be honored and any value other than "everywhere" is rejected rather than stored broader than the consent it records.',
     ),
 });
 

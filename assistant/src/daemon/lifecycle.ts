@@ -1,5 +1,6 @@
 import { config as dotenvConfig } from "dotenv";
 
+import { reconcileAppPins } from "../apps/app-pin-reconciler.js";
 import { reconcileCallsOnStartup } from "../calls/call-recovery.js";
 import { TwilioVoiceProvider } from "../calls/twilio-provider.js";
 import { expireInteractionBoundGuardianRequests } from "../channels/gateway-guardian-requests.js";
@@ -31,6 +32,7 @@ import { maybeEnqueueLexicalBackfillOnUpgrade } from "../persistence/job-handler
 import { clearLifecycleQuiesce } from "../persistence/lifecycle-quiesce.js";
 import { isPlatformClientConfigured } from "../platform/client.js";
 import { startConsentRefresh } from "../platform/consent-cache.js";
+import { syncAvatarToPlatform } from "../platform/sync-avatar.js";
 import { syncWorkspaceIdentityToPlatform } from "../platform/sync-identity.js";
 import { ensurePromptFiles } from "../prompts/system-prompt.js";
 import { runProviderConnectionsBackfill } from "../providers/inference/backfill.js";
@@ -62,6 +64,7 @@ import {
   getWorkspaceDir,
 } from "../util/platform.js";
 import { APP_VERSION } from "../version.js";
+import { drainOrphanedWatchTimelineEntries } from "../watch/watch-timeline.js";
 import { getWorkflowRunManager } from "../workflows/run-manager.js";
 import { repairAdaptiveThinkingOnManagedProfiles } from "../workspace/adaptive-thinking-repair.js";
 import { ensureByokDefaultProfiles } from "../workspace/byok-default-profile-ensure.js";
@@ -198,8 +201,10 @@ export async function runDaemon(): Promise<void> {
     }
   }
 
-  // Start the runtime HTTP server early so /healthz answers ASAP. A bind
-  // failure is non-fatal — the daemon falls back to IPC-only operation.
+  // Start the runtime HTTP server early so /healthz answers ASAP. Throws on
+  // EADDRINUSE to abort startup: another process holds the port every HTTP
+  // client (and the gateway's /v1/* proxy) targets, so an IPC-only daemon
+  // would look healthy while all HTTP traffic 502s.
   await startRuntimeHttpServer();
 
   // Warms the configured-probe cache (credential reads only, no DB). Fired
@@ -381,6 +386,29 @@ export async function runDaemon(): Promise<void> {
       }
     } catch (err) {
       log.warn({ err }, "Profiler retention sweep failed — continuing startup");
+    }
+
+    // Reclaim watch-timeline entries whose conversation is gone. Their purge
+    // runs after the conversation row is already committed as deleted and
+    // cannot be retried by the caller, and nothing cascades into the table, so
+    // a failed purge or a crash between the two writes would otherwise keep
+    // narration, AX trees, and screenshots of the user's screen for as long as
+    // the database lives. Startup is the pass every install gets: the periodic
+    // pass runs from database maintenance on the memory plugin's jobs worker,
+    // which an install with that plugin disabled or `memory.enabled: false`
+    // never starts, so this is the only sweep that install's residue sees and
+    // it drains rather than taking one page. Best-effort inside the sweep,
+    // which reports zero rather than throwing.
+    try {
+      const sweptWatchEntries = await drainOrphanedWatchTimelineEntries();
+      if (sweptWatchEntries > 0) {
+        log.info(
+          { sweptWatchEntries },
+          "Swept watch timeline entries for deleted conversations on startup",
+        );
+      }
+    } catch (err) {
+      log.warn({ err }, "Watch timeline sweep failed, continuing startup");
     }
 
     // Backfill oauth_connection rows for manual-token providers (Telegram,
@@ -668,9 +696,10 @@ export async function runDaemon(): Promise<void> {
 
   // Initialize providers before Qdrant so HTTP routes can begin accepting
   // requests while Qdrant initializes, then best-effort sync the workspace
-  // identity name to the platform record.
+  // identity name and avatar to the platform record.
   await initializeProviders(config);
   syncWorkspaceIdentityToPlatform();
+  syncAvatarToPlatform();
 
   // Start the idle/LRU/memory-pressure sweep over the in-memory conversation
   // pool.
@@ -720,6 +749,7 @@ export async function runDaemon(): Promise<void> {
   // the same shape as schedule recovery above.
   try {
     await reconcilePluginSchedules();
+    reconcileAppPins();
   } catch (err) {
     log.error({ err }, "Plugin schedule reconcile failed, continuing startup");
   }

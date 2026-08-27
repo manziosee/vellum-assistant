@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { closeSync, existsSync } from "node:fs";
+import { existsSync } from "node:fs";
 import path from "node:path";
 
 import {
@@ -39,7 +39,9 @@ import {
   runDevicesRevoke,
   runHatch,
   runRetire,
-  connectImport,
+  pairingCancel,
+  pairingPoll,
+  pairingStart,
   unpairAssistant,
   getGuardianAccessToken,
   getPairedGuardianAccessToken,
@@ -72,11 +74,10 @@ import {
 } from "../lib/platform-client";
 import { tuiLog } from "../lib/tui-log";
 import { loopbackSafeFetch } from "../lib/loopback-fetch.js";
+import { relaunchDetached } from "../lib/detached-process.js";
 import { probePort } from "../lib/port-probe.js";
 import { openBrowser } from "../lib/open-browser";
-import { isCompiledCli } from "../lib/local.js";
 import { findWebDistDir } from "../lib/web-dist.js";
-import { getLogDir, openLogFile, resetLogFile } from "../lib/xdg-log.js";
 
 const SUPPORTED_INTERFACES = ["cli", "web"] as const;
 type SupportedInterface = (typeof SUPPORTED_INTERFACES)[number];
@@ -431,7 +432,9 @@ const RETIRE_PATTERN = /^(?:\/assistant)?\/__local\/retire$/;
 const UNPAIR_PATTERN = /^(?:\/assistant)?\/__local\/unpair$/;
 const DEVICES_PATTERN = /^(?:\/assistant)?\/__local\/devices$/;
 const DEVICES_REVOKE_PATTERN = /^(?:\/assistant)?\/__local\/devices-revoke$/;
-const CONNECT_IMPORT_PATTERN = /^(?:\/assistant)?\/__local\/connect-import$/;
+const PAIRING_START_PATTERN = /^(?:\/assistant)?\/__local\/pairing-start$/;
+const PAIRING_POLL_PATTERN = /^(?:\/assistant)?\/__local\/pairing-poll$/;
+const PAIRING_CANCEL_PATTERN = /^(?:\/assistant)?\/__local\/pairing-cancel$/;
 const GUARDIAN_TOKEN_PATTERN =
   /^(?:\/assistant)?\/__local\/guardian-token\/([^/]+)$/;
 const PLATFORM_SESSION_PATTERN =
@@ -489,7 +492,9 @@ async function handleLocalEndpoints(
     UNPAIR_PATTERN.test(pathname) ||
     DEVICES_PATTERN.test(pathname) ||
     DEVICES_REVOKE_PATTERN.test(pathname) ||
-    CONNECT_IMPORT_PATTERN.test(pathname) ||
+    PAIRING_START_PATTERN.test(pathname) ||
+    PAIRING_POLL_PATTERN.test(pathname) ||
+    PAIRING_CANCEL_PATTERN.test(pathname) ||
     GUARDIAN_TOKEN_PATTERN.test(pathname) ||
     PLATFORM_SESSION_PATTERN.test(pathname) ||
     parseGatewayUrl(pathname).match ||
@@ -766,16 +771,26 @@ async function handleLocalEndpoints(
     return Response.json(await runDevicesList(invocation, assistantId));
   }
 
-  // Connect-import: register a pairing bundle from another machine (guardian
-  // token + paired lockfile entry), the write counterpart of unpair.
-  if (CONNECT_IMPORT_PATTERN.test(pathname)) {
+  // Pairing: the three-step device-code exchange that registers an assistant
+  // paired on another machine (guardian token + paired lockfile entry), the
+  // write counterpart of unpair. The exchange runs here rather than in the
+  // browser, so the device code and the credentials it buys never reach it.
+  if (
+    PAIRING_START_PATTERN.test(pathname) ||
+    PAIRING_POLL_PATTERN.test(pathname) ||
+    PAIRING_CANCEL_PATTERN.test(pathname)
+  ) {
     if (req.method !== "POST") {
       return new Response(null, { status: 405 });
     }
 
-    let body: { bundle?: unknown; name?: unknown };
+    let body: { address?: unknown; handle?: unknown; name?: unknown };
     try {
-      body = (await req.json()) as { bundle?: unknown; name?: unknown };
+      body = (await req.json()) as {
+        address?: unknown;
+        handle?: unknown;
+        name?: unknown;
+      };
     } catch {
       return Response.json(
         { ok: false, error: "Invalid JSON body" },
@@ -783,21 +798,58 @@ async function handleLocalEndpoints(
       );
     }
 
-    const result = connectImport(lockfilePaths, configDir, {
-      bundle: body.bundle,
+    if (PAIRING_CANCEL_PATTERN.test(pathname)) {
+      return Response.json({ ok: pairingCancel(body.handle) });
+    }
+
+    if (PAIRING_START_PATTERN.test(pathname)) {
+      const result = await pairingStart(body.address);
+      if (result.ok) {
+        return Response.json({
+          ok: true,
+          handle: result.handle,
+          userCode: result.userCode,
+          expiresAt: result.expiresAt,
+          intervalSeconds: result.intervalSeconds,
+        });
+      }
+      // `rejection` rides along so the renderer can show its own localized
+      // copy for a refused address instead of this host's English.
+      return Response.json(
+        {
+          ok: false,
+          reason: result.reason,
+          error: result.error,
+          rejection: result.rejection,
+        },
+        { status: result.status },
+      );
+    }
+
+    const result = await pairingPoll(lockfilePaths, configDir, {
+      handle: body.handle,
       name: body.name,
     });
-    if (result.ok) {
+    if (!result.ok) {
+      return Response.json(
+        { ok: false, reason: result.reason, error: result.error },
+        { status: result.status },
+      );
+    }
+    if (result.status === "pending") {
       return Response.json({
         ok: true,
-        assistantId: result.assistantId,
-        accessOnly: result.accessOnly,
+        status: "pending",
+        expiresAt: result.expiresAt,
+        intervalSeconds: result.intervalSeconds,
       });
     }
-    return Response.json(
-      { ok: false, error: result.error },
-      { status: result.status },
-    );
+    return Response.json({
+      ok: true,
+      status: "imported",
+      assistantId: result.assistantId,
+      accessOnly: result.accessOnly,
+    });
   }
 
   // Guardian token
@@ -1140,53 +1192,24 @@ async function spawnBackgroundWebInterface(
   }
   childArgs.push("--port", String(port));
 
-  // A compiled binary re-invokes itself; under plain bun (source tree, npm
-  // install) the entry script is argv[1].
-  const spawnArgs = isCompiledCli()
-    ? childArgs
-    : [process.argv[1], ...childArgs];
-
-  resetLogFile(WEB_BACKGROUND_LOG_FILE);
-  const fd = openLogFile(WEB_BACKGROUND_LOG_FILE);
-  const child = spawn(process.execPath, spawnArgs, {
-    detached: true,
-    stdio: ["ignore", fd, fd],
-  });
-  if (typeof fd === "number") {
-    closeSync(fd);
-  }
-  child.unref();
-
-  const logPath = path.join(getLogDir(), WEB_BACKGROUND_LOG_FILE);
-
   // Don't report success until the child is actually serving: watch for an
   // early exit (e.g. missing @vellumai/web assets, port lost to the TOCTOU
   // window) and poll the port until it accepts connections.
-  let exit: { code: number | null } | undefined;
-  child.on("error", () => {
-    exit = { code: null };
-  });
-  child.on("exit", (code) => {
-    exit = { code };
+  const { child, logPath, ready, exitCode } = await relaunchDetached({
+    args: childArgs,
+    logFile: WEB_BACKGROUND_LOG_FILE,
+    timeoutMs: WEB_BACKGROUND_START_TIMEOUT_MS,
+    isReady: () => probePort(port, "127.0.0.1"),
+    pollIntervalMs: 200,
   });
 
-  const deadline = Date.now() + WEB_BACKGROUND_START_TIMEOUT_MS;
-  let listening = false;
-  while (Date.now() < deadline && !exit) {
-    if (await probePort(port, "127.0.0.1")) {
-      listening = true;
-      break;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 200));
-  }
-
-  if (exit) {
+  if (exitCode !== undefined) {
     console.error(
-      `Web interface exited during startup${exit.code !== null ? ` (exit code ${exit.code})` : ""}. Logs: ${logPath}`,
+      `Web interface exited during startup${exitCode !== null ? ` (exit code ${exitCode})` : ""}. Logs: ${logPath}`,
     );
     process.exit(1);
   }
-  if (!listening) {
+  if (!ready) {
     // Kill the detached child (its whole process group — the Vite path spawns
     // grandchildren) so a slow startup can't bind the port and linger after
     // we've reported failure.
@@ -1206,6 +1229,27 @@ async function spawnBackgroundWebInterface(
   console.log(`Vellum web interface: http://localhost:${port}${SPA_BASE}`);
   console.log(`Running in background (pid ${child.pid}). Logs: ${logPath}`);
   console.log(`Stop with: kill ${child.pid}`);
+}
+
+/**
+ * Config the local web host injects as `window.__VELLUM_CONFIG__` and serves at
+ * `/assistant/__config`, the document a caller probes to learn which assistant
+ * an origin fronts.
+ *
+ * It carries no `assistantId`: this host also serves `handleLocalEndpoints`, so
+ * the SPA on it switches between every assistant in the lockfile, exactly like
+ * the Vite dev server (`clients/web/vite-plugin-local-mode.ts`, which omits the
+ * id for the same reason). An id here would be the launch-time one, and a probe
+ * for any other assistant this origin serves would read it as a mismatch and
+ * report a false `foreign`. An absent id is deliberately benign to the probe.
+ */
+export function buildWebInterfaceConfig(opts: {
+  webUrl: string;
+  platformUrl: string;
+  disablePlatform: boolean;
+}): Record<string, unknown> {
+  const { webUrl, platformUrl, disablePlatform } = opts;
+  return { webUrl, platformUrl, disablePlatform };
 }
 
 async function runWebInterface(
@@ -1247,7 +1291,9 @@ async function runWebInterface(
   const webUrl = getWebUrl();
   const safeJson = (v: unknown) =>
     JSON.stringify(v).replace(/</g, "\\u003c").replace(/>/g, "\\u003e");
-  const configJson = safeJson({ webUrl, platformUrl, disablePlatform });
+  const configJson = safeJson(
+    buildWebInterfaceConfig({ webUrl, platformUrl, disablePlatform }),
+  );
   const hasOverrides = Object.keys(parsedFlagOverrides).length > 0;
   const flagOverridesSnippet = hasOverrides
     ? `;window.__VELLUM_FLAG_OVERRIDES__=${safeJson(parsedFlagOverrides)}`

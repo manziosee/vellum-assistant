@@ -1,3 +1,4 @@
+import type { ResponseArtifact } from "@/domains/chat/transcript/response-artifacts";
 import {
   memo,
   type MouseEvent as ReactMouseEvent,
@@ -22,6 +23,7 @@ import { isPointerCoarse } from "@/utils/pointer";
 import type { ConfirmationDecision } from "@/types/event-types";
 import type { ChatMessageToolCall } from "@/domains/chat/api/event-types";
 import type { DisplayMessage } from "@/domains/chat/types/types";
+import { useTranslation } from "@/i18n";
 
 /**
  * Thin dispatcher: render one `TranscriptItem` using the matching existing
@@ -35,6 +37,9 @@ export interface TranscriptRowProps {
   item: TranscriptItem;
   /** Conversation id, forwarded to message bodies for the bookmark toggle. */
   conversationId?: string | null;
+  /** Tool call the Connect card renders under, resolved once by
+   *  `Transcript` so rows do not each subscribe to the transcript. */
+  acpConnectInlineToolUseId?: string | null;
   assistantDisplayName?: string | null;
   onSurfaceAction: (
     surfaceId: string,
@@ -57,7 +62,6 @@ export interface TranscriptRowProps {
     input?: Record<string, unknown>;
     allowlistOptions: import("@/types/interaction-ui-types").AllowlistOption[];
     scopeOptions: import("@/types/interaction-ui-types").ScopeOption[];
-    directoryScopeOptions: import("@/types/interaction-ui-types").DirectoryScopeOption[];
   }) => void;
   unknownNudgeToolCallIds?: Set<string>;
   onDismissUnknownNudge?: (toolCallId: string) => void;
@@ -89,7 +93,7 @@ export interface TranscriptRowProps {
   /** Ids of the documents this message's whole response changed. Set only on
    *  the message that ends a completed response, so the response closes with
    *  one reopen link per document (see `resolveResponseDocumentIds`). */
-  changedDocumentIds?: string[];
+  responseArtifacts?: ResponseArtifact[];
   /** True when this row belongs to the actively-streaming turn. Forwarded to
    *  `TranscriptMessageBody` so the streaming message's last tool-call group
    *  defaults open. History rows leave it `false`. */
@@ -163,6 +167,7 @@ function CreditsUpsellMessageRow({
 export const TranscriptRow = memo(function TranscriptRow({
   item,
   conversationId,
+  acpConnectInlineToolUseId,
   assistantDisplayName,
   onSurfaceAction,
   onForkConversation,
@@ -182,10 +187,11 @@ export const TranscriptRow = memo(function TranscriptRow({
   onStopSubagent,
   onWorkflowClick,
   onStopWorkflow,
-  changedDocumentIds,
+  responseArtifacts,
   isStreaming,
   isLatestMessage,
 }: TranscriptRowProps) {
+  const { t } = useTranslation("chat");
   switch (item.kind) {
     case "message": {
       // Daemon-authored status cards render as standalone system notices,
@@ -199,6 +205,7 @@ export const TranscriptRow = memo(function TranscriptRow({
         <TranscriptMessageBody
           message={item.message}
           conversationId={conversationId}
+          acpConnectInlineToolUseId={acpConnectInlineToolUseId}
           assistantDisplayName={assistantDisplayName}
           onSurfaceAction={onSurfaceAction}
           onForkConversation={onForkConversation}
@@ -217,7 +224,7 @@ export const TranscriptRow = memo(function TranscriptRow({
           onStopSubagent={onStopSubagent}
           onWorkflowClick={onWorkflowClick}
           onStopWorkflow={onStopWorkflow}
-          changedDocumentIds={changedDocumentIds}
+          responseArtifacts={responseArtifacts}
           isStreaming={isStreaming}
           isLatestMessage={isLatestMessage}
         />
@@ -258,7 +265,7 @@ export const TranscriptRow = memo(function TranscriptRow({
           }`}
         >
           <StreamingShimmerText>
-            {item.label ?? "Thinking"}
+            {item.label ?? t("transcriptRow.thinking")}
           </StreamingShimmerText>
         </div>
       );

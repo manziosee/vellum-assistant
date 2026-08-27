@@ -24,10 +24,20 @@
  */
 
 import { getLogger } from "../logger.js";
+import {
+  defaultSchedule,
+  type CancelTimer,
+  type ScheduleFn,
+} from "../util/schedule.js";
 import { fetchImpl } from "../fetch.js";
 import type { DiscordInboundEvent } from "../channels/inbound-event.js";
+import type { ChannelConnectionHealth } from "../channels/types.js";
 import { admitDiscordMessage } from "./admit.js";
 import { AdmissionDropLog } from "./admission-log.js";
+import {
+  extractDiscordAttachmentMap,
+  type DiscordAttachmentReference,
+} from "./attachments.js";
 import { ReconnectBackoff, SESSION_STABLE_AFTER_MS } from "./backoff.js";
 import {
   RESUMABLE_CLOSE_CODE,
@@ -43,15 +53,25 @@ import {
   DiscordMessageCreateSchema,
   DiscordReadySchema,
   DiscordThreadListSchema,
+  DiscordMessageDeleteSchema,
   DiscordThreadSchema,
 } from "./message-schemas.js";
-import { normalizeDiscordMessage, toAdmissionCandidate } from "./normalize.js";
+import {
+  normalizeDiscordMessage,
+  normalizeDiscordMessageDelete,
+  toAdmissionCandidate,
+} from "./normalize.js";
 import { DiscordSessionState } from "./session-state.js";
 import { ThreadParentCache } from "./thread-parents.js";
 
 const log = getLogger("discord-gateway");
 
 const DISCORD_API_BASE_URL = "https://discord.com/api/v10";
+
+export type DiscordGatewayEventHandler = (
+  event: DiscordInboundEvent,
+  attachmentRefs?: Map<string, DiscordAttachmentReference>,
+) => void;
 
 /**
  * Floor for the `session_start_limit.remaining` warning. Steady state spends
@@ -101,25 +121,15 @@ export interface GatewaySocketLike {
   ): void;
 }
 
-/** Cancel handle returned by {@link ScheduleFn}. */
-export type CancelTimer = () => void;
-
-/** Injectable timer: schedule `fn` after `delayMs`, return a cancel handle. */
-export type ScheduleFn = (fn: () => void, delayMs: number) => CancelTimer;
-
-const defaultSchedule: ScheduleFn = (fn, delayMs) => {
-  const timer = setTimeout(fn, delayMs);
-  return () => clearTimeout(timer);
-};
-
 export interface DiscordGatewayClientOptions {
   botToken: string;
   /**
-   * Live view of the admitted-channel allow-list, read per message so a
-   * config edit applies without restarting the client (a restart costs an
-   * IDENTIFY).
+   * A legacy install's persisted room restriction, read live per message so
+   * an operator's edit applies without a restart. Returns undefined once the
+   * config entry is cleared, which is the operator adopting the permission
+   * model; nothing writes the entry anymore.
    */
-  readAllowedChannelIds: () => ReadonlySet<string>;
+  readLegacyAllowedChannelIds?: () => ReadonlySet<string> | undefined;
   fetchFn?: typeof fetchImpl;
   createSocket?: (url: string) => GatewaySocketLike;
   schedule?: ScheduleFn;
@@ -129,7 +139,9 @@ export interface DiscordGatewayClientOptions {
 
 export class DiscordGatewayClient {
   private readonly botToken: string;
-  private readonly readAllowedChannelIds: () => ReadonlySet<string>;
+  private readonly readLegacyAllowedChannelIds?: () =>
+    | ReadonlySet<string>
+    | undefined;
   private readonly fetchFn: typeof fetchImpl;
   private readonly createSocket: (url: string) => GatewaySocketLike;
   private readonly schedule: ScheduleFn;
@@ -160,10 +172,10 @@ export class DiscordGatewayClient {
 
   constructor(
     options: DiscordGatewayClientOptions,
-    private readonly onEvent: (event: DiscordInboundEvent) => void,
+    private readonly onEvent: DiscordGatewayEventHandler,
   ) {
     this.botToken = options.botToken;
-    this.readAllowedChannelIds = options.readAllowedChannelIds;
+    this.readLegacyAllowedChannelIds = options.readLegacyAllowedChannelIds;
     this.fetchFn = options.fetchFn ?? fetchImpl;
     this.createSocket =
       options.createSocket ??
@@ -199,6 +211,28 @@ export class DiscordGatewayClient {
     }
     this.sessionState = new DiscordSessionState(baseUrl);
     this.openSocket();
+  }
+
+  /**
+   * Whether this client currently holds a live Gateway connection.
+   *
+   * Reported in the same shape as the other socket channels so a reader does
+   * not need to know which protocol proved it. Discord's proof of liveness is
+   * an op 11 ACK rather than a pong.
+   *
+   * `connected` requires an established session, not merely a socket pointer.
+   * `openSocket` assigns `this.ws` as soon as the socket is constructed, and
+   * the connection carries nothing until op 10 HELLO arrives, so a socket
+   * whose handshake stalls would otherwise report itself live for the whole
+   * HELLO deadline. A recorded heartbeat interval is the establishment
+   * signal: it is set from HELLO and cleared on every reset.
+   */
+  getConnectionHealth(): ChannelConnectionHealth {
+    return {
+      connected:
+        this.ws !== null && this.heartbeat.heartbeatIntervalMs !== undefined,
+      lastLivenessAt: this.heartbeat.lastAckAt,
+    };
   }
 
   /**
@@ -625,9 +659,120 @@ export class DiscordGatewayClient {
       case "MESSAGE_CREATE":
         this.handleMessageCreate(data);
         return;
+      case "MESSAGE_UPDATE":
+        this.handleMessageUpdate(data);
+        return;
+      case "MESSAGE_DELETE":
+        this.handleMessageDelete(data);
+        return;
       default:
         return;
     }
+  }
+
+  private handleMessageUpdate(data: unknown): void {
+    if (!this.botUserId) {
+      log.warn("Dropping MESSAGE_UPDATE: bot identity not yet resolved");
+      return;
+    }
+    const parsed = DiscordMessageCreateSchema.safeParse(data);
+    if (!parsed.success) {
+      log.warn("Dropping malformed MESSAGE_UPDATE");
+      return;
+    }
+    const message = parsed.data;
+    // Embed resolution and other non-user revisions dispatch MESSAGE_UPDATE
+    // with no edited_timestamp; nothing the user said changed, so there is
+    // nothing to rewrite. Guild content is additionally ambiguous when
+    // empty: without MESSAGE_CONTENT a non-exempt guild edit arrives with
+    // its text hidden, and rewriting a stored row to empty would destroy
+    // text over an intent gap. A DM is inside the content exemption, so an
+    // empty DM revision is a real clearing (an attachment message whose
+    // caption was removed) and propagates.
+    if (
+      message.edited_timestamp == null ||
+      (message.guild_id !== undefined && message.content.length === 0)
+    ) {
+      log.debug(
+        { messageId: message.id },
+        "Dropping MESSAGE_UPDATE with no user revision",
+      );
+      return;
+    }
+    const parentChannelId = this.threadParents.parentOf(message.channel_id);
+    const candidate = toAdmissionCandidate(message, parentChannelId);
+    if (!candidate) {
+      log.warn("Dropping MESSAGE_UPDATE with no author identity");
+      return;
+    }
+    const legacyAllowedChannelIds = this.readLegacyAllowedChannelIds?.();
+    const verdict = admitDiscordMessage(candidate, {
+      botUserId: this.botUserId,
+      ...(legacyAllowedChannelIds !== undefined
+        ? { legacyAllowedChannelIds }
+        : {}),
+    });
+    if (!verdict.admitted) {
+      log.debug(
+        { reason: verdict.reason, channelId: message.channel_id },
+        "Discord edit dropped by admission gate",
+      );
+      return;
+    }
+    const normalized = normalizeDiscordMessage(message, {
+      ...(parentChannelId !== undefined ? { parentChannelId } : {}),
+      raw: (data ?? {}) as Record<string, unknown>,
+      edit: { revision: message.edited_timestamp },
+    });
+    if (!normalized) {
+      log.warn(
+        { messageId: message.id },
+        "Discord edit dropped by normalization",
+      );
+      return;
+    }
+    log.info(
+      {
+        messageId: message.id,
+        conversationExternalId: normalized.message.conversationExternalId,
+      },
+      "Discord edit admitted",
+    );
+    this.onEvent(normalized, new Map());
+  }
+
+  private handleMessageDelete(data: unknown): void {
+    const parsed = DiscordMessageDeleteSchema.safeParse(data);
+    if (!parsed.success) {
+      log.warn("Dropping malformed MESSAGE_DELETE");
+      return;
+    }
+    const del = parsed.data;
+    // No admission gate: the dispatch names no author to gate on, and the
+    // daemon applies an unattributed delete only to a row it ingested, so a
+    // delete for anything the admission gate kept out is a no-op there. The
+    // event still rides the full forward path, where the kill switch and
+    // per-family stages apply.
+    const parentChannelId = this.threadParents.parentOf(del.channel_id);
+    const normalized = normalizeDiscordMessageDelete(del, {
+      ...(parentChannelId !== undefined ? { parentChannelId } : {}),
+      raw: (data ?? {}) as Record<string, unknown>,
+    });
+    if (!normalized) {
+      log.warn(
+        { messageId: del.id },
+        "Discord delete dropped by normalization",
+      );
+      return;
+    }
+    log.info(
+      {
+        messageId: del.id,
+        conversationExternalId: normalized.message.conversationExternalId,
+      },
+      "Discord delete forwarded",
+    );
+    this.onEvent(normalized, new Map());
   }
 
   private handleMessageCreate(data: unknown): void {
@@ -644,6 +789,8 @@ export class DiscordGatewayClient {
       return;
     }
     const message = parsed.data;
+    // Parent resolution serves the normalized event's conversation binding,
+    // and, under a legacy allow-list, the thread-inheritance rule.
     const parentChannelId = this.threadParents.parentOf(message.channel_id);
     const candidate = toAdmissionCandidate(message, parentChannelId);
     if (!candidate) {
@@ -651,9 +798,12 @@ export class DiscordGatewayClient {
       return;
     }
 
+    const legacyAllowedChannelIds = this.readLegacyAllowedChannelIds?.();
     const verdict = admitDiscordMessage(candidate, {
       botUserId: this.botUserId,
-      allowedChannelIds: this.readAllowedChannelIds(),
+      ...(legacyAllowedChannelIds !== undefined
+        ? { legacyAllowedChannelIds }
+        : {}),
     });
     if (!verdict.admitted) {
       const fields = {
@@ -662,20 +812,12 @@ export class DiscordGatewayClient {
         messageId: message.id,
       };
       // Severity splits by reason and volume is capped at the first drop per
-      // reason and channel. See `admission-log.ts` for why a single level
-      // cannot serve both a misconfigured allow-list and a busy guild.
+      // reason and channel; see `admission-log.ts`.
       const level = this.admissionDropLog.levelFor(
         verdict.reason,
         message.channel_id,
       );
-      if (level === "warn") {
-        log.warn(
-          fields,
-          "Discord message dropped: the channel is not on the allow-list. " +
-            "Check `discord.allowedChannelIds` in config.json. Further " +
-            "drops for this channel log at debug.",
-        );
-      } else if (level === "info") {
+      if (level === "info") {
         log.info(
           fields,
           "Discord message dropped by admission gate. Further drops for " +
@@ -706,7 +848,7 @@ export class DiscordGatewayClient {
       },
       "Discord message admitted",
     );
-    this.onEvent(normalized);
+    this.onEvent(normalized, extractDiscordAttachmentMap(message.attachments));
   }
 
   /**
