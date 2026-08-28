@@ -135,8 +135,8 @@ export interface TrayHandlers {
    */
   openAbout(): void;
   /**
-   * Toggle the Quick Input popover panel. Optional — only wired on builds
-   * where the quick-input feature flag can be enabled (Electron desktop).
+   * Toggle the Quick Input popover panel. Optional — only wired on Electron
+   * desktop builds that configure the quick-input window.
    */
   toggleQuickInput?(): void;
 }
@@ -182,15 +182,6 @@ const isMultiAssistantEnabled = (): boolean => {
  */
 const isDeveloperMenuEnabled = (): boolean => {
   return getRuntime().featureEnabled("developer-menu-items");
-};
-
-/**
- * Whether the quick-input feature flag is currently enabled.
- * Checked at menu-build time so toggling the flag takes effect on the next
- * right-click without requiring an app restart.
- */
-const isQuickInputEnabled = (): boolean => {
-  return getRuntime().featureEnabled("quick-input");
 };
 
 const buildTrayMenu = (
@@ -318,10 +309,9 @@ const buildTrayMenu = (
         trayRuntime.dispatch({ kind: "newConversation" });
       },
     },
-    // Quick Input: a floating panel the user can type into without switching
-    // to the main window. Gated by the quick-input feature flag; the handler
-    // is optional so this block safely compiles on builds that don't wire it.
-    ...(isQuickInputEnabled() && handlers.toggleQuickInput
+    // Quick Input: floating panel to send a message without switching windows.
+    // Present whenever the handler is wired (Electron desktop builds).
+    ...(handlers.toggleQuickInput
       ? [
           {
             label: "Quick Input",
