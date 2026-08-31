@@ -11,6 +11,7 @@ import {
   and,
   desc,
   eq,
+  inArray,
   isNotNull,
   isNull,
   like,
