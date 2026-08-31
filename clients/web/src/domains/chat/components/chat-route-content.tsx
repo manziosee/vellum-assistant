@@ -52,6 +52,11 @@ import { QuoteReplyBubble } from "@/domains/chat/components/quote-reply-bubble";
 import { TextSelectionPopover } from "@/domains/chat/components/text-selection-popover";
 import { useNativeQuoteReply } from "@/domains/chat/hooks/use-native-quote-reply";
 import { useQuoteReplyStore } from "@/domains/chat/quote-reply-store";
+import { useChannelReferenceStore } from "@/domains/chat/channel-sidecar/channel-reference-store";
+import {
+  useChannelSidecar,
+  useChannelSidecarFlag,
+} from "@/domains/chat/channel-sidecar/use-channel-sidecar";
 import { isChannelConversation } from "@/domains/chat/utils/conversation-channel";
 import { resolveComposerPlaceholder } from "@/domains/chat/utils/composer-placeholder";
 import { isPopoutWindow } from "@/runtime/popout-window";
@@ -363,7 +368,20 @@ export function ChatMainPanel({
   // -------------------------------------------------------------------------
   // Store reads — per-conversation state
   // -------------------------------------------------------------------------
-  const messages = useTranscriptMessages();
+  const transcriptMessages = useTranscriptMessages();
+
+  // Channel sidecar: while the flag is on and this conversation is bound to an
+  // external channel, rows the client can attribute to that channel are drawn
+  // in the read-only drawer instead of here, so the Vellum lane shows each row
+  // exactly once. Everything downstream in this panel (transcript projection,
+  // scroll, empty state, counts) reads the lane, because the lane IS the chat
+  // in that arrangement. `vellumMessages` is the same array by reference
+  // whenever nothing moved, so ordinary conversations see no change at all.
+  const { vellumMessages: messages } = useChannelSidecar({
+    conversationId: activeConversationId,
+    conversation: activeConversation,
+    messages: transcriptMessages,
+  });
   const error = useChatSessionStore.use.error();
   const notice = useChatSessionStore.use.notice();
   // A client-minted draft has no server row, so there is no history to wait
@@ -588,6 +606,21 @@ export function ChatMainPanel({
       store.closeReplyBubble();
     }
   }, [activeConversationId]);
+
+  // Same containment for a staged channel reference. It carries the
+  // conversation it was taken from, so the clear is conditional: a reference
+  // survives the drawer being closed and reopened within its own conversation,
+  // and is dropped the moment the user is somewhere else or the sidecar flag
+  // turns off. The flag-off clear is what keeps flag-off behavior identical
+  // to a build without the feature: no chip, and nothing riding the next
+  // send. Re-enabling starts from an empty slot.
+  const channelSidecarEnabled = useChannelSidecarFlag();
+  useEffect(() => {
+    useChannelReferenceStore.getState().reconcileReference({
+      conversationId: activeConversationId,
+      sidecarEnabled: channelSidecarEnabled,
+    });
+  }, [activeConversationId, channelSidecarEnabled]);
 
   const handleClearContext = useCallback(
     () => void sendMessage("/clean"),
@@ -932,6 +965,14 @@ export function ChatMainPanel({
   );
   const activeModelSupportsVision = activeProfileModel?.supportsVision ?? true;
   const visionGateActive = useVisionAttachmentGate();
+  // Whether an image attached to the next message would survive the turn. One
+  // resolution for every surface that can attach one: the drop/pick filter
+  // below, the Eyes toggle, and the send's own camera frame. On an assistant
+  // with the image-fallback plugin the gate is inactive and the question does
+  // not arise; below it, an image on a profile without vision fails the whole
+  // turn on the provider's rejection.
+  const imageAttachmentsAllowed =
+    !visionGateActive || activeModelSupportsVision;
 
   const isInMaintenanceWithNoMessages =
     !isLoadingHistory &&
@@ -945,10 +986,9 @@ export function ChatMainPanel({
   const handleDroppedFiles = useCallback(
     (files: FileList | File[]): File[] => {
       const arr = Array.from(files);
-      const allowed =
-        !visionGateActive || activeModelSupportsVision
-          ? arr
-          : arr.filter((f) => !isImageAttachment(f));
+      const allowed = imageAttachmentsAllowed
+        ? arr
+        : arr.filter((f) => !isImageAttachment(f));
       if (allowed.length < arr.length) {
         useComposerStore.setState({
           attachmentLastError:
@@ -963,7 +1003,7 @@ export function ChatMainPanel({
       // budget that caller is keeping.
       return allowed;
     },
-    [addChatAttachmentFiles, activeModelSupportsVision, visionGateActive],
+    [addChatAttachmentFiles, imageAttachmentsAllowed],
   );
   const handleDroppedDirectories = useCallback((directories: File[]) => {
     const { resolvedPaths, unresolvedCount } =
@@ -1043,6 +1083,7 @@ export function ChatMainPanel({
     typingDisabled,
     assistantId,
     activeConversationId,
+    imageAttachmentsAllowed,
     // Synchronous pre-send gate: re-scans the outgoing content so pastes
     // sent inside the detection debounce window are still caught. No
     // secrets → returns true, fully inert.
@@ -1161,6 +1202,7 @@ export function ChatMainPanel({
     <ResourcePressureBannerSlot
       resourcePressure={resourcePressure}
       assistantId={assistantId}
+      assistantName={assistantName}
       assistantStateKind={assistantState.kind}
       hidden={diskPressureBannerVisible}
     />
@@ -1316,6 +1358,7 @@ export function ChatMainPanel({
       typingDisabled={typingDisabled}
       sendDisabled={sendDisabled}
       onAddAttachmentFiles={handleDroppedFiles}
+      imageAttachmentsAllowed={imageAttachmentsAllowed}
       voiceInputRef={voiceInputRef}
       voiceInterim={voiceInterim ?? undefined}
       onVoiceTranscript={handleVoiceTranscript}
@@ -1331,6 +1374,9 @@ export function ChatMainPanel({
       // session should attach to the thread the user is looking at — draft
       // ids included (the runtime accepts client-generated conversation ids).
       conversationId={activeConversationId}
+      // Same value the empty state renders from, so "speak first" and "show
+      // the blank-thread greeting" can never disagree about what empty means.
+      conversationIsEmpty={isEmptyConversation}
       onRecallLastMessage={
         isIdle && isNativeConversation ? handleRecallLastMessage : undefined
       }

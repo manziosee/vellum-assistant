@@ -15,6 +15,7 @@ import {
 import { hasOnboardedAssistant } from "@/domains/onboarding/onboarded-assistant";
 import {
   canSkipOnboardingResearch,
+  isNewAssistantFunnel,
   onboardingDestinationAfterConsent,
   withSkipResearch,
 } from "@/domains/onboarding/onboarding-destination";
@@ -134,6 +135,7 @@ export function PrivacyScreen() {
       isLocalHatch,
       skipResearch,
       alreadyOnboarded,
+      newAssistant: isNewAssistantFunnel(searchParams),
     });
     const onboardingNext = skipResearch
       ? withSkipResearch(`${destination}${qs ? `?${qs}` : ""}`)
@@ -249,7 +251,7 @@ export function PrivacyScreen() {
             onClick={() => onAdvance(false)}
             className={electron ? undefined : "h-11 text-base"}
           >
-            {t("actions.start")}
+            {t("privacyScreen.start")}
           </Button>
           {showSkipToChat && (
             <Button
@@ -278,7 +280,7 @@ export function PrivacyScreen() {
            * running environment intact on web and native alike.
            */}
           <Button
-            variant="outlined"
+            variant="ghost"
             size="regular"
             fullWidth
             onClick={() =>

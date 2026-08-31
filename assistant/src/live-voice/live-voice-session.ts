@@ -45,6 +45,10 @@ import {
   recordLiveVoiceSessionStarted,
 } from "../onboarding/onboarding-events-store.js";
 import { isInstalledStaticSkillLoad } from "../permissions/checker.js";
+import {
+  attachmentExists,
+  deleteOrphanAttachments,
+} from "../persistence/attachments-store.js";
 import { ensureConversationExists } from "../persistence/conversation-crud.js";
 import {
   listProviderIds,
@@ -59,6 +63,7 @@ import {
   dominantLanguageTag,
   voteDominantLanguage,
 } from "../stt/language-metadata.js";
+import { sttCatalogKeyForRole } from "../stt/roles.js";
 import {
   DEFAULT_SPEECH_ENERGY_THRESHOLD,
   pcm16MaxNormalizedCorrelation,
@@ -129,8 +134,10 @@ import {
   PROGRESS_FALLBACK_PHRASES_BY_LANGUAGE,
 } from "./progress-phrases.js";
 import {
+  type LiveVoiceClientAttachFrameFrame,
   type LiveVoiceClientAttachImageFrame,
   type LiveVoiceClientFrame,
+  type LiveVoiceClientTextTurnFrame,
   type LiveVoiceClientUpdateConfigFrame,
   LiveVoiceProtocolErrorCode,
   type LiveVoiceServerFramePayload,
@@ -360,7 +367,8 @@ export interface LiveVoiceSessionOptions {
   /**
    * Deepgram Flux turn-detection tuning. The production factory seeds this
    * from `liveVoice.flux` config when unset; absent fields fall back to the
-   * schema defaults, which leave `turnEnd.enabled` false.
+   * schema defaults, which leave `turnEnd.enabled` on. A test that needs the
+   * local silence boundary has to say so.
    */
   fluxConfig?: Partial<LiveVoiceFluxConfig>;
   /**
@@ -705,10 +713,22 @@ interface ActiveAssistantTurn {
   // no user utterance behind it — `content` is CONTINUATION_DELIVERY_CONTENT and
   // the answer rides the control prompt (buildLiveDeliveryNote).
   continuationDelivery: ContinuationDelivery | null;
+  // The turn's content is an internal instruction rather than user speech (the
+  // greeting that opens a session, say). The row still persists and the model
+  // still sees it; `hiddenSyntheticPrompt` keeps it out of the transcript.
+  hiddenPrompt: boolean;
   // Set when a barge-in handed the interrupted work to a background subagent:
   // that request's transcript, so the model can tell the user the work is
   // still running instead of appearing to have dropped it.
   handedOffRequest: string | null;
+  // The parked camera frame this turn claimed, hung on the turn's own
+  // persisted user message. Held here so a rolled-back dispatch can hand it
+  // back to the session (see restorePendingTurnContext).
+  turnAttachmentId: string | null;
+  // The frame the rollback could NOT hand back, because a newer one took the
+  // slot while this turn was in flight. Nothing will ever send it, so it is
+  // collected once the discard has removed the row still linking it.
+  staleFrameId: string | null;
   // The queued announcement this turn consumed alongside `continuationResult`
   // — the two are routes for one answer, so launching consumes both. Held here
   // so a rolled-back speculative dispatch can re-arm it (see
@@ -993,6 +1013,19 @@ function createSyntheticUtterance(): UtteranceCycle {
   };
 }
 
+// Carrier cycle for a turn the user typed rather than spoke. Identical to the
+// announcement carrier except that it arrives with its transcript already
+// complete: the text the client sent is the finalized transcript, so the cycle
+// joins the pipeline exactly where STT would have handed one over. Like the
+// announcement carrier it is never installed as `currentUtterance`, so a typed
+// turn taken during a voice session cannot collide with the armed capture cycle.
+function createTypedUtterance(text: string): UtteranceCycle {
+  return {
+    ...createSyntheticUtterance(),
+    finalTranscriptSegments: [text],
+  };
+}
+
 // Objective handed to the background subagent that continues a barged-in turn.
 // The subagent forks the live conversation, so it already sees the interrupted
 // turn's completed tool calls in history and resumes from there. The request
@@ -1143,6 +1176,14 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
   private receivedAudio = false;
   private detectedSpeech = false;
   private dispatchedTurn = false;
+  // The client declared a text input affordance on the start frame, so it can
+  // take a turn without the microphone. Governs one thing only: whether a
+  // missing speech-to-text leg is fatal to startup (see start()).
+  private readonly textInput: boolean;
+  // Whether this session's speech-to-text leg came up. False only when the
+  // preflight found it missing and `textInput` let the session open anyway, in
+  // which case nothing arms a transcriber and typed turns are the only input.
+  private audioInput = true;
   // Non-null iff the start frame requested turnDetection "server_vad".
   private readonly turnDetector: MediaTurnDetector | null;
   // Base energy gate for server-VAD speech classification. During estimated
@@ -1227,6 +1268,11 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
   // turn; cleared when the continuation finishes (by then the result note
   // takes over and "still running" would be stale).
   private pendingHandoffRequest: string | null = null;
+  // The camera frame a client parked with `attach_frame`, waiting for the next
+  // turn to ride. One slot, latest wins: the frame is ambient context, so an
+  // older one is simply out of date. Consumed (and cleared) when a turn
+  // launches, handed back if that turn is rolled back, and cleared on close.
+  private pendingTurnAttachmentId: string | null = null;
   private readonly maxPendingAudioBytes: number;
   // Set on VAD speech onset; consumed when the first speech chunk is routed
   // to an utterance so the metric lands on the right turn.
@@ -1398,6 +1444,7 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
       context.startFrame.audio.sampleRate *
       2 *
       SERVER_VAD_PENDING_AUDIO_MAX_SECONDS;
+    this.textInput = context.startFrame.textInput === true;
   }
 
   get finalTranscriptText(): string {
@@ -1418,10 +1465,30 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
     if (this.resolveCredentialReadiness) {
       const readiness = await this.resolveCredentialReadiness();
       if (readiness.status === "not-ready") {
-        return await this.failStartup(
-          readiness.userMessage,
-          LiveVoiceProtocolErrorCode.CredentialsUnavailable,
-        );
+        // A client that can type survives a dead speech-to-text leg: it opens
+        // text-only rather than not at all. Requires the gap to be entirely on
+        // the STT side, because the text-in path still speaks its reply, so a
+        // session missing the TTS leg has nothing left to degrade to.
+        //
+        // A not-ready verdict naming no gap is not a downgrade candidate:
+        // `every` is vacuously true over an empty list, and a resolver bug must
+        // not read as "only STT is missing" and quietly open a half-working
+        // session on the strength of it.
+        const sttOnlyGap =
+          readiness.missing.length > 0 &&
+          readiness.missing.every((gap) => gap.kind === "stt");
+        if (this.textInput && sttOnlyGap) {
+          this.audioInput = false;
+          log.warn(
+            { sessionId: this.context.sessionId, missing: readiness.missing },
+            "Live voice starting text-only: speech-to-text unavailable",
+          );
+        } else {
+          return await this.failStartup(
+            readiness.userMessage,
+            LiveVoiceProtocolErrorCode.CredentialsUnavailable,
+          );
+        }
       }
     }
 
@@ -1444,6 +1511,11 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
       sessionId: this.context.sessionId,
       conversationId: this.conversationId,
       turnDetection: this.turnDetector ? "server_vad" : "manual",
+      // Unconditional: it answers "does this daemon take text frames", which
+      // is a property of the daemon and not of what this client asked for.
+      // A client reading it back absent is talking to one that predates it.
+      textInput: true,
+      ...(this.audioInput ? {} : { audioInput: false }),
     });
   }
 
@@ -1472,7 +1544,67 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
       case "attach_image":
         this.persistPhoto(frame);
         return;
+      case "attach_frame":
+        this.parkTurnFrame(frame);
+        return;
+      case "text":
+        await this.handleTextTurn(frame);
+        return;
     }
+  }
+
+  /**
+   * Run a turn the user typed instead of spoke.
+   *
+   * Joins the pipeline at the point a finished transcript would have: the same
+   * turn runner, the same streaming TTS, the same activity and metrics. The
+   * reply is spoken, which is the whole point: this is the input half being
+   * text, not the session becoming a chat.
+   *
+   * Gated on {@link sessionTurnFloorBlocker}, the same check the continuation
+   * announcement uses: no turn in flight, no assistant audio still draining,
+   * no speech onset, and no utterance mid-capture. A typed turn asks the
+   * identical question, so it asks it in the identical way rather than growing
+   * a second set of conditions that could drift from the first.
+   *
+   * A blocked turn is refused rather than queued, and refused recoverably: the
+   * session is fine and the user can send again. Typing over a reply in
+   * progress reads as an interrupt, but making it one means choosing barge-in
+   * semantics for a modality that has no speech onset to measure, which is its
+   * own decision and not this seam's.
+   */
+  private async handleTextTurn(
+    frame: LiveVoiceClientTextTurnFrame,
+  ): Promise<void> {
+    if (!this.startVoiceTurn) {
+      return;
+    }
+
+    const blocker = this.sessionTurnFloorBlocker({
+      ignoreManualCapture: true,
+    });
+    if (blocker !== null) {
+      await this.sendFrame({
+        type: "error",
+        code: LiveVoiceProtocolErrorCode.InvalidFrame,
+        message: "The assistant is busy with the current turn. Send again.",
+        frameType: "text",
+        recoverable: true,
+      });
+      log.debug(
+        { sessionId: this.context.sessionId, blocker },
+        "Typed live-voice turn refused",
+      );
+      return;
+    }
+
+    const utterance = createTypedUtterance(frame.text);
+    // Before the launch, so the anchor is the moment the text arrived rather
+    // than whatever the dispatch costs.
+    this.markTypedTurnSubmitted(utterance);
+    await this.launchAssistantTurn(utterance, frame.text, {
+      ...(frame.hidden === true ? { hiddenPrompt: true } : {}),
+    });
   }
 
   /**
@@ -1505,6 +1637,99 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
         }
       },
     );
+  }
+
+  /**
+   * Park a camera frame for the next turn to carry, or give up the parked one.
+   *
+   * Nothing is persisted and no turn runs: the frame is ambient context, and
+   * on its own it says nothing the user asked to say. It rides the next turn's
+   * own user message instead, so the picture and the words about it are one
+   * message. A frame that arrives while a turn is already running belongs to
+   * the turn after it, which the drain at launch takes care of.
+   *
+   * A null id unparks: the client's camera is off, so the slot must stop
+   * answering for a view nobody can see any more. The frame goes with it, and
+   * unparking an empty slot is a no-op.
+   *
+   * The id is checked against the attachment store here rather than at the
+   * turn, for the same reason a failed photo is reported: an id that resolves
+   * to nothing would otherwise leave the user believing the assistant can see
+   * something it never received, one turn later and with nothing said.
+   */
+  private parkTurnFrame(frame: LiveVoiceClientAttachFrameFrame): void {
+    if (frame.attachmentId === null) {
+      const parked = this.pendingTurnAttachmentId;
+      this.pendingTurnAttachmentId = null;
+      this.reclaimParkedFrame(parked);
+      return;
+    }
+
+    let exists = false;
+    try {
+      exists = attachmentExists(frame.attachmentId);
+    } catch (err) {
+      log.warn(
+        { err, attachmentId: frame.attachmentId },
+        "Live-voice camera frame lookup failed",
+      );
+    }
+    if (!exists) {
+      void this.sendFrame({
+        type: "error",
+        code: LiveVoiceProtocolErrorCode.InvalidFrame,
+        message: "Could not attach that camera frame to the conversation.",
+        frameType: "attach_frame",
+        // The session is fine; only this frame failed.
+        recoverable: true,
+      });
+      return;
+    }
+    const displaced = this.pendingTurnAttachmentId;
+    this.pendingTurnAttachmentId = frame.attachmentId;
+    if (displaced !== null && displaced !== frame.attachmentId) {
+      this.reclaimParkedFrame(displaced);
+    }
+  }
+
+  /**
+   * Give up a parked camera frame no turn will ever carry: one a newer frame
+   * displaced, one the session end leaves behind, one a rollback could not
+   * hand back. A client shooting the camera on a timer parks one every few
+   * seconds, and attachment collection is scoped to message deletion with no
+   * global sweep, so an id dropped without this leaves its row and its bytes
+   * behind for good.
+   *
+   * Safe because `deleteOrphanAttachments` is link-aware: it removes only ids
+   * with no message link, so a frame that already rode a turn is kept and one
+   * that never left this slot is collected. Nothing waits on the result and a
+   * store that cannot be reached must not take the call down, so a failure is
+   * logged and dropped.
+   */
+  private reclaimParkedFrame(attachmentId: string | null): void {
+    if (attachmentId === null) {
+      return;
+    }
+    try {
+      deleteOrphanAttachments([attachmentId]);
+    } catch (err) {
+      log.warn(
+        { err, attachmentId },
+        "Could not reclaim a parked live-voice camera frame",
+      );
+    }
+  }
+
+  /**
+   * Collect the frame a turn's rollback could not hand back, once the discard
+   * that owns the turn's row has finished. Ordering is the whole point: the
+   * reclaim is link-aware, so running it while the doomed row still links the
+   * frame finds the link, keeps the frame, and leaks it.
+   */
+  private reclaimStaleTurnFrame(turn: ActiveAssistantTurn): void {
+    const staleFrameId = turn.staleFrameId;
+    turn.staleFrameId = null;
+    this.reclaimParkedFrame(staleFrameId);
   }
 
   /**
@@ -1546,6 +1771,7 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
       ? null
       : liveVoiceSilenceReason({
           reachedActive: this.reachedActive,
+          audioInput: this.audioInput,
           receivedAudio: this.receivedAudio,
           detectedSpeech: this.detectedSpeech,
         });
@@ -1569,6 +1795,10 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
     this.turnDetector?.dispose();
     this.clearEndpointExtensionTimer();
     this.clearProviderTurnEndTimer();
+    // No turn will ever carry it now, and the frame is the client's to shoot
+    // again on its next session, so the staged row and bytes go with the call.
+    this.reclaimParkedFrame(this.pendingTurnAttachmentId);
+    this.pendingTurnAttachmentId = null;
     // There is no longer anyone on the call to speak to, so a queued
     // announcement cannot be spoken — but the answer behind it is finished
     // work the user asked for, so it takes the same conversation route a
@@ -1637,9 +1867,17 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
       // outside: the session looks like a turn-detecting session while its
       // opening turn is not one. The resolved provider reconciles this guess
       // below.
+      //
+      // The guess reads the live-voice role, which is what the dial below
+      // resolves. Reading the global provider instead makes the guess wrong
+      // in exactly the configuration roles exist for (live voice on flux,
+      // global on base deepgram), which reinstates the race this seed
+      // prevents.
       this.setProviderTurnEndActive(
         this.fluxConfig.turnEnd.enabled &&
-          supportsProviderTurnDetection(stt.provider as SttProviderId) &&
+          supportsProviderTurnDetection(
+            sttCatalogKeyForRole(stt, "liveVoice"),
+          ) &&
           this.turnDetector !== null,
       );
       const transcriber = await this.resolveTranscriber({
@@ -1838,6 +2076,17 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
   }
 
   private async armUtterance(): Promise<void> {
+    // Nothing to arm without a speech-to-text leg. Guarded here rather than at
+    // the call sites because there are several, and the post-turn re-arm
+    // reaches this through `scheduleRearmAfterTurn` from five of them: a
+    // text-only session that requested `server_vad` still holds a turn
+    // detector, so the re-arm is not skipped for want of one. Arming anyway
+    // would resolve a transcriber the preflight already said has no
+    // credential, fail the session, and close it after its first typed turn.
+    if (!this.audioInput) {
+      return;
+    }
+
     const result = await this.beginUtterance();
     if (result.status === "started" || result.status === "stale") {
       return;
@@ -1867,6 +2116,14 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
     // open", which a chunk arriving at all settles regardless of what the
     // session then does with it.
     this.receivedAudio = true;
+    // A text-only session armed no transcriber, so there is nothing downstream
+    // to route this into. Dropped rather than errored: the client was told on
+    // `ready` that the microphone leg is dead, and a client still streaming is
+    // one that has not caught up, not one to end the session over. The flag
+    // above is still set, so telemetry keeps seeing that the mic did open.
+    if (!this.audioInput) {
+      return;
+    }
     if (this.turnDetector) {
       await this.handleServerVadAudio(this.turnDetector, chunk);
       return;
@@ -3118,6 +3375,41 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
     if (this.pendingAnnouncement === null) {
       return "nothing_pending";
     }
+    return this.sessionTurnFloorBlocker();
+  }
+
+  /**
+   * Why the session may not start a turn of its own right now, or null when it
+   * may.
+   *
+   * "Of its own" means a turn with no released utterance behind it: a queued
+   * continuation announcement, or a turn the user typed. Both need the same
+   * assurance, that starting one would not talk over the assistant, cut off the
+   * user, or race a capture cycle already in flight, so both ask here rather
+   * than growing separate condition sets that could drift apart.
+   */
+  private sessionTurnFloorBlocker(opts?: {
+    /**
+     * Ignore `manualAudioCaptured` when judging whether an utterance is in
+     * flight. Set only for a typed turn.
+     *
+     * That flag means "manual capture routed at least one chunk into this
+     * cycle", and manual capture forwards from the moment the microphone
+     * opens rather than from a push-to-talk press. So in a manual session it
+     * latches on the first chunk of silence and, because a manual cycle only
+     * completes on release, never clears. Honouring it would refuse every
+     * typed turn a few milliseconds into the session.
+     *
+     * Safe to ignore here and nowhere else. The flag exists because
+     * transcript signals trail the provider, which would leave an
+     * announcement talking over someone who is mid-sentence with no text yet.
+     * A typed turn has evidence an announcement does not: the user is at the
+     * keyboard, and the act of sending is itself the signal that they are not
+     * currently speaking. The transcript-derived conditions still apply, so a
+     * cycle that has actually produced words still blocks.
+     */
+    readonly ignoreManualCapture?: boolean;
+  }): string | null {
     if (this.isClosed || this.state === "failed" || !this.startVoiceTurn) {
       return "session_unavailable";
     }
@@ -3146,7 +3438,7 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
       !utterance.completed &&
       (utterance.released ||
         utterance.assistantTurnStarted ||
-        utterance.manualAudioCaptured ||
+        (utterance.manualAudioCaptured && opts?.ignoreManualCapture !== true) ||
         utterance.finalTranscriptSegments.length > 0 ||
         utterance.latestPartialText !== null)
     ) {
@@ -3678,9 +3970,10 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
   ): void {
     turn.speculativePending = false;
     // The dispatch is being unwound, so the barge-in merge note, the finished
-    // continuation's answer, its queued announcement, and any photos it claimed
-    // all go back to the session. The turn that would have delivered them is
-    // gone, and the utterance they belong to is about to be sent by another.
+    // continuation's answer, its queued announcement, and any camera frame it
+    // claimed all go back to the session. The turn that would have delivered
+    // them is gone, and the utterance they belong to is about to be sent by
+    // another.
     this.restorePendingTurnContext(turn);
     // Latched before the handle check: when the discard beats the bridge
     // handle's resolution (startVoiceTurn still persisting), the handle's
@@ -3695,12 +3988,19 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
     );
     const handle = turn.handle;
     turn.handle = null;
-    void handle?.discard?.().catch((err: unknown) => {
-      log.warn(
-        { err, turnId: turn.turnId, reason },
-        "Speculative voice turn discard failed",
-      );
-    });
+    void handle
+      ?.discard?.()
+      .catch((err: unknown) => {
+        log.warn(
+          { err, turnId: turn.turnId, reason },
+          "Speculative voice turn discard failed",
+        );
+      })
+      // Only once the discard has deleted the row: until then the row still
+      // links a displaced frame, and the reclaim would keep it forever.
+      .finally(() => {
+        this.reclaimStaleTurnFrame(turn);
+      });
     turn.utterance.assistantTurnStarted = false;
     log.info(
       { turnId: turn.turnId, reason },
@@ -4448,10 +4748,11 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
   }
 
   /**
-   * Take the barge-in merge context, the completed-continuation context, and
-   * the handoff note for the turn being launched — each feeds exactly the next
-   * launched turn — and cancel the queued announcement, because the turn this
-   * context rides delivers the same answer and would otherwise say it twice.
+   * Take the barge-in merge context, the completed-continuation context, the
+   * handoff note, and the parked camera frame for the turn being launched
+   * (each feeds exactly the next launched turn) and cancel the queued
+   * announcement, because the turn this context rides delivers the same answer
+   * and would otherwise say it twice.
    *
    * Every real user turn consumes here, speculative or not: a speculative
    * dispatch latches `assistantTurnStarted`, so a turn that skipped this would
@@ -4463,16 +4764,19 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
     continuationResult: string | null;
     handedOffRequest: string | null;
     announcement: ContinuationDelivery | null;
+    turnAttachmentId: string | null;
   } {
     const consumed = {
       interruptedRequest: this.pendingInterruptedRequest,
       continuationResult: this.pendingContinuationResult,
       handedOffRequest: this.pendingHandoffRequest,
       announcement: this.pendingAnnouncement,
+      turnAttachmentId: this.pendingTurnAttachmentId,
     };
     this.pendingInterruptedRequest = null;
     this.pendingContinuationResult = null;
     this.pendingHandoffRequest = null;
+    this.pendingTurnAttachmentId = null;
     this.clearContinuationAnnouncement();
     return consumed;
   }
@@ -4494,20 +4798,42 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
     const continuationResult = turn.continuationResult;
     const handedOffRequest = turn.handedOffRequest;
     const announcement = turn.consumedAnnouncement;
+    const turnAttachmentId = turn.turnAttachmentId;
     // One restore per turn: the rollback paths overlap (a discarded turn whose
     // leg start also fails), and the second pass must be a no-op.
     turn.interruptedRequest = null;
     turn.continuationResult = null;
     turn.handedOffRequest = null;
     turn.consumedAnnouncement = null;
+    turn.turnAttachmentId = null;
+    // Nobody's to send unless the slot already holds it. A client that
+    // retransmits the id this turn claimed parked the SAME frame rather than a
+    // newer one, and collecting it would leave the slot pointing at a row that
+    // is gone: the discard keeps the bytes alive precisely so the replay can
+    // still send them.
+    const orphanedFrameId =
+      turnAttachmentId !== null &&
+      this.pendingTurnAttachmentId !== turnAttachmentId
+        ? turnAttachmentId
+        : null;
     if (
       this.isClosed ||
       this.detachStopGeneration !== turn.pendingContextStopGeneration
     ) {
+      // The drop is deliberate, so the frame it drops is nobody's to send.
+      turn.staleFrameId = orphanedFrameId;
       return;
     }
     if (this.pendingInterruptedRequest === null) {
       this.pendingInterruptedRequest = interruptedRequest;
+    }
+    // A frame parked since this turn launched is newer, so it wins outright
+    // and the one being handed back is the stale one: collect it rather than
+    // leave it staged for a turn that will never ask for it.
+    if (this.pendingTurnAttachmentId === null) {
+      this.pendingTurnAttachmentId = turnAttachmentId;
+    } else {
+      turn.staleFrameId = orphanedFrameId;
     }
     if (this.pendingContinuationResult === null) {
       this.pendingContinuationResult = continuationResult;
@@ -4544,6 +4870,10 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
       // leading verdict commits the turn (see commitSpeculativeTurn); a hold
       // verdict rolls everything back instead.
       speculative?: boolean;
+      // Marks `content` as an internal instruction rather than user speech, so
+      // the row persists and drives the turn but never renders: no echo, and
+      // `/messages` filters it after a reload.
+      hiddenPrompt?: boolean;
     },
   ): Promise<boolean> {
     utterance.assistantTurnStarted = true;
@@ -4601,9 +4931,12 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
       interruptedRequest: pending?.interruptedRequest ?? null,
       continuationResult: pending?.continuationResult ?? null,
       handedOffRequest: pending?.handedOffRequest ?? null,
+      turnAttachmentId: pending?.turnAttachmentId ?? null,
+      staleFrameId: null,
       consumedAnnouncement: pending?.announcement ?? null,
       pendingContextStopGeneration: this.detachStopGeneration,
       continuationDelivery: opts?.continuationDelivery ?? null,
+      hiddenPrompt: opts?.hiddenPrompt === true,
       deltaEpoch: 0,
       escalationHandedOff: false,
       ttsBuffer: "",
@@ -4624,6 +4957,9 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
       await this.sendFrame({ type: "thinking", turnId });
       if (!this.isActiveAssistantTurn(token)) {
         this.restorePendingTurnContext(activeTurn);
+        // Nothing was persisted, so a frame the restore could not hand back
+        // links to no row and is collectible right here.
+        this.reclaimStaleTurnFrame(activeTurn);
         return false;
       }
     } else {
@@ -4674,11 +5010,19 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
       content,
       routingLeg: "front-door",
       frontDoor: true,
+      // Only this leg: an escalated leg persists its own continuation row, and
+      // the frame belongs to the row carrying the user's words.
+      ...(activeTurn.turnAttachmentId
+        ? { attachments: [activeTurn.turnAttachmentId] }
+        : {}),
     });
     if (!started) {
       // Nothing was persisted or spoken, so the context this turn consumed goes
-      // back to the session rather than dying with the failed dispatch.
+      // back to the session rather than dying with the failed dispatch. A frame
+      // a newer one displaced meanwhile links to no row, so it is collected
+      // here rather than left staged.
       this.restorePendingTurnContext(activeTurn);
+      this.reclaimStaleTurnFrame(activeTurn);
     }
     return started;
   }
@@ -4711,6 +5055,7 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
       routingLeg?: VoiceRoutingLeg;
       frontDoor?: boolean;
       spokenEscalationBridge?: string;
+      attachments?: readonly string[];
     },
   ): Promise<boolean> {
     if (!this.startVoiceTurn) {
@@ -4774,10 +5119,21 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
       // silent" onto a session that has turns, a contradictory row. Setting it
       // before can at worst leave a silent session unexplained, which is a gap
       // rather than a false statement.
-      this.dispatchedTurn = true;
+      //
+      // A synthetic prompt does not count. The silence classification answers
+      // "did anything come from the person?", and the session opening by
+      // greeting them is the session talking to itself. Counting it would
+      // retire the whole taxonomy for every greeted session: `no_speech`,
+      // `text_only` and `no_turn` become unreachable, and `no_audio` survives
+      // only where capture failed early enough to withhold the greeting. That
+      // is the one rate the funnel has for "voice didn't work for me".
+      if (!activeTurn.hiddenPrompt) {
+        this.dispatchedTurn = true;
+      }
       const handle = await this.startVoiceTurn({
         conversationId: this.conversationId,
         voiceSessionId: this.context.sessionId,
+        ...(activeTurn.hiddenPrompt ? { hiddenSyntheticPrompt: true } : {}),
         userMessageChannel: "vellum",
         assistantMessageChannel: "vellum",
         // Fixed, and NOT the originating client: this pair resolves the turn's
@@ -4804,6 +5160,7 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
           this.clearAwaitingApproval(activeTurn);
         },
         content: leg.content,
+        ...(leg.attachments ? { attachments: leg.attachments } : {}),
         isInbound: true,
         launchedAtMs: activeTurn.launchedAtMs,
         signal: activeTurn.abortController.signal,
@@ -5120,12 +5477,19 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
         // rollback: a plain abort would leave the discarded pause's user
         // row in history.
         if (activeTurn.discardRequested && handle.discard) {
-          void handle.discard().catch((err: unknown) => {
-            log.warn(
-              { err, turnId: activeTurn.turnId },
-              "Late speculative voice turn discard failed",
-            );
-          });
+          void handle
+            .discard()
+            .catch((err: unknown) => {
+              log.warn(
+                { err, turnId: activeTurn.turnId },
+                "Late speculative voice turn discard failed",
+              );
+            })
+            // This discard owns the row, so it owns the reclaim of any frame
+            // the rollback could not hand back (see reclaimStaleTurnFrame).
+            .finally(() => {
+              this.reclaimStaleTurnFrame(activeTurn);
+            });
         } else {
           handle.abort();
         }
@@ -5950,6 +6314,29 @@ export class LiveVoiceSession implements LiveVoiceSessionContract {
     );
   }
 
+  /**
+   * Stamp the moment a typed turn's text arrived as the end of the user's
+   * input.
+   *
+   * `roundTripMs` measures from the user finishing their turn to the first
+   * audio they hear, and it anchors on `utteranceEndAtMs ?? pttReleaseAtMs`.
+   * A typed turn produces neither, so without this every typed turn reports a
+   * null round trip and disappears from the latency numbers. That would bias
+   * them toward spoken turns rather than simply losing rows, which is the
+   * worse failure: the metric would still look healthy while describing less
+   * and less of the traffic.
+   *
+   * The text frame landing is the honest equivalent of an utterance closing:
+   * it is the instant the user stopped providing input and started waiting.
+   * `sttMs` and the partial-transcript durations stay null, because nothing
+   * was transcribed and claiming otherwise would invent a measurement.
+   */
+  private markTypedTurnSubmitted(utterance: UtteranceCycle): void {
+    this.markUtteranceMetric(utterance, "utteranceEndAtMs", (turnId) =>
+      this.metrics.markUtteranceEnd(turnId),
+    );
+  }
+
   // Manual mode stamps the PTT release; server_vad stamps the utterance-end
   // boundary instead (utteranceEndToFinalTranscript plays the sttMs role).
   private markUtteranceReleased(utterance: UtteranceCycle): void {
@@ -6609,7 +6996,9 @@ async function defaultResolveStreamingTranscriber(
     await import("../config/managed-speech-defaults.js");
   const { resolveStreamingTranscriber } =
     await import("../providers/speech-to-text/resolve.js");
-  const { stt } = await resolveEffectiveSpeechProviders();
+  const { stt } = await resolveEffectiveSpeechProviders(undefined, {
+    role: "liveVoice",
+  });
   return resolveStreamingTranscriber({ ...options, providerId: stt });
 }
 

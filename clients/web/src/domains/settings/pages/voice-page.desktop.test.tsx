@@ -1,3 +1,5 @@
+import type { UseManagedVoiceSelection } from "@/components/speech/use-managed-voice-selection";
+import type { UseSttLanguageSelection } from "@/components/speech/use-stt-language-selection";
 /**
  * The desktop-host voice mode shortcut card.
  *
@@ -15,22 +17,26 @@
 import { beforeEach, describe, expect, mock, test } from "bun:test";
 
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router";
 
 mock.module("@/assistant/use-active-assistant-id", () => ({
   useActiveAssistantId: () => "asst-test",
 }));
 mock.module("@/components/speech/use-managed-voice-selection", () => ({
-  useManagedVoiceSelection: () => ({
+  useManagedVoiceSelection: (): UseManagedVoiceSelection => ({
     available: false,
+    isByok: false,
+    settled: true,
     voices: [],
     currentModel: "",
+    defaultModel: "",
     selectModel: () => {},
     selecting: false,
   }),
 }));
 mock.module("@/components/speech/use-stt-language-selection", () => ({
-  useSttLanguageSelection: () => ({
+  useSttLanguageSelection: (): UseSttLanguageSelection => ({
     available: false,
     currentCode: "multi",
     configuredProviderId: "deepgram",
@@ -76,10 +82,17 @@ mock.module("@/runtime/hotkeys", () => ({
 import { VoiceSections } from "@/domains/settings/pages/voice-page";
 
 function renderPage() {
+  // The page reads daemon config now (the turn-taking row), so it needs a
+  // client. `retry: false` keeps a miss from re-fetching through the test.
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
   return render(
-    <MemoryRouter>
-      <VoiceSections />
-    </MemoryRouter>,
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter>
+        <VoiceSections />
+      </MemoryRouter>
+    </QueryClientProvider>,
   );
 }
 

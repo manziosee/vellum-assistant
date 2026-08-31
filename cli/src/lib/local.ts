@@ -44,6 +44,7 @@ import {
 } from "./http-client.js";
 import { stopIngressNginx } from "./nginx-ingress.js";
 import {
+  DAEMON_STOP_TIMEOUT_MS,
   type ProcessState,
   executableName,
   isProcessAlive,
@@ -138,6 +139,18 @@ export function isCompiledCli(): boolean {
 
 function compiledSibling(name: string): string {
   return join(dirname(process.execPath), executableName(name, platform()));
+}
+
+function envWithCompiledRuntimeNodePath(
+  env: Record<string, string>,
+): Record<string, string> {
+  if (!isCompiledCli()) {
+    return env;
+  }
+  return {
+    ...env,
+    NODE_PATH: join(dirname(process.execPath), "node_modules"),
+  };
 }
 
 function resolveBunExecutable(): string {
@@ -266,6 +279,7 @@ export function ensureLocalRuntime(
     cwd: installDir,
     stdio: "inherit",
     env: envWithBunPath(process.env),
+    windowsHide: true,
   });
 
   if (result.error || result.status !== 0) {
@@ -517,6 +531,7 @@ function ensureBunInstalled(): void {
     execFileSync(resolveBunExecutable(), ["--version"], {
       stdio: "pipe",
       env: envWithBunPath(process.env),
+      windowsHide: true,
     });
     return;
   } catch {
@@ -550,10 +565,12 @@ function ensureBunInstalled(): void {
         installEnv[key] = process.env[key]!;
       }
     }
-    execSync("curl -fsSL https://bun.sh/install | bash", {
+    // Pinned. Keep in sync with .tool-versions.
+    execSync('curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.11"', {
       stdio: "pipe",
       timeout: 60_000,
       env: installEnv,
+      windowsHide: true,
     });
     console.log("   Bun installed successfully");
   } catch {
@@ -831,6 +848,7 @@ async function startDaemonFromSource(
     ? spawn(bunPath, ["run", daemonMainPath], {
         stdio: "inherit",
         env: spawnEnv,
+        windowsHide: true,
       })
     : (() => {
         const daemonLogFd = openLogFile("hatch.log");
@@ -1169,7 +1187,12 @@ function findPidListeningOnPort(port: number): number | undefined {
     const output = execFileSync(
       "lsof",
       ["-iTCP:" + port, "-sTCP:LISTEN", "-t"],
-      { encoding: "utf-8", timeout: 3000, stdio: ["ignore", "pipe", "ignore"] },
+      {
+        encoding: "utf-8",
+        timeout: 3000,
+        stdio: ["ignore", "pipe", "ignore"],
+        windowsHide: true,
+      },
     ).trim();
     // lsof -t may return multiple PIDs (one per line); take the first.
     const pid = parseInt(output.split("\n")[0], 10);
@@ -1644,6 +1667,7 @@ export async function startLocalDaemon(
         }
       }
       applyDaemonEnvOverrides(daemonEnv, resources, options);
+      const daemonSpawnEnv = envWithCompiledRuntimeNodePath(daemonEnv);
 
       // Write a sentinel PID file before spawning so concurrent hatch() calls
       // see the file and fall through to the isDaemonResponsive() port check
@@ -1654,7 +1678,8 @@ export async function startLocalDaemon(
         ? spawn(daemonBinary, [], {
             cwd: dirname(daemonBinary),
             stdio: "inherit",
-            env: daemonEnv,
+            env: daemonSpawnEnv,
+            windowsHide: true,
           })
         : (() => {
             const daemonLogFd = openLogFile("hatch.log");
@@ -1663,7 +1688,7 @@ export async function startLocalDaemon(
               detached: true,
               stdio: ["ignore", "pipe", "pipe"],
               windowsHide: true,
-              env: daemonEnv,
+              env: daemonSpawnEnv,
             });
             pipeToLogFile(c, daemonLogFd, "daemon");
             c.unref();
@@ -1715,8 +1740,17 @@ export async function startLocalDaemon(
           console.log(
             "   Bundled assistant not healthy after 60s, falling back to source assistant...",
           );
-          // Kill the bundled daemon to avoid two processes competing for the same port
-          await stopProcessByPidFile(pidFile, "bundled daemon");
+          // Kill the bundled daemon to avoid two processes competing for the
+          // same port. It gets the full stop budget like any other daemon:
+          // failing the health probe does not mean it has nothing to flush, and
+          // a daemon still working through a long DB migration is exactly the
+          // one whose WAL checkpoint must not be interrupted.
+          await stopProcessByPidFile(
+            pidFile,
+            "bundled daemon",
+            undefined,
+            DAEMON_STOP_TIMEOUT_MS,
+          );
           daemonSpawn = watch
             ? await startDaemonWatchFromSource(
                 assistantIndex,
@@ -1875,7 +1909,7 @@ export async function startGateway(
       detached: true,
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
-      env: gatewayEnv,
+      env: envWithCompiledRuntimeNodePath(gatewayEnv),
     });
     pipeToLogFile(gateway, gatewayLogFd, "gateway");
   } else {
@@ -1935,6 +1969,7 @@ function isNgrokProcess(pid: number): boolean {
       encoding: "utf-8",
       timeout: 3000,
       stdio: ["ignore", "pipe", "ignore"],
+      windowsHide: true,
     }).trim();
     return /ngrok/.test(output);
   } catch {
@@ -1957,7 +1992,12 @@ export async function stopLocalProcesses(
     ? join(resources.instanceDir, ".vellum")
     : join(homedir(), ".vellum");
   const daemonPidFile = getDaemonPidPath(resources);
-  await stopProcessByPidFile(daemonPidFile, "daemon");
+  await stopProcessByPidFile(
+    daemonPidFile,
+    "daemon",
+    undefined,
+    DAEMON_STOP_TIMEOUT_MS,
+  );
 
   const gatewayPidFile = join(vellumDir, "gateway.pid");
   await stopProcessByPidFile(gatewayPidFile, "gateway", undefined, 7000);

@@ -1824,12 +1824,15 @@ paths:
           enum:
           - airtable
           - asana
+          - calendly
           - discord
           - dropbox
+          - eventbrite
           - github
           - google
           - hubspot
           - linear
+          - monday
           - notion
           - outlook
           - salesforce
@@ -2632,6 +2635,12 @@ paths:
           description: No response body
         '409':
           description: No response body
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DetailResponse'
+          description: ''
       x-vellum-api-clients:
       - platform
   /v1/assistants/{id}/access-consent/:
@@ -5239,6 +5248,39 @@ paths:
           description: ''
       x-vellum-api-clients:
       - platform
+  /v1/organizations/billing/subscription/reactivate/:
+    post:
+      operationId: organizations_billing_subscription_reactivate_create
+      description: 'Reactivate the org''s Pro subscription by removing a pending cancellation
+        before the current billing period ends — the server-side equivalent of clicking
+        "Do not cancel" in the Stripe Customer Portal. The subscription resumes renewing
+        at the period end; nothing is charged now. Idempotent: a subscription with
+        no pending cancellation returns no_op. Requires an active Pro subscription
+        with a provisioned Stripe subscription — once the period has ended and the
+        subscription is fully canceled it can no longer be reactivated (returns HTTP
+        403; subscribe again via upgrade instead).'
+      parameters:
+      - in: header
+        name: Vellum-Organization-Id
+        schema:
+          type: string
+          format: uuid
+        description: Required if using Cookie-based or X-Session-Token authentication
+          methods.
+      tags:
+      - organizations
+      security:
+      - cookieAuth: []
+      - XSessionTokenAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubscriptionReactivateResponse'
+          description: ''
+      x-vellum-api-clients:
+      - platform
   /v1/organizations/billing/subscription/upgrade/:
     post:
       operationId: organizations_billing_subscription_upgrade_create
@@ -6205,6 +6247,10 @@ components:
           type: string
           nullable: true
           readOnly: true
+        avatar_url:
+          type: string
+          nullable: true
+          readOnly: true
         machine_id:
           type: string
           nullable: true
@@ -6247,6 +6293,7 @@ components:
           readOnly: true
       required:
       - access_consented
+      - avatar_url
       - created
       - current_release_version
       - handle
@@ -6758,13 +6805,17 @@ components:
             when no daily limit is set.
         daily_spend_usd:
           type: string
-          description: Today's (UTC) credit spend as a decimal string. Reported as
-            "0.00" when the stored counter is from a prior UTC day.
+          description: Today's (UTC) credit spend counted against the daily limit,
+            as a decimal string. Spend covered by plan-included credits (initial credit,
+            Pro credit bundle) is excluded. Reported as "0.00" when the stored counter
+            is from a prior UTC day.
         daily_limit_reached:
           type: boolean
           description: True when a daily limit is set, today's spend has reached it,
             and the limit is being enforced. False while the limit is skipped for
-            the day (see daily_limit_snoozed). Drives the in-app daily-limit banner.
+            the day (see daily_limit_snoozed) or while plan-included credits (initial
+            credit, Pro credit bundle) still hold unexpired balance. Drives the in-app
+            daily-limit banner.
         daily_limit_snoozed:
           type: boolean
           description: True when the daily limit has been skipped for the current
@@ -8520,6 +8571,9 @@ components:
       - airtable
       - hubspot
       - salesforce
+      - eventbrite
+      - calendly
+      - monday
       type: string
       description: |-
         * `twitter` - twitter
@@ -8535,6 +8589,9 @@ components:
         * `airtable` - airtable
         * `hubspot` - hubspot
         * `salesforce` - salesforce
+        * `eventbrite` - eventbrite
+        * `calendly` - calendly
+        * `monday` - monday
     OAuthStartRequestRequest:
       type: object
       properties:
@@ -9110,12 +9167,16 @@ components:
       description: |-
         Write surface for ``PATCH /v1/assistants/{id}/``.
 
-        Accepts a narrow allowlist (``name``, ``description``, ``handle``) and
-        delegates handle format validation to
+        Accepts a narrow allowlist (``name``, ``description``, ``handle``,
+        ``avatar_base64``) and delegates handle format validation to
         :func:`app.assistant.handle_validation.validate_handle`. Uniqueness is
         enforced at the database layer via the case-insensitive functional
         unique index on ``LOWER(handle)``; the view converts the resulting
         ``IntegrityError`` to a 409 (see :meth:`AssistantViewSet.partial_update`).
+
+        ``avatar_base64`` is a write-only, non-model field: the daemon sends the
+        raw image inline, and :meth:`AssistantViewSet.partial_update` pops the
+        decoded payload out of ``validated_data`` before the model save.
       properties:
         name:
           type: string
@@ -9128,6 +9189,13 @@ components:
           type: string
           minLength: 1
           maxLength: 150
+        avatar_base64:
+          type: string
+          writeOnly: true
+          nullable: true
+          description: Base64-encoded avatar image (PNG, JPEG, WebP, or GIF), at most
+            524288 bytes (512 KiB) decoded. Send null or an empty string to remove
+            the current avatar; omit the field to leave it alone.
     PatchedSleepPolicyRequest:
       type: object
       description: Serializer for the assistant sleep/wake policy.
@@ -9731,6 +9799,18 @@ components:
       - key
       - name
       - version
+    SubscriptionReactivateResponse:
+      type: object
+      properties:
+        status:
+          $ref: '#/components/schemas/TierChangeStatusEnum'
+        current_period_end:
+          type: string
+          format: date-time
+          nullable: true
+      required:
+      - current_period_end
+      - status
     SubscriptionResponse:
       type: object
       properties:

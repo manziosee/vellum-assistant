@@ -3,7 +3,7 @@
 openapi: 3.1.0
 info:
   title: Vellum Assistant API
-  version: 0.11.5
+  version: 0.11.7
   description: Auto-generated OpenAPI specification for the Vellum Assistant runtime HTTP server.
 servers:
   - url: http://127.0.0.1:7821
@@ -466,6 +466,8 @@ paths:
                         task:
                           type: string
                         parentToolUseId:
+                          type: string
+                        authErrorCode:
                           type: string
                         usedTokens:
                           type: number
@@ -2766,8 +2768,8 @@ paths:
       operationId: backup_destinations_get
       summary: List configured offsite backup destinations
       description:
-        Returns the current offsite destinations array, materializing the iCloud Drive default when no explicit
-        array is configured.
+        Returns the current offsite destinations array. When no explicit array is configured, macOS materializes
+        its encrypted iCloud Drive default while Windows and Linux return no implicit destination.
       tags:
         - backups
       responses:
@@ -2799,8 +2801,8 @@ paths:
       operationId: backup_destinations_add_post
       summary: Add an offsite backup destination
       description:
-        Appends a new destination. Materializes the iCloud default first if destinations is currently null. Errors
-        if the path already exists.
+        Appends a new destination. Materializes the platform default first if destinations is currently null.
+        Errors if the path already exists.
       tags:
         - backups
       requestBody:
@@ -4190,6 +4192,30 @@ paths:
                   type: string
                 content:
                   type: string
+                eventKind:
+                  type: string
+                  enum:
+                    - message
+                    - edit
+                    - delete
+                    - reaction
+                    - button
+                reaction:
+                  type: object
+                  properties:
+                    op:
+                      type: string
+                      enum:
+                        - added
+                        - removed
+                    emoji:
+                      type: string
+                    targetMessageId:
+                      type: string
+                  required:
+                    - op
+                    - emoji
+                    - targetMessageId
                 isEdit:
                   type: boolean
                 callbackQueryId:
@@ -4342,6 +4368,15 @@ paths:
                             - type: "null"
                         memberDisplayName:
                           type: string
+                        autoApproveThreshold:
+                          anyOf:
+                            - type: string
+                              enum:
+                                - none
+                                - low
+                                - medium
+                                - high
+                            - type: "null"
                         interactionCount:
                           type: number
                         hasInterceptableVerificationSession:
@@ -4349,6 +4384,8 @@ paths:
                       required:
                         - trustClass
                         - canonicalSenderId
+                    actorUnattributed:
+                      type: boolean
                     emailProvider:
                       type: string
                     emailSubject:
@@ -5223,6 +5260,10 @@ paths:
                     required:
                       - profile
                       - weight
+                fallbackProfile:
+                  readOnly: true
+                  type: string
+                  minLength: 1
       responses:
         "200":
           description: Successful response
@@ -5320,12 +5361,6 @@ paths:
                 decision:
                   type: string
                   description: "One of: allow, deny"
-                selectedPattern:
-                  type: string
-                  description: Allowlist pattern for persistent decisions
-                selectedScope:
-                  type: string
-                  description: Scope for persistent decisions
               required:
                 - requestId
                 - decision
@@ -5524,6 +5559,81 @@ paths:
                   - runs
                   - nextCursor
                 additionalProperties: false
+  /v1/contact_prompt_claim:
+    post:
+      operationId: contact_prompt_claim_post
+      summary: Claim a pending contact form for one submission
+      description:
+        Marks a pending form as answered so a second client submitting the same form writes nothing. Returns
+        claimed=false with reason 'already_claimed' when somebody got there first, or 'unknown' when no such form is
+        pending. A granted claim carries the window its write has to report back in.
+      tags:
+        - contacts
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                requestId:
+                  type: string
+                  description: The pending contact_request id.
+              required:
+                - requestId
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  claimed:
+                    type: boolean
+                  reason:
+                    type: string
+                    enum:
+                      - already_claimed
+                      - unknown
+                  settleMs:
+                    description: How long a granted claim has to report its write back before the waiting call gives up.
+                    type: number
+                required:
+                  - claimed
+                additionalProperties: false
+  /v1/contact_prompt_flags:
+    post:
+      operationId: contact_prompt_flags_post
+      summary: Read flags for a pending contact prompt
+      description: Returns whether the pending prompt asked the gateway to mark the submitted channel verified.
+      tags:
+        - contacts
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                requestId:
+                  type: string
+                  description: The pending contact_request id.
+              required:
+                - requestId
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  verify:
+                    type: boolean
+                required:
+                  - verify
+                additionalProperties: false
   /v1/contact-channels/{contactChannelId}:
     patch:
       operationId: contactchannels_by_contactChannelId_patch
@@ -5592,6 +5702,15 @@ paths:
                       interactionCount:
                         anyOf:
                           - type: number
+                          - type: "null"
+                      autoApproveThreshold:
+                        anyOf:
+                          - type: string
+                            enum:
+                              - none
+                              - low
+                              - medium
+                              - high
                           - type: "null"
                       createdAt:
                         type: number
@@ -5757,6 +5876,15 @@ paths:
                           anyOf:
                             - type: number
                             - type: "null"
+                        autoApproveThreshold:
+                          anyOf:
+                            - type: string
+                              enum:
+                                - none
+                                - low
+                                - medium
+                                - high
+                            - type: "null"
                         createdAt:
                           type: number
                         updatedAt:
@@ -5889,6 +6017,15 @@ paths:
                       interactionCount:
                         anyOf:
                           - type: number
+                          - type: "null"
+                      autoApproveThreshold:
+                        anyOf:
+                          - type: string
+                            enum:
+                              - none
+                              - low
+                              - medium
+                              - high
                           - type: "null"
                       createdAt:
                         type: number
@@ -6294,6 +6431,15 @@ paths:
                         anyOf:
                           - type: number
                           - type: "null"
+                      autoApproveThreshold:
+                        anyOf:
+                          - type: string
+                            enum:
+                              - none
+                              - low
+                              - medium
+                              - high
+                          - type: "null"
                       createdAt:
                         type: number
                       updatedAt:
@@ -6379,7 +6525,7 @@ paths:
       summary: Prompt user to register a contact channel
       description:
         Broadcasts a contact_request to connected clients, waits for the user to submit an address via the gateway.
-        The gateway owns the contact write and notifies the daemon via resolve_contact_prompt IPC.
+        The gateway owns the contact write and reports it back via resolve_contact_prompt.
       tags:
         - contacts
       requestBody:
@@ -6412,6 +6558,18 @@ paths:
                     - guardian
                     - trusted-contact
                     - unknown
+                verify:
+                  description:
+                    Pre-check the form's 'mark verified' box. The guardian's answer on submit decides the attest, so an
+                    unchecked box leaves the channel unverified.
+                  type: boolean
+                timeoutMs:
+                  description:
+                    How long to hold the form open (ms). The caller waits slightly longer than this, so the form closing is
+                    what ends the wait. Defaults to 300000.
+                  type: integer
+                  exclusiveMinimum: 0
+                  maximum: 3600000
       responses:
         "200":
           description: Successful response
@@ -6432,6 +6590,106 @@ paths:
                     type: string
                   address:
                     type: string
+                  verified:
+                    type: boolean
+                required:
+                  - ok
+                additionalProperties: false
+  /v1/contacts/record-prompt:
+    post:
+      operationId: contacts_recordprompt_post
+      summary: Ask the guardian to confirm a contact record write
+      description:
+        Broadcasts a contact_record_request to connected clients and waits for the guardian to submit the form. The
+        gateway owns the write and reports it back via resolve_contact_prompt. Nothing is written if nobody answers.
+      tags:
+        - contacts
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                operation:
+                  type: string
+                  enum:
+                    - create
+                    - update
+                    - delete
+                  description: Which record write the guardian is being asked to confirm.
+                contactId:
+                  description: Target contact. Required for update and delete.
+                  type: string
+                currentDisplayName:
+                  description:
+                    The target's current name, resolved by the caller, so the form can show what is changing. Gateway-owned
+                    facts are not read here.
+                  type: string
+                currentNotes:
+                  description:
+                    The target's current notes, resolved by the caller. The form submits a field only when it differs from what
+                    is stored.
+                  type: string
+                channels:
+                  description:
+                    The target's channels, resolved by the caller, so a delete confirmation can identify the contact and show
+                    what access is about to be lost.
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      type:
+                        type: string
+                      address:
+                        type: string
+                    required:
+                      - type
+                      - address
+                displayName:
+                  description: Proposed name, prefilled into the form. The guardian can edit it.
+                  type: string
+                notes:
+                  description: Proposed notes, prefilled into the form. The guardian can edit them.
+                  type: string
+                notesProposed:
+                  description:
+                    Whether the caller asked for these notes explicitly, so the form submits them even when they match what is
+                    stored.
+                  type: boolean
+                label:
+                  description: Display label shown in the form.
+                  type: string
+                description:
+                  description: Longer description shown in the form.
+                  type: string
+                timeoutMs:
+                  description:
+                    How long to hold the form open (ms). The caller waits slightly longer than this, so the form closing is
+                    what ends the wait. Defaults to 300000.
+                  type: integer
+                  exclusiveMinimum: 0
+                  maximum: 3600000
+              required:
+                - operation
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  error:
+                    type: string
+                  contactId:
+                    type: string
+                  notesSaved:
+                    type: boolean
+                  nothingWritten:
+                    type: boolean
                 required:
                   - ok
                 additionalProperties: false
@@ -6492,6 +6750,15 @@ paths:
                     interactionCount:
                       anyOf:
                         - type: number
+                        - type: "null"
+                    autoApproveThreshold:
+                      anyOf:
+                        - type: string
+                          enum:
+                            - none
+                            - low
+                            - medium
+                            - high
                         - type: "null"
                     createdAt:
                       type: number
@@ -14830,6 +15097,110 @@ paths:
                 required:
                   - ok
                 additionalProperties: false
+  /v1/inference/chatgpt-subscription/device-auth:
+    post:
+      operationId: inference_chatgptsubscription_deviceauth_post
+      summary: Start ChatGPT subscription device-code sign-in
+      description:
+        Mint a short user code the user types at OpenAI's device page, and start a background poll that stores the
+        tokens and upserts the provider connection once the sign-in is approved. Returns immediately; poll
+        `.../device-auth/status/{state}` for the outcome. The account must have device-code authorization for Codex
+        enabled in its ChatGPT security settings.
+      tags:
+        - inference
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  state:
+                    type: string
+                  user_code:
+                    type: string
+                  verification_url:
+                    type: string
+                  expires_at:
+                    type: string
+                  interval_seconds:
+                    type: number
+                required:
+                  - state
+                  - user_code
+                  - verification_url
+                  - expires_at
+                  - interval_seconds
+                additionalProperties: false
+  /v1/inference/chatgpt-subscription/device-auth/{state}:
+    delete:
+      operationId: inference_chatgptsubscription_deviceauth_by_state_delete
+      summary: Cancel a ChatGPT subscription device-code sign-in
+      description:
+        Stop the background poll for a device-code sign-in the user walked away from, and mark the flow `error`
+        with code `aborted`. A flow that already settled is left as it is. 404s an unknown state.
+      tags:
+        - inference
+      parameters:
+        - name: state
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  cancelled:
+                    type: boolean
+                required:
+                  - cancelled
+                additionalProperties: false
+        "404":
+          description: No active device sign-in for the given state
+  /v1/inference/chatgpt-subscription/device-auth/status/{state}:
+    get:
+      operationId: inference_chatgptsubscription_deviceauth_status_by_state_get
+      summary: Poll ChatGPT subscription device-code sign-in status
+      description:
+        Returns the current status of an in-flight device-code sign-in (pending/connected/error) so the client
+        knows when the tokens have landed. A failure carries OpenAI's error code in `error_code`.
+      tags:
+        - inference
+      parameters:
+        - name: state
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum:
+                      - pending
+                      - connected
+                      - error
+                  error:
+                    type: string
+                  error_code:
+                    type: string
+                required:
+                  - status
+                additionalProperties: false
+        "404":
+          description: No active device sign-in for the given state
   /v1/inference/models:
     get:
       operationId: inference_models_get
@@ -14847,7 +15218,7 @@ paths:
             type: string
           description:
             "Filter by provider id. One of: anthropic, openai, gemini, ollama, fireworks, together, openrouter,
-            vercel-ai-gateway, litellm, openai-compatible, minimax, atlascloud, baseten, poolside"
+            vercel-ai-gateway, litellm, opencode, openai-compatible, minimax, atlascloud, baseten, poolside, vellum"
       responses:
         "200":
           description: Successful response
@@ -14988,8 +15359,8 @@ paths:
           description: Profile not found
         "409":
           description:
-            Profile is still referenced by activeProfile, advisorProfile, a call site, a default-tier override, or a
-            mix arm
+            Profile is still referenced by activeProfile, advisorProfile, a call site, a default-tier override, a mix
+            arm, or another profile's fallbackProfile
     get:
       operationId: inference_profiles_by_name_get
       summary: Get an effective inference profile
@@ -15119,7 +15490,8 @@ paths:
             type: string
           description:
             "Filter by provider. One of: anthropic, openai, gemini, ollama, fireworks, together, openrouter,
-            vercel-ai-gateway, litellm, openai-compatible, minimax, atlascloud, baseten, poolside, vellum, chatgpt"
+            vercel-ai-gateway, litellm, opencode, openai-compatible, minimax, atlascloud, baseten, poolside, vellum,
+            chatgpt"
       responses:
         "200":
           description: Successful response
@@ -15589,6 +15961,129 @@ paths:
                 required:
                   - success
                 additionalProperties: false
+  /v1/integrations/discord/config:
+    delete:
+      operationId: integrations_discord_config_delete
+      summary: Clear Discord config
+      description:
+        Clear the stored Discord bot token, which disconnects the bot on the gateway's next watcher tick. Room
+        choices are left alone.
+      tags:
+        - integrations
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  hasBotToken:
+                    type: boolean
+                  connected:
+                    type: boolean
+                  error:
+                    type: string
+                  botUserId:
+                    type: string
+                  botUsername:
+                    type: string
+                  applicationId:
+                    type: string
+                  inviteUrl:
+                    type: string
+                required:
+                  - success
+                  - hasBotToken
+                  - connected
+                additionalProperties: false
+    get:
+      operationId: integrations_discord_config_get
+      summary: Get Discord config
+      description: Check whether a Discord bot token is configured.
+      tags:
+        - integrations
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  hasBotToken:
+                    type: boolean
+                  connected:
+                    type: boolean
+                  error:
+                    type: string
+                  botUserId:
+                    type: string
+                  botUsername:
+                    type: string
+                  applicationId:
+                    type: string
+                  inviteUrl:
+                    type: string
+                required:
+                  - success
+                  - hasBotToken
+                  - connected
+                additionalProperties: false
+    post:
+      operationId: integrations_discord_config_post
+      summary: Set Discord config
+      description:
+        "Validate a Discord bot token and store it. Storing it is what connects the bot: the gateway's Discord
+        client is credential-gated and starts on the watcher's next tick."
+      tags:
+        - integrations
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                botToken:
+                  type: string
+                  minLength: 1
+                  description: Discord bot token
+              required:
+                - botToken
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  hasBotToken:
+                    type: boolean
+                  connected:
+                    type: boolean
+                  error:
+                    type: string
+                  botUserId:
+                    type: string
+                  botUsername:
+                    type: string
+                  applicationId:
+                    type: string
+                  inviteUrl:
+                    type: string
+                required:
+                  - success
+                  - hasBotToken
+                  - connected
+                additionalProperties: false
   /v1/integrations/ingress/config:
     get:
       operationId: integrations_ingress_config_get
@@ -15748,11 +16243,13 @@ paths:
                     type: boolean
                   hasBotToken:
                     type: boolean
+                  connected:
+                    type: boolean
+                  error:
+                    type: string
                   hasAppToken:
                     type: boolean
                   hasUserToken:
-                    type: boolean
-                  connected:
                     type: boolean
                   teamId:
                     type: string
@@ -15769,16 +16266,14 @@ paths:
                     enum:
                       - mention_only
                       - mention_then_thread
-                  error:
-                    type: string
                   warning:
                     type: string
                 required:
                   - success
                   - hasBotToken
+                  - connected
                   - hasAppToken
                   - hasUserToken
-                  - connected
                   - threadMode
                 additionalProperties: false
     get:
@@ -15799,11 +16294,13 @@ paths:
                     type: boolean
                   hasBotToken:
                     type: boolean
+                  connected:
+                    type: boolean
+                  error:
+                    type: string
                   hasAppToken:
                     type: boolean
                   hasUserToken:
-                    type: boolean
-                  connected:
                     type: boolean
                   teamId:
                     type: string
@@ -15820,16 +16317,14 @@ paths:
                     enum:
                       - mention_only
                       - mention_then_thread
-                  error:
-                    type: string
                   warning:
                     type: string
                 required:
                   - success
                   - hasBotToken
+                  - connected
                   - hasAppToken
                   - hasUserToken
-                  - connected
                   - threadMode
                 additionalProperties: false
     patch:
@@ -15863,11 +16358,13 @@ paths:
                     type: boolean
                   hasBotToken:
                     type: boolean
+                  connected:
+                    type: boolean
+                  error:
+                    type: string
                   hasAppToken:
                     type: boolean
                   hasUserToken:
-                    type: boolean
-                  connected:
                     type: boolean
                   teamId:
                     type: string
@@ -15884,16 +16381,14 @@ paths:
                     enum:
                       - mention_only
                       - mention_then_thread
-                  error:
-                    type: string
                   warning:
                     type: string
                 required:
                   - success
                   - hasBotToken
+                  - connected
                   - hasAppToken
                   - hasUserToken
-                  - connected
                   - threadMode
                 additionalProperties: false
     post:
@@ -15910,14 +16405,14 @@ paths:
               type: object
               properties:
                 botToken:
-                  type: string
                   description: Slack bot token
-                appToken:
                   type: string
+                appToken:
                   description: Slack app-level token
-              required:
-                - botToken
-                - appToken
+                  type: string
+                userToken:
+                  description: Slack user token, for reading channels the bot is not in
+                  type: string
       responses:
         "200":
           description: Successful response
@@ -15930,11 +16425,13 @@ paths:
                     type: boolean
                   hasBotToken:
                     type: boolean
+                  connected:
+                    type: boolean
+                  error:
+                    type: string
                   hasAppToken:
                     type: boolean
                   hasUserToken:
-                    type: boolean
-                  connected:
                     type: boolean
                   teamId:
                     type: string
@@ -15951,16 +16448,14 @@ paths:
                     enum:
                       - mention_only
                       - mention_then_thread
-                  error:
-                    type: string
                   warning:
                     type: string
                 required:
                   - success
                   - hasBotToken
+                  - connected
                   - hasAppToken
                   - hasUserToken
-                  - connected
                   - threadMode
                 additionalProperties: false
   /v1/integrations/telegram/commands:
@@ -15982,17 +16477,17 @@ paths:
                     type: boolean
                   hasBotToken:
                     type: boolean
+                  connected:
+                    type: boolean
+                  error:
+                    type: string
                   botId:
                     type: string
                   botUsername:
                     type: string
-                  connected:
-                    type: boolean
                   hasWebhookSecret:
                     type: boolean
                   lastError:
-                    type: string
-                  error:
                     type: string
                   commandsRegistered:
                     type: array
@@ -16025,17 +16520,17 @@ paths:
                     type: boolean
                   hasBotToken:
                     type: boolean
+                  connected:
+                    type: boolean
+                  error:
+                    type: string
                   botId:
                     type: string
                   botUsername:
                     type: string
-                  connected:
-                    type: boolean
                   hasWebhookSecret:
                     type: boolean
                   lastError:
-                    type: string
-                  error:
                     type: string
                   commandsRegistered:
                     type: array
@@ -16067,17 +16562,17 @@ paths:
                     type: boolean
                   hasBotToken:
                     type: boolean
+                  connected:
+                    type: boolean
+                  error:
+                    type: string
                   botId:
                     type: string
                   botUsername:
                     type: string
-                  connected:
-                    type: boolean
                   hasWebhookSecret:
                     type: boolean
                   lastError:
-                    type: string
-                  error:
                     type: string
                   commandsRegistered:
                     type: array
@@ -16121,17 +16616,17 @@ paths:
                     type: boolean
                   hasBotToken:
                     type: boolean
+                  connected:
+                    type: boolean
+                  error:
+                    type: string
                   botId:
                     type: string
                   botUsername:
                     type: string
-                  connected:
-                    type: boolean
                   hasWebhookSecret:
                     type: boolean
                   lastError:
-                    type: string
-                  error:
                     type: string
                   commandsRegistered:
                     type: array
@@ -16164,17 +16659,17 @@ paths:
                     type: boolean
                   hasBotToken:
                     type: boolean
+                  connected:
+                    type: boolean
+                  error:
+                    type: string
                   botId:
                     type: string
                   botUsername:
                     type: string
-                  connected:
-                    type: boolean
                   hasWebhookSecret:
                     type: boolean
                   lastError:
-                    type: string
-                  error:
                     type: string
                   commandsRegistered:
                     type: array
@@ -25683,7 +26178,7 @@ paths:
     post:
       operationId: resolve_contact_prompt_post
       summary: "Gateway callback: resolve a pending contact prompt"
-      description: Called by the gateway after it writes the contact and channel. Unblocks the waiting contacts/prompt IPC call.
+      description: Called by the gateway after it writes the contact and channel. Unblocks the waiting contacts/prompt call.
       tags:
         - contacts
       responses:
@@ -31044,6 +31539,16 @@ paths:
                           enum:
                             - manual
                             - auto
+                        modelFamilies:
+                          type: array
+                          items:
+                            type: string
+                        baseModelFamily:
+                          type: string
+                        turnDetectionLanguages:
+                          type: array
+                          items:
+                            type: string
                         credentialsGuide:
                           type: string
                       required:
@@ -31662,6 +32167,26 @@ paths:
                           type: string
                           minLength: 1
                           maxLength: 64
+                        tool_name:
+                          type: string
+                          minLength: 1
+                          maxLength: 255
+                        risk_level:
+                          type: string
+                          minLength: 1
+                          maxLength: 32
+                        risk_threshold:
+                          type: string
+                          minLength: 1
+                          maxLength: 32
+                        surface:
+                          type: string
+                          minLength: 1
+                          maxLength: 64
+                        conversation_id:
+                          type: string
+                          minLength: 1
+                          maxLength: 128
                       required:
                         - event_name
                       description:
@@ -34758,6 +35283,12 @@ components:
                   - profile
                   - weight
             - type: "null"
+        fallbackProfile:
+          anyOf:
+            - readOnly: true
+              type: string
+              minLength: 1
+            - type: "null"
       additionalProperties: {}
     ProfileStatus:
       type: string
@@ -34942,6 +35473,7 @@ components:
         - openrouter
         - vercel-ai-gateway
         - litellm
+        - opencode
         - openai-compatible
         - minimax
         - atlascloud
@@ -35529,6 +36061,10 @@ components:
               - profile
               - weight
             additionalProperties: false
+        fallbackProfile:
+          readOnly: true
+          type: string
+          minLength: 1
         supportsVision:
           type: boolean
         invariant:

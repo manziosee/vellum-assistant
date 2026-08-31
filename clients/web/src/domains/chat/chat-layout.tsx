@@ -61,6 +61,7 @@ import { useChatLayoutDrawerGestures } from "@/domains/chat/hooks/use-chat-layou
 import { useChatLayoutShortcuts } from "@/domains/chat/hooks/use-chat-layout-shortcuts";
 import { useConversationActions } from "@/domains/chat/hooks/use-conversation-actions";
 import { useConversationGroupActions } from "@/domains/chat/hooks/use-conversation-group-actions";
+import { useConversationListDeepLink } from "@/domains/chat/hooks/use-conversation-list-deep-link";
 import { useMaterializedDraftReconcile } from "@/domains/chat/hooks/use-materialized-draft-reconcile";
 import { useGroupNameRequestStore } from "@/domains/chat/group-name-request-store";
 import { useCanUseInternalThreadActions } from "@/lib/auth/internal-thread-actions";
@@ -100,6 +101,7 @@ import { OnboardingAvatarApplier } from "@/components/onboarding-avatar-applier"
 import { VoiceSessionPillHost } from "@/domains/chat/components/voice-session-pill-host";
 import { useLiveVoiceSessionController } from "@/domains/chat/voice/live-voice/use-live-voice-session-controller";
 import { useSeedLiveVoiceSnapshot } from "@/domains/chat/voice/live-voice/use-seed-live-voice-snapshot";
+import { SightTile } from "@/domains/chat/sight/sight-tile";
 import { VoiceRoom } from "@/domains/chat/voice/voice-room/voice-room";
 import { useIsVoiceRoomVisible } from "@/domains/chat/voice/voice-room/use-is-voice-room-visible";
 import { ChatConversationHeader } from "./chat-conversation-header";
@@ -501,6 +503,19 @@ export function ChatLayout({
 
   const [drawerOpen, setDrawerOpen] = useState<boolean>(false);
 
+  // The two shapes the conversation list takes, as callbacks the deep-link
+  // drain below can hold. Blurring first is what the toggle and the swipe do:
+  // without it iOS keeps the soft keyboard up and the drawer slides in behind
+  // it looking stuck.
+  const openDrawerForDeepLink = useCallback(() => {
+    (document.activeElement as HTMLElement | null)?.blur();
+    setDrawerOpen(true);
+  }, []);
+  // Uncollapsing writes the persisted preference, same as the toggle: the user
+  // asked to see the list, and reverting it a moment later would be the
+  // surprise.
+  const expandSidebarForDeepLink = useCallback(() => setCollapsed(false), []);
+
   useEffect(() => {
     if (!isMobile) {
       setDrawerOpen(false);
@@ -515,6 +530,15 @@ export function ChatLayout({
   useEffect(() => {
     setDrawerOpen(false);
   }, [location.key]);
+
+  // The Home Screen widgets' unread chip and unread line
+  // (`deeplink.openConversations`), drained after the close-on-navigation
+  // effect above so an open it grants on the same commit is not undone by it.
+  useConversationListDeepLink({
+    isMobile,
+    openDrawer: openDrawerForDeepLink,
+    expandSidebar: expandSidebarForDeepLink,
+  });
 
   // The tips new-user grace clock anchors to first app use. Stamping here
   // (not only in the tip hook) covers mobile, where the drawer-gated tip
@@ -1279,6 +1303,12 @@ export function ChatLayout({
                 transcript render underneath, hidden by it. */}
             <VoiceRoom variant="content" />
           </main>
+          {/* The Eyes viewfinder, a sibling of `<main>` rather than a child:
+              it is a fixed corner tile, and nesting it under a box that can
+              take a filter would make that box the containing block for its
+              `position: fixed` and park it against `<main>`'s rectangle
+              instead of the viewport. Self-gates on the camera's status. */}
+          <SightTile />
         </div>
       )}
 

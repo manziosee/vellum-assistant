@@ -15,6 +15,8 @@ import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
 import { Trans, useTranslation } from "@/i18n";
 import { useSupportsRemoteWebPairing } from "@/lib/backwards-compat/remote-web-pairing-gate";
 import { useClientFeatureFlagStore } from "@/stores/client-feature-flag-store";
+import { handleNativeAnchorClick } from "@/utils/native-anchor";
+import { docsUrl, routes } from "@/utils/routes";
 
 import { CODE_CHIP_CLASS } from "./code-chip";
 import { resolvePairDeviceTarget } from "./pair-device-client";
@@ -57,9 +59,12 @@ const DOUBTED_KINDS = new Set<TunnelStatusView["kind"]>([
 
 const TUNNEL_HELP_COMMAND = "vellum tunnel --help";
 
+/** Public how-to for the whole tunnel-and-pair flow this card is one step of. */
+const PAIRING_DOCS_URL = docsUrl(routes.docs.pairADevice);
+
 /**
  * Settings card that pairs another device to this assistant without shell
- * commands, the UI equivalent of `vellum pair --qr`. It mints and auto-approves a
+ * commands, the UI equivalent of `vellum pair`. It mints and auto-approves a
  * device-code challenge against the host's loopback gateway and renders the
  * https pair URL as a QR with a copyable link and expiry countdown. It also
  * hosts the approval list for pairing requests minted elsewhere
@@ -318,6 +323,16 @@ export function PairDeviceCard() {
             revalidateKey={devicesRevalidateKey}
           />
         )}
+
+        <a
+          href={PAIRING_DOCS_URL}
+          target="_blank"
+          rel="noopener noreferrer"
+          onClick={(event) => handleNativeAnchorClick(event, PAIRING_DOCS_URL)}
+          className="self-start text-body-medium-default text-[var(--content-tertiary)] underline hover:text-[var(--content-default)]"
+        >
+          {t("pairDeviceCard.learnMore")}
+        </a>
       </div>
     </DetailCard>
   );

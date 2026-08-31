@@ -7,22 +7,21 @@ import { captureTakeoverAvatarStash } from "@/lib/billing/takeover-avatar-stash"
 import { proPackageDisplayName } from "@/domains/settings/billing/package-types";
 import { currentPlanFeatures } from "@/domains/settings/billing/plan-spec";
 import { useCancelSubscription } from "@/domains/settings/billing/use-cancel-subscription";
+import { useReactivateSubscription } from "@/domains/settings/billing/use-reactivate-subscription";
 import {
   buildPortalReturnSnapshot,
   formatGraceDate,
   getEffectiveCancelDate,
   useBillingPortalSession,
 } from "@/domains/settings/hooks/use-billing-portal-session";
+import { invalidateBillingQueries } from "@/domains/settings/billing/invalidate-billing-queries";
 import {
   organizationsBillingPlansRetrieveOptions,
-  organizationsBillingPlansRetrieveQueryKey,
   organizationsBillingSubscriptionChangeCreditTierCreateMutation,
   organizationsBillingSubscriptionChangeMachineTierCreateMutation,
   organizationsBillingSubscriptionChangeStorageTierCreateMutation,
   organizationsBillingSubscriptionOnboardingRetrieveOptions,
-  organizationsBillingSubscriptionOnboardingRetrieveQueryKey,
   organizationsBillingSubscriptionRetrieveOptions,
-  organizationsBillingSubscriptionRetrieveQueryKey,
   organizationsBillingSubscriptionUpgradeCreateMutation,
 } from "@/generated/api/@tanstack/react-query.gen";
 import type {
@@ -96,9 +95,12 @@ function AdjustPlanModalContent({
     organizationsBillingSubscriptionChangeCreditTierCreateMutation(),
   );
   const portalSnapshot = buildPortalReturnSnapshot(subscriptionQuery.data);
-  // The portal is still where "Keep your Plan" reactivates a pending
-  // cancellation; the cancellation itself posts the cancel endpoint directly.
+  // "Keep your Plan" posts the reactivate endpoint and the cancellation posts
+  // the cancel endpoint; the portal is the fallback for subscriptions those
+  // endpoints reject (non-entitlement status).
   const portalMutation = useBillingPortalSession(portalSnapshot);
+  const { reactivateSubscription, isPending: reactivatePending } =
+    useReactivateSubscription();
   const { cancelSubscription, isPending: cancelPending } =
     useCancelSubscription();
   const [view, setView] = useState<"plans" | "downgrade-confirm">("plans");
@@ -120,15 +122,7 @@ function AdjustPlanModalContent({
   // surrounding UI re-fetches, then close the modal.
   useEffect(() => {
     return openUrlFinishedListener(() => {
-      void queryClient.invalidateQueries({
-        queryKey: organizationsBillingSubscriptionRetrieveQueryKey(),
-      });
-      void queryClient.invalidateQueries({
-        queryKey: organizationsBillingPlansRetrieveQueryKey(),
-      });
-      void queryClient.invalidateQueries({
-        queryKey: organizationsBillingSubscriptionOnboardingRetrieveQueryKey(),
-      });
+      void invalidateBillingQueries(queryClient);
       onClose();
     });
   }, [queryClient, onClose]);
@@ -352,18 +346,6 @@ function AdjustPlanModalContent({
     }
   };
 
-  const invalidateBillingQueries = () => {
-    void queryClient.invalidateQueries({
-      queryKey: organizationsBillingSubscriptionRetrieveQueryKey(),
-    });
-    void queryClient.invalidateQueries({
-      queryKey: organizationsBillingSubscriptionOnboardingRetrieveQueryKey(),
-    });
-    void queryClient.invalidateQueries({
-      queryKey: organizationsBillingPlansRetrieveQueryKey(),
-    });
-  };
-
   const tierChangePending =
     changeMachineTierMutation.isPending ||
     changeStorageTierMutation.isPending ||
@@ -450,7 +432,7 @@ function AdjustPlanModalContent({
     }
 
     void Promise.all(pending).then((results) => {
-      invalidateBillingQueries();
+      void invalidateBillingQueries(queryClient);
 
       // A storage change is always an upgrade (downgrades are disabled in the
       // picker). A machine change needs the explicit downgrade check.
@@ -702,13 +684,23 @@ function AdjustPlanModalContent({
                             creditChanged={creditChanged}
                             tierChangeError={tierChangeError}
                             upgradePending={upgradeMutation.isPending}
-                            portalPending={portalMutation.isPending}
+                            billingActionPending={
+                              portalMutation.isPending || reactivatePending
+                            }
                             onUpgrade={handleUpgrade}
                             onApplyTierChange={handleApplyTierChange}
                             onDowngradeClick={() =>
                               setView("downgrade-confirm")
                             }
-                            onKeepPlan={() => portalMutation.mutate({})}
+                            onKeepPlan={() => {
+                              if (
+                                !isDirectCancelEligible(subscriptionQuery.data)
+                              ) {
+                                portalMutation.mutate({});
+                                return;
+                              }
+                              void reactivateSubscription();
+                            }}
                           />
                         );
                       })}

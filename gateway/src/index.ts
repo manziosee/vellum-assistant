@@ -1,6 +1,6 @@
 process.title = "vellum-gateway";
 
-import { slackEventRefersToAnotherMessage } from "./slack/event-kind.js";
+import { eventRefersToAnotherMessage } from "./channels/inbound-event.js";
 import { buildSlackSourceMetadata } from "./slack/source-metadata.js";
 import { randomBytes } from "node:crypto";
 
@@ -90,7 +90,10 @@ import { createTwilioControlPlaneProxyHandler } from "./http/routes/twilio-contr
 import { createVercelControlPlaneProxyHandler } from "./http/routes/vercel-control-plane-proxy.js";
 import { createContactsControlPlaneProxyHandler } from "./http/routes/contacts-control-plane-proxy.js";
 import { buildContactsControlPlaneRoutes } from "./http/routes/contacts-control-plane-route-table.js";
-import { handleContactPromptSubmit } from "./http/routes/contact-prompt.js";
+import {
+  handleContactPromptSubmit,
+  handleContactRecordSubmit,
+} from "./http/routes/contact-prompt.js";
 import {
   handleListDevices,
   handleRevokeDevice,
@@ -190,7 +193,6 @@ import { downloadSlackFile } from "./slack/download.js";
 import { slackBotContactNote } from "./slack/actor.js";
 import { DiscordGatewayClient } from "./discord/gateway-socket.js";
 import { createDiscordInboundEventHandler } from "./discord/forward.js";
-import { readDiscordAllowedChannelIds } from "./discord/allowed-channels.js";
 import { handleInbound } from "./handlers/handle-inbound.js";
 import { upsertContactChannel } from "./verification/contact-helpers.js";
 import { checkAuthRateLimit } from "./http/middleware/rate-limit.js";
@@ -228,10 +230,7 @@ import { inviteRoutes } from "./ipc/invite-handlers.js";
 import { verificationSessionRoutes } from "./ipc/verification-session-handlers.js";
 import { guardianRequestRoutes } from "./ipc/guardian-request-handlers.js";
 import { featureFlagRoutes } from "./ipc/feature-flag-handlers.js";
-import {
-  admissionPolicyRoutes,
-  createDiscordAdmissionRoutes,
-} from "./ipc/admission-policy-handlers.js";
+import { admissionPolicyRoutes } from "./ipc/admission-policy-handlers.js";
 import { channelPermissionRoutes } from "./ipc/channel-permission-handlers.js";
 import { trustVerdictRoutes } from "./ipc/trust-verdict-handlers.js";
 import { guardianDeliveryRoutes } from "./ipc/guardian-delivery-handlers.js";
@@ -245,9 +244,6 @@ import { trustRulesRoutes } from "./ipc/trust-rules-handlers.js";
 import { riskClassificationRoutes } from "./ipc/risk-classification-handlers.js";
 import { createVelayRoutes } from "./ipc/velay-handlers.js";
 import { refreshRouteSchema } from "./ipc/route-schema-cache.js";
-import { AvatarChannelSyncer } from "./avatar-sync/avatar-channel-syncer.js";
-import { AvatarSyncWatcher } from "./avatar-sync/avatar-sync-watcher.js";
-import { SlackAvatarSyncer } from "./avatar-sync/slack-avatar-syncer.js";
 import { initGatewayDb } from "./db/connection.js";
 import { cleanupExpiredInboundEvents } from "./db/inbound-dedup-store.js";
 import { runPostAssistantReady } from "./post-assistant-ready.js";
@@ -412,17 +408,12 @@ async function main() {
     configFile: configFileCache,
   });
 
-  // ── Avatar sync ──
-  const avatarChannelSyncer = new AvatarChannelSyncer();
-  const avatarSyncWatcher = new AvatarSyncWatcher(avatarChannelSyncer);
-
   // ── Integration readiness flags ──
   // Track whether each integration has valid credentials so route
   // preconditions can gate requests synchronously. Updated by the
   // credential watcher callback whenever credentials change.
   let telegramReady = false;
   let whatsappReady = false;
-  let slackReady = false;
   let vellumReady = false;
   let velayStartRequested = false;
 
@@ -561,6 +552,15 @@ async function main() {
     config,
     "stt",
     { credentials: credentialCache },
+  );
+  // Managed STT v2 (Flux). Separate handler rather than a param on v1: the
+  // contract version is the endpoint, and v2 accepts query params v1 must
+  // keep rejecting.
+  const handleSpeechRelaySttV2Ws = createSpeechRelayUpgradeHandler(
+    config,
+    "stt",
+    { credentials: credentialCache },
+    "v2",
   );
   const handleSpeechRelayTtsWs = createSpeechRelayUpgradeHandler(
     config,
@@ -911,6 +911,7 @@ async function main() {
     ...buildContactsControlPlaneRoutes({
       contactsControlPlaneProxy,
       handleContactPromptSubmit,
+      handleContactRecordSubmit,
     }),
 
     // ── Generic loopback pairing (localhost-only, auth: none) ──
@@ -2204,6 +2205,12 @@ async function main() {
       return undefined as unknown as Response;
     }
 
+    if (url.pathname === "/v2/speech/stt/stream") {
+      const upgradeResult = await handleSpeechRelaySttV2Ws(req, server);
+      if (upgradeResult !== undefined) return upgradeResult;
+      return undefined as unknown as Response;
+    }
+
     if (url.pathname === "/v1/speech/tts/stream") {
       const upgradeResult = await handleSpeechRelayTtsWs(req, server);
       if (upgradeResult !== undefined) return upgradeResult;
@@ -2429,7 +2436,7 @@ async function main() {
         if (!threadTs && origMessageTs) params.set("messageTs", origMessageTs);
         const replyCallbackUrl = `${config.gatewayInternalBaseUrl}/deliver/slack?${params}`;
 
-        const refersToAnotherMessage = slackEventRefersToAnotherMessage(
+        const refersToAnotherMessage = eventRefersToAnotherMessage(
           normalized.event.message,
         );
         const slackSourceMetadata = buildSlackSourceMetadata(normalized);
@@ -2644,13 +2651,27 @@ async function main() {
       return;
     }
 
+    // Room admission defers to Discord's own channel permissions. A
+    // non-empty legacy allow-list is persisted operator intent, so it keeps
+    // gating rooms until the operator clears it; the log names the way out.
+    const readLegacyAllowedChannelIds = (): ReadonlySet<string> | undefined => {
+      const ids =
+        configFileCache.getStringArray("discord", "allowedChannelIds") ?? [];
+      return ids.length > 0 ? new Set(ids) : undefined;
+    };
+    if (readLegacyAllowedChannelIds() !== undefined) {
+      log.warn(
+        "discord.allowedChannelIds is a legacy setting and is still " +
+          "enforced: the bot answers mentions only in listed channels. To " +
+          "adopt Discord's own permission model, scope the bot with View " +
+          "Channel permissions in Discord and remove the config entry.",
+      );
+    }
+
     discordGatewayClient = new DiscordGatewayClient(
       {
         botToken,
-        // Read live (the config cache is TTL'd) so an allow-list edit applies
-        // without a client restart, which would spend an IDENTIFY.
-        readAllowedChannelIds: () =>
-          readDiscordAllowedChannelIds(configFileCache),
+        readLegacyAllowedChannelIds,
       },
       createDiscordInboundEventHandler({
         config,
@@ -2674,6 +2695,13 @@ async function main() {
   // first message evaluates flags against stale values (see JARVIS-1018).
   let remoteFeatureFlagSyncRef: RemoteFeatureFlagSync | null = null;
 
+  /**
+   * Fingerprint of the Telegram bot token the dedup cache's watermark belongs
+   * to. Null while no token is stored, which is itself a bot change: the next
+   * bot to arrive must not meet the departed one's mark.
+   */
+  let lastTelegramTokenFingerprint: string | null = null;
+
   const credentialWatcher = new CredentialWatcher((event) => {
     const changed = detectCredentialChanges(event, log);
 
@@ -2693,9 +2721,6 @@ async function main() {
       whatsappCreds?.phone_number_id && whatsappCreds?.access_token
     );
 
-    const slackCreds = event.credentials.get("slack_channel");
-    slackReady = !!(slackCreds?.bot_token && slackCreds?.app_token);
-
     const vellumCreds = event.credentials.get("vellum");
     vellumReady = !!(
       vellumCreds?.platform_base_url &&
@@ -2705,6 +2730,25 @@ async function main() {
     const twilioCreds = event.credentials.get("twilio");
 
     // Side effects keyed by service name
+    // `update_id` is a per-bot sequence, so a replacement bot starts below the
+    // previous one's high-water mark and every inbound would be rejected as an
+    // already-processed replay and answered 200. Forgetting the mark is what
+    // keeps delivery working across a bot swap.
+    //
+    // Keyed on the token itself rather than on `changed`. Every `keys.enc`
+    // write polls with `forceChanged`, which reports every configured service
+    // as changed even when its plaintext is identical, so re-saving an
+    // unrelated credential would otherwise clear replay protection for a bot
+    // that never moved and let a delayed retry be processed twice.
+    const telegramTokenFingerprint = telegramCreds?.bot_token
+      ? new Bun.CryptoHasher("sha256")
+          .update(telegramCreds.bot_token)
+          .digest("hex")
+      : null;
+    if (telegramTokenFingerprint !== lastTelegramTokenFingerprint) {
+      lastTelegramTokenFingerprint = telegramTokenFingerprint;
+      telegramDedupCache.reset();
+    }
     if (changed.has("telegram") && telegramReady) {
       registerTelegramCommands();
       reconcileTelegramWebhook(telegramCaches).catch((err) => {
@@ -2730,15 +2774,6 @@ async function main() {
           "Failed to restart Slack Socket Mode after credential change",
         );
       });
-
-      if (slackReady) {
-        avatarChannelSyncer.register(new SlackAvatarSyncer(credentialCache));
-        avatarChannelSyncer.syncToChannel("slack").catch((err) => {
-          log.warn({ err }, "Initial Slack avatar sync failed");
-        });
-      } else {
-        avatarChannelSyncer.unregister("slack");
-      }
     }
 
     if (changed.has("twilio")) {
@@ -2815,10 +2850,6 @@ async function main() {
   // cleared before those side effects can register external callbacks.
   await credentialWatcher.start();
 
-  // Start watching avatar directory for changes after credential watcher
-  // so channel syncers are already registered before the first file event.
-  avatarSyncWatcher.start();
-
   const configFileWatcher = new ConfigFileWatcher((event) => {
     // Invalidate the config file cache so subsequent reads pick up fresh values
     configFileCache.invalidate();
@@ -2892,7 +2923,6 @@ async function main() {
     ...slackThreadRoutes,
     ...thresholdRoutes,
     ...admissionPolicyRoutes,
-    ...createDiscordAdmissionRoutes(configFileCache),
     ...channelPermissionRoutes,
     ...trustVerdictRoutes,
     ...guardianDeliveryRoutes,
@@ -2987,7 +3017,6 @@ async function main() {
     backupWorkerHandle.stop();
     credentialWatcher.stop();
     configFileWatcher.stop();
-    avatarSyncWatcher.stop();
     featureFlagWatcher.stop();
     remoteFeatureFlagSync.stop();
     // Stop the timer and flush any buffered auth-fallback counts before exit.

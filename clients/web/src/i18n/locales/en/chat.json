@@ -94,7 +94,8 @@
     "bulkActionMembersFailed": "Couldn't load every conversation in this section. Try again.",
     "closeNavAria": "Close navigation",
     "navAria": "Assistant navigation",
-    "searchShortcut": "Search (⌘K)"
+    "search": "Search",
+    "searchShortcut": "Search ({shortcut})"
   },
   "assistantSwitcher": {
     "collapse": "Hide assistants",
@@ -124,8 +125,15 @@
     "downloadAria": "Download {filename}",
     "downloadLabel": "Download",
     "nextAttachmentAria": "Next attachment",
+    "pdfLoadFailed": "Couldn't display this PDF",
     "previewAria": "Preview of {filename}",
     "previousAttachmentAria": "Previous attachment"
+  },
+  "attachmentTile": {
+    "cancelUpload": "Cancel upload of {filename}",
+    "preview": "Preview {filename}",
+    "remove": "Remove {filename}",
+    "uploading": "Uploading {filename}"
   },
   "backgroundTaskDetailPanel": {
     "closeDetail": "Close task detail",
@@ -239,8 +247,38 @@
     "shutter": "Take photo",
     "title": "Take a photo"
   },
+  "cameraError": {
+    "captureFailed": "Couldn't take that photo.",
+    "deviceInUse": "Another app is using the camera.",
+    "noDevice": "No camera found.",
+    "notDelivered": "Reconnecting. Take that one again.",
+    "permissionDenied": "Camera access is off for Vellum.",
+    "refused": "Your assistant can't receive photos yet.",
+    "storeFailed": "Couldn't add that photo to the conversation.",
+    "unknown": "Couldn't open the camera.",
+    "unsupported": "This device can't open a camera.",
+    "uploadFailed": "Couldn't send that photo."
+  },
+  "cameraStatusPill": {
+    "announceLive": "Live. {status}",
+    "announceLiveMuted": "Live. Muted. {status}",
+    "announceLiveMutedSpeaking": "Live. Muted. {name} speaking",
+    "announceLiveSpeaking": "Live. {name} speaking",
+    "announcePhoto": "Photo. {status}",
+    "announcePhotoMuted": "Photo. Muted. {status}",
+    "announcePhotoMutedSpeaking": "Photo. Muted. {name} speaking",
+    "announcePhotoSpeaking": "Photo. {name} speaking",
+    "live": "Live",
+    "photo": "Photo",
+    "yourAssistant": "Your assistant"
+  },
   "cardSurface": {
     "tasksProgress": "{completed} / {total} tasks"
+  },
+  "channelReferenceChip": {
+    "heading": "Referencing a {channel} message",
+    "headingWithSender": "Referencing {sender} on {channel}",
+    "removeAria": "Remove the referenced message"
   },
   "channelSetupPanel": {
     "accountSid": "Account SID",
@@ -259,7 +297,33 @@
     "setupTitle": "{channel} setup",
     "slackConnected": "Your assistant is ready to receive messages on Slack.",
     "telegramConnected": "Your assistant is ready to receive messages on Telegram.",
-    "twilioIntro": "Enter your Twilio credentials from the <consoleLink>Twilio Console</consoleLink>. After saving, return to the chat. Your assistant will finish configuring your phone number and webhooks."
+    "twilioIntro": "Enter your Twilio credentials from the <consoleLink>Twilio Console</consoleLink>. After saving, return to the chat. Your assistant will finish configuring your phone number and webhooks.",
+    "discordConnected": "Discord is connected. Add the bot to a server and it will start answering there."
+  },
+  "channelThreadControl": {
+    "closeAria": "Close the {channel} thread",
+    "label": "{channel} thread",
+    "openAria": "Open the {channel} thread"
+  },
+  "channelTranscriptPanel": {
+    "assistantSender": "Assistant",
+    "closeAria": "Close the channel thread",
+    "closeTooltip": "Close",
+    "emptyNoMessageDetail": "{channel} does not send Vellum the per-message details this view needs, so there is nothing to list here. Open the conversation in {channel} to read it in full.",
+    "emptyThread": "No {channel} messages in this conversation yet.",
+    "namedTitle": "{channel} · {thread}",
+    "noText": "No text content",
+    "openInChannel": "Open in {channel}",
+    "reactionAdded": "Reacted with {emoji}",
+    "reactionRemoved": "Removed the {emoji} reaction",
+    "readOnly": "Read only",
+    "readOnlyNote": "This is the conversation as it stands in {channel}. Vellum's composer is the only place you can write.",
+    "reference": "Reference in Vellum",
+    "referenceAria": "Reference this {channel} message in Vellum",
+    "referenced": "Referenced",
+    "removeReferenceAria": "Remove this reference from the Vellum composer",
+    "title": "{channel} thread",
+    "unknownSender": "Unknown sender"
   },
   "chatAttachments": {
     "attachFileAria": "Attach file",
@@ -273,6 +337,8 @@
     "addToChat": "Add to chat",
     "askAssistantPlaceholder": "Ask {assistantName}",
     "configureVoice": "Configure voice",
+    "endOtherVoiceSession": "End it and start here",
+    "goToVoiceSession": "Go to it",
     "recording": "Recording",
     "sendMessage": "Send message",
     "stopGenerating": "Stop generating",
@@ -324,7 +390,6 @@
     "createTitle": "Create Trust Rule",
     "description": "Matching tool calls take this rule's risk level, so your approval tolerance can auto-approve them.",
     "editTitle": "Edit Trust Rule",
-    "everywhere": "Everywhere",
     "narrowerScopeAria": "Narrower scope",
     "orNarrowScope": "Or narrow the scope:",
     "save": "Save",
@@ -332,8 +397,7 @@
     "saveRule": "Save Rule",
     "saving": "Saving…",
     "suggested": "Suggested: {risk}",
-    "treatAs": "Treat as",
-    "where": "Where"
+    "treatAs": "Treat as"
   },
   "choiceSurface": {
     "continue": "Continue",
@@ -416,11 +480,11 @@
     "loadingProfiles": "Loading profiles…",
     "modelProfile": "Model Profile",
     "modelProfileTitle": "Model profile",
-    "newProfile": "New Profile",
     "profileAria": "Model profile: {label}",
     "profileAriaFallback": "Model profile",
     "profileSwitchFailed": "Profile created, but couldn't switch to it",
-    "profileSwitchFallback": "Failed to switch profile. Please try again."
+    "profileSwitchFallback": "Failed to switch profile. Please try again.",
+    "quickAdd": "New Model"
   },
   "confirmationActions": {
     "submitFailed": "Failed to submit confirmation. Please try again.",
@@ -435,6 +499,9 @@
     "toolLabel": "Tool:"
   },
   "contactActions": {
+    "cancelFailed": "Failed to dismiss the form. Please try again.",
+    "recordCancelFailed": "Failed to dismiss the form. Please try again.",
+    "recordSaveFailed": "Failed to save the contact. Please try again.",
     "saveFailed": "Failed to save contact. Please try again."
   },
   "contactPromptCard": {
@@ -443,8 +510,26 @@
     "contactSaved": "Contact saved",
     "dismiss": "Dismiss",
     "enterAddress": "Enter {channel} address",
+    "markVerified": "Mark this address verified",
+    "markVerifiedHelp": "A verified address is allowed to message your assistant.",
     "save": "Save",
     "saving": "Saving…"
+  },
+  "contactRecordCard": {
+    "cancel": "Cancel",
+    "contactDeleted": "Contact deleted",
+    "contactSaved": "Contact saved",
+    "createTitle": "Add a contact",
+    "delete": "Delete",
+    "deleteTitle": "Delete {name}?",
+    "deleteWarning": "This also removes their channels, so they can no longer reach your assistant.",
+    "dismiss": "Dismiss",
+    "namePlaceholder": "Name",
+    "noChannels": "This contact has no channels.",
+    "notesPlaceholder": "Notes (optional)",
+    "save": "Save",
+    "saving": "Saving…",
+    "updateTitle": "Update {name}"
   },
   "contextWindowIndicator": {
     "clearContext": "Clear Context",
@@ -553,9 +638,6 @@
     "title": "Delete conversation",
     "untitled": "Untitled"
   },
-  "detailPanelStopButton": {
-    "tooltip": "Stop"
-  },
   "documentAssetActions": {
     "pdfDownloadFailed": "Failed to download PDF"
   },
@@ -606,6 +688,7 @@
     "wordCount": "{count, plural, one {# word} other {# words}}"
   },
   "documentViewerPage": {
+    "exportFailed": "Failed to export PDF",
     "notFound": "Document not found."
   },
   "dynamicPageSurface": {
@@ -727,8 +810,25 @@
     "scopedToTurn": "Scoped to turn {index} of {count} · ",
     "title": "LLM Context Inspector"
   },
+  "liveVoiceBusy": {
+    "android": "Voice is already active in the Android app.",
+    "ios": "Voice is already active in the iOS app.",
+    "macos": "Voice is already active in the Mac app.",
+    "unknown": "Voice is already active somewhere else.",
+    "web": "Voice is already active in another browser tab.",
+    "windows": "Voice is already active in the Windows app."
+  },
   "liveVoiceButton": {
     "startVoiceMode": "Start voice mode"
+  },
+  "liveVoiceStatus": {
+    "connecting": "Connecting…",
+    "ending": "Ending…",
+    "listening": "Listening…",
+    "muted": "Muted",
+    "reconnecting": "Reconnecting…",
+    "speaking": "Speaking…",
+    "thinking": "Thinking…"
   },
   "llmCallErrorCard": {
     "chipCode": "Code",
@@ -1074,6 +1174,12 @@
   "pageTabs": {
     "formStepsAria": "Form steps"
   },
+  "pdfPageSkeleton": {
+    "loadingPdf": "Loading PDF"
+  },
+  "pdfPreview": {
+    "pageCapNotice": "{count, plural, one {Showing the first page} other {Showing the first # pages}}"
+  },
   "phaseGroupedStepList": {
     "startedAt": "Started at {time}"
   },
@@ -1105,10 +1211,13 @@
   "preferencesUsagePanel": {
     "addCreditsAriaLabel": "Add credits",
     "exhausted": "Add credits to continue.",
+    "extraCredits": "Now using extra usage credits",
     "pctUsed": "{pct}% used",
-    "resets": "Resets {date}",
     "settingsAriaLabel": "Usage and billing settings",
     "title": "Usage"
+  },
+  "previewError": {
+    "cannotPreview": "Can't preview this file"
   },
   "previewMessageCard": {
     "download": "Download",
@@ -1117,9 +1226,14 @@
   "previewSkeleton": {
     "loadingPreview": "Loading preview"
   },
+  "previewTruncationNotice": {
+    "markdown": "Showing the first 512 KB",
+    "text": "Showing the first 2 MB"
+  },
   "previewUnsupported": {
     "downloadFile": "Download file",
-    "goToFile": "Go to file"
+    "goToFile": "Go to file",
+    "noPreviewForType": "No preview for this file type"
   },
   "promptSubmission": {
     "noActiveSession": "No active session. Please try again."
@@ -1151,18 +1265,19 @@
     "submitFailed": "Failed to submit response. Please try again."
   },
   "questionPromptCard": {
-    "closeQuestionAria": "Close question",
+    "expandAria": "Reopen question",
+    "minimizeAria": "Minimize question",
     "nextQuestionAria": "Next question",
     "optionAria": "Option {number}: {label}",
-    "position": "{current} of {total}",
     "previousQuestionAria": "Previous question",
+    "position": "{current} of {total}",
     "sendResponseAria": "Send response",
     "skip": "Skip",
     "skipAria": "Skip this question",
     "skipped": "Skipped",
     "skippedHint": "Skipped - pick an option to override",
     "typeDifferentAnswerAria": "Type a different answer",
-    "typeSomethingElsePlaceholder": "Type something else"
+    "typeSomethingElsePlaceholder": "Something else"
   },
   "queuedMessagesDrawer": {
     "cancelAll": "Cancel all",
@@ -1316,6 +1431,17 @@
   },
   "sidebarListContextMenu": {
     "newGroup": "New group…"
+  },
+  "sightTile": {
+    "close": "Close camera",
+    "interrupted": "The camera was disconnected.",
+    "permissionDenied": "Camera access is blocked. Allow it in your browser settings.",
+    "unavailable": "No camera is available."
+  },
+  "sightToggle": {
+    "busyInCall": "The voice call is using the camera",
+    "turnOff": "Turn off camera vision",
+    "turnOn": "Turn on camera vision"
   },
   "singleActivity": {
     "webSearch": "Web Search"
@@ -1523,6 +1649,9 @@
     "unmuteAssistant": "Unmute assistant",
     "unmuteMicrophone": "Unmute microphone"
   },
+  "voiceEntryGreeting": {
+    "seed": "Hey, I just started a voice conversation with you. This message is sent automatically. Greet me in one short sentence, then ask what I'd like to work on."
+  },
   "voiceErrors": {
     "nativeSttNoTranscript": "{clientName} Native Dictation didn’t return a transcript. Check native speech recognition in system settings, then try again."
   },
@@ -1547,6 +1676,10 @@
     "closeCamera": "Close camera",
     "endSessionAria": "End voice session",
     "endSessionTooltip": "End session",
+    "flashAuto": "Flash auto",
+    "flashAutoBadge": "A",
+    "flashOff": "Flash off",
+    "flashOn": "Flash on",
     "flipCamera": "Flip camera",
     "minimizeAria": "Minimize voice room",
     "minimizeTooltip": "Minimize (session keeps going)",

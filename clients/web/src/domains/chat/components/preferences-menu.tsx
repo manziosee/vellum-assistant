@@ -57,12 +57,13 @@ const AddCreditsModal = lazy(() =>
 /**
  * Whether the credits row belongs below the usage panel.
  *
- * Under `obscure-credits` the dollar balance stays hidden while the included
- * bundle still has room: the bar is the reading that matters there, and a
- * second number beside it only invites the arithmetic the flag exists to
- * avoid. Once the bundle is spent the next turn draws on the wallet instead,
- * so the row that names it comes back, unless the wallet is empty too and the
- * panel's add-credits strip is already saying so.
+ * Under `obscure-credits` the dollar balance stays hidden whenever there is a
+ * usage reading to stand in for it. While the included bundle has room the
+ * bar is the reading that matters, and a second number beside it only invites
+ * the arithmetic the flag exists to avoid. Once the bundle is spent the panel
+ * itself says the next turn draws on extra usage credits, and once the wallet
+ * is empty too its add-credits strip takes over, so the row never earns its
+ * place.
  *
  * With no reading to hide behind, the row stays: the panel renders nothing
  * without one, and hiding the row too would leave the menu with no balance and
@@ -73,10 +74,7 @@ export function showsMenuCredits(
   obscureCredits: boolean,
   usage: PreferencesUsage | null,
 ): boolean {
-  if (!obscureCredits || usage == null) {
-    return true;
-  }
-  return usage.spent && !usage.exhausted;
+  return !obscureCredits || usage == null;
 }
 
 export interface PreferencesMenuProps {
@@ -223,7 +221,7 @@ export function PreferencesMenu({
               event.preventDefault();
               content?.focus();
             }}
-            className="w-64 rounded-lg p-4"
+            className="w-64"
           >
             {content}
           </Popover.Content>
@@ -284,7 +282,7 @@ function PreferencesMenuContent({
     <>
       <ThemeToggle className="px-2 py-0" />
 
-      <div className="my-2 border-t border-[var(--border-subtle)]" />
+      <div className="my-1 h-px bg-[var(--border-base)]" />
 
       <PreferencesUsagePanel
         conversationId={activeConversationId}
