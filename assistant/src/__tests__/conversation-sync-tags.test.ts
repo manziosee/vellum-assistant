@@ -85,9 +85,7 @@ describe("conversation sync tags", () => {
     // (`patchConversation` in `metadata-handlers.ts`) and the per-
     // conversation `sync_changed` metadata tag is included as a belt-and-
     // suspenders signal for sibling-tab consumers that missed the typed
-    // event. The legacy `conversation_list_invalidated` broadcast is
-    // scoped to `targetInterfaceId: "macos"` and therefore not visible to
-    // this process-type subscriber.
+    // event. No `conversation_list_invalidated` broadcast is emitted.
     const conversation = createConversation("Old title");
     const route = findRoute(
       CONVERSATION_MANAGEMENT_ROUTES,
@@ -119,7 +117,9 @@ describe("conversation sync tags", () => {
     // reach this process-type subscriber.
     expect(
       received.some(
-        (event) => event.message.type === "conversation_list_invalidated",
+        (event) =>
+          (event.message as { type: string }).type ===
+          "conversation_list_invalidated",
       ),
     ).toBe(false);
   });
@@ -187,7 +187,9 @@ describe("conversation sync tags", () => {
     });
     expect(
       received.some(
-        (event) => event.message.type === "conversation_list_invalidated",
+        (event) =>
+          (event.message as { type: string }).type ===
+          "conversation_list_invalidated",
       ),
     ).toBe(false);
   });
@@ -230,7 +232,9 @@ describe("conversation sync tags", () => {
     });
     expect(
       received.some(
-        (event) => event.message.type === "conversation_list_invalidated",
+        (event) =>
+          (event.message as { type: string }).type ===
+          "conversation_list_invalidated",
       ),
     ).toBe(false);
   });
@@ -246,10 +250,7 @@ describe("conversation sync tags", () => {
     // `conversation:<id>:metadata` tag, which web consumes by GET-and-
     // patching the single cached row via `refreshConversationRow`.
     //
-    // The legacy `conversation_list_invalidated` broadcast is still
-    // emitted for macOS (which has no per-row patcher) but is scoped
-    // to `targetInterfaceId: "macos"` and therefore not visible to
-    // this process-type subscriber.
+    // No `conversation_list_invalidated` broadcast is emitted.
     const conversation = createConversation("Attention");
     projectAssistantMessage({
       conversationId: conversation.id,
@@ -285,7 +286,9 @@ describe("conversation sync tags", () => {
     );
     expect(
       received.some(
-        (event) => event.message.type === "conversation_list_invalidated",
+        (event) =>
+          (event.message as { type: string }).type ===
+          "conversation_list_invalidated",
       ),
     ).toBe(false);
   });
@@ -329,7 +332,9 @@ describe("conversation sync tags", () => {
     );
     expect(
       received.some(
-        (event) => event.message.type === "conversation_list_invalidated",
+        (event) =>
+          (event.message as { type: string }).type ===
+          "conversation_list_invalidated",
       ),
     ).toBe(false);
   });
