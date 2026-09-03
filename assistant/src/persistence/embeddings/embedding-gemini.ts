@@ -64,6 +64,7 @@ export class GeminiEmbeddingBackend implements EmbeddingBackend {
   private stdoutReaderActive = false;
   private readyResolve: (() => void) | null = null;
   private readyReject: ((err: Error) => void) | null = null;
+  private disposeRequested = false;
 
   private readonly initGuard = new PromiseGuard<void>();
 
@@ -94,7 +95,7 @@ export class GeminiEmbeddingBackend implements EmbeddingBackend {
     return this.embedViaWorker(inputs, options);
   }
 
-  // ── In-process path (test-only) ──────────────────────────────────────
+  // In-process path (test-only).
 
   private async embedInProcess(
     inputs: EmbeddingInput[],
@@ -155,7 +156,7 @@ export class GeminiEmbeddingBackend implements EmbeddingBackend {
     return values;
   }
 
-  // ── Worker subprocess path (production) ──────────────────────────────
+  // Worker subprocess path (production).
 
   private async embedViaWorker(
     inputs: EmbeddingInput[],
@@ -163,7 +164,7 @@ export class GeminiEmbeddingBackend implements EmbeddingBackend {
   ): Promise<number[][]> {
     await this.ensureWorker();
 
-    // Send all requests concurrently — the worker handles each fetch independently.
+    // Send all requests concurrently. The worker handles each fetch independently.
     const promises = inputs.map((input) => {
       const normalized = normalizeEmbeddingInput(input);
       const parts = this.buildParts(normalized);
@@ -210,6 +211,16 @@ export class GeminiEmbeddingBackend implements EmbeddingBackend {
           () => {
             if (this.pendingRequests.delete(id)) {
               reject(new DOMException("Aborted", "AbortError"));
+              // Propagate cancellation so the worker can abort the in-flight fetch.
+              try {
+                const proc = this.workerProc;
+                if (proc) {
+                  proc.stdin.write(JSON.stringify({ cancel: id }) + "\n");
+                  proc.stdin.flush();
+                }
+              } catch {
+                /* pipe may already be closed */
+              }
             }
           },
           { once: true },
@@ -234,6 +245,9 @@ export class GeminiEmbeddingBackend implements EmbeddingBackend {
   }
 
   private async ensureWorker(): Promise<void> {
+    if (this.disposeRequested) {
+      throw new Error("Gemini embedding backend has been shut down");
+    }
     if (this.workerProc) {
       return;
     }
@@ -241,7 +255,7 @@ export class GeminiEmbeddingBackend implements EmbeddingBackend {
   }
 
   private async spawnWorker(): Promise<void> {
-    if (this.workerProc) {
+    if (this.workerProc || this.disposeRequested) {
       return;
     }
 
@@ -294,12 +308,94 @@ export class GeminiEmbeddingBackend implements EmbeddingBackend {
       throw err;
     }
 
+    // If shutdown was called while this init was in flight, kill the proc we
+    // just started and return. sweepOwnedWorkers() is the backstop if the
+    // initGuard settled after shutdown already checked workerProc.
+    if (this.disposeRequested) {
+      this.terminateWorker(
+        "Gemini embedding backend disposed during initialization",
+      );
+      return;
+    }
+
     log.info(
       { pid: proc.pid, model: this.model },
       "Gemini embedding worker ready",
     );
 
     this.drainStderr(proc.stderr);
+  }
+
+  // Lifecycle hooks called by the embedding backend registry.
+
+  /** Called on cache clear: kills the worker immediately, no wait. */
+  dispose(): void {
+    this.disposeRequested = true;
+    this.terminateWorker("Gemini embedding worker disposed");
+  }
+
+  /** Called on daemon shutdown: kills the worker and waits for OS confirmation. */
+  async shutdown(): Promise<void> {
+    this.disposeRequested = true;
+    await this.terminateWorkerAndWait("Gemini embedding worker shut down");
+  }
+
+  /**
+   * Backstop for workers spawned after shutdown() already ran. Called by the
+   * embedding backend registry after the shutdown budget expires.
+   */
+  async sweepOwnedWorkers(): Promise<void> {
+    if (!this.disposeRequested || !this.workerProc) {
+      return;
+    }
+    this.terminateWorker("Gemini embedding worker swept");
+  }
+
+  private terminateWorker(reason: string): void {
+    const proc = this.workerProc;
+    if (!proc) {
+      return;
+    }
+    this.workerProc = null;
+    this.stdoutBuffer = "";
+    this.initGuard.reset();
+    for (const [, pending] of this.pendingRequests) {
+      pending.resolve({ error: reason });
+    }
+    this.pendingRequests.clear();
+    try {
+      proc.kill();
+    } catch {
+      /* already gone */
+    }
+  }
+
+  private async terminateWorkerAndWait(reason: string): Promise<void> {
+    const proc = this.workerProc;
+    if (!proc) {
+      return;
+    }
+    this.workerProc = null;
+    this.stdoutBuffer = "";
+    this.initGuard.reset();
+    for (const [, pending] of this.pendingRequests) {
+      pending.resolve({ error: reason });
+    }
+    this.pendingRequests.clear();
+    try {
+      proc.kill("SIGTERM");
+      const exitTimeout = setTimeout(() => {
+        try {
+          proc.kill("SIGKILL");
+        } catch {
+          /* ignore */
+        }
+      }, 3_000);
+      await proc.exited;
+      clearTimeout(exitTimeout);
+    } catch {
+      /* already gone */
+    }
   }
 
   private startStdoutReader(): void {
@@ -329,7 +425,7 @@ export class GeminiEmbeddingBackend implements EmbeddingBackend {
         return;
       }
 
-      // Worker exited — fail all in-flight requests.
+      // Worker exited unexpectedly: fail all in-flight requests.
       for (const [, pending] of this.pendingRequests) {
         pending.resolve({ error: "Gemini embedding worker process exited" });
       }
@@ -443,7 +539,7 @@ export class GeminiEmbeddingBackend implements EmbeddingBackend {
     })();
   }
 
-  // ── Shared helper ─────────────────────────────────────────────────────
+  // Shared helper.
 
   private buildParts(input: MultimodalEmbeddingInput): unknown[] {
     if (input.type === "text") {
