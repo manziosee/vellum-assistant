@@ -43,6 +43,15 @@ export interface GeminiEmbeddingOptions {
   bypassWorker?: boolean;
 }
 
+// Module-level flag so integration tests that cannot pass options through the
+// embedding-backend registry can still force the in-process path.
+let _moduleBypassWorker = false;
+
+/** @internal - test use only */
+export function _setBypassWorkerForTests(bypass: boolean): void {
+  _moduleBypassWorker = bypass;
+}
+
 export class GeminiEmbeddingBackend implements EmbeddingBackend {
   readonly provider = "gemini" as const;
   readonly model: string;
@@ -74,7 +83,7 @@ export class GeminiEmbeddingBackend implements EmbeddingBackend {
     this.taskType = options?.taskType;
     this.dimensions = options?.dimensions;
     this.managedBaseUrl = options?.managedBaseUrl;
-    this.bypassWorker = options?.bypassWorker ?? false;
+    this.bypassWorker = options?.bypassWorker ?? _moduleBypassWorker;
   }
 
   /** True when requests route through the managed platform proxy. */
