@@ -341,9 +341,10 @@ export function RootLayout() {
       );
     },
     startVoice: () => {
-      // See `startVoiceFromSurface` for the three steps and why the window
-      // stays where it is.
-      startVoiceFromSurface(navigate);
+      // The companion surface's Talk, the one sender of this command. See
+      // `startVoiceFromSurface` for the three steps and why the window stays
+      // where it is.
+      startVoiceFromSurface(navigate, { entry: "companion" });
     },
     cancelVoiceStart: () => {
       // The companion's dial, ended. Handled here rather than beside the
@@ -361,7 +362,7 @@ export function RootLayout() {
         endLiveVoiceSession();
         return;
       }
-      startVoiceFromSurface(navigate);
+      startVoiceFromSurface(navigate, { entry: "voice_key" });
     },
     answerWatchRetro: (command) => {
       if (command.kind !== "answerWatchRetro") {

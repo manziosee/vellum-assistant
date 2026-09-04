@@ -383,7 +383,10 @@ export function GlobalPushToTalkBridge({
       }
     },
     onDoubleTap: () => {
-      toggleVoiceFromSurface((to, options) => navigateRef.current(to, options));
+      toggleVoiceFromSurface(
+        (to, options) => navigateRef.current(to, options),
+        "voice_key",
+      );
     },
   });
 
@@ -423,6 +426,7 @@ export function GlobalPushToTalkBridge({
         const taken = askVoiceFromSurface(
           (to, options) => navigateRef.current(to, options),
           ask,
+          "voice_key_ask",
         );
         console.info(
           `dictation: ask selectionChars=${selection.text.length} truncated=${selection.truncated} words=${rawText.length} taken=${taken}`,

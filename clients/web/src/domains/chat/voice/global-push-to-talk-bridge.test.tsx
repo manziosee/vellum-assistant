@@ -79,12 +79,14 @@ mock.module("@/domains/chat/voice/use-voice-key", () => ({
 }));
 
 const askedTexts: string[] = [];
+const askedEntries: string[] = [];
 let nextAskTaken = true;
 const announceAskRefusedMock = mock(() => undefined);
 const toggleVoiceMock = mock(() => undefined);
 mock.module("@/domains/chat/voice/live-voice/start-voice-request", () => ({
-  askVoiceFromSurface: (_navigate: unknown, ask: string) => {
+  askVoiceFromSurface: (_navigate: unknown, ask: string, entry: string) => {
     askedTexts.push(ask);
+    askedEntries.push(entry);
     return nextAskTaken;
   },
   announceAskRefused: announceAskRefusedMock,
@@ -215,6 +217,7 @@ afterEach(() => {
   dictationCalls.length = 0;
   insertedTexts.length = 0;
   askedTexts.length = 0;
+  askedEntries.length = 0;
   nextAskTaken = true;
   announceAskRefusedMock.mockClear();
   toggleVoiceMock.mockClear();
@@ -448,6 +451,12 @@ test("a double tap of the voice key is Talk", () => {
   });
 
   expect(toggleVoiceMock).toHaveBeenCalledTimes(1);
+  // Named for the daemon's telemetry: the same macOS client also starts calls
+  // from the composer and the companion, and only the entry tells them apart.
+  expect(toggleVoiceMock).toHaveBeenCalledWith(
+    expect.any(Function),
+    "voice_key",
+  );
 });
 
 /**
@@ -537,6 +546,7 @@ describe("a hold over a selection", () => {
     expect(askedTexts).toEqual([
       "> the powerhouse\n> of the cell\n\nwhat does this mean",
     ]);
+    expect(askedEntries).toEqual(["voice_key_ask"]);
     expect(insertedTexts).toEqual([]);
     expect(toastErrorMock).not.toHaveBeenCalled();
   });
