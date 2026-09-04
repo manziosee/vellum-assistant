@@ -344,6 +344,9 @@ final class MacHelper: @unchecked Sendable {
             case "cu.perform":
                 dispatchCuPerform(line: line)
                 return
+            case "capture.frame":
+                dispatchCaptureFrame(line: line)
+                return
             case "appControl.perform":
                 dispatchAppControlPerform(line: line)
                 return
@@ -418,6 +421,50 @@ final class MacHelper: @unchecked Sendable {
             self.writeResponse(
                 JsonRpcCodec.successResponse(id: id, result: payload.toDictionary())
             )
+        }
+    }
+
+    /// One JPEG of a display or a window, for the app to show a running call
+    /// what the user is sharing. The same capture the daemon's computer-use
+    /// path takes, reached directly: the app holds the share, not the daemon.
+    private func dispatchCaptureFrame(line: String) {
+        Task { @MainActor in
+            let object = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any]
+            let id = object?["id"] ?? NSNull()
+            let params = object?["params"] as? [String: Any] ?? [:]
+            let target: CaptureTarget
+            if let windowId = (params["windowId"] as? NSNumber)?.uint32Value {
+                target = .window(CGWindowID(windowId))
+            } else if let displayId = (params["displayId"] as? NSNumber)?.uint32Value {
+                target = .display(CGDirectDisplayID(displayId))
+            } else {
+                self.writeResponse(JsonRpcCodec.errorResponse(
+                    id: id,
+                    code: JsonRpcErrorCode.invalidParams,
+                    message: "capture.frame requires displayId or windowId"
+                ))
+                return
+            }
+            let maxWidth = (params["maxWidth"] as? NSNumber)?.intValue ?? 1280
+            let maxHeight = (params["maxHeight"] as? NSNumber)?.intValue ?? 720
+            do {
+                let result = try await ScreenCapture().captureScreenWithMetadata(
+                    maxWidth: maxWidth,
+                    maxHeight: maxHeight,
+                    target: target
+                )
+                self.writeResponse(JsonRpcCodec.successResponse(id: id, result: [
+                    "jpegBase64": result.jpegData.base64EncodedString(),
+                    "width": result.metadata?.screenshotWidthPx ?? 0,
+                    "height": result.metadata?.screenshotHeightPx ?? 0,
+                ]))
+            } catch {
+                self.writeResponse(JsonRpcCodec.errorResponse(
+                    id: id,
+                    code: JsonRpcErrorCode.internalError,
+                    message: error.localizedDescription
+                ))
+            }
         }
     }
 
