@@ -32,8 +32,9 @@ mock.module("@/domains/chat/voice/voice-room/voice-mesh-waves", () => ({
   },
 }));
 
-const { COMPOSER_RADIUS_CLASS, VoiceComposerBar } =
+const { VoiceComposerBar } =
   await import("@/domains/chat/components/chat-composer/voice-composer-bar");
+import { COMPOSER_RADIUS_CLASS } from "@/domains/chat/components/chat-composer/composer-mobile-chrome";
 import type { LiveVoiceSessionState } from "@/domains/chat/voice/live-voice/live-voice-store";
 import type { VoiceSurfacePaint } from "@/domains/chat/voice/voice-room/voice-surface-paint";
 import { stubViewportAxes } from "@/hooks/viewport-axes.test-helper";
@@ -96,7 +97,8 @@ describe("VoiceComposerBar: state announcement", () => {
   const labels: Array<[LiveVoiceSessionState, string]> = [
     ["connecting", "Connecting…"],
     ["listening", "Listening…"],
-    ["transcribing", "Transcribing…"],
+    // Shares `thinking`'s wording on purpose (JARVIS-1559).
+    ["transcribing", "Thinking…"],
     ["thinking", "Thinking…"],
     ["speaking", "Speaking…"],
     ["ending", "Ending…"],

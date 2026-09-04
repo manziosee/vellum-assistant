@@ -59,9 +59,12 @@ let byokSuppression = false;
 let byokGateCandidates: boolean[] = [];
 
 mock.module("@/hooks/use-byok-credit-banner-gate", () => ({
-  useSuppressCreditBannersForByok: (candidate: boolean) => {
+  // Always settled: what these tests drive is the suppression half of the
+  // verdict. The unsettled half is exercised where it is read, in
+  // `preferences-usage-panel.test.tsx`.
+  useByokCreditRouteVerdict: (candidate: boolean) => {
     byokGateCandidates.push(candidate);
-    return candidate && byokSuppression;
+    return { suppress: candidate && byokSuppression, settled: true };
   },
 }));
 
@@ -153,8 +156,30 @@ describe("useBillingBalanceStatus", () => {
       dailyLimit: null,
       dailySpend: "0.00",
       balance: "20.00",
+      availableUsageBalance: null,
+      totalUsageBalance: null,
       enabled: true,
+      settled: true,
     });
+  });
+
+  test("usage grants: passed through as the summary reports them", () => {
+    const { result } = setup({
+      seed: summary({
+        available_usage_balance: "1.60",
+        total_usage_balance: "5.00",
+      }),
+    });
+    expect(result.current.availableUsageBalance).toBe("1.60");
+    expect(result.current.totalUsageBalance).toBe("5.00");
+  });
+
+  test("usage grants: a platform reporting neither reads as unknown", () => {
+    // An older self-hosted platform omits both fields, which has to read as
+    // "no grant information" rather than a zeroed one.
+    const { result } = setup({ seed: summary() });
+    expect(result.current.availableUsageBalance).toBeNull();
+    expect(result.current.totalUsageBalance).toBeNull();
   });
 
   test("low balance: reflects the server-computed warning flag", () => {
@@ -169,7 +194,10 @@ describe("useBillingBalanceStatus", () => {
       dailyLimit: null,
       dailySpend: "0.00",
       balance: "3.00",
+      availableUsageBalance: null,
+      totalUsageBalance: null,
       enabled: true,
+      settled: true,
     });
   });
 
@@ -218,7 +246,10 @@ describe("useBillingBalanceStatus", () => {
       dailyLimit: null,
       dailySpend: "0.00",
       balance: "20.00",
+      availableUsageBalance: null,
+      totalUsageBalance: null,
       enabled: true,
+      settled: true,
     });
   });
 
@@ -313,7 +344,13 @@ describe("useBillingBalanceStatus", () => {
       dailyLimit: null,
       dailySpend: null,
       balance: null,
+      availableUsageBalance: null,
+      totalUsageBalance: null,
       enabled: true,
+      // The all-false shape here describes what is not yet known. An enabled
+      // query with nothing back has not settled, and a surface that paints
+      // these flags has to wait rather than read the falses as answers.
+      settled: false,
     });
   });
 
@@ -354,7 +391,10 @@ describe("useBillingBalanceStatus", () => {
       dailyLimit: null,
       dailySpend: null,
       balance: null,
+      availableUsageBalance: null,
+      totalUsageBalance: null,
       enabled: false,
+      settled: true,
     });
   });
 
@@ -374,7 +414,10 @@ describe("useBillingBalanceStatus", () => {
       dailyLimit: null,
       dailySpend: "0.00",
       balance: "0.00",
+      availableUsageBalance: null,
+      totalUsageBalance: null,
       enabled: true,
+      settled: true,
     });
   });
 
@@ -413,7 +456,10 @@ describe("useBillingBalanceStatus", () => {
       dailyLimit: null,
       dailySpend: null,
       balance: null,
+      availableUsageBalance: null,
+      totalUsageBalance: null,
       enabled: false,
+      settled: true,
     });
   });
 });

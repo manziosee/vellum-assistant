@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 
 import { organizationsBillingSummaryRetrieveOptions } from "@/generated/api/@tanstack/react-query.gen";
-import { useSuppressCreditBannersForByok } from "@/hooks/use-byok-credit-banner-gate";
+import { useByokCreditRouteVerdict } from "@/hooks/use-byok-credit-banner-gate";
 import { useIsOrgReady } from "@/hooks/use-is-org-ready";
 import {
   useActiveAssistantIsPlatformHosted,
@@ -37,11 +37,30 @@ export interface BillingBalanceStatus {
   dailySpend: string | null;
   /** Effective balance as a decimal string, or null when unknown. */
   balance: string | null;
+  /**
+   * Unused credit still sitting on the unexpired usage grants (the initial
+   * credit and a Pro sub's monthly bundle), as a decimal string. This is what
+   * the Usage Balance bar measures, and what the credit figures net out.
+   */
+  availableUsageBalance: string | null;
+  /**
+   * What those same grants were originally worth, as a decimal string. The
+   * denominator of a free plan's Usage Balance bar.
+   */
+  totalUsageBalance: string | null;
   /** Whether the billing summary query is allowed to run at all. */
   enabled: boolean;
+  /**
+   * The status is final: the summary has landed and any BYOK classification
+   * behind the flags has settled. False means the flags currently describe
+   * what is not yet known rather than what is true, which a surface painting
+   * an alarm colour has to wait out. Always true when the query is disabled,
+   * where the inert status is itself the final answer.
+   */
+  settled: boolean;
 }
 
-const INERT_STATUS: Omit<BillingBalanceStatus, "enabled"> = {
+const INERT_STATUS: Omit<BillingBalanceStatus, "enabled" | "settled"> = {
   isExhausted: false,
   isLowBalance: false,
   dailyLimitReached: false,
@@ -49,6 +68,8 @@ const INERT_STATUS: Omit<BillingBalanceStatus, "enabled"> = {
   dailyLimit: null,
   dailySpend: null,
   balance: null,
+  availableUsageBalance: null,
+  totalUsageBalance: null,
 };
 
 /**
@@ -82,7 +103,7 @@ export function useBillingBalanceQueryEnabled(): boolean {
  *
  * The balance flags additionally stay down when the effective chat route is
  * provably BYOK and no managed credits were burned in the last day (see
- * {@link useSuppressCreditBannersForByok}): chat turns that dispatch on the
+ * {@link useByokCreditRouteVerdict}): chat turns that dispatch on the
  * user's own key never fail on the managed wallet, so the credit wall would
  * be a false alarm. Chat surfaces pass their active `conversationId` so a
  * managed per-conversation profile pin keeps the banners up over a BYOK
@@ -101,13 +122,15 @@ export function useBillingBalanceStatus(
   });
   const isExhausted = !!summary && Number(summary.effective_balance) <= 0;
   const isLowBalance = !!summary && summary.low_balance_warning === true;
-  const suppressed = useSuppressCreditBannersForByok(
+  const { suppress: suppressed, settled } = useByokCreditRouteVerdict(
     enabled && (isExhausted || isLowBalance),
     opts.conversationId,
     opts.draftProfile,
   );
   if (!enabled || !summary) {
-    return { ...INERT_STATUS, enabled };
+    // A disabled query has already given its final answer; a summary still on
+    // its way has not.
+    return { ...INERT_STATUS, enabled, settled: !enabled };
   }
   return {
     isExhausted: isExhausted && !suppressed,
@@ -117,6 +140,11 @@ export function useBillingBalanceStatus(
     dailyLimit: summary.daily_credit_limit_usd ?? null,
     dailySpend: summary.daily_spend_usd ?? null,
     balance: summary.effective_balance,
+    // A platform that predates the usage-grant fields reports neither, which
+    // reads as no grant information rather than a zeroed one.
+    availableUsageBalance: summary.available_usage_balance ?? null,
+    totalUsageBalance: summary.total_usage_balance ?? null,
     enabled,
+    settled,
   };
 }

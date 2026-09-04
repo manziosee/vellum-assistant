@@ -41,14 +41,24 @@ import { useChatEmptyState } from "@/domains/chat/hooks/use-chat-empty-state";
 import { useComposerSubmit } from "@/domains/chat/hooks/use-composer-submit";
 import { useDraftSecretDetection } from "@/domains/chat/hooks/use-draft-secret-detection";
 import type { SendChatMessageOptions } from "@/domains/chat/hooks/use-send-message";
-import { DiskPressureBannerSlot } from "@/domains/chat/components/disk-pressure-banner-slot";
+import {
+  DiskPressureBannerSlot,
+  useDiskPressureBannerVisibility,
+} from "@/domains/chat/components/disk-pressure-banner-slot";
+import { ResourcePressureBannerSlot } from "@/domains/chat/components/resource-pressure-banner-slot";
 import { useRuleEditorBridge } from "@/domains/chat/hooks/use-rule-editor-bridge";
 import { useChatBannerSlots } from "@/domains/chat/hooks/use-chat-banner-slots";
 import { QuoteReplyBubble } from "@/domains/chat/components/quote-reply-bubble";
 import { TextSelectionPopover } from "@/domains/chat/components/text-selection-popover";
 import { useNativeQuoteReply } from "@/domains/chat/hooks/use-native-quote-reply";
 import { useQuoteReplyStore } from "@/domains/chat/quote-reply-store";
+import { useChannelReferenceStore } from "@/domains/chat/channel-sidecar/channel-reference-store";
+import {
+  useChannelSidecar,
+  useChannelSidecarFlag,
+} from "@/domains/chat/channel-sidecar/use-channel-sidecar";
 import { isChannelConversation } from "@/domains/chat/utils/conversation-channel";
+import { resolveComposerPlaceholder } from "@/domains/chat/utils/composer-placeholder";
 import { isPopoutWindow } from "@/runtime/popout-window";
 
 import { useChatSessionStore } from "@/domains/chat/chat-session-store";
@@ -57,7 +67,6 @@ import { useChatAttachmentDropZone } from "@/domains/chat/components/chat-attach
 import { useVisionAttachmentGate } from "@/lib/backwards-compat/vision-attachment-gate";
 import { useSupportsNewChatPlugins } from "@/lib/backwards-compat/use-supports-new-chat-plugins";
 import { recordCommit } from "@/lib/commit-pressure";
-import { copyToClipboard } from "@/lib/copy-to-clipboard";
 import { useSwitchPaintMeasurement } from "@/lib/telemetry/switch-telemetry";
 import { NewChatPluginsSection } from "@/domains/chat/components/new-chat-plugins/new-chat-plugins-section";
 import { useComposerStore } from "@/domains/chat/composer-store";
@@ -73,6 +82,7 @@ import { WORKFLOW_DESCRIPTOR } from "@/domains/chat/process-registry/descriptors
 import { BACKGROUND_TASK_DESCRIPTOR } from "@/domains/chat/process-registry/descriptors/background-task";
 import { AnimatedRightDrawer } from "@/domains/chat/components/animated-right-drawer";
 import { ChatBody } from "@/domains/chat/components/chat-body";
+import { ProgressStack } from "@/domains/chat/components/progress-stack";
 import { ChatComposer } from "@/domains/chat/components/chat-composer/chat-composer";
 import { ChatRuleEditorModal } from "@/domains/chat/components/chat-rule-editor-modal";
 import { ComposerNotices } from "@/domains/chat/components/composer-notices";
@@ -136,6 +146,7 @@ import { lifecycleService } from "@/assistant/lifecycle-service";
 import { useAssistantLifecycleStore } from "@/assistant/lifecycle-store";
 
 import type { UseDiskPressureMonitorResult } from "@/assistant/use-disk-pressure-monitor";
+import type { UseResourcePressureMonitorResult } from "@/assistant/use-resource-pressure-monitor";
 import { useAppNudges } from "@/domains/chat/hooks/use-app-nudges";
 import { useGhostTextSuggestion } from "@/domains/chat/hooks/use-ghost-text-suggestion";
 import {
@@ -158,16 +169,14 @@ import { useClientFeatureFlagStore } from "@/stores/client-feature-flag-store";
 import { shouldMintNewChatDraft } from "@/domains/chat/utils/conversation-selection";
 import { isNativeMobile } from "@/runtime/platform-detection";
 import { useConversationStore } from "@/stores/conversation-store";
+import { paneState } from "@/stores/pane-state";
+import { copyToClipboard } from "@/lib/copy-to-clipboard";
 import { useDoctorHandoffStore } from "@/stores/doctor-handoff-store";
-import { useLowBalanceBannerStore } from "@/stores/low-balance-banner-store";
 
-/**
- * Self-hosted recovery for a rejected assistant API key. Mirrors the hint the
- * daemon returns from its own auth route (`runtime/routes/auth-routes.ts`) —
- * keep the two in step.
- */
-const REPROVISION_ASSISTANT_KEY_COMMAND =
-  "assistant keys set credential/vellum/assistant_api_key <key>";
+import { canRecoverLocalAssistantPlatformCredential } from "@/lib/local-platform-identity";
+
+import { RestoreManagedCredentialButton } from "./restore-managed-credential-button";
+import { useLowBalanceBannerStore } from "@/stores/low-balance-banner-store";
 
 // ---------------------------------------------------------------------------
 // Props — only values that cannot be owned locally
@@ -188,7 +197,9 @@ export interface ChatMainPanelProps {
   handleEditQueueTail: () => void;
 
   // Conversation secondary actions (orchestration dependency)
-  handleForkConversation: (throughMessageId: string) => Promise<void>;
+  /** Forks through a message. Omitted unless the viewer passes the
+   *  staff + `fork-from-message` gate, which hides the hover action. */
+  handleForkConversation?: (throughMessageId: string) => Promise<void>;
   /** Opens the "Summarize up to here" confirm dialog for a message. */
   onSummarizeUpToHere?: (messageId: string) => void;
   /** Opens the "Retry" confirm dialog for the latest assistant turn. */
@@ -201,6 +212,9 @@ export interface ChatMainPanelProps {
   // Disk pressure (single instance lives in ActiveChatView; passed down to
   // avoid duplicate polling intervals and bus subscriptions)
   diskPressure: UseDiskPressureMonitorResult;
+
+  // Resource pressure (single instance, same reasoning as disk pressure)
+  resourcePressure: UseResourcePressureMonitorResult;
 
   // Upward signals to ActiveChatView local state
   setRefreshEpoch: Dispatch<SetStateAction<number>>;
@@ -230,7 +244,7 @@ export interface ChatMainPanelProps {
  * without positional coupling.
  *
  * `isPopout` selects that kind list. A windowed chat carries subagent and ACP
- * sessions in the header's `ConversationActivityPill`, so its overlay row holds
+ * sessions in the progress stack's `ProgressAgentsCard`, so its overlay row holds
  * only workflows and background tasks. A pop-out renders no header at all, so
  * there the overlay covers every kind and stays the one ambient surface.
  *
@@ -269,6 +283,9 @@ function useActiveProcessSlots(isPopout: boolean) {
 // Component
 // ---------------------------------------------------------------------------
 
+const REPROVISION_ASSISTANT_KEY_COMMAND =
+  "assistant keys set credential/vellum/assistant_api_key <key>";
+
 export function ChatMainPanel({
   sendMessage,
   handleStopGenerating,
@@ -283,6 +300,7 @@ export function ChatMainPanel({
   handleInspectMessage,
   historyPagination,
   diskPressure,
+  resourcePressure,
   setRefreshEpoch,
   inputRef,
   sanitizedMessagesRef,
@@ -295,6 +313,7 @@ export function ChatMainPanel({
 }: ChatMainPanelProps) {
   const location = useLocation();
   const navigate = useNavigate();
+  const { t } = useTranslation("chat");
   // A pop-out renders no header and no status banner, which changes both what
   // chrome is available and which kinds the overlay row has to carry.
   const isPopout = isPopoutWindow(location.search);
@@ -349,7 +368,20 @@ export function ChatMainPanel({
   // -------------------------------------------------------------------------
   // Store reads — per-conversation state
   // -------------------------------------------------------------------------
-  const messages = useTranscriptMessages();
+  const transcriptMessages = useTranscriptMessages();
+
+  // Channel sidecar: while the flag is on and this conversation is bound to an
+  // external channel, rows the client can attribute to that channel are drawn
+  // in the read-only drawer instead of here, so the Vellum lane shows each row
+  // exactly once. Everything downstream in this panel (transcript projection,
+  // scroll, empty state, counts) reads the lane, because the lane IS the chat
+  // in that arrangement. `vellumMessages` is the same array by reference
+  // whenever nothing moved, so ordinary conversations see no change at all.
+  const { vellumMessages: messages } = useChannelSidecar({
+    conversationId: activeConversationId,
+    conversation: activeConversation,
+    messages: transcriptMessages,
+  });
   const error = useChatSessionStore.use.error();
   const notice = useChatSessionStore.use.notice();
   // A client-minted draft has no server row, so there is no history to wait
@@ -499,10 +531,13 @@ export function ChatMainPanel({
     [],
   );
 
-  const handleForkConversationCallback = useCallback(
-    (messageId: string) => {
-      void handleForkConversation(messageId);
-    },
+  const handleForkConversationCallback = useMemo(
+    () =>
+      handleForkConversation
+        ? (messageId: string) => {
+            void handleForkConversation(messageId);
+          }
+        : undefined,
     [handleForkConversation],
   );
 
@@ -571,6 +606,21 @@ export function ChatMainPanel({
       store.closeReplyBubble();
     }
   }, [activeConversationId]);
+
+  // Same containment for a staged channel reference. It carries the
+  // conversation it was taken from, so the clear is conditional: a reference
+  // survives the drawer being closed and reopened within its own conversation,
+  // and is dropped the moment the user is somewhere else or the sidecar flag
+  // turns off. The flag-off clear is what keeps flag-off behavior identical
+  // to a build without the feature: no chip, and nothing riding the next
+  // send. Re-enabling starts from an empty slot.
+  const channelSidecarEnabled = useChannelSidecarFlag();
+  useEffect(() => {
+    useChannelReferenceStore.getState().reconcileReference({
+      conversationId: activeConversationId,
+      sidecarEnabled: channelSidecarEnabled,
+    });
+  }, [activeConversationId, channelSidecarEnabled]);
 
   const handleClearContext = useCallback(
     () => void sendMessage("/clean"),
@@ -768,7 +818,9 @@ export function ChatMainPanel({
     assistantState.kind === "active" && !assistantState.isLocal;
   const doctorAction = showDoctorAction ? (
     <Button asChild variant="outlined" size="compact">
-      <Link to={`${routes.settings.debug}?tab=doctor`}>Go to Doctor</Link>
+      <Link to={`${routes.settings.debug}?tab=doctor`}>
+        {t("chatRouteContent.goToDoctor")}
+      </Link>
     </Button>
   ) : undefined;
 
@@ -780,36 +832,49 @@ export function ChatMainPanel({
   //   platform-hosted → the Doctor, which can re-issue the key. The request is
   //     parked in the same one-shot store `/doctor <message>` uses, so the
   //     panel auto-starts a session already on topic, not on a blank prompt.
-  //   self-hosted → the Doctor tab doesn't exist (it is platform-hosted only),
-  //     but `assistant keys set` does. Copying the command is the whole fix, so
-  //     the banner hands it over rather than leaving the user with no action.
-  const reprovisionAssistantKeyAction = showDoctorAction ? (
-    <Button asChild variant="outlined" size="compact">
-      <Link
-        to={`${routes.settings.debug}?tab=doctor`}
+  //   self-hosted -> the client owns the reprovision flow (the platform's own
+  //     recovery excludes these registrations). Where this client can write
+  //     to the assistant's gateway (a plain local assistant or a local Docker
+  //     instance), the banner performs it, and the button itself asks for a
+  //     platform sign-in first when there is none. Where it cannot (a
+  //     remotely served client, a platform-disabled one), the banner hands
+  //     over the CLI command instead, so no hosting mode is left without a
+  //     way back.
+  //
+  // Built per banner rather than once, so a successful repair retires exactly
+  // the error or notice that offered it. Clearing the slot unconditionally
+  // would also wipe a newer failure that arrived while the repair ran.
+  const buildReprovisionAssistantKeyAction = (onRestored: () => void) =>
+    showDoctorAction ? (
+      <Button asChild variant="outlined" size="compact">
+        <Link
+          to={`${routes.settings.debug}?tab=doctor`}
+          onClick={() =>
+            useDoctorHandoffStore
+              .getState()
+              .setPendingPrompt("Help me re-provision my assistant's API key")
+          }
+        >
+          {t("chatRouteContent.askTheDoctor")}
+        </Link>
+      </Button>
+    ) : assistantState.kind === "active" &&
+      canRecoverLocalAssistantPlatformCredential() ? (
+      <RestoreManagedCredentialButton onRestored={onRestored} />
+    ) : assistantState.kind === "active" ? (
+      <Button
+        variant="outlined"
+        size="compact"
         onClick={() =>
-          useDoctorHandoffStore
-            .getState()
-            .setPendingPrompt("Help me re-provision my assistant's API key")
+          copyToClipboard(REPROVISION_ASSISTANT_KEY_COMMAND, {
+            successMessage: "Command copied. Run it where the assistant runs.",
+            errorMessage: "Couldn't copy the command.",
+          })
         }
       >
-        Ask the Doctor
-      </Link>
-    </Button>
-  ) : assistantState.kind === "active" ? (
-    <Button
-      variant="outlined"
-      size="compact"
-      onClick={() =>
-        copyToClipboard(REPROVISION_ASSISTANT_KEY_COMMAND, {
-          successMessage: "Command copied. Run it where the assistant runs.",
-          errorMessage: "Couldn't copy the command.",
-        })
-      }
-    >
-      Copy CLI fix
-    </Button>
-  ) : undefined;
+        {t("chatRouteContent.copyCliFix")}
+      </Button>
+    ) : undefined;
 
   // Blocked automatic opens (see `handleOpenUrl`) carry the URL in
   // `actionUrl`; the button click is a real user gesture, so the re-open
@@ -828,7 +893,7 @@ export function ChatMainPanel({
           }
         }}
       >
-        Open page
+        {t("chatRouteContent.openPage")}
       </Button>
     ) : undefined;
 
@@ -842,7 +907,12 @@ export function ChatMainPanel({
               useChatSessionStore.getState().setError(null),
             ) ??
             (isManagedCredentialChatError(error)
-              ? reprovisionAssistantKeyAction
+              ? buildReprovisionAssistantKeyAction(() => {
+                  const session = useChatSessionStore.getState();
+                  if (session.error === error) {
+                    session.setError(null);
+                  }
+                })
               : doctorAction),
         }
       : null;
@@ -857,7 +927,12 @@ export function ChatMainPanel({
               useChatSessionStore.getState().setNotice(null),
             ) ??
             (isManagedCredentialChatError(notice)
-              ? reprovisionAssistantKeyAction
+              ? buildReprovisionAssistantKeyAction(() => {
+                  const session = useChatSessionStore.getState();
+                  if (session.notice === notice) {
+                    session.setNotice(null);
+                  }
+                })
               : undefined),
         }
       : null;
@@ -913,6 +988,14 @@ export function ChatMainPanel({
   );
   const activeModelSupportsVision = activeProfileModel?.supportsVision ?? true;
   const visionGateActive = useVisionAttachmentGate();
+  // Whether an image attached to the next message would survive the turn. One
+  // resolution for every surface that can attach one: the drop/pick filter
+  // below, the Eyes toggle, and the send's own camera frame. On an assistant
+  // with the image-fallback plugin the gate is inactive and the question does
+  // not arise; below it, an image on a profile without vision fails the whole
+  // turn on the provider's rejection.
+  const imageAttachmentsAllowed =
+    !visionGateActive || activeModelSupportsVision;
 
   const isInMaintenanceWithNoMessages =
     !isLoadingHistory &&
@@ -926,10 +1009,9 @@ export function ChatMainPanel({
   const handleDroppedFiles = useCallback(
     (files: FileList | File[]): File[] => {
       const arr = Array.from(files);
-      const allowed =
-        !visionGateActive || activeModelSupportsVision
-          ? arr
-          : arr.filter((f) => !isImageAttachment(f));
+      const allowed = imageAttachmentsAllowed
+        ? arr
+        : arr.filter((f) => !isImageAttachment(f));
       if (allowed.length < arr.length) {
         useComposerStore.setState({
           attachmentLastError:
@@ -944,7 +1026,7 @@ export function ChatMainPanel({
       // budget that caller is keeping.
       return allowed;
     },
-    [addChatAttachmentFiles, activeModelSupportsVision, visionGateActive],
+    [addChatAttachmentFiles, imageAttachmentsAllowed],
   );
   const handleDroppedDirectories = useCallback((directories: File[]) => {
     const { resolvedPaths, unresolvedCount } =
@@ -1024,6 +1106,7 @@ export function ChatMainPanel({
     typingDisabled,
     assistantId,
     activeConversationId,
+    imageAttachmentsAllowed,
     // Synchronous pre-send gate: re-scans the outgoing content so pastes
     // sent inside the detection debounce window are still caught. No
     // secrets → returns true, fully inert.
@@ -1115,11 +1198,36 @@ export function ChatMainPanel({
   // -------------------------------------------------------------------------
   // Disk pressure banner (localStorage-backed dismiss/suppress)
   // -------------------------------------------------------------------------
+  // One visibility instance is shared between the slot and the precedence
+  // gate below, so the gate tracks what the slot actually renders even when
+  // a dismissal's storage write fails and no cross-instance notification
+  // fires.
+  const diskPressureVisibility = useDiskPressureBannerVisibility(
+    diskPressure,
+    assistantId,
+  );
+  const diskPressureBannerVisible = diskPressureVisibility.visibleMode !== null;
   const diskPressureBannerSlot = (
     <DiskPressureBannerSlot
       diskPressure={diskPressure}
-      assistantId={assistantId}
+      visibility={diskPressureVisibility}
       assistantStateKind={assistantState.kind}
+    />
+  );
+
+  // -------------------------------------------------------------------------
+  // Resource pressure banner (localStorage-backed dismiss/cooldown)
+  // -------------------------------------------------------------------------
+  // The slot stays mounted even while yielding to the disk banner so its
+  // in-memory dismissal fallback (for failed storage writes) survives the
+  // disk episode; it hides its own output via `hidden`.
+  const resourcePressureBannerSlot = (
+    <ResourcePressureBannerSlot
+      resourcePressure={resourcePressure}
+      assistantId={assistantId}
+      assistantName={assistantName}
+      assistantStateKind={assistantState.kind}
+      hidden={diskPressureBannerVisible}
     />
   );
 
@@ -1131,6 +1239,7 @@ export function ChatMainPanel({
     startersSlot,
     belowFoldSlot,
     dockStartersToBottom,
+    startersDockCollapsed,
     renderAvatar,
     emptyStatePlaceholder,
     composerPeekSlot,
@@ -1247,17 +1356,18 @@ export function ChatMainPanel({
   const [profileSheetOpen, setProfileSheetOpen] = useState(false);
   const settingsSheetOpen = accessSheetOpen || profileSheetOpen;
 
-  // The narrow composer is one slim row with no room for a sentence, so it
-  // names the assistant it is addressed to instead. An assistant whose name
-  // has not loaded keeps the wider copy.
-  const { t } = useTranslation("chat");
   const composerAssistantName = assistantName?.trim();
-  const mobilePlaceholder =
-    isMobile && composerAssistantName
-      ? t("chatComposer.askAssistantPlaceholder", {
-          assistantName: composerAssistantName,
-        })
-      : null;
+  const composerPlaceholder = resolveComposerPlaceholder({
+    isEmptyConversation,
+    emptyStatePlaceholder,
+    assistantPlaceholder:
+      isMobile && composerAssistantName
+        ? t("chatComposer.askAssistantPlaceholder", {
+            assistantName: composerAssistantName,
+          })
+        : null,
+    defaultPlaceholder: "What would you like to do?",
+  });
 
   // Explicit props (no spread bundle): the contract is visible here, and the
   // composer self-sources its own store state, so nothing high-frequency is
@@ -1265,17 +1375,13 @@ export function ChatMainPanel({
   const composerNode = (
     <ChatComposer
       cmdEnterMode={cmdEnterMode}
-      placeholder={
-        mobilePlaceholder ??
-        (isEmptyConversation
-          ? emptyStatePlaceholder
-          : "What would you like to do?")
-      }
+      placeholder={composerPlaceholder}
       onSubmit={handleFormSubmit}
       inputRef={inputRef}
       typingDisabled={typingDisabled}
       sendDisabled={sendDisabled}
       onAddAttachmentFiles={handleDroppedFiles}
+      imageAttachmentsAllowed={imageAttachmentsAllowed}
       voiceInputRef={voiceInputRef}
       voiceInterim={voiceInterim ?? undefined}
       onVoiceTranscript={handleVoiceTranscript}
@@ -1291,6 +1397,9 @@ export function ChatMainPanel({
       // session should attach to the thread the user is looking at — draft
       // ids included (the runtime accepts client-generated conversation ids).
       conversationId={activeConversationId}
+      // Same value the empty state renders from, so "speak first" and "show
+      // the blank-thread greeting" can never disagree about what empty means.
+      conversationIsEmpty={isEmptyConversation}
       onRecallLastMessage={
         isIdle && isNativeConversation ? handleRecallLastMessage : undefined
       }
@@ -1299,6 +1408,7 @@ export function ChatMainPanel({
       suggestion={suggestion}
       hasBillingBanner={composerBillingBanner !== null}
       settingsSheetOpen={settingsSheetOpen}
+      statusControlsSlot={<ProgressStack placement="composer" />}
       thresholdPickerSlot={
         assistantId ? (
           <ComposerSettingsMenu
@@ -1368,6 +1478,13 @@ export function ChatMainPanel({
               ) : null
             }
             diskPressureBanner={diskPressureBannerSlot}
+            // A storage warning is actionable-critical and must not stack
+            // with or compete against an upsell banner, so the resource
+            // slot yields whenever the disk-pressure banner is actually
+            // visible. Acknowledgement-required and cleanup modes are never
+            // dismissible, so disk always wins there; a dismissed or
+            // suppressed warning hands the space to the resource banner.
+            resourcePressureBanner={resourcePressureBannerSlot}
             showMissingApiKeyBanner={error?.code === "PROVIDER_NOT_CONFIGURED"}
             onOpenAiSettings={pushToAiSettings}
             onDismissApiKeyError={handleDismissApiKeyError}
@@ -1405,19 +1522,23 @@ export function ChatMainPanel({
   // -------------------------------------------------------------------------
   const editingConversationId =
     useConversationStore.use.editingConversationId();
-  const isSidePanel =
-    mainView === "app-editing" && !!openedAppState && !!editingConversationId;
+  const paneArrangement = paneState({
+    mainView,
+    appId: openedAppState?.appId ?? null,
+    conversationId: activeConversationId,
+    boundConversationId: editingConversationId,
+    isAppMinimized,
+  }).presentation;
+  const isSidePanel = paneArrangement === "side";
   const variant = isSidePanel ? "side-panel" : "main";
 
-  // Mobile-only: while the app overlay is minimized to its bottom strip, the
-  // strip covers the bottom of the chat. Reserve its height so the composer
-  // sits above it. The guard mirrors the strip's mount condition — the strip
-  // renders only while `mainView === "app"`, and navigation can leave
-  // `isAppMinimized`/`openedAppState` set after it unmounts. The strip peeks
-  // `--app-strip-h` above the safe area, and the chat shell already pads for
-  // the safe area itself, so only the strip height needs reserving.
+  // Mobile-only: while the app is parked to its bottom strip, the strip covers
+  // the bottom of the chat, so its height is reserved to keep the composer
+  // above it. The strip peeks `--app-strip-h` above the safe area, and the
+  // chat shell already pads for the safe area itself, so only the strip height
+  // needs reserving.
   const appStripBottomInset =
-    isMobile && mainView === "app" && isAppMinimized && openedAppState
+    isMobile && paneArrangement === "bottom"
       ? "var(--app-strip-h, 64px)"
       : undefined;
 
@@ -1450,6 +1571,7 @@ export function ChatMainPanel({
       startersSlot={startersSlot}
       belowFoldSlot={belowFoldSlot}
       dockStartersToBottom={dockStartersToBottom}
+      startersDockCollapsed={startersDockCollapsed}
       activeProcessOverlaysSlot={
         hasActiveProcess ? activeProcessOverlays : undefined
       }
@@ -1513,7 +1635,8 @@ export function ChatMainPanel({
           >
             <BottomSheet.Header className="sr-only">
               <BottomSheet.Title>
-                {selectedSuggestion?.detail.heading ?? "Suggestion"}
+                {selectedSuggestion?.detail.heading ??
+                  t("chatRouteContent.suggestionFallback")}
               </BottomSheet.Title>
             </BottomSheet.Header>
             {suggestionDetailPanel}

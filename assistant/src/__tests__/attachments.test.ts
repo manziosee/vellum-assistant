@@ -6,6 +6,92 @@ import {
   enrichMessageWithSourcePaths,
 } from "../agent/attachments.js";
 import { createUserMessage } from "../agent/message-types.js";
+import {
+  attachmentIdFragment,
+  mediaBlockAttachmentId,
+} from "../providers/types.js";
+
+// ---------------------------------------------------------------------------
+// attachmentIdFragment
+// ---------------------------------------------------------------------------
+
+describe("attachmentIdFragment", () => {
+  test("yields the property when an id is present", () => {
+    expect(attachmentIdFragment("att-1")).toEqual({ _attachmentId: "att-1" });
+  });
+
+  test("yields nothing for a missing or empty id", () => {
+    // Absent rather than present-and-empty: the read side requires a non-empty
+    // string before it treats the field as an id.
+    expect(attachmentIdFragment(undefined)).toEqual({});
+    expect(attachmentIdFragment("")).toEqual({});
+    expect("_attachmentId" in attachmentIdFragment("")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// mediaBlockAttachmentId
+// ---------------------------------------------------------------------------
+
+describe("mediaBlockAttachmentId", () => {
+  test("reads a reference's id off its source", () => {
+    expect(
+      mediaBlockAttachmentId({
+        type: "image",
+        source: {
+          type: "workspace_ref",
+          media_type: "image/png",
+          attachmentId: "att-ref",
+          sizeBytes: 10,
+        },
+      }),
+    ).toBe("att-ref");
+  });
+
+  test("reads an inline block's id off the top-level field", () => {
+    expect(
+      mediaBlockAttachmentId({
+        type: "image",
+        source: { type: "base64", media_type: "image/png", data: "AAAA" },
+        _attachmentId: "att-inline",
+      }),
+    ).toBe("att-inline");
+  });
+
+  test("is undefined for a block that came from no attachment", () => {
+    expect(
+      mediaBlockAttachmentId({
+        type: "image",
+        source: { type: "base64", media_type: "image/png", data: "AAAA" },
+      }),
+    ).toBeUndefined();
+  });
+
+  test("covers file blocks in both shapes", () => {
+    expect(
+      mediaBlockAttachmentId({
+        type: "file",
+        source: {
+          type: "workspace_ref",
+          media_type: "application/pdf",
+          attachmentId: "att-file-ref",
+          sizeBytes: 10,
+        },
+      }),
+    ).toBe("att-file-ref");
+    expect(
+      mediaBlockAttachmentId({
+        type: "file",
+        source: {
+          type: "base64",
+          media_type: "application/pdf",
+          data: "AAAA",
+        },
+        _attachmentId: "att-file-inline",
+      }),
+    ).toBe("att-file-inline");
+  });
+});
 
 // ---------------------------------------------------------------------------
 // attachmentsToReferenceBlocks
@@ -39,6 +125,32 @@ describe("attachmentsToReferenceBlocks", () => {
     ]);
     // The large blob never appears in the persisted block.
     expect(JSON.stringify(blocks)).not.toContain("data");
+  });
+
+  test("omits extracted_text on a video workspace_ref", () => {
+    const blocks = attachmentsToReferenceBlocks([
+      {
+        attachmentId: "att-vid",
+        filename: "clip.mp4",
+        mimeType: "video/mp4",
+        sizeBytes: 40_000_000,
+        extractedText: "this must not dump into the prompt",
+      },
+    ]);
+
+    expect(blocks).toEqual([
+      {
+        type: "file",
+        source: {
+          type: "workspace_ref",
+          media_type: "video/mp4",
+          attachmentId: "att-vid",
+          sizeBytes: 40_000_000,
+          filename: "clip.mp4",
+        },
+      },
+    ]);
+    expect(JSON.stringify(blocks)).not.toContain("extracted");
   });
 
   test("builds a file workspace_ref with filename and extracted text", () => {
@@ -122,6 +234,23 @@ describe("attachmentsToContentBlocks", () => {
     expect(blocks[0].type).toBe("image");
   });
 
+  test("omits extracted_text on an inline video file block", async () => {
+    const blocks = await attachmentsToContentBlocks([
+      {
+        filename: "clip.mp4",
+        mimeType: "video/mp4",
+        data: "AAAA",
+        extractedText: "must not dump",
+      },
+    ]);
+    expect(blocks).toHaveLength(1);
+    expect(blocks[0]).toMatchObject({
+      type: "file",
+      source: { type: "base64", media_type: "video/mp4", filename: "clip.mp4" },
+    });
+    expect(blocks[0]).not.toHaveProperty("extracted_text");
+  });
+
   test("creates file content block for non-image mime types", async () => {
     const blocks = await attachmentsToContentBlocks([
       { filename: "doc.pdf", mimeType: "application/pdf", data: "pdfdata" },
@@ -151,6 +280,42 @@ describe("attachmentsToContentBlocks", () => {
   test("returns empty array for no attachments", async () => {
     const blocks = await attachmentsToContentBlocks([]);
     expect(blocks).toHaveLength(0);
+  });
+
+  test("stamps the attachment id on image and file blocks alike", async () => {
+    const blocks = await attachmentsToContentBlocks([
+      {
+        id: "att-img",
+        filename: "photo.jpg",
+        mimeType: "image/jpeg",
+        data: "imgdata",
+      },
+      {
+        id: "att-doc",
+        filename: "doc.pdf",
+        mimeType: "application/pdf",
+        data: "pdfdata",
+      },
+    ]);
+
+    expect(blocks[0].type).toBe("image");
+    expect((blocks[0] as { _attachmentId?: string })._attachmentId).toBe(
+      "att-img",
+    );
+    expect(blocks[1].type).toBe("file");
+    expect((blocks[1] as { _attachmentId?: string })._attachmentId).toBe(
+      "att-doc",
+    );
+  });
+
+  test("omits the attachment id when the upload has none", async () => {
+    const blocks = await attachmentsToContentBlocks([
+      { filename: "photo.jpg", mimeType: "image/jpeg", data: "imgdata" },
+      { filename: "doc.pdf", mimeType: "application/pdf", data: "pdfdata" },
+    ]);
+
+    expect("_attachmentId" in blocks[0]).toBe(false);
+    expect("_attachmentId" in blocks[1]).toBe(false);
   });
 });
 

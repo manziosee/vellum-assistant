@@ -1,6 +1,20 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  describe,
+  expect,
+  test,
+} from "bun:test";
 
-import { buildSanitizedEnv, SAFE_ENV_VARS } from "../safe-env.js";
+import {
+  buildSanitizedEnv,
+  SAFE_ENV_VARS,
+  WINDOWS_SAFE_ENV_VARS,
+} from "../safe-env.js";
 
 describe("safe-env Qdrant forwarding", () => {
   const priorPort = process.env.QDRANT_HTTP_PORT;
@@ -33,5 +47,113 @@ describe("safe-env Qdrant forwarding", () => {
     process.env.QDRANT_URL = "http://external:6333";
     const env = buildSanitizedEnv();
     expect(env.QDRANT_URL).toBeUndefined();
+  });
+});
+
+describe("safe-env Windows forwarding", () => {
+  test("forwards runtime paths only to Windows children", () => {
+    const keys = [
+      "SystemRoot",
+      "COMSPEC",
+      "USERPROFILE",
+      "LOCALAPPDATA",
+      "PATHEXT",
+    ] as const;
+    const previous = Object.fromEntries(
+      keys.map((key) => [key, process.env[key]]),
+    );
+
+    try {
+      process.env.SystemRoot = "C:\\Windows";
+      process.env.COMSPEC = "C:\\Windows\\System32\\cmd.exe";
+      process.env.USERPROFILE = "C:\\Users\\Alice";
+      process.env.LOCALAPPDATA = "C:\\Users\\Alice\\AppData\\Local";
+      process.env.PATHEXT = ".COM;.EXE;.BAT;.CMD";
+
+      expect(WINDOWS_SAFE_ENV_VARS).toContain("SystemRoot");
+      const windowsEnv = buildSanitizedEnv("win32");
+      expect(windowsEnv.SystemRoot).toBe("C:\\Windows");
+      expect(windowsEnv.COMSPEC).toBe("C:\\Windows\\System32\\cmd.exe");
+      expect(windowsEnv.USERPROFILE).toBe("C:\\Users\\Alice");
+      expect(windowsEnv.LOCALAPPDATA).toBe("C:\\Users\\Alice\\AppData\\Local");
+      expect(windowsEnv.PATHEXT).toBe(".COM;.EXE;.BAT;.CMD");
+
+      const posixEnv = buildSanitizedEnv("linux");
+      expect(posixEnv.SystemRoot).toBeUndefined();
+      expect(posixEnv.COMSPEC).toBeUndefined();
+      expect(posixEnv.USERPROFILE).toBeUndefined();
+    } finally {
+      for (const key of keys) {
+        const value = previous[key];
+        if (value == null) {
+          delete process.env[key];
+        } else {
+          process.env[key] = value;
+        }
+      }
+    }
+  });
+
+  test("matches Windows environment names case-insensitively", () => {
+    const windowsEnv = buildSanitizedEnv("win32", {
+      Path: "C:\\Windows\\System32;C:\\Program Files\\Vellum",
+      systemroot: "C:\\Windows",
+      ComSpec: "C:\\Windows\\System32\\cmd.exe",
+    });
+
+    expect(windowsEnv.PATH).toBe(
+      "C:\\Windows\\System32;C:\\Program Files\\Vellum",
+    );
+    expect(windowsEnv.SystemRoot).toBe("C:\\Windows");
+    expect(windowsEnv.COMSPEC).toBe("C:\\Windows\\System32\\cmd.exe");
+  });
+});
+
+describe("safe-env PATH scrubbing", () => {
+  let root: string;
+  let shimDir: string;
+  let realNodeDir: string;
+  let emptyDir: string;
+
+  beforeAll(() => {
+    // Directly under a temp root, so it matches the shape Bun synthesizes.
+    shimDir = mkdtempSync(join(tmpdir(), "bun-node-"));
+    root = mkdtempSync(join(tmpdir(), "safe-env-path-"));
+    realNodeDir = join(root, "real-bin");
+    emptyDir = join(root, "empty-bin");
+    mkdirSync(realNodeDir);
+    mkdirSync(emptyDir);
+    writeFileSync(join(realNodeDir, "node"), "", { mode: 0o755 });
+  });
+
+  afterAll(() => {
+    rmSync(shimDir, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  test("drops Bun's synthesized node shim dir, keeping the rest in order", () => {
+    const env = buildSanitizedEnv("linux", {
+      PATH: `${shimDir}:${realNodeDir}:/usr/bin:/bin`,
+    });
+
+    expect(env.PATH).toBe(`${realNodeDir}:/usr/bin:/bin`);
+  });
+
+  test("keeps a similarly named directory outside the temp dir", () => {
+    const env = buildSanitizedEnv("linux", {
+      PATH: `${realNodeDir}:/home/assistant/bun-node-tools:/usr/bin`,
+    });
+
+    expect(env.PATH).toBe(
+      `${realNodeDir}:/home/assistant/bun-node-tools:/usr/bin`,
+    );
+  });
+
+  test("keeps the shim when it is the only node on PATH", () => {
+    const env = buildSanitizedEnv("linux", {
+      PATH: `${shimDir}:${emptyDir}`,
+    });
+
+    expect(env.PATH).toBe(`${shimDir}:${emptyDir}`);
   });
 });

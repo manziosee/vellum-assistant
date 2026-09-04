@@ -5,7 +5,10 @@
  * and typing indicators by calling the Telegram Bot API directly via ./api.ts.
  */
 
-import type { ApprovalUIMetadata } from "@vellumai/gateway-client";
+import type {
+  ApprovalUIMetadata,
+  ChannelDeliveryResult,
+} from "@vellumai/gateway-client";
 
 import { getAttachmentContent } from "../../../persistence/attachments-store.js";
 import type { RuntimeAttachmentMetadata } from "../../../runtime/http-types.js";
@@ -137,6 +140,49 @@ export interface TelegramSendResult {
  * Send a Telegram text reply, splitting long messages and optionally
  * attaching inline keyboard buttons for approval prompts.
  */
+/**
+ * Replace a Telegram message in place.
+ *
+ * Telegram rejects an edit whose text already matches the message. That is the
+ * request having been satisfied rather than a failure, so it resolves. Every
+ * other rejection throws: an edit that quietly became a new message would
+ * leave the original sitting beside it, which reads as answering twice.
+ *
+ * Unlike a send, this cannot split long text across messages, because an edit
+ * addresses exactly one. Telegram rejects text past its limit, and that
+ * rejection reaches the caller rather than being papered over.
+ *
+ * The empty `reply_markup` is load-bearing. `editMessageText` leaves an
+ * existing inline keyboard alone when the field is omitted, so a message
+ * revised to read as settled would keep its live buttons beside that text.
+ * Every caller here edits a message into a settled state, and the approval
+ * interception path says so outright, so the keyboard goes with the revision.
+ */
+export async function editTelegramMessage(
+  chatId: string,
+  messageId: string,
+  text: string,
+): Promise<void> {
+  try {
+    await callTelegramBotApi<TelegramMessage>("editMessageText", {
+      chat_id: chatId,
+      message_id: Number(messageId),
+      text,
+      reply_markup: { inline_keyboard: [] },
+    });
+  } catch (err) {
+    if (
+      err instanceof TelegramNonRetryableError &&
+      err.description?.includes("message is not modified")
+    ) {
+      log.debug({ chatId, messageId }, "Telegram edit already applied");
+      return;
+    }
+    throw err;
+  }
+  log.debug({ chatId, messageId }, "Telegram message edited");
+}
+
 export async function sendTelegramReply(
   chatId: string,
   text: string,
@@ -345,6 +391,43 @@ export async function sendTelegramAttachments(
  * Send a typing indicator ("chat action") to a Telegram chat.
  * Returns true on success, false on failure (non-throwing).
  */
+/**
+ * Set or clear the bot's emoji reaction on a message.
+ *
+ * `setMessageReaction` semantics (Bot API): a bot holds at most one
+ * reaction per message, so `add` replaces any prior one and `remove`
+ * clears it by sending the empty reaction list. `emoji` is the unicode
+ * emoji itself, and Telegram accepts only its allowed set (the standard
+ * reaction emoji, narrowed further by a chat's allowed-reactions
+ * setting); a rejected emoji reports `ok: false` rather than throwing.
+ */
+export async function sendTelegramReaction(
+  chatId: string,
+  emoji: string,
+  messageId: string,
+  action: "add" | "remove",
+): Promise<ChannelDeliveryResult> {
+  const messageIdNum = Number.parseInt(messageId, 10);
+  if (!Number.isFinite(messageIdNum)) {
+    log.warn({ chatId, messageId }, "Non-numeric Telegram reaction target");
+    return { ok: false };
+  }
+  try {
+    await callTelegramBotApi("setMessageReaction", {
+      chat_id: chatId,
+      message_id: messageIdNum,
+      reaction: action === "add" ? [{ type: "emoji", emoji }] : [],
+    });
+    return { ok: true };
+  } catch (err) {
+    log.warn(
+      { err, chatId, messageId, action },
+      "Failed to deliver Telegram reaction",
+    );
+    return { ok: false };
+  }
+}
+
 export async function sendTelegramTypingIndicator(
   chatId: string,
   opts?: TelegramSendOptions,
@@ -358,6 +441,99 @@ export async function sendTelegramTypingIndicator(
     return true;
   } catch (err) {
     log.debug({ err, chatId }, "Failed to send typing indicator");
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Live message drafts (sendMessageDraft)
+// ---------------------------------------------------------------------------
+
+/**
+ * Telegram caps a message, and so a draft's text, at 4096 characters.
+ *
+ * A draft is a preview rather than the reply, so an over-long partial keeps
+ * its tail rather than being split across drafts: splitting would animate the
+ * reader back to the start of the reply every time it grew past the cap. The
+ * tail is also the live end of the draft, so a reply past the cap keeps
+ * moving instead of freezing on a prefix, and anything drawn beneath it
+ * stays visible.
+ */
+export const TELEGRAM_DRAFT_TEXT_LIMIT = 4096;
+
+/**
+ * The tail of a draft that Telegram will accept, cut on a character boundary.
+ *
+ * The cap counts UTF-16 code units, so slicing to it can land between the two
+ * halves of an astral character (an emoji, which a plan's status glyphs and a
+ * reply's own text both carry) and send a lone surrogate. Dropping a leading
+ * low surrogate costs one character and keeps the text well-formed.
+ */
+function draftTail(text: string): string {
+  if (text.length <= TELEGRAM_DRAFT_TEXT_LIMIT) {
+    return text;
+  }
+  const tail = text.slice(-TELEGRAM_DRAFT_TEXT_LIMIT);
+  const first = tail.charCodeAt(0);
+  return first >= 0xdc00 && first <= 0xdfff ? tail.slice(1) : tail;
+}
+
+/**
+ * How long a draft survives without being re-sent: Telegram describes it as
+ * "a temporary 30-second preview". A draft that stops being advanced
+ * disappears rather than lingering with stale text.
+ */
+export const TELEGRAM_DRAFT_TTL_MS = 30_000;
+
+/**
+ * Show, or advance, the live draft of a reply still being written.
+ *
+ * `sendMessageDraft` takes the whole partial reply rather than a delta and
+ * lets Telegram's clients animate the difference, which is why every call
+ * passes the full text. Reusing one `draft_id` is what makes those calls read
+ * as one growing draft: a different id replaces the draft without animation.
+ * Empty text is meaningful, rendering Telegram's own "Thinking..." placeholder,
+ * so it is passed through rather than skipped.
+ *
+ * The draft is a preview and never the reply. Telegram's own words: "once the
+ * output is finalized, you must call sendMessage with the complete message to
+ * persist it". It also clears the moment the bot sends a real message, so
+ * nothing has to clear it, and it survives only {@link TELEGRAM_DRAFT_TTL_MS}
+ * without being re-sent.
+ *
+ * Private chats only, and `chat_id` here is an Integer rather than the
+ * "Integer or String" most methods accept, so a non-numeric chat id cannot
+ * address a draft at all and is refused rather than sent to be rejected.
+ *
+ * @see https://core.telegram.org/bots/api#sendmessagedraft
+ */
+export async function sendTelegramMessageDraft(
+  chatId: string,
+  draftId: number,
+  text: string,
+  opts?: TelegramSendOptions,
+): Promise<boolean> {
+  const numericChatId = Number(chatId);
+  if (!Number.isSafeInteger(numericChatId)) {
+    log.debug(
+      { chatId, draftId },
+      "Telegram drafts address a chat by integer id; skipping draft",
+    );
+    return false;
+  }
+  try {
+    await callTelegramBotApi("sendMessageDraft", {
+      chat_id: numericChatId,
+      draft_id: draftId,
+      text: draftTail(text),
+      ...threadIdPayloadFields(opts),
+    });
+    return true;
+  } catch (err) {
+    log.debug(
+      { err, chatId, draftId },
+      "Failed to send Telegram message draft",
+    );
     return false;
   }
 }

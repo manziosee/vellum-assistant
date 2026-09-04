@@ -66,6 +66,13 @@ export function isChannelId(value: unknown): value is ChannelId {
  * That irregularity is why this is stated rather than derived from the key,
  * and it is stated here because this file already owns what a channel is.
  *
+ * Both senses can hold a user token, which is the sharpest edge. The `slack`
+ * integration's persisted token *is* the installer's user token, held on its
+ * OAuth connection. `slack_channel` holds an optional `user_token` in the
+ * credential store, beside its bot and app tokens. Same words, different
+ * homes, and only the second is a credential-store key: a pasted token is
+ * always the channel's, because the integration's never leaves the exchange.
+ *
  * Deliberately only the key. What fields each credential requires is declared
  * once already, per service, in the gateway's credential specs; restating it
  * here would be a second copy of a different fact.
@@ -88,5 +95,26 @@ export const CHANNEL_BOT_PROVIDER = {
 export function isChannelBotProvider(providerKey: string): boolean {
   return (Object.values(CHANNEL_BOT_PROVIDER) as readonly string[]).includes(
     providerKey,
+  );
+}
+
+/**
+ * Whether a provider key names the user grant of a brand the assistant is
+ * reached through some other way: `slack` beside `slack_channel`, `discord`
+ * beside `discord_channel`. The other half of the question
+ * `isChannelBotProvider` asks.
+ *
+ * The two halves carry the same brand name, so the grant reads as the way to
+ * connect that brand when the bot is. A surface offering people a way to
+ * connect an assistant wants the bot, and wants this to say which keys it is
+ * answering for rather than naming them itself.
+ *
+ * A channel whose bot is its own key has no such pair: `telegram` names the
+ * bot, so nothing is standing beside it to be mistaken for.
+ */
+export function isChannelUserIntegration(providerKey: string): boolean {
+  return Object.entries(CHANNEL_BOT_PROVIDER).some(
+    ([channelId, botProviderKey]) =>
+      channelId === providerKey && botProviderKey !== providerKey,
   );
 }

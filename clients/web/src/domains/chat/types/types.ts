@@ -163,6 +163,19 @@ export interface DisplayMessage {
    *  summarize-up-to results). Rendered as a standalone system notice —
    *  no avatar, no persona bubble — never as assistant speech. */
   isSystemCard?: boolean;
+  /** Deliberate-silence turn: the whole reply was the no-response sentinel.
+   *  Mirrors `ConversationMessage["noResponse"]`; renders as a quiet marker
+   *  and counts as the turn's reply. */
+  isNoResponse?: boolean;
+  /** Reaction row, either direction. Mirrors `ConversationMessage["reaction"]`;
+   *  renders as a reaction line, never the stored sentinel text. */
+  reaction?: {
+    emoji: string;
+    op: "added" | "removed";
+    targetMessageId: string;
+    actorDisplayName?: string;
+    selfAuthored?: boolean;
+  };
   /** Provider-failure notice metadata, carried from the wire
    *  `ConversationMessage["providerError"]`. `code` is the stable classified
    *  error code (e.g. `"PROVIDER_BILLING"`), `category` the classified
@@ -170,6 +183,10 @@ export interface DisplayMessage {
    *  the upsell card instead of a persona bubble; other categories keep the
    *  plain rendering. */
   providerError?: { code?: string; category?: string };
+  /** Unix ms at which the message was deleted on its channel after the
+   *  daemon stored it. Mirrors `ConversationMessage["deletedAt"]`; renders as
+   *  a tombstone in place of the stored content, which stays for Inspect. */
+  deletedAt?: number;
 }
 
 /**

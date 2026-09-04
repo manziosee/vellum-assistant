@@ -20,26 +20,37 @@ import type {
   AppVersionInfo,
   AssistantStatus,
   BundleScanData,
+  CompanionCapturePick,
+  CompanionCaptureSources,
   CompanionCharacter,
   CompanionGrowth,
   CompanionContext,
+  CompanionIntroAction,
   CompanionSurfaceState,
   ConnectivityState,
+  ScreenCaptureFrame,
   DeepLink,
+  DictationOverlayHitRegion,
   DictationOverlayMessage,
   DictationOverlayState,
   DictationPartialEvent,
   DictationPartialsResult,
+  DictationTranscribeResult,
+  DownloadDoneEvent,
   ElectronHostOS,
-  FnPushToTalkResult,
+  ModifierHold,
+  ModifierHoldRegistrationResult,
   HelperRestartResult,
   HelperState,
   HotkeyEvent,
   HotkeyEventState,
   HotkeyScope,
+  HotkeySelection,
   LocalAssistantStatusResult,
-  LocalConnectImportResult,
   LocalListDevicesResult,
+  LocalPairingPollResult,
+  LocalPairingStartResult,
+  LocalReadAssistantAvatarResult,
   LocalRevokeDeviceResult,
   LocalUpgradeOptions,
   LocalWakeOptions,
@@ -47,6 +58,8 @@ import type {
   NotificationCategory,
   PowerEvent,
   PowerEventKind,
+  VoiceModeChord,
+  VoiceModeChordRegistrationResult,
   ResolvedHotkey,
   ShowNotificationPayload,
   SystemPermissionKind,
@@ -54,6 +67,7 @@ import type {
   SystemPermissionStatus,
   SystemPermissionsState,
   TextInsertionResult,
+  TitleBarOverlayTheme,
   UpdateState,
   UpdateStatus,
   VellumCommand,
@@ -63,6 +77,8 @@ import type {
   VoiceActivityPhase,
   VoiceActivityStart,
   VoiceActivityState,
+  WatchCaptureTarget,
+  WindowAttentionPayload,
 } from "@vellumai/ipc-contract";
 
 export type {
@@ -71,19 +87,22 @@ export type {
   BundleScanData,
   CompanionGrowth,
   CompanionContext,
+  CompanionIntroAction,
   CompanionSurfaceState,
   ConnectivityState,
   DeepLink,
+  DictationOverlayHitRegion,
   DictationOverlayMessage,
   DictationOverlayState,
   DictationPartialEvent,
   DictationPartialsResult,
-  FnPushToTalkResult,
+  DownloadDoneEvent,
   HelperRestartResult,
   HelperState,
   HotkeyEvent,
   HotkeyEventState,
   HotkeyScope,
+  HotkeySelection,
   NotificationCategory,
   PowerEvent,
   PowerEventKind,
@@ -145,7 +164,16 @@ declare global {
         restart?(): Promise<HelperRestartResult>;
         onState?(callback: (state: HelperState) => void): () => void;
         hotkey?: {
-          fnPushToTalk(enable: boolean): Promise<FnPushToTalkResult>;
+          setVoiceModeChord?(
+            activator: VoiceModeChord | null,
+          ): Promise<VoiceModeChordRegistrationResult>;
+          setModifierHold?(
+            hold: ModifierHold,
+          ): Promise<ModifierHoldRegistrationResult>;
+          readFrontSelection?(): Promise<HotkeySelection | null>;
+          onRegistrationChange?(
+            callback: (active: boolean) => void,
+          ): () => void;
           onEvent(callback: (event: HotkeyEvent) => void): () => void;
         };
         dictation?: {
@@ -161,9 +189,7 @@ declare global {
           onFinalized?(
             callback: (event: DictationPartialEvent) => void,
           ): () => void;
-          transcribe?(
-            audio: ArrayBuffer,
-          ): Promise<{ ok: boolean; reason?: string }>;
+          transcribe?(audio: ArrayBuffer): Promise<DictationTranscribeResult>;
           onTranscribed?(
             callback: (event: DictationPartialEvent) => void,
           ): () => void;
@@ -189,7 +215,10 @@ declare global {
       };
       icon?: {
         setAvatar(png: Uint8Array | null): void;
-        setCharacter?(character: CompanionCharacter | null): void;
+        setCharacter?(
+          character: CompanionCharacter | null,
+          accentHex?: string | null,
+        ): void;
       };
       dock: {
         setBadge(count: number): void;
@@ -197,8 +226,14 @@ declare global {
       share?: {
         shareFile(bytes: Uint8Array, filename: string): Promise<void>;
       };
+      downloads?: {
+        onDone(callback: (event: DownloadDoneEvent) => void): () => void;
+        reveal(id: string): Promise<void>;
+      };
       menu: {
         setPlatformSession(has: boolean): Promise<void>;
+        titles?(): Promise<Array<{ id: string; label: string }>>;
+        popup?(id: string, x: number, y: number): Promise<void>;
       };
       localMode: {
         hatch(
@@ -219,6 +254,10 @@ declare global {
           assistantId: string,
           name: string,
         ): Promise<LockfileWriteResult>;
+        stampLockfileAssistantOnboarded?(
+          assistantId: string,
+          onboardedAt: string,
+        ): Promise<LockfileWriteResult>;
         replacePlatformAssistants(
           platformAssistants: Array<Record<string, unknown>>,
           organizationId?: string,
@@ -229,10 +268,12 @@ declare global {
           hashedDeviceId: string,
         ): Promise<LocalRevokeDeviceResult>;
         unpair?(assistantId: string): Promise<LockfileWriteResult>;
-        connectImport?(
-          bundle: string,
+        pairingStart?(address: string): Promise<LocalPairingStartResult>;
+        pairingPoll?(
+          handle: string,
           name?: string,
-        ): Promise<LocalConnectImportResult>;
+        ): Promise<LocalPairingPollResult>;
+        pairingCancel?(handle: string): Promise<{ ok: boolean }>;
         sleep?(assistantId: string): Promise<{ ok: boolean; error?: string }>;
         wake?(
           assistantId: string,
@@ -243,6 +284,9 @@ declare global {
           options?: LocalUpgradeOptions,
         ): Promise<{ ok: boolean; version?: string; error?: string }>;
         status?(assistantId: string): Promise<LocalAssistantStatusResult>;
+        readAssistantAvatar?(
+          assistantId: string,
+        ): Promise<LocalReadAssistantAvatarResult>;
         guardianToken(
           assistantId: string,
         ): Promise<
@@ -262,6 +306,7 @@ declare global {
       mainWindow: {
         ensureVisible(): Promise<void>;
         setOnboarding(active: boolean): Promise<void>;
+        setTitleBarOverlay?(colors: TitleBarOverlayTheme): Promise<void>;
       };
       power: {
         onEvent(callback: (event: PowerEvent) => void): () => void;
@@ -303,6 +348,7 @@ declare global {
         requestStop(): void;
         onStopRequested(callback: () => void): () => void;
         setInteractive(interactive: boolean): void;
+        setHitRegion?(region: DictationOverlayHitRegion | null): void;
       };
       notifications?: {
         show(
@@ -310,6 +356,9 @@ declare global {
         ): Promise<{ success: boolean; errorMessage?: string }>;
         onAction(
           callback: (event: NotificationActionEvent) => void,
+        ): () => void;
+        onWindowAttention?(
+          callback: (payload: WindowAttentionPayload) => void,
         ): () => void;
       };
       popout?: {
@@ -330,7 +379,9 @@ declare global {
         update(content: VoiceActivityContent): void;
         end(): void;
         control(control: VoiceActivityControl): void;
-        onControl(callback: (control: VoiceActivityControl) => void): () => void;
+        onControl(
+          callback: (control: VoiceActivityControl) => void,
+        ): () => void;
       };
       companion?: {
         getState(): Promise<CompanionSurfaceState | null>;
@@ -338,10 +389,17 @@ declare global {
         setInteractive?(interactive: boolean): void;
         moveBy?(dx: number, dy: number): void;
         startVoice?(): void;
+        toggleWatch?(pick?: CompanionCapturePick): void;
+        listCaptureSources?(): Promise<CompanionCaptureSources>;
+        setScreenShare?(pick?: CompanionCapturePick): void;
+        captureScreen?(
+          target: WatchCaptureTarget,
+        ): Promise<ScreenCaptureFrame | null>;
+        answerWatchRetro?(open: boolean): void;
         activate?(): void;
-        setComposing?(composing: boolean): void;
-        submit?(message: string, startsConversation: boolean): void;
         setContext?(context: CompanionContext): void;
+        advanceIntro?(action: CompanionIntroAction): void;
+        showContextMenu?(): void;
       };
     };
   }

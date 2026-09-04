@@ -1,13 +1,21 @@
+import type { QueryClient } from "@tanstack/react-query";
+
 import { setSelectedAssistant } from "@/assistant/selection";
+import { forgetAssistantAvatar } from "@/hooks/use-chooser-row-avatar";
 import {
   getLockfileAssistant,
   getSelectedAssistant,
+  isLocalClient,
   isPairedAssistant,
   loadLockfile,
   removePairedAssistantFromLockfile,
 } from "@/lib/local-mode";
+import { t } from "@/i18n";
 import { useAuthStore } from "@/stores/auth-store";
-import { useResolvedAssistantsStore } from "@/stores/resolved-assistants-store";
+import {
+  useResolvedAssistantsStore,
+  type ResolvedAssistant,
+} from "@/stores/resolved-assistants-store";
 import { routes } from "@/utils/routes";
 
 /**
@@ -42,12 +50,40 @@ export async function switchToAssistant(
       await useAuthStore.getState().connectPairedAssistant(assistantId);
     } catch (err) {
       console.error("switchToAssistant.connectPairedAssistant failed", err);
-      return { ok: false, error: "Failed to connect to the assistant." };
+      return { ok: false, error: t("assistantConnect.failed") };
     }
     return { ok: true };
   }
   await setSelectedAssistant(assistantId);
   return { ok: true };
+}
+
+/**
+ * Switch to a resolved assistant through the connect entry its kind needs,
+ * mirroring the chooser screen's dispatch: a paired entry primes the
+ * host-authorized proxy, a local entry on a local client primes a gateway
+ * token for its gateway, and everything else (platform-hosted, or a
+ * hub-listed local entry reached through the platform) goes through the
+ * platform session path.
+ *
+ * Unlike {@link switchToAssistant}, which serves id-only host commands whose
+ * surfaces exclude local entries, this rethrows so UI callers can surface the
+ * failure. Every connect entry fails before the selection write, so a failed
+ * switch leaves the previous assistant intact.
+ */
+export async function switchToResolvedAssistant(
+  assistant: ResolvedAssistant,
+): Promise<void> {
+  const auth = useAuthStore.getState();
+  if (assistant.isPaired) {
+    await auth.connectPairedAssistant(assistant.id);
+    return;
+  }
+  if (assistant.isLocal && isLocalClient()) {
+    await auth.connectLocalAssistant(assistant.id);
+    return;
+  }
+  await auth.connectPlatformAssistant(assistant.id);
 }
 
 export type RemovePairedOutcome =
@@ -63,6 +99,7 @@ export type RemovePairedOutcome =
  * should route to the chooser (`nextRoute`); otherwise stay put (`null`).
  */
 export async function removePairedAssistant(
+  queryClient: QueryClient,
   assistantId: string,
 ): Promise<RemovePairedOutcome> {
   const wasSelected = getSelectedAssistant()?.assistantId === assistantId;
@@ -76,6 +113,7 @@ export async function removePairedAssistant(
   if (!result.ok) {
     return { ok: false, error: result.error ?? "Failed to remove assistant." };
   }
+  forgetAssistantAvatar(queryClient, assistantId);
   const resolvedStore = useResolvedAssistantsStore.getState();
   if (resolvedStore.activeAssistantId === assistantId) {
     resolvedStore.setActiveAssistantId(null);

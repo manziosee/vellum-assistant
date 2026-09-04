@@ -28,6 +28,11 @@ import {
   ProviderKeyRejectedError,
 } from "@/domains/onboarding/provider-key";
 import { onboardingProvider } from "@/domains/onboarding/provider-catalog";
+import {
+  NEW_ASSISTANT_PARAM,
+  shouldSkipResearchAfterHatch,
+} from "@/domains/onboarding/onboarding-destination";
+import { stampAssistantOnboarded } from "@/domains/onboarding/stamp-assistant-onboarded";
 import { ATTRIBUTED_PLUGIN_PARAM } from "@/domains/onboarding/plugin-attribution";
 import {
   awaitPurchasedProvisioning,
@@ -194,6 +199,9 @@ export function HatchingScreen() {
       hatchTraits.color,
       320,
     );
+    if (!svg) {
+      return "";
+    }
     return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
   }, [hatchTraits]);
   const [phase, setPhase] = useState<HatchPhase>("initializing");
@@ -299,6 +307,17 @@ export function HatchingScreen() {
         void (async () => {
           await lifecycleService.checkAssistant();
           if (cancelled) {
+            return;
+          }
+          // Non-production skip-to-chat: the assistant is live, so drop into
+          // the workspace instead of the research/personality funnel. This
+          // bypasses the research route, so it is the terminal that has to
+          // record the completion itself.
+          if (shouldSkipResearchAfterHatch(searchParams)) {
+            stampAssistantOnboarded(readyAssistantId);
+            void navigate(`${routes.assistant}?onboarding=1`, {
+              replace: true,
+            });
             return;
           }
           // A local hatch feeds the research/personality flow. The assistant is
@@ -638,7 +657,7 @@ export function HatchingScreen() {
         return;
       }
 
-      handleHatchReady();
+      handleHatchReady(assistantId);
     };
 
     const runPoll = async () => {
@@ -765,7 +784,7 @@ export function HatchingScreen() {
 
   if (error) {
     return (
-      <OnboardingLayout showAvatarWave>
+      <OnboardingLayout avatarWave="beside">
         <div
           role="alert"
           className={`mx-auto flex w-full max-w-xl flex-col items-center ${electron ? "min-h-full px-8 pt-21 pb-28 electron-prechat-type" : "min-h-screen justify-center px-6 pb-40 md:min-h-full md:pb-6"} text-center text-[var(--content-default)]`}
@@ -862,7 +881,7 @@ export function HatchingScreen() {
                 void navigate(
                   useLocalHatch
                     ? routes.onboarding.hosting
-                    : routes.onboarding.privacy,
+                    : `${routes.onboarding.privacy}?${NEW_ASSISTANT_PARAM}=1`,
                   { replace: true },
                 )
               }
@@ -876,7 +895,7 @@ export function HatchingScreen() {
   }
 
   return (
-    <OnboardingLayout showAvatarWave>
+    <OnboardingLayout avatarWave="beside">
       {/* Electron layout: title pinned 84px from the window top (the shared
           step-title position), the creature centered in the leftover space via
           auto margins, and the progress section near the bottom — pb-28 keeps

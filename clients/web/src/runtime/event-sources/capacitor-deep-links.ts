@@ -5,8 +5,12 @@ import { subscribeCapacitorListener } from "@/runtime/capacitor-listener";
 import {
   OAUTH_COMPLETE_DEEP_LINK_EVENT,
   parseBillingCheckoutCompleteDeepLink,
+  parseNewChatDeepLink,
   parseOAuthCompleteDeepLink,
+  parseOpenCameraDeepLink,
+  parseOpenConversationsDeepLink,
   parseOpenThreadDeepLink,
+  parseShareDeepLink,
   parseStartVoiceDeepLink,
 } from "@/runtime/native-deep-link";
 
@@ -22,7 +26,12 @@ import {
  * `vellum-assistant://voice?mode=…` publishes `deeplink.startVoice`;
  * `vellum-assistant://thread/<id>?message=…` publishes
  * `deeplink.sendToThread` (or `deeplink.openThread` when it carries no
- * usable message); any other URL publishes `deeplink.unknown { url }`
+ * usable message); the Home Screen widgets' `vellum-assistant://camera`
+ * and `vellum-assistant://new-chat` publish `deeplink.openCamera` /
+ * `deeplink.newChat`, the unread chip and unread line send
+ * `vellum-assistant://conversations` (`deeplink.openConversations`),
+ * and the share extension's `vellum-assistant://share/<id>` publishes
+ * `deeplink.share`; any other URL publishes `deeplink.unknown { url }`
  * on the bus (query/fragment stripped).
  *
  * Off Capacitor the function is a no-op; Electron deep links flow
@@ -110,18 +119,42 @@ function handleUrl(url: string): void {
     return;
   }
 
+  // The Home Screen widgets' buttons. Neither link carries a parameter, so
+  // unlike the ones above their placement is only about claiming the host
+  // before the fallback logs it as unknown.
+  const openCamera = parseOpenCameraDeepLink(url, parseOptions);
+  if (openCamera !== null) {
+    publish("deeplink.openCamera", openCamera);
+    return;
+  }
+
+  const newChat = parseNewChatDeepLink(url, parseOptions);
+  if (newChat !== null) {
+    publish("deeplink.newChat", newChat);
+    return;
+  }
+
+  const openConversations = parseOpenConversationsDeepLink(url, parseOptions);
+  if (openConversations !== null) {
+    publish("deeplink.openConversations", openConversations);
+    return;
+  }
+
+  const share = parseShareDeepLink(url);
+  if (share !== null) {
+    publish("deeplink.share", share);
+    return;
+  }
+
   // A malformed OAuth-complete URL can carry one-time auth codes in its
   // query/fragment — strip both so they never reach telemetry breadcrumbs.
   publish("deeplink.unknown", { url: sanitizeUnknownUrl(url) });
 }
 
 function sanitizeUnknownUrl(url: string): string {
-  try {
-    const parsed = new URL(url);
-    parsed.search = "";
-    parsed.hash = "";
-    return parsed.toString();
-  } catch {
-    return url.split(/[?#]/, 1)[0];
-  }
+  // Strip query/fragment from the raw string. `new URL` would resolve `..`
+  // (so `://share/../x` would look like a legitimate `://share/x` in
+  // telemetry) and is unnecessary: the only secret-bearing parts are after
+  // `?` or `#`.
+  return url.split(/[?#]/, 1)[0];
 }

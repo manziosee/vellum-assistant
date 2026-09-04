@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, mock, test } from "bun:test";
 
 // ── Mock modules ────────────────────────────────────────────────────────────
@@ -40,13 +40,18 @@ mock.module("../tools/network/script-proxy/index.js", () => ({
 
 // ── Imports (after mocks) ───────────────────────────────────────────────────
 
-import { formatShellOutput } from "../tools/shared/shell-output.js";
+import {
+  formatShellOutput,
+  MAX_OUTPUT_LENGTH,
+  OUTPUT_TRUNCATED_TAG,
+} from "../tools/shared/shell-output.js";
 import {
   ALWAYS_INJECTED_ENV_VARS,
   buildSanitizedEnv,
   KATA_INJECTED_ENV_VARS,
   KATA_SAFE_ENV_VARS,
   SAFE_ENV_VARS,
+  WINDOWS_SAFE_ENV_VARS,
 } from "../tools/terminal/safe-env.js";
 import { shellTool } from "../tools/terminal/shell.js";
 
@@ -141,6 +146,15 @@ describe("buildSanitizedEnv", () => {
     expect(env.VELLUM_APT_DATA_ROOT).toBe("/data/system");
     expect(env.PATH.split(":")).toContain("/data/system/usr/bin");
     expect(env.PATH.split(":")).toContain("/data/system/usr/local/bin");
+    // Shims must shadow the chroot bin dirs so a shim beats a wrapper script
+    // whose hardcoded absolute path only resolves inside the chroot.
+    const kataPathParts = env.PATH.split(":");
+    expect(
+      kataPathParts.indexOf("/data/system/.host-shims"),
+    ).toBeGreaterThanOrEqual(0);
+    expect(kataPathParts.indexOf("/data/system/.host-shims")).toBeLessThan(
+      kataPathParts.indexOf("/data/system/bin"),
+    );
     expect(env.LD_LIBRARY_PATH.split(":")).toContain("/data/system/usr/lib");
     expect(env.LD_LIBRARY_PATH.split(":")).toContain(
       "/data/system/usr/local/lib",
@@ -194,6 +208,7 @@ describe("buildSanitizedEnv", () => {
       ...KATA_SAFE_ENV_VARS,
       ...KATA_INJECTED_ENV_VARS,
       ...ALWAYS_INJECTED_ENV_VARS,
+      ...WINDOWS_SAFE_ENV_VARS,
     ];
     for (const key of keys) {
       expect(safeKeys).toContain(key);
@@ -358,12 +373,8 @@ describe("formatShellOutput", () => {
   test("truncates very long output", () => {
     const longOutput = "x".repeat(30_000);
     const result = formatShellOutput(longOutput, "", 0, false, 120);
-    expect(result.content).toContain('limit="20K"');
-    // Extract the file="..." attribute from the truncation tag
-    const fileMatch = result.content.match(/file="([^"]+)"/);
-    expect(fileMatch).not.toBeNull();
-    const filePath = fileMatch![1];
-    expect(existsSync(filePath)).toBe(true);
-    expect(readFileSync(filePath, "utf-8")).toBe(longOutput);
+    expect(result.content).toContain(OUTPUT_TRUNCATED_TAG);
+    expect(result.content).not.toContain("file=");
+    expect(result.content.length).toBeLessThan(MAX_OUTPUT_LENGTH + 80);
   });
 });

@@ -73,26 +73,77 @@ export function SidebarSectionCard({
      card to `fit-content` to read its true hug width, then restores both -
      synchronously, in the same layout-effect pass, so nothing paints in
      between and there's no visible flash. Re-measures whenever the header
-     content that determines that width could have changed. */
+     content that determines that width could have changed.
+
+     The collapsed-only indicator gets the inverse treatment for the same
+     reason the row list gets hidden: the measurement runs in whatever state
+     the card is in, but the value it produces is spent in the collapsed
+     state. An open card holds its indicator at `display:none` (the rows
+     carry their own dots), so measuring around it under-reports the hug
+     width by the dot's cell, and the collapsed header pays that deficit out
+     of its label - "From Ada" rendered as "From ...". Forcing it visible for
+     the measurement makes the measured configuration the one the pill will
+     actually show. */
+  const hasCollapsedIndicator = section.collapsedIndicator != null;
   useLayoutEffect(() => {
-    const card = cardRef.current;
-    if (!card) {
-      return;
-    }
-    const content = card.querySelector<HTMLElement>(".sidebar-section-list");
-    const prevContentDisplay = content?.style.display;
-    const prevCardWidth = card.style.width;
-    if (content) {
-      content.style.display = "none";
-    }
-    card.style.width = "fit-content";
-    const width = card.getBoundingClientRect().width;
-    card.style.width = prevCardWidth;
-    if (content) {
-      content.style.display = prevContentDisplay ?? "";
-    }
-    card.style.setProperty("--section-collapsed-width", `${width}px`);
-  }, [section.icon, section.label]);
+    const measure = () => {
+      const card = cardRef.current;
+      if (!card) {
+        return;
+      }
+      const content = card.querySelector<HTMLElement>(".sidebar-section-list");
+      const indicator = card.querySelector<HTMLElement>(
+        '[data-slot="collapsible-nav-section-indicator"]',
+      );
+      const prevContentDisplay = content?.style.display;
+      const prevIndicatorDisplay = indicator?.style.display;
+      const prevCardWidth = card.style.width;
+      if (content) {
+        content.style.display = "none";
+      }
+      if (indicator) {
+        indicator.style.display = "flex";
+      }
+      card.style.width = "fit-content";
+      const width = card.getBoundingClientRect().width;
+      card.style.width = prevCardWidth;
+      if (content) {
+        content.style.display = prevContentDisplay ?? "";
+      }
+      if (indicator) {
+        indicator.style.display = prevIndicatorDisplay ?? "";
+      }
+      /* Ceiled: the hug width is fractional and republishing it exactly
+         leaves the label with exactly its own fractional width, where
+         sub-pixel rounding still trips `text-overflow` into an ellipsis on
+         the last glyph. A whole pixel of headroom costs nothing visible and
+         keeps the label whole. */
+      card.style.setProperty(
+        "--section-collapsed-width",
+        `${Math.ceil(width)}px`,
+      );
+    };
+
+    measure();
+
+    /* The hug width is text metrics, and on a cold load this effect runs
+       before the webfont has: measured under the fallback face, every pill
+       is a few pixels off and every label ellipsizes on its first collapse.
+       One corrective pass when the fonts settle; on later runs the promise
+       is already resolved and the extra pass is an idempotent no-op. */
+    let cancelled = false;
+    document.fonts?.ready.then(
+      () => {
+        if (!cancelled) {
+          measure();
+        }
+      },
+      () => {},
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [section.icon, section.label, hasCollapsedIndicator]);
 
   /* The card is what drags, not the header inside it. A section is a card
      now, so grabbing one should pick up the whole object; with the handle on
@@ -112,17 +163,22 @@ export function SidebarSectionCard({
            row: the card is what owns the fill, and every swipeable thing it
            holds inherits the one value. */
         "[--swipe-reveal-bg:var(--surface-lift)]",
-        /* No padding of its own: the header row is already a self-contained
-           pill (its own height, its own 12px/6px inset) per Figma, and
-           wrapping it in another layer of padding would inflate the pill
-           past its spec. The row list picks up the matching horizontal
-           inset directly (see `CollapsibleNavSection.Section`'s Content). */
+        /* No padding of its own: the overlay class branch below owns the
+           card's inset, and wrapping it in another layer of Card padding
+           would inflate the pill past its spec. The row list picks up the
+           matching horizontal inset directly (see
+           `CollapsibleNavSection.Section`'s Content). */
         /* Collapsed, a section is a pill that hugs its own header: nothing
-           inside it needs the full rail width. Its own `Collapsible.Item`
-           descendant carries Radix's `data-state`, so `has-[]` reads that
-           state directly rather than this component tracking open/closed
-           itself. Open, it becomes a full-width rounded rect to hold its
-           row list.
+           inside it needs the full rail width. Its own `Collapsible.Item` is
+           the card's only direct child and carries Radix's `data-state`, so
+           `has-[>...]` reads that state directly rather than this component
+           tracking open/closed itself. The child combinator is load-bearing:
+           the header's menu triggers (the "..." Popover/BottomSheet, the
+           right-click ContextMenu on the whole header) are deeper descendants
+           that also carry `data-state=open` while their menu is up, and an
+           unscoped `has-[]` would widen a collapsed pill into an empty
+           full-width box just for opening its actions menu. Open, it becomes
+           a full-width rounded rect to hold its row list.
 
            Radius is the same 18px number in both states - half the pill's
            own 36px height, which is what makes a 36px-tall box read as
@@ -132,15 +188,19 @@ export function SidebarSectionCard({
            lag behind the width/height change since it never moves. */
         "w-[var(--section-collapsed-width,fit-content)]",
         /* The overlay's card is squarer than the rail's pill and carries the
-           inset its header and row list sit flush inside (Figma 7842-83305);
-           the rail keeps the radius that makes its 36px header read as fully
-           round. */
+           inset its header and row list sit flush inside (Figma 7842-83305).
+           The 12px vertical inset plus the 20px header row makes the
+           collapsed pill exactly the overlay tile size (44px), so it stands
+           level with the assistant pill above it. `border-0` drops the
+           Card's default transparent 1px border, which would otherwise grow
+           the border-box to 46px. The rail keeps that border and the radius
+           that makes its header read as fully round. */
         overlayCards
-          ? "rounded-[16px] pt-2.5 pr-3 pb-1.5 pl-2"
+          ? "rounded-[16px] border-0 pt-3 pr-3 pb-3 pl-2"
           : "rounded-[18px]",
-        "has-[[data-state=open]]:w-full",
+        "has-[>[data-state=open]]:w-full",
         /* `width` toggles between the measured `--section-collapsed-width`
-           (a real length - see the `ResizeObserver` above) and a percentage,
+           (a real length - see the layout effect above) and a percentage,
            not a length and a sizing keyword, so an ordinary transition
            interpolates it exactly like it would `border-radius`.
 
@@ -160,7 +220,7 @@ export function SidebarSectionCard({
              now-visible content would sit at full width inside a box still
              catching up to it. */
         "transition-[width] duration-[100ms]",
-        "has-[[data-state=open]]:ease-[step-start]",
+        "has-[>[data-state=open]]:ease-[step-start]",
         "ease-[var(--anim-ease-out)]",
         /* Only the bottom-most section ever claims leftover flex space (see
            `isLast` on `ConversationRowList`): flex-grow has no notion of
@@ -169,7 +229,7 @@ export function SidebarSectionCard({
            size as a busy one beside it. */
         !section.unbounded &&
           section.isLast &&
-          "has-[[data-state=open]]:flex has-[[data-state=open]]:min-h-0 has-[[data-state=open]]:flex-1 has-[[data-state=open]]:flex-col",
+          "has-[>[data-state=open]]:flex has-[>[data-state=open]]:min-h-0 has-[>[data-state=open]]:flex-1 has-[>[data-state=open]]:flex-col",
         /* The card is the drag handle, so it says so. Every interactive thing
            inside it sets its own `cursor-pointer`, which wins wherever one is
            actually under the pointer - so the grab cursor shows on the card's

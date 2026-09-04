@@ -22,11 +22,10 @@ import { getConfig } from "../config/loader.js";
 import { recordEstimate } from "../context/estimator-calibration.js";
 import { stripInjectionsForCompaction } from "../context/strip-injections.js";
 import { getCalibrationProviderKey } from "../context/token-estimator.js";
+import type { ProviderMessageMetadata } from "../messaging/provider-message-metadata.js";
 import {
   formatSlackTimezoneLabel,
   isSlackTs,
-  type SlackMessageMetadata,
-  writeSlackMetadata,
 } from "../messaging/providers/slack/message-metadata.js";
 import {
   recordCompactionEndBestEffort,
@@ -89,6 +88,7 @@ import {
 } from "../usage/pricing.js";
 import { ProviderError } from "../util/errors.js";
 import { faviconUrlForDomain } from "../util/favicon.js";
+import { redactLogString } from "../util/log-redact.js";
 import { getLogger } from "../util/logger.js";
 import { withSqliteRetry } from "../util/sqlite-retry.js";
 import type { DirectiveRequest } from "./assistant-attachments.js";
@@ -143,6 +143,7 @@ import type {
   WebSearchResultItem,
 } from "./message-types/web-activity.js";
 import { referenceMediaBlocksForPersist } from "./persist-media-references.js";
+import { buildProviderRejectionLogFields } from "./provider-rejection-log-fields.js";
 import { turnOrRestingTrust } from "./trust-context-types.js";
 import type { TurnLatencyTracker } from "./turn-latency-tracker.js";
 
@@ -209,6 +210,15 @@ export interface EventHandlerState {
   firstAssistantText: string;
   /** Most recent resolved provider for the current exchange's usage accounting. */
   exchangeProviderName: string | undefined;
+  /**
+   * Inference profile the most recent LLM call actually ran under, set only
+   * when a wrapper rerouted that call (`RetryProvider`'s fallback-profile
+   * escalation). Overwritten by every call, exactly like
+   * `exchangeProviderName` and `model`, so the ledger row's provider, model,
+   * and profile all describe the same call. `undefined` means the last call
+   * was not rerouted and the conversation's own profile resolution stands.
+   */
+  exchangeInferenceProfile: string | undefined;
   exchangeInputTokens: number;
   exchangeCacheCreationInputTokens: number;
   exchangeCacheReadInputTokens: number;
@@ -234,6 +244,14 @@ export interface EventHandlerState {
    * the loop persists the failure as an assistant message.
    */
   providerErrorCategory: string | null;
+  /**
+   * Connection and profile attribution of the most recent provider error
+   * (`classifyConversationError(...).connectionName` / `.profileName`).
+   * Carried into the turn's outcome stamp so failure consumers scope
+   * identity by the route the call actually resolved.
+   */
+  providerErrorConnection: string | null;
+  providerErrorProfile: string | null;
   persistProviderErrorAsAssistantMessage: boolean;
   lastAssistantMessageId: string | undefined;
   /**
@@ -576,6 +594,7 @@ export function createEventHandlerState(): EventHandlerState {
     pendingDirectiveDisplayBuffer: "",
     firstAssistantText: "",
     exchangeProviderName: undefined,
+    exchangeInferenceProfile: undefined,
     exchangeInputTokens: 0,
     exchangeCacheCreationInputTokens: 0,
     exchangeCacheReadInputTokens: 0,
@@ -587,6 +606,8 @@ export function createEventHandlerState(): EventHandlerState {
     providerErrorUserMessage: null,
     providerErrorCode: null,
     providerErrorCategory: null,
+    providerErrorConnection: null,
+    providerErrorProfile: null,
     persistProviderErrorAsAssistantMessage: false,
     lastAssistantMessageId: undefined,
     assistantRowAwaitingFinalization: false,
@@ -1322,9 +1343,9 @@ function resolveAssistantReplyTimestampTimezone(ctx: Conversation): string {
  * snapshot that handleMessageComplete used to compute at end-of-turn. All
  * inputs (channel context, trust context, turnStartedAt) are stable across
  * the LLM call, so building this once at reserve is equivalent to building
- * it at complete. Slack reply rows further stamp a `slackMeta` sub-object —
- * the `channelTs` field stays absent here and is back-filled by
- * `deliverReplyViaCallback` after the gateway returns the ts.
+ * it at complete. The envelope's `messageId` stays absent here and is
+ * back-filled by `deliverReplyViaCallback` after the transport returns the
+ * sent message's id.
  */
 function buildAssistantChannelMetadata(
   state: EventHandlerState,
@@ -1340,45 +1361,59 @@ function buildAssistantChannelMetadata(
     sentAt: state.turnStartedAt,
   };
 
-  if (deps.turnChannelContext.assistantMessageChannel === "slack") {
-    // The whole envelope resolves from one turn-local snapshot: the actor the
-    // provenance above names is the actor whose channel and thread the row
-    // routes to. Reading the live slot here instead would let a concurrent
-    // inbound repoint the reply mid-turn, and could stamp one actor's class
-    // beside another actor's routing identity.
-    const rowTrust = turnOrRestingTrust(deps.ctx);
-    const channelId = rowTrust?.requesterChatId;
-    if (channelId) {
-      // This turn's own inbound thread id (the same field guardian-approval
-      // cards read). Deliberately not the shared conversation binding: on a
-      // legacy flat→thread aliased Slack conversation a concurrent inbound
-      // can rewrite the binding's externalThreadId mid-turn.
-      const turnThreadTs = rowTrust?.sourceThreadId;
-      const threadTs = isSlackTs(turnThreadTs) ? turnThreadTs : undefined;
-      const timestampTimezone = resolveAssistantReplyTimestampTimezone(
-        deps.ctx,
-      );
-      const timestampTimezoneLabel = formatSlackTimezoneLabel(
-        timestampTimezone,
-        { nowMs: state.turnStartedAt },
-      );
-      const partialSlackMeta: Partial<SlackMessageMetadata> = {
-        source: "slack",
-        eventKind: "message",
-        channelId,
-        ...(threadTs ? { threadTs } : {}),
-        timestampTimezone,
-        ...(timestampTimezoneLabel ? { timestampTimezoneLabel } : {}),
-      };
-      // `channelTs` is filled in by the post-send reconciliation step in
-      // `deliverReplyViaCallback`; cast through the Partial to satisfy
-      // the writer's type at this pre-send boundary.
-      metadata.slackMeta = writeSlackMetadata(
-        partialSlackMeta as SlackMessageMetadata,
-      );
-    }
+  const channel = deps.turnChannelContext.assistantMessageChannel;
+  if (channel === "vellum") {
+    // A vellum turn is not a provider message: no envelope.
+    return metadata;
   }
-
+  // Every channel row describes itself in the neutral envelope
+  // `readProviderMetadata` serves, the shape a plugin channel writes too.
+  // `messageId` stays absent here and is back-filled by the post-send
+  // reconciliation once the transport returns the sent message's id, which
+  // is what lets a later reaction or delete on this row resolve back to it.
+  //
+  // The whole envelope resolves from one turn-local snapshot: the actor the
+  // provenance above names is the actor whose channel and thread the row
+  // routes to. Reading the live slot here instead would let a concurrent
+  // inbound repoint the reply mid-turn, and could stamp one actor's class
+  // beside another actor's routing identity.
+  const rowTrust = turnOrRestingTrust(deps.ctx);
+  const chatId = rowTrust?.requesterChatId;
+  if (!chatId) {
+    return metadata;
+  }
+  const envelope: ProviderMessageMetadata = {
+    source: channel,
+    conversationExternalId: chatId,
+    eventKind: "message",
+  };
+  if (channel === "slack") {
+    // Slack's own facts ride the schema's passthrough and come back through
+    // the envelope's Slack view (`slackViewOfProviderMetadata`). The thread
+    // is this turn's own inbound thread id (the same field guardian-approval
+    // cards read), stated because the reply is posted in it and the Slack
+    // transcript is assembled by thread. Deliberately not the shared
+    // conversation binding: on a legacy flat-to-thread aliased Slack
+    // conversation a concurrent inbound can rewrite the binding's
+    // externalThreadId mid-turn.
+    const turnThreadTs = rowTrust?.sourceThreadId;
+    const threadTs = isSlackTs(turnThreadTs) ? turnThreadTs : undefined;
+    const timestampTimezone = resolveAssistantReplyTimestampTimezone(deps.ctx);
+    const timestampTimezoneLabel = formatSlackTimezoneLabel(timestampTimezone, {
+      nowMs: state.turnStartedAt,
+    });
+    metadata.providerMeta = JSON.stringify({
+      ...envelope,
+      ...(threadTs ? { threadId: threadTs } : {}),
+      ...(timestampTimezone ? { timestampTimezone } : {}),
+      ...(timestampTimezoneLabel ? { timestampTimezoneLabel } : {}),
+    });
+    return metadata;
+  }
+  // No `threadId` on the other channels: a value there asserts a thread
+  // exists, and the reply's routing thread is delivery state, not a fact
+  // about this row.
+  metadata.providerMeta = JSON.stringify(envelope);
   return metadata;
 }
 
@@ -2708,7 +2743,8 @@ function handleError(
           event.error instanceof ProviderError
             ? event.error.provider
             : undefined,
-        errorMessage: event.error.message,
+        errorMessage: redactLogString(event.error.message),
+        ...buildProviderRejectionLogFields(event.error),
       },
       "Provider rejected request with unclassified 4xx error",
     );
@@ -2719,6 +2755,8 @@ function handleError(
   state.providerErrorUserMessage = classified.userMessage;
   state.providerErrorCode = classified.code;
   state.providerErrorCategory = classified.errorCategory;
+  state.providerErrorConnection = classified.connectionName ?? null;
+  state.providerErrorProfile = classified.profileName ?? null;
   state.persistProviderErrorAsAssistantMessage =
     shouldPersistProviderErrorAsAssistantMessage(classified);
 }
@@ -3068,6 +3106,11 @@ function handleUsage(
 ): void {
   const providerName = event.actualProvider ?? deps.ctx.provider.name;
   state.exchangeProviderName = providerName;
+  // Assigned unconditionally, not merged: a later non-rerouted call clearing
+  // this back to `undefined` is correct, because provider and model are being
+  // overwritten from that same call. Keeping a stale profile from an earlier
+  // fallback would reintroduce the very contradiction this field prevents.
+  state.exchangeInferenceProfile = event.actualInferenceProfile;
   state.exchangeLlmCallCount += 1;
   state.exchangeInputTokens += event.inputTokens;
   state.lastCallInputTokens = event.inputTokens;
@@ -3133,7 +3176,7 @@ function handleUsage(
         JSON.stringify(event.rawResponse),
         undefined,
         providerName,
-        "mainAgent",
+        deps.ctx.currentCallSite,
         latencyBreakdownJson,
       );
     } catch (err) {
@@ -3214,7 +3257,7 @@ function handleProviderError(
       JSON.stringify(buildProviderErrorResponsePayload(event.error)),
       undefined,
       event.actualProvider,
-      "mainAgent",
+      deps.ctx.currentCallSite,
     );
   } catch (err) {
     deps.rlog.warn(

@@ -4,8 +4,18 @@
  * Enumerates all active OAuth connections and validates each one for:
  * - Token presence in secure storage
  * - Token expiry (expired or expiring within the warning window)
- * - Scope coverage (grantedScopes vs provider defaultScopes)
+ * - Scope coverage (grantedScopes vs the request that produced the token)
  * - Liveness ping (for providers with a pingUrl)
+ *
+ * Scope coverage asks whether a connection carries the scopes the provider
+ * currently requests for the token it stores, which is how a newly required
+ * scope reaches an existing install and prompts a re-authorization. It applies
+ * only where an authorization makes a request. A manual-token provider (a bot
+ * token pasted in, e.g. `slack_channel`) has no request and carries empty
+ * scope lists here; it is still checked for token presence and liveness. What
+ * its token actually carries is read live from the `x-oauth-scopes` response
+ * header by `runtime/channel-readiness-service.ts`, which is the only source
+ * of truth available for a credential this service never negotiated.
  *
  * Designed to run during the heartbeat cycle. The BYO liveness ping is
  * routed through `withValidToken`, so a stale-but-refreshable access token
@@ -24,7 +34,15 @@ import {
   type OAuthConnectionRow,
   type OAuthProviderRow,
 } from "../oauth/oauth-store.js";
-import { scopeDifference } from "../oauth/scope-utils.js";
+import {
+  expectedScopesForStoredToken,
+  scopeDifference,
+} from "../oauth/scope-utils.js";
+import { credentialKey } from "../security/credential-key.js";
+import {
+  getSecureKeyAsync,
+  getSecureKeyResultAsync,
+} from "../security/secure-keys.js";
 import {
   TokenExpiredError,
   withValidToken,
@@ -182,6 +200,8 @@ interface CheckConnectionOpts {
   hasRefreshToken: boolean;
   grantedScopesRaw: string;
   defaultScopesRaw: string;
+  authorizeParamsRaw: string | null;
+  scopeSeparator: string | null;
   pingUrl: string | null;
   pingMethod: string | null;
   pingHeaders: string | null;
@@ -199,6 +219,8 @@ async function checkConnection(
     hasRefreshToken,
     grantedScopesRaw,
     defaultScopesRaw,
+    authorizeParamsRaw,
+    scopeSeparator,
     pingUrl,
     pingMethod,
     pingHeaders,
@@ -268,11 +290,21 @@ async function checkConnection(
     // Has refresh token — not an issue, auto-refresh will handle it
   }
 
-  // 3. Check scope coverage
+  // 3. Check scope coverage, against the request that produced the stored
+  // token rather than the provider's bot-side `scope` parameter. A provider
+  // asking for user scopes as well stores the user token and records that
+  // token's grant, so the bot request names scopes that grant can never hold.
   const grantedScopes = safeJsonParse<string[]>(grantedScopesRaw, []);
-  const defaultScopes = safeJsonParse<string[]>(defaultScopesRaw, []);
-  if (defaultScopes.length > 0 && grantedScopes.length > 0) {
-    const missing = scopeDifference(defaultScopes, grantedScopes);
+  const expectedScopes = expectedScopesForStoredToken(
+    safeJsonParse<string[]>(defaultScopesRaw, []),
+    safeJsonParse<Record<string, string> | undefined>(
+      authorizeParamsRaw,
+      undefined,
+    ),
+    scopeSeparator ?? undefined,
+  );
+  if (expectedScopes.length > 0 && grantedScopes.length > 0) {
+    const missing = scopeDifference(expectedScopes, grantedScopes);
     if (missing.length > 0) {
       return {
         ...base,
@@ -583,6 +615,131 @@ async function checkManagedProvider(
   return results;
 }
 
+/**
+ * Connection id for the Vellum-managed assistant credential.
+ *
+ * The credential is a single workspace-wide slot rather than one row per
+ * account, so it carries the credential-store key as its id instead of a
+ * connection uuid.
+ */
+const ASSISTANT_API_KEY_CONNECTION_ID = "vellum:assistant_api_key";
+
+/**
+ * Health of the platform-provisioned assistant API key, the credential that
+ * authenticates Vellum-managed inference.
+ *
+ * Deliberately not part of {@link checkAllCredentials} yet. Adding it there
+ * makes the heartbeat raise a `credential.health_alert` for this credential,
+ * and that alert has nowhere to send the reader until the notification carries
+ * the repair. It is used on demand for now, by the route a client calls to
+ * confirm a credential it just wrote.
+ *
+ * This is the one credential the assistant cannot mint for itself: the
+ * platform issues it and a signed-in client writes it in. For a self-hosted
+ * or local assistant the platform deliberately does not self-heal a dead key
+ * (`recover_expired_assistant_api_key` excludes registrations of that kind,
+ * because the client owns the reprovision flow), so its health has to be
+ * observed here and acted on by a client.
+ *
+ * Statuses map onto the shared vocabulary:
+ *   - `missing_token`: no key is stored, so managed inference cannot run.
+ *   - `revoked`: the platform settled that the stored key is not accepted.
+ *   - `unreachable`: the credential store or the platform did not answer, so
+ *     health is unknown. The heartbeat drops these before notifying, which is
+ *     what keeps a transient outage from raising a credential alert.
+ *
+ * `canAutoRecover` is true for both failure statuses: recovery needs no
+ * re-authorization from the user, only a signed-in client to rotate the key.
+ */
+export async function checkAssistantApiKey(): Promise<CredentialHealthResult | null> {
+  const base: Omit<
+    CredentialHealthResult,
+    "status" | "details" | "canAutoRecover"
+  > = {
+    connectionId: ASSISTANT_API_KEY_CONNECTION_ID,
+    provider: "vellum",
+    accountInfo: null,
+    missingScopes: [],
+  };
+
+  const stored = await getSecureKeyResultAsync(
+    credentialKey("vellum", "assistant_api_key"),
+  );
+
+  if (stored.unreachable) {
+    return {
+      ...base,
+      status: "unreachable",
+      details:
+        "The credential store is unreachable, so Vellum's managed credentials could not be checked.",
+      canAutoRecover: false,
+    };
+  }
+
+  if (stored.value == null) {
+    // A workspace that was never connected to the platform has no managed
+    // credential and is not unhealthy. Only an install that already carries
+    // the rest of a platform identity is missing something.
+    const baseUrl = await getSecureKeyAsync(
+      credentialKey("vellum", "platform_base_url"),
+    );
+    if (!baseUrl) {
+      return null;
+    }
+    return {
+      ...base,
+      status: "missing_token",
+      details:
+        "No Vellum-managed credentials are stored yet. Log in to the Vellum platform to set them up.",
+      canAutoRecover: true,
+    };
+  }
+
+  const { VellumPlatformClient } = await import("../platform/client.js");
+  const client = await VellumPlatformClient.create();
+  if (!client) {
+    return {
+      ...base,
+      status: "unreachable",
+      details:
+        "The Vellum platform client could not be built, so Vellum's managed credentials could not be checked.",
+      canAutoRecover: false,
+    };
+  }
+
+  const verdict = await client.verifyCredential();
+  if (verdict === "rejected") {
+    return {
+      ...base,
+      status: "revoked",
+      // Names the recovery the app actually performs. A replacement is
+      // provisioned only when someone asks for one, from the repair action or
+      // by logging in from the command line, so the copy points at that
+      // action rather than at reconnecting something the reader never
+      // connected.
+      details:
+        "Vellum's managed credentials stopped working, so chat and background tasks that use them are paused. Restoring takes a moment and will not affect anything else.",
+      canAutoRecover: true,
+    };
+  }
+  if (verdict === "unknown") {
+    return {
+      ...base,
+      status: "unreachable",
+      details:
+        "Vellum did not answer the managed-credential check. Health is unknown until the next check.",
+      canAutoRecover: false,
+    };
+  }
+
+  return {
+    ...base,
+    status: "healthy",
+    details: "Vellum's managed credentials are working.",
+    canAutoRecover: true,
+  };
+}
+
 // ── Public API ────────────────────────────────────────────────────────
 
 /**
@@ -637,6 +794,8 @@ export async function checkAllCredentials(): Promise<CredentialHealthReport> {
           hasRefreshToken: !!conn.hasRefreshToken,
           grantedScopesRaw: conn.grantedScopes,
           defaultScopesRaw: providerRow.defaultScopes,
+          authorizeParamsRaw: providerRow.authorizeParams,
+          scopeSeparator: providerRow.scopeSeparator,
           pingUrl: providerRow.pingUrl,
           pingMethod: providerRow.pingMethod,
           pingHeaders: providerRow.pingHeaders,
@@ -750,6 +909,8 @@ export async function checkCredentialForProvider(
       hasRefreshToken: !!conn.hasRefreshToken,
       grantedScopesRaw: conn.grantedScopes,
       defaultScopesRaw: providerRow.defaultScopes,
+      authorizeParamsRaw: providerRow.authorizeParams,
+      scopeSeparator: providerRow.scopeSeparator,
       pingUrl: providerRow.pingUrl,
       pingMethod: providerRow.pingMethod,
       pingHeaders: providerRow.pingHeaders,

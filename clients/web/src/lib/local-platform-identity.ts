@@ -1,4 +1,9 @@
+import type {
+  PlatformStatusGetResponses,
+  PlatformVerifycredentialPostResponses,
+} from "@/generated/daemon/types.gen";
 import { buildVellumMutatingHeaders } from "@/lib/auth/request-headers";
+import { resolveSupportsCredentialVerification } from "@/lib/backwards-compat/credential-verification";
 import {
   getActiveAssistant,
   getLocalGatewayUrl,
@@ -6,6 +11,7 @@ import {
   getSelectedAssistant,
   isLocalAssistant,
   isLocalClient,
+  isLocalGatewayAssistant,
   isPlatformDisabled,
   isRemoteGatewayMode,
   primeLocalGatewayConnectionWithRepair,
@@ -17,7 +23,7 @@ import {
   getSelfHostedIngressUrl,
 } from "@/lib/self-hosted/connection";
 import { getDeviceId } from "@/runtime/device-id";
-import { isElectron } from "@/runtime/is-electron";
+import { detectElectronHostOS } from "@/runtime/platform-detection";
 import { getElectronSessionToken } from "@/runtime/session-token";
 import {
   getActiveOrganizationIdForRequests,
@@ -27,19 +33,6 @@ import {
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const ELECTRON_RENDERER_ORIGIN_HEADER = "X-Vellum-Electron-Renderer-Origin";
-
-type PlatformStatusBody = {
-  assistantId?: unknown;
-  assistant_id?: unknown;
-  baseUrl?: unknown;
-  base_url?: unknown;
-  organizationId?: unknown;
-  organization_id?: unknown;
-  hasAssistantApiKey?: unknown;
-  has_assistant_api_key?: unknown;
-  clientInstallationId?: unknown;
-  client_installation_id?: unknown;
-};
 
 type LocalPlatformStatus = {
   assistantId: string | null;
@@ -73,6 +66,16 @@ type BootstrapLocalAssistantPlatformIdentityOptions = {
 
 type ResolveLocalAssistantPlatformIdentityOptions = {
   allowGatewayRepair?: boolean;
+  /**
+   * Whether a stored credential the platform has rejected may be rotated.
+   *
+   * Off by default, so the routine bootstrap never replaces a credential
+   * unattended. Rotation is a credential mutation and the user is the one who
+   * asks for it, from the repair action on the credential notification or by
+   * signing in from the CLI. The bootstrap's job is to provision what is
+   * missing, not to repair what is broken.
+   */
+  rotateRejectedCredential?: boolean;
 };
 
 const platformAssistantIdCache = new Map<string, Promise<string>>();
@@ -114,7 +117,14 @@ export async function resolveLocalAssistantPlatformIdentity(
     return assistantId;
   }
 
-  const assistant = resolveLocalAssistant(assistantId);
+  // A repair acts on any assistant this client reaches over the local
+  // gateway; bootstrap provisions only the ones the web lifecycle owns.
+  const assistant = resolveLocalAssistant(
+    assistantId,
+    options.rotateRejectedCredential
+      ? isLocalGatewayAssistant
+      : isLocalAssistant,
+  );
   if (!assistant) {
     return assistantId;
   }
@@ -126,6 +136,7 @@ export async function resolveLocalAssistantPlatformIdentity(
 
   const promise = ensureLocalAssistantPlatformIdentity(assistant, {
     allowGatewayRepair: options.allowGatewayRepair ?? true,
+    rotateRejectedCredential: options.rotateRejectedCredential ?? false,
   });
   platformAssistantIdCache.set(assistant.assistantId, promise);
   try {
@@ -133,6 +144,193 @@ export async function resolveLocalAssistantPlatformIdentity(
   } catch (error) {
     platformAssistantIdCache.delete(assistant.assistantId);
     throw error;
+  }
+}
+
+/**
+ * Re-resolve this assistant's platform identity from scratch, rotating a
+ * rejected managed credential in the process.
+ *
+ * The ordinary bootstrap cannot serve an in-session recovery. It runs when a
+ * platform session is confirmed and when the assistant changes, so nothing
+ * re-runs it when a credential is rejected mid-session, and its per-assistant
+ * promise cache would return the already-settled result if anything did. Both
+ * are right for a bootstrap and wrong for a repair, so this drops the cache
+ * entry and resolves again.
+ *
+ * Rejects with the underlying reason (no platform session, unreachable
+ * gateway, rotation refused) so a caller can show it rather than reporting a
+ * failure it cannot explain.
+ */
+export type LocalPlatformCredentialRecoveryReason =
+  /** Nothing is selected to repair. */
+  | "no_assistant"
+  /**
+   * This client cannot perform the repair for this assistant: it is not the
+   * local client, it is served through a remote gateway, platform features
+   * are off, or the assistant is platform-hosted and re-provisions its own
+   * key.
+   */
+  | "cannot_act_here"
+  /** The platform rejected the replacement too. */
+  | "replacement_rejected"
+  /** The replacement was stored but the platform could not confirm it. */
+  | "unconfirmed";
+
+/**
+ * A repair that could not complete, with a typed reason.
+ *
+ * The reason is the contract; `message` is for logs and error reporting.
+ * Surfaces render the reason through their own catalogs, so no English here
+ * ever reaches a reader, and platform or transport detail never leaks into
+ * user-facing copy.
+ */
+export class LocalPlatformCredentialRecoveryError extends Error {
+  readonly reason: LocalPlatformCredentialRecoveryReason;
+
+  constructor(reason: LocalPlatformCredentialRecoveryReason, message: string) {
+    super(message);
+    this.name = "LocalPlatformCredentialRecoveryError";
+    this.reason = reason;
+  }
+}
+
+/**
+ * The assistant a repair would act on, or null when this client cannot act
+ * on it. One predicate for the surface that offers the repair and the repair
+ * itself, so a button is never rendered for a repair that would refuse.
+ *
+ * `resolveLocalAssistantPlatformIdentity` returns an id untouched for
+ * anything it does not provision for, so a repair not guarded by this would
+ * resolve successfully having done nothing. A platform-hosted assistant is
+ * not a gap: the platform re-provisions its own key, so the repair belongs
+ * to nobody here.
+ *
+ * Scoped to `isLocalGatewayAssistant`, wider than the `isLocalAssistant` set
+ * bootstrap provisions for: a local Docker instance is never hatched, woken
+ * or retired from here, but rotating and storing its credential is a write
+ * over the local gateway it already exposes, the same write a plain local
+ * assistant takes, and the CLI login flow repairs it the same way.
+ */
+function recoverableLocalAssistant(
+  assistantId?: string,
+): LockfileAssistant | null {
+  const target = assistantId ?? getSelectedAssistant()?.assistantId;
+  if (
+    !target ||
+    !isLocalClient() ||
+    isRemoteGatewayMode() ||
+    isPlatformDisabled() ||
+    isUuid(target)
+  ) {
+    return null;
+  }
+  return resolveLocalAssistant(target, isLocalGatewayAssistant);
+}
+
+/** Whether {@link recoverLocalAssistantPlatformCredential} can act here. */
+export function canRecoverLocalAssistantPlatformCredential(
+  assistantId?: string,
+): boolean {
+  return recoverableLocalAssistant(assistantId) !== null;
+}
+
+export async function recoverLocalAssistantPlatformCredential(
+  assistantId?: string,
+): Promise<void> {
+  const target = assistantId ?? getSelectedAssistant()?.assistantId;
+  if (!target) {
+    throw new LocalPlatformCredentialRecoveryError(
+      "no_assistant",
+      "No assistant is selected.",
+    );
+  }
+
+  const assistant = recoverableLocalAssistant(target);
+  if (!assistant) {
+    throw new LocalPlatformCredentialRecoveryError(
+      "cannot_act_here",
+      "This client cannot restore the credential for this assistant.",
+    );
+  }
+
+  platformAssistantIdCache.delete(assistant.assistantId);
+
+  await resolveLocalAssistantPlatformIdentity(target, {
+    allowGatewayRepair: true,
+    rotateRejectedCredential: true,
+  });
+
+  // Storing a credential proves the write landed, not that it authenticates: a
+  // replacement can be rejected in turn. Confirm before the caller reports
+  // success, so a repair that did not repair anything reads as a failure the
+  // reader can see rather than a receipt for something that never happened.
+  //
+  // A daemon that predates the verification route cannot confirm anything,
+  // and its 404 would read as a failed repair after a successful rotation,
+  // inviting another. On those daemons the stored replacement is the repair,
+  // as it always was there. Resolved against a version held for this
+  // assistant: the sync snapshot's false-on-unknown would skip the check on a
+  // daemon that has it, and an unscoped read could let the assistant the user
+  // just switched away from vouch for this one.
+  if (!(await resolveSupportsCredentialVerification(assistant.assistantId))) {
+    return;
+  }
+  const verified = await verifyPlatformCredential(assistant);
+  if (verified === "rejected") {
+    throw new LocalPlatformCredentialRecoveryError(
+      "replacement_rejected",
+      "The platform rejected the replacement credential.",
+    );
+  }
+  if (verified !== "valid") {
+    throw new LocalPlatformCredentialRecoveryError(
+      "unconfirmed",
+      "The replacement credential was stored but could not be confirmed.",
+    );
+  }
+}
+
+/**
+ * Ask the assistant to check its stored managed credential against the
+ * platform. Returns `"unknown"` when the check itself could not be run, which
+ * is not evidence either way.
+ */
+async function verifyPlatformCredential(
+  assistant: LockfileAssistant,
+): Promise<"valid" | "rejected" | "unknown"> {
+  try {
+    const gateway = await ensureGatewayAccess(assistant, {
+      allowGatewayRepair: false,
+    });
+    // Addressed to this assistant's gateway with the token minted for it,
+    // like the status read above, rather than through the daemon client: the
+    // client routes to whichever assistant the app is connected to, and a
+    // repair can run for an assistant before that connection is primed.
+    const response = await fetch(
+      gatewayUrl(gateway.gatewayUrl, "/v1/platform/verify-credential"),
+      {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          Authorization: `Bearer ${gateway.actorToken}`,
+        },
+        credentials: "omit",
+      },
+    );
+    if (!response.ok) {
+      return "unknown";
+    }
+    // The route's own response shape; the value check keeps a malformed body
+    // from being read as a verdict.
+    const body = (await response.json()) as Partial<
+      PlatformVerifycredentialPostResponses[200]
+    >;
+    return body.status === "valid" || body.status === "rejected"
+      ? body.status
+      : "unknown";
+  } catch {
+    return "unknown";
   }
 }
 
@@ -194,13 +392,23 @@ export function bootstrapLocalAssistantPlatformIdentity(
   })();
 }
 
-function resolveLocalAssistant(assistantId: string): LockfileAssistant | null {
+/**
+ * The lockfile entry for `assistantId` when it is the active or selected
+ * assistant and `eligible` accepts it, else null. Bootstrap passes
+ * `isLocalAssistant`, the assistants the web lifecycle owns; a repair passes
+ * `isLocalGatewayAssistant`, every assistant whose gateway this client can
+ * write a credential to.
+ */
+function resolveLocalAssistant(
+  assistantId: string,
+  eligible: (assistant: LockfileAssistant) => boolean,
+): LockfileAssistant | null {
   const active = getActiveAssistant();
-  if (active?.assistantId === assistantId && isLocalAssistant(active)) {
+  if (active?.assistantId === assistantId && eligible(active)) {
     return active;
   }
   const selected = getSelectedAssistant();
-  if (selected?.assistantId === assistantId && isLocalAssistant(selected)) {
+  if (selected?.assistantId === assistantId && eligible(selected)) {
     return selected;
   }
   return null;
@@ -208,7 +416,7 @@ function resolveLocalAssistant(assistantId: string): LockfileAssistant | null {
 
 async function ensureLocalAssistantPlatformIdentity(
   assistant: LockfileAssistant,
-  options: { allowGatewayRepair: boolean },
+  options: { allowGatewayRepair: boolean; rotateRejectedCredential: boolean },
 ): Promise<string> {
   const gateway = await ensureGatewayAccess(assistant, options);
   const status = await fetchPlatformStatus(gateway, assistant.assistantId);
@@ -216,7 +424,27 @@ async function ensureLocalAssistantPlatformIdentity(
     status?.assistantId && isUuid(status.assistantId)
       ? status.assistantId
       : null;
-  if (statusPlatformAssistantId && status?.hasAssistantApiKey !== false) {
+  // A stored key the platform has rejected is worse than no key: every call
+  // fails and the assistant cannot mint a replacement for itself. The platform
+  // leaves self-hosted and local registrations to their client on purpose
+  // (`recover_expired_assistant_api_key` excludes them), so a repair here is
+  // the only thing that rotates one.
+  // A repair rotates because it was asked for, not because the daemon agrees
+  // the credential is dead. The verdict is in-process and resets to `unknown`
+  // when the daemon restarts, while the notification offering the repair
+  // persists, so requiring a reported rejection would leave the button inert
+  // in exactly the case it exists for: a dead credential surviving a restart.
+  //
+  // Rotating on request is safe. The platform keeps the outgoing key valid for
+  // a grace period, so a repair the credential did not need costs a rotation
+  // and nothing else. Routine resolution never sets this and never rotates.
+  const repairRequested = options.rotateRejectedCredential;
+
+  if (
+    statusPlatformAssistantId &&
+    status?.hasAssistantApiKey !== false &&
+    !repairRequested
+  ) {
     const statusOrganizationId =
       status?.organizationId ?? assistant.platformOrganizationId ?? null;
     if (statusOrganizationId) {
@@ -265,8 +493,15 @@ async function ensureLocalAssistantPlatformIdentity(
     );
   }
 
+  // `ensureRegistration` hands back a key only for a registration that had
+  // none, so a repair needs the explicit rotation. The platform keeps the
+  // outgoing key valid for a grace period rather than revoking it on the spot,
+  // so a rotation whose injection fails leaves the install no worse off.
   let assistantApiKey = stringValue(registration.assistant_api_key);
-  if (!assistantApiKey && status?.hasAssistantApiKey !== true) {
+  if (
+    !assistantApiKey &&
+    (status?.hasAssistantApiKey !== true || repairRequested)
+  ) {
     assistantApiKey = await reprovisionApiKey(
       assistant,
       organizationId,
@@ -338,8 +573,12 @@ async function ensureGatewayAccess(
   return { gatewayUrl, actorToken };
 }
 
-async function fetchPlatformStatus(
-  gateway: { gatewayUrl: string; actorToken: string },
+/**
+ * The daemon's `platform/status`, null on any failure. A null `actorToken`
+ * sends no bearer: the paired proxy's trusted host installs its own.
+ */
+export async function fetchPlatformStatus(
+  gateway: { gatewayUrl: string; actorToken: string | null },
   runtimeAssistantId: string,
 ): Promise<LocalPlatformStatus | null> {
   const url = gatewayUrl(
@@ -349,7 +588,9 @@ async function fetchPlatformStatus(
   const response = await fetch(url, {
     headers: {
       Accept: "application/json",
-      Authorization: `Bearer ${gateway.actorToken}`,
+      ...(gateway.actorToken && {
+        Authorization: `Bearer ${gateway.actorToken}`,
+      }),
     },
     credentials: "omit",
   }).catch(() => null);
@@ -357,21 +598,18 @@ async function fetchPlatformStatus(
     return null;
   }
 
-  const body = (await response
-    .json()
-    .catch(() => null)) as PlatformStatusBody | null;
+  // The daemon's own response shape. Partial because this bundle serves
+  // daemons of any age, and a field the current schema requires may be absent
+  // from an older one; absent reads as null, which the gates treat as unknown.
+  const body = (await response.json().catch(() => null)) as Partial<
+    PlatformStatusGetResponses[200]
+  > | null;
   return {
-    assistantId: firstString(body?.assistantId, body?.assistant_id),
-    baseUrl: firstString(body?.baseUrl, body?.base_url),
-    organizationId: firstString(body?.organizationId, body?.organization_id),
-    hasAssistantApiKey: firstBoolean(
-      body?.hasAssistantApiKey,
-      body?.has_assistant_api_key,
-    ),
-    clientInstallationId: firstString(
-      body?.clientInstallationId,
-      body?.client_installation_id,
-    ),
+    assistantId: body?.assistantId ?? null,
+    baseUrl: body?.baseUrl ?? null,
+    organizationId: body?.organizationId ?? null,
+    hasAssistantApiKey: body?.hasAssistantApiKey ?? null,
+    clientInstallationId: body?.clientInstallationId ?? null,
   };
 }
 
@@ -449,7 +687,8 @@ async function platformPost<T>(
   });
 
   const sessionToken = getElectronSessionToken();
-  if (isElectron()) {
+  const electronHostOS = detectElectronHostOS();
+  if (electronHostOS) {
     if (!sessionToken) {
       throw new Error("Sign in to Vellum to register this local assistant.");
     }
@@ -464,11 +703,11 @@ async function platformPost<T>(
     {
       method: "POST",
       headers,
-      credentials: isElectron() ? "omit" : "same-origin",
+      credentials: electronHostOS ? "omit" : "same-origin",
       body: JSON.stringify({
         client_installation_id: clientInstallationId,
         runtime_assistant_id: assistant.assistantId,
-        client_platform: isElectron() ? "macos" : "web",
+        client_platform: electronHostOS ?? "web",
       }),
     },
   ).catch((error: unknown) => {
@@ -595,7 +834,7 @@ function gatewayUrl(baseUrl: string, path: string): string {
   return url.toString();
 }
 
-function isUuid(value: string): boolean {
+export function isUuid(value: string): boolean {
   return UUID_RE.test(value);
 }
 
@@ -611,13 +850,4 @@ function firstString(...values: unknown[]): string | null {
 
 function stringValue(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
-}
-
-function firstBoolean(...values: unknown[]): boolean | null {
-  for (const value of values) {
-    if (typeof value === "boolean") {
-      return value;
-    }
-  }
-  return null;
 }

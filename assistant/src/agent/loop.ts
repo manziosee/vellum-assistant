@@ -2,7 +2,6 @@ import type { AnsweredQuestion } from "../api/events/question-answered.js";
 import type { LLMCallSite } from "../config/schemas/llm.js";
 import { recordEstimate } from "../context/estimator-calibration.js";
 import { preModelCallSanitize } from "../context/outbound-sanitize.js";
-import { turnStartUserMessageHasSpotlight } from "../context/strip-injections.js";
 import {
   estimatePromptTokensRaw,
   estimatePromptTokensWithTools,
@@ -31,6 +30,7 @@ import { defaultCompact } from "../plugins/defaults/compaction/compact.js";
 import type { ContextWindowResult } from "../plugins/defaults/compaction/window-manager.js";
 import { runHook } from "../plugins/pipeline.js";
 import type { CompactionCircuitEvent } from "../plugins/types.js";
+import { hasVisibleText } from "../providers/content-blocks.js";
 import { isMaxTokensStopReason } from "../providers/stop-reasons.js";
 import { normalizeThinkingConfigForWire } from "../providers/thinking-config.js";
 import type {
@@ -42,7 +42,10 @@ import type {
   ToolDefinition,
   ToolResultContent,
 } from "../providers/types.js";
-import { isContextOverflowError } from "../providers/types.js";
+import {
+  isContextOverflowError,
+  NATIVE_WEB_SEARCH_TOOL_NAME,
+} from "../providers/types.js";
 import { getTool } from "../tools/registry.js";
 import type { SensitiveOutputBinding } from "../tools/sensitive-output-placeholders.js";
 import {
@@ -55,6 +58,7 @@ import { CompactionCircuit } from "./compaction-circuit.js";
 import {
   deepRepairHistory,
   isRepairableOrderingError,
+  isUserTerminalHistoryError,
 } from "./history-repair/history-repair.js";
 
 const log = getLogger("agent-loop");
@@ -131,7 +135,7 @@ export interface AgentLoopConfig {
  * `input_schema` is informational — the provider supplies the real schema.
  */
 const NATIVE_WEB_SEARCH_TOOL: ToolDefinition = {
-  name: "web_search",
+  name: NATIVE_WEB_SEARCH_TOOL_NAME,
   description:
     "Search the web for current information to ground your response.",
   input_schema: {
@@ -367,6 +371,16 @@ export type AgentEvent =
       cacheReadInputTokens?: number;
       model: string;
       actualProvider?: string;
+      /**
+       * Inference profile that actually governed the call, set only when a
+       * wrapper re-routed the request away from the caller's own resolution
+       * (`RetryProvider`'s fallback-profile escalation). Travels alongside
+       * `actualProvider` so the daemon's usage ledger attributes a degraded
+       * serve to the backup profile that answered rather than to the primary
+       * that failed. Absent on the normal (non-rerouted) path, where the
+       * caller's own resolution is already correct.
+       */
+      actualInferenceProfile?: string;
       providerDurationMs: number;
       rawRequest?: unknown;
       rawResponse?: unknown;
@@ -526,13 +540,6 @@ function assistantTextOf(content: ReadonlyArray<ContentBlock>): string {
     }
   }
   return text;
-}
-
-/** Whether `content` carries at least one non-empty `text` block. */
-function hasVisibleText(content: ReadonlyArray<ContentBlock>): boolean {
-  return content.some(
-    (block) => block.type === "text" && block.text.trim().length > 0,
-  );
 }
 
 type AgentLoopContextWindowResolver = () => {
@@ -704,10 +711,56 @@ export type LoopToolExecutor = (
   errorCode?: string;
 }>;
 
+type ToolUseBlock = Extract<ContentBlock, { type: "tool_use" }>;
+
+interface NormalizedToolUse {
+  /** Assistant content with at most one `tool_use` block per call id. */
+  content: ContentBlock[];
+  /** The `tool_use` blocks in `content`, in order. */
+  toolUseBlocks: ToolUseBlock[];
+  /** Coalesced copies: a call id and name for each block dropped. */
+  duplicates: Array<{ id: string; name: string }>;
+}
+
+/**
+ * Resolves an assistant reply's `tool_use` blocks into an executable set keyed
+ * by call id: a block with no id gets one, and a repeat of an id already in the
+ * reply is dropped so the call runs once and its single `tool_result` correlates
+ * unambiguously. Providers occasionally emit the same call twice under one id,
+ * and both Anthropic and OpenAI require one `tool_result` per `tool_use` id, so
+ * the duplicate has no well-formed representation downstream.
+ */
+function normalizeToolUseBlocks(
+  content: ReadonlyArray<ContentBlock>,
+): NormalizedToolUse {
+  const nextContent: ContentBlock[] = [];
+  const toolUseBlocks: ToolUseBlock[] = [];
+  const duplicates: Array<{ id: string; name: string }> = [];
+  const seenIds = new Set<string>();
+
+  for (const block of content) {
+    if (block.type !== "tool_use") {
+      nextContent.push(block);
+      continue;
+    }
+    if (seenIds.has(block.id)) {
+      duplicates.push({ id: block.id, name: block.name });
+      continue;
+    }
+    const normalized: ToolUseBlock =
+      block.id.length === 0 ? { ...block, id: crypto.randomUUID() } : block;
+    seenIds.add(normalized.id);
+    nextContent.push(normalized);
+    toolUseBlocks.push(normalized);
+  }
+
+  return { content: nextContent, toolUseBlocks, duplicates };
+}
+
 /**
  * The benign result returned for a sibling tool call that was deferred because
  * an exclusive tool ran in the same turn. Phrased so the model treats it as a
- * "not run yet" signal — read the exclusive tool's output, then re-issue this
+ * "not run yet" signal: read the exclusive tool's output, then re-issue this
  * call if it is still the right next step.
  */
 function deferredForExclusiveMessage(exclusiveToolName: string): string {
@@ -743,6 +796,22 @@ export interface AgentLoopConstructorOptions {
    * result-time pass and the post-turn truncation covers the turn instead.
    */
   resolveConversationDir?: () => string | null;
+  /**
+   * Trim a freshly compacted history before it becomes the loop's working set.
+   *
+   * Compaction rebuilds history from the stored rows, so it can reintroduce
+   * content the caller had already trimmed out of the array it handed to
+   * `run()` (camera-frame retention is the case this exists for: the compaction
+   * model may retain any number of older frames, and the rebuilt history is
+   * sent on the very next request). The caller closes over whatever
+   * conversation state its trimming needs, which is what keeps this module free
+   * of any dependency on the daemon's conversation layer.
+   *
+   * Must be total: the loop treats a throw as "no trim" rather than failing the
+   * turn. Callers that hold no conversation (workflow leaf runs) omit it and
+   * the compacted history is installed as built.
+   */
+  transformCompactedHistory?: (messages: Message[]) => Message[];
 }
 
 export class AgentLoop {
@@ -764,6 +833,11 @@ export class AgentLoop {
   /** See {@link AgentLoopConstructorOptions.resolveConversationDir}. */
   private readonly resolveConversationDir: (() => string | null) | null;
 
+  /** See {@link AgentLoopConstructorOptions.transformCompactedHistory}. */
+  private readonly transformCompactedHistory:
+    | ((messages: Message[]) => Message[])
+    | null;
+
   /**
    * Loop-held compaction circuit breaker. The loop has a 1:1 lifetime with its
    * conversation, so it is the source of truth for the cross-turn failure
@@ -783,6 +857,7 @@ export class AgentLoop {
       resolveTools,
       conversationId,
       resolveConversationDir,
+      transformCompactedHistory,
     } = options;
     this.provider = provider;
     this.systemPrompt = systemPrompt;
@@ -792,6 +867,7 @@ export class AgentLoop {
     this.toolExecutor = toolExecutor ?? null;
     this.conversationId = conversationId;
     this.resolveConversationDir = resolveConversationDir ?? null;
+    this.transformCompactedHistory = transformCompactedHistory ?? null;
     this.compactionCircuit = new CompactionCircuit(this.conversationId);
   }
 
@@ -868,6 +944,34 @@ export class AgentLoop {
         { err: recordError, requestId },
         "Recording a compaction outcome against the circuit breaker failed; suppressing to keep the agent loop alive",
       );
+    }
+  }
+
+  /**
+   * Run the caller's post-compaction trim over a freshly compacted history,
+   * falling back to the untrimmed array when no transform is configured or the
+   * transform throws.
+   *
+   * The trim narrows what the next request carries, so failing it is strictly
+   * worse than skipping it: the turn still has a valid history either way, and
+   * the caller's own passes cover the next turn. Kept best-effort for the same
+   * reason the caller's pre-run pass is.
+   */
+  private applyCompactedHistoryTransform(
+    compacted: Message[],
+    rlog: ReturnType<typeof getLogger>,
+  ): Message[] {
+    if (!this.transformCompactedHistory) {
+      return compacted;
+    }
+    try {
+      return this.transformCompactedHistory(compacted);
+    } catch (err) {
+      rlog.warn(
+        { err },
+        "Post-compaction history transform failed (non-fatal); keeping the compacted history as built",
+      );
+      return compacted;
     }
   }
 
@@ -1176,7 +1280,7 @@ export class AgentLoop {
         "Agent loop iteration start",
       );
 
-      let toolUseBlocks: Extract<ContentBlock, { type: "tool_use" }>[] = [];
+      let toolUseBlocks: ToolUseBlock[] = [];
       // The provider rejection thrown by this iteration's call, if any. Set in
       // the inner provider catch and read by the outer catch to confine
       // error-stop recovery to genuine provider rejections — a throw from
@@ -1309,7 +1413,14 @@ export class AgentLoop {
                   overflowSignal ?? undefined,
                 );
                 if (attempt.history) {
-                  history = attempt.history;
+                  // Trim before anything else reads the rebuilt array: the
+                  // provider call further down this same iteration sends it, so
+                  // content compaction reintroduced has to be brought back
+                  // within the caller's bounds here or it ships un-trimmed.
+                  history = this.applyCompactedHistoryTransform(
+                    attempt.history,
+                    rlog,
+                  );
                   // The compacted, re-injected array is the new base; output
                   // produced after this point is what the wrapper persists.
                   newMessagesStart = history.length;
@@ -1427,23 +1538,16 @@ export class AgentLoop {
           providerConfig.tool_choice = { type: "auto" };
         }
 
-        if (this.config.cacheTtl) {
-          providerConfig.cacheTtl = this.config.cacheTtl;
+        // Mark the sentinel so a route change downstream can tell it from an
+        // app-executed `web_search` of the same name (see
+        // `SendMessageConfig.nativeWebSearchSentinel`). Only set when true so
+        // the wire config stays byte-identical otherwise.
+        if (attachNativeWebSearch) {
+          providerConfig.nativeWebSearchSentinel = true;
         }
 
-        // Cache-anchor signal for turns whose opening message is volatile. The
-        // memory-v3 `<memory_spotlight>` block is the only injected block that
-        // is strip-and-replaced from every user message each turn, so when it
-        // is present that message's bytes do not recur next turn and a
-        // long-TTL breakpoint on it could never be read back. The provider
-        // marks it at the short TTL instead. Derived from the history actually
-        // being sent rather than from configuration, so turns where memory
-        // contributed no spotlight keep a normal anchor. Read off the
-        // turn-starting message, so the signal holds for every request in the
-        // turn rather than flipping once tool results arrive. Only set when
-        // true so the wire/config stays byte-identical when absent.
-        if (turnStartUserMessageHasSpotlight(history)) {
-          providerConfig.mutableLatestUserMessage = true;
+        if (this.config.cacheTtl) {
+          providerConfig.cacheTtl = this.config.cacheTtl;
         }
 
         // Per-call LLM call-site identifier. Surfaces on the per-call
@@ -1532,7 +1636,7 @@ export class AgentLoop {
         // Sanitize the outbound history right before sending: drop accumulated
         // media, collapse old AX-tree snapshots, and convert historical
         // web-search results to text. See {@link preModelCallSanitize}.
-        const providerHistory = timeSyncSection(
+        const sanitizedHistory = timeSyncSection(
           "agent-loop:pre-model-call-sanitize",
           () => preModelCallSanitize(history),
           (sanitized) => ({ messageCount: sanitized.length }),
@@ -1717,7 +1821,7 @@ export class AgentLoop {
         let response: ProviderResponse;
         try {
           response = await traceAsyncSection("agent-loop:provider-send", () =>
-            this.provider.sendMessage(providerHistory, providerOptions),
+            this.provider.sendMessage(sanitizedHistory, providerOptions),
           );
         } catch (llmCallError) {
           // Skip recording on abort — the user cancelled the request and
@@ -1735,7 +1839,7 @@ export class AgentLoop {
             // misrepresent both.
             const rawRequest = {
               provider: this.provider.name,
-              messages: providerHistory,
+              messages: sanitizedHistory,
               tools: providerOptions.tools,
               systemPrompt: providerOptions.systemPrompt,
               config: providerOptions.config,
@@ -1768,6 +1872,14 @@ export class AgentLoop {
           cacheReadInputTokens: response.usage.cacheReadInputTokens,
           model: response.model,
           actualProvider: response.actualProvider ?? this.provider.name,
+          // Only present when a wrapper rerouted this call, so the normal
+          // path's event shape stays byte-identical. There is no caller-side
+          // fallback value to fill in: the loop's own profile resolution is
+          // exactly what a reroute invalidates, and the daemon already reads
+          // its own resolution when this is absent.
+          ...(response.actualInferenceProfile !== undefined
+            ? { actualInferenceProfile: response.actualInferenceProfile }
+            : {}),
           providerDurationMs,
           rawRequest: response.rawRequest,
           rawResponse: response.rawResponse,
@@ -1864,8 +1976,7 @@ export class AgentLoop {
         // the `post-model-call` hook below, which may add or drop tool calls;
         // this raw set drives only the completion log and the max-tokens branch.
         const modelToolUseBlocks = response.content.filter(
-          (block): block is Extract<ContentBlock, { type: "tool_use" }> =>
-            block.type === "tool_use",
+          (block): block is ToolUseBlock => block.type === "tool_use",
         );
 
         rlog.info(
@@ -1979,19 +2090,26 @@ export class AgentLoop {
         // if the model had called it (the supported way for a plugin to surface
         // a card or take a follow-up action), or drop one the model emitted, so
         // the loop runs whatever the assistant message ends up carrying.
-        // Normalize ids so the executor and tool_result correlation stay 1:1 —
-        // a hook-added block may carry an empty or duplicate id.
-        toolUseBlocks = assistantMessage.content.filter(
-          (block): block is Extract<ContentBlock, { type: "tool_use" }> =>
-            block.type === "tool_use",
+        // Normalizing ids keeps executor dispatch and tool_result correlation
+        // 1:1 for the rest of the turn.
+        const normalizedToolUse = normalizeToolUseBlocks(
+          assistantMessage.content,
         );
-        const seenToolUseIds = new Set<string>();
-        for (const block of toolUseBlocks) {
-          if (block.id.length === 0 || seenToolUseIds.has(block.id)) {
-            block.id = crypto.randomUUID();
-          }
-          seenToolUseIds.add(block.id);
+        for (const duplicate of normalizedToolUse.duplicates) {
+          rlog.warn(
+            {
+              turn: toolUseTurns,
+              duplicateId: duplicate.id,
+              duplicateName: duplicate.name,
+            },
+            "Duplicate tool_use id in the assistant reply, coalescing into a single call",
+          );
         }
+        assistantMessage = {
+          ...assistantMessage,
+          content: normalizedToolUse.content,
+        };
+        toolUseBlocks = normalizedToolUse.toolUseBlocks;
 
         // At the no-tool stop boundary the retry decision is actionable: a
         // recovery hook may repair history and ask to re-query (a tool-bearing
@@ -2492,7 +2610,9 @@ export class AgentLoop {
           ) {
             orderingRepairAttempted = true;
             postModelCallContinues++;
-            history = deepRepairHistory(errorOutcome.messages).messages;
+            history = deepRepairHistory(errorOutcome.messages, {
+              requireUserTerminal: isUserTerminalHistoryError(err.message),
+            }).messages;
             // Deep repair merges and drops messages, so the prior input
             // boundary no longer maps onto the new array; the repaired history
             // is the base the retry's output appends after.

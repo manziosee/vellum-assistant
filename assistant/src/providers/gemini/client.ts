@@ -10,6 +10,11 @@ import { isAbortReason } from "../../util/abort-reasons.js";
 import { ProviderError, type ProviderErrorReason } from "../../util/errors.js";
 import { getLogger } from "../../util/logger.js";
 import { DAILY_LIMIT_PATTERNS } from "../../util/provider-error-patterns.js";
+import {
+  clampProviderString,
+  keepFileAsWorkspaceRef,
+} from "../content-block-size.js";
+import { fileBlockToProviderText } from "../file-block-text.js";
 import { base64Source, resolveMediaReferences } from "../media-resolve.js";
 import { PROVIDER_CATALOG } from "../model-catalog.js";
 import { recordProviderRequestDiagnostics } from "../request-diagnostics.js";
@@ -62,23 +67,36 @@ const THINKING_LEVEL_BY_NAME: Record<ThinkingLevelName, ThinkingLevel> = {
  */
 const GEMINI_PRO_DEFAULT_THINKING_LEVEL: ThinkingLevelName = "high";
 
+function normalizeGeminiModelId(model: string): string {
+  return model.startsWith("models/") ? model.slice("models/".length) : model;
+}
+
 /**
  * Gemini 3.x Pro family accepts only `low`/`medium`/`high` (no `"minimal"`) and
  * cannot fully disable thinking. Matches `gemini-3.1-pro-preview`,
  * `gemini-3.1-pro-preview-customtools`, and future `gemini-3*pro*`.
  */
 function isGeminiProModel(model: string): boolean {
-  const normalized = model.startsWith("models/")
-    ? model.slice("models/".length)
-    : model;
-  return /^gemini-3.*pro/.test(normalized);
+  return /^gemini-3.*pro/.test(normalizeGeminiModelId(model));
+}
+
+function findGeminiCatalogModel(model: string) {
+  const normalized = normalizeGeminiModelId(model);
+  return PROVIDER_CATALOG.find(
+    (provider) => provider.id === "gemini",
+  )?.models.find((m) => m.id === normalized);
 }
 
 /**
- * Lowest thinking level the model accepts. Pro's floor is `"low"`; every other
+ * Lowest thinking level the model accepts. Catalog `thinkingFloor` wins when
+ * present. Uncatalogued Gemini 3.x Pro IDs fall back to `"low"`; every other
  * thinking-capable Gemini model accepts `"minimal"`.
  */
 function geminiThinkingFloor(model: string): ThinkingLevelName {
+  const catalogFloor = findGeminiCatalogModel(model)?.thinkingFloor;
+  if (catalogFloor === "low" || catalogFloor === "minimal") {
+    return catalogFloor;
+  }
   return isGeminiProModel(model) ? "low" : "minimal";
 }
 
@@ -102,9 +120,10 @@ function clampThinkingLevelToFloor(
  * Google's per-model default apply (e.g. `gemini-3.5-flash` defaults to
  * dynamic medium-level thinking).
  *
- * - `enabled: false` maps to the model's floor — the most "off" state it
- *   allows (`"minimal"` for most models, `"low"` for Pro, which can't disable
- *   thinking).
+ * - `enabled: false` maps to the model's floor (the most "off" state it
+ *   allows): `"minimal"` for most models, `"low"` for models whose catalog
+ *   `thinkingFloor` is `"low"` (Pro and recent Flash IDs that reject
+ *   `"minimal"`).
  * - An explicit `level` below the floor is raised to the floor.
  * - When no `level` is pinned, Pro models get the documented default (`"high"`)
  *   because an absent level resolves to the unsupported `"minimal"` upstream;
@@ -161,13 +180,7 @@ function buildThinkingConfig(
  * behavior); only an explicit `supportsThinking: false` suppresses it.
  */
 function geminiModelSupportsThinking(model: string): boolean {
-  const normalized = model.startsWith("models/")
-    ? model.slice("models/".length)
-    : model;
-  const catalogModel = PROVIDER_CATALOG.find(
-    (provider) => provider.id === "gemini",
-  )?.models.find((m) => m.id === normalized);
-  return catalogModel?.supportsThinking !== false;
+  return findGeminiCatalogModel(model)?.supportsThinking !== false;
 }
 
 function stripGeminiHttpOptions(
@@ -422,8 +435,7 @@ export class GeminiProvider implements Provider {
     const maxTokens = configObj?.max_tokens as number | undefined;
     const modelOverride = configObj?.model as string | undefined;
     const usageAttributionHeaders = configObj?.usageAttributionHeaders as
-      | Record<string, string>
-      | undefined;
+      Record<string, string> | undefined;
     const activeModel = modelOverride ?? this.model;
     const thinkingConfig = geminiModelSupportsThinking(activeModel)
       ? buildThinkingConfig(
@@ -694,8 +706,11 @@ export class GeminiProvider implements Provider {
     model: string,
   ): Promise<genai.Content[]> {
     // Swap any persisted attachment references back to inline base64 before
-    // building parts, so the transforms below can read `source.data`.
-    messages = await resolveMediaReferences(messages);
+    // building parts, so the transforms below can read `source.data`. Gemini
+    // decodes HEIF itself, so an untranscoded HEIC photo stays an image here
+    // rather than being replaced by an omission note:
+    // https://ai.google.dev/gemini-api/docs/image-understanding
+    messages = await resolveMediaReferences(messages, { acceptsHeif: true });
     const result: genai.Content[] = [];
 
     // Build a map from tool_use id → function name so tool_result blocks
@@ -717,14 +732,22 @@ export class GeminiProvider implements Provider {
         model,
         role,
       );
-      if (parts.length > 0) {
-        result.push({ role, parts });
+      // Gemini keeps functionResponse parts separate from other parts. Tool
+      // result media follows the function response before any remaining text.
+      const functionResponseParts = parts.filter(
+        (part) => part.functionResponse !== undefined,
+      );
+      const otherParts = parts.filter(
+        (part) => part.functionResponse === undefined,
+      );
+      if (functionResponseParts.length > 0) {
+        result.push({ role, parts: functionResponseParts });
       }
-      // Gemini requires that a Content with functionResponse parts must not
-      // contain non-functionResponse parts. Emit tool-result images in a
-      // separate user Content entry.
       if (toolResultMediaParts.length > 0) {
         result.push({ role: "user", parts: toolResultMediaParts });
+      }
+      if (otherParts.length > 0) {
+        result.push({ role, parts: otherParts });
       }
     }
 
@@ -744,7 +767,7 @@ export class GeminiProvider implements Provider {
     for (const block of blocks) {
       switch (block.type) {
         case "text":
-          parts.push({ text: block.text });
+          parts.push({ text: clampProviderString(block.text) });
           break;
         case "image": {
           const imageSrc = base64Source(block.source);
@@ -757,6 +780,10 @@ export class GeminiProvider implements Provider {
           break;
         }
         case "file": {
+          if (keepFileAsWorkspaceRef(block.source)) {
+            parts.push({ text: fileBlockToProviderText(block) });
+            break;
+          }
           const fileSrc = base64Source(block.source);
           if (this.supportsGeminiInlineFile(fileSrc.media_type)) {
             // Normalize audio MIME onto Gemini's spelling (e.g. audio/mpeg →
@@ -779,10 +806,7 @@ export class GeminiProvider implements Provider {
               });
             }
           } else {
-            const fallback = block.extracted_text?.trim()
-              ? `[Attached file: ${fileSrc.filename} (${fileSrc.media_type})]\n${block.extracted_text}`
-              : `[Attached file: ${fileSrc.filename} (${fileSrc.media_type})]\nNo extracted text available.`;
-            parts.push({ text: fallback });
+            parts.push({ text: fileBlockToProviderText(block) });
           }
           break;
         }

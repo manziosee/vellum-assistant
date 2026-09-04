@@ -1,3 +1,4 @@
+import { resolveAssistantApiKeyForInjection } from "../lib/assistant-api-key-resolution";
 import {
   findAssistantByName,
   loadAllAssistants,
@@ -23,8 +24,6 @@ import {
   platformRequestSignedUrl,
   VersionMismatchError,
   ensureSelfHostedLocalRegistration,
-  readGatewayCredential,
-  reprovisionAssistantApiKey,
   injectCredentialsIntoAssistant,
   fetchCurrentUser,
   fetchOrganizationId,
@@ -47,7 +46,10 @@ import {
 import { hatchLocal } from "../lib/hatch-local.js";
 import { retireLocal } from "../lib/retire-local.js";
 import { validateAssistantName } from "../lib/retire-archive.js";
-import { stopProcessByPidFile } from "../lib/process.js";
+import {
+  DAEMON_STOP_TIMEOUT_MS,
+  stopProcessByPidFile,
+} from "../lib/process.js";
 import {
   fetchAssistantIngressUrl,
   fetchCurrentVersion,
@@ -1151,30 +1153,19 @@ async function tryInjectPlatformCredentials(
       platformOrganizationId: orgId,
     });
 
-    // Resolve the API key: 1) fresh from registration, 2) existing from
-    // daemon credential store, 3) reprovision as last resort (revokes old key).
-    // Only reprovision when the gateway confirms no key exists — not when
-    // the gateway is merely unreachable (would revoke without injecting).
-    let assistantApiKey = registration.assistant_api_key;
-    if (!assistantApiKey) {
-      const cached = await readGatewayCredential(
-        entry.runtimeUrl,
-        "vellum:assistant_api_key",
-        entry.bearerToken,
-      );
-      if (cached.value) {
-        assistantApiKey = cached.value;
-      } else if (!cached.unreachable) {
-        const reprovision = await reprovisionAssistantApiKey(
-          token,
-          orgId,
-          clientInstallationId,
-          entry.assistantId,
-          "cli",
-        );
-        assistantApiKey = reprovision.provisioning.assistant_api_key;
-      }
-    }
+    // Which key to hand the assistant, and why. Shared with login so the two
+    // injection paths cannot drift.
+    const resolvedKey = await resolveAssistantApiKeyForInjection({
+      registrationApiKey: registration.assistant_api_key,
+      runtimeUrl: entry.runtimeUrl,
+      bearerToken: entry.bearerToken,
+      token,
+      organizationId: orgId,
+      clientInstallationId,
+      runtimeAssistantId: entry.assistantId,
+      clientPlatform: "cli",
+    });
+    const assistantApiKey = resolvedKey.apiKey;
 
     const allInjected = await injectCredentialsIntoAssistant({
       gatewayUrl: entry.runtimeUrl,
@@ -1497,6 +1488,8 @@ export async function teleport(): Promise<void> {
       await stopProcessByPidFile(
         getDaemonPidPath(fromEntry.resources),
         "assistant",
+        undefined,
+        DAEMON_STOP_TIMEOUT_MS,
       );
       await stopProcessByPidFile(gatewayPidFile, "gateway", undefined, 7000);
     }

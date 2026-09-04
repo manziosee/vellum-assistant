@@ -1,15 +1,14 @@
 /**
- * Nested detail view for a subagent `web_fetch` pill. The raw tool result is a
- * metadata header (`Requested URL` / `Final URL` / `Status` / `Content-Type` /
- * `Notices`) wrapping the extracted page text inside an `<external_content>`
- * tag. Rather than dump that verbatim, this view renders a clickable source
- * card, surfaces the fetch notices (truncation / JS-rendered warnings), and
- * shows the extracted text as readable markdown — with a "View raw" toggle for
- * the unparsed result.
+ * The body for a `web_fetch` call. Its result is a metadata header (`Requested
+ * URL` / `Final URL` / `Status` / `Content-Type` / `Notices`) wrapping the
+ * extracted page text in an `<external_content>` tag. Rather than dump that
+ * verbatim, this renders a clickable source card, surfaces the fetch notices
+ * (truncation, JS-rendered warnings), and shows the extracted text as readable
+ * markdown, with a "View raw" toggle for the unparsed result.
  *
- * Static / presentational: parses only the `input` + `result` the panel already
- * built into the `ToolDetailPayload` (see `buildSubagentStepDetails`); never
- * re-fetches.
+ * Parsing only: it reads the `result` its host resolved and never re-fetches.
+ * That result is live wherever the host has a live source, so a fetch that
+ * lands while the drawer is open reaches the reader.
  */
 
 import { useMemo, useState } from "react";
@@ -17,10 +16,11 @@ import { useMemo, useState } from "react";
 import { Typography } from "@vellumai/design-library";
 
 import { ChatMarkdownMessage } from "@/domains/chat/components/chat-markdown-message";
-import { CodeBlock } from "@/domains/chat/components/tool-detail-panel";
+import { CodeBlock } from "@/components/detail-primitives";
 import { SiteFavicon } from "@/domains/chat/components/web-search/site-favicon";
 import { extractDomain } from "@/domains/chat/utils/web-search-result-text";
-import type { ToolDetailPayload } from "@/stores/viewer-store";
+import type { ToolActivityRendererProps } from "@/domains/chat/components/tool-activity/types";
+import { useTranslation } from "@/i18n";
 
 const CONTENT_MARKER = "\nContent:\n";
 
@@ -144,18 +144,33 @@ function SourceCard({ url, status }: { url: string; status: string | null }) {
   );
 }
 
-export function WebFetchDetailView({ detail }: { detail: ToolDetailPayload }) {
+export function WebFetchDetailView({
+  detail,
+  result,
+  isRunning,
+  isError,
+}: ToolActivityRendererProps) {
+  const { t } = useTranslation("chat");
   const [showRaw, setShowRaw] = useState(false);
+  // The live result, not the open-time snapshot: this renderer owns its output,
+  // so a fetch that lands while the drawer is open reaches the user only if the
+  // view reads what `ToolDetailBody` resolved.
+  const body = typeof result === "string" ? result : "";
   const fallbackUrl =
     typeof detail.input?.url === "string" ? detail.input.url : undefined;
   const parsed = useMemo(
-    () => parseWebFetchResult(detail.result ?? "", fallbackUrl),
-    [detail.result, fallbackUrl],
+    () => parseWebFetchResult(body, fallbackUrl),
+    [body, fallbackUrl],
   );
 
-  // A failed fetch has no parseable body — show the raw error verbatim.
-  if (detail.status === "error") {
-    return <CodeBlock text={detail.result ?? "Fetch failed."} />;
+  // A failed fetch has no parseable body, so its error shows verbatim.
+  if (isError) {
+    return (
+      <CodeBlock
+        text={body || t("webFetchDetailView.fetchFailed")}
+        tone="error"
+      />
+    );
   }
 
   return (
@@ -184,22 +199,26 @@ export function WebFetchDetailView({ detail }: { detail: ToolDetailPayload }) {
             as="h3"
             className="text-[var(--content-emphasised)]"
           >
-            {showRaw ? "Raw result" : "Content"}
+            {showRaw
+              ? t("webFetchDetailView.rawResult")
+              : t("webFetchDetailView.content")}
           </Typography>
-          {detail.result && (
+          {body && (
             <button
               type="button"
               onClick={() => setShowRaw((v) => !v)}
               className="cursor-pointer text-[var(--content-secondary)] transition-colors hover:text-[var(--content-default)]"
             >
               <Typography variant="label-small-default" as="span">
-                {showRaw ? "View extracted" : "View raw"}
+                {showRaw
+                  ? t("webFetchDetailView.viewExtracted")
+                  : t("webFetchDetailView.viewRaw")}
               </Typography>
             </button>
           )}
         </div>
         {showRaw ? (
-          <CodeBlock text={detail.result ?? ""} />
+          <CodeBlock text={body} />
         ) : parsed.content ? (
           // Deliberately NO `assistantId`: this is text extracted from a
           // remote page, the least-trusted content in the app. Passing one
@@ -214,9 +233,9 @@ export function WebFetchDetailView({ detail }: { detail: ToolDetailPayload }) {
             variant="body-small-default"
             className="text-[var(--content-tertiary)]"
           >
-            {detail.status === "running"
-              ? "Fetching…"
-              : "No content extracted."}
+            {isRunning
+              ? t("webFetchDetailView.fetching")
+              : t("webFetchDetailView.noContent")}
           </Typography>
         )}
       </div>

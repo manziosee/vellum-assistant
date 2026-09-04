@@ -1,12 +1,17 @@
 import { BrowserWindow } from "electron";
 
-import type { VellumCommand } from "@vellumai/ipc-contract";
+import {
+  DEFAULT_ACCELERATORS,
+  type VellumCommand,
+} from "@vellumai/ipc-contract";
 
 import { capabilityToken } from "./capability-registry";
 
 export type { VellumCommand };
 
 export type VellumCommandKind = VellumCommand["kind"];
+
+export { DEFAULT_ACCELERATORS };
 
 export interface HotkeySettingsProvider {
   read: () => Record<string, string>;
@@ -43,61 +48,12 @@ export const readHotkeyOverrides = (): Record<string, string> => ({
   ...hotkeySettings.read(),
 });
 
-export const writeHotkeyOverrides = (
-  hotkeys: Record<string, string>,
-): void => {
+export const writeHotkeyOverrides = (hotkeys: Record<string, string>): void => {
   hotkeySettings.write(hotkeys);
 };
 
-export const onHotkeyOverridesChange = (
-  listener: () => void,
-): (() => void) => hotkeySettings.subscribe(listener);
-
-/**
- * Default accelerators per command.
- *
- * Populated lazily at menu-build time by merging with `settings.hotkeys`
- * (rather than via the electron-store schema `default` block, which would
- * clobber user overrides on schema migration).
- */
-export const DEFAULT_ACCELERATORS: Record<VellumCommandKind, string> = {
-  newConversation: "CmdOrCtrl+N",
-  currentConversation: "CmdOrCtrl+Shift+N",
-  markCurrentUnread: "CmdOrCtrl+Shift+U",
-  openSettings: "CmdOrCtrl+,",
-  shareFeedback: "",
-  find: "CmdOrCtrl+F",
-  markAllRead: "",
-  login: "",
-  logout: "",
-  rePair: "",
-  sidebarToggle: "CmdOrCtrl+\\",
-  home: "CmdOrCtrl+Shift+H",
-  popOut: "CmdOrCtrl+P",
-  previousConversation: "CmdOrCtrl+Up",
-  nextConversation: "CmdOrCtrl+Down",
-  commandPalette: "CmdOrCtrl+K",
-  openConversation: "",
-  openLibrary: "",
-  openIdentity: "",
-  navigateBack: "",
-  navigateForward: "",
-  zoomIn: "",
-  zoomOut: "",
-  actualSize: "",
-  selectAssistant: "",
-  chooseAssistant: "",
-  createAssistant: "",
-  retireAssistant: "",
-  removePairedAssistant: "",
-  quickInputSubmit: "",
-  startVoice: "",
-  companionSubmit: "",
-  cancelDictation: "",
-  replayOnboarding: "",
-  replayHatchFailure: "",
-  openComponentGallery: "",
-};
+export const onHotkeyOverridesChange = (listener: () => void): (() => void) =>
+  hotkeySettings.subscribe(listener);
 
 /**
  * Commands whose accelerators are registered as Electron `globalShortcut`s
@@ -107,6 +63,21 @@ export const DEFAULT_ACCELERATORS: Record<VellumCommandKind, string> = {
 export const GLOBAL_SHORTCUT_DEFAULTS: Record<string, string> = {
   globalHotkey: "CmdOrCtrl+Shift+G",
   quickInput: "CmdOrCtrl+Shift+/",
+  /**
+   * Talk. Ships **unbound**, and is the only global here that does.
+   *
+   * A global registration outranks every app's own shortcuts for as long as
+   * Vellum runs, and `globalShortcut.register` cannot see those: it reports a
+   * conflict only against other *global* registrants, so it returns true for
+   * chords that are load-bearing inside other apps. Cmd+Shift+T registered
+   * cleanly and took reopen-closed-tab away from every browser on the machine.
+   *
+   * There is no chord we can pick that is not load-bearing somewhere, and no
+   * way to find out which one we broke. So the user picks it, in Keyboard
+   * Shortcuts, spending a chord they know they can spare. The macOS shell
+   * excludes it altogether: a double tap of the voice key is the way in there.
+   */
+  toggleVoice: "",
 };
 
 /**

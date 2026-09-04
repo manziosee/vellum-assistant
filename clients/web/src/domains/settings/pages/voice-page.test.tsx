@@ -1,3 +1,5 @@
+import type { UseManagedVoiceSelection } from "@/components/speech/use-managed-voice-selection";
+import type { UseSttLanguageSelection } from "@/components/speech/use-stt-language-selection";
 /**
  * Captions and turn-taking cards on the Voice settings page.
  *
@@ -21,6 +23,7 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router";
 
 // The voice-picker card reads the active assistant id (throws outside the
@@ -30,20 +33,24 @@ import { MemoryRouter } from "react-router";
 mock.module("@/assistant/use-active-assistant-id", () => ({
   useActiveAssistantId: () => "asst-test",
 }));
+const voiceSelection: UseManagedVoiceSelection = {
+  available: false,
+  isByok: false,
+  settled: true,
+  voices: [],
+  currentModel: "",
+  defaultModel: "",
+  selectModel: () => {},
+  selecting: false,
+};
 mock.module("@/components/speech/use-managed-voice-selection", () => ({
-  useManagedVoiceSelection: () => ({
-    available: false,
-    voices: [],
-    currentModel: "",
-    selectModel: () => {},
-    selecting: false,
-  }),
+  useManagedVoiceSelection: () => voiceSelection,
 }));
 
 // The listening-language card reads daemon config through React Query too.
 // Hoisted with the mocks above (a mid-file `mock.module` does not re-link on
 // CI's bun), so its shape is swapped through this mutable seed instead.
-const languageSelection = {
+const languageSelection: UseSttLanguageSelection = {
   available: false,
   currentCode: "multi",
   configuredProviderId: "deepgram",
@@ -55,20 +62,36 @@ mock.module("@/components/speech/use-stt-language-selection", () => ({
 }));
 
 import { VoiceSections } from "@/domains/settings/pages/voice-page";
+import { activatorDisplayName } from "@/utils/ptt-activator";
+import { keyboardDefaultActivator } from "@/utils/voice-mode-activation";
 import {
   DEFAULT_PAUSE_BEFORE_REPLY_MS,
   useVoicePrefsStore,
 } from "@/stores/voice-prefs-store";
 
 function renderPage() {
-  return render(
-    <MemoryRouter>
-      <VoiceSections />
-    </MemoryRouter>,
+  // The page reads daemon config now (the turn-taking row), so it needs a
+  // client. `retry: false` keeps a miss from re-fetching through the test.
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  // A fresh element per pass: handed the same element object, React compares
+  // it by reference and skips the subtree, so a transition test would read the
+  // tree from before the flip.
+  const tree = () => (
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter>
+        <VoiceSections />
+      </MemoryRouter>
+    </QueryClientProvider>
   );
+  const result = render(tree());
+  return { ...result, rerenderPage: () => result.rerender(tree()) };
 }
 
 beforeEach(() => {
+  voiceSelection.available = false;
+  voiceSelection.settled = true;
   languageSelection.available = false;
   languageSelection.currentCode = "multi";
   languageSelection.configuredProviderId = "deepgram";
@@ -314,5 +337,117 @@ describe("VoiceSections microphone picker", () => {
       expect(micTrigger().textContent).toContain("not connected"),
     );
     expect(localStorage.getItem("vellum:voice:inputDeviceId")).toBe("mic-gone");
+  });
+});
+
+describe("VoiceSections voice mode shortcut", () => {
+  // Cmd+Shift+V on macOS, Ctrl+Shift+V elsewhere, so read the label off the
+  // default rather than hardcoding one platform's.
+  const defaultChord = activatorDisplayName(keyboardDefaultActivator());
+
+  // The recorder's own chip is renamed as the chord builds ("Custom" →
+  // "Press a shortcut…" → "Ctrl"), so key events go to the zone that owns the
+  // handlers instead: a stable node across all of those renders.
+  function beginRecording() {
+    fireEvent.click(screen.getByRole("button", { name: "Custom" }));
+    const zone = screen.getByRole("button", {
+      name: defaultChord,
+    }).parentElement;
+    if (!zone) {
+      throw new Error("recording zone not found");
+    }
+    return zone;
+  }
+
+  function storedBinding() {
+    return JSON.parse(
+      localStorage.getItem("vellum:voice:voiceModeActivation") ?? "null",
+    );
+  }
+
+  test("offers the platform chord as the default binding", () => {
+    renderPage();
+
+    expect(screen.getByRole("button", { name: defaultChord })).toBeTruthy();
+  });
+
+  test("refuses a bare modifier and says what is missing", () => {
+    renderPage();
+    const zone = beginRecording();
+
+    // Hold Shift, then let it go without pressing anything with it. As a
+    // toggle, that binding would fire on every abandoned chord.
+    fireEvent.keyDown(zone, { key: "Shift", shiftKey: true });
+    fireEvent.keyUp(zone, { key: "Shift", shiftKey: false });
+
+    expect(
+      screen.getByText(
+        "Hold a modifier (Cmd, Ctrl, Option, or Shift) and press a key.",
+      ),
+    ).toBeTruthy();
+    expect(storedBinding()).toBe(null);
+  });
+
+  test("records a chord and keeps it", () => {
+    renderPage();
+    const zone = beginRecording();
+
+    fireEvent.keyDown(zone, { key: "Control", ctrlKey: true });
+    fireEvent.keyDown(zone, { key: "j", ctrlKey: true, shiftKey: true });
+
+    expect(screen.getByRole("button", { name: "Ctrl+Shift+J" })).toBeTruthy();
+    expect(storedBinding()).toEqual({
+      kind: "key",
+      label: "J",
+      modifiers: ["control", "shift"],
+    });
+  });
+
+  test("turning the shortcut off stores an explicit off", () => {
+    renderPage();
+
+    fireEvent.click(
+      screen.getByRole("switch", { name: "Enable voice mode shortcut" }),
+    );
+
+    expect(storedBinding()).toEqual({ kind: "off" });
+  });
+});
+
+describe("VoiceSections voice card while the answer is in flight", () => {
+  const byoNote = () => screen.queryByText(/provider you configured yourself/i);
+  const loading = () => screen.queryByRole("status", { name: "Loading voice" });
+  // The card is named after the assistant, so match the heading it always
+  // renders rather than one branch's copy.
+  const cardTitle = () => screen.queryAllByRole("heading", { name: "Voice" });
+
+  test("says nothing about the provider until the answer lands", () => {
+    voiceSelection.settled = false;
+
+    renderPage();
+
+    expect(loading()).not.toBeNull();
+    expect(byoNote()).toBeNull();
+    expect(cardTitle()).toHaveLength(1);
+  });
+
+  test("an unsettled answer that resolves to no falls back to the note", () => {
+    voiceSelection.settled = false;
+    const { rerenderPage } = renderPage();
+    const headingWhileLoading = screen.getByRole("heading", { name: "Voice" });
+
+    expect(byoNote()).toBeNull();
+
+    voiceSelection.settled = true;
+    rerenderPage();
+
+    expect(loading()).toBeNull();
+    expect(byoNote()).not.toBeNull();
+    // The very same node, not just an equal one: React kept the heading
+    // mounted and replaced only the body under it, which is what stops the
+    // card from moving when the answer lands.
+    expect(screen.getByRole("heading", { name: "Voice" })).toBe(
+      headingWhileLoading,
+    );
   });
 });

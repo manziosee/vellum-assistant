@@ -22,6 +22,7 @@
  * gateway, evals) import via `@vellumai/assistant-api`.
  */
 
+import { ReactionEmojiFieldsSchema } from "@vellumai/service-contracts/reactions";
 import { z } from "zod";
 
 import {
@@ -358,6 +359,7 @@ const SlackMessageLinkSchema = z.object({
 
 const SlackReactionSchema = z.object({
   emoji: z.string(),
+  ...ReactionEmojiFieldsSchema.shape,
   op: z.enum(["added", "removed"]),
   actorDisplayName: z.string().optional(),
   targetChannelTs: z.string(),
@@ -607,6 +609,27 @@ export const ConversationMessageSchema = z.object({
    *  system notices — no avatar, no persona bubble — and never group them
    *  with adjacent assistant turns. */
   systemCard: z.boolean().optional(),
+  /** Set on a turn whose whole reply was the `<no_response/>` sentinel
+   *  (`metadata.messageKind === "no_response"`): the assistant deliberately
+   *  chose silence. Clients render a quiet standalone notice instead of the
+   *  sentinel text, and treat the row as the turn's reply so nothing keeps
+   *  waiting for one. */
+  noResponse: z.boolean().optional(),
+  /** Present on a reaction row, either direction: an inbound reaction the
+   *  daemon persisted, or the assistant's own (`selfAuthored`). Clients
+   *  render a reaction line from this instead of the row's stored sentinel
+   *  text. Slack rows additionally carry their own `slackMessage` envelope,
+   *  which Slack-aware renderers may prefer. */
+  reaction: z
+    .object({
+      emoji: z.string(),
+      ...ReactionEmojiFieldsSchema.shape,
+      op: z.enum(["added", "removed"]),
+      targetMessageId: z.string(),
+      actorDisplayName: z.string().optional(),
+      selfAuthored: z.boolean().optional(),
+    })
+    .optional(),
   /** Present when this assistant row is a daemon-persisted provider-failure
    *  notice (`metadata.messageKind === "provider_error"`); clients may render
    *  a themed card instead of a persona bubble. `code` is the stable
@@ -619,6 +642,11 @@ export const ConversationMessageSchema = z.object({
     })
     .optional(),
   slackMessage: ConversationSlackMessageSchema.optional(),
+  /** Unix ms at which the message was deleted on its channel after the daemon
+   *  stored it (a Slack or Discord deletion the gateway forwarded). The stored
+   *  content stays for audit and the Inspect view; clients render a tombstone
+   *  in place of the content, mirroring what the channel now shows. */
+  deletedAt: z.number().optional(),
   /**
    * Queue state for a user message that is still waiting in the daemon's
    * in-memory queue (enqueued while the agent was mid-turn, not yet drained or

@@ -20,6 +20,7 @@ const run = async (
     stdin: "inherit",
     stdout: "inherit",
     stderr: "inherit",
+    windowsHide: true,
   });
   return child.exited;
 };
@@ -35,7 +36,7 @@ const main = async (): Promise<void> => {
   const platformOrigin = platformOriginFromDevUrl(remoteUrl);
   const buildExitCode = await run(["run", "build:web"], {
     ...process.env,
-    VITE_PLATFORM_MODE: "true",
+    VITE_PLATFORM_MODE: "false",
   });
   if (buildExitCode !== 0) {
     process.exit(buildExitCode);

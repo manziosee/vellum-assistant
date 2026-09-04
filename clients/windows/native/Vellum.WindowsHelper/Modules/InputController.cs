@@ -10,7 +10,7 @@ public static class KeyPlanner
 {
     private static readonly Dictionary<string, ushort> Modifiers = new(StringComparer.OrdinalIgnoreCase)
     {
-        ["cmd"] = 0x11, ["command"] = 0x11, ["ctrl"] = 0x11, ["control"] = 0x11,
+        ["ctrl"] = 0x11, ["control"] = 0x11,
         ["shift"] = 0x10, ["alt"] = 0x12, ["option"] = 0x12, ["win"] = 0x5B, ["meta"] = 0x5B,
     };
 
@@ -33,9 +33,7 @@ public static class KeyPlanner
         var codes = new ushort[parts.Length];
         for (var i = 0; i < parts.Length - 1; i++)
         {
-            codes[i] = Modifiers.TryGetValue(parts[i], out var modifier)
-                ? modifier
-                : throw new ArgumentException($"Unsupported modifier: {parts[i]}");
+            codes[i] = ResolveModifier(parts[i]);
         }
         codes[^1] = ResolveKey(parts[^1]);
         return codes;
@@ -47,7 +45,7 @@ public static class KeyPlanner
         {
             return named;
         }
-        if (Modifiers.TryGetValue(key, out var modifier))
+        if (TryResolveModifier(key, commandAsWindowsKey: false, out var modifier))
         {
             return modifier;
         }
@@ -62,6 +60,31 @@ public static class KeyPlanner
             return (ushort)(0x70 + fn - 1);
         }
         throw new ArgumentException($"Unsupported key: {key}");
+    }
+
+    public static ushort ResolveModifier(
+        string modifier,
+        bool commandAsWindowsKey = false)
+    {
+        if (TryResolveModifier(modifier, commandAsWindowsKey, out var code))
+        {
+            return code;
+        }
+        throw new ArgumentException($"Unsupported modifier: {modifier}");
+    }
+
+    private static bool TryResolveModifier(
+        string modifier,
+        bool commandAsWindowsKey,
+        out ushort code)
+    {
+        if (modifier.Equals("cmd", StringComparison.OrdinalIgnoreCase) ||
+            modifier.Equals("command", StringComparison.OrdinalIgnoreCase))
+        {
+            code = commandAsWindowsKey ? (ushort)0x5B : (ushort)0x11;
+            return true;
+        }
+        return Modifiers.TryGetValue(modifier, out code);
     }
 
     // UTF-16 units for KEYEVENTF_UNICODE typing (surrogate pairs stay two
@@ -132,12 +155,6 @@ internal static partial class NativeInput
     private static partial uint SendInput(uint count, Input[] inputs, int size);
     [LibraryImport("user32.dll")]
     private static partial int GetSystemMetrics(int index);
-    [LibraryImport("user32.dll")]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static partial bool SetProcessDpiAwarenessContext(nint context);
-
-    static NativeInput() => _ = SetProcessDpiAwarenessContext(-4); // per-monitor v2
-
     private static void Send(Input input)
     {
         if (SendInput(1, [input], Marshal.SizeOf<Input>()) != 1)
@@ -164,6 +181,7 @@ internal static partial class NativeInput
 
     public static void MoveTo(double x, double y)
     {
+        ProcessDpi.EnsureAwareness();
         var left = GetSystemMetrics(76);
         var top = GetSystemMetrics(77);
         var width = Math.Max(1, GetSystemMetrics(78));
@@ -205,6 +223,31 @@ internal static partial class NativeInput
             {
                 Key(pressed.Pop(), down: false);
             }
+        }
+    }
+
+    // Press, interpolate the path with the button held, then release. The
+    // release is guaranteed so a failed move never leaves the button down.
+    public static async Task DragAsync(
+        double fromX, double fromY, double toX, double toY, CancellationToken cancellationToken)
+    {
+        const int steps = 10;
+        MoveTo(fromX, fromY);
+        await Task.Delay(30, cancellationToken);
+        Button("left", down: true);
+        try
+        {
+            await Task.Delay(50, cancellationToken);
+            for (var i = 1; i <= steps; i++)
+            {
+                var t = (double)i / steps;
+                MoveTo(fromX + (toX - fromX) * t, fromY + (toY - fromY) * t);
+                await Task.Delay(10, cancellationToken);
+            }
+        }
+        finally
+        {
+            Button("left", down: false);
         }
     }
 
@@ -274,11 +317,24 @@ public sealed class InputController : IRpcModule, IInputController
             return await Finish(null, null, note: false);
         }
 
-        // Element-id targets need the observation module to resolve coordinates.
-        if (action.Type is "click" or "double_click" or "right_click" &&
+        try
+        {
+            action = await ResolveElementCoordinatesAsync(
+                action, ObservationSeams.CuSource, cancellationToken, conversationId);
+        }
+        catch (InvalidOperationException error)
+        {
+            return await Finish(null, error.Message);
+        }
+
+        if (action.Type is "click" or "double_click" or "right_click" or "drag" &&
             (action.X is null || action.Y is null))
         {
-            return await Finish(null, "Coordinates are required; element-id resolution arrives with the observation module");
+            return await Finish(null, "Coordinates or a valid element_id are required");
+        }
+        if (action.Type is "drag" && (action.ToX is null || action.ToY is null))
+        {
+            return await Finish(null, "Destination coordinates or a valid to_element_id are required");
         }
 
         var verdict = verifier.Verify(action);
@@ -302,6 +358,57 @@ public sealed class InputController : IRpcModule, IInputController
         {
             return await Finish(null, err.Message, SettleDelayMs);
         }
+    }
+
+    public static async Task<CuAction> ResolveElementCoordinatesAsync(
+        CuAction action, ICuObservationSource? source, CancellationToken cancellationToken,
+        string conversationId = "")
+    {
+        if (action.Type is not ("click" or "double_click" or "right_click" or "scroll" or "drag"))
+        {
+            return action;
+        }
+        var from = await ResolvePointAsync(
+            action.X, action.Y, action.ElementId, source, cancellationToken, conversationId);
+        if (from is { } start)
+        {
+            action = action with { X = start.X, Y = start.Y };
+        }
+        if (action.Type is "drag")
+        {
+            var to = await ResolvePointAsync(
+                action.ToX, action.ToY, action.ToElementId, source, cancellationToken, conversationId);
+            if (to is { } end)
+            {
+                action = action with { ToX = end.X, ToY = end.Y };
+            }
+        }
+        return action;
+    }
+
+    // Explicit coordinates are translated into screen space; otherwise the
+    // element center is looked up. Null when neither is available.
+    private static async Task<CuPoint?> ResolvePointAsync(
+        double? x, double? y, long? elementId, ICuObservationSource? source,
+        CancellationToken cancellationToken, string conversationId)
+    {
+        if (x is double px && y is double py)
+        {
+            return source is null
+                ? new CuPoint(px, py)
+                : await source.TranslateScreenPointAsync(conversationId, new CuPoint(px, py), cancellationToken);
+        }
+        if (elementId is null)
+        {
+            return null;
+        }
+        if (source is null)
+        {
+            throw new InvalidOperationException(
+                $"Element {elementId} cannot be resolved because screen observation is unavailable");
+        }
+        return await source.ResolveElementCenterAsync(elementId.Value, cancellationToken)
+            ?? throw new InvalidOperationException($"Element {elementId} was not found in the current window");
     }
 
     private static async Task<string> ExecuteAsync(CuAction action, CancellationToken cancellationToken)
@@ -359,9 +466,14 @@ public sealed class InputController : IRpcModule, IInputController
                 // Structured unsupported result keeps the wire meaning intact.
                 throw new NotSupportedException(
                     "run_applescript is not supported on Windows; use click, type, and key actions instead");
-            case "drag" or "open_app":
-                // Drag pointer paths and app launching arrive with the observation module.
-                throw new NotSupportedException($"{action.Type} is not yet available on Windows");
+            case "drag":
+            {
+                var (x, y, toX, toY) = (action.X!.Value, action.Y!.Value, action.ToX!.Value, action.ToY!.Value);
+                await NativeInput.DragAsync(x, y, toX, toY, cancellationToken);
+                return $"dragged from ({x}, {y}) to ({toX}, {toY})";
+            }
+            case "open_app":
+                return await AppLauncher.OpenAsync(action.AppName ?? "", cancellationToken);
             default:
                 throw new InvalidOperationException($"Unsupported action: {action.Type}");
         }
@@ -427,6 +539,10 @@ public sealed class InputController : IRpcModule, IInputController
             type,
             X: JsonInput.GetDouble(input, "x"),
             Y: JsonInput.GetDouble(input, "y"),
+            ElementId: JsonInput.GetLong(input, "element_id"),
+            ToX: JsonInput.GetDouble(input, "to_x") ?? JsonInput.GetDouble(input, "toX"),
+            ToY: JsonInput.GetDouble(input, "to_y") ?? JsonInput.GetDouble(input, "toY"),
+            ToElementId: JsonInput.GetLong(input, "to_element_id") ?? JsonInput.GetLong(input, "toElementId"),
             Text: JsonInput.GetString(input, "text"),
             Key: JsonInput.GetString(input, "key"),
             ScrollDirection: JsonInput.GetString(input, "direction") ?? JsonInput.GetString(input, "scroll_direction"),
@@ -454,4 +570,11 @@ public static class JsonInput
 
     public static int? GetInt(JsonElement? element, string name) =>
         GetDouble(element, name) is double parsed ? (int)parsed : null;
+
+    public static long? GetLong(JsonElement? element, string name) =>
+        element is { ValueKind: JsonValueKind.Object } value &&
+        value.TryGetProperty(name, out var property) && property.ValueKind == JsonValueKind.Number &&
+        property.TryGetInt64(out var parsed)
+            ? parsed
+            : null;
 }

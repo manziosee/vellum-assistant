@@ -1,9 +1,10 @@
 import { ChevronDown, ChevronRight } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { useActiveAssistantId } from "@/assistant/use-active-assistant-id";
+import { useTranslation } from "@/i18n";
 import { getGlobalThresholds, setGlobalThresholds } from "@/lib/threshold-api";
 import {
   THRESHOLD_PRESETS,
@@ -18,14 +19,19 @@ function Divider() {
   );
 }
 
-const PRESET_OPTIONS = THRESHOLD_PRESETS.map((p) => ({
-  value: p.id,
-  label: p.label,
-  icon: <p.icon className="h-3.5 w-3.5" />,
-}));
-
 export function RiskToleranceSettings() {
+  const { t } = useTranslation("settings");
   const assistantId = useActiveAssistantId();
+
+  const presetOptions = useMemo(
+    () =>
+      THRESHOLD_PRESETS.map((p) => ({
+        value: p.id,
+        label: t(p.labelKey, p.label),
+        icon: <p.icon className="h-3.5 w-3.5" />,
+      })),
+    [t],
+  );
 
   const queryClient = useQueryClient();
   const { data: thresholds, isError: loadError } = useQuery({
@@ -154,38 +160,35 @@ export function RiskToleranceSettings() {
   return (
     <Card>
       <h2 className="text-title-medium text-[var(--content-default)]">
-        Assistant Access
+        {t("riskToleranceSettings.title")}
       </h2>
       <p className="mt-1 text-body-medium-lighter text-[var(--content-tertiary)]">
-        Control which actions your assistant can take without asking first. Each
-        action is classified by risk level — your access level determines which
-        levels auto-approve. Trust Rules fine-tune this for specific actions by
-        raising or lowering their risk.
+        {t("riskToleranceSettings.description")}
       </p>
       {loadError && (
-        <p className="mt-2 text-body-small-default text-[var(--system-negative-strong)]">
-          Could not load threshold settings. Check your connection and reload.
+        <p className="mt-2 text-body-small-lighter text-[var(--system-negative-strong)]">
+          {t("riskToleranceSettings.loadError")}
         </p>
       )}
       <div className="mt-4 space-y-4">
         <div>
           <div className="text-body-medium-default text-[var(--content-default)]">
-            Conversations
+            {t("riskToleranceSettings.conversationsTitle")}
           </div>
-          <p className="mt-0.5 text-body-small-default text-[var(--content-tertiary)]">
-            When you&apos;re chatting with your assistant directly.
+          <p className="mt-0.5 text-body-small-lighter text-[var(--content-tertiary)]">
+            {t("riskToleranceSettings.conversationsDescription")}
           </p>
           <div className="mt-2" style={{ maxWidth: 280 }}>
             <Select
               value={interactivePresetId}
               onChange={handleInteractiveChange}
-              options={PRESET_OPTIONS}
+              options={presetOptions}
               disabled={dropdownsDisabled}
             />
           </div>
           {interactivePreset && (
             <p className="mt-2 text-body-small-default text-[var(--content-tertiary)]">
-              {interactivePreset.description}
+              {t(interactivePreset.descriptionKey, interactivePreset.description)}
             </p>
           )}
         </div>
@@ -204,29 +207,30 @@ export function RiskToleranceSettings() {
             ) : (
               <ChevronRight className="h-4 w-4" />
             )}
-            <span className="text-body-medium-default">Advanced</span>
+            <span className="text-body-medium-default">
+              {t("riskToleranceSettings.advanced")}
+            </span>
           </button>
 
           <div className={advancedOpen ? "mt-4 space-y-4" : "hidden"}>
             <div>
               <div className="text-body-medium-default text-[var(--content-default)]">
-                Background
+                {t("riskToleranceSettings.backgroundTitle")}
               </div>
-              <p className="mt-0.5 text-body-small-default text-[var(--content-tertiary)]">
-                When your assistant acts without you — scheduled tasks,
-                background jobs, and external triggers.
+              <p className="mt-0.5 text-body-small-lighter text-[var(--content-tertiary)]">
+                {t("riskToleranceSettings.backgroundDescription")}
               </p>
               <div className="mt-2" style={{ maxWidth: 280 }}>
                 <Select
                   value={autonomousPresetId}
                   onChange={handleAutonomousChange}
-                  options={PRESET_OPTIONS}
+                  options={presetOptions}
                   disabled={dropdownsDisabled}
                 />
               </div>
               {autonomousPreset && (
                 <p className="mt-2 text-body-small-default text-[var(--content-tertiary)]">
-                  {autonomousPreset.description}
+                  {t(autonomousPreset.descriptionKey, autonomousPreset.description)}
                 </p>
               )}
             </div>
@@ -235,22 +239,22 @@ export function RiskToleranceSettings() {
 
             <div>
               <div className="text-body-medium-default text-[var(--content-default)]">
-                Headless
+                {t("riskToleranceSettings.headlessTitle")}
               </div>
-              <p className="mt-0.5 text-body-small-default text-[var(--content-tertiary)]">
-                When triggered externally with no interactive client.
+              <p className="mt-0.5 text-body-small-lighter text-[var(--content-tertiary)]">
+                {t("riskToleranceSettings.headlessDescription")}
               </p>
               <div className="mt-2" style={{ maxWidth: 280 }}>
                 <Select
                   value={headlessPresetId}
                   onChange={handleHeadlessChange}
-                  options={PRESET_OPTIONS}
+                  options={presetOptions}
                   disabled={dropdownsDisabled}
                 />
               </div>
               {headlessPreset && (
                 <p className="mt-2 text-body-small-default text-[var(--content-tertiary)]">
-                  {headlessPreset.description}
+                  {t(headlessPreset.descriptionKey, headlessPreset.description)}
                 </p>
               )}
             </div>

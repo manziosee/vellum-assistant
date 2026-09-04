@@ -14,6 +14,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import type { CharacterComponents, CharacterTraits } from "@/types/avatar";
 import { AssistantNavItem } from "@/domains/chat/components/assistant-nav-item";
 import { BUNDLED_COMPONENTS } from "@/utils/avatar-bundled-components";
+import { resolveAvatarAccentHex } from "@/utils/avatar-accent";
 
 /* The hook reads through React Query, which static rendering has no client
    for. Mocked through a mutable value rather than a fixed one: a module mock
@@ -33,6 +34,10 @@ let avatar: AvatarState = {
 mock.module("@/hooks/use-assistant-avatar", () => ({
   useAssistantAvatar: () => ({
     ...avatar,
+    // The real hook's own derivation, so the row can only wear what the app
+    // resolves for the same avatar.
+    accentHex: resolveAvatarAccentHex({ ...avatar, state: null }),
+    accent: null,
     isLoading: false,
     invalidate: () => {},
   }),
@@ -104,6 +109,63 @@ describe("AssistantNavItem leading slot", () => {
     expect(html).not.toContain("lucide-brain");
     // The eyes render as inline SVG paths in the slot.
     expect(html).toContain("<svg");
+  });
+});
+
+describe("AssistantNavItem switcher slots", () => {
+  const TRAILING = createElement(
+    "span",
+    { "data-testid": "switcher-chevron" },
+    "v",
+  );
+  const EXPANSION = createElement(
+    "div",
+    { "data-testid": "switcher-card" },
+    "card",
+  );
+
+  function renderWithSlots(
+    props: Partial<Parameters<typeof AssistantNavItem>[0]> = {},
+  ): string {
+    return renderToStaticMarkup(
+      createElement(AssistantNavItem, {
+        assistantId: "a1",
+        label: "Haze II",
+        active: false,
+        onSelect: () => {},
+        onNewConversation: () => {},
+        ...props,
+      }),
+    );
+  }
+
+  test("a trailing action renders inside the expanded pill", () => {
+    const html = renderWithSlots({ trailingAction: TRAILING });
+    expect(html).toContain('data-testid="switcher-chevron"');
+    expect(html).toContain("gap-[12px]");
+  });
+
+  test("without a trailing action the pill keeps its default gap", () => {
+    const html = renderWithSlots();
+    expect(html).not.toContain("gap-[12px]");
+  });
+
+  test("the collapsed tile has no slot for the trailing action", () => {
+    const html = renderWithSlots({ trailingAction: TRAILING, collapsed: true });
+    expect(html).not.toContain('data-testid="switcher-chevron"');
+  });
+
+  test("an expansion replaces the pill and keeps the New Chat row", () => {
+    const html = renderWithSlots({ expansion: EXPANSION });
+    expect(html).toContain('data-testid="switcher-card"');
+    expect(html).not.toContain('data-tour-id="assistant-page"');
+    expect(html).toContain(">New Chat<");
+  });
+
+  test("the collapsed tile ignores an expansion", () => {
+    const html = renderWithSlots({ expansion: EXPANSION, collapsed: true });
+    expect(html).not.toContain('data-testid="switcher-card"');
+    expect(html).toContain('data-tour-id="assistant-page"');
   });
 });
 

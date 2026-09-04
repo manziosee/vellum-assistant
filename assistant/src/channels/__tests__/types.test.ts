@@ -17,9 +17,11 @@ describe("INTERFACE_IDS", () => {
     ).toBe(true);
   });
 
-  test("still includes macos and other existing interfaces", () => {
+  test("includes desktop and existing interfaces", () => {
     for (const id of [
       "macos",
+      "windows",
+      "linux",
       "ios",
       "cli",
       "telegram",
@@ -41,8 +43,10 @@ describe("INTERACTIVE_INTERFACES", () => {
     expect(INTERACTIVE_INTERFACES.has("chrome-extension" as never)).toBe(false);
   });
 
-  test("still includes macos", () => {
+  test("includes desktop clients", () => {
     expect(INTERACTIVE_INTERFACES.has("macos")).toBe(true);
+    expect(INTERACTIVE_INTERFACES.has("windows")).toBe(true);
+    expect(INTERACTIVE_INTERFACES.has("linux")).toBe(true);
   });
 });
 
@@ -51,8 +55,10 @@ describe("isInterfaceId", () => {
     expect(isInterfaceId("chrome-extension")).toBe(true);
   });
 
-  test("returns true for macos", () => {
+  test("returns true for desktop interfaces", () => {
     expect(isInterfaceId("macos")).toBe(true);
+    expect(isInterfaceId("windows")).toBe(true);
+    expect(isInterfaceId("linux")).toBe(true);
   });
 
   test("returns false for unknown interface", () => {
@@ -68,6 +74,8 @@ describe("parseInterfaceId", () => {
   test("returns canonical ID for valid interface", () => {
     expect(parseInterfaceId("web")).toBe("web");
     expect(parseInterfaceId("macos")).toBe("macos");
+    expect(parseInterfaceId("windows")).toBe("windows");
+    expect(parseInterfaceId("linux")).toBe("linux");
   });
 
   test("normalizes legacy 'vellum' alias to 'web'", () => {
@@ -101,6 +109,26 @@ describe("supportsHostProxy", () => {
 
   test("macos returns true for host_browser", () => {
     expect(supportsHostProxy("macos", "host_browser")).toBe(true);
+  });
+
+  test("windows exposes its implemented host capabilities", () => {
+    expect(supportsHostProxy("windows")).toBe(true);
+    expect(supportsHostProxy("windows", "host_bash")).toBe(true);
+    expect(supportsHostProxy("windows", "host_file")).toBe(true);
+    expect(supportsHostProxy("windows", "host_cu")).toBe(true);
+    expect(supportsHostProxy("windows", "host_browser")).toBe(true);
+    expect(supportsHostProxy("windows", "host_ui_snapshot")).toBe(true);
+    expect(supportsHostProxy("windows", "host_app_control")).toBe(false);
+  });
+
+  test("linux exposes the same host capabilities as windows", () => {
+    expect(supportsHostProxy("linux")).toBe(true);
+    expect(supportsHostProxy("linux", "host_bash")).toBe(true);
+    expect(supportsHostProxy("linux", "host_file")).toBe(true);
+    expect(supportsHostProxy("linux", "host_cu")).toBe(true);
+    expect(supportsHostProxy("linux", "host_browser")).toBe(true);
+    expect(supportsHostProxy("linux", "host_ui_snapshot")).toBe(true);
+    expect(supportsHostProxy("linux", "host_app_control")).toBe(false);
   });
 
   // ── chrome-extension: only host_browser. ──
@@ -171,13 +199,20 @@ describe("parseClientOs", () => {
     );
   });
 
+  test("includes linux (Electron desktop client)", () => {
+    expect(parseClientOs("linux")).toBe("linux");
+    expect((CLIENT_OS_VALUES as readonly string[]).includes("linux")).toBe(
+      true,
+    );
+  });
+
   test("rejects transport-only interface ids and unknown values", () => {
     // `clientOs` is an OS surface, not a transport interface — values like
     // "cli"/"telegram" (real interfaces) are not valid OS surfaces.
     expect(parseClientOs("cli")).toBeNull();
     expect(parseClientOs("telegram")).toBeNull();
     expect(parseClientOs("vellum")).toBeNull();
-    expect(parseClientOs("linux")).toBeNull();
+    expect(parseClientOs("plan9")).toBeNull();
     expect(parseClientOs(undefined)).toBeNull();
     expect(parseClientOs(42)).toBeNull();
   });

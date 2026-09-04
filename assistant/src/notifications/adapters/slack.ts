@@ -14,7 +14,10 @@
 
 import type { Button, CardBlock, ContextBlock, KnownBlock } from "@slack/types";
 
-import { sendSlackReply } from "../../messaging/providers/slack/send.js";
+import {
+  sendSlackReply,
+  updateSlackMessage,
+} from "../../messaging/providers/slack/send.js";
 import { APPROVAL_INSTRUCTION_BLOCK_ID_PREFIX } from "../../messaging/providers/slack/withdraw.js";
 import type { ApprovalUIMetadata } from "../../runtime/channel-approval-types.js";
 import { getLogger } from "../../util/logger.js";
@@ -36,7 +39,11 @@ import type {
   DeliveryResult,
   NotificationChannel,
 } from "../types.js";
-import { resolveMessageText } from "./shared.js";
+import {
+  appendPlainTextFallback,
+  rendersActions,
+  resolveMessageText,
+} from "./shared.js";
 
 const log = getLogger("notif-adapter-slack");
 
@@ -352,7 +359,12 @@ function buildToolApprovalCardBlocks(
     type: "card",
     title: {
       type: "mrkdwn",
-      text: details ? "Tool Approval" : "Approval Request",
+      text:
+        approval.intent === "question"
+          ? "Question"
+          : details
+            ? "Tool Approval"
+            : "Approval Request",
     },
     body: { type: "mrkdwn", text: head },
     actions: buildCardActions(approval),
@@ -436,13 +448,19 @@ export class SlackAdapter implements ChannelAdapter {
       // `approval` rides along with the prebuilt card blocks so the send
       // layer treats a rejected Block Kit payload as an approval prompt:
       // its block-free retry re-attaches `plainTextFallback` reply
-      // instructions instead of posting text with no way to respond.
-      const result = payload.approvalContext
+      // instructions instead of posting text with no way to respond. A
+      // context with no buttons to draw is answered by typed reply, so its
+      // instructions join the text up front.
+      const result = rendersActions(payload.approvalContext)
         ? await sendSlackReply(chatId, messageText, {
             blocks: buildApprovalNotificationBlocks(payload, messageText),
             approval: payload.approvalContext,
           })
-        : await sendSlackReply(chatId, messageText, { useBlocks: true });
+        : await sendSlackReply(
+            chatId,
+            appendPlainTextFallback(messageText, payload.approvalContext),
+            { useBlocks: true },
+          );
 
       log.info(
         { sourceEventName: payload.sourceEventName, chatId, ts: result.ts },
@@ -476,10 +494,12 @@ export class SlackAdapter implements ChannelAdapter {
       return { success: false, error: "no body or title supplied for update" };
     }
     try {
-      const result = await sendSlackReply(delivery.destination, text, {
-        messageTs: delivery.messageId,
-        useBlocks: true,
-      });
+      const result = await updateSlackMessage(
+        delivery.destination,
+        delivery.messageId,
+        text,
+        { useBlocks: true },
+      );
       log.info(
         { chatId: delivery.destination, messageTs: delivery.messageId },
         "Slack notification updated",

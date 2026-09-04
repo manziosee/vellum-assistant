@@ -10,12 +10,28 @@ on:
       - 'patches/**'
       - 'clients/web/**'
       - 'assistant/src/api/**'
+      # `openapi-ts` generates the web's daemon client from this spec, so a
+      # schema change here can break the web build with no web file touched.
+      - 'assistant/openapi.yaml'
       - 'packages/design-library/**'
+      # The web imports this contract's types directly, so a change here can
+      # break the web type check with no web file touched.
+      - 'packages/ipc-contract/**'
       - 'packages/local-mode/**'
       - 'packages/environments/**'
+      - 'packages/avatar-catalog/**'
+      - 'packages/avatar-manifest/**'
       # The web LLM catalog parity test reads this file, so daemon-side catalog
       # regenerations must run the web tests too.
       - 'meta/llm-provider-catalog.json'
+      # The app icon row test reads these native color sources off disk, so a
+      # native-only color edit still has to run the web tests.
+      - 'clients/android/app/src/dev/res/values/colors.xml'
+      - 'clients/android/app/src/staging/res/values/colors.xml'
+      - 'clients/android/app/src/production/res/values/colors.xml'
+      - 'clients/ios/App/App/AppIcon.icon/**'
+      - 'clients/ios/App/App/AppIcon-Dev.icon/**'
+      - 'clients/ios/App/App/AppIcon-Staging.icon/**'
       - '.github/workflows/ci-main-web.yaml'
 
 # Serialize runs per branch and cancel superseded in-flight runs — only the

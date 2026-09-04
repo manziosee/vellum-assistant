@@ -20,6 +20,7 @@ import {
   emitInChatTourCompleted,
   emitInChatTourSkipped,
 } from "./tour-telemetry";
+import { useTranslation } from "@/i18n";
 
 /**
  * SPIKE — orchestrator for the in-chat onboarding UI prototype, mounted
@@ -36,12 +37,13 @@ import {
  * tour.
  */
 export function InChatOnboardingController() {
+  const { t } = useTranslation("chat");
   const prototypeActive = useInChatOnboardingStore.use.prototypeActive();
   const stage = useInChatOnboardingStore.use.stage();
   const tourRun = useInChatOnboardingStore.use.tourRun();
   const finishTour = useInChatOnboardingStore.use.finishTour();
   const assistantId = useResolvedAssistantsStore.use.activeAssistantId();
-  const { components, traits } = useAssistantAvatar(assistantId);
+  const { accentHex: accent } = useAssistantAvatar(assistantId);
 
   const tourRef = useRef<AvatarTourHandle | null>(null);
   /** True once Skip was pressed this run — tells the done handler to emit
@@ -52,12 +54,6 @@ export function InChatOnboardingController() {
   /** Latches on first landing so the chat doesn't flash back between stops. */
   const [takeover, setTakeover] = useState(false);
   const [progress, setProgress] = useState<TourProgress | null>(null);
-
-  const accent =
-    (components &&
-      traits &&
-      components.colors.find((c) => c.id === traits.color)?.hex) ||
-    null;
 
   const handleStepChange = useCallback((step: TourStep | null) => {
     setNarrationStep(step);
@@ -109,7 +105,7 @@ export function InChatOnboardingController() {
       // Contrast-toned over the intro's avatar-colored flood.
       style={{ color: introFg }}
     >
-      Skip tour
+      {t("inChatOnboardingController.skipTour")}
     </Button>
   );
 
@@ -128,7 +124,7 @@ export function InChatOnboardingController() {
           className="h-11 w-[234px] text-base"
           onClick={() => tourRef.current?.next()}
         >
-          Show me around
+          {t("inChatOnboardingController.showMeAround")}
         </Button>
         {skipButton}
       </div>
@@ -138,7 +134,7 @@ export function InChatOnboardingController() {
         rightIcon={<ArrowRight size={16} />}
         onClick={() => tourRef.current?.next()}
       >
-        Next
+        {t("inChatOnboardingController.next")}
       </Button>
     )
   ) : null;

@@ -1,23 +1,17 @@
 import { afterEach, beforeAll, describe, expect, mock, test } from "bun:test";
-import { EventEmitter } from "node:events";
 
 import type { CliInvocation } from "../util";
-
-class FakeChild extends EventEmitter {
-  stdout = new EventEmitter();
-  stderr = new EventEmitter();
-  kill = mock(() => true);
-}
+import { FakeChild, mockChildProcessSpawn } from "./helpers/child-process-mock";
 
 let lastChild: FakeChild;
 const spawnArgs: Array<
-  [string, string[], { env?: NodeJS.ProcessEnv; stdio?: unknown }]
+  [string, string[], { env?: NodeJS.ProcessEnv; stdio?: unknown; windowsHide?: boolean }]
 > = [];
 const spawnMock = mock(
   (
     command: string,
     args: string[],
-    options: { env?: NodeJS.ProcessEnv; stdio?: unknown },
+    options: { env?: NodeJS.ProcessEnv; stdio?: unknown; windowsHide?: boolean },
   ) => {
     spawnArgs.push([command, args, options]);
     lastChild = new FakeChild();
@@ -25,7 +19,7 @@ const spawnMock = mock(
   },
 );
 
-mock.module("node:child_process", () => ({ spawn: spawnMock }));
+await mockChildProcessSpawn(spawnMock);
 
 let runUpgrade: typeof import("../upgrade").runUpgrade;
 let isValidReleaseVersion: typeof import("../upgrade").isValidReleaseVersion;
@@ -85,7 +79,7 @@ describe("runUpgrade", () => {
     expect(spawnArgs[0]).toEqual([
       "bun",
       ["run", "cli", "upgrade", "asst-42", "--version", "v1.2.3"],
-      { stdio: ["ignore", "pipe", "pipe"] },
+      { stdio: ["ignore", "pipe", "pipe"], windowsHide: true },
     ]);
   });
 

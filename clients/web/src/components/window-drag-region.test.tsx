@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 
 let isElectronMock = false;
 let inlineTitleBarActiveMock = false;
-let hostOSMock: "macos" | "windows" | null = null;
+let hostOSMock: "macos" | "windows" | "linux" | null = null;
 
 mock.module("@/runtime/is-electron", () => ({
   isElectron: () => isElectronMock,
@@ -11,7 +11,10 @@ mock.module("@/runtime/is-electron", () => ({
 
 mock.module("@/stores/title-bar-store", () => ({
   useTitleBarStore: {
-    use: { inlineTitleBarActive: () => inlineTitleBarActiveMock },
+    use: {
+      inlineTitleBarActive: () => inlineTitleBarActiveMock,
+      windowsMenuBarSuppressed: () => false,
+    },
   },
 }));
 
@@ -39,6 +42,12 @@ describe("WindowDragRegion", () => {
     isElectronMock = true;
     const html = renderToStaticMarkup(<WindowDragRegion />);
     expect(html).toContain("app-region:drag");
+  });
+
+  test("renders nothing on Linux, which keeps native window decorations", () => {
+    isElectronMock = true;
+    hostOSMock = "linux";
+    expect(renderToStaticMarkup(<WindowDragRegion />)).toBe("");
   });
 
   test("leaves the Windows title-bar overlay controls unobstructed", () => {

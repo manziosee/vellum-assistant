@@ -9,6 +9,8 @@
  */
 import { z } from "zod";
 
+import { PendingToolQuestionSchema } from "../../api/responses/conversation-message.js";
+import { syncTerminalGuardianRequestStatus } from "../../approvals/guardian-request-status-sync.js";
 import { findConversation } from "../../daemon/conversation-registry.js";
 import type {
   SecretDelivery,
@@ -45,8 +47,6 @@ function canonicalizeConfirmDecision(params: {
 function handleConfirm({ body }: RouteHandlerArgs) {
   const requestId = body?.requestId as string | undefined;
   const decision = body?.decision as string | undefined;
-  const selectedPattern = body?.selectedPattern as string | undefined;
-  const selectedScope = body?.selectedScope as string | undefined;
 
   if (!requestId || typeof requestId !== "string") {
     throw new BadRequestError("requestId is required");
@@ -92,6 +92,14 @@ function handleConfirm({ body }: RouteHandlerArgs) {
       effectiveDecision === "allow" ? "approved" : "rejected",
     );
     interaction.directResolve(effectiveDecision as UserDecision);
+    // When a guardian request was promoted for this confirmation, bring its
+    // row to the matching terminal status and withdraw its cards; with no
+    // such row the CAS misses and this is a no-op.
+    void syncTerminalGuardianRequestStatus({
+      requestId,
+      status: effectiveDecision === "allow" ? "approved" : "denied",
+      syncContext: "confirm-direct-resolve",
+    });
     return { accepted: true };
   }
 
@@ -106,8 +114,6 @@ function handleConfirm({ body }: RouteHandlerArgs) {
     requestId,
     effectiveDecision as UserDecision,
     {
-      selectedPattern,
-      selectedScope,
       emissionContext: { source: "button" },
     },
   );
@@ -210,9 +216,18 @@ function handleSecret({ body }: RouteHandlerArgs) {
  * GET /v1/pending-interactions?conversationKey=...&conversationId=...
  *
  * Returns pending interactions. When conversationKey or conversationId is
- * provided, returns the first pending confirmation and secret for that
- * conversation. When neither is provided, returns all pending interactions
- * across all conversations (diagnostic mode).
+ * provided, returns the outstanding confirmation, secret, and question for
+ * that conversation. When neither is provided, returns all pending
+ * interactions across all conversations (diagnostic mode).
+ *
+ * This registry is the authority on whether a prompt is still awaiting the
+ * user, so the conversation-scoped shape is what clients project their prompt
+ * UI from: a key present with a `null` value states "nothing outstanding of
+ * this kind" as positively as an object states the opposite. Every
+ * conversation-scoped return path below therefore names all three keys, even
+ * the early return for an unresolvable conversation. A client that sees a key
+ * missing entirely is talking to an assistant that predates it, which is how
+ * `pendingQuestion` consumers detect support without a version check.
  */
 function handleListPendingInteractions({ queryParams }: RouteHandlerArgs) {
   const conversationKey = queryParams?.conversationKey;
@@ -241,7 +256,11 @@ function handleListPendingInteractions({ queryParams }: RouteHandlerArgs) {
   }
 
   if (!resolvedConversationId) {
-    return { pendingConfirmation: null, pendingSecret: null };
+    return {
+      pendingConfirmation: null,
+      pendingSecret: null,
+      pendingQuestion: null,
+    };
   }
 
   const interactions = pendingInteractions.getByConversation(
@@ -252,6 +271,13 @@ function handleListPendingInteractions({ queryParams }: RouteHandlerArgs) {
     (i) => i.kind === "confirmation" || i.kind === "acp_confirmation",
   );
   const secret = interactions.find((i) => i.kind === "secret");
+  // Newest-first for questions: a new user message supersedes an open
+  // ask_question by steering to it, which settles the old prompt through its
+  // abort signal rather than synchronously, so both can sit in the registry
+  // for the width of that turn. The newer prompt is the one the user is being
+  // asked, so it is the one to report.
+  const questions = interactions.filter((i) => i.kind === "question");
+  const question = questions[questions.length - 1];
 
   return {
     pendingConfirmation: confirmation
@@ -288,6 +314,15 @@ function handleListPendingInteractions({ queryParams }: RouteHandlerArgs) {
           allowOneTimeSend: secret.secretDetails?.allowOneTimeSend,
         }
       : null,
+    // Reported only with its `entries`, since the batch is what the card
+    // renders; a prompt that somehow carries none is not something a client
+    // could raise.
+    pendingQuestion: question?.questionDetails
+      ? {
+          requestId: question.requestId,
+          entries: question.questionDetails.entries,
+        }
+      : null,
   };
 }
 
@@ -312,14 +347,6 @@ export const ROUTES: RouteDefinition[] = [
     requestBody: z.object({
       requestId: z.string().describe("Pending interaction request ID"),
       decision: z.string().describe("One of: allow, deny"),
-      selectedPattern: z
-        .string()
-        .describe("Allowlist pattern for persistent decisions")
-        .optional(),
-      selectedScope: z
-        .string()
-        .describe("Scope for persistent decisions")
-        .optional(),
     }),
     responseBody: z.object({
       accepted: z.boolean(),
@@ -395,6 +422,9 @@ export const ROUTES: RouteDefinition[] = [
         .passthrough()
         .nullable()
         .describe("Pending secret request or null")
+        .optional(),
+      pendingQuestion: PendingToolQuestionSchema.nullable()
+        .describe("Outstanding ask_question prompt or null")
         .optional(),
       interactions: z
         .array(

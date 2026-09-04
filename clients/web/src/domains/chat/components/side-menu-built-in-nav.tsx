@@ -1,8 +1,9 @@
 import { SIDEBAR_STACK_GAP } from "@/components/sidebar-nav-geometry";
-import { AssistantNavItem } from "@/domains/chat/components/assistant-nav-item";
+import { AssistantSwitcher } from "@/domains/chat/components/assistant-switcher";
 import { PinnedAppNavItem } from "@/domains/chat/components/pinned-app-nav-item";
-import { usePinnedAppsStore } from "@/stores/pinned-apps-store";
+import { usePinnedApps } from "@/hooks/use-pinned-apps";
 import { cn } from "@vellumai/design-library";
+import { useTranslation } from "@/i18n";
 
 export interface SideMenuBuiltInNavProps {
   assistantId: string | null;
@@ -41,7 +42,8 @@ export function SideMenuBuiltInNav({
   onOpenApp,
   onClose,
 }: SideMenuBuiltInNavProps) {
-  const pinnedApps = usePinnedAppsStore.use.pinnedApps();
+  const { t } = useTranslation("chat");
+  const { pinnedApps, unpin, setColor } = usePinnedApps(assistantId);
 
   /* One column at a single gap, rather than each cluster spacing itself.
      `SideMenu.Header` puts its own gap between its children, so a margin
@@ -61,9 +63,9 @@ export function SideMenuBuiltInNav({
           overlay drawer skips the New Chat row: its floating New Chat
           pill already owns that action in the thumb zone. */}
       <div>
-        <AssistantNavItem
+        <AssistantSwitcher
           assistantId={assistantId}
-          label={assistantName || "Your Assistant"}
+          label={assistantName || t("sideMenuBuiltInNav.yourAssistant")}
           active={isIntelligenceActive}
           collapsed={collapsed}
           onSelect={
@@ -82,16 +84,19 @@ export function SideMenuBuiltInNav({
                 }
               : undefined
           }
+          onSwitched={onClose}
         />
       </div>
       {pinnedApps.length > 0 ? (
         <div className={cn("flex flex-col", SIDEBAR_STACK_GAP)}>
           {pinnedApps.map((app) => (
             <PinnedAppNavItem
-              key={app.appId}
+              key={app.id}
               app={app}
               collapsed={collapsed}
-              active={activeAppId === app.appId}
+              active={activeAppId === app.id}
+              onUnpin={unpin}
+              onSetColor={setColor}
               onOpen={
                 onOpenApp
                   ? (appId) => {

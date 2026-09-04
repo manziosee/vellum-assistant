@@ -28,12 +28,15 @@ mock.module("@/stores/command-palette-store", () => ({
 const setInlineTitleBarActiveSpy = mock((_active: boolean) => {});
 mock.module("@/stores/title-bar-store", () => ({
   useTitleBarStore: {
-    use: { setInlineTitleBarActive: () => setInlineTitleBarActiveSpy },
+    use: {
+      setInlineTitleBarActive: () => setInlineTitleBarActiveSpy,
+      windowsMenuBarSuppressed: () => false,
+    },
   },
 }));
 
 let mockIsNativeMobile = false;
-let mockElectronHostOS: "macos" | "windows" | null = null;
+let mockElectronHostOS: "macos" | "windows" | "linux" | null = null;
 mock.module("@/runtime/platform-detection", () => ({
   detectElectronHostOS: () =>
     mockIsElectron ? (mockElectronHostOS ?? "macos") : null,
@@ -49,6 +52,7 @@ beforeEach(() => {
   mockElectronHostOS = null;
   usePageSurfaceStore.getState().setSurface(null);
   toggleCommandPaletteSpy.mockClear();
+  setInlineTitleBarActiveSpy.mockClear();
 });
 
 afterEach(() => {
@@ -149,5 +153,18 @@ describe("ChatLayoutHeader desktop chrome", () => {
       '[data-slot="chat-layout-header"]',
     );
     expect(header?.style.paddingRight).toBe("150px");
+  });
+
+  test("keeps native Linux chrome instead of a custom title bar", () => {
+    mockIsElectron = true;
+    mockElectronHostOS = "linux";
+    renderHeader({ isMobile: false });
+
+    const header = document.querySelector<HTMLElement>(
+      '[data-slot="chat-layout-header"]',
+    );
+    expect(header?.className).not.toContain("app-region:drag");
+    expect(header?.style.minHeight).toBe("40px");
+    expect(setInlineTitleBarActiveSpy).not.toHaveBeenCalled();
   });
 });

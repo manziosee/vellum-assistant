@@ -16,6 +16,7 @@ import {
 } from "@/components/startup-failure";
 import { WindowDragRegion } from "@/components/window-drag-region";
 import { initI18n } from "@/i18n";
+import { setupCameraGateHudAccessSync } from "@/lib/camera/frame-gate-debug-access";
 import { isChunkLoadError } from "@/lib/chunk-errors";
 import { setupClientFlagScopeSync } from "@/lib/feature-flags/client-flag-scope";
 import { installConsentRefreshListeners } from "@/lib/consent/consent-refresh";
@@ -33,6 +34,7 @@ import { router } from "./routes";
 import "@/lib/api-interceptors";
 import "./index.css";
 
+import { initWindowsTitleBarOverlay } from "@/runtime/electron-window-chrome";
 import { initNativeKeyboard } from "@/runtime/native-keyboard";
 import { initNativePlatformAttributes } from "@/runtime/native-platform-attributes";
 import { initSafeAreaBridge } from "@/runtime/native-safe-area";
@@ -47,6 +49,7 @@ async function boot() {
 
   initInputModality();
   initNativePlatformAttributes();
+  initWindowsTitleBarOverlay();
   await initSafeAreaBridge();
   // First render waits on this bridge, so it is the first boot gate worth a
   // number. See `lib/telemetry/boot-telemetry.ts` for the mark family.
@@ -82,6 +85,9 @@ async function boot() {
   // Register before initSession so the boot `unknown → present` transition it
   // drives is caught and the platform assistants list is loaded.
   setupPlatformAssistantsSync();
+  // The camera gates are built outside React, so what a restored tuning
+  // session applies to them is decided here rather than by a mounted panel.
+  setupCameraGateHudAccessSync();
   if (isLocalClient()) {
     await loadLockfile();
     await useAuthStore.getState().initSession();

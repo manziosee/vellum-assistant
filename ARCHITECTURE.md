@@ -23,6 +23,7 @@ This file is the cross-system architecture index. Detailed designs live in domai
 | Docker volume architecture                  | [Docker Volume Architecture](#docker-volume-architecture) (this file)                              |
 | Web search failure normalization            | [Web Search Failure Normalization](#web-search-failure-normalization) (this file)                  |
 | Workflow orchestration engine               | [Workflow Orchestration Engine](#workflow-orchestration-engine) (this file)                        |
+| Watch sessions                              | [Watch Sessions](#watch-sessions) (this file)                                                      |
 | Workflow authoring guide                    | [`assistant/docs/workflows.md`](assistant/docs/workflows.md)                                       |
 | Workflow manual testing runbook             | [`assistant/docs/workflows-testing.md`](assistant/docs/workflows-testing.md)                       |
 | Service communication matrix                | [`docs/service-communication-matrix.md`](docs/service-communication-matrix.md)                     |
@@ -34,7 +35,7 @@ This file is the cross-system architecture index. Detailed designs live in domai
 - Bundled-skill outbound API calls that require credentials use the Credential Execution Service (CES) tools (`make_authenticated_request`, `run_authenticated_command`) rather than manual token plumbing or proxied shell execution. See `assistant/docs/credential-execution-service.md`.
 - Managed shared-identity channel routing runs in a separate managed-gateway service lane from the per-assistant `gateway/` lane. The deployable managed-gateway runtime is platform-owned; this repo keeps public contracts/fixtures under `gateway-managed/`.
 - Production LLM calls go through the provider abstraction, not provider SDKs in feature code.
-- The macOS and Windows Electron shells share platform-neutral window security, IPC validation, origin checks, and preload capability registration through `@vellumai/electron-desktop`, plus native helper process and JSON-RPC lifecycle through `@vellumai/native-sidecar`. Each client keeps platform lifecycle and native features in its own adapter modules under `clients/<platform>/src/`.
+- The macOS and Windows Electron shells share platform-neutral window security, IPC validation, origin checks, and preload capability registration through `@vellumai/electron-desktop`, plus native helper process and JSON-RPC lifecycle through `@vellumai/native-sidecar`. Each client keeps platform lifecycle and native features in its own adapter modules under `clients/<platform>/src/`. Both preloads implement the same `VellumBridge` contract (`packages/ipc-contract`); a surface only one shell can back is optional there and documented in [`clients/windows/docs/parity-matrix.md`](clients/windows/docs/parity-matrix.md), which `clients/windows/src/preload/bridge-parity.test.ts` enforces against the macOS preload.
 - Packaged Windows startup provisions a user-scoped CLI runtime from
   `resources/cli-runtime`. Versioned installs and one fallback live under
   Electron `userData`; a small channel-scoped launcher under
@@ -100,6 +101,24 @@ The CLI routes all lockfile reads/writes through `cli/src/lib/environments/paths
 Platform tokens (`platform-token`), device IDs (`device-id`), and guardian tokens (`assistants/<id>/guardian-token.json`) live under the env-scoped config dir. The CLI (`cli/src/lib/platform-client.ts`, `cli/src/lib/guardian-token.ts`), the daemon (`assistant/src/util/platform.ts:getXdgPlatformTokenPath`, `getXdgVellumConfigDirName`), and the Electron app (`clients/macos/src/main/device-id.ts`) all agree on the same env-scoped path, so `vellum login`, guardian leasing, persisted device IDs, and desktop session state never bleed between environments.
 
 Paired guardian credentials stay in the trusted host. The renderer sends paired traffic to `/assistant/__gateway-paired/<assistantId>/*` without a bearer. The Electron main process, CLI web host, or Vite development host resolves the paired entry, removes any renderer-provided `Authorization` header, reads or refreshes the guardian token, and injects it only on the remote gateway hop. Renderer-facing guardian-token endpoints reject paired assistant IDs. Packaged Electron gates the custom-protocol route through main-process `WebRequest` frame identity because Chromium omits Origin, Referer, and Fetch Metadata from the `GlobalRequest` delivered to custom protocol handlers.
+
+### Device pairing
+
+Connecting a second machine, a phone, or a tablet to a self-hosted assistant runs on one secret: the device code of a challenge minted on the assistant's gateway. Which side mints the challenge sets the direction. The host mints and approves in one step and hands over a pairing link carrying the code, or the joining device mints for itself and shows a short approval code for the host to approve afterward. Every QR code in the flow renders one of those two, never a credential of its own. The user-facing walkthrough is [`docs/self-hosted-phone.md`](docs/self-hosted-phone.md).
+
+**The pairing link** is the forward direction. `vellum pair` and the desktop **Settings → General → Pair a device** card both mint a remote-web challenge on the assistant's own gateway over loopback and approve it on the spot, because running either one on the host machine _is_ the proof of local presence. `buildRemoteWebPairingUrl` composes the result as `<publicBaseUrl>/assistant/pair#device_code=<code>`, carrying the code in the fragment so it never reaches the wire. By default the QR code is that same link rendered as pixels: scanning it, opening it in a browser, and pasting it into `vellum connect import` are three ways to spend one link. `vellum pair --app` changes what the QR encodes, not what pairing does: `buildAppConnectUrl` composes `<scheme>://connect?url=<base>&code=<device code>` (default scheme `vellum-assistant`) so a scan opens the native app on that same device code, and the command prints the app link plus the https link for a device without the app.
+
+**The approval code** is the reverse direction, for starting at the joining device and getting to the host afterward. Handed a bare `https://host` address instead of a link, the importing device mints its own challenge, displays the short `ABCD-EFGH` user code, and polls. The host approves it with `vellum pair --web-approve <code>` or from the pending-requests list on the Pair a device card. `POST /v1/remote-web/pairing-verification` and the three `/v1/remote-web/pairing-requests` routes are loopback-gated, so approving means being on the host.
+
+`resolvePublicBaseUrl` (`packages/service-contracts/src/remote-web-pairing.ts`) is the validator every surface ends up in, and so the place to change what pairing accepts. It normalizes an address to its base, collapsing a pasted pair-page URL back to the host it names, and refuses loopback, private-network IP literals, plain http, and tunnel-vendor websites. `vellum pair` and the Pair a device card call it directly on the URL they are about to advertise. The importing flow calls `parsePairingAddress`, which wraps it and adds the device code read off the link, so one pasted value can be either a pairing link or a bare address. Hosts POST to whatever address they are handed, so those refusals are the SSRF containment for the whole flow.
+
+The exchange runs in the trusted host, never the renderer. `pairingStart` / `pairingPoll` / `pairingCancel` (`packages/local-mode/src/pair.ts`) hold the device code, the client-generated device id, and the challenge TTL in an in-memory map keyed by an opaque handle, handing callers only `{ handle, userCode, expiresAt, intervalSeconds }`. The opaque handle is what keeps the device code off whatever IPC or loopback boundary a host exposes a session over. `vellum connect import` (`cli/src/commands/connect/import.ts`) drives them in-process; the Electron main process exposes them over IPC as `vellum:localMode:pairing*` (`packages/electron-desktop/src/local-mode.ts`), and the CLI web host (`cli/src/commands/client.ts`) and the Vite development host (`clients/web/vite-plugin-local-mode.ts`) each mirror the same three as loopback `__local/pairing-*` routes, so the renderer never sees more than the handle.
+
+`POST /v1/remote-web/pairing-token` branches on `deviceId`. A browser omits it and receives its refresh token as an `HttpOnly` cookie scoped to the refresh path. A host that sends one receives a device-bound, per-device revocable credential whose `refreshToken` comes back in the response body with no `Set-Cookie`, which is what lets a lockfile writer persist it; the `platform` it declares (`cli`, `desktop`, `ios`, or `android`) is what the host's paired-devices list renders. The response branches on that same device-bound decision, never on whether a cookie path was computed, so a browser exchange cannot quietly start serializing its refresh token into the body if the cookie-path helper ever changes. A gateway predating the branch ignores the unknown field and returns no body refresh token, so the pairing registers access-only and warns that it will expire.
+
+The `deviceId` branch is a considered trade-off rather than a free one. It grants no new _scope_: an approved device code already buys a full guardian-scoped session either way. What it changes is how durable and how exfiltratable the credential is. Before it, the strongest thing a party holding an approved code could read out of the response was the 30-day access token, because the refresh credential was reachable only as an `HttpOnly; Secure; SameSite=Strict` cookie that page script cannot read. With it, that same party can add any `deviceId` and read a rotating refresh token good for up to 365 days, or 90 days idle, straight out of the body. That lands on the pair page specifically, because the device code rides in the URL fragment where script on the assistant's remote-web origin can read it: an XSS or a hostile extension there can mint its own device-bound pair instead of being confined to the cookie path.
+
+Four compensating controls bound it, and each is load-bearing. The device code is single-use and expires in ten minutes, so a stolen exchange spends the code and the real device's exchange then fails, which surfaces the theft. `rotateCredentials` compares the caller's `hashedDeviceId` against the record's and refuses a mismatch, so a refresh token exfiltrated on its own is not redeemable without the matching raw `deviceId`. Both paths record an actor-token row, so both are revocable from the loopback-gated Paired devices list, and the device-bound row is the one carrying a stable client id and a declared `platform` (`cli`, `desktop`, `ios`, or `android`), so the host can tell which machine it is revoking. The route also accepts a `clientReportedName` and the list renders one when the row has it, but no client populates it on this route (`pairingPoll` posts `{ deviceCode, deviceId, platform }`); the rows that carry a name come from `POST /v1/guardian/init`. And the SPA sends only `deviceCode` (`clients/web/src/lib/auth/remote-gateway-session.ts`), so the browser posture is byte-identical to what it was before the branch existed.
 
 ### Backwards compatibility
 
@@ -633,6 +652,14 @@ Tool access is also narrowed during cleanup mode. The runtime marks cleanup turn
 
 The macOS app owns the local client contract through `DiskPressureStatusStore`. On app activation and SSE changes, it fetches or applies the latest status. If acknowledgement is required, the main window and pop-out thread windows show a blocking safe-storage banner; the guardian must acknowledge or dismiss before continuing. After acknowledgement, chat surfaces keep a persistent cleanup status banner explaining that background processes and trusted-contact messages remain blocked until storage is freed. Acknowledgement request failures are shown in the banner so the modal does not fail silently.
 
+## Resource Pressure Monitoring
+
+Resource pressure monitoring warns platform users when their assistant is under sustained CPU or memory pressure so they can upgrade their plan. Unlike the disk-pressure guard it never blocks work: the guard is observe-and-report only.
+
+The daemon-side guard (platform gating, sampling cadence, hysteresis windows and thresholds, SSE change fingerprinting) is documented in the "Resource Pressure Monitoring" section of [`assistant/ARCHITECTURE.md`](assistant/ARCHITECTURE.md). What clients see is a read-only contract: `GET /v1/resource-pressure/status` (no acknowledge or override transitions) plus `resource_pressure_status_changed` SSE events on substantive transitions.
+
+The web app owns the client contract. `useResourcePressureMonitor` (enabled only for platform-hosted assistants) polls the status route every 60 seconds, refetches on app resume, and applies SSE updates immediately. While the state is `elevated`, chat surfaces show a warning banner (a plan-headroom nudge with no CPU/memory figures) and an Upgrade CTA that navigates to the plans page; the CTA is hidden on native Android and for non-active assistants. Dismissing the banner starts a per-assistant 7-day cooldown stored in localStorage, and checking "Don't show again" suppresses it permanently. The disk-pressure banner takes precedence: the resource slot yields whenever the disk-pressure slot is active, so a critical storage warning never competes with an upsell.
+
 ## Web Search Failure Normalization
 
 <!-- ATL-727: centralized web_search backend-failure normalization. -->
@@ -646,6 +673,15 @@ Every `web_search` failure path funnels through a single classification layer so
 - **No conflation with `web_fetch`.** The normalization layer keys exclusively on `web_search` (native server-tool web_search and the app-side search tool). It never inspects `WebFetchMetadata`, so a `web_fetch` DNS failure (e.g. an unresolved host) keeps its own `webFetch.errorMessage` and is never rewritten to the search backend copy.
 
 End-to-end coverage lives in `assistant/src/__tests__/web-search-backend-failure.test.ts`.
+
+## Public Roadmap as the Assistant
+
+`assistant roadmap` lets an assistant read and file feedback on the public Vellum roadmap under its own name rather than its owner's. It adds one outbound service boundary, from the daemon to the marketing service that serves the roadmap API.
+
+- **Where the identity comes from.** The daemon reads `vellum:assistant_api_key` from the credential vault and spends it only on an outbound `Authorization: Api-Key` header. The plaintext key never crosses IPC into a CLI process and never appears in a response, a log, or an error body, so `runtime/routes/roadmap-routes.ts` is an allowlisted `secure-keys` importer (`credential-security-invariants`). `X-Api-Key` must not be substituted: that name collides with an unrelated internal credential under the service's case-insensitive header lookup, and a request carrying it is served as anonymous.
+- **Who may act.** Reads (`roadmap_list`, `roadmap_get`) fall back to anonymous when no key is stored, which only costs the viewer-upvoted marker. Every write requires the key and otherwise fails with a connect-first message. The gateway risk registry rates `create` and `delete` high and `update`, `upvote`, `unvote` medium: each one changes a public page attributed to the assistant.
+- **Which deployment it reaches.** The roadmap is a single public site with no per-environment deployment, so only production has a default host (`https://marketing.vellum.ai`). Any other `VELLUM_ENVIRONMENT` must name its own endpoint through `VELLUM_MARKETING_URL`, and the route refuses to run otherwise, rather than letting a staging or dev assistant file real items and hand a non-production key to a production host. Item links resolve from the environment's `webUrl` (`VELLUM_WEB_URL` overrides).
+- **Bounded calls.** Each upstream request carries a 30s deadline, below the CLI's 60s IPC timeout, and honors the caller's abort signal. Closing the IPC socket does not abort a daemon handler, so an unbounded slow `create` could otherwise publish an item after its caller had already been told the request failed, and the retry would file a second one.
 
 ## Workflow Orchestration Engine
 
@@ -704,6 +740,64 @@ graph TB
 - **Routes** (read/abort/resume surfaces): `GET /v1/workflows`, `GET /v1/workflows/runs`, `GET /v1/workflows/runs/:id`, `POST /v1/workflows/runs/:id/abort`, `POST /v1/workflows/runs/:id/resume` (the resume route refuses a side-effecting run in normal posture and proceeds at full access).
 - **CLI**: `vellum workflows list | runs | show <id> | abort <id> | resume <id>`.
 - **Config** (`workflows.*`): `maxAgentsPerRun` (500), `maxConcurrentLeaves` (6), `maxConcurrentRuns` (3), `journalRetentionDays` (30).
+
+## Watch Sessions
+
+A watch session records what the user narrates while they work and reads their screen around it. The microphone and the socket live in the browser (`clients/web/src/domains/chat/watch/watch-controller.ts`); the cadence, the observations, and the timeline live in the daemon (`assistant/src/watch/watch-session-manager.ts`). The client draws nothing during a session: frames going the other way are lifecycle only, and the retrospective is a conversational turn after the socket is gone.
+
+One session at a time, on both sides. The client holds a single module-level slot and the daemon a single manager slot, because both are driven by the one microphone the machine has. The client refuses a start while a live-voice call is running, refuses one against an assistant that predates the route (`clients/web/src/lib/backwards-compat/watch-sessions.ts`), binds the session to the assistant it was started for, and ends it when that assistant stops being the active one, when the layout unmounts, or on sign-out.
+
+**Transport.** The browser opens `wss://<ingress>/v1/watch/stream?token=<edge JWT>&mimeType=audio/pcm&sampleRate=16000` and streams 16 kHz mono PCM16LE as binary frames, the same capture pipeline live voice and streaming dictation use. The token rides the query string because browser WebSockets cannot set an `Authorization` header.
+
+Which ingress it dials depends on the deployment, chosen by `resolveWatchStreamWsUrl` the way `resolveLiveVoiceWsUrl` chooses for live voice. A self-hosted assistant is dialled straight at the user's own gateway with the actor edge JWT. A managed one has no ingress of its own, so the browser mints a short-lived velay token and dials velay, which validates it, consumes it, and injects the authenticated caller downstream; `/v1/watch/stream` is in the gateway's velay allowlist for that reason. A paired assistant is the one deployment with no transport at all: its proxy is HTTP-only and there is no loopback to fall back to, so the client refuses the start.
+
+**A socket is not a session.** The gateway accepts the downstream upgrade before it dials the runtime, so a local `open` proves only that a proxy answered. The runtime's `ready` frame (carrying `sessionId` and `conversationId`) is the first word that a session exists, and it is what starts both the microphone and the `watching` flag the companion draws its capture indicator from. Until then the session is pending and the surface shows nothing. A bounded wait covers a gateway that accepts and then never hears from the runtime; a close, an `error`, or that timeout before `ready` is a failed start rather than a stopped session, so it tears down and the flag never moves.
+
+**Auth posture.** The gateway (`gateway/src/http/routes/watch-stream-websocket.ts`) validates the edge JWT, rejects a revoked actor token, and requires an actor principal, refusing service tokens on this client-facing path. It then **pins the upgrade to the bound guardian**, as live voice does and for a sharper reason: the daemon resolves whose screen to observe from the guardian binding rather than from the request, and the proxy replaces the caller's identity with a service token upstream, so a non-guardian actor admitted here would open a session bound to the guardian and observing the guardian's screen with the daemon unable to tell. Both arrival paths are pinned (`gateway/src/http/routes/guardian-pin.ts`, shared with live voice): a velay-attested managed caller is cross-checked against the stored `platform_user_id`, and an actor edge JWT against the guardian binding. It then dials a *fresh* upstream socket to the daemon bearing only a short-lived gateway service token, never anything the client supplied, and pumps frames between the two. The daemon resolves the acting principal from its own guardian binding, restricts the upgrade to private-network peers and origins, and picks the host client to observe from that actor's own `host_cu` clients. The token gate and the frame pump are shared with `/v1/stt/stream` (`gateway/src/http/routes/runtime-audio-stream.ts`) so the two client-facing audio proxies cannot drift apart on who may open one. The guardian pin is deliberately not part of that shared gate: dictation is the user's own words going to a transcriber and back, is not a guardian-only surface, and keeps accepting any valid actor.
+
+**The retrospective.** The session records and says nothing; the retrospective is where the assistant speaks. The socket's teardown hands `WatchSessionManager.stop()`'s summary to `runWatchRetro` (`assistant/src/watch/watch-retro.ts`), which renders the timeline, asks the model for the task, the trigger phrase in the user's own words, the ordered steps, and the open questions, and directs it into the bundled `skill-management` flow. It reports and asks: it never scaffolds a skill, because the trigger phrase is not recoverable from watching someone work and `skill-management`'s first step is the alignment pass that confirms all four points with the user. A session that recorded nothing runs no retrospective.
+
+**The timeline reaches the model without becoming conversation content.** The retro dispatches through `wakeAgentForOpportunity` rather than as a user message, with `suppressWakeSurface` set. A wake's hint is ephemeral: it is never persisted and never broadcast. Its default "Conversation Woke" card would undo that by carrying the whole hint as its body, prepending it to the first assistant message, and persisting it when the tail flushes, so suppressing the card is what keeps a session's screen dump out of the transcript, out of memory, and out of search. What survives the turn is the assistant's own report, which is what the user confirms and corrects. The prompt fences the render in `<watch-timeline>`, escapes that tag inside it (`escapeTagBoundaries`, which matches on the tag name so `</watch-timeline >` and other near-misses are neutralized too), and wraps the whole recording in `wrapUntrustedContent` at the renderer's own byte budget. The two defenses stack: the escaping keeps screen content from closing the fence and landing beside the user-role instructions, and `<external_content>` is the one element the system prompt assigns never-follow semantics to, so text a page put on screen is data rather than a competing instruction.
+
+**Surfacing.** The session's conversation is created `background`, so a recording in progress does not sit in the sidebar with nothing in it. The retro sets `surfaced_at` once the turn has left visible assistant text behind, which promotes the row into the Recents grouping while leaving `conversation_type` alone. Invocation alone is not enough: a wake counts a `tool_use` block as output, so a run that loads a skill and then stops has produced no report, and provider-error rows do not count either. A retro that fails leaves the conversation where the session left it rather than as an empty thread.
+
+**Shutdown.** `RuntimeHttpServer.stop()` refuses new watch sessions, tears down the open ones, then waits on retrospectives already running (`closeWatchIngress`, then `destroy()`, then `drainWatchRetros`, bounded at 5s). Teardown during shutdown starts no retrospective: a turn begun there would be killed partway through, and the timeline it would have read outlives the daemon.
+
+```mermaid
+graph LR
+    SURFACE["Companion surface<br/>(Watch press)"]
+    MAIN["Electron main<br/>vellum:companion:toggleWatch"]
+    CTRL["watch-controller.ts<br/>one slot · version gate<br/>assistant binding"]
+    MIC["LiveVoiceAudioCapture<br/>16 kHz mono PCM16LE"]
+    GW["Gateway /v1/watch/stream<br/>edge JWT + actor principal<br/>pinned to the bound guardian"]
+    RT["Daemon /v1/watch/stream<br/>private peer + service token"]
+    MGR["WatchSessionManager<br/>narration cadence"]
+    OBS["observeHostScreen<br/>host_cu · same actor"]
+    TL["watch timeline<br/>(no-turn messages)"]
+    MIRROR["use-companion-mirror<br/>publishes watching"]
+    RETRO["runWatchRetro<br/>on teardown · one turn"]
+    WAKE["agent-wake<br/>ephemeral hint<br/>suppressWakeSurface"]
+    CONV["Session conversation<br/>surfaced once a report lands"]
+
+    SURFACE --> MAIN
+    MAIN -->|"toggleWatch command"| CTRL
+    CTRL --> MIC
+    MIC -->|"binary audio frames"| GW
+    CTRL -->|"WS upgrade"| GW
+    GW -->|"fresh upstream WS<br/>service token only"| RT
+    RT --> MGR
+    MGR -->|"speech finals"| TL
+    MGR --> OBS
+    OBS -->|"AX tree + screenshot"| TL
+    RT -->|"ready (starts mic + flag)<br/>entry / error / closed"| CTRL
+    CTRL --> MIRROR
+    MIRROR -->|"watching flag"| MAIN
+    MAIN --> SURFACE
+    RT -->|"teardown: session summary"| RETRO
+    TL -->|"rendered timeline (fenced)"| RETRO
+    RETRO -->|"prompt as a wake hint"| WAKE
+    WAKE -->|"assistant report only"| CONV
+```
 
 ## Maintenance Rule
 

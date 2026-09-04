@@ -1,14 +1,21 @@
 /**
- * Push-to-Talk (PTT) activator types and helpers.
+ * Activator types and helpers: what a user-bound key or chord looks like, how
+ * it serializes, and what counts as a keyboard event matching it.
  *
- * Mirrors the macOS `PTTActivator` model so the web port can (de)serialize
- * values already stored in `localStorage` by the settings UI. Browsers cannot
- * observe the Fn key, so stored Fn preferences fall back to Ctrl on read
- * unless the Electron host bridge asks to preserve the native Fn binding.
+ * Mirrors the macOS `PTTActivator` model, so the web port reads and writes the
+ * same serialized values. Voice mode's binding is built on this shape; see
+ * `utils/voice-mode-activation.ts` for the rules a toggle adds on top.
+ *
+ * Browsers cannot observe the Fn key, so stored Fn preferences fall back to
+ * Ctrl on read. The desktop voice key (`utils/voice-key`) is where Fn lives.
  */
 
 export type PTTModifier =
-  "function" | "control" | "shift" | "option" | "command";
+  | "function"
+  | "control"
+  | "shift"
+  | "option"
+  | "command";
 
 export interface PTTOff {
   kind: "off";
@@ -29,19 +36,10 @@ export interface PTTKey {
 
 export type PTTActivator = PTTOff | PTTModifierOnly | PTTKey;
 
-export const LS_PTT_ACTIVATION_KEY = "vellum:voice:activationKey";
 export const CTRL_PTT_ACTIVATOR: PTTModifierOnly = {
   kind: "modifierOnly",
   modifiers: ["control"],
 };
-export const FN_PTT_ACTIVATOR: PTTModifierOnly = {
-  kind: "modifierOnly",
-  modifiers: ["function"],
-};
-
-interface ParseActivatorOptions {
-  preserveFunction?: boolean;
-}
 
 const MODIFIER_ORDER: PTTModifier[] = [
   "function",
@@ -110,14 +108,6 @@ export function serializeActivator(activator: PTTActivator): string {
   return JSON.stringify(activator);
 }
 
-export function isFnPushToTalkActivator(activator: PTTActivator): boolean {
-  return (
-    activator.kind === "modifierOnly" &&
-    activator.modifiers.length === 1 &&
-    activator.modifiers[0] === "function"
-  );
-}
-
 function isPTTModifier(value: unknown): value is PTTModifier {
   return (
     typeof value === "string" &&
@@ -125,47 +115,23 @@ function isPTTModifier(value: unknown): value is PTTModifier {
   );
 }
 
-function normalizeModifiers(
-  raw: readonly unknown[],
-  options: ParseActivatorOptions,
-): PTTModifier[] {
-  const modifiers = raw.filter(isPTTModifier);
-  if (options.preserveFunction && modifiers.includes("function")) {
-    return FN_PTT_ACTIVATOR.modifiers;
-  }
-  const filtered = options.preserveFunction
-    ? modifiers
-    : modifiers.filter((m) => m !== "function");
-  return sortModifiers(filtered);
+function normalizeModifiers(raw: readonly unknown[]): PTTModifier[] {
+  return sortModifiers(
+    raw.filter(isPTTModifier).filter((m) => m !== "function"),
+  );
 }
 
-export function parseActivator(
-  raw: string | null,
-  options: ParseActivatorOptions = {},
-): PTTActivator {
+export function parseActivator(raw: string | null): PTTActivator {
   if (!raw) {
     return CTRL_PTT_ACTIVATOR;
   }
   // Back-compat with the macOS legacy string values. Browsers cannot detect
   // the Fn key, so any stored "fn" preference falls back to Ctrl.
-  if (raw === "fn") {
-    return {
-      kind: "modifierOnly",
-      modifiers: options.preserveFunction
-        ? FN_PTT_ACTIVATOR.modifiers
-        : CTRL_PTT_ACTIVATOR.modifiers,
-    };
-  }
-  if (raw === "ctrl") {
+  if (raw === "fn" || raw === "ctrl") {
     return CTRL_PTT_ACTIVATOR;
   }
   if (raw === "fn_shift") {
-    return {
-      kind: "modifierOnly",
-      modifiers: options.preserveFunction
-        ? FN_PTT_ACTIVATOR.modifiers
-        : ["shift"],
-    };
+    return { kind: "modifierOnly", modifiers: ["shift"] };
   }
   if (raw === "off") {
     return { kind: "off" };
@@ -176,7 +142,7 @@ export function parseActivator(
       return { kind: "off" };
     }
     if (parsed.kind === "modifierOnly" && Array.isArray(parsed.modifiers)) {
-      const modifiers = normalizeModifiers(parsed.modifiers, options);
+      const modifiers = normalizeModifiers(parsed.modifiers);
       if (modifiers.length === 0) {
         return CTRL_PTT_ACTIVATOR;
       }
@@ -190,7 +156,7 @@ export function parseActivator(
       return {
         kind: "key",
         label: parsed.label,
-        modifiers: normalizeModifiers(parsed.modifiers, options),
+        modifiers: normalizeModifiers(parsed.modifiers),
       };
     }
   } catch {
@@ -260,6 +226,12 @@ export function eventActivatesPTT(
   if (activator.kind === "off") {
     return false;
   }
+  // `KeyboardEvent.key` is typed `string`, but trusted keydowns from
+  // autofill, IME composition, and other synthetic dispatchers arrive
+  // with no key at all. An event with no usable key matches no binding.
+  if (typeof event.key !== "string") {
+    return false;
+  }
   if (activator.modifiers.includes("function")) {
     return false;
   }
@@ -279,46 +251,4 @@ export function eventActivatesPTT(
     return false;
   }
   return sameModifierSet(held, requiredMods);
-}
-
-/**
- * Returns `true` if releasing this key should deactivate PTT (stop recording).
- *
- * This is called on every `keyup` while PTT is active. We stop on the first
- * key-release that would break the activator — either the non-modifier key
- * itself (for `key` activators) or *any* of the required modifiers (for
- * `modifierOnly` activators). That mirrors the "hold to talk, release to
- * submit" behaviour of a physical PTT button.
- */
-export function eventDeactivatesPTT(
-  event: KeyboardEvent,
-  activator: PTTActivator,
-): boolean {
-  if (activator.kind === "off") {
-    return false;
-  }
-  if (activator.modifiers.includes("function")) {
-    return false;
-  }
-  const requiredMods = activator.modifiers.filter((m) => m !== "function");
-
-  if (activator.kind === "modifierOnly") {
-    if (event.key === "Control" && requiredMods.includes("control")) {
-      return true;
-    }
-    if (event.key === "Alt" && requiredMods.includes("option")) {
-      return true;
-    }
-    if (event.key === "Shift" && requiredMods.includes("shift")) {
-      return true;
-    }
-    if (event.key === "Meta" && requiredMods.includes("command")) {
-      return true;
-    }
-    return false;
-  }
-
-  const eventKeyLabel =
-    event.key.length === 1 ? event.key.toUpperCase() : event.key;
-  return eventKeyLabel === activator.label;
 }

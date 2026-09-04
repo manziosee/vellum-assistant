@@ -56,6 +56,7 @@ const sampleEventsSchema = z.object({
 const sampleMemoryStatSchema = z.object({
   anonBytes: z.number().nullable(),
   fileBytes: z.number().nullable(),
+  inactiveFileBytes: z.number().nullable(),
   kernelBytes: z.number().nullable(),
   slabReclaimableBytes: z.number().nullable(),
   slabUnreclaimableBytes: z.number().nullable(),
@@ -138,10 +139,7 @@ const statusResponseSchema = z.object({
 async function handleMonitoringStart() {
   let result: { pid: number; alreadyRunning: boolean };
   try {
-    // `detached: false` parents the monitor to the daemon so it appears in
-    // `assistant ps` and is torn down on shutdown.
     result = await spawnMonitoringWorkerProcess({
-      detached: false,
       terminateOnTimeout: true,
     });
   } catch (err) {
@@ -195,9 +193,16 @@ function readLatestSample(): ResourceSample | null {
     }
     // Samples persisted by an older monitor may predate some fields; fill
     // them with null so the response always matches the documented shape.
+    // The nested memoryStat needs the same backfill for fields added after
+    // a sample was written.
     return {
       ...sample,
-      memoryStat: sample.memoryStat ?? null,
+      memoryStat: sample.memoryStat
+        ? {
+            ...sample.memoryStat,
+            inactiveFileBytes: sample.memoryStat.inactiveFileBytes ?? null,
+          }
+        : null,
       reclaim: sample.reclaim ?? null,
       cpu: sample.cpu ?? null,
       deltas: sample.deltas ?? null,

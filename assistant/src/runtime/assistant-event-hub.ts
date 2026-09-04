@@ -12,8 +12,15 @@
  * Client-oriented queries (list, find-by-capability) are methods on the hub.
  */
 
+import {
+  DESKTOP_PRESENCE_STATES,
+  type DesktopPresenceState,
+} from "@vellumai/service-contracts/desktop-presence";
+
 import type { AssistantEvent } from "../api/index.js";
 import type { HostProxyCapability, InterfaceId } from "../channels/types.js";
+
+export { DESKTOP_PRESENCE_STATES, type DesktopPresenceState };
 
 // ---------------------------------------------------------------------------
 // Message type → capability inference
@@ -95,16 +102,26 @@ interface BaseSubscriberEntry {
   connectionId: string;
 }
 
-/**
- * The presence states a desktop client may report. Single runtime source: the
- * stored type and the route's wire enum both derive from this tuple.
- */
-export const DESKTOP_PRESENCE_STATES = ["active", "idle", "away"] as const;
-
-export type DesktopPresenceState = (typeof DESKTOP_PRESENCE_STATES)[number];
-
 export interface ClientPresence {
   state: DesktopPresenceState;
+  /** When the daemon last heard from the client. Drives staleness. */
+  reportedAt: Date;
+}
+
+/**
+ * Web tab visibility and conversation focus, as reported by a `web`-interface
+ * client (a browser tab or the Electron renderer). Distinct from
+ * {@link ClientPresence}: scoped to a single conversation rather than app-wide
+ * attendance, and reported by the shared web renderer rather than the macOS
+ * host-proxy bridge. See `runtime/web-presence.ts` for the read-side policy.
+ */
+export interface WebPresenceReport {
+  visible: boolean;
+  /** The conversation currently focused (chat composer on screen), or `null`. */
+  focusedConversationId: string | null;
+}
+
+export interface ClientWebPresence extends WebPresenceReport {
   /** When the daemon last heard from the client. Drives staleness. */
   reportedAt: Date;
 }
@@ -130,6 +147,11 @@ interface ClientEntry extends BaseSubscriberEntry {
    * In-memory only, so consumers must fail open when it is absent.
    */
   presence?: ClientPresence;
+  /**
+   * Last web tab visibility/focus reported by this client, for clients that
+   * report it. In-memory only, so consumers must fail open when it is absent.
+   */
+  webPresence?: ClientWebPresence;
 }
 
 interface ProcessEntry extends BaseSubscriberEntry {
@@ -315,9 +337,7 @@ export class AssistantEventHub {
    *   it receive the event; untargeted events go to all
    * - if `targetInterfaceId` is set, only client subscribers whose
    *   `interfaceId` matches receive the event; process subscribers and
-   *   non-matching clients are skipped. Used to narrow legacy
-   *   broadcasts (e.g. `conversation_list_invalidated`) to a specific
-   *   client surface during a migration window.
+   *   non-matching clients are skipped.
    *
    * Fanout is isolated: a throwing or rejecting subscriber does not abort
    * delivery to remaining subscribers.
@@ -622,6 +642,21 @@ export class AssistantEventHub {
   }
 
   /**
+   * Record the web tab visibility/focused-conversation reported by a client.
+   * `reportedAt` always advances. Returns true when at least one active
+   * client entry matched.
+   */
+  setClientWebPresence(clientId: string, report: WebPresenceReport): boolean {
+    const now = new Date();
+    let matched = false;
+    for (const entry of this.activeClientEntries(clientId)) {
+      entry.webPresence = { ...report, reportedAt: now };
+      matched = true;
+    }
+    return matched;
+  }
+
+  /**
    * Force-disconnect a client by disposing all subscribers for the given
    * `clientId`. Returns the number of disposed entries.
    *
@@ -706,13 +741,7 @@ export function broadcastMessage(
   const targetClientId = options?.targetClientId;
   const targetInterfaceId = options?.targetInterfaceId;
 
-  // `conversation_list_invalidated` is a list-level system event — publish
-  // it unscoped so every subscriber refreshes its sidebar.
-  const scopedConversationId =
-    msg.type === "conversation_list_invalidated"
-      ? undefined
-      : resolvedConversationId;
-  const event = buildAssistantEvent(msg, scopedConversationId);
+  const event = buildAssistantEvent(msg, resolvedConversationId);
   const targetCapability = capabilityForMessageType(msg.type);
   // Self-echo suppression: a `sync_changed` carrying an `originClientId`
   // means a specific client just mutated the resource. The hub must not
@@ -742,35 +771,6 @@ export function broadcastMessage(
   stampAndBuffer(event, { targeting: publishOptions });
   _hubChain = _hubChain
     .then(() => assistantEventHub.publish(event, publishOptions))
-    .then(() => {
-      // When a conversation title changes, also publish a
-      // `conversation_list_invalidated` so the macOS sidebar refreshes
-      // its row ordering for the renamed conversation. Web consumes the
-      // paired `sync_changed` with `conversation:<id>:metadata` tag
-      // emitted by `publishConversationTitleChanged` and patches the
-      // single row in place, so the broadcast is scoped to macOS only.
-      //
-      // TODO(electron-cutover): remove this emission once macOS migrates
-      // to the Electron client and consumes `sync_changed` directly. At
-      // that point `conversation_list_invalidated` has no remaining
-      // consumers and the message type can be retired.
-      if (msg.type === "conversation_title_updated") {
-        return assistantEventHub
-          .publish(
-            buildAssistantEvent({
-              type: "conversation_list_invalidated",
-              reason: "renamed",
-            }),
-            { targetInterfaceId: "macos" },
-          )
-          .catch((err: unknown) => {
-            log.warn(
-              { err },
-              "Failed to publish conversation_list_invalidated after title update",
-            );
-          });
-      }
-    })
     .catch((err: unknown) => {
       log.warn({ err }, "assistant-events hub subscriber threw during publish");
     });

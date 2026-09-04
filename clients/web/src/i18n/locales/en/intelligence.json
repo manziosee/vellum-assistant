@@ -101,6 +101,13 @@
     "renameErrorToast": "The rename didn't go through. Please try again.",
     "renameSuccessToast": "Say hi to {newName}!",
     "scheduleCadence": "{cadence} · next {nextRun}",
+    "scheduleGhosts": {
+      "inboxTriageCadence": "Every 2 hours",
+      "inboxTriageName": "Inbox triage",
+      "morningBriefingCadence": "Every weekday at 8:00",
+      "morningBriefingName": "Morning briefing"
+    },
+    "setUpSchedule": "Set one up",
     "updateAvatarAndName": "Update avatar and name",
     "viewMoreSchedules": "{count, plural, one {View # more…} other {View # more…}}"
   },
@@ -131,7 +138,7 @@
     },
     "superpowers": {
       "description": "What I can do",
-      "label": "My Superpowers"
+      "label": "Superpowers"
     },
     "workspace": {
       "description": "My files",
@@ -279,6 +286,7 @@
     "workspace": "Workspace"
   },
   "skillDetail": {
+    "backToConversationAriaLabel": "Back to conversation",
     "backToSkillsAriaLabel": "Back to skills",
     "filesTab": "Files",
     "fileViewModeAriaLabel": "File view mode",
@@ -295,6 +303,7 @@
     "source": "Source"
   },
   "skillDetailPage": {
+    "backToConversation": "Back to conversation",
     "backToSuperpowers": "Back to My Superpowers",
     "notFoundSubtitle": "This skill may have been removed, or the link is out of date.",
     "notFoundTitle": "Skill not found"
@@ -385,16 +394,16 @@
   "useIdentitySectionStats": {
     "activeCount": "{count, plural, one {# active} other {# active}}",
     "activeLabel": "{count, plural, one {active} other {active}}",
+    "appAndDocCount": "{count, plural, one {# app or doc} other {# apps & docs}}",
     "appCount": "{count, plural, one {# app} other {# apps}}",
     "connectedCount": "{count, plural, one {# connected} other {# connected}}",
     "connectedLabel": "{count, plural, one {connected} other {connected}}",
-    "docCount": "{count, plural, one {# doc} other {# docs}}",
     "itemCount": "{count, plural, one {# item} other {# items}}",
     "itemLabel": "{count, plural, one {item} other {items}}",
     "noSchedulesText": "Nothing scheduled yet",
     "personCount": "{count, plural, one {# person} other {# people}}",
     "personLabel": "{count, plural, one {person} other {people}}",
-    "pluginCount": "{count, plural, one {# plugin} other {# plugins}}",
+    "skillAndPluginCount": "{count, plural, one {# skill or plugin} other {# skills & plugins}}",
     "skillCount": "{count, plural, one {# skill} other {# skills}}"
   },
   "usePluginsList": {
@@ -422,5 +431,20 @@
       "v1": "Migrate my memory from v1 to v3. That's most likely two hops, your \"Memory v2 Migration\" skill and then your \"Memory v3 Migration\" skill, but work out what my assistant actually needs and follow whichever skills you use exactly.\n\nRun it in the background and tell me when it's done, or if something blocks.",
       "enable": "Turn my memory back on. I'd like you to start remembering things from our conversations again."
     }
+  },
+  "categories": {
+    "email": "Email",
+    "calendar": "Calendar",
+    "messaging": "Messaging",
+    "browsing": "Browsing",
+    "productivity": "Productivity",
+    "development": "Development",
+    "voice": "Voice",
+    "commerce": "Commerce",
+    "content": "Content",
+    "health": "Health",
+    "system": "System",
+    "integrations": "Integrations",
+    "other": "Other"
   }
 }

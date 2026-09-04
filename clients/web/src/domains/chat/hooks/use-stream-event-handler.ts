@@ -35,6 +35,8 @@ import {
 import {
   handleSecretRequest,
   handleConfirmationRequest,
+  handleContactFormClosed,
+  handleContactRecordRequest,
   handleContactRequest,
   handleInteractionResolved,
   handleQuestionRequest,
@@ -319,6 +321,12 @@ export function useStreamEventHandler(
         case "contact_request":
           handleContactRequest(event, ctx);
           break;
+        case "contact_record_request":
+          handleContactRecordRequest(event, ctx);
+          break;
+        case "contact_form_closed":
+          handleContactFormClosed(event);
+          break;
         case "question_request":
           handleQuestionRequest(event, ctx);
           break;
@@ -372,20 +380,6 @@ export function useStreamEventHandler(
         // subagent surfaces via the `subagent_event` envelope.
         case "usage_progress":
           break;
-        case "conversation_list_invalidated":
-          // Legacy macOS-only broadcast. Web receives the paired
-          // `sync_changed` (`conversationsList` umbrella for shape
-          // changes, `conversation:<id>:metadata` for content) directly
-          // and patches the cached list there. The hub scopes this
-          // event to `targetInterfaceId: "macos"`, so it should not
-          // reach web in practice — handling no-op'd as defense in
-          // depth in case a deployment runs an older assistant.
-          //
-          // TODO(electron-cutover): drop the case once macOS migrates
-          // to the Electron client and `conversation_list_invalidated`
-          // is retired from the event types entirely.
-          break;
-
         case "compaction_circuit_open":
           handleCompactionCircuitOpen(event, ctx);
           break;
@@ -463,8 +457,9 @@ export function useStreamEventHandler(
         // Cross-domain events handled by bus subscribers mounted in
         // RootLayout (useAssistantResourceSync, useConversationSync,
         // useNotificationIntentSync, useDocumentEditorSync, useBookmarksSync)
-        // or ChatPage-scoped hooks (useDiskPressureMonitor). The chat
-        // handler is intentionally a no-op for these.
+        // or ChatPage-scoped hooks (useDiskPressureMonitor,
+        // useResourcePressureMonitor). The chat handler is intentionally
+        // a no-op for these.
         case "bookmark.created":
         case "bookmark.deleted":
         case "sync_changed":
@@ -473,6 +468,7 @@ export function useStreamEventHandler(
         case "identity_changed":
         case "avatar_updated":
         case "disk_pressure_status_changed":
+        case "resource_pressure_status_changed":
         case "notification_intent":
         case "document_editor_show":
         case "document_editor_update":
@@ -510,6 +506,10 @@ export function useStreamEventHandler(
         case "schedule_conversation_created":
         case "heartbeat_alert":
         case "heartbeat_conversation_created":
+        // A watch session's retrospective finishing is drawn by the companion
+        // surface rather than in the transcript, and reaches it through
+        // `useWatchRetroSync` off the bus.
+        case "watch_retro_completed":
           break;
         // Host-proxy instructions targeting the desktop client / chrome
         // extension. The web chat handler is a no-op — host-proxy frames are

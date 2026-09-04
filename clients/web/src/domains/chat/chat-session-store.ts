@@ -477,9 +477,13 @@ const useChatSessionStoreBase = create<ChatSessionStore>()((set, get) => ({
     );
     if (isConversationSwitch && outgoingConversationId) {
       const interactionSnapshot = useInteractionStore.getState();
+      // Questions count here for the same reason they count in the snapshot
+      // reconcile: the turn is parked until one is answered, so switching away
+      // from an unanswered prompt has to leave the conversation marked.
       if (
         interactionSnapshot.pendingSecret ||
-        interactionSnapshot.pendingConfirmation
+        interactionSnapshot.pendingConfirmation ||
+        interactionSnapshot.pendingQuestion
       ) {
         useConversationStore
           .getState()
@@ -510,7 +514,9 @@ const useChatSessionStoreBase = create<ChatSessionStore>()((set, get) => ({
 
     // Reset all per-conversation state atomically.
     useTurnStore.getState().resetTurn();
-    useInteractionStore.getState().resetAll();
+    useInteractionStore
+      .getState()
+      .resetAll({ assistantChanged: isAssistantSwitch });
     if (isAssistantSwitch) {
       // Assistant changed — old message bubbles leave the DOM, revoke blob URLs.
       useComposerStore.getState().fullReset();

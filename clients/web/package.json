@@ -1,6 +1,6 @@
 {
   "name": "@vellumai/web",
-  "version": "0.11.4",
+  "version": "0.11.9",
   "type": "module",
   "description": "Pre-built web SPA for the Vellum Assistant",
   "license": "MIT",
@@ -72,6 +72,8 @@
     "@tiptap/react": "3.23.5",
     "@tiptap/starter-kit": "3.23.5",
     "@vellumai/assistant-api": "workspace:*",
+    "@vellumai/avatar-catalog": "workspace:*",
+    "@vellumai/avatar-manifest": "workspace:*",
     "@vellumai/design-library": "workspace:*",
     "@vellumai/environments": "workspace:*",
     "@vellumai/ipc-contract": "workspace:*",

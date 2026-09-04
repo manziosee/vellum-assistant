@@ -44,6 +44,7 @@ mock.module("../../../persistence/delivery-channels.js", () => ({
 mock.module("../../../persistence/delivery-crud.js", () => ({
   linkMessage: () => {},
   storeReplyMessageId: (eventId: string, replyMessageId: string) => {
+    operationOrder.push("store-reply-id");
     storedReplyMessageIds.push({ eventId, replyMessageId });
   },
   storeStreamedReplyTs: (eventId: string, messageTs: string) => {
@@ -58,6 +59,7 @@ mock.module("../../../persistence/delivery-status.js", () => ({
     deliveredEvents.push(eventId);
   },
   markProcessed: (eventId: string) => {
+    operationOrder.push("mark-processed");
     markedProcessedEvents.push(eventId);
   },
   recordDeliveryFailure: (eventId: string) => {
@@ -85,6 +87,62 @@ mock.module("../../gateway-client.js", () => ({
   ) => {
     deliveredChannelReplies.push({ callbackUrl, payload });
     return deliverChannelReplyImpl(callbackUrl, payload);
+  },
+}));
+
+const sentStreamOps: Array<Record<string, unknown>> = [];
+let sendChannelStreamOpImpl: (
+  op: Record<string, unknown>,
+) => Promise<{ ok: boolean; ts?: string }> = async () => ({ ok: true });
+const sentActivity: Array<Record<string, unknown>> = [];
+let setChannelActivityImpl: (
+  target: Record<string, unknown>,
+) => { ok: boolean } | Promise<{ ok: boolean }> = () => ({ ok: true });
+// Undefined stands for a channel whose indicator holds until it is changed, so
+// the controller reports each phase once and the assertions read as the turn's
+// lifecycle rather than as timer ticks. A test that needs the self-expiring
+// shape sets a cadence.
+let activityRefreshMsImpl: () => number | undefined = () => undefined;
+mock.module("../../../messaging/providers/index.js", () => ({
+  supportsChannelActivity: () => true,
+  channelActivityRefreshMs: () => activityRefreshMsImpl(),
+  setChannelActivity: async (
+    _callbackUrl: string,
+    target: Record<string, unknown>,
+  ) => {
+    sentActivity.push(target);
+    return setChannelActivityImpl(target);
+  },
+  // Slack declares it can stream by implementing the method; whether a given
+  // conversation can is Slack's own answer to `start`, which is why the stub
+  // below models the refusal rather than gating before the call.
+  getTransportForCallback: () => ({
+    streamReply: () => undefined,
+    streamPersists: true,
+  }),
+  sendChannelStreamOp: async (
+    callbackUrl: string,
+    _chatId: string,
+    op: Record<string, unknown>,
+  ) => {
+    sentStreamOps.push(op);
+    // `chat.startStream` streams into a thread, and names the reader when the
+    // room has more than one, so a start lacking either is refused. Modelled
+    // here so these tests exercise the fallback the refusal produces.
+    // `chat.startStream` streams into a thread, and a room with more than one
+    // reader must name the reader, so a start lacking either is refused. Slack
+    // ids say which room this is: `D` a DM, `C` a channel. Modelled here so
+    // these tests exercise the fallback a refusal produces, rather than a gate
+    // that no longer exists above the transport.
+    if (op.action === "start") {
+      if (!callbackUrl.includes("threadTs=")) {
+        return { ok: false };
+      }
+      if (/channel=C/.test(callbackUrl) && op.audience === undefined) {
+        return { ok: false };
+      }
+    }
+    return sendChannelStreamOpImpl(op);
   },
 }));
 
@@ -118,8 +176,8 @@ import type { MessageProcessor } from "../../http-types.js";
 import {
   isBoundGuardianActor,
   processChannelMessageInBackground,
-  shouldStartSlackThinkingStatusForText,
-  shouldStartSlackThinkingStatusImmediately,
+  shouldShowActivityForText,
+  shouldShowActivityImmediately,
 } from "./background-dispatch.js";
 import { __resetChannelTurnAdmissionForTests } from "./channel-turn-admission.js";
 
@@ -127,6 +185,11 @@ beforeEach(() => {
   __resetChannelTurnAdmissionForTests();
   clearConversations();
   deliveredChannelReplies.length = 0;
+  sentStreamOps.length = 0;
+  sendChannelStreamOpImpl = async () => ({ ok: true });
+  sentActivity.length = 0;
+  setChannelActivityImpl = () => ({ ok: true });
+  activityRefreshMsImpl = () => undefined;
   markedProcessedEvents.length = 0;
   processingFailureEvents.length = 0;
   retryableFailureEvents.length = 0;
@@ -144,10 +207,7 @@ beforeEach(() => {
   deliverReplyViaCallbackImpl = async () => {};
 });
 
-const slackStreamOps = (): Array<Record<string, unknown>> =>
-  deliveredChannelReplies
-    .map((entry) => entry.payload.slackStream as Record<string, unknown>)
-    .filter(Boolean);
+const slackStreamOps = (): Array<Record<string, unknown>> => sentStreamOps;
 
 describe("isBoundGuardianActor", () => {
   test("returns true only when requester matches bound guardian", () => {
@@ -287,6 +347,37 @@ describe("processChannelMessageInBackground — reply delivery", () => {
     expect(deliveredEvents).toEqual(["evt-fast-path"]);
   });
 
+  test("stores the reply id before marking the event processed", async () => {
+    // `processed` is the point stranded-delivery recovery starts considering
+    // an event, and that step reads the reply id from the stored payload. If
+    // the event became eligible first, a crash in between would leave a row
+    // that recovery skips, so its reply would never be delivered.
+    const processMessage: MessageProcessor = async () => ({
+      messageId: "user-msg-order",
+      assistantMessageId: "assistant-msg-order",
+    });
+
+    processChannelMessageInBackground({
+      processMessage,
+      conversationId: "conv-order",
+      eventId: "evt-order",
+      content: "hello",
+      sourceChannel: "slack",
+      sourceInterface: "slack",
+      externalChatId: "C-ORDER",
+      trustCtx,
+      metadataHints: [],
+      replyCallbackUrl: "https://example.test/deliver/slack?channel=C-ORDER",
+    });
+
+    await flush();
+
+    expect(operationOrder.indexOf("store-reply-id")).toBeGreaterThanOrEqual(0);
+    expect(operationOrder.indexOf("store-reply-id")).toBeLessThan(
+      operationOrder.indexOf("mark-processed"),
+    );
+  });
+
   test("suppresses reply delivery when a deduplicated redelivery's prior attempt already delivered", async () => {
     const conversationId = "conv-dedup-delivered";
     const channelId = "C-DEDUP-DELIVERED";
@@ -316,12 +407,15 @@ describe("processChannelMessageInBackground — reply delivery", () => {
 
     await flush();
 
-    // The redelivery is recorded as processed, but the original reply is not
-    // re-delivered — no durable delivery, no terminal delivery transition.
+    // The redelivery is recorded as processed and nothing is re-posted. It
+    // still settles its OWN delivery state: the sibling owns delivery, so a
+    // row left `pending` would read as still owing one and the
+    // stranded-delivery recovery step would re-post the sibling's reply
+    // after a restart.
     expect(markedProcessedEvents).toEqual(["evt-dedup-delivered"]);
     expect(replyDeliveryCalls).toEqual([]);
-    expect(deliveredEvents).toEqual([]);
     expect(deliveredChannelReplies).toEqual([]);
+    expect(deliveredEvents).toEqual(["evt-dedup-delivered"]);
   });
 
   test("skips reply delivery when a deduplicated redelivery's prior attempt failed (sweep owns recovery)", async () => {
@@ -351,10 +445,13 @@ describe("processChannelMessageInBackground — reply delivery", () => {
 
     await flush();
 
+    // Same settlement as the delivered-sibling case. Marking THIS row
+    // delivered does not touch the sibling's `failed` status, so the sweep
+    // still owns and retries the real delivery.
     expect(markedProcessedEvents).toEqual(["evt-dedup-failed"]);
     expect(replyDeliveryCalls).toEqual([]);
-    expect(deliveredEvents).toEqual([]);
     expect(deliveredChannelReplies).toEqual([]);
+    expect(deliveredEvents).toEqual(["evt-dedup-failed"]);
   });
 
   test("recovers the reply when a deduplicated redelivery's prior attempt is stuck pending (crash window)", async () => {
@@ -475,7 +572,8 @@ describe("processChannelMessageInBackground — reply delivery", () => {
 
     await flush();
 
-    expect(slackStreamOps()).toEqual([]);
+    // A start is attempted and refused, so nothing advances past it.
+    expect(slackStreamOps().map((op) => op.action)).toEqual(["start"]);
     expect(
       deliveredChannelReplies
         .map((entry) => entry.payload.text)
@@ -492,7 +590,7 @@ describe("processChannelMessageInBackground — reply delivery", () => {
     const channelId = "D-STREAMED";
     const threadTs = "1700000000.000044";
     const streamTs = "1700000000.000033";
-    deliverChannelReplyImpl = async () => ({ ok: true, ts: streamTs });
+    sendChannelStreamOpImpl = async () => ({ ok: true, ts: streamTs });
 
     const processMessage: MessageProcessor = async (
       _conversationId,
@@ -531,11 +629,10 @@ describe("processChannelMessageInBackground — reply delivery", () => {
     expect(slackStreamOps()).toEqual([
       {
         action: "start",
-        threadTs,
-        markdownText: "Streamed DM reply.",
-        taskDisplayMode: "plan",
+        text: "Streamed DM reply.",
+        appended: "Streamed DM reply.",
       },
-      { action: "stop", streamTs },
+      { action: "stop", streamId: streamTs, text: "Streamed DM reply." },
     ]);
     expect(
       deliveredChannelReplies
@@ -613,7 +710,8 @@ describe("processChannelMessageInBackground — reply delivery", () => {
         .map((entry) => entry.payload.text)
         .filter(Boolean),
     ).toEqual([]);
-    expect(slackStreamOps()).toEqual([]);
+    // A start is attempted and refused, so nothing advances past it.
+    expect(slackStreamOps().map((op) => op.action)).toEqual(["start"]);
     expect(replyDeliveryCalls).toEqual([
       { messageId: "assistant-msg-channel-final", startFromSegment: 0 },
     ]);
@@ -671,7 +769,7 @@ describe("processChannelMessageInBackground — reply delivery", () => {
     const channelId = "D-STREAM-PROCESSING-FAILURE";
     const threadTs = "1700000000.000066";
     const streamTs = "1700000000.000077";
-    deliverChannelReplyImpl = async () => ({ ok: true, ts: streamTs });
+    sendChannelStreamOpImpl = async () => ({ ok: true, ts: streamTs });
 
     const processMessage: MessageProcessor = async (
       _conversationId,
@@ -854,15 +952,107 @@ describe("processChannelMessageInBackground — admission (queue if busy)", () =
     expect(markedProcessedEvents).toEqual([]);
     expect(deliveredEvents).toEqual([]);
   });
+
+  test("a busy loss with a caller fallback degrades there, never to the sweep", async () => {
+    const processMessage: MessageProcessor = async () => {
+      throw new Error(CONVERSATION_BUSY_MESSAGE);
+    };
+
+    let fellBack = 0;
+    processChannelMessageInBackground({
+      processMessage,
+      conversationId: "conv-wake-busy",
+      eventId: "evt-wake-busy",
+      content: "Alice reacted with :tada: to your message",
+      sourceChannel: "discord",
+      sourceInterface: "discord",
+      externalChatId: "999000111222333444",
+      trustCtx,
+      metadataHints: [],
+      replyCallbackUrl: "https://example.test/deliver/discord",
+      onTurnLostToBusy: async () => {
+        fellBack++;
+      },
+    });
+
+    await flush();
+
+    // The caller's event stores nothing the sweep could rebuild a turn
+    // from, so its processing lane must never see it: the degradation is
+    // the fallback alone.
+    expect(fellBack).toBe(1);
+    expect(deferredRetryEvents).toEqual([]);
+    expect(retryableFailureEvents).toEqual([]);
+    expect(processingFailureEvents).toEqual([]);
+  });
+
+  test("a non-busy failure with a caller fallback records nothing for the sweep", async () => {
+    const processMessage: MessageProcessor = async () => {
+      throw new Error("provider exploded");
+    };
+
+    let fellBack = 0;
+    processChannelMessageInBackground({
+      processMessage,
+      conversationId: "conv-wake-error",
+      eventId: "evt-wake-error",
+      content: "Alice reacted with :tada: to your message",
+      sourceChannel: "discord",
+      sourceInterface: "discord",
+      externalChatId: "999000111222333444",
+      trustCtx,
+      metadataHints: [],
+      replyCallbackUrl: "https://example.test/deliver/discord",
+      onTurnLostToBusy: async () => {
+        fellBack++;
+      },
+    });
+
+    await flush();
+
+    // Best-effort turn lost; a failure record would only feed the sweep an
+    // event it cannot rebuild. The fallback is busy-specific and stays uncalled.
+    expect(fellBack).toBe(0);
+    expect(processingFailureEvents).toEqual([]);
+    expect(deferredRetryEvents).toEqual([]);
+  });
+
+  test("ingress row extensions reach processMessage", async () => {
+    let seenOptions: Record<string, unknown> | undefined;
+    const processMessage: MessageProcessor = async (
+      _conversationId,
+      _content,
+      options,
+    ) => {
+      seenOptions = options as unknown as Record<string, unknown>;
+      return { messageId: "user-row-1" };
+    };
+
+    processChannelMessageInBackground({
+      processMessage,
+      conversationId: "conv-wake-meta",
+      eventId: "evt-wake-meta",
+      content: "Alice reacted with :tada: to your message",
+      sourceChannel: "discord",
+      sourceInterface: "discord",
+      externalChatId: "999000111222333444",
+      trustCtx,
+      metadataHints: [],
+      replyCallbackUrl: "https://example.test/deliver/discord",
+      slackReactionRowMeta: '{"eventKind":"reaction"}',
+      clientMessageId: "reaction:evt-wake-meta",
+      skipUserMessageIndexing: true,
+    });
+
+    await flush();
+
+    expect(seenOptions?.slackReactionRowMeta).toBe('{"eventKind":"reaction"}');
+    expect(seenOptions?.clientMessageId).toBe("reaction:evt-wake-meta");
+    expect(seenOptions?.skipUserMessageIndexing).toBe(true);
+  });
 });
 
-describe("Slack thinking status timing", () => {
-  const slackStatusLabels = [
-    "is on it",
-    "is working hard",
-    "is touching grass",
-  ];
-
+describe("channel activity timing", () => {
   const trustCtx: TrustContext = {
     trustClass: "guardian",
     guardianExternalUserId: "guardian-1",
@@ -872,72 +1062,74 @@ describe("Slack thinking status timing", () => {
   const flush = (): Promise<void> =>
     new Promise((resolve) => setTimeout(resolve, 10));
 
+  const phases = (): unknown[] =>
+    sentActivity.map((entry) => (entry as { phase?: unknown }).phase);
+
   beforeEach(() => {
     deliveredChannelReplies.length = 0;
   });
 
-  test("recognizes only deliverable text as a Slack thinking-status trigger", () => {
-    expect(shouldStartSlackThinkingStatusForText("")).toBe(false);
-    expect(shouldStartSlackThinkingStatusForText("   ")).toBe(false);
-    expect(shouldStartSlackThinkingStatusForText("<")).toBe(false);
-    expect(shouldStartSlackThinkingStatusForText("<no_response")).toBe(false);
-    expect(shouldStartSlackThinkingStatusForText("<no_response/>")).toBe(false);
-    expect(shouldStartSlackThinkingStatusForText("  <no_response />  ")).toBe(
+  test("recognizes only deliverable text as a reason to show activity", () => {
+    expect(shouldShowActivityForText("")).toBe(false);
+    expect(shouldShowActivityForText("   ")).toBe(false);
+    expect(shouldShowActivityForText("<")).toBe(false);
+    expect(shouldShowActivityForText("<no_response")).toBe(false);
+    expect(shouldShowActivityForText("<no_response/>")).toBe(false);
+    expect(shouldShowActivityForText("  <no_response />  ")).toBe(false);
+    expect(shouldShowActivityForText("Real response.")).toBe(true);
+    expect(shouldShowActivityForText("<no_response/>\nReal response.")).toBe(
+      true,
+    );
+  });
+
+  test("recognizes a direct conversation in every channel's word for one", () => {
+    // One idea, three spellings, because `chatType` arrives as whatever the
+    // channel called it. Slack `im`, Discord `dm`, Telegram `private`. Missing
+    // one does not fail loudly: that channel silently reads as an ambient room
+    // and stops showing an indicator it used to show.
+    expect(shouldShowActivityImmediately({ chatType: "im" })).toBe(true);
+    expect(shouldShowActivityImmediately({ chatType: "dm" })).toBe(true);
+    expect(shouldShowActivityImmediately({ chatType: "private" })).toBe(true);
+  });
+
+  test("treats a room with other readers as ambient, including a group DM", () => {
+    // Slack's `mpim` has other readers, so it is a room: the assistant may
+    // process the traffic and decide to stay quiet, and an indicator there
+    // announces it was reading.
+    expect(shouldShowActivityImmediately({ chatType: "mpim" })).toBe(false);
+    expect(shouldShowActivityImmediately({ chatType: "channel" })).toBe(false);
+    expect(shouldShowActivityImmediately({ chatType: "supergroup" })).toBe(
       false,
     );
-    expect(shouldStartSlackThinkingStatusForText("Real response.")).toBe(true);
-    expect(
-      shouldStartSlackThinkingStatusForText("<no_response/>\nReal response."),
-    ).toBe(true);
+    expect(shouldShowActivityImmediately({})).toBe(false);
   });
 
-  test("starts Slack thinking status immediately for DMs and direct mentions", () => {
+  test("shows activity immediately when the assistant is mentioned", () => {
+    expect(shouldShowActivityImmediately({ botMentioned: true })).toBe(true);
     expect(
-      shouldStartSlackThinkingStatusImmediately({
-        sourceChannel: "slack",
-        chatType: "im",
-      }),
-    ).toBe(true);
-    expect(
-      shouldStartSlackThinkingStatusImmediately({
-        sourceChannel: "slack",
-        slackBotMentioned: true,
-      }),
-    ).toBe(true);
-    expect(
-      shouldStartSlackThinkingStatusImmediately({
-        sourceChannel: "slack",
+      shouldShowActivityImmediately({
         chatType: "channel",
+        botMentioned: true,
       }),
-    ).toBe(false);
-    expect(
-      shouldStartSlackThinkingStatusImmediately({
-        sourceChannel: "telegram",
-        chatType: "im",
-        slackBotMentioned: true,
-      }),
-    ).toBe(false);
+    ).toBe(true);
   });
 
-  test("sets Slack thinking indicator immediately for a DM", async () => {
-    const conversationId = "conv-dm-immediate-status";
+  test("shows activity immediately in a DM and settles it when the turn ends", async () => {
+    const conversationId = "conv-dm-immediate-activity";
     const channelId = "D-DM-IMMEDIATE";
     const messageTs = "1700000000.000010";
 
     const processMessage: MessageProcessor = async () => {
-      expect(deliveredChannelReplies).toHaveLength(1);
-      expect(deliveredChannelReplies[0]!.payload.reaction).toEqual({
-        action: "add",
-        name: "eyes",
-        messageTs,
-      });
+      // Already showing before the turn does any work: a DM is addressed to
+      // the assistant, so nothing needs to be observed first.
+      expect(phases()).toEqual(["thinking"]);
       return { messageId: "user-msg-dm-immediate" };
     };
 
     processChannelMessageInBackground({
       processMessage,
       conversationId,
-      eventId: "evt-dm-immediate-status",
+      eventId: "evt-dm-immediate-activity",
       content: "dm message",
       sourceChannel: "slack",
       sourceInterface: "slack",
@@ -950,40 +1142,27 @@ describe("Slack thinking status timing", () => {
 
     await flush();
 
-    const reactions = deliveredChannelReplies.map(
-      (entry) => entry.payload.reaction,
-    );
-    expect(reactions).toEqual([
-      { action: "add", name: "eyes", messageTs },
-      { action: "remove", name: "eyes", messageTs },
-    ]);
+    // `idle` is owed explicitly. A channel that holds its indicator keeps it
+    // up until told otherwise, so a missing terminal phase is a stuck spinner
+    // rather than a cosmetic slip.
+    expect(phases()).toEqual(["thinking", "idle"]);
+    expect(sentActivity[0]).toEqual({ chatId: channelId, phase: "thinking" });
   });
 
-  test("sets Slack thinking status immediately for an app mention", async () => {
-    const conversationId = "conv-mention-immediate-status";
+  test("shows activity immediately for an app mention and settles it", async () => {
+    const conversationId = "conv-mention-immediate-activity";
     const channelId = "C-MENTION-IMMEDIATE";
     const threadTs = "1700000000.000011";
 
     const processMessage: MessageProcessor = async () => {
-      expect(deliveredChannelReplies).toHaveLength(1);
-      expect(deliveredChannelReplies[0]!.payload.assistantThreadStatus).toEqual(
-        {
-          channel: channelId,
-          threadTs,
-          status: expect.any(String),
-          loadingMessages: ["Thinking\u2026"],
-        },
-      );
-      const threadStatus = deliveredChannelReplies[0]!.payload
-        .assistantThreadStatus as { status: string };
-      expect(slackStatusLabels).toContain(threadStatus.status);
+      expect(phases()).toEqual(["thinking"]);
       return { messageId: "user-msg-mention-immediate" };
     };
 
     processChannelMessageInBackground({
       processMessage,
       conversationId,
-      eventId: "evt-mention-immediate-status",
+      eventId: "evt-mention-immediate-activity",
       content: "@assistant please respond",
       sourceChannel: "slack",
       sourceInterface: "slack",
@@ -996,18 +1175,102 @@ describe("Slack thinking status timing", () => {
 
     await flush();
 
-    const statuses = deliveredChannelReplies.map((entry) => {
-      const status = entry.payload.assistantThreadStatus as
-        | { status?: string }
-        | undefined;
-      return status?.status;
-    });
-    expect(slackStatusLabels).toContain(statuses[0]!);
-    expect(statuses[1]).toBe("");
+    expect(phases()).toEqual(["thinking", "idle"]);
   });
 
-  test("does not set Slack thinking status for no_response text deltas", async () => {
-    const conversationId = "conv-no-response-status";
+  test("retries a terminal transition the channel failed to accept", async () => {
+    const conversationId = "conv-idle-retry";
+    const channelId = "D-IDLE-RETRY";
+    let idleAttempts = 0;
+    setChannelActivityImpl = (target) => {
+      if (target.phase === "idle") {
+        idleAttempts += 1;
+        return { ok: idleAttempts > 1 };
+      }
+      return { ok: true };
+    };
+
+    processChannelMessageInBackground({
+      processMessage: async () => ({ messageId: "user-msg-idle-retry" }),
+      conversationId,
+      eventId: "evt-idle-retry",
+      content: "dm message",
+      sourceChannel: "slack",
+      sourceInterface: "slack",
+      externalChatId: channelId,
+      trustCtx,
+      metadataHints: [],
+      chatType: "im",
+      replyCallbackUrl: `https://example.test/deliver/slack?channel=${channelId}&messageTs=1700000000.000020`,
+    });
+
+    await flush();
+
+    // A dropped `idle` is not cosmetic on a channel that holds its indicator:
+    // Slack keeps showing the assistant as working for an hour, so the
+    // terminal transition is the one worth attempting twice.
+    expect(idleAttempts).toBe(2);
+  });
+
+  test("runs idle next when the turn stops during a slow request, with no stale busy phase between", async () => {
+    const conversationId = "conv-slow-refresh";
+    const channelId = "D-SLOW-REFRESH";
+
+    // A self-expiring channel re-asserts on a timer, which is the only shape
+    // where a refresh backlog can form at all.
+    activityRefreshMsImpl = () => 5;
+
+    let release: (() => void) | undefined;
+    let calls = 0;
+    setChannelActivityImpl = (target) => {
+      calls += 1;
+      if (calls === 1 && target.phase !== "idle") {
+        // Hold the first busy call open across many refresh intervals.
+        return new Promise<{ ok: boolean }>((resolve) => {
+          release = () => resolve({ ok: true });
+        });
+      }
+      return { ok: true };
+    };
+
+    const processMessage: MessageProcessor = async () => {
+      // Long enough for several ticks to fire while the first call is unresolved.
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      return { messageId: "user-msg-slow-refresh" };
+    };
+
+    processChannelMessageInBackground({
+      processMessage,
+      conversationId,
+      eventId: "evt-slow-refresh",
+      content: "dm message",
+      sourceChannel: "slack",
+      sourceInterface: "slack",
+      externalChatId: channelId,
+      trustCtx,
+      metadataHints: [],
+      chatType: "im",
+      replyCallbackUrl: `https://example.test/deliver/slack?channel=${channelId}&messageTs=1700000000.000030`,
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    release?.();
+    await flush();
+
+    const seen = phases();
+    // The terminal phase is last and nothing busy follows it. A busy phase
+    // executing after `idle` is the visible bug: the indicator comes back on a
+    // turn that has already replied, which teaches people to distrust it.
+    expect(seen.at(-1)).toBe("idle");
+    expect(seen.slice(seen.indexOf("idle") + 1)).toEqual([]);
+    // Ticks did not accumulate behind the outstanding call. Counting rather
+    // than checking the last entry is what catches a backlog that happens to
+    // drain in a harmless order.
+    expect(seen.filter((phase) => phase === "thinking")).toHaveLength(1);
+  });
+
+  test("stays silent for a turn that decides not to answer", async () => {
+    const conversationId = "conv-no-response-activity";
     const channelId = "C-NO-RESPONSE";
     const threadTs = "1700000000.000003";
 
@@ -1027,7 +1290,7 @@ describe("Slack thinking status timing", () => {
     processChannelMessageInBackground({
       processMessage,
       conversationId,
-      eventId: "evt-no-response-status",
+      eventId: "evt-no-response-activity",
       content: "ambient channel chatter",
       sourceChannel: "slack",
       sourceInterface: "slack",
@@ -1039,11 +1302,15 @@ describe("Slack thinking status timing", () => {
 
     await flush();
 
+    // Not merely "no spinner": nothing at all was said to the channel. An
+    // `idle` here would still be a message about a turn nobody asked to see,
+    // and in a shared room it announces that the assistant read the traffic.
+    expect(sentActivity).toEqual([]);
     expect(deliveredChannelReplies).toEqual([]);
   });
 
-  test("sets and clears Slack thinking status after real assistant text starts", async () => {
-    const conversationId = "conv-real-response-status";
+  test("waits for real text in a room it was not addressed in, then settles", async () => {
+    const conversationId = "conv-real-response-activity";
     const channelId = "C-REAL-RESPONSE";
     const threadTs = "1700000000.000004";
 
@@ -1057,20 +1324,22 @@ describe("Slack thinking status timing", () => {
         text: "<",
         conversationId,
       });
-      expect(deliveredChannelReplies).toEqual([]);
+      // A partial `<` could still become `<no_response/>`, so nothing shows.
+      expect(sentActivity).toEqual([]);
 
       options?.onEvent?.({
         type: "assistant_text_delta",
         text: "b>Working on it.",
         conversationId,
       });
+      expect(phases()).toEqual(["thinking"]);
       return { messageId: "user-msg-real-response" };
     };
 
     processChannelMessageInBackground({
       processMessage,
       conversationId,
-      eventId: "evt-real-response-status",
+      eventId: "evt-real-response-activity",
       content: "please respond",
       sourceChannel: "slack",
       sourceInterface: "slack",
@@ -1082,229 +1351,6 @@ describe("Slack thinking status timing", () => {
 
     await flush();
 
-    const statuses = deliveredChannelReplies.map((entry) => {
-      const status = entry.payload.assistantThreadStatus as
-        | { status?: string }
-        | undefined;
-      return status?.status;
-    });
-    expect(slackStatusLabels).toContain(statuses[0]!);
-    expect(statuses[1]).toBe("");
-  });
-
-  test("buffers task_progress for ambiguous Slack turns until deliverable text appears", async () => {
-    const conversationId = "conv-progress-buffered";
-    const channelId = "C-PROGRESS-BUFFERED";
-    const threadTs = "1700000000.000012";
-
-    const processMessage: MessageProcessor = async (
-      _conversationId,
-      _content,
-      options,
-    ) => {
-      options?.onEvent?.({
-        type: "ui_surface_show",
-        conversationId,
-        surfaceId: "surface-progress",
-        surfaceType: "card",
-        data: {
-          title: "Task progress",
-          body: "Working",
-          template: "task_progress",
-          templateData: {
-            steps: [
-              { label: "Search docs", status: "in_progress" },
-              { label: "Summarize", status: "pending" },
-            ],
-          },
-        },
-      });
-      expect(deliveredChannelReplies).toEqual([]);
-
-      options?.onEvent?.({
-        type: "assistant_text_delta",
-        text: "I found the answer.",
-        conversationId,
-      });
-      return { messageId: "user-msg-progress-buffered" };
-    };
-
-    processChannelMessageInBackground({
-      processMessage,
-      conversationId,
-      eventId: "evt-progress-buffered",
-      content: "ambient request",
-      sourceChannel: "slack",
-      sourceInterface: "slack",
-      externalChatId: channelId,
-      trustCtx,
-      metadataHints: [],
-      replyCallbackUrl: `https://example.test/deliver/slack?channel=${channelId}&threadTs=${threadTs}`,
-    });
-
-    await flush();
-
-    const statuses = deliveredChannelReplies.map(
-      (entry) => entry.payload.assistantThreadStatus,
-    );
-    expect(statuses).toEqual([
-      {
-        channel: channelId,
-        threadTs,
-        status: expect.any(String),
-        loadingMessages: ["In progress (1/2): Search docs"],
-      },
-      {
-        channel: channelId,
-        threadTs,
-        status: "",
-      },
-    ]);
-    expect(slackStatusLabels).toContain(
-      (statuses[0] as { status: string }).status,
-    );
-  });
-
-  test("keeps ambiguous Slack no_response turns quiet even with task_progress", async () => {
-    const conversationId = "conv-progress-no-response";
-    const channelId = "C-PROGRESS-NO-RESPONSE";
-    const threadTs = "1700000000.000013";
-
-    const processMessage: MessageProcessor = async (
-      _conversationId,
-      _content,
-      options,
-    ) => {
-      options?.onEvent?.({
-        type: "ui_surface_show",
-        conversationId,
-        surfaceId: "surface-progress-no-response",
-        surfaceType: "card",
-        data: {
-          title: "Task progress",
-          body: "Working",
-          template: "task_progress",
-          templateData: {
-            steps: [{ label: "Inspect", status: "in_progress" }],
-          },
-        },
-      });
-      options?.onEvent?.({
-        type: "assistant_text_delta",
-        text: "<no_response/>",
-        conversationId,
-      });
-      return { messageId: "user-msg-progress-no-response" };
-    };
-
-    processChannelMessageInBackground({
-      processMessage,
-      conversationId,
-      eventId: "evt-progress-no-response",
-      content: "ambient chatter",
-      sourceChannel: "slack",
-      sourceInterface: "slack",
-      externalChatId: channelId,
-      trustCtx,
-      metadataHints: [],
-      replyCallbackUrl: `https://example.test/deliver/slack?channel=${channelId}&threadTs=${threadTs}`,
-    });
-
-    await flush();
-
-    expect(deliveredChannelReplies).toEqual([]);
-  });
-
-  test("updates Slack loading message when task_progress changes", async () => {
-    const conversationId = "conv-progress-update";
-    const channelId = "C-PROGRESS-UPDATE";
-    const threadTs = "1700000000.000014";
-
-    const processMessage: MessageProcessor = async (
-      _conversationId,
-      _content,
-      options,
-    ) => {
-      options?.onEvent?.({
-        type: "ui_surface_show",
-        conversationId,
-        surfaceId: "surface-progress-update",
-        surfaceType: "card",
-        data: {
-          title: "Task progress",
-          body: "Working",
-          template: "task_progress",
-          templateData: {
-            steps: [
-              { label: "Read request", status: "in_progress" },
-              { label: "Write answer", status: "pending" },
-            ],
-          },
-        },
-      });
-      options?.onEvent?.({
-        type: "assistant_text_delta",
-        text: "On it.",
-        conversationId,
-      });
-      options?.onEvent?.({
-        type: "ui_surface_update",
-        conversationId,
-        surfaceId: "surface-progress-update",
-        data: {
-          templateData: {
-            steps: [
-              { label: "Read request", status: "completed" },
-              { label: "Write answer", status: "in_progress" },
-            ],
-          },
-        },
-      });
-      return { messageId: "user-msg-progress-update" };
-    };
-
-    processChannelMessageInBackground({
-      processMessage,
-      conversationId,
-      eventId: "evt-progress-update",
-      content: "please respond",
-      sourceChannel: "slack",
-      sourceInterface: "slack",
-      externalChatId: channelId,
-      trustCtx,
-      metadataHints: [],
-      replyCallbackUrl: `https://example.test/deliver/slack?channel=${channelId}&threadTs=${threadTs}`,
-    });
-
-    await flush();
-
-    const statuses = deliveredChannelReplies.map(
-      (entry) => entry.payload.assistantThreadStatus,
-    );
-    expect(statuses).toEqual([
-      {
-        channel: channelId,
-        threadTs,
-        status: expect.any(String),
-        loadingMessages: ["In progress (1/2): Read request"],
-      },
-      {
-        channel: channelId,
-        threadTs,
-        status: expect.any(String),
-        loadingMessages: ["In progress (2/2): Write answer"],
-      },
-      {
-        channel: channelId,
-        threadTs,
-        status: "",
-      },
-    ]);
-    expect(slackStatusLabels).toContain(
-      (statuses[0] as { status: string }).status,
-    );
-    expect(slackStatusLabels).toContain(
-      (statuses[1] as { status: string }).status,
-    );
+    expect(phases()).toEqual(["thinking", "idle"]);
   });
 });

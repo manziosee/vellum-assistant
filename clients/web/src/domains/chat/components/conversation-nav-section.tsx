@@ -9,18 +9,19 @@
  *
  * A windowed section paginates: `onEndReached` fires at the bottom of the
  * rows and pages more in (LUM-2444). What differs per section is where the
- * rows scroll. Only the bottom-most section (`isLast`) grows to fill whatever
- * space the sidebar has left above the pinned footer, then scrolls within
- * itself once its rows outgrow that: flex-grow has no notion of "this
- * section needs the room," so letting every open section claim a share
- * stretched a two-row group into a mostly-empty box the same size as a busy
- * one beside it. Every section above the last one caps at a fixed height
- * and scrolls within itself instead, since an uncapped busy section would
- * otherwise push its neighbours off screen - unless it opts out via
+ * rows scroll. On the rail, only the bottom-most section (`isLast`) grows
+ * to fill whatever space the sidebar has left above the pinned footer, then
+ * scrolls within itself once its rows outgrow that: flex-grow has no notion
+ * of "this section needs the room," so letting every open section claim a
+ * share stretched a two-row group into a mostly-empty box the same size as
+ * a busy one beside it. Every section above the last one caps at a fixed
+ * height and scrolls within itself instead, since an uncapped busy section
+ * would otherwise push its neighbours off screen - unless it opts out via
  * `unbounded` (Pinned: expected to stay short, and grows to fit its rows
- * instead). The flat list instead scrolls against the sidebar body it
- * already fills (`scrollParent`), which keeps the rail to a single
- * scrollbar.
+ * instead). The overlay drawer and the flat list instead scroll against the
+ * sidebar body (`scrollParent` / `overlayCards`), which keeps those
+ * surfaces to a single scrollbar so nested lists cannot trap rows behind
+ * the floating action pills.
  *
  * Either way a list past {@link CONVERSATION_LIST_VIRTUALIZE_THRESHOLD} rows
  * windows rather than mounting every one, because an assistant accumulates
@@ -92,6 +93,14 @@ export interface ConversationRowListProps {
    * the direct path renders a {@link LoadMoreSentinel} after the rows.
    */
   onEndReached?: () => void;
+  /**
+   * Caps this section's rows shorter than the shared
+   * {@link SIDEBAR_SECTION_MAX_HEIGHT}, scrolling within itself past the
+   * cap. The assistant-initiated section passes five rows' worth so its
+   * realizations stay a glanceable stack. Ignored by `unbounded` and
+   * ancestor-scrolled lists, which have no cap of their own to shrink.
+   */
+  maxHeight?: number;
 }
 
 export function ConversationRowList({
@@ -100,7 +109,17 @@ export function ConversationRowList({
   unbounded,
   isLast,
   onEndReached,
+  maxHeight,
 }: ConversationRowListProps) {
+  const { overlayCards, scrollParent: contextScrollParent } =
+    useConversationListContext();
+  const listScrollParent = scrollParent ?? contextScrollParent;
+  /* Overlay cards and any list given an ancestor scroller grow with that
+     ancestor. A nested `overflow-y-auto` on the overlay would trap its
+     last rows behind the floating pills: the inner list cannot move those
+     rows into the body's reserved padding. */
+  const scrollWithBody = overlayCards === true || listScrollParent != null;
+
   const renderRow = (conversation: Conversation) => (
     <ConversationRow
       key={conversation.conversationId}
@@ -119,10 +138,7 @@ export function ConversationRowList({
     !unbounded && items.length > CONVERSATION_LIST_VIRTUALIZE_THRESHOLD;
 
   if (!windows) {
-    if (unbounded) {
-      return rows;
-    }
-    if (scrollParent) {
+    if (unbounded || scrollWithBody) {
       return rows;
     }
     return isLast ? (
@@ -130,7 +146,7 @@ export function ConversationRowList({
     ) : (
       <div
         className="overflow-y-auto"
-        style={{ maxHeight: SIDEBAR_SECTION_MAX_HEIGHT }}
+        style={{ maxHeight: maxHeight ?? SIDEBAR_SECTION_MAX_HEIGHT }}
       >
         {rows}
       </div>
@@ -142,16 +158,23 @@ export function ConversationRowList({
   const windowed = (
     <VirtualList
       items={items}
-      customScrollParent={scrollParent}
+      customScrollParent={listScrollParent}
       computeItemKey={(_, conversation) => conversation.conversationId}
       itemContent={(_, conversation) => renderRow(conversation)}
       endReached={onEndReached}
-      className={scrollParent ? "bg-transparent" : "h-full bg-transparent"}
+      className={
+        listScrollParent || scrollWithBody
+          ? "bg-transparent"
+          : "h-full bg-transparent"
+      }
     />
   );
 
-  if (scrollParent) {
-    return windowed;
+  if (scrollWithBody) {
+    /* The overlay body's ref lands one commit after first paint. Until it
+       does, mount the rows directly so a windowed list is not an empty
+       virtuoso viewport with no scroll parent. */
+    return listScrollParent ? windowed : rows;
   }
 
   /* Scrolling against an ancestor means no height of our own. Otherwise
@@ -175,7 +198,9 @@ export function ConversationRowList({
       {windowed}
     </div>
   ) : (
-    <div style={{ height: SIDEBAR_SECTION_MAX_HEIGHT }}>{windowed}</div>
+    <div style={{ height: maxHeight ?? SIDEBAR_SECTION_MAX_HEIGHT }}>
+      {windowed}
+    </div>
   );
 }
 export interface ConversationNavSectionProps extends ConversationRowListProps {
@@ -183,6 +208,12 @@ export interface ConversationNavSectionProps extends ConversationRowListProps {
   value: string;
   label: string;
   icon?: LucideIcon;
+  /** Leading glyph for a section whose mark is not a Lucide icon. */
+  iconNode?: ReactNode;
+  /** Forwarded to `CollapsibleNavSection.Section`: extra label-span classes. */
+  labelClassName?: string;
+  /** Forwarded to `CollapsibleNavSection.Section`: extra header-row classes. */
+  headerClassName?: string;
   trailing?: ReactNode;
   /**
    * Bulk/group actions for this section's header. Rendered as a right-click
@@ -209,6 +240,9 @@ export function ConversationNavSection({
   value,
   label,
   icon,
+  iconNode,
+  labelClassName,
+  headerClassName,
   trailing,
   groupMenu,
   collapsedIndicator,
@@ -226,7 +260,10 @@ export function ConversationNavSection({
       value={value}
       card={overlayCards}
       icon={icon}
+      iconNode={iconNode}
       label={label}
+      labelClassName={labelClassName}
+      headerClassName={headerClassName}
       trailing={trailing}
       contextMenuContent={
         hasMenu

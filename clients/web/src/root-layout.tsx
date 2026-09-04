@@ -1,10 +1,13 @@
-import { lazy, useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { Outlet, useLocation, useNavigate } from "react-router";
 
-import { LazyBoundary } from "@/components/lazy-boundary";
+import { ShareFeedbackModalLazy } from "@/components/share-feedback-modal-lazy";
 import { useAppTheme } from "@/hooks/use-app-theme";
+import { useDownloadFeedback } from "@/hooks/use-download-feedback";
 import { useEventBusInit } from "@/hooks/use-event-bus-init";
 import { useOpenUrlDirectives } from "@/hooks/use-open-url-directives";
+import { useGuardianRepairRoute } from "@/hooks/use-guardian-repair-route";
 import { useGlobalDeepLinkConsumer } from "@/hooks/use-global-deep-link-consumer";
 import { useKeyboardOpen } from "@/hooks/use-keyboard-open";
 import { useVisibleViewport } from "@/hooks/use-visible-viewport";
@@ -12,10 +15,19 @@ import { useAssistantLifecycle } from "@/assistant/use-lifecycle";
 import { useAssistantLifecycleStore } from "@/assistant/lifecycle-store";
 import { useChannelSetupCloseNotify } from "@/domains/chat/hooks/use-channel-setup-close-notify";
 import {
+  endLiveVoiceSession,
   isLiveVoiceSessionActive,
+  setLiveVoiceScreenShare,
   useLiveVoiceStore,
 } from "@/domains/chat/voice/live-voice/live-voice-store";
-import { requestVoiceStart } from "@/domains/chat/voice/live-voice/start-voice-request";
+import {
+  cancelPendingVoiceStart,
+  startVoiceFromSurface,
+} from "@/domains/chat/voice/live-voice/start-voice-request";
+import {
+  clearWatchRetro,
+  useWatchRetroStore,
+} from "@/domains/chat/watch/watch-retro";
 import {
   useAuthStore,
   useIsSessionInitializing,
@@ -30,7 +42,9 @@ import {
 import { useOnboardingLogin } from "@/hooks/use-onboarding-login";
 import { setMenuPlatformSession } from "@/runtime/menu";
 import { useVellumCommands } from "@/runtime/vellum-commands";
+import { handleToggleWatchCommand } from "@/runtime/watch-command";
 
+import { navigateToConversation } from "@/utils/conversation-navigation";
 import { routes } from "@/utils/routes";
 import { shouldSuppressRootStatusBanner } from "@/utils/status-banner-visibility";
 import { useAssistantIdentityInit } from "@/hooks/use-assistant-identity-init";
@@ -38,12 +52,15 @@ import { useAssistantResourceSync } from "@/hooks/use-assistant-resource-sync";
 import { useDocumentEditorSync } from "@/hooks/use-document-editor-sync";
 import { useBookmarksSync } from "@/hooks/use-bookmarks-sync";
 import { useNotificationIntentSync } from "@/hooks/use-notification-intent-sync";
+import { useWatchRetroSync } from "@/hooks/use-watch-retro-sync";
 import { useNotificationTapNavigation } from "@/hooks/use-notification-tap-navigation";
 import { usePushRegistration } from "@/hooks/use-push-registration";
+import { useWebPresenceReport } from "@/hooks/use-web-presence-report";
 import { useSoundEffects } from "@/hooks/use-sound-effects";
 import { useOnboardingWindowSize } from "@/hooks/use-onboarding-window-size";
 import { useConversationSync } from "@/hooks/use-conversation-sync";
 import { useFeatureFlagBusSync } from "@/hooks/use-feature-flag-bus-sync";
+import { useLegacyPinMigration } from "@/hooks/use-legacy-pin-migration";
 import { useWorkspaceTheme } from "@/hooks/use-workspace-theme";
 import { useClientFeatureFlagSync } from "@/hooks/use-client-feature-flag-sync";
 import { useAssistantFeatureFlagSync } from "@/hooks/use-assistant-feature-flag-sync";
@@ -83,13 +100,8 @@ import {
 import { CreateAssistantDialog } from "@/components/create-assistant-dialog";
 import { RemoveFromDeviceDialog } from "@/components/remove-from-device-dialog";
 import { RetireConfirmDialog } from "@/components/retire-confirm-dialog";
+import { useTranslation } from "@/i18n";
 import { toast } from "@vellumai/design-library/components/toast";
-
-const ShareFeedbackModal = lazy(() =>
-  import("@/components/share-feedback-modal").then((m) => ({
-    default: m.ShareFeedbackModal,
-  })),
-);
 
 /**
  * App-level layout route. Owns four cross-route concerns:
@@ -117,11 +129,13 @@ const ShareFeedbackModal = lazy(() =>
  */
 export function RootLayout() {
   useAppTheme();
+  const { t } = useTranslation();
   const keyboardOpen = useKeyboardOpen();
   const visibleViewport = useVisibleViewport();
 
   const location = useLocation();
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const sessionStatus = useAuthStore.use.sessionStatus();
   const isSessionInitializing = useIsSessionInitializing();
   const hasPlatformSession = useHasPlatformSession();
@@ -135,6 +149,7 @@ export function RootLayout() {
     sessionStatus,
     hasPlatformSession,
   });
+  useGuardianRepairRoute();
   // Channel-setup close auto-notify watcher. Mounted at this always-mounted
   // layer (not the chat layout) so a wizard-visibility transition triggered
   // from any route — including setMainView("chat") calls made while the chat
@@ -160,12 +175,23 @@ export function RootLayout() {
   useConversationSync(assistantId, isAssistantActive);
   useFeatureFlagBusSync(assistantId, isAssistantActive);
   useWorkspaceTheme(assistantId, isAssistantActive);
+  // Drains the browser-local pinned-app list this assistant owns into the
+  // daemon. Mounted here rather than on the chat layout because it is a
+  // one-shot per assistant and must run whichever route the user lands on.
+  useLegacyPinMigration(assistantId, isAssistantActive);
   useNotificationIntentSync(assistantId);
+  useWebPresenceReport(assistantId);
   usePushRegistration(assistantId);
   useNotificationTapNavigation();
   useSoundEffects(assistantId, isAssistantActive);
   useDocumentEditorSync();
   useBookmarksSync();
+  // The end of a watch session's summary, which arrives on the assistant's
+  // event stream because the session's own socket is gone by the time the
+  // retrospective runs. Mounted here rather than in the chat layout: the
+  // announcement names a background conversation, and the user is by definition
+  // working somewhere else when a session ends.
+  useWatchRetroSync();
 
   // Keep the browser favicon in sync with the assistant's avatar across
   // every authenticated route (chat, settings, logs, etc.). Mounted here
@@ -174,7 +200,7 @@ export function RootLayout() {
   useDynamicFavicon(avatar.customImageUrl, avatar.components, avatar.traits);
   // Publish the avatar accent as `--avatar-accent` so chat loading shimmers
   // (and any future accent-tinted UI) can read it from plain CSS.
-  useAvatarAccentVar(avatar.components, avatar.traits, avatar.customImageUrl);
+  useAvatarAccentVar(avatar.accentHex);
   // Publish the same avatar for the iOS Live Activity, which cannot fetch an
   // image at render time and needs the bytes to travel with the activity.
   useIslandAvatarSource(
@@ -185,7 +211,12 @@ export function RootLayout() {
 
   // Feed the same avatar to the Electron Dock + menu-bar icons, and publish
   // the live connection status to the menu-bar dot. Both no-op off Electron.
-  useElectronIconSync(avatar.customImageUrl, avatar.components, avatar.traits);
+  useElectronIconSync(
+    avatar.customImageUrl,
+    avatar.components,
+    avatar.traits,
+    avatar.accentHex,
+  );
   useElectronStatusSync();
   useElectronIdentitySync();
   useLockfileIdentitySync();
@@ -198,6 +229,10 @@ export function RootLayout() {
   useOnboardingWindowSize();
 
   useEventBusInit({ assistantId, isAssistantActive });
+  // Download outcome toasts (`download.started` / `download.done`). Mounted
+  // at the root because downloads start from every domain (chat attachments,
+  // workspace files, invoices, inspector exports).
+  useDownloadFeedback();
   useEffect(() => subscribeAndroidBackButtonSource(), []);
   // Inbound deep-link navigation + window activation. Mounted here
   // (not in `ChatPage`) so a `vellum://thread/...` arriving while
@@ -228,12 +263,6 @@ export function RootLayout() {
   const [removePairedPending, setRemovePairedPending] = useState(false);
   // Whether the tray "New Assistant…" name-prompt dialog is open.
   const [createOpen, setCreateOpen] = useState(false);
-  // The conversation the companion surface's open composer is talking to,
-  // minted by its first message. Held here because the surface never learns the
-  // id: it says only whether it is starting or continuing, and this is the side
-  // that mints one.
-  const companionConversationRef = useRef<string | null>(null);
-
   const { login } = useOnboardingLogin();
 
   useVellumCommands({
@@ -257,7 +286,7 @@ export function RootLayout() {
           .connectLocalAssistant(id)
           .catch((err: unknown) => {
             console.error("rePair.connectLocalAssistant failed", err);
-            toast.error("Failed to connect to the assistant.");
+            toast.error(t("assistantConnect.failed"));
             void navigate(routes.selectAssistant);
           });
       }
@@ -311,65 +340,78 @@ export function RootLayout() {
       );
     },
     startVoice: () => {
-      // A session already running is the session the user is in, so the press
-      // is spent: the starter refuses a second one anyway, and navigating
-      // would only walk the app away from the composer that owns it.
-      if (isLiveVoiceSessionActive(useLiveVoiceStore.getState().state)) {
-        return;
-      }
-      // The draft composer, because the session starts with no conversation
-      // and the server assigns one on `ready`. Navigating is also what mounts
-      // `ChatLayout` and therefore the starter this request is waiting for;
-      // until then it stays parked.
-      //
-      // The window is deliberately not raised. This command comes from the
-      // companion surface, which the user reached for precisely because they
-      // are working somewhere else, and that surface is where the call then
-      // shows itself.
-      void navigate(routes.assistant);
-      requestVoiceStart();
+      // See `startVoiceFromSurface` for the three steps and why the window
+      // stays where it is.
+      startVoiceFromSurface(navigate);
     },
-    companionSubmit: (command) => {
-      if (command.kind !== "companionSubmit") {
+    cancelVoiceStart: () => {
+      // The companion's dial, ended. Handled here rather than beside the
+      // session's controls because there may be no session yet and no layout
+      // that owns one: the request is parked, and this layout is the one
+      // mounted on every route it can be parked from.
+      cancelPendingVoiceStart();
+    },
+    toggleVoice: () => {
+      // The global Talk shortcut. Starting is Talk's own behaviour; ending is
+      // the part a key needs and a button does not, since the surface drawing
+      // the button also draws a way to stop and a keyboard user working in
+      // another app may have nothing else in reach.
+      if (isLiveVoiceSessionActive(useLiveVoiceStore.getState().state)) {
+        endLiveVoiceSession();
         return;
       }
-      // **The surface's own thread.** Opening its composer starts a
-      // conversation rather than sending into whatever the app has selected:
-      // the user reached past the app to a floating avatar, so they are
-      // starting something, not adding to a thread they cannot see. Every
-      // follow-up continues that one.
-      //
-      // Which is the remembered id, not the active conversation, because the
-      // two come apart: pressing the avatar brings the app forward with the
-      // card still open, and picking a different thread there leaves the app's
-      // selection somewhere the card's conversation is not. A follow-up
-      // resolved against the selection would land in the thread the user
-      // happened to open rather than the one they were typing to.
-      //
-      // The fallback covers the composer outliving this window's memory of it,
-      // which a reload does: the active conversation is the best guess left.
-      const conversations = useConversationStore.getState();
-      const conversationId = command.startsConversation
-        ? createDraftConversationId()
-        : (companionConversationRef.current ??
-          conversations.activeConversationId ??
-          createDraftConversationId());
-      companionConversationRef.current = conversationId;
-      conversations.setActiveConversationId(conversationId);
-      // The `?prompt=` auto-send pathway (`use-auto-send-effects`), with a
-      // relay token so sending the same words twice sends twice instead of
-      // deduping to one. Navigating is also what mounts the chat layout the
-      // send needs, which is why this routes rather than calling a sender.
-      //
-      // The layout is left alone and the window is deliberately not raised,
-      // as with `startVoice`: this command comes from a surface the user
-      // reached for precisely because they are working somewhere else.
-      void navigate(
-        routes.conversationWithPrompt(
-          conversationId,
-          command.message,
-          crypto.randomUUID(),
-        ),
+      startVoiceFromSurface(navigate);
+    },
+    answerWatchRetro: (command) => {
+      if (command.kind !== "answerWatchRetro") {
+        return;
+      }
+      // Read before the state is cleared, since clearing is what takes the
+      // conversation with it.
+      const retro = useWatchRetroStore.getState().retro;
+      clearWatchRetro();
+      // **A yes is only honoured on a summary that is actually ready.** The
+      // surface draws the two answers only in that state, but a press can
+      // outlive it: the give-up timer and a fresh session both clear the
+      // question, and navigating to a conversation the runtime never reported a
+      // report in would open an empty thread.
+      if (!command.open || retro?.phase !== "ready") {
+        return;
+      }
+      // **And only on the assistant that wrote it.** Switching away clears the
+      // question (`watch/watch-retro.ts` binds it to its owner), so this should
+      // never be false; it is checked anyway because the failure it prevents is
+      // silent. Every request this app makes is scoped to the active assistant,
+      // so opening another assistant's conversation id lands on a thread that
+      // does not exist rather than on the report.
+      if (
+        retro.assistantId !==
+        useResolvedAssistantsStore.getState().activeAssistantId
+      ) {
+        return;
+      }
+      // The full navigation rather than a bare route push. The report is a
+      // conversation like any other, and arriving at it with the previous
+      // thread's subagent and workflow state still standing is what
+      // `navigateToConversation` exists to prevent.
+      navigateToConversation(navigate, retro.conversationId);
+    },
+    // The flag gate and the toggle both live in `watch-command.ts`. This is the
+    // one command registered here that can start reading the user's screen, so
+    // its refusal is worth being able to test, and a module is what makes that
+    // possible. The command carries the picker's target on a start, and the
+    // handler is handed exactly that and nothing else of the command.
+    toggleWatch: (command) => {
+      handleToggleWatchCommand(
+        command.kind === "toggleWatch" ? command.target : undefined,
+      );
+    },
+    // The share the companion's control asks for, or its stop. Straight to
+    // the session's store: the frames are taken by a hook mounted beside the
+    // session, and a target with no session to show it to is dropped there.
+    setScreenShare: (command) => {
+      setLiveVoiceScreenShare(
+        command.kind === "setScreenShare" ? (command.target ?? null) : null,
       );
     },
     replayOnboarding: () => {
@@ -385,7 +427,7 @@ export function RootLayout() {
       return;
     }
     setRemovePairedPending(true);
-    const outcome = await removePairedAssistant(removePairedId);
+    const outcome = await removePairedAssistant(queryClient, removePairedId);
     setRemovePairedPending(false);
     setRemovePairedId(null);
     if (!outcome.ok) {
@@ -402,7 +444,7 @@ export function RootLayout() {
       return;
     }
     setRetirePending(true);
-    const outcome = await retireAssistant(retireId);
+    const outcome = await retireAssistant(queryClient, retireId);
     if (outcome.ok) {
       setRetireId(null);
       setRetirePending(false);
@@ -509,15 +551,13 @@ export function RootLayout() {
       <GlobalPushToTalkBridge assistantId={assistantId} />
 
       {feedbackOpen ? (
-        <LazyBoundary>
-          <ShareFeedbackModal
-            open={feedbackOpen}
-            onClose={() => setFeedbackOpen(false)}
-            assistantId={assistantId}
-            assistantVersion={assistantVersion}
-            activeConversationId={activeConversationId}
-          />
-        </LazyBoundary>
+        <ShareFeedbackModalLazy
+          open={feedbackOpen}
+          onClose={() => setFeedbackOpen(false)}
+          assistantId={assistantId}
+          assistantVersion={assistantVersion}
+          activeConversationId={activeConversationId}
+        />
       ) : null}
 
       {/* Destructive confirmation for the tray "Retire <assistant>…" command.
@@ -538,7 +578,7 @@ export function RootLayout() {
         kind="paired"
         assistantName={
           (removePairedId && getLockfileAssistant(removePairedId)?.name) ||
-          "the assistant"
+          t("rootLayout.unnamedAssistant")
         }
         isPending={removePairedPending}
         onConfirm={() => void handleConfirmRemovePaired()}

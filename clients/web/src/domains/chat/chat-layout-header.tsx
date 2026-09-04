@@ -8,6 +8,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, type ReactNode } from "react";
 
+import { WindowsMenuBar } from "@/components/windows-menu-bar";
 import { NATIVE_MOBILE_BARE_ICON_BUTTON } from "@/domains/chat/utils/native-mobile-button-constants";
 import { WINDOWS_TITLE_BAR_CONTROL_CLEARANCE_PX } from "@/runtime/electron-window-chrome";
 import {
@@ -20,6 +21,7 @@ import {
   usePageSurfaceStore,
 } from "@/stores/page-surface-store";
 import { useTitleBarStore } from "@/stores/title-bar-store";
+import { useTranslation } from "@/i18n";
 
 // On macOS the native window controls (traffic lights) overlay the top-left of
 // the renderer. In the Electron shell the header renders as a unified title bar
@@ -104,16 +106,22 @@ export function ChatLayoutHeader({
   // otherwise that strip, living outside `.app-shell`'s `isolation: isolate`
   // context, would out-stack and swallow clicks on the header's buttons.
   // Gated to Electron so the web/iOS layouts are byte-for-byte unchanged.
+  const { t } = useTranslation("chat");
   const electronHostOS = detectElectronHostOS();
   const electron = electronHostOS !== null;
+  // macOS and Windows hide the native title bar and use this header as the
+  // drag surface. Linux keeps the window manager decorations, so the header
+  // stays a regular toolbar.
+  const usesCustomTitleBar =
+    electronHostOS === "macos" || electronHostOS === "windows";
 
   // Mobile-only: on desktop the same affordance lives in the left cluster.
   const searchButton = isMobile ? (
     <Button
       variant="ghost"
       iconOnly={<Search />}
-      aria-label="Search (Ctrl+K)"
-      tooltip="Search (Ctrl+K)"
+      aria-label={t("chatLayoutHeader.searchAria")}
+      tooltip={t("chatLayoutHeader.searchAria")}
       className={NATIVE_MOBILE_BARE_ICON_BUTTON}
       onClick={handleSearchClick}
     />
@@ -122,12 +130,12 @@ export function ChatLayoutHeader({
   const setInlineTitleBarActive =
     useTitleBarStore.use.setInlineTitleBarActive();
   useEffect(() => {
-    if (!electron) {
+    if (!usesCustomTitleBar) {
       return;
     }
     setInlineTitleBarActive(true);
     return () => setInlineTitleBarActive(false);
-  }, [electron, setInlineTitleBarActive]);
+  }, [usesCustomTitleBar, setInlineTitleBarActive]);
 
   // The header sits between the safe-area strips and the page content, both of
   // which take the route's published surface on the native shells. Painting it
@@ -135,20 +143,23 @@ export function ChatLayoutHeader({
   // neutral band across the top. Off native mobile, and on any route that
   // publishes nothing, this resolves to the usual neutral chrome.
   const pageSurface = usePageSurfaceStore.use.surface();
-  const headerBackground = resolveShellBackground(pageSurface, isNativeMobile());
+  const headerBackground = resolveShellBackground(
+    pageSurface,
+    isNativeMobile(),
+  );
 
   return (
     <header
       data-slot={CHAT_LAYOUT_HEADER_SLOT}
       className={`flex w-full shrink-0 items-center gap-4 px-4 pt-4${isMobile && !electron ? " pb-4" : ""}${
-        electron
+        usesCustomTitleBar
           ? " select-none [-webkit-app-region:drag] [&_a]:[-webkit-app-region:no-drag] [&_button]:[-webkit-app-region:no-drag]"
           : ""
       }`}
       style={{
         background: headerBackground,
-        minHeight: electron ? "44px" : "40px",
-        paddingTop: electron ? 0 : undefined,
+        minHeight: usesCustomTitleBar ? "44px" : "40px",
+        paddingTop: usesCustomTitleBar ? 0 : undefined,
         paddingRight:
           electronHostOS === "windows"
             ? WINDOWS_TITLE_BAR_CONTROL_CLEARANCE_PX
@@ -176,21 +187,20 @@ export function ChatLayoutHeader({
           <Button
             variant="ghost"
             iconOnly={<MenuIcon />}
-            aria-label="Open navigation"
+            aria-label={t("chatLayoutHeader.openNavigationAria")}
             aria-expanded={drawerOpen}
             aria-controls="chat-side-menu"
-            tooltip="Open navigation"
-            className={NATIVE_MOBILE_BARE_ICON_BUTTON}
+            tooltip={t("chatLayoutHeader.openNavigationAria")}
             onClick={toggleSidebar}
           />
         ) : (
           <Button
             variant="ghost"
             iconOnly={<PanelLeft />}
-            aria-label="Toggle sidebar"
+            aria-label={t("chatLayoutHeader.toggleSidebarAria")}
             aria-expanded={!collapsed}
             aria-controls="chat-side-menu"
-            tooltip="Toggle sidebar"
+            tooltip={t("chatLayoutHeader.toggleSidebarAria")}
             onClick={toggleSidebar}
           />
         )}
@@ -199,15 +209,15 @@ export function ChatLayoutHeader({
             <Button
               variant="ghost"
               iconOnly={<Search />}
-              aria-label="Search (Ctrl+K)"
-              tooltip="Search (Ctrl+K)"
+              aria-label={t("chatLayoutHeader.searchAria")}
+              tooltip={t("chatLayoutHeader.searchAria")}
               onClick={handleSearchClick}
             />
             <Button
               variant="ghost"
               iconOnly={<ChevronLeft />}
-              aria-label="Back (Ctrl+[)"
-              tooltip="Back (Ctrl+[)"
+              aria-label={t("chatLayoutHeader.backAria")}
+              tooltip={t("chatLayoutHeader.backAria")}
               disabled={!canGoBack}
               className={!canGoBack ? "opacity-35" : undefined}
               onClick={onGoBack}
@@ -215,14 +225,20 @@ export function ChatLayoutHeader({
             <Button
               variant="ghost"
               iconOnly={<ChevronRight />}
-              aria-label="Forward (Ctrl+])"
-              tooltip="Forward (Ctrl+])"
+              aria-label={t("chatLayoutHeader.forwardAria")}
+              tooltip={t("chatLayoutHeader.forwardAria")}
               disabled={!canGoForward}
               className={!canGoForward ? "opacity-35" : undefined}
               onClick={onGoForward}
             />
           </>
         ) : null}
+        {/* Outside the isMobile branch: while this header is mounted the
+            fallback strip yields, so a narrow (zoomed) Windows window would
+            otherwise lose the menus entirely. Self-gates to the Windows
+            shell (renders nothing elsewhere), so no `electronHostOS`
+            branch here. */}
+        <WindowsMenuBar />
       </div>
 
       <div

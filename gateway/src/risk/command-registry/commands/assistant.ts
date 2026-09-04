@@ -91,7 +91,12 @@ const ASSISTANT_SUPPORTED_COMMAND_PATHS = [
   "contacts list",
   "contacts get",
   "contacts prompt",
+  "contacts create",
+  "contacts update",
+  "contacts delete",
+  "contacts merge",
   "contacts channels",
+  "contacts channels add",
   "contacts channels update-status",
   "contacts invites",
   "contacts invites list",
@@ -104,6 +109,7 @@ const ASSISTANT_SUPPORTED_COMMAND_PATHS = [
   "conversations defer list",
   "conversations defer cancel",
   "conversations list",
+  "conversations search",
   "conversations new",
   "conversations rename",
   "conversations export",
@@ -247,6 +253,14 @@ const ASSISTANT_SUPPORTED_COMMAND_PATHS = [
   "monitoring stop",
   "monitoring status",
   "ps",
+  "roadmap",
+  "roadmap list",
+  "roadmap get",
+  "roadmap create",
+  "roadmap update",
+  "roadmap delete",
+  "roadmap upvote",
+  "roadmap unvote",
   "routes",
   "routes list",
   "routes inspect",
@@ -458,6 +472,21 @@ const riskOverrides: AssistantRiskOverride[] = [
   { path: "channel-verification-sessions revoke", risk: "low" },
   { path: "config set", risk: "low" },
   { path: "contacts prompt", risk: "medium" },
+  // Each opens a form in the guardian's app and writes only what they submit,
+  // so the guardian is in the loop regardless of this level. The levels below
+  // still describe the command itself: create and update are non-destructive
+  // edits, while a delete takes the contact's channels with it and cannot be
+  // undone.
+  { path: "contacts create", risk: "medium" },
+  { path: "contacts update", risk: "medium" },
+  { path: "contacts delete", risk: "high" },
+  {
+    path: "contacts merge",
+    risk: "high",
+    reason:
+      "Permanently deletes the donor contact record, the same irreversible write that makes 'contacts delete' high. Its channels move to the survivor, so nobody loses access, but a policy that gates high operations should gate this one.",
+  },
+  { path: "contacts channels add", risk: "medium" },
   { path: "contacts channels update-status", risk: "medium" },
   { path: "contacts invites create", risk: "high" },
   { path: "contacts invites revoke", risk: "medium" },
@@ -479,6 +508,33 @@ const riskOverrides: AssistantRiskOverride[] = [
   { path: "email unregister", risk: "medium" },
   { path: "email send", risk: "high" },
   { path: "image-generation generate", risk: "medium" },
+  {
+    path: "roadmap create",
+    risk: "high",
+    reason:
+      "Publishes an item on the public Vellum roadmap under the assistant's name and notifies Vellum staff",
+  },
+  {
+    path: "roadmap update",
+    risk: "medium",
+    reason: "Edits a publicly visible roadmap item",
+  },
+  {
+    path: "roadmap delete",
+    risk: "high",
+    reason: "Permanently removes a publicly visible roadmap item",
+  },
+  {
+    path: "roadmap upvote",
+    risk: "medium",
+    reason: "Casts a publicly visible vote attributed to the assistant",
+  },
+  {
+    path: "roadmap unvote",
+    risk: "medium",
+    reason:
+      "Withdraws a publicly visible vote, changing state the roadmap shows to everyone",
+  },
   { path: "inference send", risk: "medium" },
   {
     path: "inference models list",

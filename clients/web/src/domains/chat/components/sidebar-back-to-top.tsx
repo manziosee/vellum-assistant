@@ -1,3 +1,5 @@
+
+import { useTranslation } from "@/i18n";
 /**
  * "Back to top" pill for the sidebar's conversation list.
  *
@@ -27,10 +29,16 @@ export interface SidebarBackToTopProps {
 }
 
 export function SidebarBackToTop({ visible, onClick }: SidebarBackToTopProps) {
+  const { t } = useTranslation("chat");
   return (
     /* `h-0` so the pill reserves no room at the end of the list: it floats
-       over the rows, and the list should run right up to the footer. */
-    <div className="pointer-events-none sticky bottom-2 z-10 flex h-0 items-end justify-center">
+       over the rows, and the list should run right up to the footer. Zero
+       height alone is not zero footprint, though: this is still a flex child
+       of the sidebar body, whose stack gap (`gap-2`) opens 8px ahead of it
+       either way. The negative margin cancels exactly that gap, so the
+       bottom-anchored assistant section sits one standard gap above
+       Preferences instead of two. */
+    <div className="pointer-events-none sticky bottom-2 z-10 -mt-2 flex h-0 items-end justify-center">
       <Button
         variant="ghost"
         leftIcon={<ArrowUp className="h-4 w-4" />}
@@ -48,7 +56,7 @@ export function SidebarBackToTop({ visible, onClick }: SidebarBackToTopProps) {
           visible ? "pointer-events-auto" : "pointer-events-none opacity-0",
         )}
       >
-        Back to top
+        {t("sidebarBackToTop.label")}
       </Button>
     </div>
   );

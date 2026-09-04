@@ -16,7 +16,10 @@ import {
   getWatchedLockfile,
   onLockfileChange,
 } from "@vellumai/electron-desktop/lockfile-watcher";
-import { getSessionToken } from "@vellumai/electron-desktop/session-token-store";
+import {
+  getSessionToken,
+  onSessionTokenChange,
+} from "@vellumai/electron-desktop/session-token-store";
 import {
   getGuardianAccessToken,
   resolveConfigDir,
@@ -25,6 +28,7 @@ import {
 
 import { createWindowsHostProxyRuntime } from "../host-proxy-adapter";
 import log from "../logger";
+import { installPresenceMonitor } from "../presence";
 import { COMPUTER_USE_ACTION_EXECUTORS } from "./computer-use-actions";
 
 const hostProxy: CapabilityModule<DesktopCapabilityRegistry> = {
@@ -74,12 +78,10 @@ const installBridge = (capabilities: DesktopCapabilityRegistry): void => {
         return result.accessToken;
       },
       getSessionToken,
+      onSessionTokenChange,
       getLockfile: getWatchedLockfile,
       onLockfileChange,
-      // Windows has no user-attention monitor yet. Reporting nothing is
-      // the fail-open direction: with no presence record on file the
-      // daemon lets mobile pushes through.
-      installPresenceMonitor: () => () => undefined,
+      installPresenceMonitor,
       getClientId: getDeviceId,
       computerUseExecutors: capabilities.get(COMPUTER_USE_ACTION_EXECUTORS),
       logger: log,

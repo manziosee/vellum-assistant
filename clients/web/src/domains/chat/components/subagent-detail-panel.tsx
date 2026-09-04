@@ -33,7 +33,7 @@ import { useBundledAvatarComponents } from "@/utils/use-bundled-avatar-component
 import { Button, Typography } from "@vellumai/design-library";
 
 import { ChatMarkdownMessage } from "@/domains/chat/components/chat-markdown-message";
-import { DetailPanelStopButton } from "@/domains/chat/components/detail-panel-stop-button";
+import { DetailPanelStopButton } from "@/components/detail-panel-stop-button";
 import { SubagentPhaseTimeline } from "@/domains/chat/components/subagent-phase-timeline";
 import {
   deriveStepLabelFromName,
@@ -41,12 +41,14 @@ import {
 } from "@/domains/chat/components/tool-progress-card/derive-step-label";
 import { ICON_MAP } from "@/domains/chat/components/tool-progress-card/phase-grouped-step-list";
 import { ThreeDotIndicator } from "@/domains/chat/components/tool-progress-card/three-dot-indicator";
-import { ToolDetailBody } from "@/domains/chat/components/tool-detail-panel";
-import { WebFetchDetailView } from "@/domains/chat/components/web-fetch/web-fetch-detail-view";
-import { WebSearchDetailView } from "@/domains/chat/components/web-search/web-search-detail-view";
+import {
+  ToolDetailBody,
+  toolDetailHeaderTitle,
+} from "@/domains/chat/components/tool-detail-panel";
 import { useSubagentSteps } from "@/domains/chat/subagent-step-projection";
 import { useSubagentStepDetails } from "@/domains/chat/subagent-detail-projection";
 import type { ToolDetailPayload } from "@/stores/viewer-store";
+import { useTranslation } from "@/i18n";
 
 /**
  * The icon name for a nested step detail — the same glyph its timeline pill
@@ -115,6 +117,7 @@ export function SubagentDetailPanel({
   onRequestDetail,
   assistantId,
 }: SubagentDetailPanelProps) {
+  const { t } = useTranslation("chat");
   const isRunning = isActiveStatus(entry.status);
   const reduce = useReducedMotion();
   const components = useBundledAvatarComponents();
@@ -261,9 +264,7 @@ export function SubagentDetailPanel({
   // The nested step's label — the breadcrumb tail and the header title while a
   // detail is open. Mirrors the main-chat tool detail panel's `activity ||
   // title` precedence.
-  const detailTitle = activeDetail
-    ? activeDetail.activity || activeDetail.title
-    : "";
+  const detailTitle = activeDetail ? toolDetailHeaderTitle(activeDetail) : "";
   // The header title tracks the breadcrumb's deepest crumb: the subagent at the
   // timeline, the drilled-into step once a detail is open.
   const headerTitle = activeDetail ? detailTitle : entry.label;
@@ -318,8 +319,8 @@ export function SubagentDetailPanel({
               variant="outlined"
               iconOnly={<ChevronLeft />}
               onClick={handleBack}
-              aria-label="Back to timeline"
-              tooltip="Back"
+              aria-label={t("subagentDetailPanel.backToTimelineAria")}
+              tooltip={t("subagentDetailPanel.backTooltip")}
               className="shrink-0"
             />
           )}
@@ -344,11 +345,11 @@ export function SubagentDetailPanel({
         isRunning && onStop ? (
           <DetailPanelStopButton
             onStop={() => onStop(entry.subagentId)}
-            ariaLabel="Stop subagent"
+            ariaLabel={t("subagentDetailPanel.stopSubagentAria")}
           />
         ) : undefined
       }
-      closeLabel="Close subagent detail"
+      closeLabel={t("subagentDetailPanel.closeDetail")}
       onClose={onClose}
     >
       {/* Body: swaps to a step's nested detail when one is selected, keeping
@@ -367,25 +368,15 @@ export function SubagentDetailPanel({
             <>
               {/* Navigation back to the timeline lives in the header (Back button)
               and the breadcrumb; this body only renders the step's detail.
-              Thinking steps render their full reasoning markdown statically
-              (subagent detail isn't a live chat-session source); web_search
-              steps render their query + source links; web_fetch gets a
-              result-shaped view; other tools fall back to the shared
-              technical-details/output body. */}
+              Thinking steps render their reasoning markdown statically, because
+              subagent detail is not a live chat-session source; every tool goes
+              through `ToolDetailBody`, which picks its renderer. */}
               {activeDetail.kind === "thinking" ? (
                 <ChatMarkdownMessage
                   content={activeDetail.thinkingText ?? ""}
                   hardLineBreaks
                   assistantId={assistantId}
                 />
-              ) : activeDetail.kind === "web_search" &&
-                activeDetail.status !== "error" ? (
-                // A successful search shows query + sources; a FAILED one falls
-                // through to `ToolDetailBody`, which renders its full, untruncated
-                // error in the Output section — parity with a failed tool.
-                <WebSearchDetailView detail={activeDetail} />
-              ) : activeDetail.toolName === "web_fetch" ? (
-                <WebFetchDetailView detail={activeDetail} />
               ) : (
                 <ToolDetailBody
                   detail={activeDetail}
@@ -406,7 +397,7 @@ export function SubagentDetailPanel({
                   }
                   target={entry.inputTokens}
                   format={(n) => formatNumber(Math.round(n))}
-                  label="Input"
+                  label={t("subagentDetailPanel.input")}
                 />
                 <AnimatedMetricCard
                   icon={
@@ -417,7 +408,7 @@ export function SubagentDetailPanel({
                   }
                   target={entry.outputTokens}
                   format={(n) => formatNumber(Math.round(n))}
-                  label="Output"
+                  label={t("subagentDetailPanel.output")}
                 />
               </div>
 
@@ -429,7 +420,7 @@ export function SubagentDetailPanel({
                     as="h3"
                     className="mb-2 text-[var(--content-emphasised)]"
                   >
-                    Objective
+                    {t("subagentDetailPanel.objective")}
                   </Typography>
                   <Typography
                     ref={objectiveBodyRef}
@@ -440,7 +431,7 @@ export function SubagentDetailPanel({
                     // users can't reach the overflowed objective content.
                     tabIndex={objectiveExpanded ? 0 : undefined}
                     role={objectiveExpanded ? "region" : undefined}
-                    aria-label={objectiveExpanded ? "Objective" : undefined}
+                    aria-label={objectiveExpanded ? t("subagentDetailPanel.objective") : undefined}
                     className={`whitespace-pre-wrap break-words leading-relaxed text-[var(--content-default)] ${
                       objectiveExpanded
                         ? "max-h-[280px] overflow-y-auto"
@@ -467,7 +458,7 @@ export function SubagentDetailPanel({
                       className="mt-1.5 inline-flex gap-1 border-0 text-[color:var(--content-secondary)] hover:text-[color:var(--content-default)] hover:no-underline"
                     >
                       <Typography variant="label-small-default">
-                        {objectiveExpanded ? "Show less" : "Show more"}
+                        {objectiveExpanded ? t("subagentDetailPanel.showLess") : t("subagentDetailPanel.showMore")}
                       </Typography>
                     </Button>
                   )}
@@ -482,7 +473,7 @@ export function SubagentDetailPanel({
                   as="h3"
                   className="mb-4 text-[var(--content-emphasised)]"
                 >
-                  Timeline
+                  {t("subagentDetailPanel.timeline")}
                 </Typography>
                 {/*
                  * Key by subagent id so the timeline remounts on subagent switch,
@@ -518,7 +509,7 @@ export function SubagentDetailPanel({
                     variant="body-small-default"
                     className="py-4 text-center text-[var(--content-tertiary)]"
                   >
-                    No events yet
+                    {t("subagentDetailPanel.noEventsYet")}
                   </Typography>
                 )}
               </div>

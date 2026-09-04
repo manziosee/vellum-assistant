@@ -37,16 +37,15 @@ function normalizeSlackReaction(
   const routing = resolveAssistant(config, channel, event.user);
   if (isRejection(routing)) return null;
 
-  const prefix = op === "added" ? "reaction" : "reaction_removed";
-  const callbackData = `${prefix}:${event.reaction}`;
-  // Include reactor user ID to prevent dedup collisions when multiple
-  // users react with the same emoji on the same message. Append the op
-  // suffix so an add and a subsequent remove of the same emoji by the
-  // same user produce distinct externalMessageIds.
+  // The addressing parts (channel, message ts, emoji, reactor, op) name a
+  // reaction, not one occurrence of one: they repeat byte for byte each time
+  // the same person re-adds the same emoji. `event_id` is the component that
+  // separates the occurrences and still repeats on a redelivery, which is why
+  // `socket-mode.ts` keys its own dedup on it too.
   const externalMessageId =
     op === "added"
-      ? `${channel}:${event.item.ts}:${event.reaction}:${event.user}`
-      : `${channel}:${event.item.ts}:${event.reaction}:${event.user}:removed`;
+      ? `${channel}:${event.item.ts}:${event.reaction}:${event.user}:${eventId}`
+      : `${channel}:${event.item.ts}:${event.reaction}:${event.user}:removed:${eventId}`;
 
   return {
     event: {
@@ -54,10 +53,27 @@ function normalizeSlackReaction(
       sourceChannel: "slack",
       receivedAt: new Date().toISOString(),
       message: {
-        content: callbackData,
+        eventKind: "reaction",
+        // A reaction has no user-authored text; its payload is structured.
+        content: "",
         conversationExternalId: channel,
         externalMessageId,
-        callbackData,
+        reaction: {
+          op,
+          emoji: event.reaction,
+          // Slack sends one namespace for both standard and workspace
+          // emoji and does not say which this is: `+1` and a workspace
+          // upload arrive identically, and only the workspace token can
+          // tell them apart. `shortcode` is that namespace, not a guess.
+          emojiKind: "shortcode",
+          emojiName: event.reaction,
+          targetMessageId: event.item.ts,
+        },
+        // A daemon that does not yet understand the structured payload
+        // dispatches reactions on the kind and reads this string
+        // unconditionally, so the sentinel form stays required beside the
+        // payload for mixed-version readers.
+        callbackData: `${op === "added" ? "reaction" : "reaction_removed"}:${event.reaction}`,
       },
       actor: {
         actorExternalId: event.user,

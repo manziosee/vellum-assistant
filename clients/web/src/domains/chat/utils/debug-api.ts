@@ -33,6 +33,7 @@ import {
 import { fetchConversationMessages as defaultFetchConversationMessages } from "@/domains/chat/api/messages";
 import { useStreamStore } from "@/domains/chat/stream-store";
 import type {
+  PendingAcpConnectState,
   PendingConfirmationState,
   PendingContactRequestState,
   PendingQuestionState,
@@ -46,6 +47,7 @@ import {
 } from "@/lib/diagnostics";
 import type { DisplayMessage } from "@/domains/chat/types/types";
 import type { ReconcileActiveConversationResult } from "@/domains/chat/hooks/use-message-reconciliation";
+import { forceSleepStage } from "@/domains/chat/utils/sleep-stage-debug-flag";
 import { setImpersonatedAssistantVersion } from "@/lib/backwards-compat/impersonate-version-flag";
 import { toggleAppIframeSandboxDisabled } from "@/lib/app-sandbox-debug-flag";
 import { classifyScrollPosition } from "@/domains/chat/transcript/transcript-scroll-utils";
@@ -64,6 +66,7 @@ import {
   shouldShowThinkingIndicator,
 } from "@/domains/chat/turn-selectors";
 import { useConversationStore } from "@/stores/conversation-store";
+import type { SleepStageScene } from "@/stores/assistant-sleep-stage-store";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -137,20 +140,27 @@ export interface ChatDebugThinkingDoneSignal {
  * snapshot never carries tool-call argument values.
  */
 export interface PendingInteractionsSnapshot {
+  submittingByKind: Record<string, string | null>;
   pendingSecret: PendingSecretState | null;
-  isSubmittingSecret: boolean;
   pendingConfirmation: PendingConfirmationState | null;
-  isSubmittingConfirmation: boolean;
   pendingContactRequest: PendingContactRequestState | null;
-  isSubmittingContactRequest: boolean;
   pendingQuestion: PendingQuestionState | null;
-  isSubmittingQuestion: boolean;
   /** True while the question card is hidden but `pendingQuestion` is set —
    *  the composer free-text intercept still routes to `submitQuestionResponse`. */
   isQuestionCardDismissed: boolean;
   /** Tool-call id paired with the currently-rendered inline confirmation,
    *  or `null` when no inline confirmation is active. */
   inlineConfirmationToolCallId: string | null;
+  /** The inline "Connect Claude Code" prompt currently raised by a failed
+   *  `acp_spawn`, or `null` when no Connect card is showing. */
+  pendingAcpConnect: PendingAcpConnectState | null;
+  /** Tool-call ids whose Connect card was dismissed in this session, sorted
+   *  so the dump is stable across captures. A dismissed id suppresses the
+   *  card even when the same failure is replayed by a resync. */
+  dismissedAcpConnectToolUseIds: string[];
+  /** True while a completed connect flow is waiting for the chat view to
+   *  fire its hidden continuation send. */
+  pendingAcpContinue: boolean;
 }
 
 /**
@@ -833,7 +843,7 @@ export function createChatDebugApi(refs: ChatDebugRefs): ChatDebugApi {
       "  .serverMessages()          [experimental] fetch /v1/history and return the server snapshot response (messages + seq)",
       "                              (diff against getClientMessages() manually in the console)",
       "  .listPendingInteractions() frontend-tracked pending prompts (secret/confirmation/",
-      "                              contact-request/question) and submission flags",
+      "                              contact-request/question/acp-connect) and submission flags",
       "  .getScrollState()          scroll geometry + pagination — why can't I scroll up?",
       "                              .diagnosis gives a human-readable summary",
       "  .getDiagnostics(prefix?)   main diagnostics ring (per-delta SSE / drop gates / history applies),",
@@ -889,6 +899,17 @@ export interface VellumDebugFlagsApi {
    *
    *  Returns the value in effect after the call. */
   impersonateVersion(value?: string | null): string | null;
+  /** Pin the conversation page's sleep stage to one scene so the
+   *  sleeping / waking / woke animation can be watched without an
+   *  assistant that will actually sleep. In memory only; a reload
+   *  clears it.
+   *
+   *  - `forceSleepStage("sleeping" | "waking" | "woke")` - pin it.
+   *  - `forceSleepStage(null)` - clear, back to the real status.
+   *  - `forceSleepStage()` - log + return the current value.
+   *
+   *  Returns the value in effect after the call. */
+  forceSleepStage(value?: SleepStageScene | null): SleepStageScene | null;
   /** Render app iframes without their `sandbox` attribute, giving the
    *  app document the host's origin so origin-gated APIs
    *  (`getDisplayMedia()`, …) work. Costs the isolation the sandbox
@@ -1022,6 +1043,7 @@ export function useChatDebugApi(refs: ChatDebugRefs): void {
     const api = createChatDebugApi(stableRefs);
     const flagsApi: VellumDebugFlagsApi = {
       impersonateVersion: setImpersonatedAssistantVersion,
+      forceSleepStage,
       toggleAppsSandboxDisabled: toggleAppIframeSandboxDisabled,
     };
     const uninstall = installVellumDebugApi(api, flagsApi);

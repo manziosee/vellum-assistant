@@ -1,6 +1,10 @@
+import type { ZodType } from "zod";
+
 import {
   type DiskPressureStatusResponse,
   DiskPressureStatusResponseSchema,
+  type ResourcePressureStatusResponse,
+  ResourcePressureStatusResponseSchema,
 } from "@vellumai/assistant-api";
 
 import {
@@ -26,6 +30,7 @@ import {
   diskpressureAcknowledgePost,
   diskpressureStatusGet,
   healthzGet,
+  resourcepressureStatusGet,
 } from "@/generated/daemon/sdk.gen";
 import type { HealthzGetResponse } from "@/generated/daemon/types.gen";
 import { assertHasResponse, toErrorObject } from "@/utils/api-errors";
@@ -51,13 +56,57 @@ export type GetHealthzResult =
   | { ok: true; status: number; data: HealthzGetResponse }
   | { ok: false; status: number; error: Record<string, unknown> };
 
-export type GetAssistantDiskPressureStatusResult =
-  | { ok: true; status: number; data: DiskPressureStatusResponse }
+export type ParsedResponseResult<TData> =
+  | { ok: true; status: number; data: TData }
   | { ok: false; status: number; error: Record<string, unknown> };
 
+export type GetAssistantDiskPressureStatusResult =
+  ParsedResponseResult<DiskPressureStatusResponse>;
+
 export type AcknowledgeAssistantDiskPressureResult =
-  | { ok: true; status: number; data: DiskPressureStatusResponse }
-  | { ok: false; status: number; error: Record<string, unknown> };
+  ParsedResponseResult<DiskPressureStatusResponse>;
+
+export type GetAssistantResourcePressureStatusResult =
+  ParsedResponseResult<ResourcePressureStatusResponse>;
+
+/**
+ * Normalize a `throwOnError: false` SDK result whose success body must
+ * match `schema` into the `{ ok, status, data | error }` shape.
+ */
+function parseWrappedResponse<TData>(
+  {
+    data,
+    error,
+    response,
+  }: { data: unknown; error: unknown; response?: Response },
+  schema: ZodType<TData>,
+  failureMessage: string,
+): ParsedResponseResult<TData> {
+  assertHasResponse(response, error, failureMessage);
+
+  if (!response.ok) {
+    return {
+      ok: false,
+      status: response.status,
+      error: toErrorObject(error, response),
+    };
+  }
+
+  const parsed = schema.safeParse(data);
+  if (!parsed.success) {
+    return {
+      ok: false,
+      status: response.status,
+      error: toErrorObject(parsed.error.message, response),
+    };
+  }
+
+  return {
+    ok: true,
+    status: response.status,
+    data: parsed.data,
+  };
+}
 
 /**
  * Hatch a managed assistant.
@@ -244,77 +293,40 @@ export async function getAssistantHealthz(
 export async function getAssistantDiskPressureStatus(
   assistantId: string,
 ): Promise<GetAssistantDiskPressureStatusResult> {
-  const { data, error, response } = await diskpressureStatusGet({
-    path: { assistant_id: assistantId },
-    throwOnError: false,
-  });
-
-  assertHasResponse(
-    response,
-    error,
+  return parseWrappedResponse(
+    await diskpressureStatusGet({
+      path: { assistant_id: assistantId },
+      throwOnError: false,
+    }),
+    DiskPressureStatusResponseSchema,
     "Failed to get assistant disk pressure status.",
   );
+}
 
-  if (response.ok) {
-    const parsed = DiskPressureStatusResponseSchema.safeParse(data);
-    if (!parsed.success) {
-      return {
-        ok: false,
-        status: response.status,
-        error: toErrorObject(parsed.error.message, response),
-      };
-    }
-
-    return {
-      ok: true,
-      status: response.status,
-      data: parsed.data,
-    };
-  }
-
-  return {
-    ok: false,
-    status: response.status,
-    error: toErrorObject(error, response),
-  };
+export async function getAssistantResourcePressureStatus(
+  assistantId: string,
+): Promise<GetAssistantResourcePressureStatusResult> {
+  return parseWrappedResponse(
+    await resourcepressureStatusGet({
+      path: { assistant_id: assistantId },
+      throwOnError: false,
+    }),
+    ResourcePressureStatusResponseSchema,
+    "Failed to get assistant resource pressure status.",
+  );
 }
 
 export async function acknowledgeAssistantDiskPressure(
   assistantId: string,
 ): Promise<AcknowledgeAssistantDiskPressureResult> {
-  const { data, error, response } = await diskpressureAcknowledgePost({
-    path: { assistant_id: assistantId },
-    throwOnError: false,
-  });
-
-  assertHasResponse(
-    response,
-    error,
+  return parseWrappedResponse(
+    await diskpressureAcknowledgePost({
+      path: { assistant_id: assistantId },
+      throwOnError: false,
+    }),
+    DiskPressureStatusResponseSchema,
     "Failed to acknowledge assistant disk pressure.",
   );
-
-  if (response.ok) {
-    const parsed = DiskPressureStatusResponseSchema.safeParse(data);
-    if (!parsed.success) {
-      return {
-        ok: false,
-        status: response.status,
-        error: toErrorObject(parsed.error.message, response),
-      };
-    }
-
-    return {
-      ok: true,
-      status: response.status,
-      data: parsed.data,
-    };
-  }
-
-  return {
-    ok: false,
-    status: response.status,
-    error: toErrorObject(error, response),
-  };
 }
 
 export interface AssistantBackup {
@@ -630,26 +642,46 @@ export type ListAssistantsResult =
   | { ok: true; status: number; data: Assistant[] }
   | { ok: false; status: number; error: Record<string, unknown> };
 
+const ASSISTANTS_PAGE_SIZE = 100;
+/** Bounds a runaway `next` chain; 2000 assistants is far past any real org. */
+const ASSISTANTS_MAX_PAGES = 20;
+
+/** Every page, so an org past one page size lists (and looks up) all of its assistants. */
 export async function listAssistants(): Promise<ListAssistantsResult> {
-  const { data, error, response } = await assistantsList({
-    query: { hosting: "all" },
-    throwOnError: false,
-  });
+  const results: Assistant[] = [];
+  let status = 200;
+  for (let page = 0; page < ASSISTANTS_MAX_PAGES; page++) {
+    const { data, error, response } = await assistantsList({
+      query: {
+        hosting: "all",
+        limit: ASSISTANTS_PAGE_SIZE,
+        offset: results.length,
+      },
+      throwOnError: false,
+    });
 
-  assertHasResponse(response, error, "Failed to list assistants.");
+    assertHasResponse(response, error, "Failed to list assistants.");
 
-  if (response.ok) {
-    return {
-      ok: true,
-      status: response.status,
-      data: data?.results ?? [],
-    };
+    if (!response.ok) {
+      return {
+        ok: false,
+        status: response.status,
+        error: toErrorObject(error, response),
+      };
+    }
+    status = response.status;
+    const pageResults = data?.results ?? [];
+    results.push(...pageResults);
+    if (!data?.next || pageResults.length === 0) {
+      return { ok: true, status, data: results };
+    }
   }
-
+  // A partial list must not read as authoritative: local mode mirrors it
+  // into the lockfile, dropping whatever it omits.
   return {
     ok: false,
-    status: response.status,
-    error: toErrorObject(error, response),
+    status,
+    error: { detail: "Assistant list exceeded the page cap." },
   };
 }
 

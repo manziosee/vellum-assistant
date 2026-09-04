@@ -169,19 +169,24 @@ whichever Swift channel you have around.
     deletes a file still in use, including one from a second Vellum build
     sharing at the same time.
 
-- **Downloads** (`src/main/downloads.ts`). The counterpart intent to the Share
-  Sheet. The renderer downloads the browser way (`saveFile` → an `<a download>`
-  click), which Chromium raises as a `will-download` on the default session.
-  Without a handler Electron falls back to its default routine and prompts a
-  Save panel for every download, so this picks the save path itself:
-  `~/Downloads`, uniquified Finder-style (`report.pdf`, `report (1).pdf`) so a
-  repeat download never clobbers an existing file, then a Dock Downloads-stack
-  bounce via `app.dock.downloadFinished` on completion. `setSavePath` is only
-  honored while the `will-download` listener is on the stack, hence the
-  synchronous `existsSync` collision check rather than the `node:fs/promises`
-  style used elsewhere in the main process. Any failure (unwritable directory,
-  no free name) simply skips `setSavePath` and lets Electron's Save panel take
-  over.
+- **Downloads** (`@vellumai/electron-desktop`'s `downloads.ts`, shared with the
+  Windows shell). The counterpart intent to the Share Sheet. The renderer
+  downloads the browser way (`saveFile` → an `<a download>` click), which
+  Chromium raises as a `will-download` on the default session. Without a
+  handler Electron falls back to its default routine and prompts a Save panel
+  for every download, so this picks the save path itself: `~/Downloads`,
+  uniquified Finder-style (`report.pdf`, `report (1).pdf`) so a repeat download
+  never clobbers an existing file. On each terminal state the originating
+  window is sent a `DownloadDoneEvent` (`vellum:downloads:done`), which the
+  renderer surfaces as a completion toast whose "Show in Finder" action calls
+  back over `vellum:downloads:reveal` with the event's opaque id. Main
+  resolves the id to the saved path itself, so the channel can only reveal
+  files this handler saved. The Dock Downloads-stack still bounces via
+  `app.dock.downloadFinished` on completion. `setSavePath` is only honored
+  while the `will-download` listener is on the stack, hence the synchronous
+  `existsSync` collision check rather than the `node:fs/promises` style used
+  elsewhere in the main process. Any failure (unwritable directory, no free
+  name) simply skips `setSavePath` and lets Electron's Save panel take over.
 
 ## Scripts
 
@@ -271,9 +276,12 @@ The preload script exposes a typed `window.vellum` API to the renderer:
   transport seam is [`clients/web/src/runtime/local-mode-host.ts`](../web/src/runtime/local-mode-host.ts),
   which selects this bridge on Electron and the dev-server `/assistant/__local/*`
   middleware on web/dev so both hosts honor the same contract.
-- `helper.hotkey.fnPushToTalk(enable)` — starts or stops the native helper
-  that captures the Fn key globally for Push to Talk, with
-  `helper.hotkey.onEvent(callback)` streaming `down` / `up` notifications.
+- `helper.hotkey.setModifierHold(hold)` points the native helper at the
+  modifier set the voice key rides on (Fn by default), watched globally as a
+  hold. `helper.hotkey.onEvent(callback)` streams its `down` / `up` edges, and
+  the `up` says why it closed, which is how the renderer tells a hold from a
+  double tap. `helper.hotkey.readFrontSelection()` reads what is highlighted
+  in the application in front, which a hold asks for once it has armed.
 - `helper.ping()` — health-checks the native helper over JSON-RPC stdio.
 - `auth.*` — typed stubs that reject with "not implemented yet" until the
   corresponding feature tickets land.

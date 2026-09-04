@@ -7,6 +7,7 @@
 import type { OAuthConnection } from "../../../oauth/connection.js";
 import { getConnectionByProvider } from "../../../oauth/oauth-store.js";
 import { getOrCreateConversation } from "../../../persistence/conversation-key-store.js";
+import { buildScopedConversationKey } from "../../../persistence/delivery-crud.js";
 import { upsertOutboundBinding } from "../../../persistence/external-conversation-store.js";
 import { credentialKey } from "../../../security/credential-key.js";
 import { getSecureKeyAsync } from "../../../security/secure-keys.js";
@@ -100,14 +101,22 @@ export const telegramBotMessagingProvider: MessagingProvider = {
     text: string,
     _options?: SendOptions,
   ): Promise<SendResult> {
-    await telegram.sendMessage(conversationId, text);
+    const sent = await telegram.sendMessage(conversationId, text);
+    if (!sent.lastMessageId) {
+      throw new Error(
+        "Telegram accepted the message but returned no message id",
+      );
+    }
 
     // Upsert external conversation binding so deleted/reset syncs are
     // resurrected when an outbound message is sent. This ensures the
     // conversation key mapping and binding exist for the next inbound.
     try {
       const sourceChannel = "telegram";
-      const conversationKey = `asst:self:${sourceChannel}:${conversationId}`;
+      const conversationKey = buildScopedConversationKey(
+        sourceChannel,
+        conversationId,
+      );
       const { conversationId: internalId } =
         getOrCreateConversation(conversationKey);
       upsertOutboundBinding({
@@ -119,8 +128,10 @@ export const telegramBotMessagingProvider: MessagingProvider = {
       // Best-effort — don't fail the send if binding upsert fails
     }
 
+    // The id is the one Telegram assigned, so a later reaction, edit, or
+    // delete carrying that id resolves to this send.
     return {
-      id: `tg-${Date.now()}`,
+      id: sent.lastMessageId,
       timestamp: Date.now(),
       conversationId,
     };

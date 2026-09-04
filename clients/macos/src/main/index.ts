@@ -8,13 +8,12 @@ import { installCommandPaletteWindow } from "@vellumai/electron-desktop/command-
 import { getDeviceId } from "@vellumai/electron-desktop/device-id";
 import { installDictationOverlay } from "@vellumai/electron-desktop/dictation-overlay-window";
 import {
-  authorizePairedGatewayForwardPlan,
-  executeGatewayForwardPlan,
-  planGatewayForward,
-  planPairedGatewayForward,
+  forwardGatewayRequest,
+  forwardPairedGatewayRequest,
   type GatewayForwardFetcher,
 } from "@vellumai/electron-desktop/gateway-forward";
 import { installPermissionHandler } from "@vellumai/electron-desktop/permissions";
+import { installPairedGatewayRequestGuard } from "@vellumai/electron-desktop/paired-gateway-request-guard";
 import {
   executePlatformForwardPlan,
   planPlatformForward,
@@ -31,7 +30,7 @@ import {
 } from "@vellumai/local-mode";
 
 import { installAbout, openAboutWindow } from "./about.client";
-import { installAutoUpdate } from "./auto-update";
+import { installAutoUpdate } from "./auto-update.client";
 import {
   BUNDLES_DIR_NAME,
   VELLUMAPP_PROTOCOL,
@@ -42,7 +41,6 @@ import { resolveAllowedOrigin } from "./app-origin";
 import { writeCliLocator } from "./cli-installer";
 import { provisionCliForWrapper } from "./cli-path-installer";
 import { handle, handleSync, on } from "./ipc";
-import { installPairedGatewayRequestGuard } from "./paired-gateway-request-guard";
 import { hasPendingDeepLinks, installDeepLinks } from "./deep-links.client";
 import { handleBundleFile, installMacBundleWorkflow } from "./bundles";
 import {
@@ -53,6 +51,7 @@ import {
 } from "./file-open.client";
 import { installAvatarIpc } from "@vellumai/electron-desktop/avatar";
 import { installConnectivityProbe } from "@vellumai/electron-desktop/connectivity-probe";
+import { installDownloads } from "@vellumai/electron-desktop/downloads";
 import { installIdentityIpc } from "@vellumai/electron-desktop/identity";
 import {
   configureNotifications,
@@ -66,8 +65,8 @@ import {
 } from "@vellumai/electron-desktop/status";
 import "./auxiliary-windows.client";
 import { installDock } from "./dock";
-import { installDownloads } from "./downloads";
 import { installShare } from "./share";
+import { installWindowAttentionFeature } from "./window-attention";
 import {
   installEscapeMonitor,
   setDictationRecording,
@@ -278,6 +277,7 @@ const registerAppProtocol = (): void => {
     const proxied = await forwardGatewayRequest(
       request,
       getAllowedGatewayPorts,
+      gatewayForwardFetcher,
     );
     if (proxied) return proxied;
 
@@ -289,14 +289,16 @@ const registerAppProtocol = (): void => {
     const pairedProxied = await forwardPairedGatewayRequest(
       request,
       getPairedGatewayTargets,
+      getPairedGuardianAccessToken,
+      gatewayForwardFetcher,
     );
     if (pairedProxied) {
       return pairedProxied;
     }
 
-    // Platform API routes (`/v1/*`, `/_allauth/*`, `/accounts/*`) forward to
-    // the cloud platform so managed mode works in packaged builds. Mirrors the
-    // Vite dev-server proxy (`clients/web/vite.config.ts` server.proxy entries).
+    // Platform API and first-party session-replay routes (`/v1/*`,
+    // `/_allauth/*`, `/accounts/*`, `/_sr/*`) forward to the cloud platform
+    // so managed mode and desktop replay ingest work in packaged builds.
     const platformProxied = await forwardPlatformRequest(request, platformUrl);
     if (platformProxied) return platformProxied;
 
@@ -319,41 +321,6 @@ const registerAppProtocol = (): void => {
 
 const gatewayForwardFetcher: GatewayForwardFetcher = (url, init) =>
   net.fetch(url, init);
-
-/**
- * Forward a gateway data-plane request (`/assistant/__gateway/{port}/*`) to the
- * local gateway on loopback, or return `null` when the URL is not a gateway
- * request. `net.fetch` runs in the main process, so the renderer only ever
- * talks to its own secure `app://` origin; main does the `http://127.0.0.1`
- * hop.
- */
-const forwardGatewayRequest = async (
-  request: GlobalRequest,
-  getAllowedPorts: () => Set<number>,
-): Promise<Response | null> =>
-  executeGatewayForwardPlan(
-    planGatewayForward(request, getAllowedPorts),
-    request,
-    gatewayForwardFetcher,
-  );
-
-/**
- * Forward a paired-gateway data-plane request
- * (`/assistant/__gateway-paired/{assistantId}/*`) to the remote gateway an
- * imported pairing recorded as its `runtimeUrl`, or return `null` when the URL
- * is not a paired-gateway request. Main does the remote hop so the renderer
- * stays same-origin.
- */
-const forwardPairedGatewayRequest = async (
-  request: GlobalRequest,
-  getTargets: () => Map<string, string>,
-): Promise<Response | null> => {
-  const plan = await authorizePairedGatewayForwardPlan(
-    planPairedGatewayForward(request, getTargets),
-    getPairedGuardianAccessToken,
-  );
-  return executeGatewayForwardPlan(plan, request, gatewayForwardFetcher);
-};
 
 const resolvedConfig = resolveLocalConfigFromEnv(process.env);
 handleSync("vellum:config:get", () => ({
@@ -430,7 +397,10 @@ app
 
     if (!isDev) {
       registerAppProtocol();
-      installPairedGatewayRequestGuard();
+      installPairedGatewayRequestGuard({
+        appOrigin: { protocol: `${APP_PROTOCOL}:`, host: APP_HOST },
+        resolveAllowedOrigin,
+      });
     }
     registerVellumAppProtocol(
       path.join(app.getPath("userData"), BUNDLES_DIR_NAME),
@@ -485,7 +455,7 @@ app
     installShare();
     // Files renderer downloads into ~/Downloads instead of prompting a Save
     // panel. Distinct from `installShare`, which is the "send elsewhere" intent.
-    installDownloads();
+    installDownloads({ handle });
     installPowerEvents();
     configureNotifications({
       ipc: { handle },
@@ -493,6 +463,7 @@ app
       logger: log,
     });
     installNotifications();
+    installWindowAttentionFeature();
     // Register the status channel before the tray installs so the tray's
     // initial render reflects any status the renderer publishes during
     // bootstrap rather than briefly showing the default idle dot.
@@ -516,13 +487,15 @@ app
     installMainWindow();
 
     // After the main window, so the surface opens over a running app rather
-    // than being the first thing on screen at launch. Present from here on,
-    // unless the user has hidden it from the tray or the flag it is behind is
-    // off: the app being frontmost is not one of its states.
+    // than being the first thing on screen at launch. Open from here on,
+    // unless the user has hidden it from the tray, and on screen whenever the
+    // app itself is not in front: it stands in for the app while the user is
+    // working somewhere else, and steps off while Vellum is the frontmost app
+    // with its window showing.
     //
-    // A launch that finds no flag yet leaves it closed and the window that
-    // opens it later is the app's own, once it has an evaluation to write into
-    // settings.
+    // A launch that has nobody signed in yet leaves it closed, and the window
+    // that opens it later is the app's own, once it has an assistant to
+    // publish.
     syncCompanionSurface();
 
     // Runs after the main window so the recovery dialog has a window to sit in

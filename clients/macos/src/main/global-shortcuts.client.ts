@@ -12,6 +12,8 @@ export const installGlobalShortcuts = (): void => {
         void ensureVisible();
       },
       quickInput: toggleQuickInput,
+      // No Talk chord: the voice key's double tap is the keyboard way into a
+      // call on this shell, and it needs no global registration.
     },
     logger: log,
   });

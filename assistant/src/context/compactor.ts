@@ -39,6 +39,10 @@ import type {
 } from "../providers/types.js";
 import { type TrustClass } from "../runtime/actor-trust-resolver.js";
 import { resolveCapabilities } from "../runtime/capabilities.js";
+import {
+  hasValidJpegStructure,
+  sniffImageMimeType,
+} from "../util/image-conversion.js";
 import { getLogger } from "../util/logger.js";
 import { preModelCallSanitize } from "./outbound-sanitize.js";
 import { stripInjectionsForCompaction } from "./strip-injections.js";
@@ -60,16 +64,64 @@ const log = getLogger("compactor");
 const COMPACTION_CALL_SITE: LLMCallSite = "mainAgent";
 
 /**
- * Tag stamped on `llm_request_logs.call_site` for compaction-driven rows.
+ * Tag stamped on `llm_request_logs.call_site` and the usage event's
+ * `callSite` for compaction-driven rows.
  *
  * Distinct from `COMPACTION_CALL_SITE` (above) on purpose: that constant
- * names the **provider config resolution** site (set to `mainAgent` so we
+ * names the provider-config resolution site (set to `mainAgent` so we
  * inherit the agent's profile and keep the prefix cache warm). This
- * constant names the **observability** site — what the row IS — so
- * inspectors can filter "show me only compaction calls". They're
+ * constant names the observability site (what the row is) so
+ * inspectors and usage breakdowns can filter compaction calls. They're
  * semantically different even though both come from the same enum.
  */
 const COMPACTION_LOG_CALL_SITE: LLMCallSite = "compactionAgent";
+
+function compactionUsageAttribution(
+  args: Pick<CompactionRunArgs, "overrideProfile">,
+): Pick<
+  CompactionRunResult,
+  "summaryCallSite" | "summaryResolutionCallSite" | "summaryOverrideProfile"
+> {
+  return {
+    summaryCallSite: COMPACTION_LOG_CALL_SITE,
+    summaryResolutionCallSite: COMPACTION_CALL_SITE,
+    summaryOverrideProfile: args.overrideProfile ?? null,
+  };
+}
+
+/**
+ * What actually served a compaction call, for attribution on both the request
+ * log and the usage row. A wrapper may reroute the request away from the
+ * caller's resolution (`RetryProvider`'s fallback-profile escalation), in
+ * which case the response carries the provider and profile that answered.
+ *
+ * Single source of truth on purpose: the request log and the usage row must
+ * never disagree about which provider ran, and every result-construction site
+ * below spreads {@link servedAttribution} rather than re-deriving the pair.
+ */
+function servedProvider(
+  response: ProviderResponse,
+  provider: Provider,
+): string {
+  return response.actualProvider ?? provider.name;
+}
+
+function servedAttribution(
+  response: ProviderResponse,
+  provider: Provider,
+): Pick<
+  CompactionRunResult,
+  "summaryActualProvider" | "summaryActualInferenceProfile"
+> {
+  return {
+    summaryActualProvider: servedProvider(response, provider),
+    // Only present on a reroute. Absent leaves `summaryOverrideProfile` in
+    // charge, which is what the caller resolved and what actually ran.
+    ...(response.actualInferenceProfile !== undefined
+      ? { summaryActualInferenceProfile: response.actualInferenceProfile }
+      : {}),
+  };
+}
 
 /**
  * Best-effort: persist a successful compaction LLM call into
@@ -96,7 +148,7 @@ function recordCompactionRequestLog(
       JSON.stringify(response.rawRequest),
       JSON.stringify(response.rawResponse),
       undefined,
-      response.actualProvider ?? provider.name,
+      servedProvider(response, provider),
       COMPACTION_LOG_CALL_SITE,
     );
   } catch (err) {
@@ -172,8 +224,8 @@ active decisions, open questions, commitments, project states.
 </retained_images>
 
 <tail_start
-  timestamp="[exact timestamp from the turn_context of the first message to preserve verbatim]"
-  preview="[first ~60 characters of that message for verification]" />
+  timestamp="[exact timestamp from the turn_context of the first preserved user message, or empty if the cut is an assistant turn]"
+  preview="[first ~60 characters of the first preserved message, user or assistant]" />
 </compaction_result>
 </compaction_instructions>`;
 
@@ -316,7 +368,31 @@ export interface CompactionRunResult {
   summaryOutputTokens: number;
   summaryModel: string;
   summaryCallSite?: LLMCallSite;
+  /**
+   * Call site used to resolve the winning inference profile for the
+   * summary. Compaction invokes the provider as `mainAgent` so the
+   * prefix cache stays warm; {@link summaryCallSite} is the observability
+   * tag (`compactionAgent`). Attribution uses this field for profile
+   * selection and {@link summaryCallSite} for the usage-row call site.
+   */
+  summaryResolutionCallSite?: LLMCallSite;
   summaryOverrideProfile?: string | null;
+  /**
+   * Provider that actually served the summary call: the response's
+   * `actualProvider` when a wrapper rerouted the request, otherwise the
+   * configured provider's name. Set on every path that made a call, so the
+   * usage row's `provider` follows a fallback the way its `model` already
+   * does. Absent only where no call happened (see {@link emptyResult}), where
+   * the caller's own provider stands.
+   */
+  summaryActualProvider?: string;
+  /**
+   * Inference profile that actually governed the summary call, set only when
+   * a wrapper rerouted the request away from `summaryOverrideProfile`
+   * (`RetryProvider`'s fallback-profile escalation). Absent on the normal
+   * path, where `summaryOverrideProfile` is already correct.
+   */
+  summaryActualInferenceProfile?: string;
   summaryCacheCreationInputTokens?: number;
   summaryCacheReadInputTokens?: number;
   summaryRawResponses?: unknown[];
@@ -369,7 +445,7 @@ export interface ParsedCompactionResult {
  * Lenient by design — the model may wrap the block in narration, may omit
  * `<retained_images>`, and may produce slightly malformed inner tags. We
  * accept any of those. Returns `null` only when the required fields
- * (summary + tail_start.timestamp) are missing. With
+ * (summary plus a tail_start timestamp or preview) are missing. With
  * `requireTailStart: false` (the fixed-boundary mode, where the caller
  * already owns the cut) an absent `<tail_start>` is tolerated and its
  * fields come back empty.
@@ -398,7 +474,8 @@ export function parseCompactionResult(
   const tail = extractTailStart(inner);
   if (
     opts.requireTailStart !== false &&
-    (!tail || tail.timestamp.length === 0)
+    (!tail ||
+      (tail.timestamp.trim().length === 0 && tail.preview.trim().length === 0))
   ) {
     return null;
   }
@@ -432,7 +509,7 @@ function extractTailStart(
   inner: string,
 ): { timestamp: string; preview: string } | null {
   // Match `<tail_start ... />` or `<tail_start ...></tail_start>` with
-  // attributes in any order. We require at least `timestamp="..."`.
+  // attributes in any order. Timestamp or preview is enough to resolve.
   const tagMatch = inner.match(
     /<tail_start\b([\s\S]*?)(?:\/>|<\/tail_start>)/i,
   );
@@ -657,10 +734,12 @@ export function canonicalDateTimeKey(ts: string): string | null {
  *   1. Exact timestamp match against a `<turn_context>` `current_time:` line
  *   2. Substring match (model may emit a shortened or re-formatted ts)
  *   3. Canonical date+time match (tolerant of weekday/timezone paraphrasing)
- *   4. Preview-text fallback — locate the message whose first non-injection
- *      text starts with the preview string
+ *   4. Preview-text fallback — locate the message (user or assistant)
+ *      whose first non-injection text starts with the preview string.
+ *      The later tool-pairing walk moves an assistant hit back to a
+ *      clean user boundary.
  */
-function resolveTailStartIndex(
+export function resolveTailStartIndex(
   messages: Message[],
   timestamps: (string | null)[],
   parsed: ParsedCompactionResult,
@@ -695,11 +774,7 @@ function resolveTailStartIndex(
   if (wantedPreview.length > 0) {
     const previewHead = wantedPreview.slice(0, 40);
     for (let i = 0; i < messages.length; i++) {
-      const m = messages[i];
-      if (m.role !== "user") {
-        continue;
-      }
-      const head = extractFirstTextPreview(m);
+      const head = extractFirstTextPreview(messages[i]);
       if (head.length > 0 && head.startsWith(previewHead)) {
         return i;
       }
@@ -865,7 +940,8 @@ function resolveTailFloorIndex(messages: Message[], tailIndex: number): number {
 // Retained-image hydration
 // ---------------------------------------------------------------------------
 
-async function buildRetainedImageBlocks(
+/** Exported for unit testing (the corrupt-bytes drop gate). */
+export async function buildRetainedImageBlocks(
   filenames: string[],
   manifest: ManifestEntry[],
 ): Promise<{ blocks: ImageContent[]; resolved: string[]; missing: string[] }> {
@@ -883,7 +959,11 @@ async function buildRetainedImageBlocks(
       missing.push(name);
       continue;
     }
-    const sourceMime = guessMimeFromFilename(name);
+    // Sniff the declared MIME from the stored bytes rather than the filename:
+    // clients derive extensions from user input, and providers reject an image
+    // whose bytes disagree with the declared media type.
+    const sourceMime =
+      sniffImageMimeType(content) ?? guessMimeFromFilename(name);
     // Run the same downscale pass the agent uses when first sending an
     // image. Without this, attachments that exceed the provider's per-image
     // byte limit (Anthropic: 5 MB) crash the next turn after compaction.
@@ -891,6 +971,26 @@ async function buildRetainedImageBlocks(
       content.toString("base64"),
       sourceMime,
     );
+    // Last-line gate before the bytes are baked into the rebuilt history: a
+    // corrupt payload would be rejected by the provider with a 400 on EVERY
+    // subsequent turn, wedging the conversation. Dropping the image loses a
+    // retained picture; shipping it loses the conversation. Format sniffing
+    // alone is not enough for JPEG: a truncated JPEG (e.g. persisted from a
+    // torn conversion-cache read) keeps its SOI header, so JPEG payloads must
+    // also walk to a terminal EOI marker.
+    const optimizedBytes = Buffer.from(optimized.data, "base64");
+    const optimizedFormat = sniffImageMimeType(optimizedBytes);
+    const bytesAreValidImage =
+      optimizedFormat != null &&
+      (optimizedFormat !== "image/jpeg" ||
+        hasValidJpegStructure(optimizedBytes));
+    if (!bytesAreValidImage) {
+      log.warn(
+        { filename: name, attachmentId: entry.attachmentId },
+        "Retained image bytes are not a valid image after transport optimization; dropping",
+      );
+      continue;
+    }
     blocks.push({
       type: "image",
       source: {
@@ -898,6 +998,18 @@ async function buildRetainedImageBlocks(
         media_type: optimized.mediaType,
         data: optimized.data,
       },
+      // The rebuilt block is inline bytes, so the row it came from is only
+      // recoverable from the id the manifest entry already holds. Carrying it
+      // keeps a retained image traceable to its attachment, which is what
+      // camera-frame retention matches on: without it a frame the compaction
+      // model chose to keep would be invisible to every later pass and could
+      // outlive the retention bound.
+      //
+      // Assigned rather than spread through `attachmentIdFragment`, the helper
+      // the conditional producers share: a manifest entry always names a row,
+      // so making the field conditional here would describe an absence the
+      // type rules out.
+      _attachmentId: entry.attachmentId,
     });
     resolved.push(name);
   }
@@ -1023,6 +1135,18 @@ export function buildSummaryMemoryText(
 // Orchestrator
 // ---------------------------------------------------------------------------
 
+/**
+ * A result for every path that compacted nothing: the pre-call bail-outs
+ * (disabled, below threshold, no messages, bad boundary) and the two
+ * provider-error paths, which are spread over with `summaryFailed: true`.
+ *
+ * Deliberately carries no `summaryActualProvider` /
+ * `summaryActualInferenceProfile`: no call was served, so there is nothing to
+ * attribute to, and leaving them absent keeps the caller's own provider and
+ * profile in charge. Nothing is billed either way, since the zero token
+ * counts here make `recordUsage` return before it writes a row. The
+ * call-bearing paths below spread {@link servedAttribution} on top.
+ */
 function emptyResult(
   args: CompactionRunArgs,
   thresholdTokens: number,
@@ -1311,11 +1435,11 @@ export async function runAssistantDrivenCompaction(
       summaryInputTokens: response.usage.inputTokens,
       summaryOutputTokens: response.usage.outputTokens,
       summaryModel: response.model,
+      ...servedAttribution(response, args.provider),
       summaryCacheCreationInputTokens:
         response.usage.cacheCreationInputTokens ?? 0,
       summaryCacheReadInputTokens: response.usage.cacheReadInputTokens ?? 0,
-      summaryCallSite: COMPACTION_CALL_SITE,
-      summaryOverrideProfile: args.overrideProfile ?? null,
+      ...compactionUsageAttribution(args),
       summaryRawResponses: response.rawResponse ? [response.rawResponse] : [],
       summaryRequestLogId,
       summaryCalls: 1,
@@ -1349,11 +1473,11 @@ export async function runAssistantDrivenCompaction(
         summaryInputTokens: response.usage.inputTokens,
         summaryOutputTokens: response.usage.outputTokens,
         summaryModel: response.model,
+        ...servedAttribution(response, args.provider),
         summaryCacheCreationInputTokens:
           response.usage.cacheCreationInputTokens ?? 0,
         summaryCacheReadInputTokens: response.usage.cacheReadInputTokens ?? 0,
-        summaryCallSite: COMPACTION_CALL_SITE,
-        summaryOverrideProfile: args.overrideProfile ?? null,
+        ...compactionUsageAttribution(args),
         summaryRawResponses: response.rawResponse ? [response.rawResponse] : [],
         summaryCalls: 1,
       };
@@ -1519,11 +1643,11 @@ export async function runAssistantDrivenCompaction(
       summaryInputTokens: response.usage.inputTokens,
       summaryOutputTokens: response.usage.outputTokens,
       summaryModel: response.model,
+      ...servedAttribution(response, args.provider),
       summaryCacheCreationInputTokens:
         response.usage.cacheCreationInputTokens ?? 0,
       summaryCacheReadInputTokens: response.usage.cacheReadInputTokens ?? 0,
-      summaryCallSite: COMPACTION_CALL_SITE,
-      summaryOverrideProfile: args.overrideProfile ?? null,
+      ...compactionUsageAttribution(args),
       summaryRawResponses: response.rawResponse ? [response.rawResponse] : [],
       summaryRequestLogId,
       summaryCalls: 1,
@@ -1592,8 +1716,8 @@ export async function runAssistantDrivenCompaction(
     summaryInputTokens: response.usage.inputTokens,
     summaryOutputTokens: response.usage.outputTokens,
     summaryModel: response.model,
-    summaryCallSite: COMPACTION_CALL_SITE,
-    summaryOverrideProfile: args.overrideProfile ?? null,
+    ...compactionUsageAttribution(args),
+    ...servedAttribution(response, args.provider),
     summaryCacheCreationInputTokens:
       response.usage.cacheCreationInputTokens ?? 0,
     summaryCacheReadInputTokens: response.usage.cacheReadInputTokens ?? 0,
@@ -1779,6 +1903,11 @@ export async function runEmergencyCompaction(
       summaryInputTokens: response.usage.inputTokens,
       summaryOutputTokens: response.usage.outputTokens,
       summaryModel: response.model,
+      // This path bills real tokens, so its provider, call site, and
+      // override profile must follow the same attribution as every other
+      // call-bearing compaction path.
+      ...servedAttribution(response, args.provider),
+      ...compactionUsageAttribution(args),
     };
   }
 
@@ -1824,8 +1953,8 @@ export async function runEmergencyCompaction(
     summaryInputTokens: response.usage.inputTokens,
     summaryOutputTokens: response.usage.outputTokens,
     summaryModel: response.model,
-    summaryCallSite: COMPACTION_CALL_SITE,
-    summaryOverrideProfile: args.overrideProfile ?? null,
+    ...compactionUsageAttribution(args),
+    ...servedAttribution(response, args.provider),
     summaryCacheCreationInputTokens:
       response.usage.cacheCreationInputTokens ?? 0,
     summaryCacheReadInputTokens: response.usage.cacheReadInputTokens ?? 0,

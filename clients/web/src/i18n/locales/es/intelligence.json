@@ -101,6 +101,13 @@
     "renameErrorToast": "El cambio de nombre no se completó. Vuelve a intentarlo.",
     "renameSuccessToast": "¡Saluda a {newName}!",
     "scheduleCadence": "{cadence} · próxima {nextRun}",
+    "scheduleGhosts": {
+      "inboxTriageCadence": "Cada 2 horas",
+      "inboxTriageName": "Revisión del buzón",
+      "morningBriefingCadence": "Cada día laborable a las 8:00",
+      "morningBriefingName": "Resumen matutino"
+    },
+    "setUpSchedule": "Crear una",
     "updateAvatarAndName": "Actualizar avatar y nombre",
     "viewMoreSchedules": "{count, plural, one {Ver # más…} other {Ver # más…}}"
   },
@@ -131,7 +138,7 @@
     },
     "superpowers": {
       "description": "Lo que puedo hacer",
-      "label": "Mis superpoderes"
+      "label": "Superpoderes"
     },
     "workspace": {
       "description": "Mis archivos",
@@ -279,6 +286,7 @@
     "workspace": "Espacio de trabajo"
   },
   "skillDetail": {
+    "backToConversationAriaLabel": "Volver a la conversación",
     "backToSkillsAriaLabel": "Volver a las habilidades",
     "filesTab": "Archivos",
     "fileViewModeAriaLabel": "Modo de vista de archivo",
@@ -295,6 +303,7 @@
     "source": "Código"
   },
   "skillDetailPage": {
+    "backToConversation": "Volver a la conversación",
     "backToSuperpowers": "Volver a Mis superpoderes",
     "notFoundSubtitle": "Es posible que esta habilidad se haya eliminado, o que el enlace esté obsoleto.",
     "notFoundTitle": "Habilidad no encontrada"
@@ -385,16 +394,16 @@
   "useIdentitySectionStats": {
     "activeCount": "{count, plural, one {# activa} other {# activas}}",
     "activeLabel": "{count, plural, one {activa} other {activas}}",
+    "appAndDocCount": "{count, plural, one {# app o documento} other {# apps y documentos}}",
     "appCount": "{count, plural, one {# app} other {# apps}}",
     "connectedCount": "{count, plural, one {# conectado} other {# conectados}}",
     "connectedLabel": "{count, plural, one {conectado} other {conectados}}",
-    "docCount": "{count, plural, one {# documento} other {# documentos}}",
     "itemCount": "{count, plural, one {# elemento} other {# elementos}}",
     "itemLabel": "{count, plural, one {elemento} other {elementos}}",
     "noSchedulesText": "Todavía no hay nada programado",
     "personCount": "{count, plural, one {# persona} other {# personas}}",
     "personLabel": "{count, plural, one {persona} other {personas}}",
-    "pluginCount": "{count, plural, one {# plugin} other {# plugins}}",
+    "skillAndPluginCount": "{count, plural, one {# habilidad o plugin} other {# habilidades y plugins}}",
     "skillCount": "{count, plural, one {# habilidad} other {# habilidades}}"
   },
   "usePluginsList": {

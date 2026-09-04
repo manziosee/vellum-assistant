@@ -40,11 +40,27 @@ import type { CommandUrlProvenance } from "@/runtime/native-deep-link";
  * `"online"`: `window.online` fired after `navigator.onLine` flipped
  * back to true; surfaced as a resume so consumers that just want
  * "we're probably stale, refresh" can subscribe to a single channel.
+ * `"window_attention"`: the Electron main process reported the window this
+ * renderer runs in leaving or returning to the screen. It is the desktop
+ * renderer's only source for this edge, because Vellum windows disable
+ * background throttling and that disables the Page Visibility API with it,
+ * so `"visibility"` never fires there.
+ *
+ * The label is load-bearing on the hidden edge. A desktop window off screen
+ * is not the same fact as a mobile app frozen by the OS or a browser tab
+ * backgrounded: the desktop has no push fallback, so `assistant/sse-service.ts`
+ * keeps the stream through a `"window_attention"` hide and tears down on the
+ * other signals. Every other consumer treats the labels alike, which is what
+ * gives the camera back and drops capture consent on a minimize.
  */
-export type AppResumeSignal = "visibility" | "app_state" | "online";
+export type AppResumeSignal =
+  | "visibility"
+  | "app_state"
+  | "online"
+  | "window_attention";
 
 /** Source of a synthetic `"app.hidden"` event. */
-export type AppHiddenSignal = "visibility" | "app_state";
+export type AppHiddenSignal = "visibility" | "app_state" | "window_attention";
 
 /**
  * Which checkout a completed Stripe session belongs to: a Pro
@@ -117,6 +133,25 @@ export interface BusEventMap {
   "app.resume": { signal: AppResumeSignal };
   /** Page hidden / app backgrounded. */
   "app.hidden": { signal: AppHiddenSignal };
+  /**
+   * The Electron window this renderer runs in gained or lost the user's
+   * attention: on screen, unminimized, and holding keyboard focus. Separate
+   * from `app.resume` / `app.hidden`, which report only whether the window is
+   * on screen. A window sitting visible behind another app is still showing
+   * the transcript, so the consumers that release the camera hardware must not
+   * act on a focus change; this edge exists for the ones that ask whether the
+   * user is watching, today the web presence reporter that suppresses a
+   * redundant push.
+   *
+   * The first payload publishes as well, so a consumer that read attention
+   * before the host reported any is corrected rather than left waiting for
+   * the next real edge.
+   *
+   * Off Electron this never fires. `document.hasFocus()` is window-level and
+   * false for a visible tab in an unfocused browser window, so visibility
+   * stays the browser's contract for whether a conversation is on screen.
+   */
+  "app.attention": { attended: boolean };
   /** Browser reported the network came back. Fires alongside `app.resume`. */
   "app.online": Record<string, never>;
   /** Browser reported the network went away. */
@@ -139,6 +174,32 @@ export interface BusEventMap {
   "power.lock": Record<string, never>;
   "power.unlock": Record<string, never>;
   "power.active": Record<string, never>;
+  /**
+   * A `saveFile` download was handed to the browser's own download UI
+   * (plain-browser host only). The browser owns everything after the
+   * handoff, so this is the one signal that host can give: Electron
+   * reports real outcomes via `download.done` instead, and Capacitor's
+   * share sheet is its own feedback, so neither publishes this.
+   * `use-download-feedback` is the consumer and owns the toast.
+   */
+  "download.started": { filename: string };
+  /**
+   * Terminal report for an Electron-host download: pushed by the main
+   * process once it saved (or failed to save) a download this window
+   * started, and published by `saveFile` itself when a URL source fails to
+   * fetch before any download could start (the shell denies the anchor
+   * fallback, so that failure has no other signal). The Capacitor save path
+   * publishes the failure case too, when the source cannot be fetched or
+   * staged before the share sheet presents; a presented sheet remains its
+   * own feedback. `id` accompanies `state: "completed"` and keys the
+   * file-manager reveal (`revealDownload`). The plain-browser host
+   * publishes `download.started` at handoff instead.
+   */
+  "download.done": {
+    id?: string;
+    filename: string;
+    state: "completed" | "interrupted";
+  };
   /**
    * Inbound deep links — `vellum://` / `vellum-assistant://` URLs
    * the OS routed to us, plus notification taps that resolve to a
@@ -220,17 +281,63 @@ export interface BusEventMap {
     provenance: CommandUrlProvenance;
   };
   /**
-   * Electron host only: inbound `<scheme>://connect` URL from the pair
-   * page's "Open in the Vellum app" button or a `vellum pair --qr --app`
-   * QR code. `bundle` is a pairing bundle that prefills the connect
-   * dialog's paste field; it is secret material, so consumers must never
-   * log or breadcrumb it. `url` is the https server base a url+code link
-   * carried (the device-code exchange cannot produce a durable desktop
-   * pairing, so those links get guidance naming the host instead).
-   * `useGlobalDeepLinkConsumer` parks the request in the connect-dialog
-   * store and navigates to the assistant chooser.
+   * A Home Screen widget's camera button was tapped: `<scheme>://camera`.
+   * `useGlobalDeepLinkConsumer` navigates to the assistant and parks the
+   * request, which the composer's attachment layer drains when it mounts
+   * (the composer does not exist yet on a cold launch, and never exists on
+   * settings / logs / account routes).
    */
-  "deeplink.connect": { url: string | null; bundle: string | null };
+  "deeplink.openCamera": {
+    /** As on `deeplink.startVoice`; no consumer gates on it today. */
+    provenance: CommandUrlProvenance;
+  };
+  /**
+   * A Home Screen widget's New Chat button was tapped:
+   * `<scheme>://new-chat`. `useGlobalDeepLinkConsumer` navigates to a fresh
+   * draft conversation through `navigateToNewConversation`.
+   */
+  "deeplink.newChat": {
+    /** As on `deeplink.startVoice`; no consumer gates on it today. */
+    provenance: CommandUrlProvenance;
+  };
+  /**
+   * A Home Screen widget's unread affordance was tapped:
+   * `<scheme>://conversations`. `useGlobalDeepLinkConsumer` parks the request
+   * in `usePendingDeepLinkStore` and lands on the chat; `ChatLayout` drains it
+   * and brings up the conversation list, which on mobile is the drawer and on
+   * a wider window is the sidebar.
+   */
+  "deeplink.openConversations": {
+    /** As on `deeplink.startVoice`; no consumer gates on it today. */
+    provenance: CommandUrlProvenance;
+  };
+  /**
+   * Drain one share-inbox item written by the iOS Share Sheet extension:
+   * `<scheme>://share/<id>`, or a Darwin / resume fallback with no id.
+   * `inboxId` names the item when the command URL arrived; `null` means
+   * take the newest unexpired item (the URL never opened the host). The
+   * payload itself is not on the URL: `useGlobalDeepLinkConsumer` consumes
+   * the App Group inbox and parks a send (`useShareInboxSend`). Inbox
+   * existence is the send-authorization. A forged id finds nothing.
+   */
+  "deeplink.share": { inboxId: string | null };
+  /**
+   * Electron host only: inbound `<scheme>://connect` URL from the pair
+   * page's "Open in the Vellum app" button or a `vellum pair --app`
+   * QR code. `url` is the validated https server base and `code` the
+   * device code the link carried; together they are the pairing link the
+   * connect dialog hands to the local-mode host. `code` is credential
+   * material, so consumers must never log or breadcrumb it. `legacy`
+   * marks a link that carried an older version's pairing bundle, whose
+   * payload the main-process parser drops. `useGlobalDeepLinkConsumer`
+   * parks the request in the connect-dialog store and navigates to the
+   * assistant chooser.
+   */
+  "deeplink.connect": {
+    url: string | null;
+    code: string | null;
+    legacy: boolean;
+  };
   "deeplink.unknown": { url: string };
   /**
    * Connectivity state change from the Electron host. Main fuses
@@ -242,6 +349,34 @@ export interface BusEventMap {
   "connectivity.state": {
     state: "online" | "device-offline" | "backend-unreachable";
   };
+  /**
+   * A daemon SDK request came back with a gateway-class status (502/503/504):
+   * it reached the platform but could not reach the assistant's runtime, which
+   * is restarting or not yet ready. Published by `daemonUnreachableInterceptor`
+   * so the connecting overlay appears even when the failure lands on an
+   * incidental request (a page load, a background refetch) rather than on the
+   * SSE stream. The lifecycle service subscribes and kicks its retry probe.
+   *
+   * Distinct from `connectivity.state`, which is the Electron host's fused
+   * view of device and backend health and never fires off Electron. This one
+   * is derived from a response the client actually received, so it reports on
+   * every platform.
+   */
+  "assistant.unreachable": Record<string, never>;
+  /**
+   * The local gateway rejects the guardian token behind this session, past
+   * what the renderer can repair on its own: the `/auth/token` mint still
+   * answers 401 after the wake `primeLocalGatewayConnectionWithRepair` ran,
+   * and a plain wake never re-leases a guardian token. Only a guardian
+   * re-provision clears it, and that revokes the assistant's other
+   * device-bound tokens, so no automatic path may run it.
+   *
+   * Published by `localGatewayAuthRecoveryInterceptor`, which has no route
+   * to the user, once it has given up. `useGuardianRepairRoute` sends the
+   * session to the assistant chooser, whose connect path owns the
+   * re-provision.
+   */
+  "gateway.guardian-repair-required": Record<string, never>;
 }
 
 export type BusEventName = keyof BusEventMap;

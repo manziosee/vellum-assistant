@@ -18,6 +18,8 @@ beforeEach(() => {
     firstRunSeen: false,
     pauseBeforeReplyMs: null,
     interruptSensitivity: null,
+    flashMode: "off",
+    showKeptFrame: true,
   });
 });
 
@@ -73,6 +75,7 @@ describe("useVoicePrefsStore — voice-mode preferences", () => {
     useVoicePrefsStore.getState().markFirstRunSeen();
     useVoicePrefsStore.getState().setPauseBeforeReplyMs(1500);
     useVoicePrefsStore.getState().setInterruptSensitivity("low");
+    useVoicePrefsStore.getState().setFlashMode("auto");
 
     const raw = localStorage.getItem(VOICE_PREFS_STORE_KEY);
     expect(raw).not.toBeNull();
@@ -83,6 +86,57 @@ describe("useVoicePrefsStore — voice-mode preferences", () => {
     expect(persisted.firstRunSeen).toBe(true);
     expect(persisted.pauseBeforeReplyMs).toBe(1500);
     expect(persisted.interruptSensitivity).toBe("low");
+    expect(persisted.flashMode).toBe("auto");
+    expect(persisted.showKeptFrame).toBe(true);
+  });
+});
+
+describe("useVoicePrefsStore: the kept-frame thumbnail", () => {
+  test("ships on, so a call keeps Live's one visible signal until it is turned off", () => {
+    // The shipped value rather than the reset above, which is a test fixture.
+    expect(useVoicePrefsStore.getInitialState().showKeptFrame).toBe(true);
+  });
+
+  test("setShowKeptFrame flips only that field, and survives a reload", () => {
+    useVoicePrefsStore.getState().setShowKeptFrame(false);
+
+    expect(useVoicePrefsStore.getState().showKeptFrame).toBe(false);
+    expect(useVoicePrefsStore.getState().flashMode).toBe("off");
+
+    const persisted = JSON.parse(
+      localStorage.getItem(VOICE_PREFS_STORE_KEY) as string,
+    ).state;
+    expect(persisted.showKeptFrame).toBe(false);
+
+    useVoicePrefsStore.getState().setShowKeptFrame(true);
+    expect(useVoicePrefsStore.getState().showKeptFrame).toBe(true);
+  });
+});
+
+describe("useVoicePrefsStore: camera flash", () => {
+  test("rests at off, so a call never opens with a flash the user did not ask for", () => {
+    expect(useVoicePrefsStore.getState().flashMode).toBe("off");
+  });
+
+  test("setFlashMode records the choice verbatim", () => {
+    useVoicePrefsStore.getState().setFlashMode("auto");
+    expect(useVoicePrefsStore.getState().flashMode).toBe("auto");
+
+    useVoicePrefsStore.getState().setFlashMode("on");
+    expect(useVoicePrefsStore.getState().flashMode).toBe("on");
+
+    useVoicePrefsStore.getState().setFlashMode("off");
+    expect(useVoicePrefsStore.getState().flashMode).toBe("off");
+  });
+
+  test("holds the choice while a flashless camera is up", () => {
+    // The device is never allowed to write here. A phone flipped to a front
+    // camera with no flash hides the control; flipping back has to restore
+    // what the user picked, not an "off" the hardware chose for them.
+    useVoicePrefsStore.getState().setFlashMode("on");
+    useVoicePrefsStore.getState().setShowUserTranscript(true);
+
+    expect(useVoicePrefsStore.getState().flashMode).toBe("on");
   });
 });
 

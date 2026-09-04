@@ -1,21 +1,27 @@
 import { CheckCircle, Loader2, X } from "lucide-react";
 import { type FormEvent, useState } from "react";
 
-import { Button, Card, Input, Typography } from "@vellumai/design-library";
+import {
+  Button,
+  Card,
+  Checkbox,
+  Input,
+  Typography,
+} from "@vellumai/design-library";
+import { useTranslation } from "@/i18n";
+
+import type { PendingContactRequestState } from "@/types/interaction-ui-types";
 
 export interface ContactPromptCardProps {
-  contactRequest: {
-    requestId: string;
-    channel?: string;
-    placeholder?: string;
-    defaultValue?: string;
-    label?: string;
-    description?: string;
-    role?: string;
-  };
+  contactRequest: PendingContactRequestState;
   isSubmitting: boolean;
   accepted: boolean;
-  onSubmit: (address: string, channelType: string) => void;
+  onSubmit: (
+    address: string,
+    channelType: string,
+    verify: boolean,
+    displayName?: string,
+  ) => void;
   onCancel: () => void;
 }
 
@@ -26,10 +32,24 @@ export function ContactPromptCard({
   onSubmit,
   onCancel,
 }: ContactPromptCardProps) {
+  const { t } = useTranslation("chat");
   // Render sites must key this card by `requestId` so a new contact_request
   // remounts it and re-runs this initializer instead of keeping stale state.
   const [address, setAddress] = useState(contactRequest.defaultValue ?? "");
-  const canSubmit = address.trim().length > 0 && !isSubmitting && !accepted;
+  // The command only proposes this. What the guardian submits is what gets
+  // attested, so the box has to be theirs to uncheck.
+  const [verify, setVerify] = useState(contactRequest.verify === true);
+  // A proposed name means this address would create a contact, so the guardian
+  // gets to name it.
+  const proposesName = Boolean(contactRequest.displayName);
+  const [displayName, setDisplayName] = useState(
+    contactRequest.displayName ?? "",
+  );
+  const canSubmit =
+    address.trim().length > 0 &&
+    (!proposesName || displayName.trim().length > 0) &&
+    !isSubmitting &&
+    !accepted;
 
   // Derive a sensible channelType from the hint (free text → normalised key).
   const channelType = contactRequest.channel?.toLowerCase().trim() || "email";
@@ -39,7 +59,12 @@ export function ContactPromptCard({
     if (!canSubmit) {
       return;
     }
-    onSubmit(address.trim(), channelType);
+    onSubmit(
+      address.trim(),
+      channelType,
+      verify,
+      proposesName ? displayName.trim() : undefined,
+    );
   }
 
   return (
@@ -50,8 +75,18 @@ export function ContactPromptCard({
             variant="label-small-default"
             className="text-[var(--content-primary)]"
           >
-            {contactRequest.label ?? "Add a contact"}
+            {contactRequest.label ?? t("contactPromptCard.addContact")}
           </Typography>
+          {contactRequest.contactDisplayName && (
+            <Typography
+              variant="body-small-default"
+              className="text-[var(--content-secondary)]"
+            >
+              {t("contactPromptCard.addingToContact", {
+                name: contactRequest.contactDisplayName,
+              })}
+            </Typography>
+          )}
           {contactRequest.description && (
             <Typography
               variant="body-small-default"
@@ -67,7 +102,7 @@ export function ContactPromptCard({
             onClick={onCancel}
             disabled={isSubmitting}
             className="shrink-0 text-[var(--content-tertiary)] hover:text-[var(--content-secondary)]"
-            aria-label="Dismiss"
+            aria-label={t("contactPromptCard.dismiss")}
           >
             <X size={16} />
           </button>
@@ -79,19 +114,53 @@ export function ContactPromptCard({
 
         <div className="flex items-center gap-2 text-sm text-[var(--color-success)]">
           <CheckCircle size={16} />
-          Contact saved
+          {t("contactPromptCard.contactSaved")}
         </div>
       ) : (
         <form onSubmit={handleSubmit} className="flex flex-col gap-3">
+          {proposesName && (
+            <Input
+              type="text"
+              value={displayName}
+              onChange={(e) => setDisplayName(e.target.value)}
+              placeholder={t("contactPromptCard.namePlaceholder")}
+              disabled={isSubmitting}
+            />
+          )}
+          {/* Read only: `contacts update` is where notes are edited. */}
+          {contactRequest.notes && (
+            <div className="flex flex-col gap-1">
+              <Typography
+                variant="label-small-default"
+                className="text-[var(--content-secondary)]"
+              >
+                {t("contactPromptCard.notesLabel")}
+              </Typography>
+              <Typography
+                variant="body-small-default"
+                className="text-[var(--content-secondary)]"
+              >
+                {contactRequest.notes}
+              </Typography>
+            </div>
+          )}
           <Input
             type="text"
             value={address}
             onChange={(e) => setAddress(e.target.value)}
             placeholder={
-              contactRequest.placeholder ?? `Enter ${channelType} address`
+              contactRequest.placeholder ??
+              t("contactPromptCard.enterAddress", { channel: channelType })
             }
             disabled={isSubmitting}
             autoFocus
+          />
+          <Checkbox
+            checked={verify}
+            onCheckedChange={(next) => setVerify(next === true)}
+            disabled={isSubmitting}
+            label={t("contactPromptCard.markVerified")}
+            helperText={t("contactPromptCard.markVerifiedHelp")}
           />
           <div className="flex justify-end gap-2">
             <Button
@@ -100,7 +169,7 @@ export function ContactPromptCard({
               onClick={onCancel}
               disabled={isSubmitting}
             >
-              Cancel
+              {t("contactPromptCard.cancel")}
             </Button>
             <Button
               type="submit"
@@ -110,7 +179,9 @@ export function ContactPromptCard({
                 isSubmitting ? <Loader2 className="animate-spin" /> : undefined
               }
             >
-              {isSubmitting ? "Saving…" : "Save"}
+              {isSubmitting
+                ? t("contactPromptCard.saving")
+                : t("contactPromptCard.save")}
             </Button>
           </div>
         </form>

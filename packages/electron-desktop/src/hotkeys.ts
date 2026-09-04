@@ -17,6 +17,13 @@ import type { IpcHandle } from "./ipc";
 
 export interface HotkeysIpc {
   handle: IpcHandle;
+  /**
+   * Catalog commands this shell does not offer. They render no row and take
+   * no override, and their global shortcut is never registered because the
+   * shell passes no handler for them. The macOS shell excludes Talk: its
+   * voice key (a double tap of Fn) is the keyboard way into a call there.
+   */
+  exclude?: readonly string[];
 }
 
 export type { HotkeyScope, ResolvedHotkey };
@@ -24,21 +31,23 @@ export type { HotkeyScope, ResolvedHotkey };
 interface HotkeyCommand {
   /** Key into `settings.hotkeys` and the matching defaults map. */
   key: string;
-  /** User-facing label, matching the native app's Keyboard Shortcuts card. */
+  /** User-facing label for the Keyboard Shortcuts settings row. */
   label: string;
   scope: HotkeyScope;
 }
 
 /**
  * The rebindable commands surfaced in the Keyboard Shortcuts settings, in the
- * same order and with the same labels as the native macOS app's
- * `SettingsAppearanceTab` "Keyboard Shortcuts" card. This is the parity
- * contract: commands the native card does not let the user rebind (voice
- * input, Find, Command Palette, Settings) are intentionally absent.
+ * order their rows render: system-wide shortcuts first, then the menu
+ * commands. This is not the menu's own order and does not track it. Voice
+ * input, Find, Command Palette, and Settings are intentionally absent: they
+ * are bound but not rebindable, and ride along in `RESERVED_COMMANDS` below
+ * so conflict detection still sees their chords.
  */
 const HOTKEY_CATALOG: readonly HotkeyCommand[] = [
   { key: "globalHotkey", label: "Open Vellum", scope: "global" },
   { key: "quickInput", label: "Quick Input", scope: "global" },
+  { key: "toggleVoice", label: "Talk", scope: "global" },
   { key: "newConversation", label: "New chat", scope: "menu" },
   { key: "currentConversation", label: "Current conversation", scope: "menu" },
   {
@@ -46,14 +55,17 @@ const HOTKEY_CATALOG: readonly HotkeyCommand[] = [
     label: "Mark conversation as unread",
     scope: "menu",
   },
+  { key: "togglePinConversation", label: "Pin conversation", scope: "menu" },
   { key: "sidebarToggle", label: "Toggle sidebar", scope: "menu" },
   { key: "popOut", label: "Pop out conversation", scope: "menu" },
-  { key: "home", label: "Home", scope: "menu" },
   { key: "previousConversation", label: "Previous conversation", scope: "menu" },
   { key: "nextConversation", label: "Next conversation", scope: "menu" },
 ];
 
-const CATALOG_KEYS = new Set(HOTKEY_CATALOG.map((command) => command.key));
+let excludedKeys: ReadonlySet<string> = new Set();
+
+const offeredCatalog = (): HotkeyCommand[] =>
+  HOTKEY_CATALOG.filter((command) => !excludedKeys.has(command.key));
 
 /**
  * Commands the app binds but does not expose for rebinding. Their accelerators
@@ -101,7 +113,7 @@ const resolveCommand = (
  * conflict, so carrying it would only add noise.
  */
 export const resolveHotkeyCatalog = (): ResolvedHotkey[] => [
-  ...HOTKEY_CATALOG.map((command) => resolveCommand(command, true)),
+  ...offeredCatalog().map((command) => resolveCommand(command, true)),
   ...RESERVED_COMMANDS.map((command) => resolveCommand(command, false)).filter(
     (entry) => entry.accelerator !== "",
   ),
@@ -116,7 +128,7 @@ export const resolveHotkeyCatalog = (): ResolvedHotkey[] => [
  * and rebuild the menu.
  */
 const writeHotkey = (key: string, accelerator: string | null): void => {
-  if (!CATALOG_KEYS.has(key)) {
+  if (!offeredCatalog().some((command) => command.key === key)) {
     throw new Error(`Unknown hotkey command: ${key}`);
   }
   if (
@@ -151,10 +163,11 @@ let teardown: (() => void) | null = null;
  * broadcast to every window whenever the hotkeys setting changes (including
  * changes a different window initiated) so open settings views stay in sync.
  */
-export const installHotkeysIpc = ({ handle }: HotkeysIpc): void => {
+export const installHotkeysIpc = ({ handle, exclude = [] }: HotkeysIpc): void => {
   if (teardown) {
     return;
   }
+  excludedKeys = new Set(exclude);
 
   handle("vellum:hotkeys:get", z.tuple([]), () => resolveHotkeyCatalog());
   handle(
@@ -178,4 +191,5 @@ export const installHotkeysIpc = ({ handle }: HotkeysIpc): void => {
 export const __resetForTesting = (): void => {
   teardown?.();
   teardown = null;
+  excludedKeys = new Set();
 };

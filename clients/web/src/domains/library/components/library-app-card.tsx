@@ -23,11 +23,7 @@ import { formatFriendlyDate } from "@/utils/format-date";
 import { cn } from "@/utils/misc";
 import { shareApp } from "@/utils/share-app";
 import type { SwipeAction } from "@/hooks/use-swipe-to-reveal";
-import {
-  ActionMenu,
-  Button,
-  toast,
-} from "@vellumai/design-library";
+import { ActionMenu, Button, toast } from "@vellumai/design-library";
 
 interface LibraryAppCardProps {
   app: AppSummary;
@@ -114,7 +110,7 @@ export function LibraryAppCard({
   const trailingActions: SwipeAction[] = [
     {
       id: "pin",
-      label: isPinned ? "Unpin" : "Pin",
+      label: isPinned ? t("libraryAppCard.unpin") : t("libraryAppCard.pin"),
       icon: isPinned ? PinOff : Pin,
       onSelect: () => onPin(app),
     },
@@ -122,7 +118,7 @@ export function LibraryAppCard({
       ? ([
           {
             id: "delete",
-            label: "Delete",
+            label: t("libraryAppCard.delete"),
             icon: Trash2,
             variant: "destructive",
             onSelect: () => deleteAction(app),
@@ -250,9 +246,7 @@ export function LibraryAppCardActionsMenu({
       <ActionMenu.Content title={title}>
         <ActionMenu.Item
           icon={isPinned ? PinOff : Pin}
-          label={
-            isPinned ? t("libraryAppCard.unpin") : t("libraryAppCard.pin")
-          }
+          label={isPinned ? t("libraryAppCard.unpin") : t("libraryAppCard.pin")}
           onSelect={onPin}
         />
         {onShare ? (
@@ -269,7 +263,7 @@ export function LibraryAppCardActionsMenu({
               icon={Link2}
               label={t("libraryAppCard.deployed")}
               description={<span className="break-all">{deployedUrl}</span>}
-              shortcut={t("libraryAppCard.copyLink")}
+              trailing={t("libraryAppCard.copyLink")}
               onSelect={() => onCopyDeployedLink?.()}
             />
             <ActionMenu.Item
