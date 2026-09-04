@@ -174,6 +174,13 @@ mock.module("electron", () => ({
   // test imports it, and an export missing from a whole-module mock fails the
   // file at load rather than in the case that uses it.
   Menu: { buildFromTemplate: () => ({ popup: () => undefined }) },
+  // The pasteboard the offer's Copy writes to. Recorded rather than counted,
+  // since what a case has to be able to say is which words were taken.
+  clipboard: {
+    writeText: (text: string) => {
+      copied.push(text);
+    },
+  },
   shell: { openExternal: () => Promise.resolve() },
   screen: {
     getCursorScreenPoint: () => ({ x: 0, y: 0 }),
@@ -185,6 +192,9 @@ mock.module("electron", () => ({
     },
   },
 }));
+
+/** Every text main has put on the pasteboard, most recent last. */
+const copied: string[] = [];
 
 /** Main's display listeners, so a case can rearrange the displays. */
 const screenListeners: { event: string; listener: () => void }[] = [];
@@ -492,6 +502,7 @@ beforeEach(() => {
   ];
   windowBounds = null;
   boundsAsked.length = 0;
+  copied.length = 0;
   resolvedPick = null;
   picksResolved.length = 0;
   // The user is working somewhere else, with the app's window open behind
@@ -2273,9 +2284,16 @@ describe("the offer of Vellum's dictation on the surface", () => {
   test("carries the offer through to the surface", () => {
     send("vellum:companion:setContext", {
       ...context(),
-      dictationOffer: { app: "Wispr Flow", text: "Send me the files." },
+      dictationOffer: {
+        reason: "claimed",
+        id: "offer-1",
+        app: "Wispr Flow",
+        text: "Send me the files.",
+      },
     });
     expect(state().dictationOffer).toEqual({
+      reason: "claimed",
+      id: "offer-1",
       app: "Wispr Flow",
       text: "Send me the files.",
     });
@@ -2289,7 +2307,12 @@ describe("the offer of Vellum's dictation on the surface", () => {
   test("stops offering once the window that made the offer is gone", () => {
     send("vellum:companion:setContext", {
       ...context(),
-      dictationOffer: { app: "Wispr Flow", text: "Send me the files." },
+      dictationOffer: {
+        reason: "claimed",
+        id: "offer-1",
+        app: "Wispr Flow",
+        text: "Send me the files.",
+      },
     });
     expect(state().dictationOffer).toBeDefined();
 
@@ -2309,15 +2332,92 @@ describe("the offer of Vellum's dictation on the surface", () => {
    * user is standing in that application, so none of them raises the app.
    */
   test("forwards every answer without raising the app", () => {
-    for (const answer of ["use", "quit", "dismiss"] as const) {
-      send("vellum:companion:answerDictationOffer", answer);
+    for (const answer of ["use", "quit", "copy", "dismiss"] as const) {
+      send("vellum:companion:answerDictationOffer", answer, "offer-2");
     }
     expect(dispatched).toEqual([
-      { kind: "answerDictationOffer", answer: "use" },
-      { kind: "answerDictationOffer", answer: "quit" },
-      { kind: "answerDictationOffer", answer: "dismiss" },
+      { kind: "answerDictationOffer", answer: "use", offerId: "offer-2" },
+      { kind: "answerDictationOffer", answer: "quit", offerId: "offer-2" },
+      { kind: "answerDictationOffer", answer: "copy", offerId: "offer-2" },
+      { kind: "answerDictationOffer", answer: "dismiss", offerId: "offer-2" },
     ]);
     expect(windowsRaised).toBe(0);
+  });
+
+  /**
+   * The one answer main acts on itself. It owns the pasteboard, and neither
+   * window either side of it can write one: the surface's never takes focus,
+   * which is what a renderer's clipboard write needs.
+   */
+  test("a copy takes the offered words to the pasteboard", () => {
+    send("vellum:companion:setContext", {
+      ...context(),
+      dictationOffer: {
+        reason: "no-text-field",
+        id: "offer-2",
+        text: "onions, tomatoes, and a bag of rice",
+      },
+    });
+
+    send("vellum:companion:answerDictationOffer", "copy", "offer-2");
+
+    expect(copied).toEqual(["onions, tomatoes, and a bag of rice"]);
+  });
+
+  /** Every other answer leaves the user's pasteboard as they left it. */
+  test("no other answer touches the pasteboard", () => {
+    send("vellum:companion:setContext", {
+      ...context(),
+      dictationOffer: {
+        reason: "no-text-field",
+        id: "offer-2",
+        text: "onions, tomatoes, and a bag of rice",
+      },
+    });
+
+    for (const answer of ["use", "quit", "dismiss"] as const) {
+      send("vellum:companion:answerDictationOffer", answer, "offer-2");
+    }
+
+    expect(copied).toEqual([]);
+  });
+
+  /**
+   * A press racing the offer's own expiry. The answer still travels, since
+   * the window that published it is the one that has to stop.
+   */
+  test("a copy with nothing waiting takes nothing and still answers", () => {
+    send("vellum:companion:answerDictationOffer", "copy", "offer-2");
+
+    expect(copied).toEqual([]);
+    expect(dispatched).toEqual([
+      { kind: "answerDictationOffer", answer: "copy", offerId: "offer-2" },
+    ]);
+  });
+
+  /**
+   * A press on a card the surface has not repainted yet, after a new hold
+   * has already replaced the offer here. The pasteboard is not given words
+   * the user never read, and the answer still travels named so the window
+   * publishing the new offer can drop it too.
+   */
+  test("a copy naming an offer that has been replaced takes nothing", () => {
+    send("vellum:companion:setContext", {
+      ...context(),
+      dictationOffer: {
+        reason: "no-text-field",
+        id: "offer-3",
+        text: "the words that took its place",
+      },
+    });
+    dispatched.length = 0;
+
+    send("vellum:companion:answerDictationOffer", "copy", "offer-2");
+
+    expect(copied).toEqual([]);
+    expect(dispatched).toEqual([
+      { kind: "answerDictationOffer", answer: "copy", offerId: "offer-2" },
+    ]);
   });
 });
 

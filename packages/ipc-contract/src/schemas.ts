@@ -177,12 +177,23 @@ export const companionContextSchema = z.object({
   dictationText: z.string().max(COMPANION_DICTATION_TAIL).catch("").default(""),
   // Optional rather than defaulted, for the reason `watchRetro` is: an offer
   // is a claim that something was said, and absence is the only way to say
-  // nothing was. Bounded at the boundary as `dictationText` is.
+  // nothing was. Bounded at the boundary as `dictationText` is, and narrowed
+  // on the reason so a card cannot be handed an app name for a case that has
+  // no app, or left without one for the case that needs it.
   dictationOffer: z
-    .object({
-      app: z.string().max(80),
-      text: z.string().max(COMPANION_DICTATION_OFFER_MAX),
-    })
+    .discriminatedUnion("reason", [
+      z.object({
+        reason: z.literal("claimed"),
+        id: z.string().max(64),
+        app: z.string().max(80),
+        text: z.string().max(COMPANION_DICTATION_OFFER_MAX),
+      }),
+      z.object({
+        reason: z.literal("no-text-field"),
+        id: z.string().max(64),
+        text: z.string().max(COMPANION_DICTATION_OFFER_MAX),
+      }),
+    ])
     .optional(),
 });
 

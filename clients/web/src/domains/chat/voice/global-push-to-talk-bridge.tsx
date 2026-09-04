@@ -24,6 +24,7 @@ import {
   armDictationOfferWatch,
   clearDictationOffer,
   setDictationOffer,
+  setUnplacedDictationOffer,
 } from "@/domains/chat/voice/dictation-offer-store";
 import {
   findRunningFnClaimant,
@@ -193,6 +194,12 @@ function showVoiceErrorToast(code: string): void {
  * be done, in the composer, so nothing said is lost. A paste the system turned
  * away says so once, with a stable id, and marks the recording so the overlay
  * shows the failure rather than a check.
+ *
+ * A front application with nowhere to put the words is not a failure and is
+ * not announced as one. Nothing is pasted, nothing is denied, and the user is
+ * not in the app to read a message about it: the words go up on the companion
+ * instead, where they can be copied, and into the composer behind that in
+ * case the surface is not on screen at all.
  */
 async function landInFrontApp(
   text: string,
@@ -207,7 +214,9 @@ async function landInFrontApp(
     return;
   }
 
-  if (frontAppInsertion.status === "automation-denied") {
+  if (frontAppInsertion.status === "no-text-field") {
+    setUnplacedDictationOffer(text);
+  } else if (frontAppInsertion.status === "automation-denied") {
     showVoiceErrorToast("dictation-automation-denied");
     useVoiceRecordingStore
       .getState()

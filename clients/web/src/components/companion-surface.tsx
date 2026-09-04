@@ -322,8 +322,8 @@ export const NAME_DWELL_MS = 500;
 const TRANSCRIPT_WIDTH = 244;
 
 /**
- * The width of the offer's line in the pill: the other app's name and a few
- * words, since the words themselves are on the card beside it.
+ * The width of the offer's line in the pill: a few words and, where there is
+ * one, the other app's name. The words themselves are on the card beside it.
  */
 const OFFER_WIDTH = 200;
 
@@ -604,10 +604,11 @@ export interface CompanionSurfaceProps {
    */
   onWatchRetro?: (open: boolean) => void;
   /**
-   * Vellum's version of a dictation another app pasted, while the offer to
-   * use it stands. Its own prop for the reason {@link CompanionSurfaceProps.watchRetro}
-   * is: a call outranks the phase, and an offer must not lose its answer
-   * because the user picked up the phone.
+   * A dictation's words while the offer of them stands, and why they were
+   * not simply typed where the user was. Its own prop for the reason
+   * {@link CompanionSurfaceProps.watchRetro} is: a call outranks the phase,
+   * and an offer must not lose its answer because the user picked up the
+   * phone.
    */
   dictationOffer?: CompanionDictationOffer;
   /**
@@ -1476,9 +1477,10 @@ function DictatingBody({
 }
 
 /**
- * The pill's line while Vellum's version of a dictation is on offer beside it.
+ * The pill's line while a dictation's words are on offer beside it.
  *
- * Only the fact and the other app's name. The words and the answers are on
+ * Only why they are being offered: the other app that pasted its own version,
+ * or that nothing in front would take them. The words and the answers are on
  * the card ({@link CompanionSurfaceProps.offer}), since the pill is one line
  * tall and the words have to be read whole.
  */
@@ -1491,7 +1493,9 @@ function OfferBody({ offer }: { offer: CompanionDictationOffer }) {
         className="truncate text-[12px] text-white/85"
         style={{ width: OFFER_WIDTH }}
       >
-        {t("companionSurface.offerHeard", { app: offer.app })}
+        {offer.reason === "claimed"
+          ? t("companionSurface.offerHeard", { app: offer.app })
+          : t("companionSurface.offerNowhere")}
       </span>
     </div>
   );

@@ -148,12 +148,14 @@ export type VellumCommand =
    */
   | { kind: "answerWatchRetro"; open: boolean }
   /**
-   * Answer the offer the surface makes when another dictation app pasted
-   * what the voice key heard: put Vellum's version in its place, get that
-   * app off the key, or leave things as they are. See
+   * Answer the offer the surface makes when a dictation ends with its words
+   * still in hand: put Vellum's version in place of what another app pasted,
+   * get that app off the key, take the words to the clipboard, or leave
+   * things as they are. `offerId` names the offer the card was drawn
+   * against, and an answer to one that no longer stands is dropped. See
    * {@link CompanionDictationOffer}.
    */
-  | { kind: "answerDictationOffer"; answer: DictationOfferAnswer }
+  | { kind: "answerDictationOffer"; answer: DictationOfferAnswer; offerId: string }
   /**
    * Start a live-voice session, or end the one that is running.
    *
@@ -653,6 +655,15 @@ export interface ShowNotificationPayload {
 export type TextInsertionResult =
   | { status: "inserted" }
   | { status: "vellum-focused" }
+  /**
+   * Nothing in the application in front takes text, so no paste was sent and
+   * the clipboard was left alone.
+   *
+   * Its own answer rather than one of the failures below, because nothing
+   * failed: the words were never handed to the system. The caller still holds
+   * them and is the side that decides where they go instead.
+   */
+  | { status: "no-text-field" }
   | { status: "automation-denied" }
   | { status: "blocked" };
 
@@ -1189,19 +1200,42 @@ export interface CompanionCharacter {
 export type CompanionWatchRetro = "pending" | "ready";
 
 /**
- * Vellum's version of a dictation another app has already pasted.
+ * Words a dictation produced that the surface is holding out to the user,
+ * and why they were not simply typed where the user was.
  *
- * Nothing on macOS owns a key, so a hold of the voice key with another
- * dictation app running dictates twice. Rather than paste beside that app's
- * words, Vellum offers its own: the surface shows them and asks whether to
- * use them instead, to get the other app off the key, or to leave it. `app`
- * is that app's name; `text` is bounded at
- * {@link COMPANION_DICTATION_OFFER_MAX}.
+ * Two things end a hold with the words still in hand, and the surface draws
+ * the same card for both. `claimed`: another dictation app heard the key
+ * too, since nothing on macOS owns one, and has already pasted its own
+ * version, so Vellum offers to put its own in place instead, to get that app
+ * off the key, or to leave it. `no-text-field`: nothing in the application
+ * in front takes text, so no paste was sent at all and the only place left
+ * to put the words is the clipboard.
+ *
+ * The reason is what the card reads to pick its answers, since the two cases
+ * can offer nothing in common: there is no app to quit when none claimed the
+ * key, and nowhere to "use" the words when nothing takes text. `text` is
+ * bounded at {@link COMPANION_DICTATION_OFFER_MAX} on both.
  */
-export interface CompanionDictationOffer {
-  app: string;
+interface OfferedDictation {
+  /**
+   * Which offer this is, minted where the words are parked and carried back
+   * on the answer.
+   *
+   * The same bargain {@link VoiceActivityControl.requestId} makes. A hold
+   * replacing an offer reaches main before it reaches the surface, so a press
+   * on the card still on screen can arrive after main is already holding
+   * different words. Copying those would put on the pasteboard something the
+   * user never read, and dismissing them would answer a question they were
+   * never asked, so the press names its offer and a press for one that no
+   * longer stands is dropped.
+   */
+  id: string;
   text: string;
 }
+
+export type CompanionDictationOffer =
+  | (OfferedDictation & { reason: "claimed"; app: string })
+  | (OfferedDictation & { reason: "no-text-field" });
 
 /**
  * The most an offered dictation can be, in characters. One bound for the
@@ -1210,7 +1244,17 @@ export interface CompanionDictationOffer {
  */
 export const COMPANION_DICTATION_OFFER_MAX = 2000;
 
-export type DictationOfferAnswer = "use" | "quit" | "dismiss";
+/**
+ * What the user pressed on the offer's card.
+ *
+ * Which of these a card draws is the offer's reason to decide, and each is
+ * answered by the side that can act on it: `use` and `quit` reach the window
+ * holding the words and the way into the application they came from, `copy`
+ * is main's because main owns the pasteboard and the surface's window never
+ * takes focus, and `dismiss` acts on nothing. Every one of them travels, so
+ * the window still publishing the offer stops.
+ */
+export type DictationOfferAnswer = "use" | "quit" | "copy" | "dismiss";
 
 /**
  * What a watch session reads, once the user has picked: one display or one

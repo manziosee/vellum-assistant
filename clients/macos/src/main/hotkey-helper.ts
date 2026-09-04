@@ -102,6 +102,11 @@ const FRONTMOST_APP_SCHEMA = z.object({
   bundleId: z.string().nullable(),
 });
 
+const FRONT_FOCUS_SCHEMA = z.object({
+  focused: z.boolean(),
+  takesText: z.boolean(),
+});
+
 const HOTKEY_RESULT_SCHEMA = z.object({
   enabled: z.boolean(),
 });
@@ -343,6 +348,33 @@ const sendInputActivityWatch = async (enable: boolean): Promise<boolean> => {
       `[mac-helper] input activity watch failed: ${err instanceof Error ? err.message : String(err)}`,
     );
     return false;
+  }
+};
+
+/**
+ * Whether a paste sent to the application in front would land in something
+ * that takes text.
+ *
+ * True on every answer but a confident no. A helper that is not running, not
+ * trusted, or slow to answer cannot see a text field that is genuinely there,
+ * and the cost of the two mistakes is not the same: withholding a paste that
+ * would have worked breaks dictation into that application, where sending one
+ * that lands nowhere is caught downstream and the words are offered instead.
+ */
+export const frontAppTakesText = async (): Promise<boolean> => {
+  try {
+    const result = await client.call("focus.read");
+    const parsed = FRONT_FOCUS_SCHEMA.safeParse(result);
+    if (!parsed.success) {
+      log.warn("[mac-helper] focus read returned an invalid result");
+      return true;
+    }
+    return parsed.data.takesText;
+  } catch (err) {
+    log.warn(
+      `[mac-helper] focus read failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return true;
   }
 };
 

@@ -152,7 +152,15 @@ function currentOffer(): CompanionDictationOffer | undefined {
   if (offer === null) {
     return undefined;
   }
-  return { app: offer.app.name, text: offer.text };
+  if (offer.reason === "no-text-field") {
+    return { reason: "no-text-field", id: offer.id, text: offer.text };
+  }
+  return {
+    reason: "claimed",
+    id: offer.id,
+    app: offer.app.name,
+    text: offer.text,
+  };
 }
 
 /**
@@ -241,6 +249,17 @@ function sameTarget(
     : b.kind === "window" && a.windowId === b.windowId;
 }
 
+/**
+ * The app name an offer carries, or undefined where its reason has none.
+ * Named so the comparison below can read one field off both shapes without
+ * narrowing each side first.
+ */
+function offerApp(
+  offer: CompanionDictationOffer | undefined,
+): string | undefined {
+  return offer?.reason === "claimed" ? offer.app : undefined;
+}
+
 /** Whether two payloads would draw the same surface. */
 function sameContext(a: CompanionContext, b: CompanionContext): boolean {
   return (
@@ -255,7 +274,9 @@ function sameContext(a: CompanionContext, b: CompanionContext): boolean {
     a.screenShareEnabled === b.screenShareEnabled &&
     a.dictating === b.dictating &&
     a.dictationText === b.dictationText &&
-    a.dictationOffer?.app === b.dictationOffer?.app &&
+    a.dictationOffer?.id === b.dictationOffer?.id &&
+    a.dictationOffer?.reason === b.dictationOffer?.reason &&
+    offerApp(a.dictationOffer) === offerApp(b.dictationOffer) &&
     a.dictationOffer?.text === b.dictationOffer?.text
   );
 }

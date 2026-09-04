@@ -1305,7 +1305,12 @@ describe("the offer of Vellum's dictation", () => {
     const { container } = render(
       <CompanionSurface
         phase="offer"
-        dictationOffer={{ app: "Wispr Flow", text: "Send me the files." }}
+        dictationOffer={{
+          reason: "claimed",
+          id: "offer-1",
+          app: "Wispr Flow",
+          text: "Send me the files.",
+        }}
         offer={<div data-testid="offer-card" />}
       />,
     );
@@ -1314,6 +1319,23 @@ describe("the offer of Vellum's dictation", () => {
       container.querySelector('[data-testid="offer-card"]'),
     ).not.toBeNull();
     expect(container.querySelectorAll("button")).toHaveLength(0);
+  });
+
+  /** No app claimed the key here, so the line says the other reason. */
+  test("says so when the words had nowhere to go instead", () => {
+    const { container } = render(
+      <CompanionSurface
+        phase="offer"
+        dictationOffer={{
+          reason: "no-text-field",
+          id: "offer-2",
+          text: "onions, tomatoes, and a bag of rice",
+        }}
+        offer={<div data-testid="offer-card" />}
+      />,
+    );
+    expect(container.textContent).toContain("Nowhere to put these");
+    expect(container.textContent).not.toContain("pasted that");
   });
 });
 

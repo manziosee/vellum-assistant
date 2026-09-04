@@ -2,6 +2,7 @@ import {
   BrowserWindow,
   Menu,
   app,
+  clipboard,
   screen,
   systemPreferences,
   type Display,
@@ -1589,15 +1590,35 @@ export const installCompanionWindow = (): void => {
   });
 
   /**
-   * The answer to the offer of Vellum's dictation. Never raises the app: every
-   * answer acts on the application in front, or on nothing, and the user is
-   * standing in that application.
+   * The answer to the offer of a dictation's words. Never raises the app:
+   * every answer acts on the application in front, on the pasteboard, or on
+   * nothing, and the user is standing in that application.
+   *
+   * **Copy is done here** rather than passed on with the rest. Main owns the
+   * pasteboard, and the two windows either side of this one cannot use it: a
+   * renderer's clipboard write needs a focused document, and the surface's
+   * window is a click-through canvas that never takes focus.
+   *
+   * The words copied are the offer the press names, not whichever offer is
+   * standing when it arrives. A hold that replaces an offer reaches here
+   * before it reaches the surface, and a press from that gap would otherwise
+   * put words the user never read onto their pasteboard. The answer travels
+   * either way, and travels named, because the window publishing the offer
+   * has the same gap to guard against.
    */
   on(
     "vellum:companion:answerDictationOffer",
-    z.tuple([z.enum(["use", "quit", "dismiss"])]),
-    ([answer]) => {
-      dispatchWithoutRaising({ kind: "answerDictationOffer", answer });
+    z.tuple([z.enum(["use", "quit", "copy", "dismiss"]), z.string()]),
+    ([answer, offerId]) => {
+      const offered = context.dictationOffer;
+      if (answer === "copy" && offered?.id === offerId) {
+        clipboard.writeText(offered.text);
+      }
+      dispatchWithoutRaising({
+        kind: "answerDictationOffer",
+        answer,
+        offerId,
+      });
     },
   );
 
