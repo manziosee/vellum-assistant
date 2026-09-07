@@ -23,6 +23,20 @@ interface GeminiEmbedResponse {
   };
 }
 
+interface GeminiBatchEmbedResponse {
+  embeddings?: Array<{ values?: number[] }>;
+}
+
+/** Texts per `batchEmbedContents` call, the API's documented maximum. */
+export const GEMINI_EMBED_BATCH_SIZE = 100;
+
+/**
+ * Response statuses that say the batch route itself is unavailable (a proxy
+ * that forwards only `embedContent`), as opposed to a bad request or a
+ * transient failure. The backend then stays on the single route.
+ */
+const BATCH_ROUTE_UNAVAILABLE_STATUSES = new Set([404, 405, 501]);
+
 interface WorkerResponse {
   id?: number;
   type?: string;
@@ -61,6 +75,12 @@ export class GeminiEmbeddingBackend implements EmbeddingBackend {
   private readonly managedBaseUrl?: string;
   private readonly bypassWorker: boolean;
 
+  /**
+   * Set once the batch route has answered that it does not exist, so later
+   * calls take the single route without a wasted round trip per batch.
+   */
+  private batchRouteUnavailable = false;
+
   // Worker subprocess state
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private workerProc: any = null;
@@ -91,6 +111,11 @@ export class GeminiEmbeddingBackend implements EmbeddingBackend {
     return Boolean(this.managedBaseUrl);
   }
 
+  /**
+   * Embed `inputs` in order. Production calls go through the worker subprocess,
+   * which handles all fetches concurrently; the bypass path (test-only) makes
+   * in-process calls with batch support for runs of text inputs.
+   */
   async embed(
     inputs: EmbeddingInput[],
     options?: EmbeddingRequestOptions,
@@ -104,26 +129,160 @@ export class GeminiEmbeddingBackend implements EmbeddingBackend {
     return this.embedViaWorker(inputs, options);
   }
 
-  // In-process path (test-only).
+  // In-process path (test-only): runs HTTP calls on the caller's event loop
+  // with batch support for runs of text inputs.
 
   private async embedInProcess(
     inputs: EmbeddingInput[],
     options?: EmbeddingRequestOptions,
   ): Promise<number[][]> {
+    const normalized = inputs.map(normalizeEmbeddingInput);
+    const vectors: number[][] = new Array(normalized.length);
+    let i = 0;
+    while (i < normalized.length) {
+      const input = normalized[i]!;
+      // Gather the run of text inputs starting here, up to one batch.
+      let end = i;
+      while (
+        !this.batchRouteUnavailable &&
+        end < normalized.length &&
+        end - i < GEMINI_EMBED_BATCH_SIZE &&
+        normalized[end]!.type === "text"
+      ) {
+        end += 1;
+      }
+      if (end - i < 2) {
+        vectors[i] = await this.embedSingle(input, options);
+        i += 1;
+        continue;
+      }
+      const run = normalized.slice(i, end);
+      const batch = await this.embedBatch(run, options);
+      if (batch) {
+        for (let j = 0; j < run.length; j++) {
+          vectors[i + j] = batch[j]!;
+        }
+      } else {
+        for (let j = 0; j < run.length; j++) {
+          vectors[i + j] = await this.embedSingle(run[j]!, options);
+        }
+      }
+      i = end;
+    }
+    return vectors;
+  }
+
+  /**
+   * One `batchEmbedContents` round trip for a run of text inputs. Resolves to
+   * the vectors in input order, or to `null` when the run should be re-sent
+   * as single calls: the route is unavailable (remembered), the request
+   * failed with any status, the request could not be sent, or the body did
+   * not carry one vector per input. A cancelled request rethrows.
+   */
+  private async embedBatch(
+    run: MultimodalEmbeddingInput[],
+    options?: EmbeddingRequestOptions,
+  ): Promise<number[][] | null> {
+    // Unlike `embedContent`, each batched request names its model, and the
+    // API wants the `models/` resource prefix there.
+    const requests = run.map((input) => {
+      const request: Record<string, unknown> = {
+        model: `models/${this.model}`,
+        content: { parts: this.buildParts(input) },
+      };
+      if (this.taskType) {
+        request.taskType = this.taskType;
+      }
+      if (this.dimensions) {
+        request.outputDimensionality = this.dimensions;
+      }
+      return request;
+    });
+    let response: Response;
+    try {
+      response = await fetch(this.endpointUrl("batchEmbedContents"), {
+        method: "POST",
+        headers: this.headers(),
+        body: JSON.stringify({ requests }),
+        signal: options?.signal,
+      });
+    } catch (err) {
+      if (options?.signal?.aborted) {
+        throw err;
+      }
+      log.warn(
+        {
+          inputs: run.length,
+          err: err instanceof Error ? err.message : String(err),
+        },
+        "Gemini batch embeddings request could not be sent; re-sending this batch one text per call",
+      );
+      return null;
+    }
+    if (!response.ok) {
+      // The error body is diagnostic only; a stream that resets while it is
+      // read is one more batch-route fault to fall back from.
+      let responseBody = "";
+      try {
+        responseBody = await response.text();
+      } catch (err) {
+        if (options?.signal?.aborted) {
+          throw err;
+        }
+      }
+      if (BATCH_ROUTE_UNAVAILABLE_STATUSES.has(response.status)) {
+        this.batchRouteUnavailable = true;
+        log.warn(
+          { status: response.status, managed: this.managed },
+          "Gemini batch embeddings route unavailable; embedding one text per call from here on",
+        );
+        return null;
+      }
+      log.warn(
+        { status: response.status, inputs: run.length, responseBody },
+        "Gemini batch embeddings request failed; re-sending this batch one text per call",
+      );
+      return null;
+    }
+    let payload: GeminiBatchEmbedResponse;
+    try {
+      payload = (await response.json()) as GeminiBatchEmbedResponse;
+    } catch (err) {
+      log.warn(
+        {
+          inputs: run.length,
+          err: err instanceof Error ? err.message : String(err),
+        },
+        "Gemini batch embeddings response was not JSON; re-sending this batch one text per call",
+      );
+      return null;
+    }
+    const embeddings = payload.embeddings;
     const vectors: number[][] = [];
-    for (const input of inputs) {
-      vectors.push(await this.embedSingle(input, options));
+    if (Array.isArray(embeddings) && embeddings.length === run.length) {
+      for (const embedding of embeddings) {
+        const values = embedding?.values;
+        if (!Array.isArray(values) || values.length === 0) {
+          break;
+        }
+        vectors.push(values);
+      }
+    }
+    if (vectors.length !== run.length) {
+      log.warn(
+        { inputs: run.length, vectors: vectors.length },
+        "Gemini batch embeddings response did not carry one vector per input; re-sending this batch one text per call",
+      );
+      return null;
     }
     return vectors;
   }
 
   private async embedSingle(
-    input: EmbeddingInput,
+    input: MultimodalEmbeddingInput,
     options?: EmbeddingRequestOptions,
   ): Promise<number[]> {
-    const normalized = normalizeEmbeddingInput(input);
-    const parts = this.buildParts(normalized);
-
+    const parts = this.buildParts(input);
     const body: Record<string, unknown> = { content: { parts } };
     // Do NOT set `model` in the body. Gemini's embedContent API models `model`
     // as a protobuf oneof populated from the URL path (internally `_model`),
@@ -135,19 +294,9 @@ export class GeminiEmbeddingBackend implements EmbeddingBackend {
     if (this.dimensions) {
       body.outputDimensionality = this.dimensions;
     }
-
-    const url = this.managedBaseUrl
-      ? `${this.managedBaseUrl}/v1beta/models/${encodeURIComponent(this.model)}:embedContent`
-      : `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(this.model)}:embedContent?key=${encodeURIComponent(this.apiKey)}`;
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-    };
-    if (this.managedBaseUrl) {
-      headers["Authorization"] = `Bearer ${this.apiKey}`;
-    }
-    const response = await fetch(url, {
+    const response = await fetch(this.endpointUrl("embedContent"), {
       method: "POST",
-      headers,
+      headers: this.headers(),
       body: JSON.stringify(body),
       signal: options?.signal,
     });
@@ -548,7 +697,25 @@ export class GeminiEmbeddingBackend implements EmbeddingBackend {
     })();
   }
 
-  // Shared helper.
+  // Shared helpers.
+
+  /** The model's `:embedContent` or `:batchEmbedContents` URL, direct or via the managed proxy. */
+  private endpointUrl(method: "embedContent" | "batchEmbedContents"): string {
+    const model = encodeURIComponent(this.model);
+    return this.managedBaseUrl
+      ? `${this.managedBaseUrl}/v1beta/models/${model}:${method}`
+      : `https://generativelanguage.googleapis.com/v1beta/models/${model}:${method}?key=${encodeURIComponent(this.apiKey)}`;
+  }
+
+  private headers(): Record<string, string> {
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+    if (this.managedBaseUrl) {
+      headers["Authorization"] = `Bearer ${this.apiKey}`;
+    }
+    return headers;
+  }
 
   private buildParts(input: MultimodalEmbeddingInput): unknown[] {
     if (input.type === "text") {
