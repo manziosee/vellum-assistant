@@ -192,6 +192,21 @@ export async function handleEditIntercept(
       },
       "Edit text unchanged; skipping update",
     );
+    // Even though the text is identical, advance the Slack ordering watermark
+    // when slackEditedTs is present and newer. Without this, a future delayed
+    // delivery of an older edit (A→B→A scenario) would pass the staleness
+    // guard and overwrite the latest content — the watermark must always
+    // reflect the highest observed edited.ts, not just writes that changed text.
+    if (sourceChannel === "slack" && slackEditedTs !== undefined) {
+      advanceSlackEditedAtWatermark({
+        messageId: original.messageId,
+        existingRow,
+        conversationExternalId,
+        sourceMessageId,
+        sourceThreadId,
+        slackEditedTs,
+      });
+    }
     markProcessed(editResult.eventId);
     return {
       accepted: true,
@@ -276,6 +291,69 @@ export async function handleEditIntercept(
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Advance `slackMeta.editedAt` for a no-op edit (identical text) whose
+ * `slackEditedTs` is newer than the stored watermark. This keeps the ordering
+ * guard consistent through A→B→A revision sequences: the watermark always
+ * reflects the highest observed Slack `edited.ts`, so a delayed delivery of B
+ * cannot sneak past the guard and overwrite the latest A content.
+ *
+ * Only updates metadata — never touches message content or triggers reindexing.
+ */
+function advanceSlackEditedAtWatermark(params: {
+  messageId: string;
+  existingRow: MessageRow | null;
+  conversationExternalId: string;
+  sourceMessageId: string;
+  sourceThreadId?: string;
+  slackEditedTs: string;
+}): void {
+  const {
+    messageId,
+    existingRow: row,
+    conversationExternalId,
+    sourceMessageId,
+    sourceThreadId,
+    slackEditedTs,
+  } = params;
+
+  const outerMetadata: Record<string, unknown> =
+    row?.metadata != null ? safeParseRecord(row.metadata) : {};
+  const existingSlackMeta =
+    typeof outerMetadata.slackMeta === "string"
+      ? outerMetadata.slackMeta
+      : undefined;
+
+  const parsedExisting = readSlackMetadata(existingSlackMeta ?? null);
+  const incomingEditedAt = parseFloat(slackEditedTs) * 1000;
+
+  if (
+    parsedExisting?.editedAt !== undefined &&
+    incomingEditedAt <= parsedExisting.editedAt
+  ) {
+    return;
+  }
+
+  const mergedSlackMeta = mergeSlackMetadata(existingSlackMeta ?? null, {
+    ...(parsedExisting
+      ? {}
+      : {
+          source: "slack" as const,
+          channelId: conversationExternalId,
+          channelTs: sourceMessageId,
+          ...(sourceThreadId ? { threadTs: sourceThreadId } : {}),
+          eventKind: "message" as const,
+        }),
+    editedAt: incomingEditedAt,
+  });
+
+  updateMessageContentAndMetadata(
+    messageId,
+    row != null ? stringifyMessageContent(row.content) : "",
+    { slackMeta: mergedSlackMeta },
+  );
+}
 
 /**
  * Apply a Slack edit to the stored message: update content and stamp
