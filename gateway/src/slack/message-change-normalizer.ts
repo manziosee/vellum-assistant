@@ -89,6 +89,9 @@ export function normalizeSlackMessageEdit(
           return conversationType ? { conversationType } : {};
         })(),
         ...(edited.thread_ts ? { threadId: edited.thread_ts } : {}),
+        // Slack's own edit timestamp, used by the runtime to reject out-of-order
+        // deliveries whose edit is older than what is already stored.
+        ...(edited.edited?.ts ? { slackEditedTs: edited.edited.ts } : {}),
       },
       raw: rawEvent,
     },
