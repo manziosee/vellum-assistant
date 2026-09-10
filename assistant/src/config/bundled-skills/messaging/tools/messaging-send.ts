@@ -10,10 +10,21 @@ import {
   getThread,
 } from "../../../../messaging/providers/gmail/client.js";
 import { buildMultipartMime } from "../../../../messaging/providers/gmail/mime-builder.js";
+import {
+  createDraft as createOutlookDraft,
+  createReplyDraft as createOutlookReplyDraft,
+  toOutlookFileAttachments,
+} from "../../../../messaging/providers/outlook/client.js";
+import type { OutlookDraftMessage } from "../../../../messaging/providers/outlook/types.js";
 import { resolveProactiveHomeConversation } from "../../../../notifications/conversation-pairing.js";
 import { recordDeliveredChannelPost } from "../../../../notifications/delivered-post-record.js";
 import { getConversation } from "../../../../persistence/conversation-crud.js";
 import { syncMessageToDisk } from "../../../../persistence/conversation-disk-view.js";
+import { normalizeExternalThreadId } from "../../../../persistence/external-conversation-store.js";
+import {
+  isAbortLikeError,
+  throwIfCancelled,
+} from "../../../../tools/shared/abort.js";
 import type {
   ToolContext,
   ToolExecutionResult,
@@ -25,6 +36,7 @@ import {
   extractEmail,
   extractHeader,
   getProviderConnection,
+  isMailboxAddress,
   ok,
   parseAddressList,
   resolveProvider,
@@ -57,26 +69,48 @@ const ATTACHMENT_CAPABLE_PLATFORMS = new Set(["gmail", "outlook"]);
  * envelope and in `channel_outbound_posts` like every other post the daemon
  * makes.
  *
- * A send made from inside the home conversation itself writes no row: its
- * tool call and result already sit in that conversation's history, and a
- * second assistant row beside the tool pair would break history repair. The
- * post is then in the outbound index only through no path, which is the
- * same class as a raw API send and is deferred with it.
+ * A send into the sending turn's own chat writes no row: its tool call and
+ * result already sit in that conversation's history, and a second assistant
+ * row beside the tool pair would break history repair. Whether the send is
+ * "its own" is decided by the delivered target against the turn, not by the
+ * home: the turn arrived on a channel, in a chat, in a thread (the turn-local
+ * snapshot on the tool context), and a post the provider delivered to exactly
+ * that place is a same-conversation send even when the chat's home resolves
+ * elsewhere, as it does for a thread-scoped chat whose home is the chat's
+ * notification conversation. The delivered thread is the one the provider
+ * reports, not the one requested: a provider that ignores the request lands
+ * the post in the thread-less chat, and the record must say so. The home
+ * comparison stays as the second test, for a sender that arrived through no
+ * channel but is the home. The post is then in the outbound index only
+ * through no path, which is the same class as a raw API send and is deferred
+ * with it.
  *
  * Failures here never fail the send: the message is already out.
  */
 async function recordSentChannelPost(params: {
   providerId: string;
   externalChatId: string;
+  /** The thread the provider delivered into, as it reported it. */
+  deliveredThreadId: string | undefined;
   text: string;
   providerMessageId: string;
-  senderConversationId: string;
+  sender: ToolContext;
 }): Promise<void> {
-  const { providerId, externalChatId } = params;
+  const { providerId, externalChatId, sender } = params;
   if (!isChannelId(providerId) || !params.providerMessageId) {
     return;
   }
   try {
+    if (
+      isSendIntoOwnChat(
+        sender,
+        providerId,
+        externalChatId,
+        params.deliveredThreadId,
+      )
+    ) {
+      return;
+    }
     const home = await resolveProactiveHomeConversation({
       sourceChannel: providerId,
       externalChatId,
@@ -84,7 +118,7 @@ async function recordSentChannelPost(params: {
       conversationType: "background",
       title: `Messages to ${externalChatId}`,
     });
-    if (home.conversationId === params.senderConversationId) {
+    if (home.conversationId === sender.conversationId) {
       return;
     }
     const recorded = await recordDeliveredChannelPost({
@@ -93,7 +127,7 @@ async function recordSentChannelPost(params: {
       externalChatId,
       text: params.text,
       providerMessageId: params.providerMessageId,
-      crossPostedFrom: params.senderConversationId,
+      crossPostedFrom: sender.conversationId,
     });
     const homeConversation = getConversation(home.conversationId);
     if (homeConversation) {
@@ -109,6 +143,32 @@ async function recordSentChannelPost(params: {
       "Failed to record the sent message in the chat's conversation",
     );
   }
+}
+
+/**
+ * True when the delivered chat and thread are the ones the sending turn
+ * arrived in. Reads the turn-local snapshot the tool context carries
+ * (`executionChannel`, `requesterChatId`, `sourceThreadId`), never the live
+ * binding, which a concurrent inbound can rewrite while this call runs.
+ * Thread ids compare in the binding store's normalized form, so an absent
+ * thread on both sides matches and a thread-less delivery never matches a
+ * turn that arrived in a thread.
+ */
+function isSendIntoOwnChat(
+  sender: ToolContext,
+  channel: string,
+  externalChatId: string,
+  deliveredThreadId: string | undefined,
+): boolean {
+  if (!sender.executionChannel || !sender.requesterChatId) {
+    return false;
+  }
+  return (
+    sender.executionChannel === channel &&
+    sender.requesterChatId === externalChatId &&
+    normalizeExternalThreadId(sender.sourceThreadId) ===
+      normalizeExternalThreadId(deliveredThreadId)
+  );
 }
 
 export async function run(
@@ -129,6 +189,8 @@ export async function run(
   if (!text) {
     return err("text is required.");
   }
+
+  throwIfCancelled(context);
 
   try {
     const provider = await resolveProvider(platform);
@@ -220,6 +282,9 @@ export async function run(
             cc: ccList.length > 0 ? ccList.join(", ") : undefined,
             attachments,
           });
+          // Recheck: the thread lookups and the attachment reads above are
+          // awaits, and this creates a real mailbox draft.
+          throwIfCancelled(context);
           const draft = await createDraftRaw(gmailConn, raw, threadId);
 
           const filenames = attachments.map((a) => a.filename).join(", ");
@@ -232,6 +297,9 @@ export async function run(
           );
         }
 
+        // Recheck: the thread and profile lookups above are awaits, and this
+        // creates a real mailbox draft.
+        throwIfCancelled(context);
         const draft = await createDraft(
           gmailConn,
           toList.join(", "),
@@ -263,6 +331,9 @@ export async function run(
           inReplyTo,
           attachments,
         });
+        // Recheck: the attachment reads above are awaits, and this creates a
+        // real mailbox draft.
+        throwIfCancelled(context);
         const draft = await createDraftRaw(gmailConn, raw, threadId);
 
         const filenames = attachments.map((a) => a.filename).join(", ");
@@ -272,6 +343,9 @@ export async function run(
       }
 
       // Without attachments: use standard createDraft
+      // Recheck: provider and connection resolution above are awaits, and
+      // this creates a real mailbox draft.
+      throwIfCancelled(context);
       const draft = await createDraft(
         gmailConn,
         conversationId,
@@ -287,10 +361,72 @@ export async function run(
       );
     }
 
-    // Non-Gmail platforms
+    // Outlook: create a Graph draft instead of sending. Recipients are
+    // optional so a voice-composed email can land in Drafts before the user
+    // names a To address.
+    if (provider.id === "outlook") {
+      if (!conn) {
+        return err(
+          "Outlook requires an OAuth connection. Is the account connected?",
+        );
+      }
+
+      const attachments = attachmentPaths?.length
+        ? await readAttachments(attachmentPaths)
+        : undefined;
+      const graphAttachments = attachments?.length
+        ? toOutlookFileAttachments(attachments)
+        : undefined;
+      const toAddress = isMailboxAddress(conversationId)
+        ? extractEmail(conversationId)
+        : undefined;
+
+      if (inReplyTo) {
+        // Recheck: the attachment reads above are awaits, and this creates a
+        // real mailbox draft.
+        throwIfCancelled(context);
+        const draft = await createOutlookReplyDraft(conn, inReplyTo, text);
+        const recipientSummary = toAddress ? `To: ${toAddress}` : undefined;
+        return ok(
+          formatOutlookDraftCreated({
+            draftId: draft.id,
+            webLink: draft.webLink,
+            recipientSummary,
+            attachmentCount: attachments?.length,
+            filenames: attachments?.map((a) => a.filename).join(", "),
+          }),
+        );
+      }
+
+      const draftBody: OutlookDraftMessage = {
+        subject: subject ?? "",
+        body: { contentType: "text", content: text },
+        ...(toAddress
+          ? { toRecipients: [{ emailAddress: { address: toAddress } }] }
+          : {}),
+        ...(graphAttachments ? { attachments: graphAttachments } : {}),
+      };
+      // Recheck: the attachment reads above are awaits, and this creates a
+      // real mailbox draft.
+      throwIfCancelled(context);
+      const draft = await createOutlookDraft(conn, draftBody);
+      const recipientSummary = toAddress ? `To: ${toAddress}` : undefined;
+      return ok(
+        formatOutlookDraftCreated({
+          draftId: draft.id,
+          webLink: draft.webLink,
+          recipientSummary,
+          attachmentCount: attachments?.length,
+          filenames: attachments?.map((a) => a.filename).join(", "),
+        }),
+      );
+    }
+
+    // Non-email platforms
     const attachments = attachmentPaths?.length
       ? await readAttachments(attachmentPaths)
       : undefined;
+    throwIfCancelled(context);
     const result = await provider.sendMessage(conn, conversationId, text, {
       subject,
       inReplyTo,
@@ -306,13 +442,37 @@ export async function run(
     await recordSentChannelPost({
       providerId: provider.id,
       externalChatId: conversationId,
+      deliveredThreadId: result.threadId,
       text,
       providerMessageId: result.id,
-      senderConversationId: context.conversationId,
+      sender: context,
     });
 
     return ok(`Message sent (ID: ${result.id}${threadSuffix}).`);
   } catch (e) {
+    // A cancelled turn is not a send failure: let it reach the executor's
+    // abort handling instead of being rendered as a tool error.
+    if (isAbortLikeError(e)) {
+      throw e;
+    }
     return err(e instanceof Error ? e.message : String(e));
   }
+}
+
+function formatOutlookDraftCreated(opts: {
+  draftId: string;
+  webLink?: string;
+  recipientSummary?: string;
+  attachmentCount?: number;
+  filenames?: string;
+}): string {
+  const attachmentBit =
+    opts.attachmentCount && opts.filenames
+      ? ` with ${opts.attachmentCount} attachment(s): ${opts.filenames}`
+      : "";
+  const recipientBit = opts.recipientSummary
+    ? ` ${opts.recipientSummary}.`
+    : " No recipient set. Open the draft in Outlook to add one.";
+  const linkBit = opts.webLink ? ` Open it: ${opts.webLink}` : "";
+  return `Outlook draft created${attachmentBit} (Draft ID: ${opts.draftId}).${recipientBit}${linkBit} Review it in your Outlook Drafts, then tell me to send it or send it yourself from Outlook.`;
 }

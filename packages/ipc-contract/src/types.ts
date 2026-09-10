@@ -16,6 +16,8 @@
  *     etc.); those are retired by this package.
  */
 
+import { NOTIFICATION_AVATAR_MAX_LOCAL_BYTES } from "@vellumai/avatar-manifest/notification-avatar";
+
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
@@ -189,7 +191,11 @@ export type VellumCommand =
    * against, and an answer to one that no longer stands is dropped. See
    * {@link CompanionDictationOffer}.
    */
-  | { kind: "answerDictationOffer"; answer: DictationOfferAnswer; offerId: string }
+  | {
+      kind: "answerDictationOffer";
+      answer: DictationOfferAnswer;
+      offerId: string;
+    }
   /**
    * Start a live-voice session, or end the one that is running.
    *
@@ -262,8 +268,13 @@ export type VoiceModeChord =
  * keys are still down and `up` when they are not, so the two edges are a
  * span, and something that has to run for exactly as long as the keys are
  * held can run across it.
+ *
+ * `chord` is a modifier set and a key pressed together, reported once as a
+ * `down` and never bracketed: a chord is over the moment it happens, and what
+ * it asks for takes no time. The host takes the press, so it reaches nothing
+ * else.
  */
-export type HotkeyEventKind = "voiceModeChord" | "modifierHold";
+export type HotkeyEventKind = "voiceModeChord" | "modifierHold" | "chord";
 
 /**
  * Why a `modifierHold` closed.
@@ -301,6 +312,11 @@ export interface HotkeyEvent {
   state: HotkeyEventState;
   /** Only on a `modifierHold` `up`. */
   reason?: ModifierHoldUpReason;
+  /**
+   * Which key was pressed. Only on a `chord`, as the character the key
+   * carries unmodified on the user's own layout.
+   */
+  key?: string;
 }
 
 /** Whether a helper took a binding, or why it did not. */
@@ -319,6 +335,30 @@ export type ModifierHold =
   | { kind: "modifierOnly"; modifiers: KeyboardModifier[] };
 
 export type ModifierHoldRegistrationResult = HotkeyRegistrationResult;
+
+/**
+ * The chords a host watches for: every modifier of the set held together, and
+ * one of `keys` pressed under them. `off` is a binding nothing is asking for.
+ *
+ * Keys are the characters on their keycaps, so the letter the user sees is the
+ * letter that answers on every layout, and the host resolves a press through
+ * the layout rather than through what the key would have typed (Option+S types
+ * "ß" and is still the S key).
+ *
+ * A press that matches belongs to the app, so the host takes it rather than
+ * letting it reach whatever is in front. That is why a binding is armed for
+ * exactly as long as something can answer it: outside that, the keys are the
+ * user's own and their application's.
+ *
+ * Exactly the modifiers named, too. Another one joining makes it a different
+ * shortcut, which is what keeps this out of the way of the ones the user
+ * already has.
+ */
+export type ChordBinding =
+  | { kind: "off" }
+  | { kind: "chord"; modifiers: KeyboardModifier[]; keys: readonly string[] };
+
+export type ChordRegistrationResult = HotkeyRegistrationResult;
 
 // ---------------------------------------------------------------------------
 // System permissions
@@ -675,6 +715,48 @@ export const NOTIFICATION_CATEGORIES = [
 
 export type NotificationCategory = (typeof NOTIFICATION_CATEGORIES)[number];
 
+/**
+ * What a notification avatar's SHA-256 has to look like: 64 lowercase hex
+ * characters. The hash names the file a host writes the avatar to, so anything
+ * else could escape the cache directory. Shared by the IPC boundary that
+ * accepts it and the cache that writes it.
+ */
+export const NOTIFICATION_AVATAR_HASH_PATTERN = /^[0-9a-f]{64}$/;
+
+/**
+ * The longest base64 payload the notification-avatar channel carries: base64
+ * of {@link NOTIFICATION_AVATAR_MAX_LOCAL_BYTES}, the cap the renderer drops a
+ * heavier render at. A payload past this is malformed rather than merely
+ * large, and the host has to cache it on disk, so the boundary refuses it
+ * instead of writing it. Derived from the byte cap rather than restated, so
+ * the two cannot drift.
+ */
+export const NOTIFICATION_AVATAR_BASE64_MAX_CHARS =
+  Math.ceil(NOTIFICATION_AVATAR_MAX_LOCAL_BYTES / 3) * 4;
+
+/**
+ * The assistant a notification is from, for the platforms that render a sender
+ * rather than the app: its name goes on the first line and its notification
+ * avatar becomes the icon.
+ */
+export interface NotificationSender {
+  id: string;
+  name: string;
+  /**
+   * The notification avatar as a base64 PNG with no data prefix, the same
+   * shape {@link VoiceActivityStart.avatarBase64} travels in. The renderer
+   * composites it (avatar on an accent-tinted disc) because main has no
+   * canvas.
+   */
+  avatarBase64: string;
+  /**
+   * SHA-256 of the PNG, 64 lowercase hex characters, so a host can name a
+   * cache file by it. The schema enforces the shape, because the file name is
+   * what it becomes.
+   */
+  avatarHash: string;
+}
+
 /** Renderer → main payload for posting a native notification. */
 export interface ShowNotificationPayload {
   category: NotificationCategory;
@@ -684,6 +766,11 @@ export interface ShowNotificationPayload {
   conversationId?: string;
   toolCallId?: string;
   deepLinkMetadata?: Record<string, unknown>;
+  /**
+   * Absent unless the renderer has a notification avatar to send, which leaves
+   * the notification with the app icon and the title on line one.
+   */
+  sender?: NotificationSender;
 }
 
 export type TextInsertionResult =
@@ -1426,6 +1513,162 @@ export const COMPANION_ANNOTATION_MAX_POINTS = 512;
 export const COMPANION_ANNOTATION_STROKE = 0.006;
 
 /**
+ * One thing the assistant is pointing at on the surface a call is being
+ * shown: the bounds of the thing, and a line about what to do with it.
+ *
+ * **In fractions of the shared surface, from `0` to `1`**, for the reason
+ * {@link CompanionAnnotationStroke} carries fractions. The overlay is a
+ * window sized in points, and what the mark was resolved from is measured in
+ * the target's own units; a fraction of the surface is the one description
+ * both ends agree on, and it survives the scaling between them.
+ *
+ * The bounds are the thing itself rather than the ring drawn for it. The ring
+ * goes outside them, so the control a user is being pointed at stays as
+ * visible as it was before anything was drawn on it.
+ *
+ * For an extent that is itself the message: a region of an image, an area of
+ * a canvas, a panel being named as a whole. To send someone to one control,
+ * see {@link CompanionCoachmarkPoint}.
+ */
+export interface CompanionCoachmarkRegion {
+  kind: "region";
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  caption?: string;
+}
+
+/**
+ * A place on the surface, drawn as an arrow aimed at it.
+ *
+ * **The ordinary way to point, because aim survives error and extent does
+ * not.** A ring asserts where a thing ends as well as where it is, and an
+ * element's bounds are the least trustworthy thing the accessibility tree
+ * reports about it: a control's frame is its hit area, which can be twice the
+ * size of the glyph inside it, and a row can be named by the small triangle
+ * that discloses it. Every one of those rings the wrong shape while knowing
+ * the right place. An arrow makes the weaker claim, so it stays true where the
+ * ring does not.
+ *
+ * `x` and `y` are the point being indicated, not a corner: the arrow's tip
+ * lands there and its tail hangs off whichever side has the room.
+ */
+export interface CompanionCoachmarkPoint {
+  kind: "point";
+  x: number;
+  y: number;
+  caption?: string;
+}
+
+/**
+ * What is drawn on the shared surface: an arrow at something, or a ring
+ * around some extent of it.
+ *
+ * Tagged rather than inferred from which fields are set, because the tag is
+ * the thing that decides what `x` and `y` mean. A corner and a point are
+ * different claims, and a reader that guessed between them by looking for a
+ * width would be one field away from drawing a mark half its own size out of
+ * place.
+ */
+export type CompanionCoachmark =
+  | CompanionCoachmarkRegion
+  | CompanionCoachmarkPoint;
+
+/**
+ * How many marks stand at once, and how long a caption may be.
+ *
+ * A mark is where to look next, so a surface covered in them is nowhere to
+ * look. The bound is low because it is the shape of the feature rather than a
+ * safeguard: past a few marks at once, what is being drawn is not a place to
+ * go but a diagram, and the call is where a diagram gets explained.
+ */
+export const COMPANION_COACHMARK_MAX = 4;
+export const COMPANION_COACHMARK_CAPTION_MAX = 80;
+
+/**
+ * Why a set of marks did not go up, or `null` for marks that did.
+ *
+ * Named refusals rather than one boolean, because the assistant can act on
+ * the difference and each one has its own answer: nothing shared is answered
+ * by asking the user to share, a surface owned by another conversation is not
+ * answered at all, and a surface that moved is answered by looking again.
+ * Told only that it failed, an assistant would ask for a share that is
+ * already running.
+ *
+ * Here rather than beside either end of the call. The window layer decides it
+ * and the host-proxy executor words it, and the file that words it says in as
+ * many words that it must not reach into the windows for anything.
+ */
+export type CoachmarkRefusal =
+  | "unshared"
+  | "not-this-call"
+  | "stale-surface"
+  | "superseded";
+
+/**
+ * One thing to point at: a control named, or a rectangle given.
+ *
+ * **Naming is the one to reach for.** The accessibility tree holds the exact
+ * frame of every labelled control on the surface, so a name resolves to where
+ * the thing actually is; a rectangle is a guess at it, measured off a picture
+ * that has been scaled and compressed on its way to whoever is guessing. The
+ * rectangle form remains for what the tree cannot name (a canvas, an image,
+ * a plugin's own drawing), where there is nothing to resolve against.
+ */
+export type CoachmarkRequest =
+  | { target: string; caption?: string }
+  | { x: number; y: number; width: number; height: number; caption?: string };
+
+/** Whether a request named a control or gave bounds outright. */
+export const namesATarget = (
+  request: CoachmarkRequest,
+): request is { target: string; caption?: string } => "target" in request;
+
+/**
+ * A mark that went up, and what it turned out to be.
+ *
+ * `matched` is the label the surface actually uses, which is not always the
+ * one that was asked for: a control found by a forgiving comparison is
+ * reported under its own name so the caller can say the same word the user
+ * can see.
+ */
+export type PlacedCoachmark = CompanionCoachmark & { matched?: string };
+
+/**
+ * Why a named control could not be turned into a mark.
+ *
+ * Each carries the labels that were on the surface, because the answer to all
+ * three is the same shape: say what is there instead of drawing at a guess.
+ * `ambiguous` lists the ones that fit, the others everything there was.
+ */
+export interface CoachmarkUnresolved {
+  target: string;
+  reason: "no-tree" | "ambiguous" | "no-match";
+  candidates: readonly string[];
+  /**
+   * How many labels the surface carried, which can be more than `candidates`
+   * holds. The host bounds the list at the point it reads the accessibility
+   * tree, since a web page is ten thousand elements and any of them can be
+   * carrying a paragraph of `aria-label`. The count is what lets the reader
+   * say how many names it is not showing.
+   */
+  candidateCount?: number;
+}
+
+/**
+ * What became of a set of marks.
+ *
+ * Three outcomes rather than a nullable refusal, because a named control that
+ * does not resolve is neither a placement nor a refusal of the surface: the
+ * share is fine and the caller simply named something that is not there.
+ */
+export type CoachmarkResult =
+  | { kind: "placed"; marks: readonly PlacedCoachmark[] }
+  | { kind: "refused"; refusal: CoachmarkRefusal }
+  | { kind: "unresolved"; unresolved: CoachmarkUnresolved };
+
+/**
  * One frame of a {@link WatchCaptureTarget}, as the helper took it: a JPEG,
  * with the size it was encoded at. Base64 rather than bytes because it
  * crosses the bridge as JSON.
@@ -1486,13 +1729,21 @@ export interface CompanionCaptureSources {
 }
 
 /**
- * The press on one row of the picker: the source with its decoration removed.
+ * What to capture, as the side asking for it can say it.
  *
- * What the surface hands back to main. A tab is still a tab here, since only
- * main can turn one into a window; the other two are already targets.
+ * Three of these are a press on one row of the picker: the source with its
+ * decoration removed. A tab is still a tab here, since only main can turn one
+ * into a window; the other two are already targets.
+ *
+ * `pointerDisplay` is the fourth and comes from no row at all. It is what a
+ * keyboard gesture means by "this screen", named as the question rather than
+ * as an answer because the answer is the pointer's, and the pointer is main's
+ * to read at the moment the press lands. A renderer that resolved it first
+ * would be handing over where the mouse was a round trip ago.
  */
 export type CompanionCapturePick =
   | { kind: "display"; displayId: number }
+  | { kind: "pointerDisplay" }
   | { kind: "window"; windowId: number }
   | { kind: "tab"; chromeWindowId: number; tabIndex: number };
 
@@ -1588,6 +1839,19 @@ export interface CompanionContext {
    * the share as on only once frames can flow to a session that takes them.
    */
   screenShare?: WatchCaptureTarget;
+  /**
+   * Which conversation the running call belongs to, while one is sharing.
+   *
+   * The marks the assistant places are addressed to a surface and say nothing
+   * about who asked for them, so without this main cannot tell the call's own
+   * conversation from any other the same user has running. A background turn
+   * would otherwise draw on a call it has no part in and be told it worked.
+   *
+   * Published with `screenShare` and withheld with it: a share that cannot
+   * flow is one nothing can be pointed at, so an id beside it would name a
+   * conversation with nothing to own.
+   */
+  callConversationId?: string;
   /**
    * Whether the call in this window can be shown the screen at all: a session
    * is running and its assistant understands the frame. The surface offers
@@ -1846,6 +2110,37 @@ export interface CompanionSurfaceState {
    * about where the next click goes.
    */
   annotating?: boolean;
+
+  /**
+   * What the assistant is pointing at on the shared surface, drawn on the
+   * frame around it. See {@link CompanionCoachmark}.
+   *
+   * Main's rather than the app window's, in the sense that main decides
+   * whether any of them stand: the coordinates are fractions of the surface
+   * the frame is drawn around, so a mark only means anything while the frame
+   * is around the surface the marks were resolved against. Main takes them
+   * down when it is not.
+   *
+   * Optional, and absence means nothing is being pointed at. An empty array
+   * never travels: a shell with nothing to draw says nothing.
+   */
+  coachmarks?: readonly CompanionCoachmark[];
+
+  /**
+   * How far below the top of the framed surface anything the frame draws
+   * there has to start, in the frame window's own pixels, to be seen.
+   *
+   * Main's, because it is a fact about where main put the window: a whole
+   * display is framed to its full bounds so the edge is the screen's, and the
+   * menu bar draws over the top of that window. A label placed against the
+   * edge would sit under the bar. This is the bar's height, read from the
+   * gap between the display's bounds and its work area.
+   *
+   * Absent for a window frame, whose top edge is the window's own title bar
+   * and inside the frame, and absent when nothing is framed. A shell that
+   * predates the field reads as no inset, which is the frame as it was.
+   */
+  frameInsetTop?: number;
 
   /**
    * Whether Watch is offered at all, as the flag was last evaluated for the
