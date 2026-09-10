@@ -212,6 +212,9 @@
     "downloadFileAria": "Download file",
     "editFileAria": "Edit file"
   },
+  "conversationTitle": {
+    "untitled": "Untitled"
+  },
   "createAssistantDialog": {
     "cancel": "Cancel",
     "create": "Create",
