@@ -547,8 +547,12 @@ subgraph "Text Q&A Session"
     %% The gateway builds replyCallbackUrl as <gatewayInternalBaseUrl>/deliver/<channel>,
     %% but isDirectDelivery() short-circuits it: the daemon calls each provider's Web API
     %% itself via messaging/providers and never POSTs the reply back to the gateway.
+    %% The same transport carries proactive sends: the messaging tool and
+    %% POST /v1/channels/send run sendChannelText (runtime/channel-send.ts), which
+    %% asks the transport to address a chat or person (addressFor) and records the
+    %% post after the channel acknowledges it.
     HTTP_RT --> CHANNEL_TX
-    CHANNEL_TX -->|"sendMessage / sendRichMessage<br/>+ attachments"| EXT_TELEGRAM
+    CHANNEL_TX -->|"deliver: replies, streams,<br/>proactive sends + attachments"| EXT_TELEGRAM
 
     %% Gateway flow — Twilio voice webhooks
     GW_TWILIO_VOICE -->|"HTTP"| HTTP_RT
