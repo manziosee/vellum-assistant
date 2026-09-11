@@ -1288,6 +1288,89 @@ export class AgentLoop {
     },
     emergencyOpts?: { minKeepRecentUserTurns?: number },
   ): Promise<CompactionAttempt> {
+    // Emergency path: probe without emitting events first. If nothing compacts
+    // (history too short, no eligible messages), return a no-op result without
+    // touching event counters, injection ledgers, or the durable history base —
+    // firing context_compacting + history_stripped for a no-op would increment
+    // event counters that downstream handlers track.
+    if (emergencyOpts != null) {
+      const preCompactionMessages = history;
+      const probeResult = await defaultCompact({
+        conversationId: this.conversationId,
+        messages: history,
+        signal,
+        force: true,
+        actorTrustClass: trust.trustClass,
+        overrideProfile,
+        minKeepRecentUserTurns: emergencyOpts.minKeepRecentUserTurns,
+      });
+      if (!probeResult.compacted) {
+        return {
+          history: null,
+          compacted: false,
+          exhausted: false,
+          autoCompressApplied: false,
+        };
+      }
+      // Compaction happened; emit events post-hoc with the captured
+      // pre-compaction history as the durable base, then run the POST_COMPACT
+      // hook so memory-injection re-applies onto the compacted history.
+      const compactionId = crypto.randomUUID();
+      const startedAt = Date.now();
+      await onEvent({
+        type: "context_compacting",
+        compactionId,
+        requestId,
+        trigger: "budget",
+        startedAt,
+        messages: preCompactionMessages,
+      });
+      await onEvent({ type: "history_stripped", compactionId });
+      if (probeResult.summaryFailed !== undefined) {
+        await this.recordCompactionOutcome(
+          requestId,
+          probeResult.summaryFailed,
+          onEvent,
+        );
+      }
+      await onEvent({
+        type: "compaction_completed",
+        compactionId,
+        requestId,
+        trigger: "budget",
+        startedAt,
+        finishedAt: Date.now(),
+        ...probeResult,
+      });
+      const injectionLedgersReset =
+        injectionLedgerResets?.delete(compactionId) ?? false;
+      const exhausted = probeResult.exhausted ?? false;
+      const autoCompressApplied = probeResult.autoCompressApplied ?? false;
+      // Compaction produced a clean summarised history; if the ledger was reset,
+      // strip any frozen injections so POST_COMPACT re-injects fresh blocks.
+      const emergencyBase = injectionLedgersReset
+        ? stripInjectionsForCompaction(probeResult.messages)
+        : probeResult.messages;
+      const emergencyPostCompactCtx: PostCompactInputContext = {
+        history: emergencyBase,
+        requestId,
+        conversationId: this.conversationId,
+        isNonInteractive,
+        modelProfileKey,
+        injectionMode: probeResult.injectionMode,
+      };
+      const emergencyFinalCtx = await runHook(
+        HOOKS.POST_COMPACT,
+        emergencyPostCompactCtx,
+      );
+      return {
+        history: emergencyFinalCtx.history,
+        compacted: true,
+        exhausted,
+        autoCompressApplied,
+      };
+    }
+
     const compactionId = crypto.randomUUID();
     const startedAt = Date.now();
     const trigger: CompactionTrigger =
@@ -1321,7 +1404,6 @@ export class AgentLoop {
       actorTrustClass: trust.trustClass,
       overrideProfile,
       overflowSignal,
-      minKeepRecentUserTurns: emergencyOpts?.minKeepRecentUserTurns,
     });
     // `force: true` bypasses the auto-threshold gate, but early returns
     // for "no eligible messages" / "insufficient messages" still leave
@@ -3124,21 +3206,12 @@ export class AgentLoop {
           looksLikeContextOverflowError(error) &&
           (options.resolveContextWindow?.().overflowRecovery.enabled ?? false)
         ) {
-          if (overflowLadderExhausted) {
-            await stopTurn(
-              overflowAutoCompressApplied
-                ? "budget_yield_unrecovered"
-                : "context_too_large",
-              err,
-            );
-            break;
-          }
           // When the loop made progress before this overflow (tool calls
-          // appended to history), attempt a fast emergency compaction
-          // (force-compact with minKeepRecentUserTurns=0) before entering the
-          // graduated reduction ladder. If the emergency pass frees enough
-          // headroom, skip the ladder and retry the provider call immediately;
-          // a failed pass (nothing to compact) falls through to the ladder.
+          // appended to history), attempt a fast emergency compaction before
+          // entering — or re-checking — the graduated reduction ladder. This
+          // runs even when the ladder is exhausted: progress after exhaustion
+          // means new history was added, which a fresh force-compact may free.
+          // A no-op probe (nothing to compact) is cheap and fires no events.
           if (toolUseTurns > 0) {
             const emergencyAttempt = await this.compact(
               history,
@@ -3159,12 +3232,24 @@ export class AgentLoop {
                 rlog,
               );
               newMessagesStart = history.length;
+              // Freed headroom resets the exhaustion latch — the ladder can
+              // try again if this retry also overflows.
+              overflowLadderExhausted = false;
               rlog.info(
                 { turn: toolUseTurns },
                 "Emergency compaction freed headroom after progress + overflow; retrying provider call",
               );
               continue;
             }
+          }
+          if (overflowLadderExhausted) {
+            await stopTurn(
+              overflowAutoCompressApplied
+                ? "budget_yield_unrecovered"
+                : "context_too_large",
+              err,
+            );
+            break;
           }
           const actualTokens = parseActualTokensFromError(error);
           if (actualTokens !== null) {
