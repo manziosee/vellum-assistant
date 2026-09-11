@@ -12,7 +12,10 @@ import {
 } from "../context/token-estimator.js";
 import { spoolAndStubOversizedToolResults } from "../context/tool-result-spool.js";
 import type { ToolActivityMetadata } from "../daemon/message-types/web-activity.js";
-import { parseActualTokensFromError } from "../daemon/parse-actual-tokens-from-error.js";
+import {
+  looksLikeContextOverflowError,
+  parseActualTokensFromError,
+} from "../daemon/parse-actual-tokens-from-error.js";
 import type { TrustContext } from "../daemon/trust-context-types.js";
 import type {
   AgentLoopExitReason,
@@ -30,6 +33,7 @@ import {
 import type { AssistantTextVisibility } from "../persistence/user-facing-content.js";
 import { HOOKS } from "../plugin-api/constants.js";
 import { defaultCompact } from "../plugins/defaults/compaction/compact.js";
+import { computeCorrectedOverflowTarget } from "../plugins/defaults/compaction/corrected-target.js";
 import type { ContextWindowResult } from "../plugins/defaults/compaction/window-manager.js";
 import { runHook } from "../plugins/pipeline.js";
 import type { CompactionCircuitEvent } from "../plugins/types.js";
@@ -45,10 +49,7 @@ import type {
   ToolDefinition,
   ToolResultContent,
 } from "../providers/types.js";
-import {
-  isContextOverflowError,
-  NATIVE_WEB_SEARCH_TOOL_NAME,
-} from "../providers/types.js";
+import { NATIVE_WEB_SEARCH_TOOL_NAME } from "../providers/types.js";
 import { recordWatchdogEvent } from "../telemetry/watchdog-events-store.js";
 import {
   ABORT_SETTLE_GRACE_MS,
@@ -309,6 +310,8 @@ interface CompactionAttempt {
    * overflow-recovery path always returns the reduction rung's history.
    */
   history: Message[] | null;
+  /** Whether the compaction pipeline actually summarized/reduced anything. */
+  compacted: boolean;
   /** Whether the overflow reduction ladder reported it is spent. */
   exhausted: boolean;
   /** Whether the ladder applied its terminal auto-compress-latest-turn rung. */
@@ -1278,7 +1281,12 @@ export class AgentLoop {
     overrideProfile: string | null,
     isNonInteractive: boolean,
     modelProfileKey: string,
-    overflowSignal?: { actualTokens: number | null; isInteractive: boolean },
+    overflowSignal?: {
+      actualTokens: number | null;
+      isInteractive: boolean;
+      targetTokens?: number;
+    },
+    emergencyOpts?: { minKeepRecentUserTurns?: number },
   ): Promise<CompactionAttempt> {
     const compactionId = crypto.randomUUID();
     const startedAt = Date.now();
@@ -1313,6 +1321,7 @@ export class AgentLoop {
       actorTrustClass: trust.trustClass,
       overrideProfile,
       overflowSignal,
+      minKeepRecentUserTurns: emergencyOpts?.minKeepRecentUserTurns,
     });
     // `force: true` bypasses the auto-threshold gate, but early returns
     // for "no eligible messages" / "insufficient messages" still leave
@@ -1347,7 +1356,12 @@ export class AgentLoop {
     const exhausted = compactResult.exhausted ?? false;
     const autoCompressApplied = compactResult.autoCompressApplied ?? false;
     if (overflowSignal == null && exhausted) {
-      return { history: null, exhausted, autoCompressApplied };
+      return {
+        history: null,
+        compacted: false,
+        exhausted,
+        autoCompressApplied,
+      };
     }
     // Continue from the shape the dispatcher committed as the durable history.
     // A compacted result is already the summary plus the compactor's stripped
@@ -1400,6 +1414,7 @@ export class AgentLoop {
     );
     return {
       history: finalPostCompactCtx.history,
+      compacted: compactResult.compacted === true,
       exhausted,
       autoCompressApplied,
     };
@@ -1476,6 +1491,9 @@ export class AgentLoop {
     let pendingOverflowSignal: {
       actualTokens: number | null;
       isInteractive: boolean;
+      /** Estimator's token count for the history that triggered the overflow;
+       *  used to compute the estimation-error correction for `targetTokens`. */
+      estimatedTokensAtOverflow: number;
     } | null = null;
     // Mirror of the reduction ladder's terminal state from the most recent
     // overflow-recovery compaction. When the ladder is spent and the provider
@@ -1806,6 +1824,23 @@ export class AgentLoop {
                   },
                   "Compacting in place before provider call",
                 );
+                // When recovering from an overflow, compute the corrected
+                // compaction target from the estimation error ratio and include
+                // it in the signal so the manager's reduction ladder compacts
+                // below the provider's true ceiling rather than the under-
+                // counted preflight budget.
+                const compactOverflowSignal =
+                  overflowSignal !== null
+                    ? {
+                        ...overflowSignal,
+                        targetTokens: computeCorrectedOverflowTarget({
+                          preflightBudget,
+                          actualTokens: overflowSignal.actualTokens,
+                          estimatedTokens:
+                            overflowSignal.estimatedTokensAtOverflow,
+                        }).targetTokens,
+                      }
+                    : undefined;
                 const attempt = await this.compact(
                   history,
                   requestId,
@@ -1816,7 +1851,7 @@ export class AgentLoop {
                   resolveEffectiveOverrideProfile() ?? null,
                   isNonInteractive,
                   options.modelProfileKey,
-                  overflowSignal ?? undefined,
+                  compactOverflowSignal,
                 );
                 if (attempt.history) {
                   // Trim before anything else reads the rebuilt array: the
@@ -3086,7 +3121,7 @@ export class AgentLoop {
         // it is disabled (e.g. agent wakes) there is no ladder to drive, so the
         // overflow falls through to the generic error path below.
         if (
-          isContextOverflowError(error) &&
+          looksLikeContextOverflowError(error) &&
           (options.resolveContextWindow?.().overflowRecovery.enabled ?? false)
         ) {
           if (overflowLadderExhausted) {
@@ -3097,6 +3132,39 @@ export class AgentLoop {
               err,
             );
             break;
+          }
+          // When the loop made progress before this overflow (tool calls
+          // appended to history), attempt a fast emergency compaction
+          // (force-compact with minKeepRecentUserTurns=0) before entering the
+          // graduated reduction ladder. If the emergency pass frees enough
+          // headroom, skip the ladder and retry the provider call immediately;
+          // a failed pass (nothing to compact) falls through to the ladder.
+          if (toolUseTurns > 0) {
+            const emergencyAttempt = await this.compact(
+              history,
+              requestId,
+              trust,
+              signal,
+              onEvent,
+              injectionLedgerResets,
+              resolveEffectiveOverrideProfile() ?? null,
+              isNonInteractive,
+              options.modelProfileKey ?? "",
+              undefined,
+              { minKeepRecentUserTurns: 0 },
+            );
+            if (emergencyAttempt.compacted && emergencyAttempt.history) {
+              history = this.applyCompactedHistoryTransform(
+                emergencyAttempt.history,
+                rlog,
+              );
+              newMessagesStart = history.length;
+              rlog.info(
+                { turn: toolUseTurns },
+                "Emergency compaction freed headroom after progress + overflow; retrying provider call",
+              );
+              continue;
+            }
           }
           const actualTokens = parseActualTokensFromError(error);
           if (actualTokens !== null) {
@@ -3110,6 +3178,7 @@ export class AgentLoop {
           pendingOverflowSignal = {
             actualTokens,
             isInteractive: !isNonInteractive,
+            estimatedTokensAtOverflow: lastPreSendEstimatedTokens,
           };
           budgetGateArmed = true;
           rlog.warn(
