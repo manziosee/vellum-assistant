@@ -469,6 +469,33 @@ paths:
                           type: string
                         authErrorCode:
                           type: string
+                        model:
+                          type: string
+                        availableModels:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              value:
+                                type: string
+                              label:
+                                type: string
+                              description:
+                                type: string
+                              group:
+                                type: string
+                            required:
+                              - value
+                              - label
+                            additionalProperties: false
+                        modelRevisionEpoch:
+                          type: string
+                          format: uuid
+                          pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        modelRevision:
+                          type: integer
+                          minimum: 0
+                          maximum: 9007199254740991
                         usedTokens:
                           type: number
                         contextSize:
@@ -548,6 +575,9 @@ paths:
                 cwd:
                   type: string
                   description: Working directory
+                model:
+                  description: Optional model id or alias to request for the session.
+                  type: string
               required:
                 - agent
                 - task
@@ -565,6 +595,9 @@ paths:
                   protocolSessionId:
                     type: string
                   agent:
+                    type: string
+                  modelWarning:
+                    description: Why the requested model was not applied. The session is running on the agent's own model.
                     type: string
                 required:
                   - acpSessionId
