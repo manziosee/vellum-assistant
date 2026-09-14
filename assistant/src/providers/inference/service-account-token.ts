@@ -13,10 +13,15 @@
 import { createSign } from "node:crypto";
 
 import {
-  getSecureKeyAsync,
-  setSecureKeyAsync,
+  getSecureKeyAsync as _realGetKey,
+  setSecureKeyAsync as _realSetKey,
 } from "../../security/secure-keys.js";
 import { getLogger } from "../../util/logger.js";
+
+// Mutable references — swapped in tests via _injectVaultAccessors so tests
+// never need mock.module (which contaminates the entire bun worker process).
+let _getKey: typeof _realGetKey = _realGetKey;
+let _setKey: typeof _realSetKey = _realSetKey;
 
 const log = getLogger("service-account-token");
 
@@ -81,7 +86,7 @@ export async function getValidServiceAccountToken(
   credential: string,
 ): Promise<ServiceAccountTokenResult> {
   const cacheKey = `${credential}/token_cache`;
-  const cached = await getSecureKeyAsync(cacheKey);
+  const cached = await _getKey(cacheKey);
   if (cached) {
     try {
       const blob = JSON.parse(cached) as {
@@ -120,7 +125,7 @@ async function doExchange(
   credential: string,
   cacheKey: string,
 ): Promise<ServiceAccountTokenResult> {
-  const keyJson = await getSecureKeyAsync(credential);
+  const keyJson = await _getKey(credential);
   if (!keyJson) {
     return { ok: false, reason: "not_found" };
   }
@@ -175,7 +180,7 @@ async function doExchange(
   }
 
   const newExpiresAt = Math.floor(Date.now() / 1000 + expiresIn);
-  const ok = await setSecureKeyAsync(
+  const ok = await _setKey(
     cacheKey,
     JSON.stringify({ access_token: accessToken, expires_at: newExpiresAt }),
   );
@@ -225,4 +230,19 @@ function buildJwt(
 /** @internal Test-only: reset all in-flight exchange mutexes. */
 export function _resetServiceAccountMutex(): void {
   exchangesInFlight.clear();
+}
+
+/** @internal Test-only: swap vault accessors so tests never need mock.module. */
+export function _injectVaultAccessors(
+  get: typeof _realGetKey,
+  set: typeof _realSetKey,
+): void {
+  _getKey = get;
+  _setKey = set;
+}
+
+/** @internal Test-only: restore real vault accessors. */
+export function _resetVaultAccessors(): void {
+  _getKey = _realGetKey;
+  _setKey = _realSetKey;
 }

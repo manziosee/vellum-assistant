@@ -1,33 +1,45 @@
-import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
-// ── Mutable state for mocks ──────────────────────────────────────────
+// ── Mutable state for injected vault ────────────────────────────────────────
 
 const vaultStore = new Map<string, string>();
 const writtenKeys = new Map<string, string>();
 
-afterAll(() => {
-  mock.restore();
+// ── Import under test ────────────────────────────────────────────────────────
+//
+// No mock.module — prevents all bun worker contamination. Vault access is
+// injected through _injectVaultAccessors / _resetVaultAccessors instead.
+
+const {
+  getValidServiceAccountToken,
+  parseServiceAccountKey,
+  _resetServiceAccountMutex,
+  _injectVaultAccessors,
+  _resetVaultAccessors,
+} = await import("../providers/inference/service-account-token.js");
+
+// ── Hooks ────────────────────────────────────────────────────────────────────
+
+beforeEach(() => {
+  vaultStore.clear();
+  writtenKeys.clear();
+  _resetServiceAccountMutex();
+  _injectVaultAccessors(
+    async (key: string) => vaultStore.get(key),
+    async (key: string, value: string) => {
+      vaultStore.set(key, value);
+      writtenKeys.set(key, value);
+      return true;
+    },
+  );
 });
 
-// ── Module mocks ─────────────────────────────────────────────────────
+afterEach(() => {
+  _resetVaultAccessors();
+});
 
-// Load the real secure-keys module BEFORE mocking it so we can spread its
-// exports. This way other test files sharing the same bun worker that import
-// any secure-keys export (e.g. getProviderKeyAsync, _resetBackend) will get
-// the real implementation instead of "Export not found" errors.
-const realSecureKeys = await import("../security/secure-keys.js");
+// ── Real 2048-bit RSA PKCS#8 key generated offline for unit tests only ───────
 
-mock.module("../security/secure-keys.js", () => ({
-  ...realSecureKeys,
-  getSecureKeyAsync: async (key: string) => vaultStore.get(key) ?? null,
-  setSecureKeyAsync: async (key: string, value: string) => {
-    vaultStore.set(key, value);
-    writtenKeys.set(key, value);
-    return true;
-  },
-}));
-
-// Real 2048-bit RSA PKCS#8 key generated offline for unit tests only.
 const TEST_PRIVATE_KEY =
   "-----BEGIN PRIVATE KEY-----\n" +
   "MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDFnEC0wI/cNKyO\n" +
@@ -65,24 +77,10 @@ const TEST_SERVICE_ACCOUNT = JSON.stringify({
   token_uri: "https://oauth2.googleapis.com/token",
 });
 
-// ── Import under test ────────────────────────────────────────────────
-
-const {
-  getValidServiceAccountToken,
-  parseServiceAccountKey,
-  _resetServiceAccountMutex,
-} = await import("../providers/inference/service-account-token.js");
-
-// ── Tests ────────────────────────────────────────────────────────────
+// ── Tests ────────────────────────────────────────────────────────────────────
 
 describe("service-account-token", () => {
-  beforeEach(() => {
-    vaultStore.clear();
-    writtenKeys.clear();
-    _resetServiceAccountMutex();
-  });
-
-  // -- parseServiceAccountKey ------------------------------------------
+  // -- parseServiceAccountKey ------------------------------------------------
 
   describe("parseServiceAccountKey", () => {
     test("returns null for empty string", () => {
@@ -108,7 +106,7 @@ describe("service-account-token", () => {
     });
   });
 
-  // -- getValidServiceAccountToken -------------------------------------
+  // -- getValidServiceAccountToken -------------------------------------------
 
   test("returns not_found when no credential is stored", async () => {
     const result = await getValidServiceAccountToken("credential/vertex-ai");
