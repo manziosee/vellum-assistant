@@ -178,14 +178,7 @@ export async function computeConnectionAvailability(
   }
 
   switch (connection.auth.type) {
-    // Schema-accepted but not dispatchable: `resolveAuth` returns
-    // not_implemented for service_account, so a stored credential still
-    // cannot serve inference.
     case "service_account":
-      return {
-        status: "unsupported_auth",
-        message: `Connection "${resolvedConnectionName}" uses service-account auth, which inference does not support yet. Pick a connection with a different auth type.`,
-      };
     case "api_key":
     case "oauth_subscription": {
       const result = await getSecureKeyResultAsync(connection.auth.credential);
