@@ -11,15 +11,20 @@ afterAll(() => {
 
 // ── Module mocks ─────────────────────────────────────────────────────
 
+// Load the real secure-keys module BEFORE mocking it so we can spread its
+// exports. This way other test files sharing the same bun worker that import
+// any secure-keys export (e.g. getProviderKeyAsync, _resetBackend) will get
+// the real implementation instead of "Export not found" errors.
+const realSecureKeys = await import("../security/secure-keys.js");
+
 mock.module("../security/secure-keys.js", () => ({
+  ...realSecureKeys,
   getSecureKeyAsync: async (key: string) => vaultStore.get(key) ?? null,
   setSecureKeyAsync: async (key: string, value: string) => {
     vaultStore.set(key, value);
     writtenKeys.set(key, value);
     return true;
   },
-  // Expose test-only helpers so other test files sharing this worker can import them.
-  _resetBackend: () => {},
 }));
 
 // Real 2048-bit RSA PKCS#8 key generated offline for unit tests only.
