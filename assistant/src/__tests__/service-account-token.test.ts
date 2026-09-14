@@ -1,9 +1,13 @@
-import { beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 
 // ── Mutable state for mocks ──────────────────────────────────────────
 
 const vaultStore = new Map<string, string>();
 const writtenKeys = new Map<string, string>();
+
+afterAll(() => {
+  mock.restore();
+});
 
 // ── Module mocks ─────────────────────────────────────────────────────
 
@@ -14,6 +18,8 @@ mock.module("../security/secure-keys.js", () => ({
     writtenKeys.set(key, value);
     return true;
   },
+  // Expose test-only helpers so other test files sharing this worker can import them.
+  _resetBackend: () => {},
 }));
 
 // Real 2048-bit RSA PKCS#8 key generated offline for unit tests only.
