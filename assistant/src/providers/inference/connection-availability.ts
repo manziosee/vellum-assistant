@@ -178,7 +178,33 @@ export async function computeConnectionAvailability(
   }
 
   switch (connection.auth.type) {
-    case "service_account":
+    case "service_account": {
+      const result = await getSecureKeyResultAsync(connection.auth.credential);
+      if (result.unreachable) {
+        return {
+          status: "unknown",
+          message: `The credential store is unreachable, so the credential for connection "${resolvedConnectionName}" could not be verified. Try again shortly.`,
+        };
+      }
+      if (result.value == null) {
+        return {
+          status: "missing_credential",
+          message: `Connection "${resolvedConnectionName}" has no service-account credential stored. Add one ${SETTINGS_HINT}.`,
+        };
+      }
+      // Validate the JSON payload before reporting ok: a stored value that is
+      // not a well-formed service-account object will be rejected by dispatch,
+      // so surface the problem here rather than letting a turn fail silently.
+      const { parseServiceAccountKey } =
+        await import("./service-account-token.js");
+      if (!parseServiceAccountKey(result.value)) {
+        return {
+          status: "missing_credential",
+          message: `Connection "${resolvedConnectionName}" has an invalid service-account credential (expected JSON with client_email, private_key, and token_uri). Update it ${SETTINGS_HINT}.`,
+        };
+      }
+      return { status: "ok" };
+    }
     case "api_key":
     case "oauth_subscription": {
       const result = await getSecureKeyResultAsync(connection.auth.credential);

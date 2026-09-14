@@ -12,6 +12,7 @@ mock.module("../security/secure-keys.js", () => ({
   setSecureKeyAsync: async (key: string, value: string) => {
     vaultStore.set(key, value);
     writtenKeys.set(key, value);
+    return true;
   },
 }));
 
@@ -55,8 +56,11 @@ const TEST_SERVICE_ACCOUNT = JSON.stringify({
 
 // ── Import under test ────────────────────────────────────────────────
 
-const { getValidServiceAccountToken, _resetServiceAccountMutex } =
-  await import("../providers/inference/service-account-token.js");
+const {
+  getValidServiceAccountToken,
+  parseServiceAccountKey,
+  _resetServiceAccountMutex,
+} = await import("../providers/inference/service-account-token.js");
 
 // ── Tests ────────────────────────────────────────────────────────────
 
@@ -67,58 +71,118 @@ describe("service-account-token", () => {
     _resetServiceAccountMutex();
   });
 
-  test("returns null when no credential is stored", async () => {
-    const token = await getValidServiceAccountToken("credential/vertex-ai");
-    expect(token).toBeNull();
+  // -- parseServiceAccountKey ------------------------------------------
+
+  describe("parseServiceAccountKey", () => {
+    test("returns null for empty string", () => {
+      expect(parseServiceAccountKey("")).toBeNull();
+    });
+
+    test("returns null for invalid JSON", () => {
+      expect(parseServiceAccountKey("not-json")).toBeNull();
+    });
+
+    test("returns null when required fields are missing", () => {
+      expect(
+        parseServiceAccountKey(
+          JSON.stringify({ client_email: "test@example.com" }),
+        ),
+      ).toBeNull();
+    });
+
+    test("returns the key when all required fields are present", () => {
+      const key = parseServiceAccountKey(TEST_SERVICE_ACCOUNT);
+      expect(key).not.toBeNull();
+      expect(key?.client_email).toBe("test@example.com");
+    });
   });
 
-  test("returns cached token when it is still fresh", async () => {
-    const futureExpiry = Math.floor(Date.now() / 1000) + 7200;
-    vaultStore.set("credential/vertex-ai", TEST_SERVICE_ACCOUNT);
-    vaultStore.set("credential/vertex-ai/access_token", "cached-token");
-    vaultStore.set("credential/vertex-ai/expires_at", String(futureExpiry));
+  // -- getValidServiceAccountToken -------------------------------------
 
-    // Should return cached token without calling token_uri
-    const token = await getValidServiceAccountToken("credential/vertex-ai");
-    expect(token).toBe("cached-token");
-    // Nothing new should have been written
-    expect(writtenKeys.size).toBe(0);
+  test("returns not_found when no credential is stored", async () => {
+    const result = await getValidServiceAccountToken("credential/vertex-ai");
+    expect(result).toEqual({ ok: false, reason: "not_found" });
   });
 
-  test("returns cached token with no expiry info as-is", async () => {
-    vaultStore.set("credential/vertex-ai", TEST_SERVICE_ACCOUNT);
-    vaultStore.set("credential/vertex-ai/access_token", "no-expiry-token");
-    // No expires_at key
-
-    const token = await getValidServiceAccountToken("credential/vertex-ai");
-    expect(token).toBe("no-expiry-token");
+  test("returns invalid_config when credential is not valid JSON", async () => {
+    vaultStore.set("credential/vertex-ai", "not-json");
+    const result = await getValidServiceAccountToken("credential/vertex-ai");
+    expect(result).toEqual({ ok: false, reason: "invalid_config" });
   });
 
-  test("returns null when credential JSON is missing required fields", async () => {
+  test("returns invalid_config when credential JSON is missing required fields", async () => {
     vaultStore.set(
       "credential/vertex-ai",
       JSON.stringify({ client_email: "missing-other-fields@example.com" }),
     );
-
-    const token = await getValidServiceAccountToken("credential/vertex-ai");
-    expect(token).toBeNull();
+    const result = await getValidServiceAccountToken("credential/vertex-ai");
+    expect(result).toEqual({ ok: false, reason: "invalid_config" });
   });
 
-  test("returns null when credential is not valid JSON", async () => {
-    vaultStore.set("credential/vertex-ai", "not-json");
+  test("returns cached token when the cache blob is still fresh", async () => {
+    const futureExpiry = Math.floor(Date.now() / 1000) + 7200;
+    vaultStore.set("credential/vertex-ai", TEST_SERVICE_ACCOUNT);
+    vaultStore.set(
+      "credential/vertex-ai/token_cache",
+      JSON.stringify({
+        access_token: "cached-token",
+        expires_at: futureExpiry,
+      }),
+    );
 
-    const token = await getValidServiceAccountToken("credential/vertex-ai");
-    expect(token).toBeNull();
+    const result = await getValidServiceAccountToken("credential/vertex-ai");
+    expect(result).toEqual({ ok: true, token: "cached-token" });
+    // Nothing new should have been written (no exchange performed).
+    expect(writtenKeys.size).toBe(0);
   });
 
-  test("coalesces concurrent callers onto a single exchange", async () => {
-    // Pre-seed with a stale token (expired 10 minutes ago) so exchange is triggered
+  test("returns cached token when cache blob has no expiry", async () => {
+    vaultStore.set("credential/vertex-ai", TEST_SERVICE_ACCOUNT);
+    vaultStore.set(
+      "credential/vertex-ai/token_cache",
+      JSON.stringify({ access_token: "no-expiry-token" }),
+    );
+
+    const result = await getValidServiceAccountToken("credential/vertex-ai");
+    expect(result).toEqual({ ok: true, token: "no-expiry-token" });
+  });
+
+  test("coalesces concurrent callers for the same credential onto one exchange", async () => {
     const pastExpiry = Math.floor(Date.now() / 1000) - 600;
     vaultStore.set("credential/vertex-ai", TEST_SERVICE_ACCOUNT);
-    vaultStore.set("credential/vertex-ai/access_token", "stale-token");
-    vaultStore.set("credential/vertex-ai/expires_at", String(pastExpiry));
+    vaultStore.set(
+      "credential/vertex-ai/token_cache",
+      JSON.stringify({ access_token: "stale-token", expires_at: pastExpiry }),
+    );
 
-    // Mock fetch to return a new token
+    let fetchCallCount = 0;
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => {
+      fetchCallCount += 1;
+      return {
+        ok: true,
+        json: async () => ({ access_token: "new-token", expires_in: 3600 }),
+      } as Response;
+    }) as unknown as typeof fetch;
+
+    try {
+      const [r1, r2] = await Promise.all([
+        getValidServiceAccountToken("credential/vertex-ai"),
+        getValidServiceAccountToken("credential/vertex-ai"),
+      ]);
+
+      expect(r1).toEqual({ ok: true, token: "new-token" });
+      expect(r2).toEqual({ ok: true, token: "new-token" });
+      expect(fetchCallCount).toBe(1);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("concurrent callers for different credentials exchange independently", async () => {
+    vaultStore.set("credential/vertex-a", TEST_SERVICE_ACCOUNT);
+    vaultStore.set("credential/vertex-b", TEST_SERVICE_ACCOUNT);
+
     let fetchCallCount = 0;
     const originalFetch = globalThis.fetch;
     globalThis.fetch = (async () => {
@@ -126,24 +190,47 @@ describe("service-account-token", () => {
       return {
         ok: true,
         json: async () => ({
-          access_token: "new-token",
+          access_token: `token-${fetchCallCount}`,
           expires_in: 3600,
         }),
       } as Response;
     }) as unknown as typeof fetch;
 
     try {
-      // Launch two concurrent callers
-      const [t1, t2] = await Promise.all([
-        getValidServiceAccountToken("credential/vertex-ai"),
-        getValidServiceAccountToken("credential/vertex-ai"),
+      const [r1, r2] = await Promise.all([
+        getValidServiceAccountToken("credential/vertex-a"),
+        getValidServiceAccountToken("credential/vertex-b"),
       ]);
 
-      // Both should get the new token
-      expect(t1).toBe("new-token");
-      expect(t2).toBe("new-token");
-      // Only one exchange should have been performed
-      expect(fetchCallCount).toBe(1);
+      expect(r1.ok).toBe(true);
+      expect(r2.ok).toBe(true);
+      // Each credential triggers its own exchange.
+      expect(fetchCallCount).toBe(2);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  test("caches token+expiry as a single JSON blob", async () => {
+    vaultStore.set("credential/vertex-ai", TEST_SERVICE_ACCOUNT);
+
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async () => ({
+      ok: true,
+      json: async () => ({ access_token: "fresh-token", expires_in: 3600 }),
+    })) as unknown as typeof fetch;
+
+    try {
+      await getValidServiceAccountToken("credential/vertex-ai");
+
+      const blob = vaultStore.get("credential/vertex-ai/token_cache");
+      expect(blob).toBeDefined();
+      const parsed = JSON.parse(blob!) as {
+        access_token: string;
+        expires_at: number;
+      };
+      expect(parsed.access_token).toBe("fresh-token");
+      expect(typeof parsed.expires_at).toBe("number");
     } finally {
       globalThis.fetch = originalFetch;
     }

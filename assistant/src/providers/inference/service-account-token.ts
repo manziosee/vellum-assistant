@@ -3,12 +3,11 @@
  *
  * Reads the service-account JSON from the vault, signs a short-lived JWT
  * with RS256, and exchanges it for a bearer access token at the token_uri
- * embedded in the key file. Caches the resulting token in the vault so
- * repeated inference calls within the token's lifetime skip the exchange.
+ * embedded in the key file. Caches the resulting token and its expiry as a
+ * single JSON blob in the vault so the write is treated as one unit.
  *
- * A module-level mutex prevents concurrent callers from racing to refresh:
- * only the first waiter performs the exchange; the rest coalesce onto its
- * result.
+ * A per-credential mutex prevents concurrent callers for the same credential
+ * from racing to refresh. Callers for different credentials are independent.
  */
 
 import { createSign } from "node:crypto";
@@ -27,74 +26,112 @@ const REFRESH_MARGIN_SECONDS = 300;
 /** Google Cloud Platform scope required for Vertex AI inference. */
 const GCP_SCOPE = "https://www.googleapis.com/auth/cloud-platform";
 
-/** Module-level mutex: only one in-flight exchange at a time per process. */
-let exchangeInFlight: Promise<string | null> | null = null;
-
-interface ServiceAccountKey {
+export interface ServiceAccountKey {
   client_email: string;
   private_key: string;
   token_uri: string;
 }
+
+export type ServiceAccountTokenResult =
+  | { ok: true; token: string }
+  | { ok: false; reason: "not_found" | "invalid_config" | "exchange_failed" };
+
+/**
+ * Parse and validate a service-account JSON string.
+ * Returns the key object when valid, or null when the JSON is missing, invalid,
+ * or lacks required fields (client_email, private_key, token_uri).
+ */
+export function parseServiceAccountKey(json: string): ServiceAccountKey | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") {
+    return null;
+  }
+  const key = parsed as Record<string, unknown>;
+  if (
+    typeof key["client_email"] !== "string" ||
+    !key["client_email"] ||
+    typeof key["private_key"] !== "string" ||
+    !key["private_key"] ||
+    typeof key["token_uri"] !== "string" ||
+    !key["token_uri"]
+  ) {
+    return null;
+  }
+  // All required fields validated as non-empty strings above.
+  return parsed as ServiceAccountKey;
+}
+
+/** Per-credential in-flight mutex. Prevents concurrent exchange races per account. */
+const exchangesInFlight = new Map<string, Promise<ServiceAccountTokenResult>>();
 
 /**
  * Return a valid bearer access token for a Google service account, fetching
  * and caching one if the stored token is absent or about to expire.
  *
  * @param credential - Vault key under which the service-account JSON is stored
- *   (e.g. `"credential/my-vertex-ai"`). Derived tokens are cached at
- *   `<credential>/access_token` and `<credential>/expires_at`.
- * @returns Bearer token string, or `null` if no service-account JSON is stored
- *   at the given key.
+ *   (e.g. `"credential/my-vertex-ai"`). The derived token is cached as a JSON
+ *   blob at `<credential>/token_cache`.
  */
 export async function getValidServiceAccountToken(
   credential: string,
-): Promise<string | null> {
-  const cachedToken = await getSecureKeyAsync(`${credential}/access_token`);
-  if (cachedToken) {
-    const expiresAtStr = await getSecureKeyAsync(`${credential}/expires_at`);
-    if (expiresAtStr) {
-      const expiresAt = Number(expiresAtStr);
-      const now = Date.now() / 1000;
-      if (now < expiresAt - REFRESH_MARGIN_SECONDS) {
-        return cachedToken;
+): Promise<ServiceAccountTokenResult> {
+  const cacheKey = `${credential}/token_cache`;
+  const cached = await getSecureKeyAsync(cacheKey);
+  if (cached) {
+    try {
+      const blob = JSON.parse(cached) as {
+        access_token?: string;
+        expires_at?: number;
+      };
+      if (blob.access_token) {
+        if (!blob.expires_at) {
+          return { ok: true, token: blob.access_token };
+        }
+        const now = Date.now() / 1000;
+        if (now < blob.expires_at - REFRESH_MARGIN_SECONDS) {
+          return { ok: true, token: blob.access_token };
+        }
       }
-    } else {
-      return cachedToken;
+    } catch {
+      // Corrupted cache entry — fall through to re-exchange.
     }
   }
 
-  if (exchangeInFlight) {
-    return await exchangeInFlight;
+  const inFlight = exchangesInFlight.get(credential);
+  if (inFlight) {
+    return await inFlight;
   }
 
-  exchangeInFlight = doExchange(credential);
+  const promise = doExchange(credential, cacheKey);
+  exchangesInFlight.set(credential, promise);
   try {
-    return await exchangeInFlight;
+    return await promise;
   } finally {
-    exchangeInFlight = null;
+    exchangesInFlight.delete(credential);
   }
 }
 
-async function doExchange(credential: string): Promise<string | null> {
+async function doExchange(
+  credential: string,
+  cacheKey: string,
+): Promise<ServiceAccountTokenResult> {
   const keyJson = await getSecureKeyAsync(credential);
   if (!keyJson) {
-    return null;
+    return { ok: false, reason: "not_found" };
   }
 
-  let key: ServiceAccountKey;
-  try {
-    key = JSON.parse(keyJson) as ServiceAccountKey;
-  } catch {
-    log.error({ credential }, "Service account credential is not valid JSON");
-    return null;
-  }
-
-  if (!key.client_email || !key.private_key || !key.token_uri) {
+  const key = parseServiceAccountKey(keyJson);
+  if (!key) {
     log.error(
       { credential },
-      "Service account JSON missing required fields (client_email, private_key, token_uri)",
+      "Service account credential is not valid JSON or missing required fields",
     );
-    return null;
+    return { ok: false, reason: "invalid_config" };
   }
 
   const jwt = buildJwt(key.client_email, key.private_key, key.token_uri);
@@ -117,7 +154,7 @@ async function doExchange(credential: string): Promise<string | null> {
         { status: resp.status, body, credential },
         "Service account token exchange failed",
       );
-      return (await getSecureKeyAsync(`${credential}/access_token`)) ?? null;
+      return { ok: false, reason: "exchange_failed" };
     }
 
     const data = (await resp.json()) as {
@@ -127,22 +164,30 @@ async function doExchange(credential: string): Promise<string | null> {
 
     if (!data.access_token) {
       log.error({ credential }, "Token exchange response missing access_token");
-      return (await getSecureKeyAsync(`${credential}/access_token`)) ?? null;
+      return { ok: false, reason: "exchange_failed" };
     }
 
     accessToken = data.access_token;
     expiresIn = data.expires_in ?? 3600;
   } catch (err) {
     log.error({ err, credential }, "Service account token exchange threw");
-    return (await getSecureKeyAsync(`${credential}/access_token`)) ?? null;
+    return { ok: false, reason: "exchange_failed" };
   }
 
-  await setSecureKeyAsync(`${credential}/access_token`, accessToken);
   const newExpiresAt = Math.floor(Date.now() / 1000 + expiresIn);
-  await setSecureKeyAsync(`${credential}/expires_at`, String(newExpiresAt));
-
-  log.info({ credential }, "Service account token exchanged and cached");
-  return accessToken;
+  const ok = await setSecureKeyAsync(
+    cacheKey,
+    JSON.stringify({ access_token: accessToken, expires_at: newExpiresAt }),
+  );
+  if (!ok) {
+    log.warn(
+      { credential },
+      "Failed to cache service account token — token still valid for this request",
+    );
+  } else {
+    log.info({ credential }, "Service account token exchanged and cached");
+  }
+  return { ok: true, token: accessToken };
 }
 
 function buildJwt(
@@ -177,7 +222,7 @@ function buildJwt(
 // Test helpers
 // ---------------------------------------------------------------------------
 
-/** @internal Test-only: reset the in-flight exchange mutex. */
+/** @internal Test-only: reset all in-flight exchange mutexes. */
 export function _resetServiceAccountMutex(): void {
-  exchangeInFlight = null;
+  exchangesInFlight.clear();
 }

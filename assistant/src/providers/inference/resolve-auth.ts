@@ -122,21 +122,23 @@ export async function resolveAuth(
     case "service_account": {
       const { getValidServiceAccountToken } =
         await import("./service-account-token.js");
-      const token = await getValidServiceAccountToken(auth.credential);
-      if (!token) {
+      const result = await getValidServiceAccountToken(auth.credential);
+      if (!result.ok) {
+        if (result.reason === "exchange_failed") {
+          return { ok: false, error: { code: "platform_unavailable" } };
+        }
+        // not_found or invalid_config: the credential needs to be supplied or fixed.
         return {
           ok: false,
-          error: {
-            code: "credential_not_found",
-            credential: auth.credential,
-          },
+          error: { code: "credential_not_found", credential: auth.credential },
         };
       }
       return {
         ok: true,
         resolved: {
           kind: "header",
-          headers: { Authorization: `Bearer ${token}` },
+          headers: { Authorization: `Bearer ${result.token}` },
+          ...(safeBaseUrl ? { baseUrl: safeBaseUrl } : {}),
         },
       };
     }
