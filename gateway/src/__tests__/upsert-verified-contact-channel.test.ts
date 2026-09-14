@@ -151,14 +151,7 @@ mock.module("../ipc/contacts-info-client.js", () => ({
   probeContactMirror: async () => {
     throw new Error("probeContactMirror not stubbed for this suite");
   },
-  // Not exercised here (ContactStore info joins only); present so the module
-  // graph links (contact-helpers → ContactStore → contacts-info-joiner).
-  fetchContactsInfoBatch: async () => {
-    throw new Error("fetchContactsInfoBatch not stubbed for this suite");
-  },
-  listContactUserFileSlugs: async () => {
-    throw new Error("listContactUserFileSlugs not stubbed for this suite");
-  },
+  fetchContactIdsByType: async () => [],
 }));
 
 mock.module("../ipc/assistant-client.js", () => ({
