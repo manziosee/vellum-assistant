@@ -1353,11 +1353,13 @@ export class AgentLoop {
       // hook so memory-injection re-applies onto the compacted history.
       const compactionId = crypto.randomUUID();
       const startedAt = Date.now();
+      const emergencyTrigger: CompactionTrigger =
+        overflowSignal != null ? "overflow" : "budget";
       await onEvent({
         type: "context_compacting",
         compactionId,
         requestId,
-        trigger: "budget",
+        trigger: emergencyTrigger,
         startedAt,
         messages: preCompactionMessages,
       });
@@ -1373,7 +1375,7 @@ export class AgentLoop {
         type: "compaction_completed",
         compactionId,
         requestId,
-        trigger: "budget",
+        trigger: emergencyTrigger,
         startedAt,
         finishedAt: Date.now(),
         ...probeResult,
@@ -3297,6 +3299,7 @@ export class AgentLoop {
           // means new history was added, which a fresh force-compact may free.
           // A no-op probe (nothing to compact) is cheap and fires no events.
           if (toolUseTurns > 0) {
+            const emergencyActualTokens = parseActualTokensFromError(error);
             const emergencyAttempt = await this.compact(
               history,
               requestId,
@@ -3307,7 +3310,10 @@ export class AgentLoop {
               resolveEffectiveOverrideProfile() ?? null,
               isNonInteractive,
               options.modelProfileKey ?? "",
-              undefined,
+              {
+                actualTokens: emergencyActualTokens,
+                isInteractive: !isNonInteractive,
+              },
               { minKeepRecentUserTurns: 0 },
             );
             if (emergencyAttempt.compacted && emergencyAttempt.history) {
