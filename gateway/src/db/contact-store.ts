@@ -25,6 +25,7 @@ import {
 } from "../contacts-mirror-op-reporter.js";
 import { ipcCallAssistant } from "../ipc/assistant-client.js";
 import {
+  fetchContactIdsByType,
   fetchContactsInfoBatch,
   lookupContactChannelIdentity,
   listContactUserFileSlugs,
@@ -208,12 +209,13 @@ export class ContactStore {
    * channelType) are NOT supported here — callers that need those should
    * fall back to the proxy path until a gateway-native search is built.
    *
-   * When `contactType` is provided the gateway fetches up to 200 contacts from
-   * the gateway DB (contactType lives in the assistant DB and is only known
-   * after the info join), post-filters in memory, then applies the limit.
-   * Workspaces with more than 200 contacts of mixed types may see fewer results
-   * than requested in that case — the same trade-off the 200-row hard cap
-   * already applies to plain list reads.
+   * When `contactType` is provided the gateway first fetches the matching
+   * contact IDs from the assistant DB via IPC (`contacts_list_ids_by_type`),
+   * then uses those as a SQL `IN` condition so the filter and limit both apply
+   * at the query layer. An IPC failure with an active contactType filter
+   * propagates as an error (5xx to the client) rather than returning a silently
+   * empty list. Workspaces with no assistant-DB entries of the requested type
+   * return an empty list without issuing a gateway SQL query.
    *
    * Ordering mirrors the daemon: guardian role first, then updatedAt desc.
    */
@@ -231,15 +233,25 @@ export class ContactStore {
       contactIds = [...new Set(opts.ids)].slice(0, 200);
       if (contactIds.length === 0) return [];
     } else {
-      // When filtering by contactType, fetch the hard cap from the gateway DB
-      // so post-filter has enough rows. Without this, a limit=50 request for
-      // contactType=human could return 0 results if the first 50 are all
-      // assistant-type contacts.
-      const effectiveLimit = opts?.contactType
-        ? 200
-        : Math.min(opts?.limit ?? 50, 200);
+      const effectiveLimit = Math.min(opts?.limit ?? 50, 200);
       const conditions = [];
       if (opts?.role) conditions.push(eq(contacts.role, opts.role));
+
+      if (opts?.contactType) {
+        // Pre-fetch the IDs matching this contactType from the assistant DB.
+        // Using the result as a SQL IN condition makes the type filter part of
+        // the gateway query, so the limit applies to the already-typed set and
+        // the 200-row cap workaround is no longer needed. Throws on IPC failure
+        // (an active contactType filter must not silently return empty).
+        const typeMatchIds = await fetchContactIdsByType(opts.contactType);
+        if (typeMatchIds.length === 0) return [];
+        conditions.push(
+          sql`${contacts.id} IN (${sql.join(
+            typeMatchIds.map((id) => sql`${id}`),
+            sql`, `,
+          )})`,
+        );
+      }
 
       // Step 1: Select contact IDs with the limit applied to CONTACTS (not
       // joined channel rows). The daemon path limits contact rows before
@@ -282,17 +294,7 @@ export class ContactStore {
       )
       .all();
 
-    let results = await this.joinInfoIntoContacts(rows, {
-      throwOnInfoFailure: !!opts?.contactType,
-    });
-
-    if (opts?.contactType) {
-      results = results.filter((c) => c.contactType === opts.contactType);
-      const requestedLimit = Math.min(opts.limit ?? 50, 200);
-      results = results.slice(0, requestedLimit);
-    }
-
-    return results;
+    return this.joinInfoIntoContacts(rows);
   }
 
   /**
@@ -493,7 +495,6 @@ export class ContactStore {
    */
   private async joinInfoIntoContacts(
     rows: { contact: Contact; channel: ContactChannel | null }[],
-    opts: { throwOnInfoFailure?: boolean } = {},
   ): Promise<ContactWithInfo[]> {
     // Group channels by contact, preserving first-seen contact order.
     const orderedIds: string[] = [];
@@ -516,12 +517,9 @@ export class ContactStore {
     try {
       infoMap = await fetchInfoForContacts(orderedIds);
     } catch (err) {
-      if (opts.throwOnInfoFailure) {
-        throw err;
-      }
       log.warn(
         { err, count: orderedIds.length },
-        "listContactsWithInfo: assistant DB info read failed; returning ACL-only shape",
+        "joinInfoIntoContacts: assistant DB info read failed; returning ACL-only shape",
       );
       infoMap = new Map();
     }

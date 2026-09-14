@@ -92,6 +92,14 @@ mock.module("../ipc/assistant-client.js", () => ({
           .map(shapeInfo);
         return { infos };
       }
+      if (method === "contacts_list_ids_by_type") {
+        const contactType = (params?.body as { contactType?: string })
+          ?.contactType;
+        const contactIds = [...fakeAssistantDb.info.entries()]
+          .filter(([, row]) => row.contact_type === contactType)
+          .map(([id]) => id);
+        return { contactIds };
+      }
       return {};
     },
   ),
