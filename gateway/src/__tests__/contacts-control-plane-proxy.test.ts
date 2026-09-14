@@ -81,16 +81,38 @@ const DEFAULT_MOCK_CONTACT = {
   displayName: "Mock Contact",
   notes: null as string | null,
   role: "contact",
-  contactType: "human",
+  contactType: "human" as string | null,
   principalId: null as string | null,
   userFile: null as string | null,
   createdAt: 1000000,
   updatedAt: 1000000,
   interactionCount: 0,
   lastInteraction: null as number | null,
-  autoApproveThreshold: null as string | null,
-  channels: [] as unknown[],
-  assistantMetadata: null as Record<string, unknown> | null,
+  autoApproveThreshold: null as "none" | "low" | "medium" | "high" | null,
+  channels: [] as {
+    id: string;
+    contactId: string;
+    type: string;
+    address: string;
+    isPrimary: boolean;
+    externalChatId: string | null;
+    status: string | null;
+    policy: string | null;
+    verifiedAt: number | null;
+    verifiedVia: string | null;
+    inviteId: string | null;
+    revokedReason: string | null;
+    blockedReason: string | null;
+    lastSeenAt: number | null;
+    interactionCount: number;
+    lastInteraction: number | null;
+    createdAt: number | null;
+    updatedAt: number | null;
+  }[],
+  assistantMetadata: null as {
+    species: string;
+    metadata: Record<string, unknown> | null;
+  } | null,
 };
 
 type UpsertResult = { contact: typeof DEFAULT_MOCK_CONTACT; created: boolean };
@@ -106,6 +128,7 @@ type ListFn = (opts?: {
   limit?: number;
   role?: string;
   contactType?: string;
+  ids?: string[];
 }) => Promise<(typeof DEFAULT_MOCK_CONTACT)[]>;
 let contactStoreListMock: ReturnType<typeof mock<ListFn>> = mock(
   async () => [],
@@ -188,6 +211,9 @@ type InviteRow = {
   status: string;
   createdAt: number;
   updatedAt: number;
+  redeemedByExternalUserId?: string | null;
+  redeemedByExternalChatId?: string | null;
+  redeemedAt?: number | null;
 };
 const DEFAULT_INVITE: InviteRow = {
   id: "inv_1",
@@ -202,6 +228,9 @@ const DEFAULT_INVITE: InviteRow = {
   status: "active",
   createdAt: 1000000,
   updatedAt: 1000000,
+  redeemedByExternalUserId: null,
+  redeemedByExternalChatId: null,
+  redeemedAt: null,
 };
 
 type GetContactFn = (
@@ -351,31 +380,55 @@ beforeAll(async () => {
     );
   jest
     .spyOn(RealContactStore.prototype, "getContact")
-    .mockImplementation((contactId: string) =>
-      contactStoreGetContactMock(contactId),
+    .mockImplementation(
+      (contactId: string) =>
+        contactStoreGetContactMock(contactId) as unknown as ReturnType<
+          typeof RealContactStore.prototype.getContact
+        >,
     );
   jest
     .spyOn(RealContactStore.prototype, "listInvites")
-    .mockImplementation((params: unknown) => contactStoreListInvitesMock(params));
+    .mockImplementation(
+      (...args) =>
+        contactStoreListInvitesMock(
+          args[0] as unknown,
+        ) as unknown as ReturnType<
+          typeof RealContactStore.prototype.listInvites
+        >,
+    );
   jest
     .spyOn(RealContactStore.prototype, "createInvite")
-    .mockImplementation((params: unknown) =>
-      contactStoreCreateInviteMock(params),
+    .mockImplementation(
+      (...args) =>
+        contactStoreCreateInviteMock(
+          args[0] as unknown,
+        ) as unknown as ReturnType<
+          typeof RealContactStore.prototype.createInvite
+        >,
     );
   jest
     .spyOn(RealContactStore.prototype, "revokeInvite")
-    .mockImplementation((inviteId: string) =>
-      contactStoreRevokeInviteMock(inviteId),
+    .mockImplementation(
+      (inviteId: string) =>
+        contactStoreRevokeInviteMock(inviteId) as unknown as ReturnType<
+          typeof RealContactStore.prototype.revokeInvite
+        >,
     );
   jest
     .spyOn(RealContactStore.prototype, "recordInviteRedemption")
-    .mockImplementation((params: unknown) =>
-      contactStoreRecordRedemptionMock(params),
+    .mockImplementation(
+      (...args) =>
+        contactStoreRecordRedemptionMock(args[0] as unknown) as ReturnType<
+          typeof RealContactStore.prototype.recordInviteRedemption
+        >,
     );
   jest
     .spyOn(RealContactStore.prototype, "getInviteById")
-    .mockImplementation((inviteId: string) =>
-      contactStoreGetInviteByIdMock(inviteId),
+    .mockImplementation(
+      (inviteId: string) =>
+        contactStoreGetInviteByIdMock(inviteId) as unknown as ReturnType<
+          typeof RealContactStore.prototype.getInviteById
+        >,
     );
   jest
     .spyOn(RealContactStore.prototype, "markInviteExpired")
@@ -385,22 +438,36 @@ beforeAll(async () => {
   jest
     .spyOn(RealContactStore.prototype, "listContactsWithInfo")
     .mockImplementation(
-      (opts?: { limit?: number; role?: string; contactType?: string }) =>
-        contactStoreListMock(opts),
+      (opts?: {
+        limit?: number;
+        role?: string;
+        contactType?: string;
+        ids?: string[];
+      }) => contactStoreListMock(opts),
     );
   jest
     .spyOn(RealContactStore.prototype, "getContactWithInfo")
     .mockImplementation((contactId: string) => contactStoreGetMock(contactId));
   jest
     .spyOn(RealContactStore.prototype, "getAclByContactIds")
-    .mockImplementation((ids: string[]) => contactStoreGetAclMock(ids));
+    .mockImplementation(
+      (ids: string[]) =>
+        contactStoreGetAclMock(ids) as unknown as ReturnType<
+          typeof RealContactStore.prototype.getAclByContactIds
+        >,
+    );
   jest
     .spyOn(RealContactStore.prototype, "updateChannelStatus")
     .mockImplementation(
       (
         channelId: string,
         params: { status?: string; policy?: string; reason?: string | null },
-      ) => contactStoreUpdateChannelMock(channelId, params),
+      ) =>
+        Promise.resolve(
+          contactStoreUpdateChannelMock(channelId, params),
+        ) as unknown as ReturnType<
+          typeof RealContactStore.prototype.updateChannelStatus
+        >,
     );
   jest
     .spyOn(RealContactStore.prototype, "mergeContacts")
@@ -729,7 +796,7 @@ describe("handleUpsertContact (gateway-native)", () => {
       ...DEFAULT_MOCK_CONTACT,
       id: "ct_high",
       displayName: "Alice",
-      autoApproveThreshold: "high",
+      autoApproveThreshold: "high" as "none" | "low" | "medium" | "high" | null,
     };
     contactStoreUpsertMock = mock(async () => ({
       contact: mockContact,
