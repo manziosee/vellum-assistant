@@ -270,77 +270,12 @@ let contactStoreMarkInviteExpiredMock: ReturnType<
   typeof mock<MarkInviteExpiredFn>
 > = mock(() => true);
 
-mock.module("../db/contact-store.js", () => ({
-  NO_INVITE_CODE_HASH: "",
-  ContactStore: class MockContactStore {
-    upsertContact(...args: Parameters<UpsertFn>) {
-      return contactStoreUpsertMock(...args);
-    }
-    getContact(contactId: string) {
-      return contactStoreGetContactMock(contactId);
-    }
-    listInvites(params: unknown) {
-      return contactStoreListInvitesMock(params);
-    }
-    createInvite(params: unknown) {
-      return contactStoreCreateInviteMock(params);
-    }
-    revokeInvite(inviteId: string) {
-      return contactStoreRevokeInviteMock(inviteId);
-    }
-    recordInviteRedemption(params: unknown) {
-      return contactStoreRecordRedemptionMock(params);
-    }
-    getInviteById(inviteId: string) {
-      return contactStoreGetInviteByIdMock(inviteId);
-    }
-    markInviteExpired(inviteId: string) {
-      return contactStoreMarkInviteExpiredMock(inviteId);
-    }
-    async listContactsWithInfo(opts?: {
-      limit?: number;
-      role?: string;
-      contactType?: string;
-    }) {
-      return contactStoreListMock(opts);
-    }
-    async getContactWithInfo(contactId: string) {
-      return contactStoreGetMock(contactId);
-    }
-    async getAclByContactIds(ids: string[]) {
-      return contactStoreGetAclMock(ids);
-    }
-    async updateChannelStatus(
-      channelId: string,
-      params: {
-        status?: string;
-        policy?: string;
-        reason?: string | null;
-      },
-    ) {
-      return contactStoreUpdateChannelMock(channelId, params);
-    }
-    async mergeContacts(keepId: string, mergeId: string) {
-      return contactStoreMergeMock(keepId, mergeId);
-    }
-  },
-  CannotRevokeBlockedError: class CannotRevokeBlockedError extends Error {
-    readonly channelId: string;
-    constructor(channelId: string) {
-      super(
-        "Cannot revoke a blocked channel. Unblock it first or leave it blocked.",
-      );
-      this.name = "CannotRevokeBlockedError";
-      this.channelId = channelId;
-    }
-  },
-  MergeContactsError: class MergeContactsError extends Error {
-    constructor(message: string) {
-      super(message);
-      this.name = "MergeContactsError";
-    }
-  },
-}));
+// Spy on ContactStore.prototype instead of mock.module so that other test
+// files sharing this Bun worker still import the real ContactStore class.
+// (mock.module replaces the module registry entry at load time and cannot be
+// reliably un-done before the next file's static imports resolve.)
+const actualContactStore = await import("../db/contact-store.js");
+const { ContactStore: RealContactStore } = actualContactStore;
 
 // ── Redemption engine mock ────────────────────────────────────────────────────
 // handleRedeemInvite drives the gateway-native engine directly; mock it so
@@ -407,10 +342,78 @@ const { contacts: gwContacts } = await import("../db/schema.js");
 
 beforeAll(async () => {
   await initGatewayDb();
+  // Spy on prototype methods so the handler's `new ContactStore()` calls are
+  // intercepted by the per-test mock functions without replacing the module.
+  jest
+    .spyOn(RealContactStore.prototype, "upsertContact")
+    .mockImplementation((...args: Parameters<UpsertFn>) =>
+      contactStoreUpsertMock(...args),
+    );
+  jest
+    .spyOn(RealContactStore.prototype, "getContact")
+    .mockImplementation((contactId: string) =>
+      contactStoreGetContactMock(contactId),
+    );
+  jest
+    .spyOn(RealContactStore.prototype, "listInvites")
+    .mockImplementation((params: unknown) => contactStoreListInvitesMock(params));
+  jest
+    .spyOn(RealContactStore.prototype, "createInvite")
+    .mockImplementation((params: unknown) =>
+      contactStoreCreateInviteMock(params),
+    );
+  jest
+    .spyOn(RealContactStore.prototype, "revokeInvite")
+    .mockImplementation((inviteId: string) =>
+      contactStoreRevokeInviteMock(inviteId),
+    );
+  jest
+    .spyOn(RealContactStore.prototype, "recordInviteRedemption")
+    .mockImplementation((params: unknown) =>
+      contactStoreRecordRedemptionMock(params),
+    );
+  jest
+    .spyOn(RealContactStore.prototype, "getInviteById")
+    .mockImplementation((inviteId: string) =>
+      contactStoreGetInviteByIdMock(inviteId),
+    );
+  jest
+    .spyOn(RealContactStore.prototype, "markInviteExpired")
+    .mockImplementation((inviteId: string) =>
+      contactStoreMarkInviteExpiredMock(inviteId),
+    );
+  jest
+    .spyOn(RealContactStore.prototype, "listContactsWithInfo")
+    .mockImplementation(
+      (opts?: { limit?: number; role?: string; contactType?: string }) =>
+        contactStoreListMock(opts),
+    );
+  jest
+    .spyOn(RealContactStore.prototype, "getContactWithInfo")
+    .mockImplementation((contactId: string) => contactStoreGetMock(contactId));
+  jest
+    .spyOn(RealContactStore.prototype, "getAclByContactIds")
+    .mockImplementation((ids: string[]) => contactStoreGetAclMock(ids));
+  jest
+    .spyOn(RealContactStore.prototype, "updateChannelStatus")
+    .mockImplementation(
+      (
+        channelId: string,
+        params: { status?: string; policy?: string; reason?: string | null },
+      ) => contactStoreUpdateChannelMock(channelId, params),
+    );
+  jest
+    .spyOn(RealContactStore.prototype, "mergeContacts")
+    .mockImplementation((keepId: string, mergeId: string) =>
+      contactStoreMergeMock(keepId, mergeId),
+    );
 });
 
 afterAll(() => {
   resetGatewayDb();
+  // Restore real ContactStore prototype so later files in this Bun worker
+  // get the real implementation (spies affect runtime, not module loading).
+  jest.restoreAllMocks();
 });
 
 function makeConfig(overrides: Partial<GatewayConfig> = {}): GatewayConfig {
