@@ -5,13 +5,16 @@
  *
  * Owns:
  * - `headerSupplements` computation and slot registration
- * - `topBarRightSlot` (ChannelSourceLinkPill + ConversationAssetsPill +
- *   InChatPluginPill) computation and registration
+ * - `topBarRightSlot` (ChannelThreadControl or ChannelSourceLinkPill, plus
+ *   the ConversationAssetsPill Chat Info trigger + InChatPluginPill)
+ *   computation and registration
  * - Slack conversation display derivation for the header label and the
  *   source-thread link
+ * - Settling the channel drawer when the sidecar target changes, so a
+ *   conversation switch or a lost binding never leaves a stale thread open
  */
 
-import { useCallback, useEffect, useMemo } from "react";
+import { useEffect, useMemo } from "react";
 
 import { useChatLayoutSlotsStore } from "@/components/layout/chat-layout-slots-store";
 import type { ChatHeaderSupplements } from "@/components/layout/chat-layout-slots-store";
@@ -26,13 +29,12 @@ import { isChannelConversation } from "@/domains/chat/utils/conversation-channel
 import { getChannelBindingDisplayText } from "@/domains/chat/utils/channel-conversation-display";
 import { getChannelLabel } from "@/utils/channel-presentation";
 import { ChannelSourceLinkPill } from "@/domains/chat/components/channel-source-link-pill";
-import { ConversationActivityPill } from "@/domains/chat/components/conversation-activity-pill";
+import { ChannelThreadControl } from "@/domains/chat/channel-sidecar/channel-thread-control";
+import { useChannelSidecar } from "@/domains/chat/channel-sidecar/use-channel-sidecar";
 import { ConversationAssetsPill } from "@/domains/chat/components/conversation-assets-pill";
 import { InChatPluginPill } from "@/domains/chat/components/inchat-plugin-pill/inchat-plugin-pill";
 import { useSupportsInchatPluginEdit } from "@/lib/backwards-compat/use-supports-inchat-plugin-edit";
-import { useOpenAppFromChat } from "@/domains/chat/hooks/use-open-app-from-chat";
 import { useViewerStore } from "@/stores/viewer-store";
-import { haptic } from "@/utils/haptics";
 import type { Conversation } from "@/types/conversation-types";
 
 export interface UseChatHeaderRegistrationOptions {
@@ -112,6 +114,38 @@ export function useChatHeaderRegistration({
       null)
     : null;
 
+  // Channel sidecar. Non-null `target` means the flag is on, this conversation
+  // is bound to an external channel, and there is something to open: the top
+  // bar trades the source-link pill for the drawer toggle, and the link
+  // survives as the drawer's secondary action. Null keeps the source-link
+  // pill, which is what the flag-off path always renders.
+  const { target: channelSidecarTarget } = useChannelSidecar({
+    conversationId: activeConversationId,
+    conversation: activeConversation,
+    messages,
+    sourceHref: channelSourceLinkHref,
+  });
+
+  // Settle the drawer as the sidecar re-resolves. Switching conversations,
+  // losing the binding, or turning the flag off all land here, and each one
+  // leaves `mainView` pointing at a thread with nothing behind it until the
+  // store is told. Keyed on the resolved identity rather than the object so a
+  // re-derived-but-identical target does not re-run this.
+  const sidecarConversationId = channelSidecarTarget?.conversationId ?? null;
+  const sidecarChannelId = channelSidecarTarget?.channelId ?? null;
+  useEffect(() => {
+    useViewerStore
+      .getState()
+      .reconcileChannelTranscript(
+        sidecarConversationId && sidecarChannelId
+          ? {
+              conversationId: sidecarConversationId,
+              channelId: sidecarChannelId,
+            }
+          : null,
+      );
+  }, [sidecarConversationId, sidecarChannelId]);
+
   // Header supplements — chat-specific data for the conversation header menu
   const hasPersistedMessage = useMemo(
     () => messages.some((m) => m.id != null),
@@ -151,25 +185,16 @@ export function useChatHeaderRegistration({
     };
   }, [headerSupplements, setHeaderSupplements]);
 
-  // Top bar right slot — ConversationAssetsPill
-  const handleOpenAppFromChat = useOpenAppFromChat();
-  const handleOpenDocument = useCallback(
-    (surfaceId: string) => {
-      haptic.light();
-      if (assistantId) {
-        void useViewerStore.getState().loadDocument(assistantId, surfaceId);
-      }
-    },
-    [assistantId],
-  );
-
+  // Top bar right slot - ConversationAssetsPill
   const topBarRightContent = useMemo(() => {
     if (!activeConversation?.conversationId || !assistantId) {
       return null;
     }
     return (
       <>
-        {channelSourceLinkHref ? (
+        {channelSidecarTarget ? (
+          <ChannelThreadControl target={channelSidecarTarget} />
+        ) : channelSourceLinkHref ? (
           <ChannelSourceLinkPill
             href={channelSourceLinkHref}
             channelId={channelHeaderChannelId}
@@ -179,11 +204,6 @@ export function useChatHeaderRegistration({
           assistantId={assistantId}
           conversationId={activeConversation.conversationId}
           refreshKey={assetsRefreshKey}
-          onOpenApp={handleOpenAppFromChat}
-          onOpenDocument={handleOpenDocument}
-        />
-        <ConversationActivityPill
-          conversationId={activeConversation.conversationId}
         />
         {supportsPluginPill ? (
           <InChatPluginPill
@@ -197,11 +217,10 @@ export function useChatHeaderRegistration({
     activeConversation?.conversationId,
     assistantId,
     assetsRefreshKey,
-    handleOpenAppFromChat,
-    handleOpenDocument,
     supportsPluginPill,
     channelSourceLinkHref,
     channelHeaderChannelId,
+    channelSidecarTarget,
   ]);
 
   useEffect(() => {

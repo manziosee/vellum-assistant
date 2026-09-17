@@ -2,6 +2,10 @@ import { Capacitor } from "@capacitor/core";
 import type { ElectronHostOS } from "@vellumai/ipc-contract";
 import { useSyncExternalStore } from "react";
 
+import {
+  getBrowserPlatform,
+  isKnownUnsupportedDesktopBrowser,
+} from "@/runtime/desktop-app-platform";
 import { isElectron } from "@/runtime/is-electron";
 import { isNativePlatform } from "@/runtime/native-auth";
 
@@ -31,14 +35,7 @@ export function isIOSBrowser(): boolean {
   }
 
   // iPadOS 13+ in desktop mode: reports as Mac but has multitouch
-  const uaData = (
-    navigator as Navigator & {
-      userAgentData?: { platform?: string };
-    }
-  ).userAgentData;
-  const isMacPlatform = uaData?.platform
-    ? uaData.platform.toLowerCase().includes("mac")
-    : navigator.platform.toLowerCase().includes("mac");
+  const isMacPlatform = getBrowserPlatform().toLowerCase().includes("mac");
 
   return isMacPlatform && navigator.maxTouchPoints > 1;
 }
@@ -82,15 +79,7 @@ export function isMacOSBrowser(): boolean {
   if (isIOSBrowser()) {
     return false;
   }
-  const uaData = (
-    navigator as Navigator & {
-      userAgentData?: { platform?: string };
-    }
-  ).userAgentData;
-  if (uaData?.platform) {
-    return uaData.platform.toLowerCase().includes("mac");
-  }
-  return navigator.platform.toLowerCase().includes("mac");
+  return getBrowserPlatform().toLowerCase().includes("mac");
 }
 
 /**
@@ -111,6 +100,55 @@ export function isAndroidBrowser(): boolean {
 }
 
 /**
+ * Returns true when the current browser is running on a phone or tablet,
+ * whatever the OS.
+ *
+ * This is the catch-all for the devices `isIOSBrowser()` / `isAndroidBrowser()`
+ * cannot name, so it layers three signals, most reliable first:
+ * `navigator.userAgentData.mobile` (Chromium only), the `Mobi` / `Tablet`
+ * user-agent tokens that Firefox and Safari carry, then a media-query probe of
+ * the input capability.
+ *
+ * Always returns `false` during SSR (no `navigator` / `window`).
+ */
+export function isMobileBrowser(): boolean {
+  if (typeof navigator === "undefined" || typeof window === "undefined") {
+    return false;
+  }
+
+  const uaData = (
+    navigator as Navigator & {
+      userAgentData?: { mobile?: boolean };
+    }
+  ).userAgentData;
+  if (uaData?.mobile === true) {
+    return true;
+  }
+
+  if (/Mobi|Tablet/i.test(navigator.userAgent)) {
+    return true;
+  }
+
+  if (typeof window.matchMedia !== "function") {
+    return false;
+  }
+  // Input capability is a separate axis from platform (docs/PLATFORM_ADAPTATION.md),
+  // so this last resort must not promote a desktop OS on its own: a Windows,
+  // ChromeOS, or Linux tablet reports coarse hoverless input and is still a
+  // desktop. `Macintosh` is deliberately absent, since no Mac has a touchscreen
+  // and that user agent plus coarse input is iPadOS in desktop mode.
+  if (/Windows NT|CrOS|X11/i.test(navigator.userAgent)) {
+    return false;
+  }
+  // Touchscreen laptops report `pointer: coarse` but keep `hover: hover`, so
+  // the hover clause is what keeps them out of the mobile bucket.
+  return (
+    window.matchMedia("(pointer: coarse)").matches &&
+    window.matchMedia("(hover: none)").matches
+  );
+}
+
+/**
  * The OS surfaces this web bundle can report as `clientOs`.
  *
  * The same `clients/web` bundle runs in a plain browser, the Capacitor mobile
@@ -126,6 +164,7 @@ export type { ElectronHostOS };
 const CLIENT_OS_DISPLAY_NAMES: Readonly<Record<ClientOs, string>> = {
   macos: "macOS",
   windows: "Windows",
+  linux: "Linux",
   ios: "iOS",
   android: "Android",
   web: "Web",
@@ -147,7 +186,19 @@ export function detectElectronHostOS(): ElectronHostOS | null {
   if (window.vellum?.hostOS) {
     return window.vellum.hostOS;
   }
-  return navigator.platform.toLowerCase().includes("win") ? "windows" : "macos";
+  const platform = navigator.platform.toLowerCase();
+  if (platform.includes("win")) {
+    return "windows";
+  }
+  if (platform.includes("linux")) {
+    return "linux";
+  }
+  return "macos";
+}
+
+/** Resolve desktop copy to macOS unless the Windows client is detected. */
+export function resolveDesktopHostOS(): ElectronHostOS {
+  return detectElectronHostOS() ?? "macos";
 }
 
 /**
@@ -326,6 +377,22 @@ export function useIsIOSWeb(): boolean {
   );
 }
 
+/**
+ * iOS web user on Safari, where Apple's own Smart App Banner already offers
+ * the app (driven by the `apple-itunes-app` meta tag on the marketing site).
+ *
+ * `useIsIOSWeb` already excludes Safari, but `useIsMobileWeb` does not, so a
+ * cascade that falls back to the unidentified-mobile promotion needs this to
+ * bow out rather than nudge a Safari reader twice.
+ */
+export function useIsIOSSafariWeb(): boolean {
+  return useSyncExternalStore(
+    noop,
+    () => isIOSBrowser() && isSafariBrowser() && !isNativePlatform(),
+    () => false,
+  );
+}
+
 /** Android browser user who may be offered the native Android app. */
 export function useIsAndroidWeb(): boolean {
   return useSyncExternalStore(
@@ -336,17 +403,31 @@ export function useIsAndroidWeb(): boolean {
 }
 
 /**
- * macOS web user who should see custom nudge surfaces.
+ * Mobile web user who may be offered the native app, on devices the iOS and
+ * Android checks did not claim.
  *
- * Excludes Electron because the user is already inside the macOS desktop
- * app — showing a "download the macOS app" nudge would be nonsensical.
- * Also excludes Capacitor (via `isNativePlatform()`) for symmetry with
- * the iOS hook above.
+ * Unlike `useIsIOSWeb` this does NOT exclude Safari: it is the fallback for
+ * browsers we cannot identify, and the caller resolves the iOS Smart App
+ * Banner case before reaching it. Excludes the Capacitor and Electron shells,
+ * where the user is already inside the app.
  */
-export function useIsMacOSWeb(): boolean {
+export function useIsMobileWeb(): boolean {
   return useSyncExternalStore(
     noop,
-    () => isMacOSBrowser() && !isNativePlatform() && !isElectron(),
+    () => isMobileBrowser() && !isNativePlatform() && !isElectron(),
+    () => false,
+  );
+}
+
+/** Desktop browser user who may be offered the detected desktop app. */
+export function useIsDesktopAppWeb(): boolean {
+  return useSyncExternalStore(
+    noop,
+    () =>
+      !isMobileBrowser() &&
+      !isNativePlatform() &&
+      !isElectron() &&
+      !isKnownUnsupportedDesktopBrowser(),
     () => false,
   );
 }
@@ -362,7 +443,7 @@ export function useIsMacOSWeb(): boolean {
  * renders client-only through `createRoot` (no SSR, no hydration).
  *
  * Prefer it over the bare function in JSX (docs/CAPACITOR.md): it keeps the
- * shape consistent with `useIsIOSWeb` / `useIsMacOSWeb` and stays correct if a
+ * shape consistent with `useIsIOSWeb` / `useIsDesktopAppWeb` and stays correct if a
  * prerender step is ever added. There is no first-paint flicker to avoid.
  */
 export function useIsNativeIOS(): boolean {

@@ -21,7 +21,11 @@ import {
   packageSpecs,
 } from "@/domains/settings/billing/plan-spec";
 import { PlanTile } from "@/domains/settings/billing/plan-tile";
-import { UsageBalancePanel } from "@/domains/settings/billing/usage-balance-panel";
+import {
+  UsageBalancePanel,
+  type UsagePeriodEnd,
+  usagePeriodEndLabels,
+} from "@/domains/settings/billing/usage-balance-panel";
 import { captureTakeoverAvatarStash } from "@/lib/billing/takeover-avatar-stash";
 import { useCheckoutDismissRefresh } from "@/domains/settings/billing/use-checkout-dismiss-refresh";
 import {
@@ -43,14 +47,12 @@ import type {
 import { useTranslation } from "@/i18n";
 import { useBillingBalanceStatus } from "@/hooks/use-billing-balance-status";
 import { useDocumentTheme } from "@/hooks/use-document-theme";
-import { useObscureCredits } from "@/hooks/use-obscure-credits-flag";
-import {
-  includedMonthlyCreditsUsd,
-  usePlanUsageBalance,
-} from "@/hooks/use-plan-usage-balance";
+import { usePlanUsageBalance } from "@/hooks/use-plan-usage-balance";
+import { openBillingPathInBrowser } from "@/lib/billing/android-billing-handoff";
 import { saveCheckoutIntent } from "@/lib/billing/checkout-intent";
 import { checkoutReturnTarget } from "@/lib/billing/checkout-return-target";
 import { openUrl } from "@/runtime/browser";
+import { useIsNativeAndroid } from "@/runtime/platform-detection";
 import { routes } from "@/utils/routes";
 import { Button } from "@vellumai/design-library/components/button";
 import { Card } from "@vellumai/design-library/components/card";
@@ -65,6 +67,7 @@ import {
 import {
   extractMutationError,
   isPackageSwitchEligible,
+  TIER_CHANGE_ELIGIBLE_STATUSES,
 } from "./adjust-plan-utils";
 
 export interface PlanCardProps {
@@ -120,11 +123,6 @@ interface RecommendedUpgradeProps {
    */
   relation: SwitchRelation;
   /**
-   * Whether the `obscure-credits` flag is on. Read once by `PlanCard` and
-   * passed down so both tiles answer to the same read.
-   */
-  obscureCredits: boolean;
-  /**
    * Manage-path delegate (AdjustPlanModal). Handles a cancelling or
    * non-entitlement Pro sub that the change-package flow cannot act on.
    */
@@ -143,7 +141,6 @@ function RecommendedUpgrade({
   isProUser,
   canChangePackage,
   relation,
-  obscureCredits,
   onManage,
   onTierUpgraded,
 }: RecommendedUpgradeProps) {
@@ -160,6 +157,9 @@ function RecommendedUpgrade({
   const inverted = useDocumentTheme() === "light" ? "dark" : "light";
   // Native iOS keeps Checkout inside an in-app sheet; refetch when it closes.
   useCheckoutDismissRefresh();
+  // Native Android renders the same tile but hands the purchase off to this
+  // same billing page on the web app, opened in the browser.
+  const isNativeAndroid = useIsNativeAndroid();
 
   const recommended = nextPackageUp(packages, currentKey);
 
@@ -190,6 +190,10 @@ function RecommendedUpgrade({
 
   const handleUpgrade = async () => {
     if (!recommended) {
+      return;
+    }
+    if (isNativeAndroid) {
+      openBillingPathInBrowser(routes.settings.usageBilling);
       return;
     }
     // Any switch-eligible Pro sub (a clean pin, a customized pin, or an
@@ -239,10 +243,7 @@ function RecommendedUpgrade({
       }
     } catch (error) {
       toast.error(
-        extractMutationError(
-          error,
-          t("planCard.checkoutFailedToast"),
-        ),
+        extractMutationError(error, t("planCard.checkoutFailedToast")),
       );
     } finally {
       setPending(false);
@@ -290,15 +291,8 @@ function RecommendedUpgrade({
         }
         specs={packageSpecs(
           recommended,
-          obscureCredits
-            ? {
-                obscuredUsageLabel: t("planCard.usageChip", {
-                  name: recommended.name,
-                }),
-              }
-            : undefined,
+          t("planCard.usageChip", { name: recommended.name }),
         )}
-        specsWrap={obscureCredits}
         footer={
           <Button
             variant="primary"
@@ -365,7 +359,6 @@ export function PlanCard({ onManage, onTierUpgraded }: PlanCardProps) {
     organizationsBillingSubscriptionRetrieveOptions(),
   );
   const plansQuery = useQuery(organizationsBillingPlansRetrieveOptions());
-  const obscureCredits = useObscureCredits();
   const { balance, availableUsageBalance, totalUsageBalance } =
     useBillingBalanceStatus();
   const [addCreditsOpen, setAddCreditsOpen] = useState(false);
@@ -377,11 +370,6 @@ export function PlanCard({ onManage, onTierUpgraded }: PlanCardProps) {
   );
   const usage = usePlanUsageBalance({
     subscription: subscriptionQuery.data,
-    includedCreditsUsd: includedMonthlyCreditsUsd(
-      subscriptionQuery.data,
-      currentPackage,
-      findProPlan(plansQuery.data?.plans),
-    ),
     availableUsageBalance,
     totalUsageBalance,
   });
@@ -424,8 +412,6 @@ export function PlanCard({ onManage, onTierUpgraded }: PlanCardProps) {
     Boolean(subscription.cancel_at);
   const isCanceled = subscription.status === "canceled";
   const cancelDate = getEffectiveCancelDate(subscription);
-  const showRenewal =
-    !isCancelling && !isCanceled && subscription.current_period_end;
   const showCancellation = isCancelling && !isCanceled && cancelDate;
 
   const proPlan = findProPlan(plans);
@@ -446,6 +432,12 @@ export function PlanCard({ onManage, onTierUpgraded }: PlanCardProps) {
     (currentPlan.id === "base" ||
       isCleanPin(subscription.package) ||
       isPackageSwitchEligible(subscription));
+  // Shared by both header button variants: "Manage Subscription" is the name
+  // a paid Pro user scans for, but it leads to the same surface as the base
+  // plan's "View All Plans", which is where a sub is changed or cancelled.
+  const handlePlansClick = canOpenPlansTakeover
+    ? () => navigate(routes.plans)
+    : onManage;
   // The next tile's one-click switch is offered to any switch-eligible Pro sub
   // (a clean pin, a customized pin, or an unpinned Custom sub), inheriting the
   // shared eligibility gate. The confirm copy adapts to the sub's state via
@@ -474,13 +466,7 @@ export function PlanCard({ onManage, onTierUpgraded }: PlanCardProps) {
     : currentPackage
       ? packageSpecs(
           currentPackage,
-          obscureCredits
-            ? {
-                obscuredUsageLabel: t("planCard.usageChip", {
-                  name: currentPackage.name,
-                }),
-              }
-            : undefined,
+          t("planCard.usageChip", { name: currentPackage.name }),
         )
       : null;
   const currentPriceCents = isFreePlan
@@ -491,18 +477,55 @@ export function PlanCard({ onManage, onTierUpgraded }: PlanCardProps) {
     : currentPackage
       ? priceLabelFromCents(currentPackage.total_price_cents)
       : null;
-  const priceRow = priceLabel ? (
-    <div className="flex h-10 items-center border-t border-[var(--border-base)]">
-      <Typography
-        as="span"
-        variant="body-large-default"
-        className="text-[var(--content-tertiary)]"
-        data-testid="plan-card-price"
-      >
-        {priceLabel}
-      </Typography>
-    </div>
-  ) : undefined;
+  // The cycle end is dated only where one is coming: not for the free plan,
+  // whose grant is one-time, not for a sub that is ending rather than
+  // renewing, which the header's cancellation line already dates, and not for
+  // a status the platform bears no entitlement for (`unpaid`, `incomplete`,
+  // `paused`, a null status), which keeps its last `current_period_end`
+  // without renewing on it. A sub holding a credit bundle sees that bundle
+  // reset on the date; one holding none only renews (see `UsagePeriodEnd`).
+  const usagePeriodEnd: UsagePeriodEnd | undefined =
+    !isFreePlan &&
+    !isCancelling &&
+    subscription.status != null &&
+    TIER_CHANGE_ELIGIBLE_STATUSES.has(subscription.status) &&
+    subscription.current_period_end
+      ? {
+          at: subscription.current_period_end,
+          kind: subscription.selected_credit_tier != null ? "resets" : "renews",
+        }
+      : undefined;
+  const periodEndLabels = usagePeriodEndLabels(usagePeriodEnd, t);
+  // The footer while there is no reading to chart: the catalog price, with
+  // the cycle-end line beside it, worded by the panel's own helper, so a
+  // renewing sub keeps its date rather than losing it to a summary that has
+  // not loaded. Either alone still makes the row: a Custom or catalog-less
+  // sub has no price to quote but a cycle end to date all the same.
+  const footerRow =
+    priceLabel || periodEndLabels ? (
+      <div className="flex h-10 items-center justify-between gap-3 border-t border-[var(--border-base)]">
+        {priceLabel ? (
+          <Typography
+            as="span"
+            variant="body-large-default"
+            className="text-[var(--content-tertiary)]"
+            data-testid="plan-card-price"
+          >
+            {priceLabel}
+          </Typography>
+        ) : null}
+        {periodEndLabels ? (
+          <Typography
+            as="span"
+            variant="body-small-default"
+            className="whitespace-nowrap text-[var(--content-tertiary)]"
+            data-testid="plan-card-period-end"
+          >
+            {periodEndLabels.line}
+          </Typography>
+        ) : null}
+      </div>
+    ) : undefined;
   // The add-credits strip is only warranted once the wallet behind the bundle
   // is empty too: a sub at 100% whose purchased credits still cover the next
   // turn has nothing to buy. The bar goes red either way.
@@ -515,19 +538,17 @@ export function PlanCard({ onManage, onTierUpgraded }: PlanCardProps) {
   const usagePanel = usage ? (
     <UsageBalancePanel
       ratio={usage.ratio}
-      resetsAt={usage.resetsAt}
+      periodEnd={usagePeriodEnd}
       exhausted={creditsExhausted}
       onAddCredits={() => setAddCreditsOpen(true)}
     />
   ) : null;
-  // A tile under the flag trades its price for the usage balance, so the two
-  // never state the same allowance twice. A free account that was never granted
-  // any usage has no bar to trade for, so "Free Forever" stays as its footer
-  // rather than leaving the tile with an empty bottom slot.
-  let currentFooter: ReactNode = priceRow;
-  if (obscureCredits && (!isFreePlan || usagePanel != null)) {
-    currentFooter = usagePanel;
-  }
+  // The tile trades its price for the usage balance, so the two never state
+  // the same allowance twice. With no bar to trade for (a free account that
+  // was never granted usage, or a platform whose summary reports no grant
+  // figures), the footer row stays rather than leaving the tile with an empty
+  // bottom slot.
+  const currentFooter: ReactNode = usagePanel ?? footerRow;
 
   return (
     <Card padding="md">
@@ -535,18 +556,6 @@ export function PlanCard({ onManage, onTierUpgraded }: PlanCardProps) {
         <div className="flex items-center justify-between gap-3">
           <div className="flex min-w-0 flex-col gap-1">
             <PlanHeading />
-            {showRenewal && (
-              <Typography
-                variant="body-small-default"
-                as="div"
-                className="leading-snug text-[var(--content-tertiary)]"
-                data-testid="plan-card-renews"
-              >
-                {t("planCard.renewsOn", {
-                  date: formatGraceDate(subscription.current_period_end!),
-                })}
-              </Typography>
-            )}
             {showCancellation && (
               <Typography
                 variant="body-small-default"
@@ -560,18 +569,24 @@ export function PlanCard({ onManage, onTierUpgraded }: PlanCardProps) {
               </Typography>
             )}
           </div>
+          {/* The button never breaks its label, so it must stay free to
+              shrink; a fixed-width slot would push the long es/ru labels past
+              the card. */}
           <Button
             variant="outlined"
-            onClick={
-              canOpenPlansTakeover ? () => navigate(routes.plans) : onManage
+            onClick={handlePlansClick}
+            data-testid={
+              isFreePlan
+                ? "plan-card-plans-button"
+                : "plan-card-manage-subscription-button"
             }
-            data-testid="plan-card-plans-button"
-            className="shrink-0"
           >
-            {t("planCard.viewAllPlans")}
+            {isFreePlan
+              ? t("planCard.viewAllPlans")
+              : t("planCard.manageSubscription")}
           </Button>
         </div>
-        <div className="flex flex-col gap-2 lg:flex-row lg:items-stretch">
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-stretch">
           <PlanTile
             testId="plan-tile-current"
             tierKey={currentTier}
@@ -579,7 +594,6 @@ export function PlanCard({ onManage, onTierUpgraded }: PlanCardProps) {
             nameTestId="plan-card-name"
             tag={<Tag tone="info">{t("planCard.current")}</Tag>}
             specs={currentSpecs}
-            specsWrap={obscureCredits}
             footer={currentFooter}
           />
           <RecommendedUpgrade
@@ -589,7 +603,6 @@ export function PlanCard({ onManage, onTierUpgraded }: PlanCardProps) {
             isProUser={currentPlan.id !== "base"}
             canChangePackage={canChangePackage}
             relation={switchRelation}
-            obscureCredits={obscureCredits}
             onManage={onManage}
             onTierUpgraded={onTierUpgraded}
           />

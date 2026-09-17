@@ -52,10 +52,6 @@ mock.module("@/domains/chat/hooks/use-slack-conversation-display", () => ({
   useSlackConversationDisplay: () => slackDisplayRef.value,
 }));
 
-mock.module("@/domains/chat/hooks/use-open-app-from-chat", () => ({
-  useOpenAppFromChat: () => () => {},
-}));
-
 const supportsRef = { value: true };
 mock.module("@/lib/backwards-compat/use-supports-inchat-plugin-edit", () => ({
   useSupportsInchatPluginEdit: () => supportsRef.value,
@@ -125,8 +121,15 @@ describe("useChatHeaderRegistration top-right slot", () => {
     renderRegistration();
 
     const { queryByTestId } = render(<>{slotRef.value}</>);
-    expect(queryByTestId("assets-pill")).not.toBeNull();
     expect(queryByTestId("plugin-pill")).toBeNull();
+  });
+
+  test("mounts the assets pill", () => {
+    supportsRef.value = true;
+    renderRegistration();
+
+    const { queryByTestId } = render(<>{slotRef.value}</>);
+    expect(queryByTestId("assets-pill")).not.toBeNull();
   });
 
   test("mounts the channel source link pill for a Slack conversation with a link", () => {

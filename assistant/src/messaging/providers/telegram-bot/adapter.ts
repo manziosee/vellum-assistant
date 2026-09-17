@@ -6,8 +6,6 @@
 
 import type { OAuthConnection } from "../../../oauth/connection.js";
 import { getConnectionByProvider } from "../../../oauth/oauth-store.js";
-import { getOrCreateConversation } from "../../../persistence/conversation-key-store.js";
-import { upsertOutboundBinding } from "../../../persistence/external-conversation-store.js";
 import { credentialKey } from "../../../security/credential-key.js";
 import { getSecureKeyAsync } from "../../../security/secure-keys.js";
 import type { MessagingProvider } from "../../provider.js";
@@ -19,8 +17,6 @@ import type {
   Message,
   SearchOptions,
   SearchResult,
-  SendOptions,
-  SendResult,
 } from "../../provider-types.js";
 import * as telegram from "./client.js";
 
@@ -33,7 +29,7 @@ export const telegramBotMessagingProvider: MessagingProvider = {
   id: "telegram",
   displayName: "Telegram",
   credentialService: "telegram",
-  capabilities: new Set(["send"]),
+  capabilities: new Set(),
 
   async isConnected(): Promise<boolean> {
     const conn = getConnectionByProvider("telegram");
@@ -92,38 +88,6 @@ export const telegramBotMessagingProvider: MessagingProvider = {
         metadata: { error: e instanceof Error ? e.message : "getMe failed" },
       };
     }
-  },
-
-  async sendMessage(
-    _connection: OAuthConnection | undefined,
-    conversationId: string,
-    text: string,
-    _options?: SendOptions,
-  ): Promise<SendResult> {
-    await telegram.sendMessage(conversationId, text);
-
-    // Upsert external conversation binding so deleted/reset syncs are
-    // resurrected when an outbound message is sent. This ensures the
-    // conversation key mapping and binding exist for the next inbound.
-    try {
-      const sourceChannel = "telegram";
-      const conversationKey = `asst:self:${sourceChannel}:${conversationId}`;
-      const { conversationId: internalId } =
-        getOrCreateConversation(conversationKey);
-      upsertOutboundBinding({
-        conversationId: internalId,
-        sourceChannel,
-        externalChatId: conversationId,
-      });
-    } catch {
-      // Best-effort — don't fail the send if binding upsert fails
-    }
-
-    return {
-      id: `tg-${Date.now()}`,
-      timestamp: Date.now(),
-      conversationId,
-    };
   },
 
   async listConversations(

@@ -3,7 +3,7 @@
  *
  * `APP_PROTOCOL` and `APP_HOST` define the custom scheme the packaged
  * renderer is served from; `index.ts` registers it privileged and serves
- * `resources/web-dist` through it, and `main-window.ts` derives the
+ * `resources/cli-runtime/web-dist` through it, and `main-window.ts` derives the
  * BrowserWindow load URL and the same-origin navigation guard from it.
  *
  * The renderer-base URLs are derived: `RENDERER_BASE_PROD` is the
@@ -18,10 +18,16 @@
 export const APP_PROTOCOL = "app";
 export const APP_HOST = "vellum.ai";
 
+declare const __VELLUM_APP_USER_MODEL_ID__: string;
 declare const __VELLUM_BUILD_SHA__: string;
 declare const __VELLUM_ENVIRONMENT__: string;
 
 export const WINDOWS_RELEASE_INFO = {
+  // Injected from electron-builder.config.cjs `appId` at build time.
+  appUserModelId:
+    typeof __VELLUM_APP_USER_MODEL_ID__ === "string"
+      ? __VELLUM_APP_USER_MODEL_ID__
+      : "com.vellum.vellum-assistant-electron",
   commitSha:
     typeof __VELLUM_BUILD_SHA__ === "string" ? __VELLUM_BUILD_SHA__ : "unknown",
   releaseChannel:

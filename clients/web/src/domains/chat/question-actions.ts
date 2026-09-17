@@ -6,12 +6,16 @@
  * submit/dismiss lifecycle for multi-field question prompts.
  */
 
+import { t } from "@/i18n";
 import { captureError } from "@/lib/sentry/capture-error";
 
 import { useChatSessionStore } from "@/domains/chat/chat-session-store";
 import { useInteractionStore } from "@/domains/chat/interaction-store";
+import { getDesktopHelpEntry } from "@/domains/chat/desktop/desktop-help";
+import { useDesktopPreviewStore } from "@/domains/chat/desktop/desktop-preview-store";
 import {
   clearSubmissionFailure,
+  captureSubmissionRejection,
   reportSubmissionFailure,
   stillOwnsSubmission,
 } from "@/domains/chat/prompt-submission";
@@ -82,11 +86,21 @@ export async function handleQuestionResponse(
     // guard above, so no newer prompt can have arrived yet.
     useChatSessionStore
       .getState()
-      .setError({ message: "No active session. Please try again." });
+      .setError({ message: t("chat:promptSubmission.noActiveSession") });
     useInteractionStore
       .getState()
       .releaseSubmission("question", snapshot.requestId);
     return;
+  }
+
+  if (getDesktopHelpEntry(snapshot)) {
+    useDesktopPreviewStore
+      .getState()
+      .markHelpSubmitted(
+        ctx.assistantId,
+        snapshot.requestId,
+        ctx.conversationId,
+      );
   }
 
   try {
@@ -95,14 +109,25 @@ export async function handleQuestionResponse(
       snapshot.requestId,
       { kind: "submit", responses },
     );
+    if (result.ok || result.status === 404) {
+      useDesktopPreviewStore
+        .getState()
+        .resolveHelpSubmission(snapshot.requestId);
+    }
     if (!result.ok) {
       if (result.status === 404) {
         clearStaleQuestion(snapshot.requestId);
         return;
       }
-      // A retryable failure, so the card stays and the user is told, provided
-      // the prompt they are looking at is still this one.
-      reportSubmissionFailure("question", snapshot.requestId, result.error);
+      // The assistant's own message describes a body this client built, so it
+      // goes to Sentry rather than in front of the user, who never chose the
+      // payload and cannot correct it.
+      captureSubmissionRejection("submit_question_response", result);
+      reportSubmissionFailure(
+        "question",
+        snapshot.requestId,
+        "questionActions.submitFailed",
+      );
       useInteractionStore
         .getState()
         .releaseSubmission("question", snapshot.requestId);
@@ -124,7 +149,7 @@ export async function handleQuestionResponse(
     reportSubmissionFailure(
       "question",
       snapshot.requestId,
-      "Failed to submit response. Please try again.",
+      "questionActions.submitFailed",
     );
     useInteractionStore
       .getState()

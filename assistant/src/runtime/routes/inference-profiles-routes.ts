@@ -20,7 +20,7 @@ import { z } from "zod";
 
 import { validateInferenceProfileConfig } from "../../api/constants/profile-config-validation.js";
 import {
-  getEffectiveProfilesForProvider,
+  getUserSelectableProfilesForProvider,
   MANAGED_PROFILE_NAMES,
   resolveDefaultProfileForProvider,
 } from "../../config/default-profile-catalog.js";
@@ -29,6 +29,10 @@ import {
   getConfigReadOnly,
   loadRawConfig,
 } from "../../config/loader.js";
+import {
+  nonTextConversationProfileMessage,
+  profileSupportsTextGeneration,
+} from "../../config/profile-text-generation.js";
 import {
   ProfileEntry,
   routingIdentityModelIssue,
@@ -436,8 +440,9 @@ function fragmentFromBody(
 
 /**
  * Enumerate every live reference to profile `name` in the raw `llm` config
- * block: `activeProfile`, `advisorProfile`, each `callSites.<id>.profile`, and
- * every mix arm (`profiles.<mix>.mix[].profile`). Deleting a profile while any
+ * block: `activeProfile`, `advisorProfile`, each `callSites.<id>.profile`,
+ * every mix arm (`profiles.<mix>.mix[].profile`), and every fallback pointer
+ * (`profiles.<p>.fallbackProfile`). Deleting a profile while any
  * of these point at it would leave a dangling reference that `LLMSchema`'s
  * superRefine rejects on the next load — silently resetting the user's chat
  * model or call-site pins. The delete handler rejects instead.
@@ -467,12 +472,16 @@ export function collectProfileReferences(
   const profiles = asPlainObject(llm.profiles);
   if (profiles) {
     for (const [profileName, profileEntry] of Object.entries(profiles)) {
-      const mix = asPlainObject(profileEntry)?.mix;
+      const entry = asPlainObject(profileEntry);
+      const mix = entry?.mix;
       if (
         Array.isArray(mix) &&
         mix.some((arm) => asPlainObject(arm)?.profile === name)
       ) {
         refs.push(`llm.profiles.${profileName}.mix`);
+      }
+      if (entry?.fallbackProfile === name) {
+        refs.push(`llm.profiles.${profileName}.fallbackProfile`);
       }
     }
   }
@@ -514,7 +523,7 @@ function assertSaneMaxTokens(
 
 async function handleListProfiles() {
   const config = getConfigReadOnly();
-  const effective = getEffectiveProfilesForProvider(
+  const effective = getUserSelectableProfilesForProvider(
     config.llm.profiles,
     config.llm.defaultProvider ?? null,
   );
@@ -870,7 +879,7 @@ async function handleSetActiveProfile({ body = {} }: RouteHandlerArgs) {
   // is rejected here instead of silently stripped on the next config load —
   // which would reset the user's chat-model selection.
   const config = getConfigReadOnly();
-  const effective = getEffectiveProfilesForProvider(
+  const effective = getUserSelectableProfilesForProvider(
     config.llm.profiles,
     config.llm.defaultProvider ?? null,
   );
@@ -885,6 +894,11 @@ async function handleSetActiveProfile({ body = {} }: RouteHandlerArgs) {
     throw new BadRequestError(
       `Profile "${name}" is disabled and cannot be set as the active profile. Enable it first, or pick another.`,
     );
+  }
+  if (
+    !profileSupportsTextGeneration(entry, effective as Record<string, unknown>)
+  ) {
+    throw new BadRequestError(nonTextConversationProfileMessage(name));
   }
   // No escape hatch here: an active profile that cannot dispatch locks the
   // user out of chat entirely, and nothing about the write signals that.
@@ -1011,7 +1025,7 @@ export const ROUTES: RouteDefinition[] = [
       "404": { description: "Profile not found" },
       "409": {
         description:
-          "Profile is still referenced by activeProfile, advisorProfile, a call site, a default-tier override, or a mix arm",
+          "Profile is still referenced by activeProfile, advisorProfile, a call site, a default-tier override, a mix arm, or another profile's fallbackProfile",
       },
     },
     handler: handleDeleteProfile,

@@ -10,12 +10,18 @@
  * explicitly allowed.
  */
 export * from "./types";
+export * from "./accelerators";
+export * from "./accelerator-keys";
 export * from "./schemas";
 export {
   type ElectronHostOS,
-  type LocalConnectImportResult,
   type LocalListDevicesResult,
   type LocalPairedDeviceRecord,
+  type LocalPairingFailure,
+  type LocalPairingFailureReason,
+  type LocalPairingPollResult,
+  type LocalPairingStartResult,
+  type LocalReadAssistantAvatarResult,
   type LocalRevokeDeviceResult,
   type LocalUpgradeOptions,
   type LocalWakeOptions,
@@ -23,3 +29,4 @@ export {
   VELLUM_BRIDGE_KEYS,
 } from "./bridge";
 export * from "./channels";
+export * from "./fn-claimants";

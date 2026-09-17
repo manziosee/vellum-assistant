@@ -27,6 +27,10 @@
  *
  * Reference: https://heyapi.dev/openapi-ts/clients/fetch#interceptors
  */
+import {
+  beginAssistantRequest,
+  recordAssistantResponse,
+} from "@/assistant/request-activity";
 import { client as platformClient } from "@/generated/api/client.gen";
 import { client as authClient } from "@/generated/auth/client.gen";
 import { client as daemonClient } from "@/generated/daemon/client.gen";
@@ -53,6 +57,7 @@ import {
   getSelfHostedIngressUrl,
   setSelfHostedConnection,
 } from "@/lib/self-hosted/connection";
+import { currentLocale } from "@/i18n";
 import { getClientRegistrationHeaders } from "@/lib/telemetry/client-identity";
 import {
   installResumeRequestCounter,
@@ -124,17 +129,38 @@ const RUNTIME_PROXIED_FIRST_SEGMENTS = new Set<string>([
   // Every removed entry (contacts, trust-rules, permissions,
   // channel-admission-policy, …) was retired by migrating its call sites
   // to the generated gateway SDK, whose client forwards all
-  // assistant-scoped requests without this list — that is the paved road
+  // assistant-scoped requests without this list: that is the paved road
   // for new endpoints. Deliberately NOT listed: `artifacts` (no
-  // gateway/daemon route exists) and `a2a` (platform broker route); those
-  // stay on the platform. The contact family (`contacts`,
-  // `contact-channels`) is forwarded via {@link FLATTENED_FIRST_SEGMENTS}
-  // with the assistant prefix stripped — it does not belong in this
-  // allowlist.
+  // gateway/daemon route exists), `a2a` (platform broker route), and
+  // `push-tokens` / `live-activity` (Django-owned token registration).
+  // Those stay on the platform in cloud and local-with-ingress. Remote
+  // gateway authorizes the last two via
+  // {@link authorizeRemoteGatewayRequest} so the features gate does not
+  // abort them. The contact family (`contacts`, `contact-channels`) is
+  // forwarded via {@link FLATTENED_FIRST_SEGMENTS} with the assistant
+  // prefix stripped; it does not belong in this allowlist.
   "config",
 ]);
 
+/**
+ * Django-owned device and Live Activity token routes. In remote-gateway
+ * mode they are same-origin to the ingress, so they must carry the
+ * paired bearer or {@link platformFeaturesGate} aborts them before
+ * Django (or the gateway proxy that reaches Django) sees them.
+ */
+const PLATFORM_PUSH_FIRST_SEGMENTS = new Set<string>([
+  "push-tokens",
+  "live-activity",
+]);
+
 const ASSISTANT_PATH_RE = /^\/v1\/assistants\/[^/]+\/(([^/?#]+)(?:\/.*)?)$/;
+
+/**
+ * Same resource match as {@link ASSISTANT_PATH_RE}, but allows an ingress
+ * path prefix (`/assistant-123/v1/assistants/...`).
+ */
+const ASSISTANT_RESOURCE_RE =
+  /\/v1\/assistants\/[^/]+\/(([^/?#]+)(?:\/.*)?)$/;
 
 /**
  * First segments whose `/v1/assistants/{id}/` prefix is stripped before
@@ -194,6 +220,47 @@ function isDaemonBoundPath(url: string): boolean {
   );
 }
 
+function isPlatformPushPath(url: string): boolean {
+  const match = ASSISTANT_RESOURCE_RE.exec(new URL(url).pathname);
+  return match !== null && PLATFORM_PUSH_FIRST_SEGMENTS.has(match[2]);
+}
+
+/**
+ * Platform clients emit `/v1/assistants/...` against the page origin. A
+ * path-prefixed remote ingress only serves `/assistant-123/v1/...`, so
+ * relocate the resource under that prefix before authorizing.
+ */
+function relocateRemoteGatewayPushRequest(request: Request): Request {
+  if (!isRemoteGatewayMode()) {
+    return request;
+  }
+  const ingressUrl = getSelfHostedIngressUrl();
+  if (!ingressUrl) {
+    return request;
+  }
+
+  const url = new URL(request.url);
+  const ingress = new URL(ingressUrl);
+  if (url.origin !== ingress.origin) {
+    return request;
+  }
+
+  const resource = ASSISTANT_RESOURCE_RE.exec(url.pathname);
+  if (!resource || !PLATFORM_PUSH_FIRST_SEGMENTS.has(resource[2])) {
+    return request;
+  }
+
+  const prefix = ingress.pathname.replace(/\/$/, "");
+  const relocatedPath = `${prefix}${resource[0]}`;
+  if (url.pathname === relocatedPath) {
+    return request;
+  }
+
+  const relocated = new URL(request.url);
+  relocated.pathname = relocatedPath;
+  return new Request(relocated.toString(), request);
+}
+
 /**
  * Rewrites a request bound for `/v1/assistants/{id}/{runtime-segment}/...`
  * to the registered self-hosted ingress, swapping platform session/CSRF
@@ -206,7 +273,7 @@ function isDaemonBoundPath(url: string): boolean {
  * @param options.skipSegmentAllowlist — when `true`, all assistant
  *   sub-resource paths are forwarded regardless of
  *   {@link RUNTIME_PROXIED_FIRST_SEGMENTS}. The daemon client sets this
- *   because every daemon SDK endpoint is a daemon route by definition.
+ *   for both daemon routes and gateway-owned compatibility routes.
  *   The platform client leaves it `false` to avoid forwarding
  *   platform-owned routes (maintenance-mode, system-events, etc.);
  *   {@link FLATTENED_FIRST_SEGMENTS} are forwarded regardless.
@@ -290,6 +357,9 @@ export async function rewriteForSelfHostedIngress(
     credentials: "omit",
     redirect: request.redirect,
     signal: request.signal,
+    // A rebuilt Request does not inherit this from `request`, and dropping it
+    // cancels pagehide-time sends (the boot telemetry flush) mid-navigation.
+    keepalive: request.keepalive,
   };
   if (!isLocalClient() && request.body) {
     (init as RequestInit & { duplex: "half" }).duplex = "half";
@@ -338,11 +408,65 @@ export function authorizeRemoteGatewayRequest(
   });
 }
 
+const assistantRequestObservations = new WeakMap<
+  Request,
+  {
+    observation: number;
+    isStatus: boolean;
+    provesReadiness: boolean;
+  }
+>();
+// Legacy daemon SDK routes served by the gateway, plus sleep acknowledgements
+// and health checks whose payload must be validated by the lifecycle service.
+const NON_SERVING_DAEMON_PATHS = new Set([
+  ...FLATTENED_FIRST_SEGMENTS,
+  ...PLATFORM_PUSH_FIRST_SEGMENTS,
+  "audio",
+  "background-wake",
+  "backups",
+  "brain-graph",
+  "brain-graph-ui",
+  "channel-verification-sessions",
+  "channels",
+  "credential-requests",
+  "events",
+  "health",
+  "healthz",
+  "integrations",
+  "logs",
+  "oauth",
+  "ps",
+  "slack",
+  "trust-rules",
+]);
+
+export function assistantActivityResponseInterceptor(
+  response: Response,
+  request: Request,
+  options?: { parseAs?: string },
+): Response {
+  const observation = assistantRequestObservations.get(request);
+  const isStream =
+    options?.parseAs === "stream" ||
+    response.headers.get("content-type")?.includes("text/event-stream");
+  if (
+    response.ok &&
+    request.method !== "OPTIONS" &&
+    !request.signal.aborted &&
+    !isStream &&
+    observation
+  ) {
+    if (observation.isStatus || observation.provesReadiness) {
+      recordAssistantResponse(observation.observation, !observation.isStatus);
+    }
+  }
+  return response;
+}
+
 /**
  * Builds a request interceptor for a HeyAPI client.
  *
- * @param isDaemonClient `true` for the daemon + gateway clients, where every
- *   endpoint is a daemon route by definition. Two things follow from it: all
+ * @param isDaemonClient `true` for the daemon + gateway clients. All
  *   assistant sub-resource paths are forwarded to the self-hosted gateway
  *   without consulting {@link RUNTIME_PROXIED_FIRST_SEGMENTS}, and every
  *   request counts toward the post-resume burst. `false` for the platform and
@@ -361,6 +485,7 @@ export function authorizeRemoteGatewayRequest(
 function createInterceptor({
   isDaemonClient = false,
   allowRemoteGatewayDirect = false,
+  observeDaemonActivity = false,
 } = {}) {
   /**
    * `outgoing` is the request the chain hands downstream; `url` is the original
@@ -394,6 +519,8 @@ function createInterceptor({
       newRequest.headers.set(name, value);
     }
 
+    newRequest.headers.set("Accept-Language", currentLocale());
+
     // Self-hosted assistant + runtime-proxied path → talk to the user's
     // gateway directly instead of stamping the platform's session/CSRF
     // headers.
@@ -406,6 +533,14 @@ function createInterceptor({
 
     if (allowRemoteGatewayDirect) {
       const remoteGateway = authorizeRemoteGatewayRequest(newRequest);
+      if (remoteGateway) {
+        return remoteGateway;
+      }
+    }
+
+    if (!isDaemonClient && isPlatformPushPath(newRequest.url)) {
+      const relocated = relocateRemoteGatewayPushRequest(newRequest);
+      const remoteGateway = authorizeRemoteGatewayRequest(relocated);
       if (remoteGateway) {
         return remoteGateway;
       }
@@ -449,7 +584,30 @@ function createInterceptor({
   };
 
   return async (request: Request): Promise<Request> => {
+    const pathname = new URL(request.url).pathname;
+    const isStatus =
+      !isDaemonClient &&
+      /\/v1\/assistants\/[^/]+\/operational\/status\/?$/.test(pathname);
+    const match =
+      observeDaemonActivity || isDaemonClient
+        ? /\/v1\/assistants\/([^/]+)\/([^/?#]+)/.exec(pathname)
+        : null;
+    const observation =
+      match &&
+      (isStatus ||
+        isDaemonClient ||
+        RUNTIME_PROXIED_FIRST_SEGMENTS.has(match[2]))
+        ? beginAssistantRequest(match[1])
+        : null;
     const outgoing = await route(request);
+    if (observation && match) {
+      assistantRequestObservations.set(outgoing, {
+        observation,
+        isStatus,
+        provesReadiness:
+          observeDaemonActivity && !NON_SERVING_DAEMON_PATHS.has(match[2]),
+      });
+    }
     try {
       if (shouldCount(request.url, outgoing)) {
         noteDaemonApiRequest(request.url);
@@ -462,10 +620,18 @@ function createInterceptor({
 }
 
 /** Platform + auth clients: uses the segment allowlist. */
-export const requestInterceptor = createInterceptor();
+export const requestInterceptor = createInterceptor({
+  observeDaemonActivity: true,
+});
 
 /** Daemon client: bypasses the segment allowlist. */
 export const daemonRequestInterceptor = createInterceptor({
+  isDaemonClient: true,
+  allowRemoteGatewayDirect: true,
+  observeDaemonActivity: true,
+});
+
+const gatewayRequestInterceptor = createInterceptor({
   isDaemonClient: true,
   allowRemoteGatewayDirect: true,
 });
@@ -477,14 +643,19 @@ export const daemonRequestInterceptor = createInterceptor({
 const UNREACHABLE_STATUS_CODES = new Set<number>([502, 503, 504]);
 
 /**
- * Daemon-only response interceptor. Publishes `assistant.unreachable` on
- * gateway-class errors. No URL filtering needed because every daemon
- * SDK request targets the assistant runtime by definition. Not
- * installed on platform/auth clients (a 502 from Django is a
- * different failure domain).
+ * Records gateway-class failures before prompting a scoped reachability probe.
+ * Not installed on platform/auth clients, whose 502s can come from Django.
  */
-export function daemonUnreachableInterceptor(response: Response): Response {
-  if (UNREACHABLE_STATUS_CODES.has(response.status)) {
+export function daemonUnreachableInterceptor(
+  response: Response,
+  request: Request,
+): Response {
+  const observation = assistantRequestObservations.get(request)?.observation;
+  if (
+    UNREACHABLE_STATUS_CODES.has(response.status) &&
+    !request.signal.aborted &&
+    recordAssistantResponse(observation ?? null, false)
+  ) {
     publish("assistant.unreachable", {});
   }
   return response;
@@ -1111,13 +1282,14 @@ daemonClient.interceptors.request.use(daemonRequestInterceptor);
 daemonClient.interceptors.response.use(daemonUnreachableInterceptor);
 daemonClient.interceptors.response.use(localGatewayAuthRecoveryInterceptor);
 daemonClient.interceptors.response.use(platformAuthRecoveryInterceptor);
+daemonClient.interceptors.response.use(assistantActivityResponseInterceptor);
 daemonClient.interceptors.error.use(daemonErrorInterceptor);
 
 // Gateway client uses the same routing as daemon: all gateway endpoints
 // are proxied through the same self-hosted ingress / platform gateway path,
 // so a stale renderer token 401s both clients identically and the same
-// in-place recovery applies. The two chains are kept in the same order.
-gatewayClient.interceptors.request.use(daemonRequestInterceptor);
+// in-place recovery applies. Gateway-only responses do not prove daemon readiness.
+gatewayClient.interceptors.request.use(gatewayRequestInterceptor);
 gatewayClient.interceptors.response.use(daemonUnreachableInterceptor);
 gatewayClient.interceptors.response.use(localGatewayAuthRecoveryInterceptor);
 gatewayClient.interceptors.response.use(platformAuthRecoveryInterceptor);
@@ -1241,3 +1413,4 @@ export function platformFeaturesGate(request: Request): Request {
 }
 
 platformClient.interceptors.request.use(platformFeaturesGate);
+platformClient.interceptors.response.use(assistantActivityResponseInterceptor);

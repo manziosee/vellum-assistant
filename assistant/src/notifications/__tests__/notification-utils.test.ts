@@ -1,8 +1,11 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  collapseHorizontalWhitespace,
+  decodeLiteralLineBreaks,
   describeMedia,
   mediaEmbeds,
+  sanitizeMultilineMessagePreview,
   stripMarkdownForPreview,
 } from "../notification-utils.js";
 
@@ -230,6 +233,35 @@ describe("mediaEmbeds", () => {
   });
 });
 
+describe("collapseHorizontalWhitespace", () => {
+  test("keeps paragraph breaks and trims line padding", () => {
+    expect(collapseHorizontalWhitespace("  Here:\n\n  item  \n  other  ")).toBe(
+      "Here:\n\nitem\nother",
+    );
+  });
+
+  test("collapses three or more newlines to one blank line", () => {
+    expect(collapseHorizontalWhitespace("a\n\n\n\nb")).toBe("a\n\nb");
+  });
+});
+
+describe("sanitizeMultilineMessagePreview", () => {
+  test("keeps newlines and strips other control characters", () => {
+    expect(sanitizeMultilineMessagePreview("Hello\n\tWorld")).toBe(
+      "Hello\nWorld",
+    );
+    expect(sanitizeMultilineMessagePreview("Test\r\nMessage")).toBe(
+      "Test\nMessage",
+    );
+  });
+
+  test("clamps to the shared preview budget", () => {
+    const result = sanitizeMultilineMessagePreview("A".repeat(250));
+    expect(result).toHaveLength(200);
+    expect(result.endsWith("…")).toBe(true);
+  });
+});
+
 describe("describeMedia", () => {
   test("names a single label", () => {
     expect(describeMedia(["cut.mp4"])).toBe("Sent cut.mp4");
@@ -245,5 +277,17 @@ describe("describeMedia", () => {
 
   test("returns empty for no labels, leaving the fallback to the caller", () => {
     expect(describeMedia([])).toBe("");
+  });
+});
+
+describe("decodeLiteralLineBreaks", () => {
+  test("turns literal newline escapes into real line breaks", () => {
+    expect(decodeLiteralLineBreaks("Line one\\n\\nLine two")).toBe(
+      "Line one\n\nLine two",
+    );
+  });
+
+  test("leaves ordinary markdown alone", () => {
+    expect(decodeLiteralLineBreaks("**3 new emails**")).toBe("**3 new emails**");
   });
 });

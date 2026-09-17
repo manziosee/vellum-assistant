@@ -378,6 +378,56 @@ describe("deriveReason", () => {
     ).toBe("model_not_found");
   });
 
+  test("OpenCode 401 ModelError 'is not supported' → model_not_found", () => {
+    // OpenCode zen returns 401 with type=ModelError for an unknown model
+    // id. That must not fall through to the 401 → invalid_credentials branch.
+    expect(
+      deriveReason(
+        n({
+          message: "Model muse-spark-1.3-contributor is not supported",
+          apiErrorType: "ModelError",
+        }),
+        401,
+      ),
+    ).toBe("model_not_found");
+  });
+
+  test("401 with only apiErrorType=ModelError → model_not_found", () => {
+    expect(
+      deriveReason(
+        n({ message: "Request failed", apiErrorType: "ModelError" }),
+        401,
+      ),
+    ).toBe("model_not_found");
+  });
+
+  test("plain 401 without a model signal stays invalid_credentials", () => {
+    expect(deriveReason(n({ message: "Invalid API key provided" }), 401)).toBe(
+      "invalid_credentials",
+    );
+  });
+
+  test("500 with apiErrorType=ModelError stays server_error", () => {
+    expect(
+      deriveReason(
+        n({
+          message: "Internal server error",
+          apiErrorType: "ModelError",
+        }),
+        500,
+      ),
+    ).toBe("server_error");
+  });
+
+  test("500 with 'model is not supported' prose stays server_error", () => {
+    expect(
+      deriveReason(
+        n({ message: "Model muse-spark-1.3-contributor is not supported" }),
+        500,
+      ),
+    ).toBe("server_error");
+  });
+
   test("vision-not-supported prose → vision_unsupported", () => {
     expect(
       deriveReason(
@@ -385,6 +435,28 @@ describe("deriveReason", () => {
         400,
       ),
     ).toBe("vision_unsupported");
+  });
+
+  test("chat-template failure prose on a 400 → request_shape_unsupported", () => {
+    // Together's server-side renderer error for MiniMax M3, verbatim.
+    expect(
+      deriveReason(
+        n({
+          message:
+            "Failed to apply chat template: invalid operation: object is not callable (in chat:22)",
+        }),
+        400,
+      ),
+    ).toBe("request_shape_unsupported");
+  });
+
+  test("chat-template prose on a 5xx stays server-side, not request_shape_unsupported", () => {
+    expect(
+      deriveReason(
+        n({ message: "Failed to apply chat template: renderer crashed" }),
+        500,
+      ),
+    ).not.toBe("request_shape_unsupported");
   });
 
   test("402 → insufficient_credits", () => {

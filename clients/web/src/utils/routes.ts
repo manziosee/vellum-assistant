@@ -27,6 +27,14 @@ const PLANS_PATH = r("/assistant/plans");
 export const SCROLL_TO_MESSAGE_PARAM = "message";
 
 /**
+ * Path segment introducing the app a conversation URL keeps on screen
+ * (`/assistant/conversations/:conversationId/app/:appId`). Shared by the route
+ * tree in `routes.tsx`, the URL producers ({@link routes.conversation} and
+ * friends), and the parser ({@link appIdForPath}) so the spelling can't drift.
+ */
+export const CONVERSATION_APP_SEGMENT = "app";
+
+/**
  * Search param naming a Pro package. Carried by the checkout deep link
  * (`/assistant/checkout?package=<slug>`) that the marketing pricing CTAs
  * target, and by the plans takeover's one-shot switch deep link
@@ -34,6 +42,20 @@ export const SCROLL_TO_MESSAGE_PARAM = "message";
  * spelling can't drift.
  */
 export const PACKAGE_PARAM = "package";
+
+/**
+ * Search params that fire once on the entry carrying them: an auto-send
+ * prompt, its relay token, and the document a conversation URL opens with.
+ * An entry holding one is not a destination to pop back to, since the pop
+ * would re-fire it, so the app and document entry recorders both refuse it.
+ */
+const ONE_SHOT_ENTRY_PARAMS = ["prompt", "relay", "document"] as const;
+
+/** Whether `search` carries a param that would re-fire on a pop back to it. */
+export function hasOneShotEntryParam(search: string): boolean {
+  const params = new URLSearchParams(search);
+  return ONE_SHOT_ENTRY_PARAMS.some((key) => params.has(key));
+}
 
 export const routes = {
   assistant: r("/assistant"),
@@ -68,22 +90,37 @@ export const routes = {
   credentialEntry: r("/assistant/credentials/enter"),
   quickInput: r("/assistant/quick-input"),
   conversations: r("/assistant/conversations"),
-  conversation: (key: string) => dyn(r("/assistant/conversations"), key),
+  /** Conversation URL, optionally naming the app the viewer keeps on screen.
+   *  `appId` is passed through unencoded, like {@link routes.library.app};
+   *  `useParams` and {@link appIdForPath} both decode the segment on the way
+   *  back. */
+  conversation: (key: string, appId?: string | null) => {
+    const base = dyn(r("/assistant/conversations"), key);
+    return appId ? `${base}/${CONVERSATION_APP_SEGMENT}/${appId}` : base;
+  },
   /** Conversation URL that asks the transcript to scroll to + highlight a
    *  specific message on load. */
-  conversationAtMessage: (conversationId: string, messageId: string) =>
-    `${dyn(r("/assistant/conversations"), conversationId)}?${SCROLL_TO_MESSAGE_PARAM}=${encodeURIComponent(messageId)}`,
-  /** Conversation URL that auto-sends `prompt` on load via the `?prompt=`
-   *  pathway (see `use-auto-send-effects.ts`). Lets another surface (app
-   *  viewer, document feedback) relay a message into a conversation. An
-   *  optional `relayToken` makes the URL unique so identical prompts relayed
-   *  back-to-back still re-fire the auto-send (the dedupe keys on the token). */
+  conversationAtMessage: (
+    conversationId: string,
+    messageId: string,
+    appId?: string | null,
+  ) =>
+    `${routes.conversation(conversationId, appId)}?${SCROLL_TO_MESSAGE_PARAM}=${encodeURIComponent(messageId)}`,
+  /** Conversation URL carrying `prompt` via the `?prompt=` pathway (see
+   *  `use-auto-send-effects.ts`). Lets another surface (app viewer, document
+   *  feedback) relay a message into a conversation. The prompt is only sent
+   *  on the user's behalf when the navigation also carries
+   *  `autoSendPromptState` (`utils/auto-send-prompt.ts`); a bare URL pre-fills
+   *  the composer instead. An optional `relayToken` makes the URL unique so
+   *  identical prompts relayed back-to-back still re-fire the auto-send (the
+   *  dedupe keys on the token). */
   conversationWithPrompt: (
     conversationId: string,
     prompt: string,
     relayToken?: string,
+    appId?: string | null,
   ) => {
-    const base = `${dyn(r("/assistant/conversations"), conversationId)}?prompt=${encodeURIComponent(prompt)}`;
+    const base = `${routes.conversation(conversationId, appId)}?prompt=${encodeURIComponent(prompt)}`;
     return relayToken
       ? `${base}&relay=${encodeURIComponent(relayToken)}`
       : base;
@@ -131,7 +168,6 @@ export const routes = {
     research: r("/assistant/onboarding/research"),
   },
 
-  home: r("/assistant/home"),
   /**
    * Schedules surface — a drill-down section under the assistant overview
    * (`identity`), sharing the About Assistant chrome with Skills, Plugins,
@@ -151,6 +187,14 @@ export const routes = {
    */
   personality: r("/assistant/personality"),
   memory: r("/assistant/memory"),
+  /**
+   * The Inspiration List: every activation task of the active persona list,
+   * reached from the Preferences menu and from the checklist's celebration
+   * modal. A standalone page rather than an About Assistant section, so it
+   * carries no `ABOUT_ASSISTANT_SECTIONS` entry, inherits none of that
+   * drill-down chrome and takes no sidebar highlight.
+   */
+  activationList: r("/assistant/suggestions"),
   /**
    * The My Superpowers surface — skills and plugins combined into one
    * list. The legacy `/assistant/skills` and `/assistant/plugins` list
@@ -260,6 +304,7 @@ export const routes = {
     },
     community: r("/assistant/settings/community"),
     developer: r("/assistant/settings/developer"),
+    personality: r("/assistant/settings/personality"),
     mcp: r("/assistant/settings/mcp"),
     debug: r("/assistant/settings/debug"),
     dangerZone: r("/assistant/settings/danger-zone"),
@@ -274,6 +319,7 @@ export const routes = {
 
   docs: {
     hostingOptions: r("/docs/hosting-options"),
+    pairADevice: r("/docs/hosting-options/pair-a-device"),
     legal: {
       privacyPolicy: r("/docs/privacy-policy"),
       termsOfUse: r("/docs/vellum-terms-of-use"),
@@ -358,6 +404,11 @@ export function isAboutAssistantPath(pathname: string): boolean {
   );
 }
 
+/** Whether `pathname` is the `/assistant` index, trailing slash tolerated. */
+function isAssistantIndexPath(pathname: string): boolean {
+  return pathname === routes.assistant || pathname === `${routes.assistant}/`;
+}
+
 /**
  * Whether `pathname` falls inside the conversation *area* — the `/assistant`
  * index (draft conversation) or anything under `/assistant/conversations/`,
@@ -369,33 +420,111 @@ export function isAboutAssistantPath(pathname: string): boolean {
  */
 export function isConversationPath(pathname: string): boolean {
   return (
-    pathname === routes.assistant ||
-    pathname === `${routes.assistant}/` ||
-    pathname.startsWith(`${routes.conversations}/`)
+    isAssistantIndexPath(pathname) ||
+    decodePath(pathname).startsWith(`${routes.conversations}/`)
   );
 }
 
 /**
+ * The pathname the router matches on: one decode over the whole path, so a
+ * malformed escape anywhere keeps every segment raw, exactly as React Router's
+ * own `decodePath` does. A decoded `/` is escaped back to `%2F` so it cannot
+ * split a segment; {@link restoreEncodedSlashes} puts it back inside an id.
+ */
+function decodePath(pathname: string): string {
+  try {
+    return pathname
+      .split("/")
+      .map((segment) => decodeURIComponent(segment).replace(/\//g, "%2F"))
+      .join("/");
+  } catch {
+    return pathname;
+  }
+}
+
+/**
+ * The `/` an id carries, back from the `%2F` that keeps it one segment. React
+ * Router's `matchPath` does this to every param it hands `useParams`, whether
+ * the path decoded or a malformed escape left it raw.
+ */
+function restoreEncodedSlashes(segment: string): string {
+  return segment.replace(/%2F/g, "/");
+}
+
+/**
+ * Sole owner of the conversation URL shape: `/assistant/conversations/:id`,
+ * optionally followed by the app viewer segment (`/app/:appId`), tolerating a
+ * trailing slash. The whole path is decoded first, the way the router decodes
+ * a location before matching it, so an escaped spelling of the prefix names
+ * the route too and the ids are the ones `useParams` yields. Anything else
+ * (the conversations list, a subroute such as the inspector, a deeper path) is
+ * `null`.
+ */
+function parseConversationPath(
+  pathname: string,
+): { conversationId: string; appId: string | null } | null {
+  const decoded = decodePath(pathname);
+  const prefix = `${routes.conversations}/`;
+  if (!decoded.startsWith(prefix)) {
+    return null;
+  }
+  const rest = decoded.slice(prefix.length).replace(/\/+$/, "");
+  if (rest.length === 0) {
+    return null;
+  }
+  const segments = rest.split("/");
+  const conversationId = restoreEncodedSlashes(segments[0]);
+  // An empty id means a doubled slash (`/conversations//app/a1`), never a route.
+  if (conversationId.length === 0) {
+    return null;
+  }
+  if (segments.length === 1) {
+    return { conversationId, appId: null };
+  }
+  if (segments.length === 3 && segments[1] === CONVERSATION_APP_SEGMENT) {
+    const appId = restoreEncodedSlashes(segments[2]);
+    return appId.length > 0 ? { conversationId, appId } : null;
+  }
+  return null;
+}
+
+/**
+ * The conversation id `pathname` names, or `null` when it names none. The
+ * `/assistant` index, which mounts a chat surface without naming a
+ * conversation, yields `null`, and so does a subroute such as the inspector
+ * (`/assistant/conversations/:id/inspect`). The app viewer sub-route
+ * (`/app/:appId`) is accepted because it keeps `ChatPage` mounted, unlike
+ * `InspectPage`, which replaces it.
+ *
+ * {@link isConversationChatPath} and {@link appIdForPath} read the same parse,
+ * so the three cannot drift apart.
+ */
+export function conversationIdForPath(pathname: string): string | null {
+  return parseConversationPath(pathname)?.conversationId ?? null;
+}
+
+/**
+ * The app id `pathname` keeps on screen, or `null` when it names none. The URL
+ * is the source of truth for which app the viewer shows, so the id comes back
+ * decoded and compares equal to the one the viewer holds.
+ */
+export function appIdForPath(pathname: string): string | null {
+  return parseConversationPath(pathname)?.appId ?? null;
+}
+
+/**
  * Whether `pathname` mounts the conversation chat surface — the `/assistant`
- * index (draft conversation, via `ConversationRedirect`) or exactly
- * `/assistant/conversations/:id` — i.e. a route where `ChatPage` renders the
- * active conversation's composer. Stricter than {@link isConversationPath}:
- * conversation subroutes such as the inspector
+ * index (draft conversation, via `ConversationRedirect`) or
+ * `/assistant/conversations/:id`, with or without the app viewer sub-route
+ * (`/app/:appId`), which `ChatPage` stays mounted under. Stricter than
+ * {@link isConversationPath}: conversation subroutes such as the inspector
  * (`/assistant/conversations/:id/inspect`) are excluded because `InspectPage`
  * replaces `ChatPage` and has no composer.
  */
 export function isConversationChatPath(pathname: string): boolean {
-  if (pathname === routes.assistant || pathname === `${routes.assistant}/`) {
-    return true;
-  }
-  const prefix = `${routes.conversations}/`;
-  if (!pathname.startsWith(prefix)) {
-    return false;
-  }
-  // Exactly one path segment after the prefix (a bare conversation id,
-  // tolerating a trailing slash) — deeper segments are other pages.
-  const rest = pathname.slice(prefix.length).replace(/\/+$/, "");
-  return rest.length > 0 && !rest.includes("/");
+  return (
+    isAssistantIndexPath(pathname) || conversationIdForPath(pathname) !== null
+  );
 }
 
 const WWW_DOMAIN = "vellum.ai";

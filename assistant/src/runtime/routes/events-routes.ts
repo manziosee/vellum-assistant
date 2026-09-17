@@ -436,9 +436,23 @@ export function handleSubscribeAssistantEvents(
             type: "client" as const,
             clientId,
             interfaceId,
-            capabilities: ALL_CAPABILITIES.filter((cap) =>
-              supportsHostProxy(interfaceId, cap),
-            ),
+            capabilities: [
+              ...ALL_CAPABILITIES.filter((cap) =>
+                supportsHostProxy(interfaceId, cap),
+              ),
+              ...(interfaceId === "macos" &&
+              headers?.["x-vellum-cu-window-capture"] === "1"
+                ? ["host_cu_window_capture" as const]
+                : []),
+              ...(interfaceId === "macos" &&
+              headers?.["x-vellum-cu-sequence"] === "1"
+                ? ["host_cu_sequence" as const]
+                : []),
+              ...(interfaceId === "macos" &&
+              headers?.["x-vellum-cu-annotate"] === "1"
+                ? ["host_cu_annotate" as const]
+                : []),
+            ],
             machineName: rawMachineName?.trim() || undefined,
             actorPrincipalId,
           })

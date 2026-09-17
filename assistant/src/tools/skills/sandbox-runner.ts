@@ -3,9 +3,17 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
+import { PLUGIN_NAME_ENV } from "../../plugin-api/plugin-name-env.js";
 import { conversationRevealNonce } from "../../runtime/reveal-nonce.js";
 import { computeSkillVersionHash } from "../../skills/version-hash.js";
+import {
+  buildShellInvocation,
+  buildShellSpawnFlags,
+  terminateProcessTree,
+  watchShellProcessStart,
+} from "../../util/host-process.js";
 import { safeStringSlice } from "../../util/unicode.js";
+import { SHELL_DID_NOT_START_MESSAGE } from "../shared/shell-output.js";
 import { buildSanitizedEnv } from "../terminal/safe-env.js";
 import type { ToolContext, ToolExecutionResult } from "../types.js";
 
@@ -67,6 +75,7 @@ export async function runSkillToolScriptSandbox(
     timeoutMs?: number;
     expectedSkillVersionHash?: string;
     skillDirHashResolver?: (skillDir: string) => string;
+    pluginOwner?: string;
   },
 ): Promise<ToolExecutionResult> {
   const scriptPath = resolve(join(skillDir, executorPath));
@@ -110,7 +119,9 @@ export async function runSkillToolScriptSandbox(
       "utf-8",
     );
 
-    return await spawnRunner(runDir, input, context, timeoutMs, executorPath);
+    return await spawnRunner(runDir, input, context, timeoutMs, executorPath, {
+      pluginOwner: options?.pluginOwner,
+    });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return {
@@ -132,6 +143,7 @@ function spawnRunner(
   context: ToolContext,
   timeoutMs: number,
   executorPath: string,
+  pluginContext?: { pluginOwner?: string },
 ): Promise<ToolExecutionResult> {
   return new Promise<ToolExecutionResult>((resolve) => {
     const stdoutChunks: Buffer[] = [];
@@ -139,7 +151,7 @@ function spawnRunner(
     let timedOut = false;
 
     const bunRunCmd = "bun run __skill_runner.ts";
-    const wrapped = { command: "bash", args: ["-c", "--", bunRunCmd] };
+    const wrapped = buildShellInvocation(bunRunCmd);
 
     const env = buildSanitizedEnv();
     env.__SKILL_INPUT_JSON = JSON.stringify(input);
@@ -149,40 +161,33 @@ function spawnRunner(
       conversationId: context.conversationId,
     });
     env.__CONVERSATION_ID = context.conversationId;
-    // Secret binding for reveal-derived chat authority — see reveal-nonce.ts.
+    // Secret binding for reveal-derived chat authority. See reveal-nonce.ts.
     env.__REVEAL_NONCE = conversationRevealNonce(context.conversationId);
+
+    if (pluginContext?.pluginOwner) {
+      env[PLUGIN_NAME_ENV] = pluginContext.pluginOwner;
+    }
 
     const child = spawn(wrapped.command, wrapped.args, {
       cwd: runDir,
       env,
       stdio: ["ignore", "pipe", "pipe"],
-      detached: true,
+      ...buildShellSpawnFlags(),
     });
+    const launch = watchShellProcessStart(child);
 
     const timer = setTimeout(() => {
       timedOut = true;
-      try {
-        process.kill(-child.pid!, "SIGKILL");
-      } catch {
-        // Process group may have already exited.
-      }
+      terminateProcessTree(child);
     }, timeoutMs);
 
     // Cooperative cancellation via AbortSignal
     const onAbort = () => {
-      try {
-        process.kill(-child.pid!, "SIGKILL");
-      } catch {
-        // Process group may have already exited.
-      }
+      terminateProcessTree(child);
     };
     if (context.signal) {
       if (context.signal.aborted) {
-        try {
-          process.kill(-child.pid!, "SIGKILL");
-        } catch {
-          // Process group may have already exited.
-        }
+        terminateProcessTree(child);
       } else {
         context.signal.addEventListener("abort", onAbort, { once: true });
       }
@@ -194,6 +199,14 @@ function spawnRunner(
     child.on("close", (code) => {
       clearTimeout(timer);
       context.signal?.removeEventListener("abort", onAbort);
+
+      if (!launch.didStart()) {
+        resolve({
+          content: `Failed to spawn skill tool script "${executorPath}": ${SHELL_DID_NOT_START_MESSAGE}`,
+          isError: true,
+        });
+        return;
+      }
 
       if (timedOut) {
         resolve({

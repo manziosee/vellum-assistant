@@ -49,6 +49,10 @@
     "deleteConfirmMessage": "Удалить \"{name}\"? Это нельзя отменить.",
     "cancel": "Отмена",
     "confirmDelete": "Да, удалить",
+    "cancelOneTime": "Отменить напоминание",
+    "cancelOneTimeConfirmMessage": "Отменить \"{name}\"? Оно не сработает.",
+    "confirmCancelOneTime": "Да, отменить",
+    "cancelOneTimeFailed": "Не удалось отменить напоминание.",
     "viewUsage": "Смотреть использование",
     "turnOnToRun": "Включение этого расписания запускает его",
     "running": "Запуск…",
@@ -58,7 +62,8 @@
     "toggleFailed": "Не удалось переключить расписание.",
     "notUsedForWorkflow": "Не используется в запусках сценариев",
     "enabled": "Включено",
-    "disabled": "Выключено"
+    "disabled": "Выключено",
+    "timezone": "Часовой пояс"
   },
   "systemTaskDetail": {
     "openMemorySettings": "Открыть настройки Памяти",

@@ -25,11 +25,13 @@ import { isElectron } from "@/runtime/is-electron";
 // interaction store (`pendingAcpConnect`). The transcript renders this inline
 // affordance under the failed tool call's group so the user can complete the
 // OAuth flow in one round-trip instead of reading dead error text and running a
-// CLI prompt. Because the prompt lives in the store — not on the reseed-able
-// tool-call field — it survives the routine `/messages` resync instead of
-// vanishing mid-turn. Gated on the daemon being new enough to serve the Connect
-// auth routes (see `useSupportsAcpConnect`); against an older daemon the
-// component renders nothing and the tool call keeps its plain error rendering.
+// CLI prompt. Dismiss retires this failed spawn without connecting and persists
+// that choice so a reload cannot raise the same card. Because the prompt lives
+// in the store (not on the reseed-able tool-call field) it survives the
+// routine `/messages` resync instead of vanishing mid-turn. Gated on the daemon
+// being new enough to serve the Connect auth routes (see
+// `useSupportsAcpConnect`); against an older daemon the component renders
+// nothing and the tool call keeps its plain error rendering.
 //
 // The transcript's own `assistantId` is passed in (rather than read via
 // `useActiveAssistantId()`, which throws outside `ActiveAssistantGate` — and
@@ -76,10 +78,13 @@ function AcpConnectAffordanceInner({ assistantId }: { assistantId: string }) {
   // `idle`), so a fresh in-card connect keeps showing its "connected"
   // confirmation instead of unmounting out from under the user.
   //
-  // Skipped for an `auth_required` prompt: that check asks "is a token
-  // stored", the wrong question when the stored token itself was rejected. A
-  // "yes" would retire the card over the failure it exists to repair; those
-  // prompts clear only by completing the connect flow.
+  // Skipped for an `auth_required` prompt, restored or live. The check asks
+  // "is a token stored", and `hasAcpClaudeToken` answers on presence, shape and
+  // broker readability without ever putting the token to Claude, so a rejected
+  // one still reports connected. Retiring on that would dismiss the card over
+  // the failure it exists to repair, and the dismissal set would keep it from
+  // coming back for the rest of the session. A stale marker is retired at the
+  // daemon instead, when a new token is actually written.
   useEffect(() => {
     if (reason === "auth_required") {
       return;
@@ -122,6 +127,27 @@ function AcpConnectAffordanceInner({ assistantId }: { assistantId: string }) {
   // auto-continue the failed task (via a hidden "retry" send) so the user
   // doesn't have to re-ask. One-shot — the continuation's own send clears the
   // card, but guard so a re-render can't re-trigger it.
+  // Publish that this tab owns a live flow, so the invalidation its own token
+  // write triggers does not dismiss the card before it can auto-continue.
+  // Cleared on unmount so a tab that navigates away stops claiming it.
+  // Only phases that can still produce this tab's own successful write. A
+  // terminal `error` cannot, so leaving it "active" would let a failed attempt
+  // pin a stale card in place after another client repaired the token, with
+  // nothing to clear it: `auth_required` prompts skip the connected-state
+  // self-heal.
+  const flowActive =
+    connection.phase === "starting" ||
+    connection.phase === "awaiting_capture" ||
+    connection.phase === "awaiting_paste" ||
+    connection.phase === "exchanging" ||
+    connection.phase === "connected";
+  useEffect(() => {
+    useInteractionStore.getState().setAcpConnectFlowActive(flowActive);
+    return () => {
+      useInteractionStore.getState().setAcpConnectFlowActive(false);
+    };
+  }, [flowActive]);
+
   const continuedRef = useRef(false);
   useEffect(() => {
     if (connection.phase === "connected" && !continuedRef.current) {
@@ -145,13 +171,18 @@ function AcpConnectAffordanceInner({ assistantId }: { assistantId: string }) {
     ? connection.mode === "loopback"
     : isElectron();
 
+  const handleDismiss = () => {
+    useInteractionStore.getState().dismissAcpConnect({ persist: true });
+  };
+
   return oneStep ? (
-    <OneStepCard connection={connection} />
+    <OneStepCard connection={connection} onDismiss={handleDismiss} />
   ) : (
     <TwoStepCard
       connection={connection}
       pastedCode={pastedCode}
       onPastedCodeChange={setPastedCode}
+      onDismiss={handleDismiss}
     />
   );
 }
@@ -177,6 +208,44 @@ function Title() {
   );
 }
 
+function ConnectActions({
+  canConnect,
+  busy,
+  phase,
+  onConnect,
+  onDismiss,
+  connectLabel,
+  dismissLabel,
+}: {
+  canConnect: boolean;
+  busy: boolean;
+  phase: UseConnectClaudeResult["phase"];
+  onConnect: () => void;
+  onDismiss?: () => void;
+  connectLabel: string;
+  dismissLabel: string;
+}) {
+  const canDismiss = Boolean(onDismiss) && phase !== "connected";
+  return (
+    <div className="flex shrink-0 items-center gap-2">
+      {canDismiss ? (
+        <Button variant="ghost" onClick={onDismiss}>
+          {dismissLabel}
+        </Button>
+      ) : null}
+      {canConnect ? (
+        <Button variant="primary" onClick={onConnect}>
+          {connectLabel}
+        </Button>
+      ) : busy ? (
+        <Loader2 className="h-4 w-4 shrink-0 animate-spin text-[var(--content-tertiary)]" />
+      ) : phase === "connected" ? (
+        <Check className="h-5 w-5 shrink-0 text-[var(--system-positive-strong)]" />
+      ) : null}
+    </div>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // One-step (desktop / loopback): compact single row
 // ---------------------------------------------------------------------------
@@ -185,8 +254,10 @@ function Title() {
 // directly; production callers stay within this file.
 export function OneStepCard({
   connection,
+  onDismiss,
 }: {
   connection: UseConnectClaudeResult;
+  onDismiss?: () => void;
 }) {
   const { phase, error, connect } = connection;
   const { t } = useTranslation("chat");
@@ -231,15 +302,15 @@ export function OneStepCard({
         </div>
       </div>
 
-      {canConnect ? (
-        <Button variant="primary" onClick={() => void connect()}>
-          {t("acpConnectAffordance.connectButton")}
-        </Button>
-      ) : busy ? (
-        <Loader2 className="h-4 w-4 shrink-0 animate-spin text-[var(--content-tertiary)]" />
-      ) : phase === "connected" ? (
-        <Check className="h-5 w-5 shrink-0 text-[var(--system-positive-strong)]" />
-      ) : null}
+      <ConnectActions
+        canConnect={canConnect}
+        busy={busy}
+        phase={phase}
+        onConnect={() => void connect()}
+        onDismiss={onDismiss}
+        connectLabel={t("acpConnectAffordance.connectButton")}
+        dismissLabel={t("acpConnectAffordance.dismissButton")}
+      />
     </div>
   );
 }
@@ -252,10 +323,12 @@ export function TwoStepCard({
   connection,
   pastedCode,
   onPastedCodeChange,
+  onDismiss,
 }: {
   connection: UseConnectClaudeResult;
   pastedCode: string;
   onPastedCodeChange: (value: string) => void;
+  onDismiss?: () => void;
 }) {
   const { phase, error, connect, submitPastedCode } = connection;
   const { t } = useTranslation("chat");
@@ -305,15 +378,15 @@ export function TwoStepCard({
           </div>
         </div>
 
-        {canConnect ? (
-          <Button variant="primary" onClick={() => void connect()}>
-            {t("acpConnectAffordance.connectButton")}
-          </Button>
-        ) : busy ? (
-          <Loader2 className="h-4 w-4 shrink-0 animate-spin text-[var(--content-tertiary)]" />
-        ) : phase === "connected" ? (
-          <Check className="h-5 w-5 shrink-0 text-[var(--system-positive-strong)]" />
-        ) : null}
+        <ConnectActions
+          canConnect={canConnect}
+          busy={busy}
+          phase={phase}
+          onConnect={() => void connect()}
+          onDismiss={onDismiss}
+          connectLabel={t("acpConnectAffordance.connectButton")}
+          dismissLabel={t("acpConnectAffordance.dismissButton")}
+        />
       </div>
 
       {phase === "awaiting_paste" ? (

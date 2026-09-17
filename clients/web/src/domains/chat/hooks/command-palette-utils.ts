@@ -16,11 +16,24 @@ import {
 
 import type { CommandPaletteSection } from "@/components/command-palette/command-palette";
 import type { GlobalSearchResponse } from "@/domains/chat/api/global-search";
-import { newChatShortcutHint } from "@/domains/chat/new-chat-shortcut";
+import { t, type TFunction } from "@/i18n";
+import { displayConversationTitle } from "@/utils/conversation-title";
+
+/**
+ * Accelerators for the actions bound on this host. Resolved by the caller so
+ * this stays a pure function of its inputs; a command with no binding passes
+ * `undefined` and renders none.
+ */
+export interface ActionShortcutHints {
+  newConversation?: string;
+  currentConversation?: string;
+  openSettings?: string;
+}
 
 /** Build the static "Actions" section with keyboard shortcuts. */
 export function buildActionsSection(
   assistantName: string,
+  shortcuts: ActionShortcutHints = {},
 ): CommandPaletteSection {
   return {
     id: "actions",
@@ -30,19 +43,19 @@ export function buildActionsSection(
         id: "action-new-conversation",
         icon: SquarePen,
         title: "New Conversation",
-        shortcutHint: newChatShortcutHint(),
+        shortcut: shortcuts.newConversation,
       },
       {
         id: "action-current-conversation",
         icon: Monitor,
         title: "Current Conversation",
-        shortcutHint: "⌘⇧N",
+        shortcut: shortcuts.currentConversation,
       },
       {
         id: "action-settings",
         icon: Settings,
         title: "Settings",
-        shortcutHint: "⌘,",
+        shortcut: shortcuts.openSettings,
       },
       { id: "action-library", icon: LayoutGrid, title: "Library" },
       { id: "action-intelligence", icon: Globe, title: assistantName },
@@ -57,6 +70,7 @@ export function buildActionsSection(
 export function buildServerResultSections(
   results: GlobalSearchResponse,
   recentConversationIds: Set<string>,
+  translate: TFunction = t,
 ): CommandPaletteSection[] {
   const sections: CommandPaletteSection[] = [];
 
@@ -65,7 +79,7 @@ export function buildServerResultSections(
     .map((c) => ({
       id: `search-conv-${c.id}`,
       icon: MessageSquare,
-      title: c.title ?? "Untitled",
+      title: displayConversationTitle(c.title, translate),
       snippet: c.excerpt || undefined,
     }));
   if (serverConvItems.length > 0) {

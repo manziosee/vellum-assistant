@@ -69,19 +69,19 @@ Based on the chosen channel, ask for the required destination:
      USER_QUERY="alice"  # ← replace with the actual value the user provided
      USER_QUERY="${USER_QUERY#@}"  # strip leading @ — Slack .name fields have no @ prefix
 
-     # Get the bot token from the credential store
-     BOT_TOKEN=$(assistant credentials reveal --service slack_channel --field bot_token)
-     if [ -z "$BOT_TOKEN" ]; then
-       echo "ERROR: bot_token not found in credential store — fall back to manual entry"
-       exit 1
-     fi
-
-     # Search for matching users (paginate through all workspace members)
+     # Search for matching users (paginate through all workspace members).
+     # The request door sends the bot token from inside the assistant; never
+     # reveal it into a variable or a curl line, where it would land in the
+     # transcript and the tool log. The door exits non-zero when the bot is
+     # not configured, when the call is refused, and when Slack answers with
+     # ok:false, so one branch covers every failure.
      CURSOR=""
      MATCHES="[]"
      while true; do
-       RESPONSE=$(curl -s -H "Authorization: Bearer $BOT_TOKEN" \
-         "https://slack.com/api/users.list?limit=200${CURSOR:+&cursor=$CURSOR}")
+       RESPONSE=$(assistant channels request slack "/users.list?limit=200${CURSOR:+&cursor=$CURSOR}") || {
+         echo "ERROR: the Slack lookup failed; fall back to manual entry"
+         exit 1
+       }
        PAGE_MATCHES=$(echo "$RESPONSE" | jq --arg q "$USER_QUERY" '[.members[] | select(.deleted == false) | select(.profile.display_name == $q or .name == $q or .profile.display_name_normalized == $q or .real_name == $q) | {id: .id, name: .name, display_name: .profile.display_name, real_name: .real_name}]')
        MATCHES=$(echo "$MATCHES $PAGE_MATCHES" | jq -s 'add')
        CURSOR=$(echo "$RESPONSE" | jq -r '.response_metadata.next_cursor // empty')
@@ -98,8 +98,7 @@ Based on the chosen channel, ask for the required destination:
      - **No matches**: Tell the user no matches were found. Suggest they double-check the spelling, or fall back to manual entry (see below).
 
   2. **Fallback to manual entry** if any of the following occur:
-     - The `BOT_TOKEN` retrieval fails (the bash block above exits 1 with the "bot_token not found" error)
-     - The `users.list` API call fails or returns an error
+     - The bash block above exits 1: the Slack bot is not configured, the request door refused the call, or Slack answered `users.list` with an error such as `missing_scope` (the door prints the reason)
      - Too many matches are returned (more than 5)
      - The user prefers to enter their ID directly
 
@@ -129,7 +128,7 @@ Report the exact next action based on the channel:
 - **Telegram with chat ID** (no `telegramBootstrapUrl` in response): The response includes a `secret` field. Show it in the current chat: "Your verification code is **[secret]**. I've also sent it to your Telegram. Open the Telegram bot chat and reply with that 6-digit code to complete verification." If the response does not contain a `secret` field, treat this as a control-plane error: tell the user something went wrong and ask them to retry from Step 3 or resend (Step 4).
 - **Telegram with handle** (`telegramBootstrapUrl` present in response): "Tap this deep-link first: [telegramBootstrapUrl]. After Telegram binds your identity, I'll send your verification code."
 - **Slack**: The response includes a `secret` field with the verification code. Show it in the current chat: "Your verification code is **[secret]**. I've also sent it to you as a Slack DM. Open the DM from the Vellum bot in Slack and reply with that 6-digit code to complete verification." The DM channel ID is captured automatically during this process for future message delivery. If the response does not contain a `secret` field, treat this as a control-plane error: tell the user something went wrong and ask them to retry from Step 3 or resend (Step 4). **After delivering the code, immediately begin the auto-check polling loop** (see [Auto-Check Polling](#auto-check-polling) below).
-- **Discord**: The response includes a `secret` field with the verification code. Show it in the current chat: "Your verification code is **[secret]**. I've also sent it to you as a Discord DM. Open the DM from the bot and reply with that 6-digit code to complete verification." If the response does not contain a `secret` field, treat this as a control-plane error: tell the user something went wrong and ask them to retry from Step 3 or resend (Step 4). **After delivering the code, begin the auto-check polling loop** (see [Auto-Check Polling](#auto-check-polling) below). The DM send is fire-and-forget, so a closed-DM or not-in-a-shared-server failure shows up as the poll timing out rather than as an error here.
+- **Discord**: The response includes a `secret` field with the verification code. Show it in the current chat: "Your verification code is **[secret]**. I've also sent it to you as a Discord DM. Open the DM from the bot and send that 6-digit code in this DM to complete verification. Any plain message containing the code works; Discord's reply feature is not required." If the response does not contain a `secret` field, treat this as a control-plane error: tell the user something went wrong and ask them to retry from Step 3 or resend (Step 4). **After delivering the code, begin the auto-check polling loop** (see [Auto-Check Polling](#auto-check-polling) below). The DM send is fire-and-forget, so a closed-DM or not-in-a-shared-server failure shows up as the poll timing out rather than as an error here.
 - **Email**: The response includes a `secret` field with the verification code. Show it in the current chat: "Your verification code is **[secret]**. I've also sent it to your email. Reply to the verification email with only the 6-digit code to complete verification." If the response does not contain a `secret` field, treat this as a control-plane error: tell the user something went wrong and ask them to retry from Step 3 or resend (Step 4). **After delivering the code, immediately begin the auto-check polling loop** (see [Auto-Check Polling](#auto-check-polling) below).
 
 After reporting the bootstrap URL for Telegram handle flows, wait for the user to confirm they clicked the link. Then check verification status (Step 6) to see if the bootstrap completed and a code was sent.
@@ -160,7 +159,7 @@ On success, report the next action based on the channel:
 - **Phone**: The resend response includes a fresh `secret` field with a new verification code. Tell the user the new code BEFORE the call connects - just like the initial start flow: "I'm calling [number] again. Your new verification code is [secret]. When you answer the call, enter this code using your phone's keypad." The `resend` command already initiates the voice call. Do NOT place a separate `call_start` call. **After delivering the code, immediately begin the auto-check polling loop** (see [Auto-Check Polling](#auto-check-polling) below).
 - **Telegram**: The resend response includes a fresh `secret` field. Show the new code in the current chat: "Your new verification code is **[secret]**. I've also sent it to your Telegram. Open the Telegram bot chat and reply with that 6-digit code to complete verification." If the response does not contain a `secret` field, treat this as a control-plane error: tell the user something went wrong and ask them to retry from Step 3.
 - **Slack**: The resend response includes a fresh `secret` field. Show the new code in the current chat: "Your new verification code is **[secret]**. I've also sent it to you as a Slack DM. Reply to the DM with that 6-digit code to complete verification. (resent)" If the response does not contain a `secret` field, treat this as a control-plane error: tell the user something went wrong and ask them to retry from Step 3. **After delivering the code, immediately begin the auto-check polling loop** (see [Auto-Check Polling](#auto-check-polling) below).
-- **Discord**: The resend response includes a fresh `secret` field. Show the new code in the current chat: "Your new verification code is **[secret]**. I've also sent it to you as a Discord DM. Reply to the DM with that 6-digit code to complete verification. (resent)" If the response does not contain a `secret` field, treat this as a control-plane error: tell the user something went wrong and ask them to retry from Step 3. **After delivering the code, begin the auto-check polling loop** (see [Auto-Check Polling](#auto-check-polling) below).
+- **Discord**: The resend response includes a fresh `secret` field. Show the new code in the current chat: "Your new verification code is **[secret]**. I've also sent it to you as a Discord DM. Open the DM from the bot and send that 6-digit code in this DM to complete verification. Any plain message containing the code works. (resent)" If the response does not contain a `secret` field, treat this as a control-plane error: tell the user something went wrong and ask them to retry from Step 3. **After delivering the code, begin the auto-check polling loop** (see [Auto-Check Polling](#auto-check-polling) below).
 - **Email**: The resend response includes a fresh `secret` field. Show the new code in the current chat: "Your new verification code is **[secret]**. I've also sent it to your email. Reply to the verification email with only the 6-digit code to complete verification. (resent)" If the response does not contain a `secret` field, treat this as a control-plane error: tell the user something went wrong and ask them to retry from Step 3. **After delivering the code, immediately begin the auto-check polling loop** (see [Auto-Check Polling](#auto-check-polling) below).
 
 ### Resend errors

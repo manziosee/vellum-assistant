@@ -21,13 +21,9 @@ import { type AppSummary, isReadOnlyApp } from "@/types/app-types";
 import { getCachedAppHtml } from "@/utils/app-html-cache";
 import { formatFriendlyDate } from "@/utils/format-date";
 import { cn } from "@/utils/misc";
-import { shareApp } from "@/utils/share-app";
+import { useShareApp } from "@/hooks/use-share-app";
 import type { SwipeAction } from "@/hooks/use-swipe-to-reveal";
-import {
-  ActionMenu,
-  Button,
-  toast,
-} from "@vellumai/design-library";
+import { ActionMenu, Button } from "@vellumai/design-library";
 
 interface LibraryAppCardProps {
   app: AppSummary;
@@ -53,7 +49,6 @@ export function LibraryAppCard({
   onAnimationEnd,
 }: LibraryAppCardProps) {
   const { t } = useTranslation("library");
-  const [isSharing, setIsSharing] = useState(false);
   // Plugin-bundled apps are read-only: the daemon rejects delete/share/deploy
   // against them, so drop those actions here rather than render buttons that
   // error. Pin/Open stay — pinning is a client-only preference and opening is
@@ -62,27 +57,13 @@ export function LibraryAppCard({
   const deleteAction = readOnly ? undefined : onDelete;
   const deployAction = readOnly ? undefined : onDeploy;
   const loadHtml = useCallback(
-    () => getCachedAppHtml(assistantId, app.id),
-    [assistantId, app.id],
+    () => getCachedAppHtml(assistantId, app.id, app.updatedAt),
+    [assistantId, app.id, app.updatedAt],
   );
-  const handleShare = useCallback(async () => {
-    if (isSharing) {
-      return;
-    }
-    setIsSharing(true);
-    try {
-      await shareApp(assistantId, app.id, app.name);
-      toast.success(t("libraryAppCard.exported"), {
-        description: `${app.name}.vellum`,
-      });
-    } catch (err) {
-      toast.error(t("libraryAppCard.shareFailed"), {
-        description: err instanceof Error ? err.message : undefined,
-      });
-    } finally {
-      setIsSharing(false);
-    }
-  }, [assistantId, app.id, app.name, isSharing, t]);
+  const share = useShareApp(assistantId, app, {
+    exported: t("libraryAppCard.exported"),
+    failed: t("libraryAppCard.shareFailed"),
+  });
 
   const [menuOpen, setMenuOpen] = useState(false);
 
@@ -114,7 +95,7 @@ export function LibraryAppCard({
   const trailingActions: SwipeAction[] = [
     {
       id: "pin",
-      label: isPinned ? "Unpin" : "Pin",
+      label: isPinned ? t("libraryAppCard.unpin") : t("libraryAppCard.pin"),
       icon: isPinned ? PinOff : Pin,
       onSelect: () => onPin(app),
     },
@@ -122,7 +103,7 @@ export function LibraryAppCard({
       ? ([
           {
             id: "delete",
-            label: "Delete",
+            label: t("libraryAppCard.delete"),
             icon: Trash2,
             variant: "destructive",
             onSelect: () => deleteAction(app),
@@ -170,7 +151,7 @@ export function LibraryAppCard({
             }}
             onPin={() => onPin(app)}
             onDelete={deleteAction ? () => deleteAction(app) : undefined}
-            onShare={readOnly ? undefined : handleShare}
+            onShare={readOnly ? undefined : share}
             onDeploy={deployAction}
             deployedUrl={deployedUrl}
             onCopyDeployedLink={handleCopyDeployedLink}
@@ -182,10 +163,10 @@ export function LibraryAppCard({
           onClick={() => onOpen(app.id)}
           className="flex cursor-pointer flex-col gap-0.5 px-0.5 text-left outline-none"
         >
-          <span className="truncate text-body-large-default text-[color:var(--content-emphasised)]">
+          <span className="truncate text-body-large-default text-[color:var(--content-emphasised)] max-md:text-body-medium-lighter max-md:text-[color:var(--content-secondary)]">
             {app.name}
           </span>
-          <span className="text-body-small-default text-[color:var(--content-tertiary)]">
+          <span className="text-body-small-default text-[color:var(--content-tertiary)] max-md:hidden">
             {formatFriendlyDate(new Date(app.createdAt))}
           </span>
         </button>
@@ -250,9 +231,7 @@ export function LibraryAppCardActionsMenu({
       <ActionMenu.Content title={title}>
         <ActionMenu.Item
           icon={isPinned ? PinOff : Pin}
-          label={
-            isPinned ? t("libraryAppCard.unpin") : t("libraryAppCard.pin")
-          }
+          label={isPinned ? t("libraryAppCard.unpin") : t("libraryAppCard.pin")}
           onSelect={onPin}
         />
         {onShare ? (
@@ -269,7 +248,7 @@ export function LibraryAppCardActionsMenu({
               icon={Link2}
               label={t("libraryAppCard.deployed")}
               description={<span className="break-all">{deployedUrl}</span>}
-              shortcut={t("libraryAppCard.copyLink")}
+              trailing={t("libraryAppCard.copyLink")}
               onSelect={() => onCopyDeployedLink?.()}
             />
             <ActionMenu.Item

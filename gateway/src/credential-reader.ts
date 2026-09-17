@@ -13,7 +13,7 @@ import { join } from "node:path";
 import { createCesHttpCredentialClient } from "@vellumai/ces-client/http-credentials";
 import { credentialKey } from "./credential-key.js";
 import { getLogger } from "./logger.js";
-import { getGatewaySecurityDir, getWorkspaceDir } from "./paths.js";
+import { getGatewaySecurityDir } from "./paths.js";
 
 export { getGatewaySecurityDir, getWorkspaceDir } from "./paths.js";
 
@@ -138,10 +138,6 @@ export function getEncryptedStorePath(): string {
   return join(getGatewaySecurityDir(), "keys.enc");
 }
 
-export function getMetadataPath(): string {
-  return join(getWorkspaceDir(), "data", "credentials", "metadata.json");
-}
-
 // ---------------------------------------------------------------------------
 // Encrypted store reader
 // ---------------------------------------------------------------------------
@@ -182,19 +178,13 @@ function readEncryptedCredential(account: string): string | undefined {
 // CES HTTP credential reader (containerized mode)
 // ---------------------------------------------------------------------------
 
-/**
- * Try to read a credential from the CES managed service over HTTP.
- *
- * Delegates to `@vellumai/ces-client/http-credentials` for the transport.
- * Activated when `CES_CREDENTIAL_URL` is set (e.g. `http://ces-host:8090`).
- * Requires `CES_SERVICE_TOKEN` for bearer auth.
- *
- * Returns `undefined` if the env vars are not set, the CES is unreachable,
- * or the credential doesn't exist (404).
- */
-async function readCesCredential(account: string): Promise<string | undefined> {
+export function getCesHttpConfig():
+  | { baseUrl: string; serviceToken: string }
+  | undefined {
   const baseUrl = process.env.CES_CREDENTIAL_URL?.trim();
-  if (!baseUrl) return undefined;
+  if (!baseUrl) {
+    return undefined;
+  }
 
   const serviceToken = process.env.CES_SERVICE_TOKEN?.trim();
   if (!serviceToken) {
@@ -202,9 +192,68 @@ async function readCesCredential(account: string): Promise<string | undefined> {
     return undefined;
   }
 
-  const client = createCesHttpCredentialClient({ baseUrl, serviceToken }, log);
-  const result = await client.get(account);
-  return result.value;
+  return { baseUrl, serviceToken };
+}
+
+/**
+ * Try to read a credential from the CES managed service over HTTP.
+ *
+ * Delegates to `@vellumai/ces-client/http-credentials` for the transport.
+ * Activated when `CES_CREDENTIAL_URL` is set (e.g. `http://ces-host:8090`).
+ * Requires `CES_SERVICE_TOKEN` for bearer auth.
+ *
+ * Returns `undefined` when CES HTTP is not configured. When it is configured,
+ * `unreachable` is true on transport/5xx failures so callers can distinguish
+ * an outage from a missing credential.
+ */
+async function readCesCredential(
+  account: string,
+): Promise<{ value: string | undefined; unreachable: boolean } | undefined> {
+  const config = getCesHttpConfig();
+  if (!config) {
+    return undefined;
+  }
+
+  const client = createCesHttpCredentialClient(config, log);
+  return client.get(account);
+}
+
+export type ServiceCredentialSpec = {
+  /** Service name as it appears in CES metadata (e.g., "telegram", "slack_channel") */
+  service: string;
+  /** Field names required for this service (e.g., ["bot_token", "webhook_secret"]) */
+  requiredFields: readonly string[];
+};
+
+export type ServiceCredentialsRead =
+  | { status: "ok"; credentials: Record<string, string> }
+  | { status: "missing" }
+  | { status: "unreachable" };
+
+/**
+ * When CES HTTP is configured, every required field must have a CES
+ * metadata record. Leftover workspace `metadata.json` is not consulted.
+ * Local keys.enc mode (no CES HTTP) skips this gate.
+ */
+async function requiredCesMetadataResult(
+  spec: ServiceCredentialSpec,
+): Promise<"ok" | "missing" | "unreachable"> {
+  const config = getCesHttpConfig();
+  if (!config) {
+    return "ok";
+  }
+
+  const client = createCesHttpCredentialClient(config, log);
+  for (const field of spec.requiredFields) {
+    const result = await client.getRecord(credentialKey(spec.service, field));
+    if (result.unreachable) {
+      return "unreachable";
+    }
+    if (!result.record) {
+      return "missing";
+    }
+  }
+  return "ok";
 }
 
 // ---------------------------------------------------------------------------
@@ -212,77 +261,111 @@ async function readCesCredential(account: string): Promise<string | undefined> {
 // ---------------------------------------------------------------------------
 
 /**
- * Read a single credential by account key.
+ * Read a single credential by account key, distinguishing a vault outage
+ * from a missing value.
  *
  * Resolution order:
  * 1. CES HTTP API (when CES_CREDENTIAL_URL is set)
- * 2. Encrypted-at-rest store (keys.enc)
+ * 2. Encrypted-at-rest store (keys.enc), only when CES is not configured
+ *    or CES answered that the account is absent
+ *
+ * A configured CES that is unreachable does not fall through to keys.enc.
+ * On a containerized pod that store is empty, and falling through would
+ * report every credential as missing.
+ */
+export async function readCredentialResult(
+  account: string,
+): Promise<{ value: string | undefined; unreachable: boolean }> {
+  const ces = await readCesCredential(account);
+  if (ces) {
+    if (ces.unreachable) {
+      return { value: undefined, unreachable: true };
+    }
+    if (ces.value !== undefined) {
+      return { value: ces.value, unreachable: false };
+    }
+  }
+
+  return {
+    value: await readEncryptedCredential(account),
+    unreachable: false,
+  };
+}
+
+/**
+ * Read a single credential by account key.
+ *
+ * Convenience wrapper over `readCredentialResult` that returns only the
+ * value. Callers that must distinguish "not stored" from "vault down"
+ * should use `readCredentialResult`.
  */
 export async function readCredential(
   account: string,
 ): Promise<string | undefined> {
-  // CES HTTP backend (containerized mode)
-  const cesValue = await readCesCredential(account);
-  if (cesValue !== undefined) return cesValue;
-
-  // Encrypted file fallback
-  return readEncryptedCredential(account);
+  const result = await readCredentialResult(account);
+  return result.value;
 }
 
-export type ServiceCredentialSpec = {
-  /** Service name as it appears in metadata.json (e.g., "telegram", "slack_channel") */
-  service: string;
-  /** Field names required for this service (e.g., ["bot_token", "webhook_secret"]) */
-  requiredFields: readonly string[];
-};
+/**
+ * Read every required field for a service, distinguishing a vault outage
+ * from a missing catalog entry.
+ *
+ * Returns `unreachable` when CES HTTP is configured and any metadata or
+ * secret lookup fails with a transport/5xx error. Callers that hot-reload
+ * channel state should keep last-known credentials in that case rather
+ * than treating the service as cleared.
+ */
+export async function readServiceCredentialsResult(
+  spec: ServiceCredentialSpec,
+): Promise<ServiceCredentialsRead> {
+  try {
+    const metadata = await requiredCesMetadataResult(spec);
+    if (metadata === "unreachable") {
+      return { status: "unreachable" };
+    }
+    if (metadata === "missing") {
+      return { status: "missing" };
+    }
+
+    const credentials: Record<string, string> = {};
+    for (const field of spec.requiredFields) {
+      const value = await readCredentialResult(
+        credentialKey(spec.service, field),
+      );
+      if (value.unreachable) {
+        return { status: "unreachable" };
+      }
+      if (!value.value) {
+        return { status: "missing" };
+      }
+      credentials[field] = value.value;
+    }
+
+    return { status: "ok", credentials };
+  } catch (err) {
+    log.debug({ err }, `Failed to read ${spec.service} credentials`);
+    return { status: "unreachable" };
+  }
+}
 
 /**
- * Generic credential reader that checks metadata for the given service and
- * reads the required fields from the encrypted store.
+ * Generic credential reader that checks CES metadata (when CES HTTP is
+ * configured) and then loads every required secret from CES or the
+ * encrypted store.
  *
  * Returns a `Record<string, string>` mapping field names to their values if
- * all required fields are present in metadata and readable from the store.
- * Returns `null` if metadata is missing, any required field is absent from
- * metadata, or any secret value can't be read.
+ * all required secrets are readable. Returns `null` if CES metadata is
+ * missing or unreachable, or if any secret value can't be read. Prefer
+ * `readServiceCredentialsResult` when an outage must not look like a clear.
  */
 export async function readServiceCredentials(
   spec: ServiceCredentialSpec,
 ): Promise<Record<string, string> | null> {
-  try {
-    const metadataPath = getMetadataPath();
-    if (!existsSync(metadataPath)) return null;
-
-    const raw = readFileSync(metadataPath, "utf-8");
-    const data = JSON.parse(raw);
-    if (!data || !Array.isArray(data.credentials)) return null;
-
-    // Check that all required fields exist in metadata
-    for (const field of spec.requiredFields) {
-      const found = data.credentials.some(
-        (c: { service?: string; field?: string }) =>
-          c.service === spec.service && c.field === field,
-      );
-      if (!found) return null;
-    }
-
-    // Read each credential from the store
-    const result: Record<string, string> = {};
-    for (const field of spec.requiredFields) {
-      const value = await readCredential(credentialKey(spec.service, field));
-      if (!value) {
-        log.warn(
-          `${spec.service} credential metadata exists but secrets could not be read`,
-        );
-        return null;
-      }
-      result[field] = value;
-    }
-
-    return result;
-  } catch (err) {
-    log.debug({ err }, `Failed to read ${spec.service} credentials`);
+  const result = await readServiceCredentialsResult(spec);
+  if (result.status !== "ok") {
     return null;
   }
+  return result.credentials;
 }
 
 // ---------------------------------------------------------------------------
@@ -321,12 +404,7 @@ export const DISCORD_CHANNEL_CREDENTIAL_SPEC: ServiceCredentialSpec = {
 
 export const VELLUM_CREDENTIAL_SPEC: ServiceCredentialSpec = {
   service: "vellum",
-  requiredFields: [
-    "platform_base_url",
-    "assistant_api_key",
-    "platform_assistant_id",
-    "webhook_secret",
-  ],
+  requiredFields: ["platform_base_url", "assistant_api_key", "webhook_secret"],
 } as const;
 
 export const ALL_CREDENTIAL_SPECS: readonly ServiceCredentialSpec[] = [

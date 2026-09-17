@@ -74,6 +74,9 @@ function projectModel(model: CatalogModel): Record<string, unknown> {
   if (model.adaptiveThinkingOnly !== undefined) {
     projected.adaptiveThinkingOnly = model.adaptiveThinkingOnly;
   }
+  if (model.thinkingFloor !== undefined) {
+    projected.thinkingFloor = model.thinkingFloor;
+  }
   if (model.supportsCaching !== undefined) {
     projected.supportsCaching = model.supportsCaching;
   }
@@ -83,8 +86,14 @@ function projectModel(model: CatalogModel): Record<string, unknown> {
   if (model.supportsToolUse !== undefined) {
     projected.supportsToolUse = model.supportsToolUse;
   }
+  if (model.supportsText !== undefined) {
+    projected.supportsText = model.supportsText;
+  }
   if (model.pricing !== undefined) {
     projected.pricing = model.pricing;
+  }
+  if (model.featureFlag !== undefined) {
+    projected.featureFlag = model.featureFlag;
   }
   return projected;
 }
@@ -114,6 +123,9 @@ function projectProvider(entry: ProviderCatalogEntry): Record<string, unknown> {
   }
   if (entry.supportsPlatformAuth !== undefined) {
     projected.supportsPlatformAuth = entry.supportsPlatformAuth;
+  }
+  if (entry.featureFlag !== undefined) {
+    projected.featureFlag = entry.featureFlag;
   }
   projected.defaultModel = entry.defaultModel;
   projected.models = entry.models.map(projectModel);

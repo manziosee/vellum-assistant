@@ -50,7 +50,13 @@ mock.module("../../../persistence/embeddings/embedding-backend.js", () => ({
   },
 }));
 
-import { getConfig, loadRawConfig } from "../../../config/loader.js";
+import { BACKUP_PROFILE_KEYS } from "../../../config/default-profile-names.js";
+import {
+  getConfig,
+  loadConfig,
+  loadRawConfig,
+} from "../../../config/loader.js";
+import { AssistantConfigSchema } from "../../../config/schema.js";
 import { LLMConfigBase } from "../../../config/schemas/llm.js";
 import type { ConversationCreateType } from "../../../persistence/conversation-types.js";
 import {
@@ -836,6 +842,49 @@ describe("PUT /v1/config/llm/profiles/:name", () => {
     seedRawConfig();
   });
 
+  describe("fallbackProfile write protection", () => {
+    beforeEach(() => {
+      const llm = rawConfigFixture.llm as {
+        profiles: Record<string, Record<string, unknown>>;
+      };
+      llm.profiles.backup = {
+        provider: "anthropic",
+        model: "claude-sonnet-4-6",
+      };
+      seedRawConfig();
+    });
+
+    test("rejects a custom fallbackProfile without writing", async () => {
+      await expect(
+        replaceProfileRoute.handler({
+          pathParams: { name: "custom" },
+          body: {
+            provider: "anthropic",
+            model: "claude-sonnet-4-6",
+            fallbackProfile: "backup",
+          },
+        }),
+      ).rejects.toThrow(/Automatic fallbacks are code-owned/);
+      expect(persistedProfile("custom").fallbackProfile).toBeUndefined();
+      expect(initializeProvidersCalls).toBe(0);
+    });
+
+    test("rejects a custom pointer at a managed backup name", async () => {
+      await expect(
+        replaceProfileRoute.handler({
+          pathParams: { name: "custom" },
+          body: {
+            provider: "anthropic",
+            model: "claude-sonnet-4-6",
+            fallbackProfile: "balanced-backup",
+          },
+        }),
+      ).rejects.toThrow(/Automatic fallbacks are code-owned/);
+      expect(persistedProfile("custom").fallbackProfile).toBeUndefined();
+      expect(initializeProvidersCalls).toBe(0);
+    });
+  });
+
   test("owns contextWindow maxInputTokens while preserving non-UI profile leaves", async () => {
     const result = await replaceProfileRoute.handler({
       pathParams: { name: "custom" },
@@ -1239,6 +1288,48 @@ describe("PUT /v1/config/llm/profiles/:name", () => {
       expect(initializeProvidersCalls).toBe(1);
       expect(clearEmbeddingBackendCacheCalls).toBe(1);
     });
+  });
+});
+
+describe("PATCH /v1/config fallbackProfile write protection", () => {
+  const patchRoute = ROUTES.find((r) => r.operationId === "config_patch")!;
+
+  beforeEach(() => {
+    initializeProvidersCalls = 0;
+    clearEmbeddingBackendCacheCalls = 0;
+    rawConfigFixture = {
+      llm: {
+        profiles: {
+          custom: { provider: "anthropic", model: "claude-sonnet-4-6" },
+          backup: { provider: "anthropic", model: "claude-sonnet-4-6" },
+        },
+      },
+    };
+    seedRawConfig();
+  });
+
+  test("rejects a custom fallbackProfile without writing", async () => {
+    await expect(
+      patchRoute.handler({
+        body: { llm: { profiles: { custom: { fallbackProfile: "backup" } } } },
+      }),
+    ).rejects.toThrow(/Automatic fallbacks are code-owned/);
+    expect(persistedProfile("custom").fallbackProfile).toBeUndefined();
+    expect(initializeProvidersCalls).toBe(0);
+  });
+
+  test("rejects a custom pointer at a managed backup name", async () => {
+    await expect(
+      patchRoute.handler({
+        body: {
+          llm: {
+            profiles: { custom: { fallbackProfile: "balanced-backup" } },
+          },
+        },
+      }),
+    ).rejects.toThrow(/Automatic fallbacks are code-owned/);
+    expect(persistedProfile("custom").fallbackProfile).toBeUndefined();
+    expect(initializeProvidersCalls).toBe(0);
   });
 });
 
@@ -1685,7 +1776,7 @@ describe("config invariant flag enrichment", () => {
     expect(profiles.custom!).not.toHaveProperty("invariant");
   });
 
-  test("every managed default is invariant on the wire, Speed included", async () => {
+  test("every managed default is invariant on the wire, Fast included", async () => {
     // The clients drive their read-only lock off this flag, so a default that
     // resolves from the catalog with no workspace stub must still carry it.
     const body = await configGetRoute.handler({});
@@ -1694,6 +1785,16 @@ describe("config invariant flag enrichment", () => {
     for (const name of ["balanced", "quality-optimized", "latency-optimized"]) {
       expect(profiles[name]!.invariant).toBe(true);
     }
+  });
+
+  test("GET /v1/config hides managed backups from the picker catalog", async () => {
+    const body = await configGetRoute.handler({});
+    const profiles = wireProfiles(body);
+
+    for (const name of BACKUP_PROFILE_KEYS) {
+      expect(profiles).not.toHaveProperty(name);
+    }
+    expect(profiles.balanced).toBeDefined();
   });
 
   test("PATCH /v1/config stamps the flag on the response but never persists it", async () => {
@@ -1842,5 +1943,107 @@ describe("ingress URL writes through the generic config routes", () => {
     const ingress = savedIngress();
     expect(ingress.assistantId).toBe("assistant-1");
     expect(ingress.lastTunnel).toEqual(LAST_TUNNEL);
+  });
+});
+
+describe("config writes to a per-agent acp entry", () => {
+  const patchRoute = ROUTES.find((r) => r.operationId === "config_patch")!;
+  const setRoute = ROUTES.find((r) => r.operationId === "config_set")!;
+
+  beforeEach(() => {
+    rawConfigFixture = {
+      acp: {
+        agents: {
+          claude: { command: "claude-agent-acp", args: [], model: "opus" },
+        },
+      },
+    };
+    seedRawConfig();
+  });
+
+  function agentEntry(
+    raw: Record<string, unknown>,
+    id = "claude",
+  ): Record<string, unknown> {
+    const acp = raw.acp as Record<string, unknown>;
+    const agents = acp.agents as Record<string, Record<string, unknown>>;
+    return agents[id]!;
+  }
+
+  test("a nulled per-agent model is dropped on both write paths", async () => {
+    await patchRoute.handler({
+      body: { acp: { agents: { claude: { model: null } } } },
+    });
+
+    const patched = agentEntry(loadRawConfig());
+    expect("model" in patched).toBe(false);
+    expect(patched.command).toBe("claude-agent-acp");
+    expect(AssistantConfigSchema.safeParse(loadRawConfig()).success).toBe(true);
+
+    seedRawConfig();
+    await setRoute.handler({
+      body: { path: "acp.agents.claude.model", value: null },
+    });
+
+    expect("model" in agentEntry(loadRawConfig())).toBe(false);
+    expect(AssistantConfigSchema.safeParse(loadRawConfig()).success).toBe(true);
+    expect(loadConfig().acp.agents.claude?.model).toBeUndefined();
+  });
+
+  test("a nulled per-agent command is dropped on both write paths", async () => {
+    await setRoute.handler({
+      body: { path: "acp.agents.claude.command", value: null },
+    });
+
+    expect("command" in agentEntry(loadRawConfig())).toBe(false);
+    expect(AssistantConfigSchema.safeParse(loadRawConfig()).success).toBe(true);
+    expect(loadConfig().acp.agents.claude?.command).toBeUndefined();
+
+    seedRawConfig();
+    await patchRoute.handler({
+      body: { acp: { agents: { claude: { command: null } } } },
+    });
+
+    const patched = agentEntry(loadRawConfig());
+    expect("command" in patched).toBe(false);
+    expect(patched.model).toBe("opus");
+    expect(AssistantConfigSchema.safeParse(loadRawConfig()).success).toBe(true);
+    expect(loadConfig().acp.agents.claude?.command).toBeUndefined();
+  });
+
+  test("a nulled command on an id with no bundled profile is dropped too", async () => {
+    rawConfigFixture = {
+      acp: { agents: { mine: { command: "my-acp", args: [] } } },
+    };
+    seedRawConfig();
+
+    await setRoute.handler({
+      body: { path: "acp.agents.mine.command", value: null },
+    });
+
+    expect("command" in agentEntry(loadRawConfig(), "mine")).toBe(false);
+    const result = AssistantConfigSchema.safeParse(loadRawConfig());
+    expect(result.success).toBe(false);
+    if (result.success) {
+      return;
+    }
+    expect(result.error.issues.map((issue) => issue.path)).toEqual([
+      ["acp", "agents", "mine", "command"],
+    ]);
+    expect(result.error.issues[0]?.message).toContain("acp.agents.mine");
+  });
+
+  test("a model set on a bare bundled entry survives the next load", async () => {
+    rawConfigFixture = {};
+    seedRawConfig();
+
+    await setRoute.handler({
+      body: { path: "acp.agents.claude.model", value: "sonnet" },
+    });
+
+    const entry = agentEntry(loadRawConfig());
+    expect("command" in entry).toBe(false);
+    expect(AssistantConfigSchema.safeParse(loadRawConfig()).success).toBe(true);
+    expect(loadConfig().acp.agents.claude?.model).toBe("sonnet");
   });
 });

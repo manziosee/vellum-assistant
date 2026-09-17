@@ -90,6 +90,9 @@ function makeTarget(): {
       },
     },
     messages,
+    // The wake trims its own run input; no row here is tagged as a camera
+    // frame, so the real pass would return the array unchanged too.
+    trimAgedSightFrames: (msgs: Message[]) => msgs,
     getMessages: () => messages,
     isProcessing: () => processing,
     waitForIdle: async () => !processing,
@@ -103,6 +106,8 @@ function makeTarget(): {
     kickDrainQueue: async () => {},
     // Pre-run auto-compaction gate — no-op for these tests.
     maybeCompact: async () => null,
+    // The wake rebuilds the loop prompt under its per-turn stamps.
+    syncLoopSystemPrompt: () => {},
     buildCurrentSystemPrompt: () => "mock-system-prompt",
     modelOverride: undefined,
   };

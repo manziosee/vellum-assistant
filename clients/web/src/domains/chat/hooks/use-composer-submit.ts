@@ -19,6 +19,7 @@ import {
   type RefObject,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
 } from "react";
 
@@ -28,10 +29,13 @@ import {
   selectUploadingCount,
   useComposerStore,
 } from "@/domains/chat/composer-store";
+import { prependChannelReference } from "@/domains/chat/channel-sidecar/channel-reference";
+import { useChannelReferenceStore } from "@/domains/chat/channel-sidecar/channel-reference-store";
 import {
   useQuoteReplyStore,
   type StagedQuote,
 } from "@/domains/chat/quote-reply-store";
+import { finishActiveDictation } from "@/domains/chat/voice/finish-dictation";
 import { conversationsByIdUndoPost } from "@/generated/daemon/sdk.gen";
 import { haptic } from "@/utils/haptics";
 import { isPointerCoarse } from "@/utils/pointer";
@@ -60,11 +64,19 @@ export interface UseComposerSubmitParams {
   activeConversationId: string | null;
   /**
    * Pre-send gate, invoked with the fully assembled outgoing content
-   * (quotes and path references included) before any composer state is
-   * cleared. Return `false` to block the send — the draft, attachments,
-   * and staged quotes are left fully intact. Omitted = always proceed.
+   * (quotes, a staged channel reference, and path references included)
+   * before any composer state is cleared. Return `false` to block the send:
+   * the draft, attachments, staged quotes, and the staged channel reference
+   * are left fully intact. Omitted = always proceed.
    */
   beforeSend?: (content: string) => boolean;
+  /** Saves context before chat takes ownership of the message. Null cancels losslessly. */
+  prepareSend?: () => Promise<ComposerSendPreparation | null>;
+}
+
+export interface ComposerSendPreparation {
+  isCurrent: () => boolean;
+  release: () => void;
 }
 
 export interface ComposerSubmitResult {
@@ -104,8 +116,30 @@ export function useComposerSubmit({
   assistantId,
   activeConversationId,
   beforeSend,
+  prepareSend,
 }: UseComposerSubmitParams): ComposerSubmitResult {
   const shouldFocusInputRef = useRef(false);
+  /**
+   * Tail of the delivery chain, so submits reach the send in the order they
+   * were made. See where it is advanced in `submitMessage`.
+   */
+  const sendChainRef = useRef<Promise<void>>(Promise.resolve());
+  const preparingRef = useRef<symbol | null>(null);
+  const sendDisabledRef = useRef(sendDisabled);
+  const editingTarget = isEditing ? editingMessageId : null;
+  const editingTargetRef = useRef(editingTarget);
+  useLayoutEffect(() => {
+    sendDisabledRef.current = sendDisabled;
+    editingTargetRef.current = editingTarget;
+  }, [sendDisabled, editingTarget]);
+  const ownerRef = useRef({ assistantId, activeConversationId, mounted: true });
+  useLayoutEffect(() => {
+    ownerRef.current = { assistantId, activeConversationId, mounted: true };
+    preparingRef.current = null;
+    return () => {
+      ownerRef.current = { assistantId, activeConversationId, mounted: false };
+    };
+  }, [assistantId, activeConversationId, prepareSend]);
 
   // --- Focus effect -------------------------------------------------------
   useEffect(() => {
@@ -118,6 +152,47 @@ export function useComposerSubmit({
   // --- Submit logic -------------------------------------------------------
   const submitMessage = useCallback(
     async (inputOverride?: string, opts?: { bypassSecretCheck?: boolean }) => {
+      if (sendDisabled || preparingRef.current || !ownerRef.current.mounted) {
+        return;
+      }
+      const originatingOwner = ownerRef.current;
+      const editingAtPress = editingTargetRef.current;
+      // A send pressed mid-dictation means "finish, then send". Waiting for
+      // the transcript to land is what keeps the payload equal to what the
+      // user can read: the live partial is not in the draft yet, so sending
+      // first would drop everything spoken since the draft was last written
+      // (LUM-3432). An explicit override is its own payload (a starter
+      // prompt, the secret guard's re-send) and never the live draft, so it
+      // does not wait.
+      if (inputOverride === undefined) {
+        const outcome = await finishActiveDictation();
+        if (outcome === "no-transcript") {
+          // The spoken words did not survive. The draft sitting in the
+          // composer is not what the user asked to send, so leave it intact
+          // rather than sending it in their place.
+          return;
+        }
+        // The wait is long enough for the world to move. The composer is not
+        // keyed by conversation, so a thread switch during it lands the
+        // transcript in the new thread's draft while this closure still
+        // holds the old thread's `sendMessage`: sending now would clear one
+        // thread's draft and deliver it to another. A confirmation or secret
+        // prompt arriving during the wait flips `sendDisabled` for the same
+        // reason, and the prompt gate must win over a send pressed before it
+        // existed. An edit cancelled during the wait (Escape is live again
+        // once the recording has moved to processing) would otherwise still
+        // be undone and re-sent by this closure, which remembers the edit as
+        // it stood at the press. Either way the words stay in the draft for
+        // the user.
+        if (
+          ownerRef.current !== originatingOwner ||
+          !ownerRef.current.mounted ||
+          sendDisabledRef.current ||
+          editingTargetRef.current !== editingAtPress
+        ) {
+          return;
+        }
+      }
       const input = useComposerStore.getState().input;
       const chatAttachments = useComposerStore.getState().attachments;
       const uploadingCount = selectUploadingCount(chatAttachments);
@@ -125,15 +200,20 @@ export function useComposerSubmit({
       const pathReferences = selectPathReferencePaths(chatAttachments);
 
       const stagedQuotes = useQuoteReplyStore.getState().stagedQuotes;
+      const channelReference = useChannelReferenceStore.getState().reference;
       const trimmed = (inputOverride ?? input).trim();
-      if (sendDisabled) {
+      if (sendDisabledRef.current || preparingRef.current) {
         return;
       }
+      // A staged channel reference is content in its own right: "look at this
+      // message" is a complete instruction, so it makes an otherwise empty
+      // composer sendable exactly as a staged quote does.
       if (
         !trimmed &&
         uploadedIds.length === 0 &&
         pathReferences.length === 0 &&
-        stagedQuotes.length === 0
+        stagedQuotes.length === 0 &&
+        channelReference === null
       ) {
         return;
       }
@@ -144,75 +224,150 @@ export function useComposerSubmit({
       // Assemble the outgoing content before touching any state so the gate
       // below can veto the send with the draft/attachments/quotes intact.
       const contentWithQuotes = buildContentWithQuotes(stagedQuotes, trimmed);
-      const finalContent = appendPathReferences(
+      // The channel reference leads the message: it is the thing being talked
+      // about, and everything the user typed is their remark on it.
+      const contentWithReference = prependChannelReference(
         contentWithQuotes,
+        channelReference,
+      );
+      const finalContent = appendPathReferences(
+        contentWithReference,
         pathReferences,
       );
       if (beforeSend && !beforeSend(finalContent)) {
         return;
       }
 
-      const attachmentsToSend: DisplayAttachment[] = chatAttachments
-        .filter(
-          (att): att is Extract<typeof att, { kind: "uploaded" }> =>
-            att.kind === "uploaded",
-        )
-        .map((att) => ({
-          id: att.id,
-          filename: att.filename,
-          mimeType: att.mimeType,
-          sizeBytes: att.sizeBytes,
-          previewUrl: att.previewUrl ?? null,
-          thumbnailUrl: att.thumbnailUrl ?? null,
-        }));
-
-      useComposerStore.getState().setInput("");
-      if (activeConversationId) {
-        useComposerStore.getState().clearDraft(activeConversationId);
-      }
-      if (inputRef.current) {
-        inputRef.current.style.height = "auto";
-      }
-      useComposerStore.getState().resetAttachments();
-      useQuoteReplyStore.getState().clearStagedQuotes();
-
-      if (!isPointerCoarse()) {
-        shouldFocusInputRef.current = true;
-      }
-      haptic.medium();
-
-      // Engage the auto-pin window so the new turn lands at the bottom.
-      scrollToLatest({ behavior: "auto" });
-
-      if (
-        isEditing &&
-        editingMessageId &&
-        assistantId &&
-        activeConversationId &&
-        canUndoEdit
-      ) {
-        cancelEditing();
-        try {
-          await conversationsByIdUndoPost({
-            path: { assistant_id: assistantId, id: activeConversationId },
-          });
-        } catch {
-          // If undo fails, still send the message as a new one
+      const attempt = Symbol();
+      let preparation: ComposerSendPreparation | null = null;
+      const releasePreparation = () => {
+        const current = preparation;
+        preparation = null;
+        current?.release();
+        if (preparingRef.current === attempt) {
+          preparingRef.current = null;
         }
+      };
+      try {
+        if (prepareSend) {
+          preparingRef.current = attempt;
+          preparation = await prepareSend();
+          const owner = ownerRef.current;
+          if (
+            !preparation ||
+            !preparation.isCurrent() ||
+            sendDisabledRef.current ||
+            editingTargetRef.current !== editingAtPress ||
+            owner !== originatingOwner ||
+            !owner.mounted ||
+            owner.assistantId !== assistantId ||
+            owner.activeConversationId !== activeConversationId ||
+            useComposerStore.getState().input !== input ||
+            useComposerStore.getState().attachments !== chatAttachments ||
+            useQuoteReplyStore.getState().stagedQuotes !== stagedQuotes ||
+            useChannelReferenceStore.getState().reference !== channelReference
+          ) {
+            return;
+          }
+        }
+
+        const attachmentsToSend: DisplayAttachment[] = chatAttachments
+          .filter(
+            (att): att is Extract<typeof att, { kind: "uploaded" }> =>
+              att.kind === "uploaded",
+          )
+          .map((att) => ({
+            id: att.id,
+            filename: att.filename,
+            mimeType: att.mimeType,
+            sizeBytes: att.sizeBytes,
+            previewUrl: att.previewUrl ?? null,
+            thumbnailUrl: att.thumbnailUrl ?? null,
+          }));
+
+        useComposerStore.getState().setInput("");
+        if (activeConversationId) {
+          useComposerStore.getState().clearDraft(activeConversationId);
+        }
+        if (inputRef.current) {
+          inputRef.current.style.height = "auto";
+        }
+        useComposerStore.getState().resetAttachments();
+        useQuoteReplyStore.getState().clearStagedQuotes();
+        useChannelReferenceStore.getState().clearReference();
+
+        if (!isPointerCoarse()) {
+          shouldFocusInputRef.current = true;
+        }
+        haptic.medium();
+
+        // Engage the auto-pin window so the new turn lands at the bottom.
+        scrollToLatest({ behavior: "auto" });
+
+        if (
+          isEditing &&
+          editingMessageId &&
+          assistantId &&
+          activeConversationId &&
+          canUndoEdit
+        ) {
+          cancelEditing();
+          try {
+            await conversationsByIdUndoPost({
+              path: { assistant_id: assistantId, id: activeConversationId },
+            });
+          } catch {
+            // If undo fails, still send the message as a new one
+          }
+        }
+
+        const deliver = async () => {
+          // Forward the secret-check override only when this send explicitly
+          // carries it (the Send-anyway path); ordinary sends never set it.
+          let delivery: Promise<void>;
+          try {
+            delivery = sendMessage(
+              finalContent,
+              attachmentsToSend,
+              opts?.bypassSecretCheck === true
+                ? { bypassSecretCheck: true }
+                : undefined,
+            );
+          } finally {
+            // Keep the saved context locked through the queue wait, until chat
+            // takes ownership of this message. Delivery completion does not hold it.
+            releasePreparation();
+          }
+          await delivery;
+        };
+
+        // Deliveries run one after another, in the order they were submitted.
+        //
+        // The composer is cleared and re-enabled above, ahead of the send
+        // `deliver` runs, so a second message can be written and sent while the
+        // first is still in flight. Whichever send settles first would otherwise
+        // reach the assistant first, and the send treats a message arriving while
+        // a turn is starting as one to queue behind it: the two land in the
+        // assistant's history the wrong way round.
+        //
+        // The link runs whether the previous one resolved or rejected, and the
+        // chain is advanced with a continuation that cannot reject, so one failed
+        // send does not wedge every send after it. The first submit of a quiet
+        // composer awaits an already-resolved promise, which costs it a microtask.
+        const link = sendChainRef.current.then(deliver, deliver);
+        sendChainRef.current = link.then(
+          () => {},
+          () => {},
+        );
+        await link;
+      } finally {
+        releasePreparation();
       }
-      // Forward the secret-check override only when this send explicitly
-      // carries it (the Send-anyway path); ordinary sends never set it.
-      await sendMessage(
-        finalContent,
-        attachmentsToSend,
-        opts?.bypassSecretCheck === true
-          ? { bypassSecretCheck: true }
-          : undefined,
-      );
     },
     [
       sendDisabled,
       beforeSend,
+      prepareSend,
       activeConversationId,
       inputRef,
       scrollToLatest,

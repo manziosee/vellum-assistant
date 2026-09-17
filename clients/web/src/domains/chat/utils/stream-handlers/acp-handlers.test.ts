@@ -2,15 +2,19 @@ import { beforeEach, describe, expect, it } from "bun:test";
 
 import { useAcpRunStore } from "@/domains/chat/acp-run-store";
 import { useInteractionStore } from "@/domains/chat/interaction-store";
+import { useConversationStore } from "@/stores/conversation-store";
 import { ACP_CLAUDE_AUTH_REQUIRED_CODE } from "@/domains/chat/utils/acp-connect";
 import {
   handleAcpAuthRequired,
   handleAcpSessionSpawned,
   handleAcpSessionUpdate,
   handleAcpSessionUsage,
+  handleAcpSessionModelUpdate,
   handleAcpSessionCompleted,
   handleAcpSessionError,
 } from "@/domains/chat/utils/stream-handlers/acp-handlers";
+
+const MODEL_REVISION_EPOCH = "01900000-0000-7000-8000-000000000001";
 
 function getState() {
   return useAcpRunStore.getState();
@@ -173,6 +177,61 @@ describe("handleAcpSessionUsage", () => {
   });
 });
 
+describe("handleAcpSessionModelUpdate", () => {
+  it("records the model and the adapter's options on the run", () => {
+    spawn();
+    handleAcpSessionModelUpdate({
+      type: "acp_session_model_update",
+      acpSessionId: "acp-1",
+      modelRevisionEpoch: MODEL_REVISION_EPOCH,
+      modelRevision: 1,
+      model: "opus",
+      availableModels: [
+        { value: "opus", label: "Opus" },
+        { value: "haiku", label: "Haiku", group: "Fast" },
+      ],
+    });
+    const entry = getState().byId["acp-1"];
+    expect(entry?.model).toBe("opus");
+    expect(entry?.availableModels).toEqual([
+      { value: "opus", label: "Opus" },
+      { value: "haiku", label: "Haiku", group: "Fast" },
+    ]);
+    expect(entry?.modelRevision).toBe(1);
+  });
+
+  it("records an adapter with no model selector", () => {
+    spawn();
+    handleAcpSessionModelUpdate({
+      type: "acp_session_model_update",
+      acpSessionId: "acp-1",
+      modelRevisionEpoch: MODEL_REVISION_EPOCH,
+      modelRevision: 2,
+      availableModels: [],
+    });
+    const entry = getState().byId["acp-1"];
+    expect(entry?.model).toBeUndefined();
+    expect(entry?.availableModels).toEqual([]);
+  });
+
+  it("buffers a model update for a session it has not seeded", () => {
+    handleAcpSessionModelUpdate({
+      type: "acp_session_model_update",
+      acpSessionId: "acp-missing",
+      modelRevisionEpoch: MODEL_REVISION_EPOCH,
+      modelRevision: 3,
+      model: "opus",
+      availableModels: [{ value: "opus", label: "Opus" }],
+    });
+    expect(getState().byId).toEqual({});
+    expect(getState().pendingModelUpdates.get("acp-missing")).toMatchObject({
+      modelRevision: 3,
+      model: "opus",
+      availableModels: [{ value: "opus", label: "Opus" }],
+    });
+  });
+});
+
 describe("handleAcpSessionCompleted", () => {
   it("marks the run completed with stop reason", () => {
     spawn();
@@ -273,11 +332,27 @@ describe("handleAcpAuthRequired", () => {
     authRequired();
 
     // Anchored to the acp_spawn call, not the run: that is the transcript row
-    // the affordance renders under.
+    // the affordance renders under. The conversation comes off the run entry
+    // the spawn recorded, not the chat on screen: this event is global, so it
+    // can land after the user has navigated away.
     expect(useInteractionStore.getState().pendingAcpConnect).toEqual({
       toolUseId: "tool-1",
       reason: "auth_required",
+      conversationId: "conv-1",
     });
+  });
+
+  it("keeps the run's own conversation when the event lands after a navigation", () => {
+    // `acp_auth_required` carries no conversation of its own, so reading the
+    // active one would file the prompt under whatever chat is open when a
+    // background run finally fails.
+    spawn();
+    useConversationStore.setState({ activeConversationId: "conv-elsewhere" });
+    authRequired();
+
+    expect(
+      useInteractionStore.getState().pendingAcpConnect?.conversationId,
+    ).toBe("conv-1");
   });
 
   it("marks the prompt auth_required so it cannot self-dismiss on a presence check", () => {

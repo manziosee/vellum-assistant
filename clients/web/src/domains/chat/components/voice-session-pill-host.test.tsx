@@ -22,6 +22,8 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 import type { MainView } from "@/stores/viewer-store";
+import { composerViewerStoreMock } from "@/stores/viewer-store.test-helper";
+import { conversationNavigationMock } from "@/utils/conversation-navigation.test-helper";
 import { routes } from "@/utils/routes";
 
 import {
@@ -54,13 +56,13 @@ mock.module("react-router", () => ({
 // matters, and only to decide whether the state word navigates.
 
 let mockMainView: MainView = "chat";
-mock.module("@/stores/viewer-store", () => ({
-  useViewerStore: {
-    use: {
-      mainView: () => mockMainView,
-    },
-  },
-}));
+let mockActiveAppId: string | null = null;
+mock.module("@/stores/viewer-store", () =>
+  composerViewerStoreMock(() => ({
+    mainView: mockMainView,
+    activeAppId: mockActiveAppId,
+  })),
+);
 
 let mockIsMobile = false;
 mock.module("@/hooks/use-is-mobile", () => ({
@@ -71,9 +73,11 @@ mock.module("@/hooks/use-is-mobile", () => ({
 const navigateToConversationSpy = mock(
   (_navigate: unknown, _conversationId: string) => {},
 );
-mock.module("@/utils/conversation-navigation", () => ({
-  navigateToConversation: navigateToConversationSpy,
-}));
+mock.module("@/utils/conversation-navigation", () =>
+  conversationNavigationMock({
+    navigateToConversation: navigateToConversationSpy,
+  }),
+);
 
 // Avatar data feeding the pill's wave accent. Mocked so the host renders
 // without a QueryClientProvider (the real hook is React Query).
@@ -109,6 +113,7 @@ beforeEach(() => {
   mockPathname = routes.conversation(OTHER_CONVERSATION_ID);
   mockSearch = "";
   mockMainView = "chat";
+  mockActiveAppId = null;
   mockIsMobile = false;
   navigateFn.mockClear();
   navigateToConversationSpy.mockClear();
@@ -173,6 +178,7 @@ describe("VoiceSessionPillHost — visibility", () => {
       .setActiveConversationId(OWNING_CONVERSATION_ID);
     mockPathname = routes.conversation(OWNING_CONVERSATION_ID);
     mockMainView = "app";
+    mockActiveAppId = "app-1";
     render(<VoiceSessionPillHost />);
     expect(pill()).not.toBeNull();
   });
@@ -184,6 +190,7 @@ describe("VoiceSessionPillHost — visibility", () => {
       .setActiveConversationId(OWNING_CONVERSATION_ID);
     mockPathname = routes.conversation(OWNING_CONVERSATION_ID);
     mockMainView = "app";
+    mockActiveAppId = "app-1";
     mockIsMobile = true;
     const { container } = render(<VoiceSessionPillHost />);
     expect(container.firstChild).toBeNull();
@@ -196,7 +203,7 @@ describe("VoiceSessionPillHost — visibility", () => {
     useConversationStore
       .getState()
       .setActiveConversationId(OWNING_CONVERSATION_ID);
-    mockPathname = routes.home;
+    mockPathname = routes.identity;
     render(<VoiceSessionPillHost />);
     expect(pill()).not.toBeNull();
   });
@@ -250,7 +257,7 @@ describe("VoiceSessionPillHost — failure surface", () => {
 
   test("failure while on a composer-less route shows the dismissible error chip", () => {
     startSession("listening");
-    mockPathname = routes.home;
+    mockPathname = routes.identity;
     useLiveVoiceStore.getState().fail("Microphone capture could not start.");
     render(<VoiceSessionPillHost />);
     expect(errorChip()).not.toBeNull();
@@ -268,6 +275,7 @@ describe("VoiceSessionPillHost — failure surface", () => {
       .setActiveConversationId(OWNING_CONVERSATION_ID);
     mockPathname = routes.conversation(OWNING_CONVERSATION_ID);
     mockMainView = "app";
+    mockActiveAppId = "app-1";
     useLiveVoiceStore.getState().fail("Connection lost.");
     render(<VoiceSessionPillHost />);
     expect(errorChip()).not.toBeNull();
@@ -275,7 +283,7 @@ describe("VoiceSessionPillHost — failure surface", () => {
 
   test("dismissing the chip resets the store to idle, mirroring the composer Notice", () => {
     startSession("listening");
-    mockPathname = routes.home;
+    mockPathname = routes.identity;
     useLiveVoiceStore.getState().fail("boom");
     render(<VoiceSessionPillHost />);
     fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
@@ -285,7 +293,7 @@ describe("VoiceSessionPillHost — failure surface", () => {
   });
 
   test("no chip without an error message", () => {
-    mockPathname = routes.home;
+    mockPathname = routes.identity;
     useLiveVoiceStore.getState().setState("failed");
     const { container } = render(<VoiceSessionPillHost />);
     expect(container.firstChild).toBeNull();
@@ -344,7 +352,7 @@ describe("VoiceSessionPillHost — standalone variant (headerless pop-outs)", ()
 
   test("floats the error chip for a failure on a composer-less route", () => {
     startSession("listening");
-    mockPathname = routes.home;
+    mockPathname = routes.identity;
     useLiveVoiceStore.getState().fail("boom");
     render(<VoiceSessionPillHost variant="standalone" />);
     expect(screen.queryByRole("alert")).not.toBeNull();
@@ -373,7 +381,7 @@ describe("VoiceSessionPillHost: row variant (above the phone header)", () => {
     // The chip carries its own pill-shaped fill, so full-bleed placement would
     // leave it floating against the page edge.
     startSession("listening");
-    mockPathname = routes.home;
+    mockPathname = routes.identity;
     useLiveVoiceStore.getState().fail("boom");
     const { container } = render(<VoiceSessionPillHost variant="row" />);
     expect((container.firstChild as HTMLElement).className).toContain("px-4");

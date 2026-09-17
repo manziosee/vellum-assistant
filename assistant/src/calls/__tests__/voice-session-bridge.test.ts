@@ -12,6 +12,7 @@
  * covered by `src/__tests__/conversation-wait-for-idle.test.ts`.
  */
 import {
+  afterEach,
   beforeEach,
   describe,
   expect,
@@ -35,8 +36,43 @@ mock.module("../../daemon/conversation-store.js", () => ({
 // production (a BYO provider resolves the profile key through its own column
 // of the intent matrix), so it is scripted rather than read from a catalog.
 let pinProfileSupportsVision = true;
+// Vision capability of the conversation's own profile, which an escalated
+// leg is pinned to. Scripted for the same reason.
+let conversationProfileSupportsVision = true;
+// Per-profile answers that outrank the two switches above, for a mix whose
+// arms differ.
+const visionByProfile = new Map<string, boolean>();
 mock.module("../../plugin-api/vision-support.js", () => ({
-  doesSupportVision: () => pinProfileSupportsVision,
+  doesSupportVision: (profile: string) =>
+    visionByProfile.get(profile) ??
+    (profile === "latency-optimized"
+      ? pinProfileSupportsVision
+      : conversationProfileSupportsVision),
+}));
+
+// Attachment hydration for the parked-camera-frame path. Only `att-frame-*`
+// ids exist; anything else resolves to nothing, which is how an id the client
+// invented reaches the bridge. `collectedAttachmentIds` is the store's other
+// half: the fake `deleteMessageById` below writes into it under the real
+// orphan rule, so an id the cleanup ate stops resolving here, exactly as a
+// deleted attachment row would.
+import * as realAttachmentsStore from "../../persistence/attachments-store.js";
+
+const collectedAttachmentIds = new Set<string>();
+
+mock.module("../../persistence/attachments-store.js", () => ({
+  ...realAttachmentsStore,
+  resolveAttachmentsForPersist: (ids: string[]) =>
+    ids
+      .filter(
+        (id) => id.startsWith("att-frame-") && !collectedAttachmentIds.has(id),
+      )
+      .map((id) => ({
+        id,
+        filename: `${id}.png`,
+        mimeType: "image/png",
+        data: "ZnJhbWU=",
+      })),
 }));
 
 // Conversation-CRUD doubles for the teardown transcript-hygiene pass. The
@@ -48,15 +84,22 @@ let getMessageByIdImpl: (
   messageId: string,
   conversationId?: string,
 ) => unknown = () => null;
+// Attachment ids each persisted message links, so the fake delete below can
+// apply the orphan rule to the same candidate set the real one would collect.
+const messageAttachmentLinks = new Map<string, string[]>();
 const crudLog: {
   reads: string[];
   updates: Array<{ messageId: string; content: string }>;
   deletes: string[];
-} = { reads: [], updates: [], deletes: [] };
+  retained: Array<{ messageId: string; ids: readonly string[] }>;
+} = { reads: [], updates: [], deletes: [], retained: [] };
 function resetCrudLog(): void {
   crudLog.reads.length = 0;
   crudLog.updates.length = 0;
   crudLog.deletes.length = 0;
+  crudLog.retained.length = 0;
+  messageAttachmentLinks.clear();
+  collectedAttachmentIds.clear();
   getMessageByIdImpl = () => null;
 }
 
@@ -69,8 +112,23 @@ mock.module("../../persistence/conversation-crud.js", () => ({
   updateMessageContent: (messageId: string, content: string) => {
     crudLog.updates.push({ messageId, content });
   },
-  deleteMessageById: (messageId: string) => {
+  deleteMessageById: (
+    messageId: string,
+    options?: { retainAttachmentIds?: readonly string[] },
+  ) => {
     crudLog.deletes.push(messageId);
+    const retained = options?.retainAttachmentIds ?? [];
+    crudLog.retained.push({ messageId, ids: retained });
+    // Mirrors the real cleanup: the row's own attachment links are the
+    // candidate set, and a candidate nothing else references is collected
+    // unless the caller retained it. Every id here is referenced by this one
+    // row, which is the case the rollback path is about.
+    for (const id of messageAttachmentLinks.get(messageId) ?? []) {
+      if (!retained.includes(id)) {
+        collectedAttachmentIds.add(id);
+      }
+    }
+    messageAttachmentLinks.delete(messageId);
     return { segmentIds: [], deletedSummaryIds: [] };
   },
   // The echo path advances the snapshot anchor for a real-user turn; the
@@ -79,6 +137,8 @@ mock.module("../../persistence/conversation-crud.js", () => ({
 }));
 
 import { setConfig } from "../../__tests__/helpers/set-config.js";
+import { selectWinningProfile } from "../../config/llm-resolver.js";
+import { getConfig } from "../../config/loader.js";
 import { ABORT_WATCHDOG_MS } from "../../daemon/abort-watchdog.js";
 import { VOICE_ESCALATION_CONTINUATION_MESSAGE_KIND } from "../../plugin-api/constants.js";
 import { assistantEventHub } from "../../runtime/assistant-event-hub.js";
@@ -115,6 +175,9 @@ interface WaitForIdleCall {
 
 interface FakeConversation {
   conversationId: string;
+  /** Per-conversation profile pin an escalated leg follows; absent = none. */
+  inferenceProfile?: string | null;
+  inferenceProfileExpiresAt?: number | null;
   callSessionId: string | undefined;
   forcePromptSideEffects: boolean;
   currentRequestId: string | undefined;
@@ -132,6 +195,7 @@ interface FakeConversation {
     content: string;
     requestId: string;
     metadata?: Record<string, unknown>;
+    attachments?: Array<Record<string, unknown>>;
   }) => Promise<{ id: string }>;
   workingDir: string;
   addEventObserver: (observer: unknown) => () => void;
@@ -160,6 +224,10 @@ function makeFakeConversation(opts: {
   workingDir?: string;
   /** In-memory history the profile pin reads; undefined models a text-only call. */
   messages?: Array<{ role: string; content: unknown[] }>;
+  /** Per-conversation profile pin; undefined models an unpinned conversation. */
+  inferenceProfile?: string;
+  /** Expiry of that pin; a past stamp models a lapsed session pin. */
+  inferenceProfileExpiresAt?: number;
 }) {
   const waitForIdleCalls: WaitForIdleCall[] = [];
   const confirmationDecisions: Array<{ requestId: string; decision: string }> =
@@ -167,10 +235,21 @@ function makeFakeConversation(opts: {
   let clientCallback: ((msg: unknown) => Promise<void>) | undefined;
   let persistCount = 0;
   let lastPersistOpts:
-    | { content: string; requestId: string; metadata?: Record<string, unknown> }
+    | {
+        content: string;
+        requestId: string;
+        metadata?: Record<string, unknown>;
+        attachments?: Array<Record<string, unknown>>;
+      }
     | undefined;
   const conversation: FakeConversation = {
     conversationId: "conv-voice-bridge-test",
+    ...(opts.inferenceProfile !== undefined
+      ? { inferenceProfile: opts.inferenceProfile }
+      : {}),
+    ...(opts.inferenceProfileExpiresAt !== undefined
+      ? { inferenceProfileExpiresAt: opts.inferenceProfileExpiresAt }
+      : {}),
     // The workspace boundary the reach check compares paths against. A real
     // conversation always has one; without it the approval gate fails closed.
     workingDir: opts.workingDir ?? "/tmp/workspace-voice-bridge-test",
@@ -196,6 +275,14 @@ function makeFakeConversation(opts: {
     persistUserMessage: async (persistOpts) => {
       persistCount += 1;
       lastPersistOpts = persistOpts;
+      // The link rows the real persist writes, which is what makes an
+      // attachment a cleanup candidate when this message is deleted.
+      if (persistOpts.attachments && persistOpts.attachments.length > 0) {
+        messageAttachmentLinks.set(
+          `msg-${persistCount}`,
+          persistOpts.attachments.map((a) => a.id as string),
+        );
+      }
       // Recorded before `onPersist` so scripted persist FAILURES also
       // appear in the event stream — ordering tests need the losing
       // attempt visible.
@@ -249,6 +336,7 @@ interface FakeTurnState {
   assistantId: string | undefined;
   callSessionId: string | undefined;
   trustContext: unknown;
+  actorPrincipalId: string | undefined;
   commandIntent: unknown;
   turnChannelContext: unknown;
   turnInterfaceContext: unknown;
@@ -271,6 +359,8 @@ function wireTurnState(
   const conv = fake as FakeConversation & {
     assistantId?: string;
     trustContext?: unknown;
+    currentTurnSourceActorPrincipalId?: string;
+    currentTurnActorStampGeneration?: number;
     commandIntent?: unknown;
     channelCapabilities?: unknown;
     voiceCallControlPrompt?: string;
@@ -280,6 +370,22 @@ function wireTurnState(
   conv.assistantId = initial.assistantId;
   conv.callSessionId = initial.callSessionId;
   conv.trustContext = initial.trustContext;
+  // The real Conversation counts every write to the actor stamp behind an
+  // accessor (see `currentTurnActorStampGeneration`), which is what lets a
+  // turn tell its own stamp from a concurrent writer's. The fake counts them
+  // the same way, so the bridge's check is exercised here rather than being
+  // trivially true against a plain property.
+  let actorPrincipal = initial.actorPrincipalId;
+  conv.currentTurnActorStampGeneration = 0;
+  Object.defineProperty(conv, "currentTurnSourceActorPrincipalId", {
+    configurable: true,
+    get: () => actorPrincipal,
+    set: (value: string | undefined) => {
+      actorPrincipal = value;
+      conv.currentTurnActorStampGeneration =
+        (conv.currentTurnActorStampGeneration ?? 0) + 1;
+    },
+  });
   conv.commandIntent = initial.commandIntent;
   conv.channelCapabilities = initial.channelCapabilities;
   conv.voiceCallControlPrompt = initial.voiceCallControlPrompt;
@@ -313,6 +419,7 @@ function wireTurnState(
     assistantId: conv.assistantId,
     callSessionId: conv.callSessionId,
     trustContext: conv.trustContext,
+    actorPrincipalId: conv.currentTurnSourceActorPrincipalId,
     commandIntent: conv.commandIntent,
     turnChannelContext,
     turnInterfaceContext,
@@ -332,6 +439,7 @@ function makeWinnerState(): FakeTurnState {
     assistantId: "assistant-winner",
     callSessionId: "session-winner",
     trustContext: { sourceChannel: "imessage", trustClass: "trusted_contact" },
+    actorPrincipalId: "principal-winner",
     commandIntent: undefined,
     turnChannelContext: {
       userMessageChannel: "imessage",
@@ -390,6 +498,7 @@ describe("startVoiceTurn escalation-continuation persistence", () => {
     );
     expect(fake.lastPersistOpts()?.metadata).toEqual({
       voiceSessionTurn: true,
+      scripted: true,
       hidden: true,
       messageKind: VOICE_ESCALATION_CONTINUATION_MESSAGE_KIND,
     });
@@ -404,8 +513,11 @@ describe("startVoiceTurn escalation-continuation persistence", () => {
 
     await startVoiceTurn(makeTurnOptions()); // content: CALL_OPENING_MARKER
 
+    // Visible AND scripted: the opener is shown, but the assistant wrote it,
+    // so it is not the user taking a turn.
     expect(fake.lastPersistOpts()?.metadata).toEqual({
       voiceSessionTurn: true,
+      scripted: true,
     });
   });
 
@@ -425,6 +537,7 @@ describe("startVoiceTurn escalation-continuation persistence", () => {
     // analytics already read.
     expect(fake.lastPersistOpts()?.metadata).toEqual({
       voiceSessionTurn: true,
+      scripted: true,
       client: {
         voice: true,
         voice_session_id: "session-123",
@@ -444,8 +557,39 @@ describe("startVoiceTurn escalation-continuation persistence", () => {
 
     expect(fake.lastPersistOpts()?.metadata).toEqual({
       voiceSessionTurn: true,
+      scripted: true,
       client: { voice: true, voice_session_id: "session-123" },
     });
+  });
+
+  test("a turn the user really spoke is left unmarked, not marked false", async () => {
+    // Absent means UNKNOWN and falls through to the legacy classifier, which
+    // is the safe answer here. Stamping `false` would assert this turn was
+    // typed by the user, and a wrong `false` is trusted downstream.
+    const fake = makeFakeConversation({ processing: false });
+    fakeConversation = fake.conversation;
+
+    await startVoiceTurn({
+      ...makeTurnOptions(),
+      content: "what is on my calendar",
+    });
+
+    expect(fake.lastPersistOpts()?.metadata).not.toHaveProperty("scripted");
+  });
+
+  test("scripted is not derived from hidden", async () => {
+    // The two answer different questions, and the opener is the case that
+    // separates them: shown to the user, written by the assistant. Deriving
+    // one from the other lets every visible-but-scripted turn count as
+    // activation, which is the largest single source of funnel inflation.
+    const fake = makeFakeConversation({ processing: false });
+    fakeConversation = fake.conversation;
+
+    await startVoiceTurn(makeTurnOptions()); // content: CALL_OPENING_MARKER
+
+    const metadata = fake.lastPersistOpts()?.metadata;
+    expect(metadata?.scripted).toBe(true);
+    expect(metadata).not.toHaveProperty("hidden");
   });
 
   test("a phone turn carries no client bag", async () => {
@@ -457,6 +601,125 @@ describe("startVoiceTurn escalation-continuation persistence", () => {
     // Only live-voice sessions pass `voiceTelemetry`; a phone call has no
     // live-voice session id to attribute a turn to.
     expect(fake.lastPersistOpts()?.metadata).not.toHaveProperty("client");
+  });
+});
+
+describe("startVoiceTurn camera-frame attachments", () => {
+  test("hydrates parked ids onto the turn's own user message", async () => {
+    // The live-voice session parks an ambient camera frame and hands the id
+    // over; the row it lands on is the one carrying the user's words, so the
+    // picture and the sentence about it are one message.
+    const fake = makeFakeConversation({ processing: false });
+    fakeConversation = fake.conversation;
+
+    await startVoiceTurn({
+      ...makeTurnOptions(),
+      content: "what is this",
+      attachments: ["att-frame-1"],
+    });
+
+    expect(fake.lastPersistOpts()?.attachments).toEqual([
+      {
+        id: "att-frame-1",
+        filename: "att-frame-1.png",
+        mimeType: "image/png",
+        data: "ZnJhbWU=",
+      },
+    ]);
+    // `UserMessageAttachment` carries no metadata of its own, so which of a
+    // row's attachments were ambient frames is recorded on the message.
+    expect(fake.lastPersistOpts()?.metadata).toMatchObject({
+      voiceSessionTurn: true,
+      sightFrameAttachmentIds: ["att-frame-1"],
+    });
+  });
+
+  test("an id that resolves to nothing costs the caller no turn", async () => {
+    const fake = makeFakeConversation({ processing: false });
+    fakeConversation = fake.conversation;
+
+    await startVoiceTurn({
+      ...makeTurnOptions(),
+      content: "what is this",
+      attachments: ["att-missing"],
+    });
+
+    expect(fake.persistCount()).toBe(1);
+    expect(fake.lastPersistOpts()).not.toHaveProperty("attachments");
+    expect(fake.lastPersistOpts()?.metadata).not.toHaveProperty(
+      "sightFrameAttachmentIds",
+    );
+  });
+
+  test("a discarded turn leaves its camera frame attachable again", async () => {
+    // The hold verdict rolls the speculative turn back and the session parks
+    // the id again for the replay. The rollback deletes the row, and the row
+    // was the attachment's only reference, so without the retention the
+    // cleanup takes the frame with it and the replayed utterance speaks
+    // without the picture the user is holding up, with nothing said.
+    resetCrudLog();
+    const fake = makeFakeConversation({ processing: false });
+    fakeConversation = fake.conversation;
+
+    const handle = await startVoiceTurn({
+      ...makeTurnOptions(),
+      content: "what is this",
+      attachments: ["att-frame-1"],
+    });
+    expect(fake.lastPersistOpts()?.attachments).toHaveLength(1);
+
+    await handle.discard?.();
+
+    // The replay: the same parked id, and the row it lands on still carries
+    // the frame.
+    await startVoiceTurn({
+      ...makeTurnOptions(),
+      content: "what is this",
+      attachments: ["att-frame-1"],
+    });
+
+    expect(fake.lastPersistOpts()?.attachments).toEqual([
+      {
+        id: "att-frame-1",
+        filename: "att-frame-1.png",
+        mimeType: "image/png",
+        data: "ZnJhbWU=",
+      },
+    ]);
+    expect(fake.lastPersistOpts()?.metadata).toMatchObject({
+      sightFrameAttachmentIds: ["att-frame-1"],
+    });
+    // The rollback asked for exactly the ids its own row linked.
+    expect(crudLog.retained).toEqual([
+      { messageId: "msg-1", ids: ["att-frame-1"] },
+    ]);
+  });
+
+  test("a discard with no parked frame retains nothing", async () => {
+    resetCrudLog();
+    const fake = makeFakeConversation({ processing: false });
+    fakeConversation = fake.conversation;
+
+    const handle = await startVoiceTurn({
+      ...makeTurnOptions(),
+      content: "what is this",
+    });
+    await handle.discard?.();
+
+    expect(crudLog.deletes).toEqual(["msg-1"]);
+    expect(crudLog.retained).toEqual([{ messageId: "msg-1", ids: [] }]);
+  });
+
+  test("a turn with no parked frame persists exactly as before", async () => {
+    const fake = makeFakeConversation({ processing: false });
+    fakeConversation = fake.conversation;
+
+    await startVoiceTurn({ ...makeTurnOptions(), content: "what is this" });
+
+    expect(fake.lastPersistOpts()).not.toHaveProperty("attachments");
+    expect(fake.lastPersistOpts()?.metadata).toEqual({
+      voiceSessionTurn: true,
+    });
   });
 });
 
@@ -501,6 +764,7 @@ describe("startVoiceTurn hiddenSyntheticPrompt", () => {
     expect(fake.lastPersistOpts()?.content).toBe(SYNTHETIC_CONTENT);
     expect(fake.lastPersistOpts()?.metadata).toEqual({
       voiceSessionTurn: true,
+      scripted: true,
       hidden: true,
     });
     expect(echoes).toHaveLength(0);
@@ -578,6 +842,53 @@ describe("startVoiceTurn triage-and-escalate control prompt", () => {
     expect(installed()).toContain(escalatedContinuationRule());
   });
 
+  test("a direct escalated turn keeps the caller-supplied resume prompt verbatim", async () => {
+    const installed = captureInstalledPrompt();
+    await startVoiceTurn({
+      ...makeTurnOptions(),
+      voiceControlPrompt: LIVE_VOICE_PROMPT,
+      routingLeg: "escalated",
+      directEscalated: true,
+    });
+    expect(installed()).toBe(LIVE_VOICE_PROMPT);
+  });
+
+  test("the auto-built phone prompt carries the front-door rule anchored to the caller's words", async () => {
+    const installed = captureInstalledPrompt();
+    await startVoiceTurn({
+      ...makeTurnOptions(),
+      content: "what time is it",
+      routingLeg: "front-door",
+    });
+    expect(installed()).toContain("<voice_call_control>");
+    expect(installed()).toContain(
+      `13. ${frontDoorDecisionRule({ callerUtterance: "what time is it" })}`,
+    );
+  });
+
+  test("a phone sentinel anchors the front-door rule on its persisted form", async () => {
+    const installed = captureInstalledPrompt();
+    await startVoiceTurn({ ...makeTurnOptions(), routingLeg: "front-door" });
+    expect(installed()).toContain(
+      frontDoorDecisionRule({
+        callerUtterance: "(call connected — deliver opening greeting)",
+      }),
+    );
+    expect(installed()).not.toContain(JSON.stringify(CALL_OPENING_MARKER));
+  });
+
+  test("the auto-built phone prompt carries the escalated continuation rule", async () => {
+    const installed = captureInstalledPrompt();
+    await startVoiceTurn({
+      ...makeTurnOptions(),
+      routingLeg: "escalated",
+      spokenEscalationBridge: "One moment.",
+    });
+    expect(installed()).toContain(
+      `13. ${escalatedContinuationRule("One moment.")}`,
+    );
+  });
+
   test("leaves a caller-supplied prompt verbatim when no routing leg is set", async () => {
     const installed = captureInstalledPrompt();
     await startVoiceTurn({
@@ -596,7 +907,7 @@ describe("default call protocol numbered rules", () => {
     const installed = captureInstalledPrompt();
     await startVoiceTurn(makeTurnOptions());
     expect(installed()).toContain(
-      "12. Speak the caller's language: reply in the language of the caller's most recent actual speech, and follow them if they switch languages mid-call. Synthetic user turns (parenthetical markers like the call-connected and verification-completed notices) are not caller speech and never set the language. Before the caller has spoken, such as on the opening greeting turn, use the language the Task context implies, if any; otherwise default to English.",
+      "11. Speak the caller's language: reply in the language of the caller's most recent actual speech, and follow them if they switch languages mid-call. Synthetic user turns (parenthetical markers like the call-connected and verification-completed notices) are not caller speech and never set the language. Before the caller has spoken, such as on the opening greeting turn, use the language the Task context implies, if any; otherwise default to English.",
     );
   });
 
@@ -631,6 +942,26 @@ describe("default call protocol numbered rules", () => {
       expect(preSpeechLanguageRuleFragment(autoDetect, "deepgram")).toBe(
         "use the language the Task context implies, if any; otherwise default to English",
       );
+    }
+  });
+
+  test("the pre-speech pin reads the telephony role, not the global provider", async () => {
+    // Whisper ignores services.stt.language, so reading the global provider
+    // drops the pin and opens in English. The caller is transcribed by the
+    // telephony role's deepgram, which is listening in Spanish.
+    setConfig("services", {
+      stt: {
+        provider: "openai-whisper",
+        language: "es",
+        roles: { telephony: { provider: "deepgram" } },
+      },
+    });
+    try {
+      const installed = captureInstalledPrompt();
+      await startVoiceTurn(makeTurnOptions());
+      expect(installed()).toContain('configured listening language ("es")');
+    } finally {
+      setConfig("services", {});
     }
   });
 
@@ -1252,6 +1583,103 @@ describe("startVoiceTurn queued-message drain race", () => {
   });
 });
 
+describe("startVoiceTurn actor principal", () => {
+  // The turn's actor is what host proxies match connected desktop clients
+  // against (`pickSameUserAutoResolve`). A turn that carries none matches no
+  // client, so every computer-use call it makes is refused however healthy
+  // the connected client is.
+
+  test("stamps the caller's actor for the duration of the turn", async () => {
+    const statesAtPersist: FakeTurnState[] = [];
+    const fake = makeFakeConversation({
+      processing: false,
+      onPersist: () => {
+        statesAtPersist.push(readState());
+      },
+    });
+    const readState = wireTurnState(fake.conversation, {});
+    fakeConversation = fake.conversation;
+
+    await startVoiceTurn({
+      ...makeTurnOptions(undefined, "conv-actor-stamp"),
+      actorPrincipalId: "principal-guardian",
+    });
+
+    expect(statesAtPersist.length).toBe(1);
+    expect(statesAtPersist[0]!.actorPrincipalId).toBe("principal-guardian");
+  });
+
+  /**
+   * A phone caller is whoever dialled in. Resolving them to a desktop client
+   * would hand an inbound caller the owner's machine, so the telephony path
+   * passes no actor and the turn must not invent one.
+   */
+  test("a turn with no caller actor leaves the conversation without one", async () => {
+    const statesAtPersist: FakeTurnState[] = [];
+    const fake = makeFakeConversation({
+      processing: false,
+      onPersist: () => {
+        statesAtPersist.push(readState());
+      },
+    });
+    const readState = wireTurnState(fake.conversation, {});
+    fakeConversation = fake.conversation;
+
+    await startVoiceTurn(makeTurnOptions(undefined, "conv-actor-absent"));
+
+    expect(statesAtPersist.length).toBe(1);
+    expect(statesAtPersist[0]!.actorPrincipalId).toBeUndefined();
+  });
+
+  /** The stamp is the turn's, so it goes when the turn does. */
+  test("releases the actor when the turn ends", async () => {
+    const fake = makeFakeConversation({ processing: false });
+    const readState = wireTurnState(fake.conversation, {});
+    fakeConversation = fake.conversation;
+
+    const handle = await startVoiceTurn({
+      ...makeTurnOptions(undefined, "conv-actor-release"),
+      actorPrincipalId: "principal-guardian",
+    });
+    handle.abort();
+    await flushMicrotasks();
+
+    expect(readState().actorPrincipalId).toBeUndefined();
+  });
+
+  /**
+   * The release is not unconditional. `runAgentLoopImpl` gives up the
+   * processing claim before the turn-boundary commit is awaited, so a retry
+   * can take the conversation and stamp its own actor while this turn is
+   * still unwinding. The retry route installs no auth-context fallback, so a
+   * clear on the way out would leave it with no actor at all and its
+   * host-proxy calls refused.
+   */
+  test("does not clear an actor another turn stamped while this one unwound", async () => {
+    let conv: { currentTurnSourceActorPrincipalId?: string } | null = null;
+    const fake = makeFakeConversation({
+      processing: false,
+      runAgentLoop: async () => {
+        conv!.currentTurnSourceActorPrincipalId = "principal-retry";
+      },
+    });
+    conv = fake.conversation as {
+      currentTurnSourceActorPrincipalId?: string;
+    };
+    const readState = wireTurnState(fake.conversation, {});
+    fakeConversation = fake.conversation;
+
+    const handle = await startVoiceTurn({
+      ...makeTurnOptions(undefined, "conv-actor-release-guard"),
+      actorPrincipalId: "principal-guardian",
+    });
+    handle.abort();
+    await flushMicrotasks();
+
+    expect(readState().actorPrincipalId).toBe("principal-retry");
+  });
+});
+
 describe("startVoiceTurn race-loss state restore", () => {
   // A busy persist means a concurrent turn (the lock winner) is running with
   // per-turn state it installed. Every race-loss path must put the winner's
@@ -1308,6 +1736,54 @@ describe("startVoiceTurn race-loss state restore", () => {
       assistantMessageInterface: "phone",
     });
     expect(retryState.voiceCallControlPrompt).toContain("voice_call_control");
+  });
+
+  /**
+   * The winner here is an ordinary message turn, which stamps the actor
+   * directly (`conversation-routes`, `conversation-process`) rather than
+   * through this bridge. It shares the guardian, so it writes the identical
+   * string this turn did and the field cannot say which of them wrote it.
+   * Reverting on that would hand the winner a principal from an earlier turn,
+   * and automatic host-client resolution would then go looking for that other
+   * principal's desktop.
+   */
+  test("an ordinary turn's actor stamp is not reverted by a losing voice turn", async () => {
+    const statesDuringWait: FakeTurnState[] = [];
+    const fake = makeFakeConversation({
+      processing: false,
+      waitForIdle: async () => {
+        statesDuringWait.push(readState());
+        fake.setProcessingFlag(false);
+        return true;
+      },
+      onPersist: (attempt) => {
+        if (attempt === 1) {
+          // The winner takes the conversation and stamps the same guardian,
+          // the way an ordinary turn does: a direct write, counted but
+          // otherwise invisible to this bridge.
+          (
+            fake.conversation as { currentTurnSourceActorPrincipalId?: string }
+          ).currentTurnSourceActorPrincipalId = "principal-guardian";
+          fake.setProcessingFlag(true);
+          throw new Error("Conversation is already processing a message");
+        }
+      },
+    });
+    // What an earlier turn left resident, and what a value-based revert would
+    // wrongly put back.
+    const readState = wireTurnState(fake.conversation, {
+      actorPrincipalId: "principal-other",
+    });
+    fakeConversation = fake.conversation;
+
+    await startVoiceTurn({
+      ...makeTurnOptions(undefined, "conv-race-ordinary-winner"),
+      callSessionId: "session-voice-loser",
+      actorPrincipalId: "principal-guardian",
+    });
+
+    expect(statesDuringWait.length).toBe(1);
+    expect(statesDuringWait[0]!.actorPrincipalId).toBe("principal-guardian");
   });
 
   test("a busy persist whose retry wait exhausts the budget leaves the winner's values in place", async () => {
@@ -1501,7 +1977,7 @@ describe("startVoiceTurn tool-event forwarding", () => {
     fakeConversation = fake.conversation;
   }
 
-  test("tool_use_start delivers the tool name, toolUseId, and input", async () => {
+  test("tool_use_start delivers the tool name, input, and active allowlist", async () => {
     makeEventEmittingConversation([
       {
         type: "tool_use_start",
@@ -1510,6 +1986,11 @@ describe("startVoiceTurn tool-event forwarding", () => {
         toolUseId: "toolu-1",
       },
     ]);
+    (
+      fakeConversation as typeof fakeConversation & {
+        allowedToolNames?: Set<string>;
+      }
+    ).allowedToolNames = new Set(["web_search"]);
 
     const starts: Array<{ toolName: string; detail?: unknown }> = [];
     await startVoiceTurn({
@@ -1523,7 +2004,11 @@ describe("startVoiceTurn tool-event forwarding", () => {
     expect(starts).toEqual([
       {
         toolName: "web_search",
-        detail: { toolUseId: "toolu-1", input: { query: "weather" } },
+        detail: {
+          toolUseId: "toolu-1",
+          input: { query: "weather" },
+          allowedToolNames: new Set(["web_search"]),
+        },
       },
     ]);
   });
@@ -1678,6 +2163,68 @@ describe("front-door leg tool suppression", () => {
       expect(depthDuringLoop).toBe(0);
       expect(fake.conversation.toolsDisabledDepth).toBe(0);
     }
+  });
+});
+
+describe("desktop skill preactivation", () => {
+  async function preactivatedFor(turn: Record<string, unknown>): Promise<{
+    skillIds: string[];
+    proxyInterfaces: unknown[];
+    skillIdsDuringLoop: string[];
+  }> {
+    const skillIds: string[] = [];
+    const proxyInterfaces: unknown[] = [];
+    let skillIdsDuringLoop: string[] = [];
+    const fake = makeFakeConversation({
+      processing: false,
+      runAgentLoop: async () => {
+        skillIdsDuringLoop = [...skillIds];
+      },
+    });
+    Object.assign(fake.conversation, {
+      addPreactivatedSkillId: (id: string) => {
+        skillIds.push(id);
+      },
+      ensureHostProxiesForTurn: (sourceInterface: unknown) => {
+        proxyInterfaces.push(sourceInterface);
+      },
+    });
+    fakeConversation = fake.conversation;
+
+    await startVoiceTurn({
+      ...makeTurnOptions(undefined, "conv-desktop-skills"),
+      userMessageInterface: "macos",
+      ...turn,
+    });
+    await flushMicrotasks();
+    return { skillIds, proxyInterfaces, skillIdsDuringLoop };
+  }
+
+  test("an escalated leg of a macOS desktop session starts with computer use active", async () => {
+    const result = await preactivatedFor({
+      routingLeg: "escalated",
+      macosDesktopSession: true,
+    });
+
+    expect(result.skillIdsDuringLoop).toContain("computer-use");
+    expect(result.proxyInterfaces).toEqual(["macos"]);
+  });
+
+  test("a session from any other client leaves the desktop skills to be loaded", async () => {
+    const result = await preactivatedFor({ routingLeg: "escalated" });
+
+    expect(result.skillIds).toEqual([]);
+    expect(result.proxyInterfaces).toEqual([]);
+  });
+
+  test("the toolless front-door leg is never preactivated", async () => {
+    const result = await preactivatedFor({
+      routingLeg: "front-door",
+      macosDesktopSession: true,
+    });
+
+    expect(result.skillIds).toEqual([]);
+    expect(result.proxyInterfaces).toEqual([]);
   });
 });
 
@@ -2048,6 +2595,25 @@ describe("transcript hygiene (teardown pass)", () => {
     expect(events).toContain("loadFromDb");
   });
 
+  test("a row ending with a session control marker persists with it stripped", async () => {
+    const { events } = makeReservedRowConversation();
+    getMessageByIdImpl = () =>
+      makeRow("Muting you for thirty seconds. [MUTE:30]");
+
+    await startVoiceTurn({ ...makeTurnOptions(), routingLeg: "front-door" });
+    await flushMicrotasks();
+
+    expect(crudLog.updates).toEqual([
+      {
+        messageId: "assistant-row-1",
+        content: JSON.stringify([
+          { type: "text", text: "Muting you for thirty seconds." },
+        ]),
+      },
+    ]);
+    expect(events).toContain("loadFromDb");
+  });
+
   test("a mid-text [-1] (content, not command) leaves the row untouched", async () => {
     const { events } = makeReservedRowConversation();
     getMessageByIdImpl = () =>
@@ -2178,19 +2744,19 @@ describe("transcript hygiene (teardown pass)", () => {
   });
 });
 
-describe("startVoiceTurn image-bearing profile pin", () => {
-  /** A persisted user message carrying a photo taken mid-call. */
-  const PHOTO_HISTORY = [
-    { role: "user", content: [{ type: "text", text: "here's a photo:" }] },
-    {
-      role: "user",
-      content: [
-        { type: "text", text: "here's a photo:" },
-        { type: "image", source: { type: "base64", data: "abc" } },
-      ],
-    },
-  ];
+/** A persisted user message carrying a photo taken mid-call. */
+const PHOTO_HISTORY = [
+  { role: "user", content: [{ type: "text", text: "here's a photo:" }] },
+  {
+    role: "user",
+    content: [
+      { type: "text", text: "here's a photo:" },
+      { type: "image", source: { type: "base64", data: "abc" } },
+    ],
+  },
+];
 
+describe("startVoiceTurn image-bearing profile pin", () => {
   beforeEach(() => {
     pinProfileSupportsVision = true;
   });
@@ -2277,5 +2843,190 @@ describe("startVoiceTurn image-bearing profile pin", () => {
     });
 
     expect(runOptions.overrideProfile).toBe("quality-optimized");
+  });
+});
+
+describe("startVoiceTurn escalated-leg profile pin", () => {
+  beforeEach(() => {
+    pinProfileSupportsVision = true;
+    conversationProfileSupportsVision = true;
+  });
+
+  afterEach(() => {
+    setConfig("llm", {});
+  });
+
+  async function runOptionsFor(opts: {
+    messages?: Array<{ role: string; content: unknown[] }>;
+    inferenceProfile?: string;
+    inferenceProfileExpiresAt?: number;
+    turn?: Record<string, unknown>;
+  }): Promise<Record<string, unknown>> {
+    const fake = makeFakeConversation({
+      processing: false,
+      ...(opts.messages ? { messages: opts.messages } : {}),
+      ...(opts.inferenceProfile
+        ? { inferenceProfile: opts.inferenceProfile }
+        : {}),
+      ...(opts.inferenceProfileExpiresAt !== undefined
+        ? { inferenceProfileExpiresAt: opts.inferenceProfileExpiresAt }
+        : {}),
+    });
+    fakeConversation = fake.conversation;
+    let runOptions: Record<string, unknown> = {};
+    fake.conversation.runAgentLoop = async (...args: unknown[]) => {
+      runOptions = args[2] as Record<string, unknown>;
+    };
+    await startVoiceTurn({
+      ...makeTurnOptions(),
+      routingLeg: "escalated",
+      ...(opts.turn ?? {}),
+    });
+    return runOptions;
+  }
+
+  test("with no chat-model selection the leg keeps the call-site profile", async () => {
+    const runOptions = await runOptionsFor({});
+
+    expect(runOptions.callSite).toBe("callAgent");
+    expect(runOptions.overrideProfile).toBeUndefined();
+    expect(runOptions.forceOverrideProfile).toBeUndefined();
+  });
+
+  test("the workspace chat-model selection pins the leg", async () => {
+    // `callAgent`'s chain never consults `llm.activeProfile`, so without the
+    // pin the hand-off would land on the site's shipped default while the
+    // same conversation's typed turns run on the user's pick.
+    setConfig("llm", { activeProfile: "quality-optimized" });
+
+    const runOptions = await runOptionsFor({});
+
+    expect(runOptions.callSite).toBe("callAgent");
+    expect(runOptions.overrideProfile).toBe("quality-optimized");
+    expect(runOptions.forceOverrideProfile).toBe(true);
+  });
+
+  test("the conversation's own pin wins over the workspace selection", async () => {
+    setConfig("llm", { activeProfile: "quality-optimized" });
+
+    const runOptions = await runOptionsFor({
+      inferenceProfile: "cost-optimized",
+    });
+
+    expect(runOptions.overrideProfile).toBe("cost-optimized");
+    expect(runOptions.forceOverrideProfile).toBe(true);
+  });
+
+  test("a lapsed conversation pin falls back to the workspace selection", async () => {
+    setConfig("llm", { activeProfile: "quality-optimized" });
+
+    const runOptions = await runOptionsFor({
+      inferenceProfile: "cost-optimized",
+      inferenceProfileExpiresAt: Date.now() - 1,
+    });
+
+    expect(runOptions.overrideProfile).toBe("quality-optimized");
+  });
+
+  test("only the escalated leg follows the conversation", async () => {
+    setConfig("llm", { activeProfile: "quality-optimized" });
+
+    const frontDoor = await runOptionsFor({
+      turn: { routingLeg: "front-door" },
+    });
+    expect(frontDoor.callSite).toBe("voiceFrontDoor");
+    expect(frontDoor.overrideProfile).toBeUndefined();
+
+    const unrouted = await runOptionsFor({ turn: { routingLeg: undefined } });
+    expect(unrouted.callSite).toBe("callAgent");
+    expect(unrouted.overrideProfile).toBeUndefined();
+  });
+
+  test("an image stays on a conversation profile whose model takes it", async () => {
+    setConfig("llm", { activeProfile: "quality-optimized" });
+
+    const runOptions = await runOptionsFor({ messages: PHOTO_HISTORY });
+
+    expect(runOptions.overrideProfile).toBe("quality-optimized");
+  });
+
+  test("an image hands a text-only conversation profile to the image pin", async () => {
+    // A model that rejects the image fails the whole leg, so the image pin
+    // outranks the conversation's choice for this one turn.
+    setConfig("llm", { activeProfile: "quality-optimized" });
+    conversationProfileSupportsVision = false;
+
+    const runOptions = await runOptionsFor({ messages: PHOTO_HISTORY });
+
+    expect(runOptions.overrideProfile).toBe("latency-optimized");
+    expect(runOptions.forceOverrideProfile).toBe(true);
+  });
+
+  test("an image with no image-capable profile anywhere keeps the conversation profile", async () => {
+    setConfig("llm", { activeProfile: "quality-optimized" });
+    conversationProfileSupportsVision = false;
+    pinProfileSupportsVision = false;
+
+    const runOptions = await runOptionsFor({ messages: PHOTO_HISTORY });
+
+    expect(runOptions.overrideProfile).toBe("quality-optimized");
+  });
+
+  test("an explicit routing pin wins over the conversation profile", async () => {
+    setConfig("llm", { activeProfile: "quality-optimized" });
+
+    const runOptions = await runOptionsFor({
+      turn: { overrideProfile: "balanced" },
+    });
+
+    expect(runOptions.overrideProfile).toBe("balanced");
+  });
+
+  test("a mix is judged by the arm serving this conversation, not by any arm", async () => {
+    // A mix reads as vision-capable when any arm is, but dispatch expands it
+    // to one arm from the conversation seed. Only that arm's model sees the
+    // image, so only that arm's capability decides whether the image pin
+    // takes over. The pin itself stays the mix's own name, so dispatch lands
+    // on the same arm.
+    const llm = {
+      activeProfile: "voice-mix",
+      profiles: {
+        "voice-mix": {
+          mix: [
+            { profile: "quality-optimized", weight: 1 },
+            { profile: "cost-optimized", weight: 1 },
+          ],
+        },
+      },
+    };
+    setConfig("llm", llm);
+    let chosenArm: string | undefined;
+    selectWinningProfile("mainAgent", getConfig().llm, {
+      selectionSeed: "conv-voice-bridge-test",
+      onMixSelected: ({ chosenProfile }) => {
+        chosenArm = chosenProfile;
+      },
+    });
+    expect(chosenArm).toBeDefined();
+    const otherArm =
+      chosenArm === "quality-optimized"
+        ? "cost-optimized"
+        : "quality-optimized";
+    try {
+      // Only the unchosen arm takes images: judged as "any arm", the mix
+      // would keep the pin off and the image would reach a text-only model.
+      visionByProfile.set(chosenArm!, false);
+      visionByProfile.set(otherArm, true);
+      const textOnlyArm = await runOptionsFor({ messages: PHOTO_HISTORY });
+      expect(textOnlyArm.overrideProfile).toBe("latency-optimized");
+
+      // Only the chosen arm takes images: no pin needed, the mix stands.
+      visionByProfile.set(chosenArm!, true);
+      visionByProfile.set(otherArm, false);
+      const visionArm = await runOptionsFor({ messages: PHOTO_HISTORY });
+      expect(visionArm.overrideProfile).toBe("voice-mix");
+    } finally {
+      visionByProfile.clear();
+    }
   });
 });

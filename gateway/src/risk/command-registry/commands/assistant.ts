@@ -1,3 +1,5 @@
+import { CHANNEL_BOT_PROVIDER } from "@vellumai/service-contracts/channels";
+
 import type {
   ArgRule,
   CommandRiskSpec,
@@ -14,6 +16,8 @@ import type {
 const ASSISTANT_SUPPORTED_COMMAND_PATHS = [
   "apps",
   "apps list",
+  "apps inspect",
+  "apps refresh",
   "attachment",
   "attachment register",
   "attachment lookup",
@@ -77,6 +81,8 @@ const ASSISTANT_SUPPORTED_COMMAND_PATHS = [
   "channels",
   "channels list",
   "channels get",
+  "channels request",
+  "channels send",
   "clients",
   "clients disconnect",
   "clients list",
@@ -91,7 +97,12 @@ const ASSISTANT_SUPPORTED_COMMAND_PATHS = [
   "contacts list",
   "contacts get",
   "contacts prompt",
+  "contacts create",
+  "contacts update",
+  "contacts delete",
+  "contacts merge",
   "contacts channels",
+  "contacts channels add",
   "contacts channels update-status",
   "contacts invites",
   "contacts invites list",
@@ -230,6 +241,7 @@ const ASSISTANT_SUPPORTED_COMMAND_PATHS = [
   "oauth request",
   "oauth disconnect",
   "oauth token",
+  "oauth proxy-url",
   "platform",
   "platform connect",
   "platform status",
@@ -248,6 +260,14 @@ const ASSISTANT_SUPPORTED_COMMAND_PATHS = [
   "monitoring stop",
   "monitoring status",
   "ps",
+  "roadmap",
+  "roadmap list",
+  "roadmap get",
+  "roadmap create",
+  "roadmap update",
+  "roadmap delete",
+  "roadmap upvote",
+  "roadmap unvote",
   "routes",
   "routes list",
   "routes inspect",
@@ -441,6 +461,11 @@ const riskOverrides: AssistantRiskOverride[] = [
 
   // Mutating assistant state / external side effects
   { path: "attachment register", risk: "medium" },
+  {
+    path: "apps refresh",
+    risk: "medium",
+    reason: "Compiles workspace app source and refreshes open surfaces",
+  },
   { path: "avatar generate", risk: "low" },
   { path: "avatar set", risk: "low" },
   { path: "avatar remove", risk: "low" },
@@ -459,6 +484,21 @@ const riskOverrides: AssistantRiskOverride[] = [
   { path: "channel-verification-sessions revoke", risk: "low" },
   { path: "config set", risk: "low" },
   { path: "contacts prompt", risk: "medium" },
+  // Each opens a form in the guardian's app and writes only what they submit,
+  // so the guardian is in the loop regardless of this level. The levels below
+  // still describe the command itself: create and update are non-destructive
+  // edits, while a delete takes the contact's channels with it and cannot be
+  // undone.
+  { path: "contacts create", risk: "medium" },
+  { path: "contacts update", risk: "medium" },
+  { path: "contacts delete", risk: "high" },
+  {
+    path: "contacts merge",
+    risk: "high",
+    reason:
+      "Permanently deletes the donor contact record, the same irreversible write that makes 'contacts delete' high. Its channels move to the survivor, so nobody loses access, but a policy that gates high operations should gate this one.",
+  },
+  { path: "contacts channels add", risk: "medium" },
   { path: "contacts channels update-status", risk: "medium" },
   { path: "contacts invites create", risk: "high" },
   { path: "contacts invites revoke", risk: "medium" },
@@ -480,6 +520,33 @@ const riskOverrides: AssistantRiskOverride[] = [
   { path: "email unregister", risk: "medium" },
   { path: "email send", risk: "high" },
   { path: "image-generation generate", risk: "medium" },
+  {
+    path: "roadmap create",
+    risk: "high",
+    reason:
+      "Publishes an item on the public Vellum roadmap under the assistant's name and notifies Vellum staff",
+  },
+  {
+    path: "roadmap update",
+    risk: "medium",
+    reason: "Edits a publicly visible roadmap item",
+  },
+  {
+    path: "roadmap delete",
+    risk: "high",
+    reason: "Permanently removes a publicly visible roadmap item",
+  },
+  {
+    path: "roadmap upvote",
+    risk: "medium",
+    reason: "Casts a publicly visible vote attributed to the assistant",
+  },
+  {
+    path: "roadmap unvote",
+    risk: "medium",
+    reason:
+      "Withdraws a publicly visible vote, changing state the roadmap shows to everyone",
+  },
   { path: "inference send", risk: "medium" },
   {
     path: "inference models list",
@@ -775,6 +842,18 @@ const riskOverrides: AssistantRiskOverride[] = [
     reason: "Makes authenticated OAuth request",
   },
   {
+    path: "channels request",
+    risk: "high",
+    reason:
+      "Acts as the channel's bot with any effect the bot's API allows (sends, edits, deletes, uploads, reactions, as well as reads); the effect is the endpoint's, which the command cannot tell apart",
+  },
+  {
+    path: "channels send",
+    risk: "high",
+    reason:
+      "Posts a message people will read, as the assistant's bot, which nobody can take back; the same effect as the messaging tool's send, which carries the same rating",
+  },
+  {
     path: "oauth connect",
     risk: "low",
     reason: "Creates OAuth connection",
@@ -788,6 +867,12 @@ const riskOverrides: AssistantRiskOverride[] = [
   { path: "oauth providers update", risk: "medium" },
   { path: "oauth providers delete", risk: "medium" },
   { path: "oauth apps delete", risk: "medium" },
+  {
+    path: "oauth proxy-url",
+    risk: "medium",
+    reason:
+      "Mints a scoped, expiring grant a third-party CLI presents to reach a provider API through the passthrough proxy",
+  },
   { path: "platform connect", risk: "low" },
   { path: "platform disconnect", risk: "medium" },
   { path: "platform callback-routes register", risk: "low" },
@@ -923,6 +1008,34 @@ const oauthModeArgRules: ArgRule[] = [
   },
 ];
 getExistingPath(spec, "oauth mode").argRules = oauthModeArgRules;
+
+// `oauth request` is medium-risk as an authenticated request through a
+// person's OAuth integration, but the same door reaches a channel's bot when
+// `--provider` names a bot credential, and acting as the bot carries every
+// effect the bot's API allows. That form is high, like `channels request`.
+// The bot provider keys come from the channel contract, never a list kept
+// here, so a channel that gains a bot credential is covered by joining the
+// contract's map.
+const botProviderKeyPattern = Object.values(CHANNEL_BOT_PROVIDER)
+  .map((key) => key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+  .join("|");
+const oauthRequestArgRules: ArgRule[] = [
+  {
+    id: "assistant-oauth-request:bot-provider",
+    flags: ["--provider"],
+    valuePattern: `^(${botProviderKeyPattern})$`,
+    risk: "high",
+    reason:
+      "Acts as a channel's bot through the OAuth request door, with every effect the bot's API allows",
+  },
+];
+const oauthRequestNode = getExistingPath(spec, "oauth request");
+oauthRequestNode.argRules = oauthRequestArgRules;
+// `--provider` consumes the next token as a value; so do the account
+// selectors, so the arg parser pairs every value flag correctly.
+oauthRequestNode.argSchema = {
+  valueFlags: ["--provider", "--account", "--client-id"],
+};
 
 const assistantBashArgRules: ArgRule[] = [
   {

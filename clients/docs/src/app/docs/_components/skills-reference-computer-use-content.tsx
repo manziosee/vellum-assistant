@@ -22,9 +22,9 @@ export function SkillsReferenceComputerUseContent() {
             What it does
           </SectionHeading>
           <p className="mb-0 text-zinc-600">
-            Controls your Mac directly &mdash; observes the screen via accessibility APIs and
-            screenshots, clicks, types, scrolls, drags, opens apps, and runs AppleScript. Your
-            assistant&apos;s hands and eyes on your desktop.
+            Controls a connected desktop directly. It observes the screen through accessibility
+            APIs and screenshots, then clicks, types, and scrolls. Some actions depend on the
+            desktop operating system.
           </p>
         </section>
 
@@ -33,7 +33,8 @@ export function SkillsReferenceComputerUseContent() {
             Setup required
           </SectionHeading>
           <p className="mb-0 text-zinc-600">
-            None (built into the macOS app). Requires macOS system permissions.
+            None (built into the desktop app). The app will request the operating-system permissions
+            it needs.
           </p>
         </section>
 
@@ -43,7 +44,7 @@ export function SkillsReferenceComputerUseContent() {
           </SectionHeading>
           <ul className="mb-0 list-disc space-y-2 pl-6 text-zinc-600">
             <li>Accessibility (mouse/keyboard control)</li>
-            <li>Screen Recording (seeing screen content)</li>
+            <li>Screen capture (seeing screen content)</li>
             <li>Each action is prompted individually for approval</li>
           </ul>
         </section>
@@ -67,7 +68,7 @@ export function SkillsReferenceComputerUseContent() {
               <tbody className="[&>tr:nth-child(even)]:bg-zinc-50">
                 <tr>
                   <td className="px-3 py-2">
-                    &ldquo;Open Safari and go to my bank&apos;s website&rdquo;
+                    &ldquo;Open my browser and go to my bank&apos;s website&rdquo;
                   </td>
                   <td className="px-3 py-2">
                     Opens app and navigates
@@ -138,8 +139,8 @@ export function SkillsReferenceComputerUseContent() {
           <ul className="mb-0 list-disc space-y-2 pl-6 text-zinc-600">
             <li>
               <strong>Accessibility tree + screenshots.</strong> The assistant reads the
-              accessibility tree (same API screen readers use) AND takes screenshots for a complete
-              picture.
+              accessibility tree (same API screen readers use) on every step and takes a screenshot
+              after each action, so it can see what the action did.
             </li>
             <li>
               <strong>Element-based clicking.</strong> It prefers clicking by element name rather
@@ -149,11 +150,52 @@ export function SkillsReferenceComputerUseContent() {
               <strong>Session caps.</strong> Sessions are capped at 50 steps with loop detection.
             </li>
             <li>
-              <strong>macOS only.</strong> Computer use is macOS only &mdash; not available on other channels.
+              <strong>Platform differences.</strong> Dragging, opening apps by name, and AppleScript
+              are available on macOS. Windows exposes only actions its desktop helper supports, so
+              unsupported tools are not offered to the assistant.
             </li>
             <li>
-              <strong>Screen visibility.</strong> Be mindful of what&apos;s visible on screen
-              &mdash; screenshots are sent to the AI model.
+              <strong>Scripting first on macOS.</strong> When an app can be driven by AppleScript,
+              the assistant runs a script instead of moving your pointer. It asks the app&apos;s
+              own scripting commands for what it wants where the app has them, falls back to
+              clicking menus by script where it does not, and clicks and types only for what a
+              script cannot reach.
+            </li>
+            <li>
+              <strong>Typing is not sending.</strong> Asked to type or draft a message, the
+              assistant types it and stops before pressing Enter. It sends only when asked to.
+            </li>
+            <li>
+              <strong>Your pointer comes back on macOS.</strong> The pointer stays where the
+              assistant last clicked while it works, so controls that only show on hover keep
+              working. It returns to where you left it when the task ends, unless you have
+              already moved it.
+            </li>
+            <li>
+              <strong>Batched actions on macOS.</strong> When the assistant already knows several
+              steps, such as opening a window, typing a URL, and pressing Enter, it can run them
+              in one step and look at the screen once afterward. It stops at the first action
+              that fails. This needs a desktop app that supports batched actions.
+            </li>
+            <li>
+              <strong>Single-window observations on macOS.</strong> The observe tool accepts
+              <code> capture_window_id</code>, a current native CGWindowID, not a browser tab
+              or accessibility element ID. It captures only that window and its accessibility
+              tree, even behind another app, without secondary windows or a desktop fallback.
+              A compatible desktop app must explicitly advertise window-capture support;
+              older or unsupported clients are rejected before capture.
+            </li>
+            <li>
+              <strong>Observation-only scope.</strong> Window selection applies to one observe
+              call, not the whole session: later click, type, and scroll actions still return
+              normal desktop observations. Selection does not focus the window or restrict
+              later input to it. Cropped screenshot coordinates are window-relative, not
+              full-display coordinates; prefer accessibility element IDs and focus the
+              intended window before acting.
+            </li>
+            <li>
+              <strong>Screen visibility.</strong> Be mindful of what&apos;s visible on screen.
+              Screenshots are sent to the AI model.
             </li>
           </ul>
         </section>

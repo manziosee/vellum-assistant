@@ -1,6 +1,6 @@
 ---
 name: slack
-description: Read, send, and manage Slack messages via the Web API
+description: Send, read, and manage Slack messages
 compatibility: "Designed for Vellum personal assistants"
 metadata:
   icon: assets/icon.svg
@@ -10,7 +10,32 @@ metadata:
     display-name: "Slack"
 ---
 
-You help users interact with their Slack workspace. All Slack operations use the **Slack Web API** directly via `assistant oauth request --provider slack_channel` -- there are no dedicated Slack tools. Use relative Slack API method paths such as `/chat.postMessage`; the provider supplies the Slack host.
+You help users interact with their Slack workspace.
+
+**Sending text is its own command: `assistant channels send`.** It posts through the same path a reply takes, so the message is threaded where you name a thread, rendered the way your other messages are, and recorded in the chat's conversation once Slack acknowledges it. That record is what lets you see later what you said, and what lets a reaction or an edit on that post find it again.
+
+**Everything else is the Slack Web API, through one of two doors.** As the assistant's own bot: `assistant channels request slack <path>`, which resolves the bot credential from the channel so you never name a provider (`assistant oauth request --provider slack_channel` is the same bot door under its provider name). As the person who connected the `slack` integration: `assistant oauth request --provider slack <path>`, for `search.messages` and anything that needs the installer's reach. Reading, reactions, opening a DM, uploading a file, and any method with no first-class command go through them. Use relative Slack API method paths such as `/conversations.history`; the provider supplies the Slack host.
+
+A message posted with `/chat.postMessage` reaches Slack but is not recorded in the chat's conversation, so `recall` will not find it (reading Slack back will) and nothing can resolve a reaction to it. Use the send command for text, and reach for `chat.postMessage` only for a shape the send command does not carry, such as Block Kit.
+
+**In a Slack turn, the reply is the door.** When you are already answering in a chat, just reply; that reply is delivered and recorded for you. The send command is for posting somewhere you are not, or at a time nobody asked.
+
+## Which provider to pass
+
+Two Slack credentials can exist. They act as different identities and reach different things, so the right one depends on the operation, not only on which is configured.
+
+| Provider        | Sends                      | Acts as       | Reaches                                           |
+| --------------- | -------------------------- | ------------- | ------------------------------------------------- |
+| `slack_channel` | the bot token              | the assistant | channels the bot has joined                       |
+| `slack`         | the installer's user token | that person   | channels that person is in, and `search.messages` |
+
+**Posting: `slack_channel`.** The send command always posts as the bot, which is the assistant's own identity, and takes no provider. The distinction still matters for a Web API post: a message sent through `slack` arrives from the person who connected it, not from the assistant. Where that is the only credential present, say so before posting rather than posting as them silently.
+
+**`search.messages`: `slack` only.** It is a user-token method. `--provider slack_channel` sends the bot token even on an install that stored a user token, so it cannot serve search at all.
+
+**Everything else: whichever is present**, preferring `slack_channel` when both are. Reach differs rather than one being better: the bot sees channels it was invited to, the user token sees channels that person belongs to.
+
+A workspace has only `slack` when Slack was connected as an integration without running the setup wizard, which means no bot. `oauth status <provider>` reports whether a given one holds a connection. Passing a provider that holds none fails with a not-configured error rather than falling back on its own.
 
 ## Resolution Scripts
 
@@ -29,29 +54,36 @@ All scripts return JSON:
 
 The cache is stored locally under `$VELLUM_WORKSPACE_DIR/data/slack-skill/`. On first use the script fetches all channels/users from Slack and caches them. Subsequent lookups read from the cache with no API calls. Pass `--refresh` to force a refresh.
 
+## Sending a message
+
+The send command names the channel, the chat, and the text. It takes no provider and no token.
+
+```bash
+assistant channels send slack C0123456789 --text "Hello from the assistant!"
+```
+
+Add `--thread <ts>` to post inside a thread, `--plain` to send the text verbatim instead of the channel's rich rendering, and `--json` for a machine-readable result naming every message id Slack acknowledged, plus the conversation the post was recorded in when a record was written.
+
+The command refuses a channel it cannot address before anything is sent, and reports a failure rather than a success when Slack does not acknowledge the post. If it reports that the outcome is unknown, the message may still have gone out: check the chat before sending again.
+
 ## Making Slack API Calls
 
-Use `assistant oauth request --provider slack_channel` to call any Slack Web API method. Auth is handled transparently -- the provider injects the bot token automatically. Pass relative method paths; do not include a host.
+Two commands reach the Slack Web API, and both send the token from inside the assistant. `assistant channels request slack <path>` acts as the bot, resolving the bot credential from the channel id. `assistant oauth request --provider <key> <path>` names the credential by provider: `slack_channel` is that same bot token, stored by the setup wizard with no OAuth flow involved; `slack` is the separate OAuth integration that acts as the person who connected it. Pass relative method paths; do not include a host.
+
+These two commands are the only way to call the Slack Web API. Never fetch a Slack token yourself (`assistant credentials reveal`, an environment variable, a pasted value) and never call `slack.com/api` with `curl` or any other HTTP client: a token that reaches a shell command line is written into the transcript and the tool log, where no redaction applies. The doors send the token from inside the assistant and never show it to you.
+
+The examples below use `assistant oauth request --provider slack_channel`, the bot door under its provider name, since reading a channel the bot has joined is what it is for; `assistant channels request slack` makes the same call. See [Which provider to pass](#which-provider-to-pass) before reaching for one on a workspace that has no bot, or for `search.messages`.
 
 General pattern:
 
 ```bash
 assistant oauth request --provider slack_channel \
   -X POST \
-  -d '{"channel":"C123","text":"Hello world"}' \
-  /chat.postMessage --json
+  -d '{"channel":"C0123456789","limit":20}' \
+  /conversations.history --json
 ```
 
 The model knows the full Slack API from training data. Refer to https://api.slack.com/methods for the complete list of available endpoints.
-
-### Send a message
-
-```bash
-assistant oauth request --provider slack_channel \
-  -X POST \
-  -d '{"channel":"C0123456789","text":"Hello from the assistant!"}' \
-  /chat.postMessage --json
-```
 
 ### Read channel history
 
@@ -71,6 +103,44 @@ assistant oauth request --provider slack_channel \
   /conversations.replies --json
 ```
 
+### Read back what you sent
+
+When someone asks what you sent them earlier ("what did you send me this morning", "quote the digest from yesterday"), look in this order: the current conversation first; then `recall`, which searches your other conversations; then Slack itself, for anything older.
+
+Anything you posted with the send command is recorded in the chat's conversation, so `recall` finds it. A post made with `chat.postMessage` is not, which is why reading Slack back is sometimes the only way to find one.
+
+Reading Slack back is three calls on `slack_channel`. That is your own bot identity, and it is the right one here: a DM with you is your app's own DM, the posts you are looking for were made as the bot, and the history scopes this needs (`im:history`, `mpim:history`, `channels:history`, `groups:history`) are ones the app setup already requests.
+
+1. **Know where you are.** When your `<turn_context>` carries `chat_id` (and `thread_id` for a message in a thread), that is the chat. Otherwise the person's contact record has the DM as `externalChatId` (see User Resolution below).
+
+2. **Read the top level.** `conversations.history` returns only top-level messages, never thread replies. In a DM with you, every proactive post you made (a digest, a notification, a check-in from a run of your own) is top-level and appears here directly. Each thread you have taken part in appears only as its parent, carrying `reply_count`, `latest_reply`, and `reply_users`.
+
+   Do not put the time window you were asked about into `oldest` here: history filters by each parent's own timestamp, and a thread started days ago can hold a reply you made this morning. Read recent parents by count instead, and follow `response_metadata.next_cursor` while the parents are still newer than the window you care about.
+
+   ```bash
+   assistant oauth request --provider slack_channel \
+     -X POST \
+     -d '{"channel":"D0123456789","limit":100}' \
+     /conversations.history --json
+   ```
+
+3. **Read the threads you replied in.** Your own user id comes from `auth.test` (`user_id` in the response). Keep the parents whose `reply_users` includes it and whose `latest_reply` is not older than the window; fetch each of those threads. The first message returned is the parent, the rest are the replies in order; pick the replies whose `ts` falls in the window, and follow `next_cursor` on a long thread.
+
+   ```bash
+   assistant oauth request --provider slack_channel /auth.test --json
+
+   assistant oauth request --provider slack_channel \
+     -X POST \
+     -d '{"channel":"D0123456789","ts":"1756800000.000100","limit":200}' \
+     /conversations.replies --json
+   ```
+
+In an agent-style DM, every conversation the person starts with you is its own thread, so what you said in an earlier chat lives in that chat's replies, not in the thread you are answering from now. The parents from step 2 are the list of those chats; step 3 reads the ones you spoke in.
+
+Do not reach for `search.messages` here. It is a user-token method: on `slack_channel` it fails with `not_allowed_token_type`, and on `slack` it would read as the person who connected the integration, with their reach, which is not what re-reading your own DM calls for.
+
+If any of these calls fails with `missing_scope`, the installed app holds fewer scopes than the setup requests. Do not work around it: `assistant channels get slack` re-probes the install and names the missing scopes with the reinstall step, and the **slack-app-setup** skill walks the reconnect.
+
 ### Add a reaction
 
 ```bash
@@ -81,6 +151,8 @@ assistant oauth request --provider slack_channel \
 ```
 
 ### Send with blocks (rich formatting)
+
+The send command renders ordinary markdown the way a reply is rendered, and that covers more than it sounds like: headings, lists, task lists, blockquotes, code with a language, tables with their alignment, images, and dividers all become their native Slack blocks. Write GFM and it arrives formatted. Reach for Block Kit only for something markdown has no way to say, such as buttons or a custom section layout, and know that a post made this way is not recorded.
 
 ```bash
 assistant oauth request --provider slack_channel \
@@ -98,7 +170,7 @@ assistant oauth request --provider slack_channel \
 
 ### Upload a file
 
-File uploads use a multi-step flow: get an upload URL, upload the file, then complete the upload.
+File uploads use a multi-step flow: get an upload URL, upload the file, then complete the upload. The send command carries text only, so a file still goes this way.
 
 ```bash
 # Step 1: Get an upload URL
@@ -115,10 +187,24 @@ assistant oauth request --provider slack_channel \
   /files.completeUploadExternal --json
 ```
 
-### Search messages
+### Download a file
+
+A file shared in a message arrives on the message's `files` entries. Each carries `url_private_download` (or `url_private`) on `files.slack.com`, which takes the same token as the Web API, so the same command reads it. Pass the absolute URL as given and write the bytes with `-o`; the response is the file itself, not a JSON envelope.
 
 ```bash
 assistant oauth request --provider slack_channel \
+  -o /tmp/shot.png \
+  "https://files.slack.com/files-pri/T0123456789-F0123456789/download/shot.png"
+```
+
+The token needs `files:read`; one without it is answered with a sign-in page instead of the file. The bot has it from the app manifest. The `slack` integration requests it when it connects; a connection made before that keeps working for everything else, and every request through it comes back with a hint naming the missing scope until the person reconnects from Integrations. Pass that on rather than retrying. Do not fetch the URL with `curl` or paste a token into a shell: the command is the only place the token is allowed to be.
+
+### Search messages
+
+Takes `slack`, not `slack_channel`: `search.messages` is a user-token method, and the bot token cannot call it. A workspace with no `slack` connection cannot search this way; say so instead of reporting an empty result.
+
+```bash
+assistant oauth request --provider slack \
   "/search.messages?query=project+launch+in%3A%23general" --json
 ```
 
@@ -134,14 +220,14 @@ assistant oauth request --provider slack_channel \
 ## Typical Workflow
 
 1. **Resolve the channel**: `bun skills/slack/scripts/slack-resolve.ts channel general` to get the channel ID.
-2. **Call the API**: Use `assistant oauth request --provider slack_channel` with that ID for the actual operation (send, read, react, etc.).
-3. **For DMs**: Use `bun skills/slack/scripts/slack-resolve.ts user <name>` to get the user ID, then `conversations.open` to get the DM channel ID, then `chat.postMessage` to send the message.
+2. **Post or read**: to say something, use the send command with that ID. For anything else, use `assistant oauth request --provider slack_channel`.
+3. **For DMs**: Use `bun skills/slack/scripts/slack-resolve.ts user <name>` to get the user ID, then `conversations.open` to get the DM channel ID, then post to that DM channel ID with the send command.
 
 ## User Resolution
 
 When you need to send a DM or look up a Slack user by name, check contacts first to avoid redundant API calls:
 
-1. **Before calling the resolve script**: Use `contact_search` with `query: "<name>"` and `channel_type: "slack"`. If a matching contact has `externalUserId` (Slack user ID) and `externalChatId` (DM channel ID), skip the API lookups and use those IDs directly with `chat.postMessage` via `assistant oauth request --provider slack_channel`.
+1. **Before calling the resolve script**: Use `contact_search` with `query: "<name>"` and `channel_type: "slack"`. If a matching contact has `externalUserId` (Slack user ID) and `externalChatId` (DM channel ID), skip the API lookups and post to the DM channel ID with the send command.
 
    When `contact_search` returns notes for the recipient, use them to inform the message's tone, formality, and content. Contact notes capture relationship context and communication preferences that should shape how you write to this person.
 
@@ -159,14 +245,15 @@ When you need to send a DM or look up a Slack user by name, check contacts first
 
 ## Threading
 
-When responding to messages from Slack channels, replies should be threaded. Pass `thread_ts` to `chat.postMessage` to reply in a thread rather than posting a new top-level message:
+When you post into a chat where a conversation is already running, thread it. Name the thread's parent timestamp with `--thread`:
 
 ```bash
-assistant oauth request --provider slack_channel \
-  -X POST \
-  -d '{"channel":"C0123456789","text":"Replying in thread","thread_ts":"1716000000.000001"}' \
-  /chat.postMessage --json
+assistant channels send slack C0123456789 \
+  --thread 1716000000.000001 \
+  --text "Replying in thread"
 ```
+
+When you are answering a Slack turn you are already in, reply instead: that reply is threaded and recorded without a command.
 
 ## Connection
 
@@ -178,6 +265,7 @@ If a Slack API call fails due to missing or invalid credentials -- for example, 
 
 ## Delivery Notes
 
-- For rich content (digests, reports, formatted summaries): use `chat.postMessage` with blocks via `assistant oauth request --provider slack_channel`
+- For text, including digests, reports, and formatted summaries: the send command, which records what it posted. Markdown is rendered the way a reply is.
+- For something markdown has no way to say (buttons, a custom section layout): `chat.postMessage` with blocks via `assistant oauth request --provider slack_channel`, knowing the post is not recorded. Headings, tables, lists, and code blocks do not need this; write them as markdown.
 - For short alerts: `assistant notifications send` via `bash` is fine -- it lets the notification router pick the best channel
-- For scheduled tasks: always include an explicit Slack API call to deliver results, otherwise output only lives in the conversation log
+- For a task that runs on its own: the **schedule** skill's Delivering Results section covers how a scheduled run delivers what it produced

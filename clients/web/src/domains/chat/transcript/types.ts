@@ -14,9 +14,11 @@ import type { MessagesGetResponse } from "@/generated/daemon/types.gen";
 export type TranscriptItemKind =
   | "message"
   | "thinking"
+  | "pendingDesktopHelp"
   | "pendingSecret"
   | "pendingConfirmation"
   | "pendingContactRequest"
+  | "pendingContactRecordRequest"
   | "surface"
   | "ephemeralMeta"
   | "onboardingChoice"
@@ -30,6 +32,8 @@ export interface TranscriptItemBase {
 export interface MessageItem extends TranscriptItemBase {
   kind: "message";
   message: DisplayMessage;
+  /** Frames saved before the utterance, or a standalone run hosted by its first frame. */
+  cameraFrames?: DisplayMessage[];
 }
 
 export interface ThinkingItem extends TranscriptItemBase {
@@ -45,6 +49,11 @@ export interface ThinkingItem extends TranscriptItemBase {
    * prompt — is signaling progress (see `shouldShowThinkingIndicator`).
    */
   active: boolean;
+}
+
+export interface PendingDesktopHelpItem extends TranscriptItemBase {
+  kind: "pendingDesktopHelp";
+  requestId: string;
 }
 
 export interface PendingSecretItem extends TranscriptItemBase {
@@ -67,6 +76,15 @@ export interface PendingContactRequestItem extends TranscriptItemBase {
   label?: string;
   description?: string;
   role?: string;
+}
+
+/**
+ * A proposed contact record write awaiting the guardian. The row reads the
+ * form's contents from the interaction store, so only the id is carried here.
+ */
+export interface PendingContactRecordRequestItem extends TranscriptItemBase {
+  kind: "pendingContactRecordRequest";
+  requestId: string;
 }
 
 export interface SurfaceItem extends TranscriptItemBase {
@@ -102,9 +120,11 @@ export interface EphemeralMetaItem extends TranscriptItemBase {
 export type TranscriptItem =
   | MessageItem
   | ThinkingItem
+  | PendingDesktopHelpItem
   | PendingSecretItem
   | PendingConfirmationItem
   | PendingContactRequestItem
+  | PendingContactRecordRequestItem
   | SurfaceItem
   | EphemeralMetaItem
   | OnboardingChoiceItem

@@ -165,6 +165,25 @@ References:
 - [React Router — Lazy Loading (Data Mode)](https://reactrouter.com/start/data/custom#3-lazy-loading)
 - [React Router — `lazy` property](https://reactrouter.com/start/data/route-object#lazy)
 
+### Don't throw from render or user data
+
+A throw that escapes a React render or a route loader is the
+full-page "Something went wrong" screen. Treat unknown, stale, or
+absent user data as a fallback:
+
+- Return `null` / `undefined` from a lookup (`resolveDefinitions`,
+  catalog finds, optional sidecar fields).
+- Skip the surface or render the next fallback (image, letter mark,
+  empty state).
+- Do not `throw new Error("Unknown …")` because a persisted id is
+  missing from today's palette.
+
+Reserve `throw` for programmer invariants that cannot be reached with
+real user data, and keep those out of render. Expected missing data
+is a return value, not a thrown-and-caught error. That keeps the
+"no bare `catch`" rule below from colliding with this one: there is
+nothing to catch if the lookup does not throw.
+
 ### Manual error reporting from imperative code
 
 For errors caught in `try/catch` blocks, `onError` callbacks, and other
@@ -832,6 +851,22 @@ the URL is the source of truth. Custom in-memory navigation state
 (e.g. `MainView` enums synced to URLs via effects) should be replaced
 by routes as views are ported.
 
+The app viewer is ported this way:
+`/assistant/conversations/:conversationId/app/:appId` names the app on
+screen. `useAppRouteSync` is the one bridge from that segment into
+`useViewerStore`. An open navigates to
+`routes.conversation(conversationId, appId)`; every removal of the
+segment goes through the helpers in `utils/conversation-navigation.ts`,
+whose docblocks carry the rules.
+
+The split, the minimized strip and the app itself are presentation
+rather than history, so a reload lands the app full width. The chat pane
+bound beside the app names a conversation, which the URL also names, so
+`useAppRouteSync` keeps the binding on the conversation the route names.
+Closing returns through the entry the open recorded
+(`utils/app-navigation.ts`, mirroring `utils/document-navigation.ts`)
+and replaces the app's own entry when there is none.
+
 References:
 - [React Router — Nested Routes](https://reactrouter.com/start/framework/routing#nested-routes)
 - [React Router — useSearchParams](https://reactrouter.com/hooks/use-search-params)
@@ -1474,6 +1509,15 @@ the `Vellum-Organization-Id` header and uses bearer auth instead.
 Stories are tests, not just visual demos. They verify that a component
 renders correctly given the data it actually receives in production.
 
+- **A story is a public document.** This repository is public, and
+  `ci-main-storybook.yaml` publishes the built web Storybook from `main`
+  to a world-readable bucket, so every story, fixture, and docstring is
+  readable by anyone and is also rendered as a browsable page. Write them
+  for that audience: no internal measurements, usage or revenue figures,
+  infrastructure or table names, customer identifiers, or unannounced
+  plans. A note that only makes sense to the team belongs on the ticket,
+  not in a docstring. The shapes a component receives are fine, since the
+  product already shows those to any user.
 - **Use the component's prop types, not ad-hoc shapes.** Each story
   should construct props that match the component's typed interface.
   If the component accepts `Surface`, construct a valid `Surface` —

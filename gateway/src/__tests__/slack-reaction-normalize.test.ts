@@ -57,11 +57,70 @@ describe("normalizeSlackReactionAdded", () => {
 
     expect(result).not.toBeNull();
     expect(result!.event.sourceChannel).toBe("slack");
+    expect(result!.event.message.reaction?.emoji).toBe("+1");
+    // The sentinel form stays required for mixed-version readers.
     expect(result!.event.message.callbackData).toBe("reaction:+1");
+    expect(result!.event.message.reaction?.op).toBe("added");
     expect(result!.event.actor.actorExternalId).toBe("U001");
     expect(result!.event.message.conversationExternalId).toBe("C123");
     expect(result!.channel).toBe("C123");
     expect(result!.threadTs).toBe("1234567890.123456");
+  });
+
+  test("resolves a standard name to its character in the adapter, keeping the spelling everywhere it is load-bearing", () => {
+    const config = makeConfig({
+      routingEntries: [
+        { type: "conversation_id", key: "C123", assistantId: "ast-1" },
+      ],
+    });
+    const result = normalizeSlackReactionAdded(
+      makeReactionEvent(),
+      "ev-9",
+      config,
+    );
+    const reaction = result!.event.message.reaction!;
+    expect(reaction.emojiKind).toBe("unicode");
+    expect(reaction.emojiName?.replace(/️/g, "")).toBe("👍");
+    // The spelling Slack sent still names the dedup id and the sentinel.
+    expect(reaction.emoji).toBe("+1");
+    expect(result!.event.message.callbackData).toBe("reaction:+1");
+    expect(result!.event.message.externalMessageId).toContain(":+1:");
+  });
+
+  test("resolves a skin tone suffix to the toned character", () => {
+    const config = makeConfig({
+      routingEntries: [
+        { type: "conversation_id", key: "C123", assistantId: "ast-1" },
+      ],
+    });
+    const result = normalizeSlackReactionAdded(
+      makeReactionEvent({ reaction: "thumbsup::skin-tone-3" }),
+      "ev-10",
+      config,
+    );
+    expect(result!.event.message.reaction?.emojiKind).toBe("unicode");
+    expect(result!.event.message.reaction?.emojiName?.replace(/️/g, "")).toBe(
+      "👍🏼",
+    );
+    expect(result!.event.message.reaction?.emoji).toBe("thumbsup::skin-tone-3");
+  });
+
+  test("a name outside Slack's standard list stays a shortcode in Slack's namespace", () => {
+    const config = makeConfig({
+      routingEntries: [
+        { type: "conversation_id", key: "C123", assistantId: "ast-1" },
+      ],
+    });
+    const result = normalizeSlackReactionAdded(
+      makeReactionEvent({ reaction: "blob_wave" }),
+      "ev-11",
+      config,
+    );
+    expect(result!.event.message.reaction).toMatchObject({
+      emoji: "blob_wave",
+      emojiKind: "shortcode",
+      emojiName: "blob_wave",
+    });
   });
 
   test("encodes emoji name in callbackData", () => {
@@ -74,9 +133,8 @@ describe("normalizeSlackReactionAdded", () => {
     const result = normalizeSlackReactionAdded(event, "ev-2", config);
 
     expect(result).not.toBeNull();
-    expect(result!.event.message.callbackData).toBe(
-      "reaction:white_check_mark",
-    );
+    expect(result!.event.message.reaction?.emoji).toBe("white_check_mark");
+    expect(result!.event.message.reaction?.op).toBe("added");
   });
 
   // Self-authored reactions are now filtered upstream in processEventPayload,
@@ -126,7 +184,7 @@ describe("normalizeSlackReactionAdded", () => {
 
     expect(result).not.toBeNull();
     expect(result!.event.message.externalMessageId).toBe(
-      "C123:1234567890.123456:alarm_clock:U001",
+      "C123:1234567890.123456:alarm_clock:U001:ev-7",
     );
   });
 
@@ -138,8 +196,11 @@ describe("normalizeSlackReactionAdded", () => {
     });
     const event1 = makeReactionEvent({ user: "U001" });
     const event2 = makeReactionEvent({ user: "U002" });
-    const result1 = normalizeSlackReactionAdded(event1, "ev-8a", config);
-    const result2 = normalizeSlackReactionAdded(event2, "ev-8b", config);
+    // One event id across both, so the reactor is the only thing that can
+    // separate the two ids. Distinct event ids would separate them on their
+    // own and the assertion would hold even if the reactor were dropped.
+    const result1 = normalizeSlackReactionAdded(event1, "ev-8", config);
+    const result2 = normalizeSlackReactionAdded(event2, "ev-8", config);
 
     expect(result1).not.toBeNull();
     expect(result2).not.toBeNull();

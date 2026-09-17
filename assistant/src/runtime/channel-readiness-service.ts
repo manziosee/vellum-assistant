@@ -3,6 +3,7 @@ import { z } from "zod";
 
 import { resolveTwilioPhoneNumber } from "../calls/twilio-config.js";
 import { hasTwilioCredentials } from "../calls/twilio-rest.js";
+import { CHANNEL_METADATA } from "../channels/types.js";
 import { getNestedValue, loadRawConfig } from "../config/loader.js";
 import { hasWebhookRoutingConfigured } from "../config/webhook-routing.js";
 import { credentialKey } from "../security/credential-key.js";
@@ -25,10 +26,10 @@ export const REMOTE_TTL_MS = 5 * 60 * 1000;
  * Bot scopes the Slack manifest requests that the app cannot work without.
  *
  * Slack's install flow can return a token carrying a fraction of the manifest's
- * scopes while `auth.test` still succeeds — a live install produced 2 of 18, and
- * the first real API call failed with `missing_scope`. `auth.test` passing is
- * therefore not evidence the install is usable; the granted set has to be read
- * off the `x-oauth-scopes` response header and compared.
+ * scopes while `auth.test` still succeeds, leaving the first real API call to
+ * fail with `missing_scope`. `auth.test` passing is therefore not evidence the
+ * install is usable; the granted set has to be read off the `x-oauth-scopes`
+ * response header and compared.
  *
  * Mirrors the non-optional half of `oauth_config.scopes.bot` in
  * `skills/slack-app-setup/scripts/build-manifest.ts` (and its copy in
@@ -282,32 +283,92 @@ const emailProbe: ChannelProbe = {
         "Email invite code redemption is enabled",
         "Email invite code redemption is disabled",
       ),
-      await checkIngress(),
+      // Managed callbacks allowed: inbound email arrives through the platform
+      // callback route the gateway registers (`registerEmailCallbackRoute`,
+      // the same pattern as Telegram's webhook route), so a platform-connected
+      // deployment with no public ingress URL still receives email.
+      await checkIngress(true),
     ];
   },
+  /**
+   * Ask the platform whether an inbox address is registered, falling back to
+   * a "your own" provider credential. The platform's email-addresses API is
+   * the only writer of managed inbox registrations (nothing about one lands
+   * in workspace config), and a BYO deployment's configuration claim is its
+   * stored provider API key, so those are the only sources this check may
+   * read.
+   *
+   * Three outcomes, matching the Telegram probe: an answer passes or fails
+   * the check outright, and an unreachable platform (with no BYO credential
+   * to fall back to) is indeterminate, which is not evidence of a fault and
+   * must not report the channel broken.
+   */
   async runRemoteChecks(): Promise<ReadinessCheckResult[]> {
-    try {
-      const raw = loadRawConfig();
-      const address = getNestedValue(raw, "email.address");
-      const hasInbox = typeof address === "string" && address.length > 0;
-      return [
-        {
-          name: "inbox_configured",
-          passed: hasInbox,
-          message: hasInbox
-            ? `Inbox address is configured (${address})`
-            : "No inbox address configured — register one with: assistant email register <username>",
-        },
-      ];
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      return [
-        {
-          name: "inbox_configured",
-          passed: false,
-          message: `Failed to check inbox configuration: ${message}`,
-        },
-      ];
+    // Imported here rather than at module scope, matching the other probes:
+    // the platform client pulls in a module graph that unrelated consumers of
+    // this service should not have to mock.
+    const { resolveRegisteredInbox } =
+      await import("../email/registered-inbox.js");
+    // Fresh, because this service already caches remote checks for
+    // REMOTE_TTL_MS; layering the resolver's own cache under that would make
+    // an explicit readiness refresh serve a stale answer anyway.
+    const inbox = await resolveRegisteredInbox({ fresh: true });
+
+    // Published identifier (see the Telegram probe's `webhook_delivery` note):
+    // external clients search readiness responses for this name.
+    const name = "inbox_configured";
+
+    if (inbox.status !== "registered") {
+      const { resolveConfiguredByoEmailService } =
+        await import("../email/byo-email-credential.js");
+      const byoService = await resolveConfiguredByoEmailService();
+      if (byoService) {
+        return [
+          {
+            name,
+            passed: true,
+            message: `Email is configured through your own provider (${byoService} API key is stored)`,
+          },
+        ];
+      }
+    }
+
+    switch (inbox.status) {
+      case "registered":
+        return [
+          {
+            name,
+            passed: true,
+            message: `Inbox address is registered (${inbox.address})`,
+          },
+        ];
+      case "none":
+        return [
+          {
+            name,
+            passed: false,
+            message:
+              "No inbox address registered. Register one with: assistant email register <username>, or configure your own provider (Resend or Mailgun)",
+          },
+        ];
+      case "no_platform":
+        return [
+          {
+            name,
+            passed: false,
+            message:
+              "Email is not configured. Connect the platform for a managed inbox (assistant platform connect), or configure your own provider (Resend or Mailgun)",
+          },
+        ];
+      case "unavailable":
+        return [
+          {
+            name,
+            passed: true,
+            indeterminate: true,
+            message: `Could not reach the platform to check inbox registration (${inbox.detail})`,
+          },
+        ];
     }
   },
 };
@@ -363,11 +424,17 @@ const whatsappProbe: ChannelProbe = {
 // ── Slack Probe ─────────────────────────────────────────────────────────────
 
 /**
- * Ask the gateway whether Slack's Socket Mode connection is receiving.
+ * Ask the gateway whether a socket-backed channel's connection is receiving.
  *
- * Distinct from the credential checks: valid tokens and a reachable
- * `auth.test` establish that Slack would accept us, not that anything is
- * arriving. A socket can be open at the transport layer and deliver nothing.
+ * One function for every such channel, matching the IPC route it reads, which
+ * is keyed by channel for the same reason: the question and the answer are the
+ * same wherever a socket carries inbound. A channel whose ingress is not a
+ * gateway-owned socket answers `unsupported`, which reads as indeterminate
+ * rather than a fault, so asking is always safe.
+ *
+ * Distinct from the credential checks: valid tokens establish that the
+ * provider would accept us, not that anything is arriving. A socket can be
+ * open at the transport layer and deliver nothing.
  *
  * Three outcomes, matching the Telegram probe:
  *
@@ -392,7 +459,13 @@ const whatsappProbe: ChannelProbe = {
  * to die and recover. Placement is a cost decision here; `kind` carries the
  * meaning.
  */
-async function checkSlackInboundDelivery(): Promise<ReadinessCheckResult> {
+async function checkSocketInboundDelivery(
+  channel: ChannelId,
+): Promise<ReadinessCheckResult> {
+  // The channel's own display name, so a socket-backed channel added later
+  // needs no string decision here. Falls back to the id for a channel with no
+  // metadata entry, which is every channel clients are not offered.
+  const label = CHANNEL_METADATA[channel]?.label ?? channel;
   // Imported here rather than at module scope, matching the Telegram probe:
   // the gateway IPC client pulls in a module graph that unrelated consumers of
   // this service should not have to mock.
@@ -401,13 +474,13 @@ async function checkSlackInboundDelivery(): Promise<ReadinessCheckResult> {
 
   let health;
   try {
-    health = await readChannelSocketHealth("slack");
+    health = await readChannelSocketHealth(channel);
   } catch {
     return {
       name: "inbound_delivery",
       kind: "operational",
       passed: true,
-      message: "Could not reach the gateway to read the Slack connection state",
+      message: `Could not reach the gateway to read the ${label} connection state`,
       indeterminate: true,
     };
   }
@@ -419,8 +492,8 @@ async function checkSlackInboundDelivery(): Promise<ReadinessCheckResult> {
       passed: true,
       message:
         health.status === "not_configured"
-          ? "Slack Socket Mode is not running, because its credentials are not configured"
-          : "Slack does not report a gateway-owned socket",
+          ? `${label} is not connected, because its credentials are not configured`
+          : `${label} does not report a gateway-owned socket`,
       indeterminate: true,
     };
   }
@@ -433,8 +506,8 @@ async function checkSlackInboundDelivery(): Promise<ReadinessCheckResult> {
     ...check(
       "inbound_delivery",
       health.status === "connected",
-      `Slack is delivering to this assistant (${lastProof})`,
-      "Slack Socket Mode holds no live connection, so inbound messages are not reaching this assistant",
+      `${label} is delivering to this assistant (${lastProof})`,
+      `${label} holds no live connection, so inbound messages are not reaching this assistant`,
     ),
     kind: "operational",
   };
@@ -456,7 +529,7 @@ const slackProbe: ChannelProbe = {
         "app_token",
         "Slack app token",
       ),
-      await checkSlackInboundDelivery(),
+      await checkSocketInboundDelivery("slack"),
     ];
   },
   async runRemoteChecks(): Promise<ReadinessCheckResult[]> {
@@ -532,6 +605,38 @@ const slackProbe: ChannelProbe = {
         ),
       ];
     }
+  },
+};
+
+// ── Discord Probe ───────────────────────────────────────────────────────────
+
+/**
+ * Discord readiness.
+ *
+ * One credential and one socket, which is the whole of it. Discord holds a
+ * Gateway connection rather than receiving webhooks, so there is no ingress
+ * routing to check: nothing has to reach this deployment from outside for
+ * inbound to work.
+ *
+ * No remote check either, and that is a decision rather than an omission. The
+ * remote bucket exists to ask a provider whether it would accept us, which for
+ * Slack is worth asking separately because its socket authenticates with a
+ * different token than its sends. Discord uses one bot token for both, so a
+ * live Gateway connection already proves the token the sends will use, and a
+ * call to `GET /users/@me` would restate it a cache interval later.
+ */
+const discordProbe: ChannelProbe = {
+  channel: "discord",
+  async runLocalChecks(): Promise<ReadinessCheckResult[]> {
+    return [
+      await checkCredential(
+        "bot_token",
+        "discord_channel",
+        "bot_token",
+        "Discord bot token",
+      ),
+      await checkSocketInboundDelivery("discord"),
+    ];
   },
 };
 
@@ -727,7 +832,13 @@ export class ChannelReadinessService {
 
 // ── Factory ─────────────────────────────────────────────────────────────────
 
-/** Create a service instance with built-in Voice, Telegram, Email, WhatsApp, and Slack probes registered. */
+/**
+ * A service with every built-in probe registered.
+ *
+ * The registrations below are the list; naming them here as well gives the set
+ * a second home that drifts the moment a channel is added, which is what it
+ * did.
+ */
 export function createReadinessService(): ChannelReadinessService {
   const service = new ChannelReadinessService();
   service.registerProbe(voiceProbe);
@@ -735,5 +846,6 @@ export function createReadinessService(): ChannelReadinessService {
   service.registerProbe(emailProbe);
   service.registerProbe(whatsappProbe);
   service.registerProbe(slackProbe);
+  service.registerProbe(discordProbe);
   return service;
 }

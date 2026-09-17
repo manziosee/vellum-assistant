@@ -17,7 +17,12 @@ export {
 
 export * from "./gateway-ipc-contracts.js";
 
-export { ipcCall, IpcCallError, PersistentIpcClient } from "./ipc-client.js";
+export {
+  ipcCall,
+  IpcCallError,
+  IpcConnectError,
+  PersistentIpcClient,
+} from "./ipc-client.js";
 
 // Outbound delivery contract (daemon → gateway) — Zod schemas + derived types
 export {
@@ -28,7 +33,9 @@ export {
   ChannelReplyPayloadSchema,
   MessageAudienceSchema,
   PermissionRequestDetailsSchema,
-  SlackStreamOpSchema,
+  StreamOpSchema,
+  StreamPlanSchema,
+  StreamPlanStepSchema,
   SlackStreamTaskSchema,
 } from "./outbound-contract.js";
 
@@ -40,7 +47,9 @@ export type {
   ChannelReplyPayload,
   MessageAudience,
   PermissionRequestDetails,
-  SlackStreamOp,
+  StreamOp,
+  StreamPlan,
+  StreamPlanStep,
   SlackStreamTask,
 } from "./outbound-contract.js";
 
@@ -78,6 +87,28 @@ export {
 } from "./admission-policy-contract.js";
 
 export type { AdmissionPolicy } from "./admission-policy-contract.js";
+
+export {
+  INBOUND_EVENT_KINDS,
+  inboundEventRefersToAnotherMessage,
+  isInboundEventKind,
+  resolveInboundEventKind,
+  resolveInboundReactionPayload,
+} from "./inbound-event-kind.js";
+export type {
+  InboundEventKind,
+  InboundReactionPayload,
+} from "./inbound-event-kind.js";
+
+// Plugin admission-denied notice (gateway → plugin) — canned deny copy + envelope
+export {
+  ACCESS_DENIED_NOT_APPROVED_REPLY,
+  PLUGIN_ADMISSION_DENIED_NOTICE_PATH,
+  PLUGIN_NOTICES_ROUTE_PREFIX,
+  PluginAdmissionDeniedNoticeSchema,
+} from "./plugin-admission-denied-contract.js";
+
+export type { PluginAdmissionDeniedNotice } from "./plugin-admission-denied-contract.js";
 
 // Trust verdict contract (gateway → daemon) — Zod schemas + derived types
 export {
@@ -220,7 +251,6 @@ export {
   ExpireInteractionBoundIpcResponseSchema,
   GetGuardianRequestByCallSessionIpcParamsSchema,
   GetGuardianRequestByCodeIpcParamsSchema,
-  GetGuardianRequestByDestinationMessageIpcParamsSchema,
   GetGuardianRequestByPendingQuestionIpcParamsSchema,
   GetGuardianRequestIpcParamsSchema,
   GUARDIAN_REQUESTS_IPC_METHODS,
@@ -239,12 +269,13 @@ export {
   GuardianRequestSourceTypeSchema,
   GuardianRequestStatusSchema,
   isGuardianRequestExpired,
+  ListGuardianRequestDeliveriesByChatIpcParamsSchema,
   ListGuardianRequestDeliveriesIpcParamsSchema,
   ListGuardianRequestsIpcParamsSchema,
   ListPendingGuardianRequestsByDestinationIpcParamsSchema,
   ListPendingGuardianRequestsByScopeIpcParamsSchema,
-  SweepExpiredGuardianRequestsIpcParamsSchema,
-  SweepExpiredGuardianRequestsIpcResponseSchema,
+  DELIVERY_STATUS,
+  ListExpiredPendingGuardianRequestsIpcParamsSchema,
   UpdateGuardianRequestDeliveryIpcParamsSchema,
   UpdateGuardianRequestIpcParamsSchema,
 } from "./guardian-request-contract.js";
@@ -254,12 +285,12 @@ export type {
   CreateGuardianRequestIpcParams,
   DecideGuardianRequestIpcParams,
   DecideGuardianRequestIpcResponse,
+  DeliveryStatus,
   ExpireGuardianRequestIpcParams,
   ExpireInteractionBoundIpcParams,
   ExpireInteractionBoundIpcResponse,
   GetGuardianRequestByCallSessionIpcParams,
   GetGuardianRequestByCodeIpcParams,
-  GetGuardianRequestByDestinationMessageIpcParams,
   GetGuardianRequestByPendingQuestionIpcParams,
   GetGuardianRequestIpcParams,
   GuardianRequestAclOutcome,
@@ -277,12 +308,12 @@ export type {
   GuardianRequestSourceType,
   GuardianRequestStatus,
   GuardianRequestWire,
+  ListGuardianRequestDeliveriesByChatIpcParams,
   ListGuardianRequestDeliveriesIpcParams,
   ListGuardianRequestsIpcParams,
   ListPendingGuardianRequestsByDestinationIpcParams,
   ListPendingGuardianRequestsByScopeIpcParams,
-  SweepExpiredGuardianRequestsIpcParams,
-  SweepExpiredGuardianRequestsIpcResponse,
+  ListExpiredPendingGuardianRequestsIpcParams,
   UpdateGuardianRequestDeliveryIpcParams,
   UpdateGuardianRequestIpcParams,
 } from "./guardian-request-contract.js";

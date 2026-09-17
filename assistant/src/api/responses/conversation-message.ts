@@ -22,6 +22,7 @@
  * gateway, evals) import via `@vellumai/assistant-api`.
  */
 
+import { ReactionEmojiFieldsSchema } from "@vellumai/service-contracts/reactions";
 import { z } from "zod";
 
 import {
@@ -50,6 +51,9 @@ export const ConversationMessageAttachmentSchema = z.object({
   thumbnailData: z.string().optional(),
   /** True when the attachment bytes are backed by a file on disk. */
   fileBacked: z.boolean().optional(),
+  /** True when this computer-use screenshot was placed on the reply
+   *  automatically. Missing or false identifies legacy or explicit placement. */
+  computerUseScreenshot: z.boolean().optional(),
 });
 export type ConversationMessageAttachment = z.infer<
   typeof ConversationMessageAttachmentSchema
@@ -358,6 +362,7 @@ const SlackMessageLinkSchema = z.object({
 
 const SlackReactionSchema = z.object({
   emoji: z.string(),
+  ...ReactionEmojiFieldsSchema.shape,
   op: z.enum(["added", "removed"]),
   actorDisplayName: z.string().optional(),
   targetChannelTs: z.string(),
@@ -607,6 +612,42 @@ export const ConversationMessageSchema = z.object({
    *  system notices — no avatar, no persona bubble — and never group them
    *  with adjacent assistant turns. */
   systemCard: z.boolean().optional(),
+  /** Set on a turn whose whole reply was the `<no_response/>` sentinel
+   *  (`metadata.messageKind === "no_response"`): the assistant deliberately
+   *  chose silence. Clients render a quiet standalone notice instead of the
+   *  sentinel text, and treat the row as the turn's reply so nothing keeps
+   *  waiting for one. */
+  noResponse: z.boolean().optional(),
+  /** Set only on standalone ambient camera-frame rows, derived from
+   *  `messageMetadataIsAmbientSightKeep`. Clients may fold consecutive frames
+   *  into the following user message. Absent on shutter photos, spoken turns
+   *  carrying parked frames, and every other row. */
+  cameraFrame: z.literal(true).optional(),
+  /** How this assistant row's plain text reached the user, set only on a turn
+   *  that routed its reply through the `send_user_message` tool. `"private"`
+   *  means the row's text blocks are the model's working notes and the text
+   *  the client shows came from the tool call; `"visible"` means the turn
+   *  ended without ever calling the tool, so its raw text was surfaced as the
+   *  fallback and is the reply. Absent on every other row. Clients gate
+   *  per-row presentation (e.g. collapsing intermediate activity) on this
+   *  rather than on the feature flag, so a row keeps the treatment it was
+   *  written with. */
+  assistantTextVisibility: z.enum(["private", "visible"]).optional(),
+  /** Present on a reaction row, either direction: an inbound reaction the
+   *  daemon persisted, or the assistant's own (`selfAuthored`). Clients
+   *  render a reaction line from this instead of the row's stored sentinel
+   *  text. Slack rows additionally carry their own `slackMessage` envelope,
+   *  which Slack-aware renderers may prefer. */
+  reaction: z
+    .object({
+      emoji: z.string(),
+      ...ReactionEmojiFieldsSchema.shape,
+      op: z.enum(["added", "removed"]),
+      targetMessageId: z.string(),
+      actorDisplayName: z.string().optional(),
+      selfAuthored: z.boolean().optional(),
+    })
+    .optional(),
   /** Present when this assistant row is a daemon-persisted provider-failure
    *  notice (`metadata.messageKind === "provider_error"`); clients may render
    *  a themed card instead of a persona bubble. `code` is the stable
@@ -619,6 +660,11 @@ export const ConversationMessageSchema = z.object({
     })
     .optional(),
   slackMessage: ConversationSlackMessageSchema.optional(),
+  /** Unix ms at which the message was deleted on its channel after the daemon
+   *  stored it (a Slack or Discord deletion the gateway forwarded). The stored
+   *  content stays for audit and the Inspect view; clients render a tombstone
+   *  in place of the content, mirroring what the channel now shows. */
+  deletedAt: z.number().optional(),
   /**
    * Queue state for a user message that is still waiting in the daemon's
    * in-memory queue (enqueued while the agent was mid-turn, not yet drained or

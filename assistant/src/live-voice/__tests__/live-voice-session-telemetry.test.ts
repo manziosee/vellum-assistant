@@ -121,7 +121,30 @@ describe("live-voice session telemetry", () => {
 
     await session.start();
 
-    expect(recordLiveVoiceSessionStarted).toHaveBeenCalledWith("session-123");
+    expect(recordLiveVoiceSessionStarted).toHaveBeenCalledWith({
+      sessionId: "session-123",
+      screen: "started_unknown:unknown",
+    });
+
+    await session.close("client_end");
+  });
+
+  test("stamps the started row with the client and entry the start frame declared", async () => {
+    // The dimension this row exists to carry: the same `macos` client covers
+    // the chat's voice button, the companion's Talk and the voice key, and
+    // only the entry says which one the user reached for.
+    const session = readySession({
+      ...START_FRAME,
+      client: "macos",
+      entry: "companion",
+    });
+
+    await session.start();
+
+    expect(recordLiveVoiceSessionStarted).toHaveBeenCalledWith({
+      sessionId: "session-123",
+      screen: "started_macos:companion",
+    });
 
     await session.close("client_end");
   });
@@ -138,7 +161,10 @@ describe("live-voice session telemetry", () => {
 
     // The denominator of the failure rate: a session rejected before `ready`
     // is exactly the one that must not go missing from the started count.
-    expect(recordLiveVoiceSessionStarted).toHaveBeenCalledWith("session-123");
+    expect(recordLiveVoiceSessionStarted).toHaveBeenCalledWith({
+      sessionId: "session-123",
+      screen: "started_unknown:unknown",
+    });
   });
 
   test("records the close reason and a completed outcome on a clean end", async () => {
@@ -146,6 +172,73 @@ describe("live-voice session telemetry", () => {
     await session.start();
 
     await session.close("client_end");
+
+    // These sessions reach `ready` and are closed without ever sending audio,
+    // so they are silent by construction and the reason says which layer
+    // stopped short. See `telemetry/live-voice-funnel.ts`.
+    expect(recordLiveVoiceSessionEnded).toHaveBeenCalledWith({
+      sessionId: "session-123",
+      screen: "ended_client_end:silent_no_audio",
+      outcome: "completed",
+    });
+  });
+
+  /**
+   * Run one typed turn against a session with a real turn starter, then close.
+   *
+   * `readySession` wires none, so `handleTextTurn` returns before dispatching
+   * and every silence assertion against it passes for the wrong reason.
+   */
+  async function endAfterTypedTurn(frame: {
+    text: string;
+    hidden?: boolean;
+  }): Promise<void> {
+    let started = false;
+    const session = new LiveVoiceSession(createContext(), {
+      resolveTranscriber: mock(async () => new MockStreamingTranscriber()),
+      resolveCredentialReadiness: mock(
+        async (): Promise<LiveVoiceCredentialReadiness> => ({
+          status: "ready",
+        }),
+      ),
+      startVoiceTurn: mock(async () => {
+        started = true;
+        return { turnId: "bridge-turn-1", abort: mock() };
+      }),
+      emitMetrics: false,
+    });
+    await session.start();
+    await session.handleClientFrame({ type: "text", ...frame });
+    for (let attempt = 0; attempt < 40 && !started; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    if (!started) {
+      throw new Error("the typed turn never reached the bridge");
+    }
+    await session.close("client_end");
+  }
+
+  test("the greeting that opens a session does not spend its silence reason", async () => {
+    // The classification answers "did anything come from the person?". A
+    // session that greets and hears nothing back is silent, and counting the
+    // greeting would retire the taxonomy for every greeted session.
+    await endAfterTypedTurn({
+      text: "this message is sent automatically",
+      hidden: true,
+    });
+
+    expect(recordLiveVoiceSessionEnded).toHaveBeenCalledWith({
+      sessionId: "session-123",
+      screen: "ended_client_end:silent_no_audio",
+      outcome: "completed",
+    });
+  });
+
+  test("a turn the user really took clears the silence reason", async () => {
+    // The other half, and what keeps the test above honest: the same path with
+    // an ordinary typed turn is the person taking a turn, so the session is
+    // not silent and carries no classification at all.
+    await endAfterTypedTurn({ text: "typed by hand" });
 
     expect(recordLiveVoiceSessionEnded).toHaveBeenCalledWith({
       sessionId: "session-123",
@@ -164,7 +257,7 @@ describe("live-voice session telemetry", () => {
     // the reason on `screen` is what distinguishes a drop from a hangup.
     expect(recordLiveVoiceSessionEnded).toHaveBeenCalledWith({
       sessionId: "session-123",
-      screen: "ended_websocket_close",
+      screen: "ended_websocket_close:silent_no_audio",
       outcome: "completed",
     });
   });
@@ -257,9 +350,42 @@ describe("live-voice turn attribution", () => {
     expect(options.assistantMessageInterface).toBe("macos");
   });
 
+  test("a session opened from the macOS desktop client asks for the desktop skills", async () => {
+    const options = await captureTurnOptions({
+      ...START_FRAME,
+      client: "macos",
+    });
+
+    expect(options.macosDesktopSession).toBe(true);
+  });
+
+  test("a session from any other client does not ask for the desktop skills", async () => {
+    for (const startFrame of [{ ...START_FRAME, client: "ios" }, START_FRAME]) {
+      const options = await captureTurnOptions(
+        startFrame as LiveVoiceClientStartFrame,
+      );
+
+      expect(options.macosDesktopSession).toBeUndefined();
+    }
+  });
+
   test("omits the client when the start frame declares none", async () => {
     const options = await captureTurnOptions(START_FRAME);
 
     expect(options.voiceTelemetry).toEqual({ sessionId: "session-123" });
+  });
+
+  test("carries the entry point onto the turn beside the client", async () => {
+    const options = await captureTurnOptions({
+      ...START_FRAME,
+      client: "macos",
+      entry: "voice_key",
+    });
+
+    expect(options.voiceTelemetry).toEqual({
+      sessionId: "session-123",
+      client: "macos",
+      entry: "voice_key",
+    });
   });
 });

@@ -7,6 +7,7 @@ import { tailIsAssistant } from "@/domains/chat/utils/stream-updaters/shared";
 import { useTurnStore } from "@/domains/chat/turn-store";
 import { endTurn } from "@/domains/chat/turn-coordinator";
 import { useChatSessionStore } from "@/domains/chat/chat-session-store";
+import { useComposerStore } from "@/domains/chat/composer-store";
 import { useStreamStore } from "@/domains/chat/stream-store";
 
 import { recordDiagnostic, summarizeAssistantEvent } from "@/lib/diagnostics";
@@ -35,6 +36,8 @@ import {
 import {
   handleSecretRequest,
   handleConfirmationRequest,
+  handleContactFormClosed,
+  handleContactRecordRequest,
   handleContactRequest,
   handleInteractionResolved,
   handleQuestionRequest,
@@ -72,6 +75,7 @@ import {
   handleAcpSessionSpawned,
   handleAcpSessionUpdate,
   handleAcpSessionUsage,
+  handleAcpSessionModelUpdate,
   handleAcpSessionCompleted,
   handleAcpAuthRequired,
   handleAcpSessionError,
@@ -117,7 +121,11 @@ export interface UseStreamEventHandlerParams {
 }
 
 interface UseStreamEventHandlerReturn {
-  handleStreamEvent: (event: AssistantEvent, epoch: number) => void;
+  handleStreamEvent: (
+    event: AssistantEvent,
+    epoch: number,
+    envelopeConversationId: string | undefined,
+  ) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -133,7 +141,8 @@ interface UseStreamEventHandlerReturn {
  * mutable state). Delegates to the appropriate handler based on event type
  * via an exhaustive switch.
  *
- * @returns `handleStreamEvent(event, epoch)` — call this for each SSE event.
+ * @returns `handleStreamEvent(event, epoch, envelopeConversationId)`, called
+ * for each SSE event.
  */
 export function useStreamEventHandler(
   params: UseStreamEventHandlerParams,
@@ -151,11 +160,19 @@ export function useStreamEventHandler(
   // --- Refs owned by this hook (only used inside handleStreamEvent) ---
   const lastActivityVersionRef = useRef<Map<string, number>>(new Map());
   const currentAssistantMessageIdRef = useRef<string | undefined>(undefined);
+  const lastCompletedToolNameRef = useRef<string | undefined>(undefined);
+  const composerSessionGenerationRef = useRef(
+    useComposerStore.getState().sessionGeneration,
+  );
 
   // --- Main event handler ---
 
   const handleStreamEvent = useCallback(
-    (event: AssistantEvent, epoch: number) => {
+    (
+      event: AssistantEvent,
+      epoch: number,
+      envelopeConversationId: string | undefined,
+    ) => {
       // Discard events from stale/previous streams
       const eventSummary = summarizeAssistantEvent(event);
       const streamState = useStreamStore.getState();
@@ -234,11 +251,17 @@ export function useStreamEventHandler(
 
       // Build context object for domain handlers
       const ctx: StreamHandlerContext = {
+        eventConversationId: envelopeConversationId,
         router: { push },
         isNative,
         streamContext: streamState.streamContext,
         assistantId: useResolvedAssistantsStore.getState().activeAssistantId,
+        composerSessionGeneration: composerSessionGenerationRef.current,
         setOptimisticSends: store.setOptimisticSends,
+        // Read live rather than closing over `store`: a queue ack can arrive
+        // after later sends have already changed the list.
+        getOptimisticSends: () =>
+          useChatSessionStore.getState().optimisticSends,
         turnActions: useTurnStore.getState(),
         getTurnState: () => useTurnStore.getState(),
         endTurn,
@@ -262,6 +285,7 @@ export function useStreamEventHandler(
         consumePendingLocalDeletion: store.consumePendingLocalDeletion,
         lastActivityVersionRef,
         currentAssistantMessageIdRef,
+        lastCompletedToolNameRef,
       };
 
       switch (event.type) {
@@ -319,6 +343,12 @@ export function useStreamEventHandler(
         case "contact_request":
           handleContactRequest(event, ctx);
           break;
+        case "contact_record_request":
+          handleContactRecordRequest(event, ctx);
+          break;
+        case "contact_form_closed":
+          handleContactFormClosed(event);
+          break;
         case "question_request":
           handleQuestionRequest(event, ctx);
           break;
@@ -372,20 +402,6 @@ export function useStreamEventHandler(
         // subagent surfaces via the `subagent_event` envelope.
         case "usage_progress":
           break;
-        case "conversation_list_invalidated":
-          // Legacy macOS-only broadcast. Web receives the paired
-          // `sync_changed` (`conversationsList` umbrella for shape
-          // changes, `conversation:<id>:metadata` for content) directly
-          // and patches the cached list there. The hub scopes this
-          // event to `targetInterfaceId: "macos"`, so it should not
-          // reach web in practice — handling no-op'd as defense in
-          // depth in case a deployment runs an older assistant.
-          //
-          // TODO(electron-cutover): drop the case once macOS migrates
-          // to the Electron client and `conversation_list_invalidated`
-          // is retired from the event types entirely.
-          break;
-
         case "compaction_circuit_open":
           handleCompactionCircuitOpen(event, ctx);
           break;
@@ -428,6 +444,9 @@ export function useStreamEventHandler(
         case "acp_session_usage":
           handleAcpSessionUsage(event);
           break;
+        case "acp_session_model_update":
+          handleAcpSessionModelUpdate(event);
+          break;
         case "acp_session_completed":
           handleAcpSessionCompleted(event);
           break;
@@ -469,6 +488,7 @@ export function useStreamEventHandler(
         case "bookmark.created":
         case "bookmark.deleted":
         case "sync_changed":
+        case "desktop_activity_changed":
         case "home_feed_updated":
         case "relationship_state_updated":
         case "identity_changed":

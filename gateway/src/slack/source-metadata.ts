@@ -1,13 +1,10 @@
 import type { SourceMetadata } from "@vellumai/gateway-client";
 
-import { slackEventRefersToAnotherMessage } from "./event-kind.js";
+import { eventRefersToAnotherMessage } from "../channels/inbound-event.js";
 import type { NormalizedSlackEvent } from "./message-schemas.js";
 
 /** The `sourceMetadata` fields the Slack ingress path sets. */
-export type SlackSourceMetadata = Pick<
-  SourceMetadata,
-  "slackBotMentioned" | "threadId"
->;
+export type SlackSourceMetadata = Pick<SourceMetadata, "threadId">;
 
 /**
  * Build the Slack fields the runtime reads off `sourceMetadata`.
@@ -29,13 +26,12 @@ export type SlackSourceMetadata = Pick<
 export function buildSlackSourceMetadata(
   normalized: NormalizedSlackEvent,
 ): SlackSourceMetadata {
-  const { message, source, raw } = normalized.event;
+  const { message, source } = normalized.event;
 
   return {
-    ...(raw.type === "app_mention" ? { slackBotMentioned: true } : {}),
     ...(normalized.threadTs &&
     !source.threadId &&
-    !slackEventRefersToAnotherMessage(message)
+    !eventRefersToAnotherMessage(message)
       ? { threadId: normalized.threadTs }
       : {}),
   };

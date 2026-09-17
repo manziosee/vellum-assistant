@@ -14,8 +14,12 @@
 
 import { randomUUID } from "node:crypto";
 
-import { getEffectiveProfilesForProvider } from "../../config/default-profile-catalog.js";
+import { getUserSelectableProfilesForProvider } from "../../config/default-profile-catalog.js";
 import { loadConfig } from "../../config/loader.js";
+import {
+  nonTextConversationProfileMessage,
+  profileSupportsTextGeneration,
+} from "../../config/profile-text-generation.js";
 import { findConversation } from "../../daemon/conversation-registry.js";
 import {
   getConversation,
@@ -153,7 +157,7 @@ export async function setInferenceProfileSession({
 
   // --- Validate profile ---
   const { llm } = loadConfig();
-  const profiles = getEffectiveProfilesForProvider(
+  const profiles = getUserSelectableProfilesForProvider(
     llm?.profiles,
     llm?.defaultProvider ?? null,
   );
@@ -163,10 +167,16 @@ export async function setInferenceProfileSession({
     );
   }
 
+  const selectable = profiles as Record<string, unknown>;
+  const selected = selectable[profile] as Record<string, unknown>;
+  if (!profileSupportsTextGeneration(selected, selectable)) {
+    throw new BadRequestError(nonTextConversationProfileMessage(profile));
+  }
+
   // Pinning a profile that provably cannot dispatch turns the next turn in
   // this conversation into a hard failure, so refuse the pin the same way the
   // active-profile setter does.
-  const entry = profiles[profile] as Record<string, unknown>;
+  const entry = selected;
   const availability = await computeProfileAvailability(entry);
   if (isUnavailable(availability)) {
     throw new BadRequestError(

@@ -1,11 +1,14 @@
 {
   "accessConsentSetting": {
     "description": "Если включено, сотрудники Vellum смогут заходить в ассистента и его данные для отладки. Лучше держать это выключенным и включать только на время, если поддержке Vellum нужно разобрать проблему.",
+    "expiresAt": "Доступ сотрудников завершится {when}.",
+    "extend": "Продлить на 24 часа",
     "loadError": "Не удалось загрузить настройку согласия.",
     "loginNotice": "Вход на платформу Vellum для управления доступом администраторов к данным.",
     "title": "Разрешить доступ сотрудникам",
     "toastDisabled": "Доступ администраторов к данным выключен.",
     "toastEnabled": "Доступ администраторов к данным включён.",
+    "toastExtended": "Доступ администраторов к данным продлён.",
     "toastUpdateFailed": "Не удалось обновить согласие на доступ к журналам."
   },
   "adjustPlanModal": {
@@ -24,7 +27,6 @@
     "machineDowngradeFeature": "Меньше CPU и памяти у ассистента: он перейдёт на меньший вычислительный профиль.",
     "pickTiersError": "Нужен выбор уровня машины и хранилища, чтобы продолжить.",
     "planUpdated": "План обновлён.",
-    "updateFailed": "Не удалось обновить план. Повторите попытку.",
     "upgradeFailed": "Не удалось начать повышение. Повторите попытку.",
     "upgradePlanTitle": "Повысить план"
   },
@@ -34,7 +36,9 @@
     "title": "Советник"
   },
   "aiProviderPicker": {
-    "defaultEntryMeta": "По умолчанию"
+    "defaultEntryMeta": "По умолчанию",
+    "selfHostedOnlyMeta": "Только свой хостинг",
+    "selfHostedOnlyTooltip": "{name} работает на вашей машине, поэтому доступен только ассистентам на своём хостинге."
   },
   "allConversationsView": {
     "archive": "В архив",
@@ -54,8 +58,7 @@
     "searchPlaceholder": "Поиск диалогов",
     "unarchive": "Вернуть из архива",
     "unarchiveFailed": "Не удалось вернуть диалог из архива.",
-    "unarchiving": "Возврат из архива",
-    "untitled": "Диалог без названия"
+    "unarchiving": "Возврат из архива"
   },
   "androidNotificationSettingsCard": {
     "checkingDescription": "Проверяем доступ к уведомлениям на этом устройстве.",
@@ -232,14 +235,24 @@
     "adjust": "Изменить",
     "capProgress": " / {cap} в этом месяце",
     "connectCardBanner": "Для автопополнения нужно привязать карту.",
+    "dailyLimitLookupError": "Не удалось проверить дневной лимит кредитов, который нужен для автопополнения. Повторите попытку, чтобы продолжить.",
     "declinedCutoffNotice": "Автопополнение приостановлено после нескольких отклонённых платежей. Добавление нового способа оплаты снова его включит.",
     "disableError": "Не удалось выключить автопополнение. Повторите попытку.",
     "dismiss": "Скрыть",
     "loadError": "Не удалось загрузить настройки автопополнения.",
     "loading": "Загрузка…",
+    "retry": "Повторить",
     "summary": "Добавлять {amount}, когда баланс опускается ниже {threshold}",
+    "toggleHelper": "Автопополнение срабатывает только после исчерпания лимита использования по плану",
     "toggleLabel": "Включить автопополнение",
     "updateError": "Не удалось сохранить настройки автопополнения. Повторите попытку."
+  },
+  "autoTopUpDailyLimitModal": {
+    "cancel": "Выключить автопополнение",
+    "message": "Для автопополнения нужен дневной лимит кредитов. Задайте его, чтобы сохранить настройки автопополнения, или выключите автопополнение.",
+    "save": "Сохранить",
+    "saving": "Сохранение…",
+    "title": "Задайте дневной лимит кредитов"
   },
   "autoTopUpDisableConfirm": {
     "disable": "Выключить",
@@ -256,14 +269,35 @@
     "thresholdLabel": "Пополнять, когда баланс ниже"
   },
   "autoTopUpPaymentMethodModal": {
-    "addressFormLoadError": "Не удалось загрузить форму адреса для оплаты. Закройте окно и откройте его снова.",
+    "addSubtitle": "Карта сохранится для автопополнения и плана Pro.",
+    "addTitle": "Добавить карту",
+    "addressFormLoadError": "Не удалось загрузить форму адреса для оплаты. Повторите попытку.",
     "cancel": "Отмена",
+    "cardOnFileExpiry": "· {month} / {year}",
+    "close": "Закрыть",
     "confirmFailed": "Не удалось сохранить способ оплаты.",
-    "paymentFormLoadError": "Не удалось загрузить форму оплаты. Закройте окно и откройте его снова.",
-    "save": "Сохранить",
-    "savedToast": "Способ оплаты сохранён.",
+    "confirmingWithBank": "Подтверждение в банке…",
+    "declined": "Банк отклонил эту карту. Попробуйте другую или свяжитесь с банком.",
+    "loadingLabel": "Загрузка полей оплаты",
+    "paymentFormLoadError": "Не удалось загрузить форму оплаты. Повторите попытку.",
+    "primaryAdd": "Сохранить карту",
+    "primaryReplace": "Заменить карту",
+    "primarySubmitting": "Сохранение",
+    "replaceSubtitle": "Новая карта начнёт действовать сразу.",
+    "replaceSubtitleCard": "Заменяем карту {brand} •••• {last4}. Новая карта начнёт действовать сразу.",
+    "replaceSubtitleCardExpiry": "Заменяем карту {brand} •••• {last4} · {month} / {year}. Новая карта начнёт действовать сразу.",
+    "replaceSubtitleCardNoBrand": "Заменяем карту, оканчивающуюся на {last4}. Новая карта начнёт действовать сразу.",
+    "replaceSubtitleCardNoBrandExpiry": "Заменяем карту, оканчивающуюся на {last4} · {month} / {year}. Новая карта начнёт действовать сразу.",
+    "replaceSubtitleCardNoLast4": "Заменяем вашу карту {brand}. Новая карта начнёт действовать сразу.",
+    "replaceSubtitleCardNoLast4Expiry": "Заменяем вашу карту {brand} · {month} / {year}. Новая карта начнёт действовать сразу.",
+    "replaceTitle": "Замена карты",
+    "savedSubtitle": "Автопополнение снова активно",
+    "savedTitle": "{brand} •••• {last4} сохранена",
+    "savedTitleGeneric": "Карта сохранена",
+    "savedTitleNoBrand": "Карта, оканчивающаяся на {last4}, сохранена",
     "setupError": "Не удалось начать привязку карты. Повторите попытку.",
-    "title": "Сохранить способ оплаты",
+    "termsAdd": "Vellum может списывать с этой карты оплату за автопополнение и продление подписки. Удалить её можно в любой момент в разделе «Оплата».",
+    "termsReplace": "Старая карта останется в Stripe, пока вы не удалите её в разделе «Оплата»; Vellum больше не будет с неё списывать.",
     "tryAgain": "Попробовать снова",
     "unavailable": "Привязка способа оплаты сейчас недоступна. Повторить позже."
   },
@@ -291,8 +325,8 @@
     "loading": "Загрузка сводки по оплате...",
     "lowBalanceToggle": "Своё оповещение о низком балансе",
     "noInfo": "Нет сведений об оплате.",
-    "subtitle": "Краткая сводка по балансам и не только",
-    "title": "Кредиты"
+    "subtitle": "Кредиты, используемые при достижении лимита использования",
+    "title": "Кредиты дополнительного использования"
   },
   "billingPortalReturnHandler": {
     "endOfBillingPeriod": "конца расчётного периода",
@@ -335,8 +369,7 @@
     "errorTitle": "Не удалось загрузить закладки",
     "open": "Открыть",
     "removeBookmark": "Убрать закладку",
-    "retry": "Повторить",
-    "untitledConversation": "Диалог без названия"
+    "retry": "Повторить"
   },
   "bulkOverrideSwapModal": {
     "affectedSummary": "{count, plural, one {# действие сейчас использует {profile}} few {# действия сейчас используют {profile}} many {# действий сейчас используют {profile}} other {# действия сейчас используют {profile}}}",
@@ -366,33 +399,67 @@
     "providerLabel": "Провайдер",
     "unavailableOption": "{name} (недоступно)"
   },
+  "cancelReasonSurvey": {
+    "optionCustomerService": "Плохой опыт общения с поддержкой",
+    "optionLowQuality": "Качество не оправдало ожиданий",
+    "optionMissingFeatures": "Не хватает нужных функций",
+    "optionOther": "Другое",
+    "optionSwitchedService": "Переход на другой сервис",
+    "optionTooComplex": "Слишком сложно",
+    "optionTooExpensive": "Слишком дорого",
+    "optionUnused": "Редко пользуюсь",
+    "otherLabel": "Расскажите подробнее",
+    "otherPlaceholder": "Что мы могли бы сделать лучше?",
+    "title": "Почему вы отменяете подписку?"
+  },
+  "chatgptDeviceAuthFlow": {
+    "authorizationHint": "Вам или администратору команды может потребоваться включить авторизацию по коду устройства <settingsLink>в настройках ChatGPT</settingsLink>.",
+    "connected": "Подписка ChatGPT успешно подключена.",
+    "copiedButton": "Скопировано",
+    "copyButton": "Копировать код",
+    "copyError": "Не удалось скопировать код. Скопируйте его вручную.",
+    "instructions": "Ввод этого кода на странице ChatGPT. Срок действия кода: 15 минут.",
+    "openButton": "Открыть ChatGPT",
+    "signInButton": "Войти через ChatGPT",
+    "startOver": "Начать заново",
+    "starting": "Начинаем вход...",
+    "tryAgain": "Попробовать снова",
+    "waiting": "Ожидание ввода кода..."
+  },
   "chatgptOauthSection": {
+    "hideOtherOptions": "Скрыть другие способы входа",
+    "intro": "Подключение подписки ChatGPT для моделей OpenAI без API-ключа.",
+    "otherOptions": "Другие способы входа"
+  },
+  "chatgptPasteAuthFlow": {
     "completeFailed": "Не удалось завершить вход. Повторите попытку.",
     "completeSignIn": "Завершить вход",
     "completingSignIn": "Завершение входа...",
     "connected": "Подписка ChatGPT успешно подключена.",
-    "intro": "Подключение подписки ChatGPT для моделей OpenAI без API-ключа.",
     "invalidUrl": "Некорректный URL. Вставка полного URL из адресной строки.",
     "missingCode": "В URL нет кода авторизации. Копирование URL целиком.",
     "missingState": "В URL нет параметра state. Копирование URL целиком.",
     "pasteUrlError": "Вставка URL со страницы ошибки.",
-    "signInButton": "Войти через ChatGPT",
+    "signInButton": "Открыть вход в ChatGPT",
+    "signInButtonStandalone": "Войти через ChatGPT",
     "startFailed": "Не удалось начать вход через ChatGPT. Повторите попытку.",
     "startingSignIn": "Начинаем вход...",
-    "step1Idle": "1. Нажатие \"Войти через ChatGPT\" ниже открывает всплывающее окно",
-    "step1PasteUrl": "1. Нажатие \"Войти через ChatGPT\" открывает всплывающее окно",
+    "step1Idle": "1. Нажатие \"Открыть вход в ChatGPT\" ниже открывает всплывающее окно",
+    "step1IdleStandalone": "1. Нажатие \"Войти через ChatGPT\" ниже открывает всплывающее окно",
+    "step1PasteUrl": "1. Нажатие \"Открыть вход в ChatGPT\" открывает всплывающее окно",
+    "step1PasteUrlStandalone": "1. Нажатие \"Войти через ChatGPT\" открывает всплывающее окно",
     "step2": "2. Вход, затем страница ошибки: так и должно быть",
     "step3": "3. Копирование полного URL из адресной строки этой страницы и вставка ниже",
     "tryAgain": "Попробовать снова",
     "urlPlaceholder": "Callback URL..."
   },
   "checkoutBonusModal": {
-    "body": "Разовый кредит {amount}: сразу зачислим его на баланс. Платить не нужно.",
-    "claim": "Забрать {amount} кредитами",
+    "body": "Разовое дополнительное использование на {amount}: сразу зачислим его на баланс использования. Платить не нужно.",
+    "claim": "Забрать {amount} дополнительного использования",
     "decline": "Нет, спасибо",
-    "errorToast": "Не удалось добавить кредиты. Повторите попытку.",
-    "grantedToast": "На аккаунт добавлено {amount} кредитами.",
-    "title": "Держи {amount} от нас",
+    "errorToast": "Не удалось добавить дополнительное использование. Повторите попытку.",
+    "grantedToast": "На баланс использования добавлено {amount} дополнительного использования.",
+    "title": "Держи {amount} дополнительного использования от нас",
     "unavailableToast": "Это предложение больше недоступно."
   },
   "checkoutPage": {
@@ -477,12 +544,12 @@
   "credentialRow": {
     "addedMetadata": "добавлено {date}",
     "clickToRevealTitle": "Нажатие, чтобы показать",
-    "configureAriaLabel": "Настроить {name}",
-    "configureButton": "Настроить",
     "copyFailedToast": "Не удалось скопировать. Показ значения и копирование вручную.",
     "copyValueAriaLabel": "Скопировать значение {name}",
     "copyValueTitle": "Скопировать значение",
+    "deleteAriaLabel": "Удалить {name}",
     "deleteLabel": "Удалить",
+    "generateLinkAriaLabel": "Создать ссылку для {name}",
     "generateLinkLabel": "Создать ссылку",
     "hideValueAriaLabel": "Скрыть значение {name}",
     "hideValueTitle": "Скрыть значение",
@@ -531,17 +598,15 @@
   },
   "customPlanModal": {
     "cancel": "Отмена",
+    "changeFailed": "Не удалось изменить план. Повторите попытку.",
     "comparedToPrevious": "{delta} относительно предыдущего ({previous})",
     "continue": "Продолжить",
-    "creditBundleAriaLabel": "Пакет кредитов",
-    "creditBundlePlaceholder": "Выбор пакета кредитов",
-    "creditsDocsAriaLabel": "Подробнее о пакетах кредитов",
-    "creditsLabel": "Добавить кредиты:",
     "learnMore": "Подробнее",
     "machineSizeAriaLabel": "Размер машины",
     "machineSizeDocsAriaLabel": "Подробнее о размерах машин",
     "machineSizeLabel": "Выбор размера машины:",
     "machineSizePlaceholder": "Выбор размера машины",
+    "noExtraUsage": "Без дополнительного использования",
     "recap": "Итого",
     "storageAriaLabel": "Хранилище",
     "storageDocsAriaLabel": "Подробнее о хранилище",
@@ -550,6 +615,10 @@
     "subtitle": "Просто лучше.",
     "title": "Сборка плана",
     "totalBilledMonthly": "Итого · Ежемесячная оплата",
+    "usageBundleAriaLabel": "Пакет использования",
+    "usageBundleDocsAriaLabel": "Подробнее о пакетах использования",
+    "usageBundleLabel": "Добавить пакет использования:",
+    "usageBundlePlaceholder": "Выбор пакета использования",
     "yourSelection": "Выбор:"
   },
   "customPlanRow": {
@@ -575,7 +644,8 @@
     "save": "Сохранить",
     "saveError": "Не удалось сохранить дневной лимит кредитов. Повторите попытку.",
     "skippedNotice": "На сегодня пропущен. Этот лимит снова заработает в {time}.",
-    "toggleLabel": "Дневной лимит кредитов"
+    "toggleLabel": "Дневной лимит кредитов",
+    "toggleSubtitle": "Дневной лимит действует только для кредитов за дополнительное использование"
   },
   "debugControlsPanel": {
     "backups": "Резервные копии",
@@ -646,16 +716,10 @@
     "toolLabel": "Инструмент:"
   },
   "doctorPanel": {
-    "beta": "Beta",
-    "betaTitle": "Doctor в бете: отзыв можно отправить через меню Настройки",
     "connecting": "Подключение...",
-    "copied": "Скопировано!",
-    "copiedAria": "Скопировано",
-    "copiedTooltip": "Скопировано!",
+    "copiedToast": "Сессия скопирована в буфер обмена.",
     "copyFailed": "Не удалось скопировать сессию.",
     "copySession": "Скопировать сессию",
-    "copySessionAria": "Скопировать сессию в буфер обмена",
-    "copySessionTooltip": "Скопировать сессию в буфер обмена",
     "endSession": "Завершить сессию",
     "goToNewest": "К новому",
     "goToNewestAria": "К самому новому сообщению",
@@ -667,6 +731,7 @@
     "placeholderApproval": "\"approve\" или \"deny\", либо сообщение...",
     "placeholderMessage": "Сообщение...",
     "sendMessageAria": "Отправить сообщение",
+    "sessionMenu": "Параметры сессии",
     "shareFeedback": "Отправить отзыв",
     "startSession": "Начать сессию Doctor",
     "thinking": "Думает…",
@@ -687,69 +752,15 @@
     "registerSubdomainFailed": "Не удалось зарегистрировать этот поддомен. Выбор другого.",
     "skip": "Пропустить",
     "subtitle": "Настройка почты для ассистента.",
-    "title": "Почта ассистента"
+    "title": "Почта ассистента",
+    "emailUsernamePlaceholder": "hi",
+    "subdomainExamplePlaceholder": "my-assistant"
   },
   "downgradeReconfirmModal": {
     "body": "При понижении пропадут эти функции Pro:",
     "confirm": "Подтвердить понижение",
     "keepPro": "Оставить Pro",
     "title": "Перейти на Base?"
-  },
-  "emailManagedContent": {
-    "addressLabel": "Адрес",
-    "checkingSubscription": "Проверка подписки…",
-    "confirm": "Подтвердить",
-    "create": "Создать",
-    "createEmailFailedFallback": "Не удалось создать адрес почты.",
-    "creating": "Создание…",
-    "domainLabel": "Домен",
-    "domainRegisteredToast": "Домен {domain} зарегистрирован.",
-    "domainReleaseFailedToast": "Не удалось освободить домен.",
-    "domainReleasedToast": "Домен освобождён.",
-    "emailAddressLabel": "Адрес почты",
-    "emailCreatedToast": "Адрес почты создан.",
-    "emailRemoveFailedToast": "Не удалось удалить адрес почты.",
-    "emailRemovedToast": "Адрес почты удалён.",
-    "emailUsernameAriaLabel": "Имя пользователя почты",
-    "emailUsernamePlaceholder": "hi",
-    "enterSubdomainError": "Ввод поддомена.",
-    "enterUsernameError": "Ввод имени пользователя почты.",
-    "register": "Зарегистрировать",
-    "registerDomainFailedFallback": "Не удалось зарегистрировать домен.",
-    "registering": "Регистрация…",
-    "releaseConfirm": "Освободить",
-    "releaseDomainAriaLabel": "Освободить домен",
-    "releaseDomainConfirmMessage": "Точно освободить <code>{domain}</code>? Поддомен станет доступен другим.",
-    "releaseDomainTitle": "Освободить домен",
-    "removeAddressFirstToast": "Сначала удаление адреса почты.",
-    "removeConfirm": "Удалить",
-    "removeEmailAriaLabel": "Удалить адрес почты",
-    "removeEmailConfirmMessage": "Точно удалить <code>{address}</code>? Ассистент больше не сможет отправлять и получать почту на этот адрес.",
-    "removeEmailTitle": "Удалить адрес почты",
-    "retry": "Повторить",
-    "setSubdomainConfirmMessage": "<code>{subdomain}</code> также станет публичным идентификатором ассистента. После установки его нельзя сменить.",
-    "setSubdomainTitle": "Задать поддомен",
-    "subdomainExamplePlaceholder": "my-assistant",
-    "subdomainFallback": "поддомен",
-    "subdomainHint": "У каждого ассистента свой поддомен. Только строчные латинские буквы, цифры и дефисы.",
-    "subdomainLabel": "Поддомен",
-    "subscriptionWarningBody": "Не удалось связаться со службой оплаты. Форма ниже считает, что управляемая почта включена для организации. Если это не так, регистрация домена не сработает.",
-    "subscriptionWarningTitle": "Не удалось проверить статус подписки",
-    "upgradeButton": "Повысить план",
-    "upgradeNoticeBody": "Переход на план, в котором у ассистента есть свой адрес почты. Настраивать провайдера не нужно.",
-    "upgradeNoticeTitle": "Адрес почты для ассистента",
-    "usageSummary": "сегодня отправлено {sent} / {limit} · получено {received}"
-  },
-  "emailServiceCard": {
-    "apiKeyConfigured": "API-ключ {providerName} настроен. Повторная настройка: запуск навыка <code>{setupSkill}</code>.",
-    "connecting": "Подключение к платформе Vellum…",
-    "openProvider": "Открыть {providerName}",
-    "platformLoginNotice": "Вход на платформу Vellum для управления настройками почты.",
-    "providerLabel": "Провайдер",
-    "saveSuccessToast": "Настройки почты сохранены.",
-    "setupInstructions": "Настройка {providerName} через CLI ассистента: запрос ассистенту запустить навык <code>{setupSkill}</code>. Он поможет сохранить API-ключ, определить домен и (по желанию) подключить входящий webhook.",
-    "subtitle": "Настройка отправки и получения почты ассистентом",
-    "title": "Почта"
   },
   "enrollTotpModal": {
     "cancel": "Отмена",
@@ -805,8 +816,10 @@
     "valueAriaLabel": "Значение {label}"
   },
   "freeDowngradeConfirmModal": {
-    "bodyCancelOnly": "Перенаправление в Stripe, чтобы отменить подписку.",
-    "bodyWithFeatures": "При понижении пропадут эти функции Pro. Перенаправление в Stripe, чтобы отменить подписку.",
+    "bodyCancelOnly": "Подписка будет отменена в конце текущего расчётного периода. Доступ Pro сохранится до этого момента.",
+    "bodyCancelOnlyPortal": "Перенаправление в Stripe, чтобы отменить подписку.",
+    "bodyWithFeatures": "При понижении пропадут эти функции Pro. Подписка будет отменена в конце текущего расчётного периода.",
+    "bodyWithFeaturesPortal": "При понижении пропадут эти функции Pro. Перенаправление в Stripe, чтобы отменить подписку.",
     "cancel": "Отмена",
     "confirm": "Перейти на Base",
     "title": "Перейти на Base?"
@@ -858,64 +871,33 @@
     "title": "Генерация изображений",
     "vellumNote": "Генерация изображений идёт через аккаунт Vellum."
   },
-  "integrationDetailModal": {
-    "accountFallback": "Аккаунт {name}",
-    "close": "Закрыть",
-    "confirm": "Подтвердить",
-    "disconnect": "Отключить",
-    "disconnectFailedToast": "Не удалось отключить аккаунт {name}.",
-    "disconnectMessage": "Отключить {account}? Потом можно подключить снова.",
-    "disconnectTitle": "Отключить {name}?",
-    "disconnectedToast": "Аккаунт {name} отключён.",
-    "loginNotice": "Вход на платформу Vellum для управления подключениями OAuth.",
-    "managedTab": "Управляемые",
-    "oauthModeAriaLabel": "Режим OAuth",
-    "subtitle": "Настроить OAuth {name}",
-    "subtitleWithDescription": "Настроить OAuth {name} для {description}",
-    "title": "OAuth {name}",
-    "yourOwnTab": "Свои"
-  },
   "integrationRow": {
-    "configure": "Настроить",
-    "disable": "Выключить",
-    "disconnect": "Отключить",
-    "disconnectFailedToast": "Не удалось отключить аккаунт {name}.",
-    "disconnectMessage": "Отключить аккаунт {name}? Потом можно подключить снова.",
-    "disconnectTitle": "Отключить {name}?",
-    "disconnectedToast": "Аккаунт {name} отключён.",
-    "editConnections": "Изменить подключения",
-    "enable": "Включить"
+    "configureLabel": "Настроить {name}",
+    "connect": "Подключить",
+    "connectedAccounts": "{count, plural, one {# подключённый аккаунт} few {# подключённых аккаунта} many {# подключённых аккаунтов} other {# подключённого аккаунта}}",
+    "needsAttention": "Требует внимания"
   },
   "integrationsPage": {
     "accountConnectedToast": "Аккаунт {providerLabel} успешно подключён.",
     "accountConnectedToastGeneric": "Аккаунт успешно подключён.",
+    "addCustom": "Добавить свою интеграцию",
     "connectFailedToast": "Не удалось подключить {providerLabel}.",
     "connectFailedToastGeneric": "Не удалось подключить. Повторите попытку.",
-    "emptyAllEnabledTitle": "Все интеграции включены",
-    "emptyDefaultSubtitle": "Проверьте подключение и повторите попытку.",
-    "emptyDefaultTitle": "Нет доступных интеграций",
-    "emptyEnabledSubtitle": "Подключение интеграции для начала работы.",
-    "emptyEnabledTitle": "Нет включённых интеграций",
-    "emptyNotEnabledSubtitle": "Все доступные интеграции уже подключены.",
+    "empty": "Нет доступных интеграций.",
     "emptySearchSubtitle": "Нет интеграций по запросу \"{query}\"",
-    "emptySearchTitle": "Нет подходящих интеграций",
-    "filterAll": "Все",
-    "filterAriaLabel": "Фильтр интеграций",
-    "filterEnabled": "Включённые",
-    "filterNotEnabled": "Не включённые",
-    "loadFailed": "Не удалось загрузить интеграции. Повторите попытку.",
     "loading": "Загрузка...",
-    "noAssistant": "Ассистент не найден. Создание ассистента для интеграций.",
+    "mcpUnavailable": "Не удалось загрузить подключения MCP. Другие интеграции по-прежнему доступны.",
     "oauthErrorDenied": "Авторизацию отклонили. Повторите попытку.",
     "oauthErrorExchangeFailed": "Не удалось завершить авторизацию. Повторите попытку.",
     "oauthErrorIdentityFailed": "Не удалось подтвердить личность аккаунта. Повторите попытку.",
     "oauthErrorStateExpired": "Авторизация истекла. Повторите попытку.",
     "oauthErrorStateInvalid": "Состояние авторизации было недействительным. Повторите попытку.",
+    "oauthUnavailable": "Не удалось загрузить некоторые интеграции OAuth. Подключения MCP по-прежнему доступны.",
+    "pluginCatalogUnavailable": "Не удалось загрузить интеграции плагинов. Существующие интеграции по-прежнему доступны.",
     "searchAriaLabel": "Поиск интеграций",
     "searchPlaceholder": "Поиск интеграций",
-    "tabMcp": "MCP",
-    "tabOAuth": "OAuth",
-    "tipBanner": "<tip>Совет:</tip> интеграции можно включать, упоминая их в диалоге."
+    "sectionAvailable": "Доступные",
+    "sectionConfigured": "Ваши интеграции"
   },
   "invoicesTable": {
     "columnAction": "Действие",
@@ -983,14 +965,6 @@
     "summaryTwoClauses": "\"{display}\" {clause1} и {clause2}. Выбор замены ниже: эти ссылки перейдут на неё, затем \"{display}\" будет удалён.",
     "title": "Выбор профиля на замену"
   },
-  "managedOauthTab": {
-    "accountFallback": "Аккаунт {name}",
-    "connectAccount": "Подключить аккаунт",
-    "connectAccountLower": "Подключить аккаунт",
-    "connectToContinue": "Подключение аккаунта для продолжения",
-    "disconnectAriaLabel": "Отключить {account}",
-    "waitingForAuthorization": "Ожидание авторизации..."
-  },
   "mcpAddServerModal": {
     "addServer": "Добавить сервер",
     "adding": "Добавление...",
@@ -1023,95 +997,67 @@
     "urlPlaceholder": "https://example.com/mcp"
   },
   "mcpPage": {
-    "addServerButton": "Добавить сервер",
-    "emptyAddSubtitle": "Добавление MCP-сервера расширяет ассистента внешними инструментами.",
-    "emptyChatSubtitle": "Сообщить ассистенту о необходимости настроить MCP-сервер.",
-    "emptyTitle": "Нет MCP-серверов",
-    "loadError": "Не удалось загрузить MCP-серверы. Проверь, что ассистент запущен.",
-    "loading": "Загрузка MCP-серверов...",
-    "reloadAriaLabel": "Перезагрузить MCP-серверы",
-    "reloadTooltip": "Перезагрузить все серверы",
     "removeDialogConfirm": "Удалить",
     "removeDialogMessage": "Точно удалить \"{serverId}\"? Это отключит все инструменты этого сервера.",
     "removeDialogTitle": "Удалить MCP-сервер",
     "setupPrompt": "Помоги настроить MCP-сервер, чтобы расширить тебя внешними инструментами.",
-    "subtitle": "Управление подключениями серверов Model Context Protocol и их зарегистрированными инструментами.",
-    "title": "MCP-серверы",
-    "toastAddFailed": "Не удалось добавить {name}",
-    "toastAdded": "Добавлен {name}",
-    "toastAlreadyAuthenticated": "{serverId} уже аутентифицирован",
-    "toastAuthFailed": "Аутентификация не удалась для {serverId}",
-    "toastAuthPollingFailed": "Опрос аутентификации не удался для {serverId}",
-    "toastAuthStartFailed": "Не удалось начать аутентификацию для {serverId}",
-    "toastAuthTimedOut": "Время аутентификации истекло для {serverId}",
-    "toastAuthenticatedSuccess": "{serverId} успешно аутентифицирован",
-    "toastDisableFailed": "Не удалось выключить {serverId}",
-    "toastEnableFailed": "Не удалось включить {serverId}",
-    "toastOAuthRevokeFailed": "Не удалось отозвать OAuth для {serverId}",
-    "toastOAuthRevoked": "Учётные данные OAuth отозваны для {serverId}",
-    "toastReloadFailed": "Не удалось перезагрузить MCP-серверы",
-    "toastReloadSuccess": "MCP-серверы перезагружены",
     "toastRemoveFailed": "Не удалось удалить {serverId}",
-    "toastRemoved": "Удалён {serverId}",
-    "toastUpdateFailed": "Не удалось обновить {serverId}",
-    "toastUpdated": "Обновлён {serverId}",
-    "totalTokens": "~{count} токенов всего",
-    "totalTools": "{count, plural, one {всего # инструмент} few {всего # инструмента} many {всего # инструментов} other {всего # инструмента}}"
+    "toastRemoved": "Удалён {serverId}"
+  },
+  "mcpConnect": {
+    "addFailed": "Не удалось добавить интеграцию.",
+    "authorizationFailed": "Авторизация не удалась. Подключитесь ещё раз.",
+    "pollFailed": "Не удалось проверить подключение. Повторите попытку.",
+    "popupBlocked": "Браузер заблокировал окно входа. Разрешите всплывающие окна и повторите попытку.",
+    "retry": "Повторить",
+    "saveFailed": "Не удалось сохранить интеграцию.",
+    "startFailed": "Не удалось начать подключение. Повторите попытку.",
+    "stopWaiting": "Прекратить ожидание",
+    "timedOut": "Подключение занимает слишком много времени. Повторите попытку или прекратите ожидание.",
+    "waitingForAuthorization": "Завершите авторизацию {name} в браузере и вернитесь сюда.",
+    "waitingForRuntime": "Ожидание готовности {name}..."
   },
   "mcpServerCard": {
-    "authenticate": "Аутентифицировать",
-    "authenticating": "Аутентификация...",
+    "actionsSheetClose": "Закрыть",
     "configure": "Настроить",
-    "configureTooltip": "Настроить",
-    "estimatedTokens": "~{count} токенов",
-    "oauthBadge": "OAuth",
-    "reAuth": "Повторная аутентификация",
-    "reAuthTooltip": "Повторно аутентифицировать OAuth",
-    "registeredTools": "{count, plural, one {# зарегистрированный инструмент} few {# зарегистрированных инструмента} many {# зарегистрированных инструментов} other {# зарегистрированных инструмента}}",
-    "removeServerAriaLabel": "Удалить {serverId}",
-    "removeServerTooltip": "Удалить сервер",
-    "revoke": "Отозвать",
-    "revokeOAuthTooltip": "Отозвать учётные данные OAuth",
-    "revoking": "Отзыв...",
-    "statusConnected": "Подключён",
-    "statusDisabled": "Выключен",
-    "statusError": "Ошибка",
-    "statusNeedsAuth": "Нужна аутентификация",
-    "toggleDisableAriaLabel": "Выключить {serverId}",
-    "toggleEnableAriaLabel": "Включить {serverId}",
-    "toolCount": "{count, plural, one {# инструмент} few {# инструмента} many {# инструментов} other {# инструмента}}",
-    "toolTokensAbbrev": "~{count} ток"
+    "configureLabel": "Настроить {serverId}",
+    "connecting": "Подключение...",
+    "finishConnecting": "Завершить подключение",
+    "managePlugin": "Управление плагином",
+    "moreActions": "Другие действия для {serverId}",
+    "reconnect": "Переподключить",
+    "removeServer": "Удалить",
+    "statusNeedsAttention": "Требует внимания",
+    "viewDetails": "Подробнее"
   },
   "mcpServerDetailModal": {
     "apiKey": "API-ключ",
     "apiKeyPlaceholder": "sk_...",
-    "apiKeyPlaceholderKeep": "••••••••  (пустое поле сохраняет текущий)",
+    "savedApiCredentialPlaceholder": "••••••••  (пустое поле сохраняет текущий)",
     "authApiKey": "API-ключ",
     "authBearerToken": "Bearer-токен",
     "authNone": "Нет",
     "authentication": "Аутентификация",
     "bearerToken": "Bearer-токен",
     "bearerTokenPlaceholder": "tok_...",
-    "bearerTokenPlaceholderKeep": "••••••••  (пустое поле сохраняет текущий)",
+    "savedBearerPlaceholder": "••••••••  (пустое поле сохраняет текущий)",
     "cancel": "Отмена",
-    "defaultRiskLevel": "Уровень риска по умолчанию",
+    "close": "Закрыть",
+    "command": "Команда",
     "description": "транспорт {transport} · {status}",
-    "emptyDescription": "-",
+    "endpoint": "Адрес сервера",
     "headerName": "Имя заголовка",
     "headerNamePlaceholder": "X-API-Key",
     "oauthBadge": "OAuth",
     "oauthManagedHint": "управляется через поток OAuth",
-    "registeredToolsHeading": "Зарегистрированные инструменты ({count})",
-    "riskHigh": "Высокий",
-    "riskLow": "Низкий",
-    "riskMedium": "Средний",
     "save": "Сохранить",
     "saving": "Сохранение...",
-    "tableDescription": "Описание",
-    "tableTokens": "Токены",
-    "tableTool": "Инструмент",
     "tokenOverhead": "Оценка накладных токенов: ~{count} токенов",
-    "toolEstimatedTokens": "~{count}"
+    "toolEstimatedTokens": "~{count} токенов",
+    "toolsEmpty": "Для этого подключения нет зарегистрированных инструментов.",
+    "toolsError": "Не удалось загрузить инструменты. Закройте и снова откройте настройки, чтобы повторить попытку.",
+    "toolsHeading": "Зарегистрированные инструменты",
+    "toolsLoading": "Загрузка инструментов..."
   },
   "mediaEmbedsCard": {
     "add": "Добавить",
@@ -1166,7 +1112,9 @@
     "benefitPush": "Push-уведомления",
     "download": "Скачать",
     "subtitle": "Приложение Vellum для {appName} даёт нативный опыт.",
-    "title": "Скачать приложение {appName}"
+    "subtitleGeneric": "Мобильное приложение Vellum даёт нативный опыт.",
+    "title": "Скачать приложение {appName}",
+    "titleGeneric": "Скачать мобильное приложение Vellum"
   },
   "notificationsPage": {
     "description": "Настройка уведомлений Vellum на этом устройстве Android.",
@@ -1214,12 +1162,12 @@
     "publicUrlHelperTunnel": "Этот адрес взят из `vellum tunnel` на этом устройстве. Если публичный адрес ассистента отличается от этого, требуется указать актуальный адрес.",
     "publicUrlLabel": "Публичный URL",
     "publicUrlPlaceholder": "https://your-assistant.ts.net",
-    "subtitle": "Отсканируйте камерой другого устройства или откройте на нём сгенерированную ссылку, чтобы пользоваться {name}.",
+    "subtitle": "Отсканируйте камерой телефона или вставьте ссылку на другом компьютере, чтобы пользоваться {name}.",
     "subtitleFallbackName": "этим ассистентом",
     "title": "Привязать устройство"
   },
   "pairDeviceClient": {
-    "connectivityHint": "Если сканирование не подключается: на хосте должен быть запущен туннель (`vellum tunnel`), публичный URL должен указывать на него, затем создание нового кода.",
+    "connectivityHint": "Если сканирование не подключается: на хосте должен быть запущен туннель (список провайдеров: `vellum tunnel --help`), публичный URL должен указывать на него, затем создание нового кода.",
     "httpError": "Привязка не удалась (HTTP {status}).",
     "networkError": "Не удалось достучаться до ассистента. Проверьте, что он запущен, и повторите попытку.",
     "unexpectedResponse": "Ассистент вернул неожиданный ответ."
@@ -1236,16 +1184,20 @@
   "pairDeviceUrl": {
     "loopback": "Это loopback-адрес, до которого другие устройства не достучатся. Нужен публичный https URL ассистента.",
     "nonHttps": "URL должен использовать https, чтобы устройства подключались безопасно.",
+    "privateAddress": "Этот адрес указывает на адрес частной сети. Введите публичный https URL ассистента, чтобы устройства могли до него достучаться.",
     "serviceFallbackName": "провайдер туннеля",
-    "serviceWebsite": "Это сайт {service}, а не адрес ассистента. Команда `vellum tunnel` на хосте даёт адрес.",
+    "serviceWebsite": "Это сайт {service}, а не адрес ассистента. Запустите туннель на хосте, чтобы получить адрес; список провайдеров: `vellum tunnel --help`.",
     "unparseable": "Нужен корректный URL, например https://your-assistant.ts.net."
   },
   "pairedDevicesSection": {
-    "confirmMessage": "Устройство {platform} {hash} потеряет доступ к этому ассистенту. Его токены доступа сразу станут недействительными; чтобы подключиться снова, устройство нужно привязать с этой машины.",
+    "browserOnOs": "{browser} на {os}",
+    "confirmMessageNamed": "{name} ({hash}) потеряет доступ к этому ассистенту. Его токены доступа сразу станут недействительными; чтобы подключиться снова, устройство нужно привязать с этой машины.",
     "confirmTitle": "Отозвать это устройство?",
     "dateUnknown": "неизвестно",
-    "datesLine": "Привязано {paired} · Последнее использование {lastUsed}",
     "hostRevokeDisabledTitle": "Это учётные данные этой же машины; если их отозвать, хост потеряет доступ к ассистенту.",
+    "pairedActiveLine": "Привязано {paired} · Активно сейчас",
+    "pairedAndUsedLine": "Привязано {paired} · Последнее использование {lastUsed}",
+    "pairedLine": "Привязано {paired}",
     "platformUnknown": "Неизвестно",
     "revokeButton": "Отозвать",
     "thisMachine": "Эта машина",
@@ -1253,24 +1205,15 @@
   },
   "paymentMethodRow": {
     "endingIn": "Оканчивается на {last4}",
-    "remove": "Удалить",
-    "removing": "Удаление…",
-    "savedCard": "Сохранённая карта",
-    "updateCard": "Обновить карту"
+    "replaceCard": "Заменить карту",
+    "savedCard": "Сохранённая карта"
   },
   "paymentMethodsCard": {
     "addButton": "Добавить способ оплаты",
     "empty": "Способа оплаты нет. Добавление для автопополнения.",
     "loadError": "Не удалось загрузить способы оплаты.",
     "loading": "Загрузка…",
-    "removeConfirmCancel": "Оставить карту",
-    "removeConfirmConfirm": "Удалить",
-    "removeConfirmMessage": "Если удалить карту, автопополнение выключится.",
-    "removeConfirmPending": "Удаление…",
-    "removeConfirmTitle": "Удалить способ оплаты?",
-    "removeError": "Не удалось удалить способ оплаты. Повторите попытку.",
-    "subtitle": "Способы оплаты, привязанные к аккаунту.",
-    "title": "Способы оплаты"
+    "title": "Способ оплаты"
   },
   "pendingPairingRequests": {
     "approveButton": "Одобрить",
@@ -1289,15 +1232,18 @@
     "heading": "План",
     "loadError": "Не удалось загрузить план.",
     "loading": "Загрузка плана...",
+    "manageSubscription": "Управление подпиской",
     "nextPlan": "Следующий план",
     "powerUp": "Усилить",
     "powerUpFor": "Усилить за +{amount}/мес",
-    "renewsOn": "Ежемесячная оплата • Подписка автоматически продлится {date}.",
     "usageBalanceAddCredits": "Добавить",
+    "usageBalanceBarRenews": "Текущее использование, продлится {date}",
+    "usageBalanceBarResets": "Текущее использование, сброс {date}",
     "usageBalanceExhausted": "Добавление кредитов, чтобы продолжить пользоваться ассистентом",
     "usageBalancePctUsed": "использовано {pct}%",
+    "usageBalanceRenews": "Продлится {date}",
     "usageBalanceResets": "Сброс {date}",
-    "usageBalanceTitle": "Баланс использования",
+    "usageBalanceTitle": "Текущее использование",
     "usageChip": "Использование {name}, сброс каждый месяц",
     "viewAllPlans": "Все планы"
   },
@@ -1333,8 +1279,8 @@
     "checkoutFailedToast": "Не удалось начать оплату повышения. Повторите попытку.",
     "downgradeTo": "Перейти на {name}",
     "featureComputer": "Компьютер {machine}",
-    "featureCreditsIncluded": "Входит {amount} кредитами",
     "featureStorage": "{gib} ГБ хранилища",
+    "featureUsage": "Использование {name}, сброс каждый месяц",
     "foreverCaption": "Навсегда",
     "freeFeaturePayAsYouGo": "Кредиты по мере использования",
     "freeFeatureSmallComputer": "Небольшой компьютер",
@@ -1353,6 +1299,7 @@
     "keyboardShortcutsTitle": "Сочетания клавиш",
     "launchAtLoginAriaLabel": "Запускать при входе",
     "launchAtLoginDescription": "Автоматический запуск Vellum при входе в Mac.",
+    "launchAtLoginDescriptionWindows": "Автоматический запуск Vellum при входе в Windows.",
     "launchAtLoginTitle": "Запускать при входе",
     "sendWithCmdEnter": "Отправлять через Cmd+Enter",
     "sendWithCmdEnterHelper": "Если включено, Enter добавляет новую строку, а Cmd+Enter отправляет.",
@@ -1435,7 +1382,6 @@
     "enableExtendedThinkingLabel": "Включить расширенное размышление",
     "maxOutputTokensLabel": "Макс. токенов на выход",
     "reset": "Сбросить",
-    "snapshotsHint": "Поля, оставленные по умолчанию, сохраняются с показанными значениями и не изменятся, если значения ассистента по умолчанию позже сменятся.",
     "speedLabel": "Скорость",
     "streamThinkingTokensLabel": "Стримить токены размышления",
     "temperatureLabel": "Температура",
@@ -1452,13 +1398,35 @@
     "transient": "Сохранено, но тестовый запрос через этот профиль не завершился: {detail} Возможно, это временно.",
     "unknown": "Сохранено, но тестовый запрос через этот профиль не прошёл: {detail}"
   },
+  "profileCreateModelFirst": {
+    "addApiKeyTag": "Добавить API-ключ",
+    "cancelConnect": "Отменить настройку",
+    "chooseFromList": "Выбрать из списка",
+    "connectedTag": "Подключено",
+    "customModelAriaLabel": "Свой ID модели",
+    "customModelHint": "Точный идентификатор модели, который ждёт провайдер. Он уйдёт в подключение как есть.",
+    "customModelOption": "Ввести свой ID модели…",
+    "customModelPlaceholder": "provider/model-id",
+    "modelAriaLabel": "Модель",
+    "modelLabel": "Модель",
+    "modelNoMatches": "Подходящих моделей нет",
+    "modelPlaceholder": "Поиск моделей…",
+    "modelResultsAnnouncement": "{count, plural, one {# модель доступна} few {# модели доступны} many {# моделей доступно} other {# модели доступно}}. Стрелки вверх и вниз для перехода, Enter для выбора.",
+    "providerLabel": "Провайдер",
+    "recommendedMeta": "Рекомендуется",
+    "seeLess": "Свернуть",
+    "seeMore": "Показать ещё",
+    "setUpTag": "Настроить",
+    "signInTag": "Войти",
+    "soleProviderHint": "Эту модель обслуживает только {name}."
+  },
   "profileDetailPanel": {
-    "createProfile": "Создать профиль",
+    "create": "Создать модель",
+    "createTitle": "Новая модель",
     "defaultTitle": "Профиль",
     "delete": "Удалить",
     "deleting": "Удаление…",
     "managedTag": "Управляет Vellum",
-    "newProfileTitle": "Новый профиль",
     "save": "Сохранить",
     "saveAsNew": "Сохранить как новый",
     "saveChanges": "Сохранить изменения",
@@ -1467,6 +1435,9 @@
   "profileEditor": {
     "maxTokensNoInputRoom": "Макс. токенов ({maxTokens}) занимает всё контекстное окно в {window} токенов под выход, и для сообщений места не остаётся. Уменьшение значения (например, 8000).",
     "maxTokensOverCap": "Макс. токенов ({maxTokens}) больше максимального выхода модели в {cap} токенов. Уменьшение до {cap} или меньше.",
+    "nameRequired": "Укажите имя",
+    "nameTaken": "Это имя уже занято",
+    "providerRequired": "Выбор провайдера",
     "subscriptionSteeringHint": "Подписка ChatGPT доступна как провайдер ChatGPT."
   },
   "profileEditorFields": {
@@ -1477,9 +1448,7 @@
     "descriptionLabel": "Описание <optional>(необязательно)</optional>",
     "descriptionPlaceholder": "Когда использовать этот профиль",
     "displayNameLabel": "Отображаемое имя",
-    "displayNamePlaceholder": "например, Быстрый и дешёвый",
-    "keyLabel": "Ключ",
-    "keyPlaceholder": "например, fast-cheap",
+    "displayNamePlaceholder": "например, Claude Opus 4.8",
     "nameLabel": "Имя",
     "newProviderNote": "Новое подключение провайдера появится в разделе «Провайдеры».",
     "providerLabel": "Провайдер",
@@ -1489,8 +1458,8 @@
   "profileEditorModal": {
     "cancel": "Отмена",
     "close": "Закрыть",
+    "createTitle": "Новая модель",
     "editProfileTitle": "Изменить профиль",
-    "newProfileTitle": "Новый профиль",
     "platformTag": "Платформа",
     "profileFallbackTitle": "Профиль",
     "save": "Сохранить",
@@ -1517,6 +1486,18 @@
     "selectModelError": "Выбор модели.",
     "selectModelPlaceholder": "Выбор модели",
     "selectProviderPlaceholder": "Выбор провайдера…"
+  },
+  "profileModalitiesSection": {
+    "audio": "Аудио",
+    "enableAria": "Включить {modality}",
+    "enabledColumn": "Включено",
+    "helper": "Модель получает модальность, только если она включена и отмечена как поддерживаемая. Изображения, которые не отправляются так, подписываются текстом.",
+    "image": "Изображение",
+    "resolvedOff": "Не отправляется модели",
+    "resolvedOn": "Отправляется модели",
+    "supportedAria": "Модель поддерживает {modality}",
+    "supportedColumn": "Модель поддерживает",
+    "title": "Модальности"
   },
   "profileRow": {
     "actionsAriaLabel": "Действия для {displayName}",
@@ -1550,9 +1531,11 @@
     "advanced": "Дополнительно",
     "apiKeyPlaceholder": "API-ключ",
     "baseUrlHintOllama": "Пустое поле: локальный Ollama по умолчанию. Иначе удалённый либо нестандартный хост.",
+    "baseUrlHintOpencode": "Пустое поле: OpenCode Zen. Иначе укажите endpoint OpenCode Go.",
     "baseUrlLabel": "Базовый URL",
     "baseUrlPlaceholder": "https://api.x.ai/v1",
     "baseUrlPlaceholderOllama": "http://127.0.0.1:11434/v1",
+    "baseUrlPlaceholderOpencode": "https://opencode.ai/zen/v1",
     "cancel": "Отмена",
     "customProviderHint": "Свои провайдеры подключаются к любому endpoint с API, совместимым с OpenAI: xAI, Groq, LM Studio, vLLM и похожим.",
     "customProviderOption": "Свой провайдер",
@@ -1593,9 +1576,11 @@
   "providerEditorContent": {
     "apiKeyPlaceholder": "API-ключ",
     "baseUrlHintOllama": "Пустое поле: локальный Ollama по умолчанию. Иначе удалённый либо нестандартный хост.",
+    "baseUrlHintOpencode": "Пустое поле: OpenCode Zen. Иначе укажите endpoint OpenCode Go.",
     "baseUrlLabel": "Базовый URL",
     "baseUrlPlaceholder": "https://api.example.com/v1",
     "baseUrlPlaceholderOllama": "http://127.0.0.1:11434/v1",
+    "baseUrlPlaceholderOpencode": "https://opencode.ai/zen/v1",
     "cancel": "Отмена",
     "displayNameLabel": "Отображаемое имя <optional>(необязательно)</optional>",
     "displayNamePlaceholder": "например, Мой ключ Anthropic",
@@ -1623,7 +1608,7 @@
     "customTag": "Свой",
     "customTagTitle": "Созданный провайдер на endpoint, совместимом с OpenAI.",
     "defaultTag": "По умолчанию",
-    "defaultTagTitle": "Встроенные профили (Balanced, Quality, Cost, Speed) используют этого провайдера.",
+    "defaultTagTitle": "Встроенные профили (Balanced, Quality, Budget, Fast) используют этого провайдера.",
     "delete": "Удалить",
     "edit": "Изменить",
     "localTag": "Локальный",
@@ -1643,10 +1628,10 @@
     "allDoneStatus": "Готово!",
     "confirmingCaption": "Это может занять пару секунд.",
     "continueInBackground": "Продолжить в фоне",
-    "creditsChip": "{count} кредитов",
     "dimensionsComplete": "{dimensions} готово",
     "goToBilling": "К оплате",
     "machineLabel": "Машина",
+    "noExtraUsage": "Без дополнительного использования",
     "packageChip": "пакет {name}",
     "planReadyStatus": "План готов",
     "retryInBackground": "Повторить в фоне",
@@ -1657,6 +1642,7 @@
     "storageLabel": "Хранилище",
     "takingLongerStatus": "Это занимает больше времени, чем ожидалось",
     "tryAgain": "Попробовать снова",
+    "usageLabel": "Использование",
     "waitingCaptionLong": "Ещё работаем. Это может занять минуту или две.",
     "waitingCaptionShort": "Это может занять пару секунд."
   },
@@ -1681,23 +1667,6 @@
     "loginNoticeExit": "Вход на платформу Vellum для выхода из режима восстановления.",
     "resumeAssistant": "Возобновить ассистента",
     "title": "Режим восстановления"
-  },
-  "referralContent": {
-    "copied": "Скопировано!",
-    "copyError": "Не удалось скопировать реферальную ссылку.",
-    "copySuccess": "Скопировано в буфер обмена!",
-    "creditsEarned": "Заработано кредитов",
-    "friendsReferred": "Приглашено друзей",
-    "gatedNotice": "Реферальные кредиты сейчас не начисляются. Покупка кредитов или переход на Pro включает начисление. Ссылка-приглашение пока работает.",
-    "loadError": "Не удалось загрузить сведения о реферальной программе.",
-    "loading": "Загрузка...",
-    "shareLink": "Поделиться ссылкой",
-    "subtitleDefault": "Расскажи друзьям о Vellum и получай кредиты за каждую регистрацию.",
-    "subtitleGated": "Пригласи друзей в Vellum. Реферальные кредиты начнут начисляться после покупки кредитов или перехода на Pro.",
-    "subtitleWithAmounts": "Расскажи друзьям о Vellum: вы оба получите {creditAmount} кредитов после их регистрации, всего до {earningCap}."
-  },
-  "referralModal": {
-    "title": "Заработать бесплатные кредиты"
   },
   "resizeCard": {
     "apply": "Применить",
@@ -1795,21 +1764,6 @@
     "warningLabel": "Событие Warning",
     "warningSentToast": "Событие warning Sentry отправлено."
   },
-  "sharedUi": {
-    "checkingDomain": "Проверка домена…",
-    "domainVerified": "Домен подтверждён",
-    "failedTitle": "Не удалось подтвердить домен. Записи DNS могли ещё не распространиться. Освободите домен и зарегистрируйте его снова.",
-    "managedLabel": "Управляемые",
-    "managedServicesBanner": "Управляемые сервисы тарифицируются и списываются с баланса аккаунта Vellum. <link>Смотреть цены</link>",
-    "modeToggleAriaLabel": "Режим сервиса",
-    "unknownStatus": "Неизвестный статус",
-    "unknownStatusTitle": "Не удалось получить статус проверки домена.",
-    "verificationFailed": "Проверка не прошла",
-    "verifiedTitle": "Записи DNS подтверждены. Домен готов отправлять и получать почту.",
-    "verifyingDomain": "Проверка домена…",
-    "verifyingTitle": "Записи DNS подготовлены. Ждём, пока почтовый провайдер их подтвердит: обычно это несколько минут.",
-    "yourOwnLabel": "Свои"
-  },
   "shortcutsSections": {
     "alreadyUsedBy": "Уже занято: {label}",
     "appDescription": "Работают, пока в фокусе окно Vellum.",
@@ -1826,11 +1780,6 @@
     "recordingHint": "Запись… нажатие сочетания или Esc отменяет",
     "removeBindingAriaLabel": "Удалить привязку {label}",
     "resetShortcutAriaLabel": "Сбросить {label} к значению по умолчанию"
-  },
-  "showTipsRow": {
-    "ariaLabel": "Показывать подсказки",
-    "description": "Редкие подсказки в боковой панели про функции, которые ещё не использовались.",
-    "label": "Показывать подсказки"
   },
   "soundsSections": {
     "addSound": "Добавить звук",
@@ -1861,6 +1810,19 @@
     "subtitle": "Настройка того, как ассистент слышит слова",
     "title": "Речь в текст"
   },
+  "sttRoleOverrides": {
+    "clear": "Сбросить",
+    "clearAria": "Сбросить: {feature}",
+    "clearFailed": "Не удалось сбросить",
+    "role": {
+      "batch": "Транскрипция файлов",
+      "dictation": "Диктовка",
+      "liveVoice": "Голосовой режим",
+      "telephony": "Звонки",
+      "watch": "Наблюдение"
+    },
+    "title": "По функциям"
+  },
   "systemTasksSection": {
     "consolidationName": "Консолидация",
     "consolidationPausedHelper": "Память выключена, поэтому консолидация на паузе.",
@@ -1881,13 +1843,56 @@
   },
   "teleportCard": {
     "cancel": "Отмена",
+    "cloudSetupFailed": "Не удалось настроить облачного ассистента.",
     "confirmAndSwitch": "Подтвердить и переключиться",
     "confirmLabel": "Teleport",
     "confirmMessage": "Данные скопируются в новую среду. Текущий ассистент останется доступен до подтверждения, что новый работает.",
+    "dockerDescriptionLinux": "Запустить ассистента в контейнере Docker на этом компьютере.",
+    "dockerDescriptionMacos": "Запустить ассистента в контейнере Docker на этом Mac.",
+    "dockerDescriptionWindows": "Запустить ассистента в контейнере Docker на этом ПК.",
+    "existingPlatformAssistant": "У вас уже есть ассистент на платформе «{id}». Сначала отключите его, затем повторите Teleport.",
+    "exportTimedOut": "Время ожидания экспорта истекло.",
+    "importFailed": "Импорт не удался.",
+    "importFailedHttp": "Импорт не удался (HTTP {status}).",
+    "importJobFailed": "Задача импорта завершилась с ошибкой.",
+    "importNoJobId": "Импорт принят, но ID задачи не возвращён.",
+    "importReportedFailure": "Импорт сообщил об ошибке.",
+    "importTimedOut": "Время ожидания импорта истекло через 60 минут.",
+    "localCreateFailed": "Не удалось создать локального ассистента.",
+    "localDescriptionLinux": "Запустить ассистента локально на этом компьютере.",
+    "localDescriptionMacos": "Запустить ассистента локально на этом Mac.",
+    "localDescriptionWindows": "Запустить ассистента локально на этом ПК.",
+    "localNotFound": "Не удалось найти или создать локального ассистента.",
+    "localRuntimeVersionUnknown": "Не удалось определить версию рантайма локального ассистента. Перезапустите или обновите локального ассистента, затем повторите Teleport.",
+    "loginNotice": "Вход на платформу Vellum для Teleport этого ассистента.",
+    "moveToDocker": "Перенести в Docker",
+    "moveToLocal": "Перенести локально",
+    "moveToPlatform": "Перенести в облако (платформа)",
+    "multipleOrganizations": "Найдено несколько организаций. Сначала выберите одну в настройках аккаунта.",
+    "noOrganizations": "Для этого аккаунта не найдено организаций.",
+    "platformDescription": "Запустить ассистента в облаке под управлением платформы Vellum.",
     "progressAriaLabel": "Прогресс Teleport",
+    "stepCheckingExisting": "Проверка существующего ассистента...",
+    "stepDownloading": "Загрузка данных...",
+    "stepExportingCloud": "Экспорт облачных данных...",
+    "stepExportingLocal": "Экспорт данных ассистента...",
+    "stepFinalizingCloud": "Завершение настройки облачного ассистента...",
+    "stepImporting": "Импорт данных...",
+    "stepImportingToCloud": "Импорт данных в облако...",
+    "stepPreparingExport": "Подготовка экспорта...",
+    "stepPreparingImport": "Подготовка импорта...",
+    "stepPreparingLocal": "Подготовка локального ассистента...",
+    "stepResolvingOrganization": "Определение организации...",
+    "stepSettingUpCloud": "Настройка облачного ассистента...",
+    "stepUploading": "Отправка данных в облако...",
     "subtitle": "Перенос ассистента в другую среду размещения.",
+    "switchFailed": "Переключение не удалось: {message}",
+    "switchFailedUnknown": "Не удалось переключить ассистента.",
+    "teleportFailed": "Teleport не удался: {message}",
+    "teleportFailedUnknown": "Teleport не удался.",
     "title": "Teleport",
     "tryAgain": "Попробовать снова",
+    "unsupportedDestination": "Неподдерживаемое назначение Teleport.",
     "verifyTitle": "Перенос завершён: проверь, что новый ассистент работает."
   },
   "textToSpeechCard": {
@@ -1917,12 +1922,12 @@
     "storageTooltip": "Постоянное дисковое пространство для файлов и данных ассистента"
   },
   "timezonePicker": {
-    "citiesAriaLabel": "Города",
-    "closestCity": "Ближайший город",
-    "noMatchingCities": "Нет подходящих городов",
+    "noMatches": "Нет совпадений",
     "notSet": "Не задано",
-    "searchPlaceholder": "Поиск города или страны...",
-    "timeZone": "Часовой пояс"
+    "searchPlaceholder": "Поиск по городу или смещению UTC...",
+    "timezone": "Часовой пояс",
+    "timezonesAriaLabel": "Часовые пояса",
+    "zoneName": "Название часового пояса"
   },
   "timezoneSection": {
     "description": "Используется при показе времени и назначении напоминаний.",
@@ -2102,6 +2107,16 @@
   "useBillingPortalSession": {
     "openError": "Не удалось открыть портал оплаты. Повторите попытку."
   },
+  "useCancelSubscription": {
+    "cancelFailedToast": "Не удалось отменить подписку. Повторите попытку.",
+    "canceledToast": "План Pro отменён. Доступ сохранится до {date}.",
+    "endOfBillingPeriod": "конца расчётного периода"
+  },
+  "useChatgptDeviceAuth": {
+    "expired": "Срок действия кода истёк. Начните заново, чтобы получить новый.",
+    "rejected": "ChatGPT не смог подтвердить этот код.",
+    "startFailed": "Не удалось начать вход через ChatGPT. Повторите попытку."
+  },
   "useDaemonConfig": {
     "assistantNotReadyToast": "Ассистент не готов. Повторите попытку.",
     "saveApiKeyFailedToast": "Не удалось сохранить API-ключ {providerName}. Повторите попытку."
@@ -2122,6 +2137,10 @@
     "deleteInUseToast": "Этот провайдер используется в профиле или как провайдер по умолчанию. Сначала обновление этих настроек, потом удаление.",
     "setDefaultFailedToast": "Не удалось назначить провайдера по умолчанию. Повторите попытку."
   },
+  "useReactivateSubscription": {
+    "reactivateFailedToast": "Не удалось возобновить подписку. Повторите попытку.",
+    "reactivatedToast": "План Pro снова активен."
+  },
   "useSystemTasks": {
     "consolidationAlreadyQueued": "Консолидация уже в очереди или выполняется.",
     "consolidationQueued": "Консолидация в очереди.",
@@ -2141,8 +2160,6 @@
     "customKey": "Своя",
     "defaultBadge": "По умолчанию",
     "enableVoiceShortcut": "Включить сочетание клавиш",
-    "fnKeyLabel": "Fn",
-    "fnRefusedNote": "Для Fn нужен мониторинг ввода. Разрешение в Системных настройках или своё сочетание.",
     "focusedTabNote": "«Нажми и говори» работает только пока эта вкладка в фокусе, и браузеры могут перехватывать некоторые сочетания (например, Ctrl+T) раньше страницы. Для постоянного режима «Нажми и говори»: приложение Vellum, а не веб-версия.",
     "grantMicrophoneAccessHint": "Разрешение доступа к микрофону показывает доступные устройства ввода.",
     "interruptSensitivityAriaLabel": "Чувствительность к перебиванию",
@@ -2159,7 +2176,6 @@
     "pauseBeforeReplyDescription": "Как долго ассистент ждёт после паузы в речи, прежде чем ответить. Более длинная пауза даёт собраться с мыслями посреди фразы без обрыва.",
     "pauseBeforeReplyLabel": "Пауза перед ответом",
     "pressShortcut": "Нажатие сочетания…",
-    "recommendedBadge": "Рекомендуем",
     "recordingPrompt": "Нажатие аккорда или клавиши…",
     "resetToDefaults": "Сбросить к значениям по умолчанию",
     "savedMicrophone": "Сохранённый микрофон",
@@ -2174,15 +2190,34 @@
     "speechServicesBannerLink": "Настройка в «Модели и сервисы»",
     "speechServicesBannerPrompt": "Свой API-ключ для STT или TTS или свой голос?",
     "systemDefault": "Системный по умолчанию",
+    "turnDetectionDescription": "Модель распознавания речи сама решает, когда вы закончили, вместо таймера паузы выше.",
+    "turnDetectionFailed": "Не удалось изменить режим реплик",
+    "turnDetectionLabel": "Определение реплик моделью",
+    "turnDetectionLanguageUnsupported": "Недоступно для выбранного языка речи.",
     "turnTakingSubtitle": "Где заканчивается ход пользователя и начинается ход ассистента. Для разговоров без рук. В режиме «нажми и говори» решает клавиша.",
     "turnTakingTitle": "Смена ходов",
     "voiceShortcutSubtitle": "Нажатие сочетания начинает или заканчивает разговор голосом из любого места в приложении.",
     "voiceShortcutSubtitleDesktop": "Глобальное сочетание для начала и окончания разговора голосом.",
     "voiceShortcutTitle": "Сочетание клавиш"
   },
+  "voiceKeyCard": {
+    "allowInputMonitoring": "Разрешить мониторинг ввода",
+    "customHint": "Удерживайте две или более из клавиш Cmd, Ctrl, Option и Shift, затем отпустите.",
+    "customLabel": "Своя",
+    "fnDictationNote": "Если диктовка macOS запускается двойным нажатием Fn, отключите это в разделе «Клавиатура» Системных настроек.",
+    "fnLabel": "Fn",
+    "needsInputMonitoring": "Клавишу нельзя отслеживать, пока не разрешён мониторинг ввода.",
+    "offLabel": "Выкл.",
+    "recordingPrompt": "Удерживайте клавиши-модификаторы…",
+    "refusedNote": "Не удалось отслеживать клавишу. Перезапустите приложение, чтобы попробовать снова.",
+    "subtitle": "Удерживайте, чтобы диктовать в позицию курсора или спросить о выделенном. Нажмите дважды, чтобы начать или завершить звонок.",
+    "title": "Голосовая клавиша",
+    "voiceOverNote": "Control и Option — модификатор VoiceOver. Если вы используете VoiceOver, его команды получат эти клавиши первыми."
+  },
   "voicePickerCard": {
     "changeButton": "Сменить",
     "creditsNote": "Тратит кредиты Vellum через провайдеров вроде ElevenLabs и Deepgram.",
+    "loadingAria": "Загрузка голоса",
     "title": "Голос",
     "titleWithName": "Голос {name}"
   },
@@ -2250,5 +2285,37 @@
     "redirectHint": "Этот URL: в настройки перенаправления OAuth-приложения.",
     "redirectUrl": "Redirect URL",
     "waitingAuthorization": "Ожидание авторизации..."
+  },
+  "personalityPage": {
+    "axes": {
+      "companionCoworker": {
+        "left": "Компаньон",
+        "right": "Коллега"
+      },
+      "executeCollaborate": {
+        "left": "Самостоятельный",
+        "right": "Совместный"
+      },
+      "genzBoomer": {
+        "left": "Gen Z",
+        "right": "Baby Boomer"
+      },
+      "playfulSerious": {
+        "left": "Игривый",
+        "right": "Серьёзный"
+      },
+      "politeUnfiltered": {
+        "left": "Вежливый",
+        "right": "Без фильтра"
+      }
+    },
+    "loadError": "Не удалось загрузить ползунки личности.",
+    "rangeAriaLabel": "{left} до {right}",
+    "save": "Сохранить",
+    "saveErrorToast": "Не удалось сохранить ползунки личности. Повторите попытку.",
+    "saveSuccessToast": "Ползунки личности сохранены.",
+    "saving": "Сохранение…",
+    "subtitle": "Сохраняет значения ползунков у этого ассистента. Файлы идентичности не переписываются.",
+    "title": "Личность"
   }
 }

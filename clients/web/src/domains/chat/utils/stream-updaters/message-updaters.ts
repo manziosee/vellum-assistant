@@ -9,11 +9,15 @@
  * `(prev: DisplayMessage[], ...args) => DisplayMessage[]`.
  */
 
+import { isNoResponseOnlyText } from "@vellumai/service-contracts/no-response";
+
 import type { DisplayMessage } from "@/domains/chat/types/types";
+import { readAssistantTextVisibility } from "@/domains/chat/utils/assistant-text-visibility";
 import { messagePlainText } from "@/domains/chat/utils/message-plain-text";
 import { toDisplayAttachments } from "@/utils/display-attachments";
 import type {
   ConversationContentBlock,
+  GenerationHandoffEvent,
   MessageCompleteEvent,
 } from "@vellumai/assistant-api";
 import {
@@ -368,11 +372,16 @@ export function finalizeOnIdle(
  */
 export function finalizeMessageComplete(
   prev: DisplayMessage[],
-  event: MessageCompleteEvent,
+  event: MessageCompleteEvent | GenerationHandoffEvent,
   at: number = Date.now(),
 ): DisplayMessage[] {
   const last = prev[prev.length - 1];
   const attachments = toDisplayAttachments(event.attachments);
+  // Whether the row's plain text is something the user reads, stamped on the
+  // live row from the same event that finalizes it, so it renders the way its
+  // persisted twin does with no refetch in between.
+  const assistantTextVisibility = readAssistantTextVisibility(event);
+  const visibility = assistantTextVisibility ? { assistantTextVisibility } : {};
 
   if (last?.role !== "assistant") {
     if (!attachments) {
@@ -386,6 +395,7 @@ export function finalizeMessageComplete(
         role: "assistant" as const,
         timestamp: at,
         attachments,
+        ...visibility,
       },
     ];
   }
@@ -399,6 +409,15 @@ export function finalizeMessageComplete(
       ...(adoptServerId ? { id: event.messageId!, isOptimistic: false } : {}),
       ...(attachments ? { attachments } : {}),
       ...(finalized ?? {}),
+      ...visibility,
+      // Deliberate silence, derived at fold time from the shared sentinel
+      // contract: the daemon stamps the durable row after the turn, but the
+      // live bubble would otherwise render the raw sentinel until a refetch.
+      // Deriving here from the same predicate keeps the live view truthful
+      // even if that refetch never lands.
+      ...(isNoResponseOnlyText((last.textSegments ?? []).join("\n").trim())
+        ? { isNoResponse: true }
+        : {}),
     },
   ];
 }
@@ -476,7 +495,12 @@ function findOptimisticUserEchoIdx(
  */
 export function applyUserMessageEcho(
   prev: DisplayMessage[],
-  event: { text: string; messageId?: string; clientMessageId?: string },
+  event: {
+    text: string;
+    messageId?: string;
+    clientMessageId?: string;
+    cameraFrame?: true;
+  },
   at: number = Date.now(),
 ): DisplayMessage[] {
   const serverId = event.messageId;
@@ -492,7 +516,10 @@ export function applyUserMessageEcho(
     }
   }
 
-  const optimisticIdx = findOptimisticUserEchoIdx(prev, event.clientMessageId);
+  // Ambient camera frames never confirm a typed send.
+  const optimisticIdx = event.cameraFrame
+    ? -1
+    : findOptimisticUserEchoIdx(prev, event.clientMessageId);
   if (optimisticIdx !== -1) {
     if (serverId === undefined) {
       return prev;
@@ -513,13 +540,13 @@ export function applyUserMessageEcho(
     {
       id: serverId ?? crypto.randomUUID(),
       ...(serverId === undefined ? { isOptimistic: true } : {}),
-      // Carry the nonce so the folded row shares the persisted server row's
-      // identity keys — the transcript overlay and the reseed prune both
-      // correlate on it (see `messageMatchKeys`).
-      ...(event.clientMessageId
+      // Only ordinary sends share the optimistic row's identity. Camera
+      // frames remain distinct in the transcript overlay and reseed prune.
+      ...(!event.cameraFrame && event.clientMessageId
         ? { clientMessageId: event.clientMessageId }
         : {}),
       role: "user",
+      ...(event.cameraFrame ? { isCameraFrame: true } : {}),
       textSegments: [event.text],
       contentOrder: [{ type: "text", id: "0" }],
       contentBlocks: [{ type: "text", text: event.text }],

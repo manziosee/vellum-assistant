@@ -28,12 +28,8 @@ import type { Provider } from "../providers/types.js";
 import { getLogger } from "../util/logger.js";
 import { truncate } from "../util/truncate.js";
 import {
-  buildAccessRequestContractText,
-  buildAccessRequestInviteDirective,
-  hasAccessRequestInstructions,
-  hasInviteFlowDirective,
-  isHandshakeOfferedForPayload,
-  parseAccessRequestPayload,
+  ensureAccessRequestInviteDirectiveInCopy,
+  stripAccessRequestReplyMechanicsFromCopy,
 } from "./access-request-copy.js";
 import {
   buildAccessRequestSeedContentBlocks,
@@ -47,12 +43,10 @@ import {
 import { composeFallbackCopy, resolveTitle } from "./copy-composer.js";
 import { createDecision } from "./decisions-store.js";
 import {
-  buildGuardianRequestCodeInstruction,
-  hasGuardianRequestCodeInstruction,
-  parseInteractiveApprovalPayload,
-  resolveGuardianQuestionInstructionMode,
-  stripConflictingGuardianRequestInstructions,
-  stripGuardianRequestCodeInstructions,
+  buildQuestionDeliveryText,
+  parseGuardianQuestionPayload,
+  resolveGuardianInstructionModeFromPayload,
+  stripGuardianReplyMechanicsFromCopy,
 } from "./guardian-question-mode.js";
 import {
   nonEmpty,
@@ -89,6 +83,20 @@ const MAX_IDENTITY_CONTEXT_CHARS = 2000;
  * to it.
  */
 const ASSISTANT_REPLY_CHANNELS = [
+  "platform",
+] as const satisfies readonly NotificationChannel[];
+
+/**
+ * Delivery scope for `schedule.result` signals. Wider than
+ * {@link ASSISTANT_REPLY_CHANNELS} by one channel, and the difference is the
+ * point: an unseen chat reply is already sitting in a conversation the user
+ * opened, so a push is the only thing it can add. A scheduled run's output has
+ * no such home — nobody is looking at the run's conversation — so `vellum`
+ * carries it into the notification center where it persists, and `platform`
+ * pushes it.
+ */
+const SCHEDULE_RESULT_CHANNELS = [
+  "vellum",
   "platform",
 ] as const satisfies readonly NotificationChannel[];
 
@@ -161,7 +169,7 @@ function buildSystemPrompt(
     `  - Avoid meta-send phrasing (e.g. "I'd like to send a notification", "May I go ahead with that?"). Write the recipient-facing message directly.`,
     `  - Avoid intermediary-instruction phrasing like "consider telling the guardian", "ask the recipient to", or "the assistant should remind them". Rewrite it as final copy the recipient can act on directly.`,
     `  - For telegram: 1-2 concise sentences.`,
-    `  - For slack approval requests: the message renders inside an interactive card with Approve/Reject buttons. Describe only what needs approval — never include approval/reference codes, code-reply instructions, or directions to respond in another app.`,
+    `  - For guardian requests (approvals, questions, access requests) on every channel: describe the request only. Never include reference or approval codes, code-reply instructions, or directions to respond elsewhere. The delivery layer adds buttons, or typed-reply instructions where a channel has none.`,
     `- \`conversationSeedMessage\` is the opening message in the internal notification conversation and also the expanded detail shown in the home feed. It should be richer and more contextual than the popup body.`,
     `  - For vellum (desktop): use structured markdown for readability. Break content into bullet points, numbered lists, or short sections with **bold** labels. Avoid long unbroken paragraphs — scan-friendly formatting is preferred.`,
     `  - Never dump raw JSON. Include only human-readable context.`,
@@ -230,23 +238,28 @@ function buildUserPrompt(signal: NotificationSignal): string {
 // ── Tool definition ────────────────────────────────────────────────────
 
 /**
- * Spec for the per-channel notification title. Mirrors the conversation title
- * prompt (`persistence/conversation-title-service.ts`), which gets clean
- * noun-phrase headlines out of this same model profile.
+ * Spec for the per-channel notification title. The title is the one line a
+ * reader sees in the notification bell, where a row that only reports shows
+ * nothing else, so it has to say what happened on its own rather than name a
+ * topic the body then explains. Same length discipline as the conversation
+ * title prompt (`persistence/conversation-title-service.ts`), which shares
+ * this model profile and the `normalizeTitle` clamp.
  */
 const TITLE_FIELD_DESCRIPTION = [
-  "Scannable headline naming the TOPIC of this notification, not a summary of it.",
+  "Scannable headline saying WHAT HAPPENED or WHAT IS NEEDED, so it stands on its own without the body.",
   "Rules:",
-  "- 2 to 5 words. Longer titles are unacceptable, ruthlessly compress",
+  "- 2 to 6 words. Longer titles are unacceptable, ruthlessly compress",
   "- 40 characters absolute maximum, longer titles get truncated and look broken",
-  "- A noun phrase naming the topic, never a sentence, question, or greeting (e.g. 'Platform Standup', 'Nightly Backup Failure')",
-  "- Do NOT restate, summarize, or echo the body. The title and the body must carry different information",
+  "- Lead with the outcome as a short clause: a past-tense verb for something done ('Prepared a wedding schedule', 'Nightly backup failed'), a need for something waiting on the reader ('Needs an answer on the venue')",
+  "- Sentence case, never Title Case",
+  "- Do NOT restate the body word for word. The body adds the detail the title leaves out: numbers, names, what to do next",
   "- No quotes, no markdown, no trailing punctuation",
-  "- Never describe missing or thin context. Titles like 'Notification', 'Update', 'Missing Context' are forbidden. Extract a topic from the words that ARE present",
+  "- Never describe missing or thin context. Titles like 'Notification', 'Update', 'Activity complete', 'Missing context' are forbidden. Say what was done from the words that ARE present",
   "Examples:",
-  "- Body 'Your 9am standup with the platform team starts in 5 minutes' -> 'Platform Standup', NOT 'Standup Starts In 5 Minutes'",
-  "- Body 'The nightly backup job failed on db-primary at 02:14' -> 'Nightly Backup Failure', NOT 'Nightly Backup Job Failed On db-primary'",
-  "- Body 'Alice replied about the Q3 pricing deck and wants your notes' -> 'Q3 Pricing Deck', NOT 'Alice Replied About The Pricing Deck'",
+  "- Body 'Your 9am standup with the platform team starts in 5 minutes' -> 'Platform standup in 5 minutes', NOT 'Platform Standup'",
+  "- Body 'The nightly backup job failed on db-primary at 02:14' -> 'Nightly backup failed', NOT 'Nightly Backup Failure'",
+  "- Body 'Alice replied about the Q3 pricing deck and wants your notes' -> 'Alice wants notes on the Q3 deck', NOT 'Q3 Pricing Deck'",
+  "- Body 'Recapped the 12 emails that needed a reply and deleted 6 newsletters' -> 'Recapped 12 emails, deleted 6', NOT 'Inbox Recap'",
 ].join("\n");
 
 function buildDecisionTool(availableChannels: NotificationChannel[]) {
@@ -597,119 +610,55 @@ export function validateConversationActions(
   return result;
 }
 
-function ensureGuardianRequestCodeInCopy(
-  copy: RenderedChannelCopy,
-  requestCode: string,
-  mode: "approval" | "answer",
-): RenderedChannelCopy {
-  const instruction = buildGuardianRequestCodeInstruction(requestCode, mode);
-
-  const ensureText = (text: string | undefined): string => {
-    const base = typeof text === "string" ? text.trim() : "";
-    const sanitized = stripConflictingGuardianRequestInstructions(
-      base,
-      requestCode,
-      mode,
-    );
-    if (hasGuardianRequestCodeInstruction(sanitized, requestCode, mode)) {
-      return sanitized;
-    }
-    return sanitized.length > 0
-      ? `${sanitized}\n\n${instruction}`
-      : instruction;
-  };
-
-  return {
-    ...copy,
-    body: ensureText(copy.body),
-    deliveryText: copy.deliveryText
-      ? ensureText(copy.deliveryText)
-      : copy.deliveryText,
-    conversationSeedMessage: copy.conversationSeedMessage
-      ? ensureText(copy.conversationSeedMessage)
-      : copy.conversationSeedMessage,
-  };
-}
-
 /**
- * Remove request-code reply instructions from copy for a channel whose
- * approval UI makes them redundant. Instruction-only fields keep their
- * original text rather than becoming empty — downstream treats an empty
- * body as missing copy.
+ * Composed copy never carries reply mechanics. The broadcaster's
+ * `plainTextFallback` is their only home, and a transport appends it exactly
+ * when it sends text without buttons, so the model's own echo of them
+ * ("Reference code: X", "Reply "X approve"", "Reply "X trust"") is noise on
+ * every channel and comes out here on every decision path.
  */
-function stripGuardianRequestCodeInCopy(
-  copy: RenderedChannelCopy,
-  requestCode: string,
-): RenderedChannelCopy {
-  const strip = (text: string): string => {
-    const stripped = stripGuardianRequestCodeInstructions(text, requestCode);
-    return stripped.length > 0 ? stripped : text;
-  };
-
-  return {
-    ...copy,
-    body: strip(copy.body),
-    deliveryText: copy.deliveryText
-      ? strip(copy.deliveryText)
-      : copy.deliveryText,
-    conversationSeedMessage: copy.conversationSeedMessage
-      ? strip(copy.conversationSeedMessage)
-      : copy.conversationSeedMessage,
-  };
-}
-
-/**
- * Guardian questions that share a conversation require explicit request-code
- * targeting. Enforce request-code instructions in rendered copy so guardians
- * can always disambiguate replies even when model copy omits them.
- *
- * Slack is the exception for approval-mode questions: the Slack adapter
- * renders those as an interactive card with Approve/Reject buttons (see
- * `resolveApprovalContext` in broadcaster.ts, gated on the same
- * `parseInteractiveApprovalPayload`), so code-reply instructions are
- * redundant noise there and are stripped instead of enforced in.
- */
-function enforceGuardianRequestCode(
+function stripReplyMechanics(
   decision: NotificationDecision,
   signal: NotificationSignal,
 ): NotificationDecision {
-  if (signal.sourceEventName !== "guardian.question") {
+  const isQuestion = signal.sourceEventName === "guardian.question";
+  const isAccessRequest = signal.sourceEventName === "ingress.access_request";
+  if (!isQuestion && !isAccessRequest) {
     return decision;
   }
   const rawCode = signal.contextPayload.requestCode;
-  if (typeof rawCode !== "string" || rawCode.trim().length === 0) {
+  const requestCode =
+    typeof rawCode === "string" && rawCode.trim().length > 0
+      ? rawCode.trim().toUpperCase()
+      : undefined;
+  if (isQuestion && !requestCode) {
     return decision;
   }
+  const questionText = readPayloadString(signal.contextPayload, "questionText");
 
-  const requestCode = rawCode.trim().toUpperCase();
-  const modeResolution = resolveGuardianQuestionInstructionMode(
-    signal.contextPayload,
-  );
-  const slackRendersApprovalButtons =
-    parseInteractiveApprovalPayload(signal.contextPayload) != null;
   const nextCopy: Partial<Record<NotificationChannel, RenderedChannelCopy>> = {
     ...decision.renderedCopy,
   };
-
   for (const channel of Object.keys(nextCopy) as NotificationChannel[]) {
     const copy = nextCopy[channel];
     if (!copy) {
       continue;
     }
     nextCopy[channel] =
-      channel === "slack" && slackRendersApprovalButtons
-        ? stripGuardianRequestCodeInCopy(copy, requestCode)
-        : ensureGuardianRequestCodeInCopy(
-            copy,
-            requestCode,
-            modeResolution.mode,
+      isQuestion && requestCode
+        ? stripGuardianReplyMechanicsFromCopy(copy, requestCode, questionText)
+        : // The invite directive is context the model may leave out, and the
+          // only affordance for that flow on most surfaces, so it is ensured
+          // after the code mechanics come out.
+          ensureAccessRequestInviteDirectiveInCopy(
+            stripAccessRequestReplyMechanicsFromCopy(
+              copy,
+              signal.contextPayload,
+            ),
           );
   }
 
-  return {
-    ...decision,
-    renderedCopy: nextCopy,
-  };
+  return { ...decision, renderedCopy: nextCopy };
 }
 
 /**
@@ -745,6 +694,55 @@ function ensureSeedContentBlocks(
 }
 
 /**
+ * Pin a question's channel text to the question itself.
+ *
+ * Every other notification's copy is composed here, and for most of them a
+ * paraphrase is an improvement. A question is the exception: the guardian is
+ * being asked to choose between these words, and the composed copy replaces
+ * `title` / `body` / `deliveryText` wholesale, so a summary of the question
+ * arrives where the question should be and the options never appear at all.
+ * Runs on every decision path for the same reason the seed-block guard does.
+ *
+ * Scoped to answer mode. A `pending_question` carrying a tool name is a voice
+ * tool approval, where composed copy is the right thing.
+ */
+function pinQuestionDeliveryCopy(
+  decision: NotificationDecision,
+  signal: NotificationSignal,
+): NotificationDecision {
+  if (signal.sourceEventName !== "guardian.question") {
+    return decision;
+  }
+  const parsed = parseGuardianQuestionPayload(signal.contextPayload);
+  if (
+    !parsed ||
+    parsed.requestKind !== "pending_question" ||
+    resolveGuardianInstructionModeFromPayload(parsed).mode !== "answer"
+  ) {
+    return decision;
+  }
+
+  const text = buildQuestionDeliveryText(parsed);
+  const nextCopy: Partial<Record<NotificationChannel, RenderedChannelCopy>> = {
+    ...decision.renderedCopy,
+  };
+  for (const channel of Object.keys(nextCopy) as NotificationChannel[]) {
+    const copy = nextCopy[channel];
+    if (!copy) {
+      continue;
+    }
+    nextCopy[channel] = {
+      ...copy,
+      body: text,
+      deliveryText: text,
+      conversationSeedMessage: text,
+    };
+  }
+
+  return { ...decision, renderedCopy: nextCopy };
+}
+
+/**
  * Tool-approval and tool-grant notifications need a Surface card with
  * Approve/Reject buttons on all decision paths.
  */
@@ -762,131 +760,20 @@ function enforceToolApprovalSeedBlocks(
 }
 
 /**
- * Access-request notifications require deterministic instruction elements:
- * - Request-code approve/reject directive (when requestCode is present)
- * - Exact "open invite flow" phrase (always required)
- *
- * When requestCode IS present: use the full hasAccessRequestInstructions
- * check (approve+reject+invite) and append the complete contract text if
- * any element is missing.
- *
- * When requestCode is NOT present: still check for the invite-flow
- * directive and append it if missing. Per the documented contract, the
- * invite directive should always be present in access-request copy.
+ * Access-request notifications need their Surface card on every decision
+ * path, the same way tool approvals do.
  */
-function enforceAccessRequestInstructions(
+function enforceAccessRequestSeedBlocks(
   decision: NotificationDecision,
   signal: NotificationSignal,
 ): NotificationDecision {
   if (signal.sourceEventName !== "ingress.access_request") {
     return decision;
   }
-
-  const rawCode = signal.contextPayload.requestCode;
-  const hasRequestCode =
-    typeof rawCode === "string" && rawCode.trim().length > 0;
-
-  const nextCopy: Partial<Record<NotificationChannel, RenderedChannelCopy>> = {
-    ...decision.renderedCopy,
-  };
-
-  if (hasRequestCode) {
-    const requestCode = rawCode.trim().toUpperCase();
-    const contractText = buildAccessRequestContractText(signal.contextPayload);
-    const handshakeOffered = isHandshakeOfferedForPayload(
-      parseAccessRequestPayload(signal.contextPayload),
-    );
-
-    for (const channel of Object.keys(nextCopy) as NotificationChannel[]) {
-      const copy = nextCopy[channel];
-      if (!copy) {
-        continue;
-      }
-      nextCopy[channel] = ensureAccessRequestInstructionsInCopy(
-        copy,
-        requestCode,
-        contractText,
-        handshakeOffered,
-      );
-    }
-  } else {
-    // No requestCode — still enforce the invite-flow directive.
-    const inviteDirective = buildAccessRequestInviteDirective();
-
-    for (const channel of Object.keys(nextCopy) as NotificationChannel[]) {
-      const copy = nextCopy[channel];
-      if (!copy) {
-        continue;
-      }
-      nextCopy[channel] = ensureInviteFlowDirectiveInCopy(
-        copy,
-        inviteDirective,
-      );
-    }
-  }
-
-  let result: NotificationDecision = {
-    ...decision,
-    renderedCopy: nextCopy,
-  };
-
-  // Ensure seedContentBlocks on all paths (LLM, assistant_tool, fallback).
-  result = ensureSeedContentBlocks(
-    result,
+  return ensureSeedContentBlocks(
+    decision,
     buildAccessRequestSeedContentBlocks(signal.contextPayload),
   );
-
-  return result;
-}
-
-function ensureAccessRequestInstructionsInCopy(
-  copy: RenderedChannelCopy,
-  requestCode: string,
-  contractText: string,
-  handshakeOffered: boolean,
-): RenderedChannelCopy {
-  const ensureText = (text: string | undefined): string => {
-    const base = typeof text === "string" ? text.trim() : "";
-    if (hasAccessRequestInstructions(base, requestCode, { handshakeOffered })) {
-      return base;
-    }
-    return base.length > 0 ? `${base}\n\n${contractText}` : contractText;
-  };
-
-  return {
-    ...copy,
-    body: ensureText(copy.body),
-    deliveryText: copy.deliveryText
-      ? ensureText(copy.deliveryText)
-      : copy.deliveryText,
-    conversationSeedMessage: copy.conversationSeedMessage
-      ? ensureText(copy.conversationSeedMessage)
-      : copy.conversationSeedMessage,
-  };
-}
-
-function ensureInviteFlowDirectiveInCopy(
-  copy: RenderedChannelCopy,
-  inviteDirective: string,
-): RenderedChannelCopy {
-  const ensureText = (text: string | undefined): string => {
-    const base = typeof text === "string" ? text.trim() : "";
-    if (hasInviteFlowDirective(base)) {
-      return base;
-    }
-    return base.length > 0 ? `${base}\n\n${inviteDirective}` : inviteDirective;
-  };
-
-  return {
-    ...copy,
-    body: ensureText(copy.body),
-    deliveryText: copy.deliveryText
-      ? ensureText(copy.deliveryText)
-      : copy.deliveryText,
-    conversationSeedMessage: copy.conversationSeedMessage
-      ? ensureText(copy.conversationSeedMessage)
-      : copy.conversationSeedMessage,
-  };
 }
 
 // ── Producer pass-through decisions ────────────────────────────────────
@@ -941,16 +828,38 @@ function buildPassThroughDecision(params: {
     verbatimCopy: true,
     ...(deepLinkTarget ? { deepLinkTarget } : {}),
   };
-  decision = enforceGuardianRequestCode(decision, signal);
-  decision = enforceToolApprovalSeedBlocks(decision, signal);
-  decision = enforceAccessRequestInstructions(decision, signal);
-  decision = enforceGuardianRequestConversationAffinity(decision, signal);
-  decision = enforceConversationAffinity(
-    decision,
-    signal.conversationAffinityHint,
-  );
+  decision = applyDecisionGuards(decision, signal);
   decision.persistedDecisionId = persistDecision(signal, decision);
   return decision;
+}
+
+function selectDefaultChannelsByUrgency(
+  urgency: NotificationSignal["attentionHints"]["urgency"],
+  availableChannels: NotificationChannel[],
+): NotificationChannel[] {
+  const isUrgent = urgency === "critical" || urgency === "high";
+  if (isUrgent) {
+    return [...availableChannels];
+  }
+  return availableChannels.includes("vellum")
+    ? ["vellum" as NotificationChannel]
+    : [];
+}
+
+/**
+ * The deterministic guards every decision passes through once the model,
+ * the assistant-tool pass-through, or the fallback has rendered copy.
+ */
+function applyDecisionGuards(
+  decision: NotificationDecision,
+  signal: NotificationSignal,
+): NotificationDecision {
+  decision = pinQuestionDeliveryCopy(decision, signal);
+  decision = stripReplyMechanics(decision, signal);
+  decision = enforceToolApprovalSeedBlocks(decision, signal);
+  decision = enforceAccessRequestSeedBlocks(decision, signal);
+  decision = enforceGuardianRequestConversationAffinity(decision, signal);
+  return enforceConversationAffinity(decision, signal.conversationAffinityHint);
 }
 
 // ── Core evaluation function ───────────────────────────────────────────
@@ -974,14 +883,10 @@ export async function evaluateSignal(
   );
   if (signal.sourceChannel === "assistant_tool" && requestedBody) {
     const payload = signal.contextPayload as Record<string, unknown>;
-    const isUrgent =
-      signal.attentionHints.urgency === "critical" ||
-      signal.attentionHints.urgency === "high";
-    const defaultChannels: NotificationChannel[] = isUrgent
-      ? [...availableChannels]
-      : availableChannels.includes("vellum")
-        ? ["vellum" as NotificationChannel]
-        : [];
+    const defaultChannels = selectDefaultChannelsByUrgency(
+      signal.attentionHints.urgency,
+      availableChannels,
+    );
     // Honor `--preferred-channels` as ADDITIVE push targets on top of
     // the default channel set. The notification center (vellum) is the
     // always-on canonical inbox; preferred channels add push surfaces
@@ -1030,6 +935,50 @@ export async function evaluateSignal(
     });
   }
 
+  // Scheduler-owned requested copy: the scheduler already authored the
+  // complete message. Ownership requires both the signal source and the
+  // payload marker so schedule.result (requestedMessage, no
+  // requestedBySource) and notify-mode (message, no requestedBySource)
+  // stay on their existing paths. Urgency still chooses channels; every
+  // selected channel keeps the producer body.
+  const requestedBySource = nonEmpty(
+    readPayloadString(signal.contextPayload, "requestedBySource"),
+  );
+  if (
+    signal.sourceChannel === "scheduler" &&
+    requestedBySource === "scheduler" &&
+    requestedBody
+  ) {
+    return buildPassThroughDecision({
+      signal,
+      availableChannels,
+      selectedChannels: selectDefaultChannelsByUrgency(
+        signal.attentionHints.urgency,
+        availableChannels,
+      ),
+      body: requestedBody,
+      reasoningSummary: "scheduler requested-message pass-through",
+    });
+  }
+
+  // Schedule-result pass-through: the body is the run's own reply, which is
+  // the whole point of the notification — a briefing, a digest, a report. The
+  // classifier rewrites bodies into short alerts, which would throw away the
+  // content the user set the schedule up to receive. Routing has nothing to
+  // decide either: the user asked for this cadence, so it goes to the inbox
+  // and to push, and `enforceRoutingIntent` still narrows it afterwards.
+  if (signal.sourceEventName === "schedule.result" && requestedBody) {
+    return buildPassThroughDecision({
+      signal,
+      availableChannels,
+      selectedChannels: SCHEDULE_RESULT_CHANNELS.filter((ch) =>
+        availableChannels.includes(ch),
+      ),
+      body: requestedBody,
+      reasoningSummary: "schedule_result pass-through",
+    });
+  }
+
   // When no explicit preference context is provided, load the user's
   // stored notification preferences from the memory-backed store.
   // Wrapped in try/catch so a DB failure doesn't break the decision path.
@@ -1065,14 +1014,9 @@ export async function evaluateSignal(
     log.warn(
       "Configured provider unavailable for notification decision, using fallback",
     );
-    let decision = buildFallbackDecision(signal, availableChannels);
-    decision = enforceGuardianRequestCode(decision, signal);
-    decision = enforceToolApprovalSeedBlocks(decision, signal);
-    decision = enforceAccessRequestInstructions(decision, signal);
-    decision = enforceGuardianRequestConversationAffinity(decision, signal);
-    decision = enforceConversationAffinity(
-      decision,
-      signal.conversationAffinityHint,
+    const decision = applyDecisionGuards(
+      buildFallbackDecision(signal, availableChannels),
+      signal,
     );
     decision.persistedDecisionId = persistDecision(signal, decision);
     return decision;
@@ -1096,14 +1040,7 @@ export async function evaluateSignal(
     decision = buildFallbackDecision(signal, availableChannels);
   }
 
-  decision = enforceGuardianRequestCode(decision, signal);
-  decision = enforceToolApprovalSeedBlocks(decision, signal);
-  decision = enforceAccessRequestInstructions(decision, signal);
-  decision = enforceGuardianRequestConversationAffinity(decision, signal);
-  decision = enforceConversationAffinity(
-    decision,
-    signal.conversationAffinityHint,
-  );
+  decision = applyDecisionGuards(decision, signal);
   decision.persistedDecisionId = persistDecision(signal, decision);
 
   return decision;

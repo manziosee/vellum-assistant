@@ -97,6 +97,40 @@ describe("text-segment cleaning", () => {
 });
 
 describe("mapRuntimeToDisplayMessage", () => {
+  test("preserves screenshot provenance in flat and structured attachments", () => {
+    const automatic = {
+      id: "shot-1",
+      filename: "computer-use-click.png",
+      mimeType: "image/png",
+      sizeBytes: 10,
+      kind: "image",
+      computerUseScreenshot: true,
+    };
+    const explicit = {
+      id: "explicit-1",
+      filename: "report.pdf",
+      mimeType: "application/pdf",
+      sizeBytes: 20,
+      kind: "document",
+    };
+    const display = mapRuntimeToDisplayMessage(
+      makeMessage({
+        attachments: [automatic, explicit],
+        contentBlocks: [
+          { type: "attachment", attachment: automatic },
+          { type: "attachment", attachment: explicit },
+        ],
+      }),
+    );
+
+    expect(display.attachments?.[0]?.computerUseScreenshot).toBe(true);
+    expect(display.attachments?.[1]?.computerUseScreenshot).toBeUndefined();
+    expect(display.contentBlocks).toEqual([
+      { type: "attachment", attachment: automatic },
+      { type: "attachment", attachment: explicit },
+    ]);
+  });
+
   test("preserves queued-message state from history", () => {
     const display = mapRuntimeToDisplayMessage(
       makeMessage({
@@ -172,6 +206,96 @@ describe("mapRuntimeToDisplayMessage", () => {
     expect(mapRuntimeToDisplayMessage(m).isSystemCard).toBe(true);
   });
 
+  test("flags a noResponse message as isNoResponse", () => {
+    const plain = makeMessage({ id: "m-plain", role: "assistant" });
+    expect(mapRuntimeToDisplayMessage(plain).isNoResponse).toBeUndefined();
+
+    const m = makeMessage({
+      id: "m-silent",
+      role: "assistant",
+      noResponse: true,
+    });
+    expect(mapRuntimeToDisplayMessage(m).isNoResponse).toBe(true);
+  });
+
+  test("flags a cameraFrame message as isCameraFrame", () => {
+    const message = makeMessage({
+      id: "frame-1",
+      role: "user",
+      cameraFrame: true,
+    });
+    expect(mapRuntimeToDisplayMessage(message).isCameraFrame).toBe(true);
+  });
+
+  test("does not infer camera frames from their text", () => {
+    const message = makeMessage({
+      role: "user",
+      ...wireTextBody("(camera frame)"),
+    });
+    expect(mapRuntimeToDisplayMessage(message).isCameraFrame).toBeUndefined();
+  });
+
+  test("carries the assistant-text visibility marker onto the display message", () => {
+    // The marker is the row's own, so each row in a conversation renders by
+    // its own value. An unmarked row stays unmarked, and an unrecognized value
+    // reads as no marker rather than being guessed at.
+    const plain = makeMessage({ id: "m-plain", role: "assistant" });
+    expect(
+      mapRuntimeToDisplayMessage(plain).assistantTextVisibility,
+    ).toBeUndefined();
+
+    for (const marker of ["private", "visible"] as const) {
+      const m = makeMessage({
+        id: `m-${marker}`,
+        role: "assistant",
+        assistantTextVisibility: marker,
+      } as Partial<ConversationMessage>);
+      expect(mapRuntimeToDisplayMessage(m).assistantTextVisibility).toBe(
+        marker,
+      );
+    }
+
+    const unknown = makeMessage({
+      id: "m-unknown",
+      role: "assistant",
+      assistantTextVisibility: "later",
+    } as unknown as Partial<ConversationMessage>);
+    expect(
+      mapRuntimeToDisplayMessage(unknown).assistantTextVisibility,
+    ).toBeUndefined();
+  });
+
+  test("carries deletedAt onto the display message", () => {
+    const plain = makeMessage({ id: "m-plain", role: "user" });
+    expect(mapRuntimeToDisplayMessage(plain).deletedAt).toBeUndefined();
+
+    const m = makeMessage({
+      id: "m-deleted",
+      role: "user",
+      deletedAt: 1725100001000,
+    });
+    expect(mapRuntimeToDisplayMessage(m).deletedAt).toBe(1725100001000);
+  });
+
+  test("carries the reaction fact onto the display message", () => {
+    const m = makeMessage({
+      id: "m-react",
+      role: "assistant",
+      reaction: {
+        emoji: "🎉",
+        op: "added",
+        targetMessageId: "555.1",
+        selfAuthored: true,
+      },
+    });
+    expect(mapRuntimeToDisplayMessage(m).reaction).toEqual({
+      emoji: "🎉",
+      op: "added",
+      targetMessageId: "555.1",
+      selfAuthored: true,
+    });
+  });
+
   test("carries providerError code and category onto the display message", () => {
     const plain = makeMessage({ id: "m-plain", role: "assistant" });
     expect(mapRuntimeToDisplayMessage(plain).providerError).toBeUndefined();
@@ -179,7 +303,10 @@ describe("mapRuntimeToDisplayMessage", () => {
     const m = makeMessage({
       id: "m-err",
       role: "assistant",
-      providerError: { code: "PROVIDER_BILLING", category: "credits_exhausted" },
+      providerError: {
+        code: "PROVIDER_BILLING",
+        category: "credits_exhausted",
+      },
     });
     expect(mapRuntimeToDisplayMessage(m).providerError).toEqual({
       code: "PROVIDER_BILLING",

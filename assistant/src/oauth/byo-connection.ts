@@ -14,17 +14,36 @@ import type {
   OAuthConnectionRequest,
   OAuthConnectionResponse,
 } from "./connection.js";
+import { decodeOAuthResponseBytes, isBinaryOAuthBody } from "./connection.js";
 
 const log = getLogger("byo-oauth-connection");
 
 /** Default per-request timeout to prevent hung requests from blocking indefinitely. */
 const REQUEST_TIMEOUT_MS = 30_000;
 
+/**
+ * How the access token is attached to an outbound request. Almost every
+ * provider reads `Authorization: Bearer <token>`; a few use their own header
+ * (Shopify's Admin API reads `X-Shopify-Access-Token` and ignores
+ * Authorization entirely). Derived from the provider's header-type injection
+ * template so the seed is the single source of truth.
+ */
+export interface BYOTokenHeader {
+  name: string;
+  /** Text placed before the token, e.g. `"Bearer "`, `"Bot "`, or `""`. */
+  valuePrefix: string;
+}
+
 export interface BYOOAuthConnectionOptions {
   id: string;
   provider: string;
   baseUrl: string;
   accountInfo: string | null;
+  /**
+   * Token header override. When omitted the connection falls back to
+   * `Authorization: Bearer` (or `Bot` for discord_channel).
+   */
+  tokenHeader?: BYOTokenHeader | null;
 }
 
 export class BYOOAuthConnection implements OAuthConnection {
@@ -33,12 +52,14 @@ export class BYOOAuthConnection implements OAuthConnection {
   readonly accountInfo: string | null;
 
   private readonly baseUrl: string;
+  private readonly tokenHeader: BYOTokenHeader | null;
 
   constructor(opts: BYOOAuthConnectionOptions) {
     this.id = opts.id;
     this.provider = opts.provider;
     this.baseUrl = opts.baseUrl;
     this.accountInfo = opts.accountInfo;
+    this.tokenHeader = opts.tokenHeader ?? null;
   }
 
   async request(req: OAuthConnectionRequest): Promise<OAuthConnectionResponse> {
@@ -50,25 +71,20 @@ export class BYOOAuthConnection implements OAuthConnection {
         // Discord bot tokens authenticate with the `Bot ` scheme, not
         // `Bearer`. Sending Bearer here reaches Discord as an unusable
         // credential and comes back 401, which reads as a revoked token.
-        const authScheme =
-          this.provider === "discord_channel" ? "Bot" : "Bearer";
+        // Providers with their own token header (Shopify) override the
+        // whole thing via `tokenHeader`.
+        const tokenHeader: BYOTokenHeader = this.tokenHeader ?? {
+          name: "Authorization",
+          valuePrefix: this.provider === "discord_channel" ? "Bot " : "Bearer ",
+        };
         const requestPath = isTelegram
           ? buildTelegramBotApiPath(req.path, token)
           : req.path;
         let fullUrl = `${effectiveBaseUrl}${requestPath}`;
 
-        if (req.query && Object.keys(req.query).length > 0) {
-          const params = new URLSearchParams();
-          for (const [key, value] of Object.entries(req.query)) {
-            if (Array.isArray(value)) {
-              for (const v of value) {
-                params.append(key, v);
-              }
-            } else {
-              params.append(key, value);
-            }
-          }
-          fullUrl += `?${params.toString()}`;
+        const search = resolveQueryString(req);
+        if (search) {
+          fullUrl += `?${search}`;
         }
 
         const logUrl = isTelegram
@@ -80,10 +96,19 @@ export class BYOOAuthConnection implements OAuthConnection {
           "Making authenticated request",
         );
 
+        // A string body is already in its wire form (multipart, XML,
+        // form-encoded, or pre-serialized JSON) and travels verbatim under
+        // the caller's own Content-Type. A Buffer travels as raw bytes.
+        // Objects and arrays are serialized as JSON and get the JSON
+        // Content-Type by default.
+        const hasBody = req.body !== undefined && req.body !== null;
+        const binaryBody = isBinaryOAuthBody(req.body) ? req.body : undefined;
+        const rawBody = typeof req.body === "string" ? req.body : undefined;
+
         // Use the Headers API for case-insensitive merging. Set defaults
         // first so caller-supplied headers (in any casing) override them.
         const headers = new Headers();
-        if (req.body) {
+        if (hasBody && rawBody === undefined && binaryBody === undefined) {
           headers.set("Content-Type", "application/json");
         }
         if (req.headers) {
@@ -92,13 +117,26 @@ export class BYOOAuthConnection implements OAuthConnection {
           }
         }
         if (!isTelegram) {
-          headers.set("Authorization", `${authScheme} ${token}`);
+          // The credential always wins over a caller-supplied value, and a
+          // provider that reads its own header must not also receive a
+          // stray Authorization the caller happened to send.
+          if (tokenHeader.name.toLowerCase() !== "authorization") {
+            headers.delete("Authorization");
+          }
+          headers.set(tokenHeader.name, `${tokenHeader.valuePrefix}${token}`);
         }
 
         const resp = await fetch(fullUrl, {
           method: req.method,
           headers,
-          body: req.body ? JSON.stringify(req.body) : undefined,
+          body: hasBody
+            ? binaryBody !== undefined
+              ? Buffer.from(binaryBody)
+              : (rawBody ?? JSON.stringify(req.body))
+            : undefined,
+          // Following a redirect would replay a POST as a GET against a URL
+          // the caller never asked for, and hide the 3xx from them.
+          redirect: req.manualRedirect === true ? "manual" : "follow",
           signal: req.signal
             ? AbortSignal.any([
                 req.signal,
@@ -115,7 +153,7 @@ export class BYOOAuthConnection implements OAuthConnection {
           throw err;
         }
 
-        return buildResponse(resp);
+        return buildResponse(resp, req.rawResponseBody === true);
       },
       { connectionId: this.id },
     );
@@ -126,6 +164,34 @@ export class BYOOAuthConnection implements OAuthConnection {
       connectionId: this.id,
     });
   }
+}
+
+/**
+ * Query string to append, without its `?`.
+ *
+ * `rawQuery` is the caller's own bytes and is returned untouched, so a query a
+ * provider signs keeps its key order, its `%20`, and its valueless flags. An
+ * empty one falls through to `query`, which `URLSearchParams` rebuilds.
+ */
+function resolveQueryString(req: OAuthConnectionRequest): string {
+  const raw = req.rawQuery?.replace(/^\?/, "") ?? "";
+  if (raw) {
+    return raw;
+  }
+  if (!req.query) {
+    return "";
+  }
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(req.query)) {
+    if (Array.isArray(value)) {
+      for (const v of value) {
+        params.append(key, v);
+      }
+    } else {
+      params.append(key, value);
+    }
+  }
+  return params.toString();
 }
 
 function buildTelegramBotApiPath(path: string, token: string): string {
@@ -144,23 +210,23 @@ function redactTelegramBotTokenFromUrl(url: string, token: string): string {
   );
 }
 
-async function buildResponse(resp: Response): Promise<OAuthConnectionResponse> {
+async function buildResponse(
+  resp: Response,
+  rawResponseBody: boolean,
+): Promise<OAuthConnectionResponse> {
   const headers: Record<string, string> = {};
   resp.headers.forEach((value, key) => {
     headers[key] = value;
   });
 
-  let body: unknown;
-  const text = await resp.text().catch(() => "");
-  if (text) {
-    try {
-      body = JSON.parse(text);
-    } catch {
-      body = text;
-    }
-  } else {
-    body = null;
-  }
-
-  return { status: resp.status, headers, body };
+  const raw = Buffer.from(await resp.arrayBuffer());
+  return {
+    status: resp.status,
+    headers,
+    // Raw bytes skip the decode: parsing and re-serializing JSON would rewrite
+    // whitespace, drop duplicate keys, and round integers past 2^53.
+    body: rawResponseBody
+      ? raw
+      : decodeOAuthResponseBytes(raw, headers["content-type"] ?? ""),
+  };
 }

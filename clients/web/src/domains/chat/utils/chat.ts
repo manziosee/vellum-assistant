@@ -23,6 +23,11 @@ import {
   clientOsDisplayName,
   detectClientOs,
 } from "@/runtime/platform-detection";
+import {
+  COMMAND_KEYS,
+  FILE_PATH_KEYS,
+  readToolInputString,
+} from "@/domains/chat/utils/tool-input";
 
 export const ERROR_MESSAGES: Record<string, string> = {
   rate_limit_exceeded: "Too many requests. Please wait a moment and try again.",
@@ -31,7 +36,6 @@ export const ERROR_MESSAGES: Record<string, string> = {
 };
 
 const GLOBAL_STREAM_EVENT_TYPE_NAMES = [
-  "conversation_list_invalidated",
   "conversation_title_updated",
   "notification_intent",
   // Client directive to open a settings tab — carries no `conversationId`
@@ -47,6 +51,7 @@ const GLOBAL_STREAM_EVENT_TYPE_NAMES = [
   "identity_changed",
   "avatar_updated",
   "sync_changed",
+  "desktop_activity_changed",
   "disk_pressure_status_changed",
   // Workspace-wide resource-pressure broadcast, no `conversationId`.
   "resource_pressure_status_changed",
@@ -60,6 +65,12 @@ const GLOBAL_STREAM_EVENT_TYPE_NAMES = [
   // the wire payload has no `conversationId` and the conversation gate
   // would drop it.
   "contact_request",
+  // Same for the record form: the CLI can propose a contact write from a
+  // settings or skill flow with no conversation binding.
+  "contact_record_request",
+  // Retires whichever contact form timed out; global for the same reason the
+  // forms themselves are.
+  "contact_form_closed",
   // Subagent lifecycle events route by `subagentId` into the global subagent
   // store, not by the parent stream's `conversationId`. They carry
   // `parentConversationId` (spawn) or nothing (`subagent_status_changed`) at the
@@ -77,6 +88,7 @@ const GLOBAL_STREAM_EVENT_TYPE_NAMES = [
   "acp_session_spawned",
   "acp_session_update",
   "acp_session_usage",
+  "acp_session_model_update",
   "acp_session_completed",
   "acp_session_error",
   "acp_auth_required",
@@ -281,6 +293,9 @@ export function formatVoiceError(code: string): string {
     return t("chat:voiceErrors.nativeSttNoTranscript", {
       clientName: clientOsDisplayName(detectClientOs()),
     });
+  }
+  if (code === "voice-ask-unavailable") {
+    return t("chat:voiceErrors.askUnavailable");
   }
   return (
     VOICE_ERROR_MESSAGES[code] ??
@@ -511,12 +526,15 @@ export function deriveCommandText(
   if (!input) {
     return toolName;
   }
-  const preferredKeys = ["command", "cmd", "path", "file", "url"];
-  for (const key of preferredKeys) {
-    const val = input[key];
-    if (typeof val === "string" && val.trim()) {
-      return val.trim();
-    }
+  const preferred = readToolInputString(
+    input,
+    ...COMMAND_KEYS,
+    ...FILE_PATH_KEYS,
+    "file",
+    "url",
+  );
+  if (preferred) {
+    return preferred;
   }
   for (const val of Object.values(input)) {
     if (typeof val === "string" && val.trim()) {
@@ -542,7 +560,6 @@ export function toolCallToRuleContext(
     input: tc.input ?? {},
     allowlistOptions: tc.riskAllowlistOptions ?? [],
     scopeOptions: tc.scopeOptions ?? [],
-    directoryScopeOptions: tc.riskDirectoryScopeOptions ?? [],
     matchedTrustRuleId: tc.matchedTrustRuleId,
   };
 }

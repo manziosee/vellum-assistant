@@ -1,8 +1,14 @@
 import { z } from "zod";
 
+export {
+  isComputerUseToolCall,
+  resolveComputerUseToolName,
+} from "./computer-use-tool.js";
+
 import { AcpAuthRequiredEventSchema } from "./events/acp-auth-required.js";
 import { AcpSessionCompletedEventSchema } from "./events/acp-session-completed.js";
 import { AcpSessionErrorEventSchema } from "./events/acp-session-error.js";
+import { AcpSessionModelUpdateEventSchema } from "./events/acp-session-model-update.js";
 import { AcpSessionSpawnedEventSchema } from "./events/acp-session-spawned.js";
 import { AcpSessionUpdateEventSchema } from "./events/acp-session-update.js";
 import { AcpSessionUsageEventSchema } from "./events/acp-session-usage.js";
@@ -23,15 +29,17 @@ import { CompactionCircuitOpenEventSchema } from "./events/compaction-circuit-op
 import { ConfigChangedEventSchema } from "./events/config-changed.js";
 import { ConfirmationRequestEventSchema } from "./events/confirmation-request.js";
 import { ConfirmationStateChangedEventSchema } from "./events/confirmation-state-changed.js";
+import { ContactFormClosedEventSchema } from "./events/contact-form-closed.js";
+import { ContactRecordRequestEventSchema } from "./events/contact-record-request.js";
 import { ContactRequestEventSchema } from "./events/contact-request.js";
 import { ContactsChangedEventSchema } from "./events/contacts-changed.js";
 import { ContextCompactedEventSchema } from "./events/context-compacted.js";
 import { ContextWindowUsageEventSchema } from "./events/context-window-usage.js";
 import { ConversationErrorEventSchema } from "./events/conversation-error.js";
 import { ConversationInferenceProfileUpdatedEventSchema } from "./events/conversation-inference-profile-updated.js";
-import { ConversationListInvalidatedEventSchema } from "./events/conversation-list-invalidated.js";
 import { ConversationNoticeEventSchema } from "./events/conversation-notice.js";
 import { ConversationTitleUpdatedEventSchema } from "./events/conversation-title-updated.js";
+import { DesktopActivityChangedEventSchema } from "./events/desktop-activity-changed.js";
 import { DiskPressureStatusChangedEventSchema } from "./events/disk-pressure-status-changed.js";
 import { DocumentCommentCreatedEventSchema } from "./events/document-comment-created.js";
 import { DocumentCommentDeletedEventSchema } from "./events/document-comment-deleted.js";
@@ -153,6 +161,14 @@ export {
   REOPENABLE_DOCUMENT_MUTATION_TOOL_NAMES,
 } from "./constants/document-tools.js";
 export {
+  PERSONALITY_AXIS_IDS,
+  PERSONALITY_DIRECTION_AXES,
+  PERSONALITY_SLIDER_DEFAULT,
+  PERSONALITY_SLIDERS_PATH,
+  type PersonalityAxisId,
+  type PersonalityDirectionAxis,
+} from "./constants/personality-sliders.js";
+export {
   MIN_INPUT_RESERVE_TOKENS,
   type ProfileConfigIssue,
   validateInferenceProfileConfig,
@@ -177,6 +193,10 @@ export {
   type AcpSessionErrorEvent,
   AcpSessionErrorEventSchema,
 } from "./events/acp-session-error.js";
+export {
+  type AcpSessionModelUpdateEvent,
+  AcpSessionModelUpdateEventSchema,
+} from "./events/acp-session-model-update.js";
 export {
   type AcpSessionSpawnedEvent,
   AcpSessionSpawnedEventSchema,
@@ -286,6 +306,14 @@ export {
   ConfirmationStateChangedEventSchema,
 } from "./events/confirmation-state-changed.js";
 export {
+  type ContactFormClosedEvent,
+  ContactFormClosedEventSchema,
+} from "./events/contact-form-closed.js";
+export {
+  type ContactRecordRequestEvent,
+  ContactRecordRequestEventSchema,
+} from "./events/contact-record-request.js";
+export {
   type ContactRequestEvent,
   ContactRequestEventSchema,
 } from "./events/contact-request.js";
@@ -312,12 +340,6 @@ export {
   ConversationInferenceProfileUpdatedEventSchema,
 } from "./events/conversation-inference-profile-updated.js";
 export {
-  type ConversationListInvalidatedEvent,
-  ConversationListInvalidatedEventSchema,
-  type ConversationListInvalidatedReason,
-  ConversationListInvalidatedReasonSchema,
-} from "./events/conversation-list-invalidated.js";
-export {
   type ConversationNoticeEvent,
   ConversationNoticeEventSchema,
   ConversationNoticeSourceSchema,
@@ -326,6 +348,10 @@ export {
   type ConversationTitleUpdatedEvent,
   ConversationTitleUpdatedEventSchema,
 } from "./events/conversation-title-updated.js";
+export {
+  type DesktopActivityChangedEvent,
+  DesktopActivityChangedEventSchema,
+} from "./events/desktop-activity-changed.js";
 export {
   type DiskPressureBlockedCapability,
   DiskPressureBlockedCapabilitySchema,
@@ -767,6 +793,12 @@ export {
   type FeedItemDetailPanelKind,
   FeedItemDetailPanelKindSchema,
   FeedItemDetailPanelSchema,
+  type FeedItemGuardianIntent,
+  FeedItemGuardianIntentSchema,
+  type FeedItemGuardianRequest,
+  FeedItemGuardianRequestSchema,
+  type FeedItemGuardianStatus,
+  FeedItemGuardianStatusSchema,
   FeedItemSchema,
   type FeedItemSourceType,
   FeedItemSourceTypeSchema,
@@ -776,8 +808,10 @@ export {
   FeedItemTypeSchema,
   type FeedItemUrgency,
   FeedItemUrgencySchema,
+  GUARDIAN_TERMINAL_REASON_SUPERSEDED,
   type HomeFeedResponse,
   HomeFeedResponseSchema,
+  isPendingGuardianFeedItem,
   type RelationshipState,
   RelationshipStateSchema,
   type RelationshipTier,
@@ -821,6 +855,10 @@ export {
   MemoryV2ConfigSnapshotSchema,
 } from "./responses/memory-v2-activation-log.js";
 export {
+  type MemoryV3Pool,
+  type MemoryV3PoolCandidate,
+  MemoryV3PoolCandidateSchema,
+  MemoryV3PoolSchema,
   type MemoryV3SelectionLog,
   MemoryV3SelectionLogSchema,
   type MemoryV3SelectionRow,
@@ -895,6 +933,15 @@ export {
   TableSurfaceDataSchema,
   type VisualSurfaceData,
   VisualSurfaceDataSchema,
+  WATCH_RETRO_MAX_QUESTIONS,
+  type WatchRetroOption,
+  WatchRetroOptionSchema,
+  type WatchRetroQuestion,
+  type WatchRetroQuestionKind,
+  WatchRetroQuestionKindSchema,
+  WatchRetroQuestionSchema,
+  type WatchRetroSurfaceData,
+  WatchRetroSurfaceDataSchema,
   type WorkResultDiff,
   WorkResultDiffSchema,
   type WorkResultItem,
@@ -932,6 +979,7 @@ export const AssistantEventSchema = z.discriminatedUnion("type", [
   AcpAuthRequiredEventSchema,
   AcpSessionCompletedEventSchema,
   AcpSessionErrorEventSchema,
+  AcpSessionModelUpdateEventSchema,
   AcpSessionSpawnedEventSchema,
   AcpSessionUpdateEventSchema,
   AcpSessionUsageEventSchema,
@@ -952,15 +1000,17 @@ export const AssistantEventSchema = z.discriminatedUnion("type", [
   ConfigChangedEventSchema,
   ConfirmationRequestEventSchema,
   ConfirmationStateChangedEventSchema,
+  ContactFormClosedEventSchema,
+  ContactRecordRequestEventSchema,
   ContactRequestEventSchema,
   ContactsChangedEventSchema,
   ContextCompactedEventSchema,
   ContextWindowUsageEventSchema,
   ConversationErrorEventSchema,
   ConversationInferenceProfileUpdatedEventSchema,
-  ConversationListInvalidatedEventSchema,
   ConversationNoticeEventSchema,
   ConversationTitleUpdatedEventSchema,
+  DesktopActivityChangedEventSchema,
   DiskPressureStatusChangedEventSchema,
   DocumentCommentCreatedEventSchema,
   DocumentCommentDeletedEventSchema,

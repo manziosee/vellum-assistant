@@ -10,6 +10,7 @@ import {
   type VellumCommand,
 } from "@vellumai/ipc-contract";
 import {
+  readOnboardingActive,
   readTitleBarOverlayTheme,
   restoreBounds,
   track as trackWindowState,
@@ -148,17 +149,39 @@ export const dispatchToMain = (command: VellumCommand): void => {
   }
 };
 
-export const toggleVisibility = (): void => {
+/** Module-private: {@link toggleVisibility} is the only caller. */
+const isVisibleAndFocused = (): boolean => {
   const win = current();
-  if (win && !win.isDestroyed() && win.isVisible() && win.isFocused()) {
-    win.hide();
+  return !!win && !win.isDestroyed() && win.isVisible() && win.isFocused();
+};
+
+export const toggleVisibility = (): void => {
+  if (isVisibleAndFocused()) {
+    current()?.hide();
     return;
   }
   ensureVisible();
 };
 
+const onboardingListeners = new Set<(active: boolean) => void>();
+
+// Fires only on a real transition; the renderer re-asserts the mode on
+// every navigation.
+export const onOnboardingChange = (
+  listener: (active: boolean) => void,
+): (() => void) => {
+  onboardingListeners.add(listener);
+  return () => onboardingListeners.delete(listener);
+};
+
 export const setOnboarding = (active: boolean): void => {
+  if (readOnboardingActive() === active) {
+    return;
+  }
   writeOnboardingActive(active);
+  for (const listener of onboardingListeners) {
+    listener(active);
+  }
 };
 
 /**

@@ -6,7 +6,7 @@
  * GET    /v1/model                      — current model info
  * PUT    /v1/model/image-gen            — set image-gen model
  * GET    /v1/config/embeddings          — current embedding config
- * PUT    /v1/config/embeddings          — set embedding provider/model
+ * PUT    /v1/config/embeddings          - set embedding provider/model/baseUrl
  * GET    /v1/config                     — full raw workspace config
  * PATCH  /v1/config                     — deep-merge partial config
  * PUT    /v1/config/llm/profiles/:name  — replace an inference profile
@@ -29,6 +29,13 @@ import {
   LatencyBreakdownSchema,
   LLMRequestLogEntrySchema,
 } from "../../api/responses/llm-request-log-entry.js";
+import { scrubNulledAcpAgentLeaves } from "../../config/acp-agent-write.js";
+import {
+  catalogEntryFor,
+  type InputModalities,
+  modalitiesOf,
+  resolveModalityOverride,
+} from "../../config/input-modalities.js";
 import {
   deepMergeOverwrite,
   fillContextDefaultsForMissingKeys,
@@ -48,6 +55,7 @@ import {
 import { AssistantConfigSchema } from "../../config/schema.js";
 import { getSchemaAtPath } from "../../config/schema-utils.js";
 import {
+  collectFallbackProfileIssues,
   DefaultProviderSchema,
   LLMConfigBase,
   LLMConfigFragment,
@@ -84,6 +92,8 @@ import {
   CONFIG_RELOAD_DEBOUNCE_MS,
   log,
 } from "../../daemon/handlers/shared.js";
+import { rescheduleHeartbeatIfTimezoneChanged } from "../../heartbeat/heartbeat-service.js";
+import { overlayWorkspaceMcpForConfigRead } from "../../mcp/workspace-mcp-config.js";
 import {
   getAssistantMessageIdsInTurn,
   getConversation,
@@ -96,6 +106,7 @@ import {
 } from "../../persistence/conversation-types.js";
 import { getDb } from "../../persistence/db-connection.js";
 import { clearEmbeddingBackendCache } from "../../persistence/embeddings/embedding-backend.js";
+import { resolveOpenAICompatibleBaseUrl } from "../../persistence/embeddings/embedding-openai.js";
 import { getLlmRequestLogSource } from "../../persistence/llm-request-log-source.js";
 import { type LogRow } from "../../persistence/llm-request-log-store.js";
 import { getMemoryRecallLogByMessageIds } from "../../plugins/defaults/memory/memory-recall-log-store.js";
@@ -111,7 +122,6 @@ import {
   listConnections,
   VELLUM_MANAGED_CONNECTION_NAME,
 } from "../../providers/inference/connections.js";
-import { PROVIDER_CATALOG } from "../../providers/model-catalog.js";
 import { initializeProviders } from "../../providers/registry.js";
 import { MANAGED_ROUTABLE_PROVIDERS } from "../../providers/vellum-model-routing.js";
 import { credentialKey } from "../../security/credential-key.js";
@@ -156,6 +166,7 @@ type LlmContextRouteResult = Omit<LlmContextNormalizationResult, "summary"> & {
 import {
   CODE_OWNED_PROFILE_NAMES,
   getEffectiveProfilesForProvider,
+  getUserSelectableProfilesForProvider,
   INVARIANT_PROFILE_NAMES,
   MANAGED_PROFILE_NAMES,
   resolveDefaultProfileForProvider,
@@ -240,6 +251,13 @@ function replaceInferenceProfileConfig(
   const nextProfile: Record<string, unknown> = { ...existingProfile };
   for (const key of INFERENCE_PROFILE_UI_KEYS) {
     delete nextProfile[key];
+  }
+  // Converting a profile to a mix is an explicit replacement: a mix carries
+  // no model route of its own to fall back from, so an existing
+  // `fallbackProfile` pointer is dropped rather than preserved alongside
+  // `mix` (a combination `LLMSchema` rejects on the next full reload).
+  if (fragment.mix != null) {
+    delete nextProfile.fallbackProfile;
   }
   const fragmentTopLevel = { ...fragment };
   delete fragmentTopLevel.contextWindow;
@@ -448,9 +466,11 @@ async function handleSetEmbeddingConfig({ body }: RouteHandlerArgs) {
   if (!body || typeof body !== "object") {
     throw new BadRequestError("Request body is required");
   }
-  const { provider, model } = body as {
+  const { provider, model, baseUrl, dimensions } = body as {
     provider?: string;
     model?: string;
+    baseUrl?: string;
+    dimensions?: number | null;
   };
   if (!provider || typeof provider !== "string") {
     throw new BadRequestError("Missing required field: provider");
@@ -463,8 +483,32 @@ async function handleSetEmbeddingConfig({ body }: RouteHandlerArgs) {
   if (model !== undefined && typeof model !== "string") {
     throw new BadRequestError("Field 'model' must be a string");
   }
+  if (baseUrl !== undefined && typeof baseUrl !== "string") {
+    throw new BadRequestError("Field 'baseUrl' must be a string");
+  }
+  if (
+    typeof baseUrl === "string" &&
+    baseUrl !== "" &&
+    !resolveOpenAICompatibleBaseUrl(baseUrl)
+  ) {
+    throw new BadRequestError("Field 'baseUrl' must be an http(s) URL");
+  }
+  if (
+    dimensions !== undefined &&
+    dimensions !== null &&
+    (typeof dimensions !== "number" ||
+      !Number.isInteger(dimensions) ||
+      dimensions <= 0)
+  ) {
+    throw new BadRequestError(
+      "Field 'dimensions' must be a positive integer or null",
+    );
+  }
   try {
-    return await setEmbeddingConfig(provider, model, getModelSetContext());
+    return await setEmbeddingConfig(provider, model, getModelSetContext(), {
+      baseUrl,
+      dimensions,
+    });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     throw new InternalError(`Failed to set embedding config: ${message}`);
@@ -643,6 +687,38 @@ function rejectMcpTransportHeaderWrite(patch: unknown): void {
   throw new BadRequestError(
     "MCP authentication headers must be managed through MCP server add/update APIs, not generic config writes.",
   );
+}
+
+const MCP_CONFIG_WRITE_MESSAGE =
+  "MCP servers are stored in mcp.json. Use assistant mcp add or assistant mcp remove.";
+
+function stripMcpFromConfigWrite(patch: Record<string, unknown>): void {
+  if (Object.hasOwn(patch, "mcp")) {
+    delete patch.mcp;
+  }
+}
+
+function rejectMcpConfigSetPath(path: string, value: unknown): void {
+  if (path !== "mcp" && !path.startsWith("mcp.")) {
+    return;
+  }
+  const relative =
+    path === "mcp" ? value : nestPath(path.slice("mcp.".length), value);
+  if (patchContainsMcpTransportHeaders({ mcp: relative })) {
+    throw new BadRequestError(
+      "MCP authentication headers must be managed through MCP server add/update APIs, not generic config writes.",
+    );
+  }
+  throw new BadRequestError(MCP_CONFIG_WRITE_MESSAGE);
+}
+
+function nestPath(path: string, value: unknown): unknown {
+  const segments = path.split(".");
+  let current: unknown = value;
+  for (let i = segments.length - 1; i >= 0; i--) {
+    current = { [segments[i]!]: current };
+  }
+  return current;
 }
 
 const WireProfileEntry = ProfileEntry.extend({
@@ -851,6 +927,7 @@ const ConfigPatchRequestSchema = z
 function handleGetConfig() {
   try {
     const config = applyContextDefaultsToRawConfig(loadRawConfig());
+    overlayWorkspaceMcpForConfigRead(config);
     sanitizeMcpTransportHeadersForSettingsRead(config);
     overlayEffectiveProfilesForWire(config);
     enrichProfilesForWire(config);
@@ -891,7 +968,7 @@ function overlayEffectiveProfilesForWire(config: unknown): void {
   if (!existingLlm) {
     root.llm = llm;
   }
-  llm.profiles = getEffectiveProfilesForProvider(
+  llm.profiles = getUserSelectableProfilesForProvider(
     readPlainObject(llm.profiles) as Record<string, ProfileEntry> | undefined,
     getConfig().llm.defaultProvider ?? null,
   );
@@ -1055,9 +1132,10 @@ export function normalizeManagedProfileWrites(patch: unknown): void {
  * Annotate each profile in `config.llm.profiles` with wire-only flags
  * (`WIRE_ONLY_PROFILE_KEYS`) — never persisted to disk:
  *
- * - `supportsVision`: resolved from the model catalog. Unknown (provider,
- *   model) pairs default to `true` (fail-open) so image upload remains
- *   available for custom / unlisted models.
+ * - `supportsVision`: resolved from the model catalog, with a profile
+ *   `inputModalities.image` override winning when set. Unknown (provider,
+ *   model) pairs with no override default to `true` (fail-open) so image
+ *   upload remains available for custom / unlisted models.
  * - `invariant`: `true` for managed-source entries of the managed profile
  *   names (`INVARIANT_PROFILE_NAMES`); absent otherwise. Source-gated to
  *   match `assertInvariantProfilesPreserved` — a user-owned profile sharing
@@ -1092,9 +1170,13 @@ function enrichProfilesForWire(config: unknown): void {
       continue;
     }
 
-    const catalogProvider = PROVIDER_CATALOG.find((p) => p.id === provider);
-    const catalogModel = catalogProvider?.models.find((m) => m.id === model);
-    entry.supportsVision = catalogModel?.supportsVision ?? true;
+    const catalogModel = catalogEntryFor(provider, model);
+    const catalogVision = catalogModel?.supportsVision;
+    const imageOverride = modalitiesOf({
+      inputModalities: entry.inputModalities as InputModalities | null,
+    })?.image;
+    entry.supportsVision =
+      resolveModalityOverride(imageOverride, catalogVision) ?? true;
   }
 }
 
@@ -1399,6 +1481,28 @@ function assertRoutableIdentityEntries(
   }
 }
 
+/**
+ * Reject writes that would persist unsupported `fallbackProfile` metadata.
+ * Automatic fallbacks are code-owned for managed default profiles. The write
+ * paths save raw config without a full-schema parse, so this check keeps a
+ * custom pointer from reaching disk. It runs unconditionally so an existing
+ * hand-edited pointer blocks unrelated rewrites until the user clears it with
+ * `null`.
+ */
+function assertCodeOwnedFallbackProfiles(raw: Record<string, unknown>): void {
+  const llm = readPlainObject(raw.llm);
+  const profiles = readPlainObject(llm?.profiles);
+  // The sibling `llm.defaultProvider` decides whether the managed backups are
+  // valid fallback targets: they resolve on the managed column alone.
+  const issues = collectFallbackProfileIssues(
+    profiles ?? undefined,
+    llm?.defaultProvider,
+  );
+  if (issues.length > 0) {
+    throw new BadRequestError(issues.map((issue) => issue.message).join(" "));
+  }
+}
+
 export async function commitConfigWrite(
   raw: Record<string, unknown>,
   opLabel: string,
@@ -1411,6 +1515,7 @@ export async function commitConfigWrite(
   completeChangedCustomProfiles(preWrite, raw);
   assertInvariantProfilesPreserved(preWrite, raw);
   assertRoutableIdentityEntries(preWrite, raw);
+  assertCodeOwnedFallbackProfiles(raw);
 
   // Suppress the file-watcher callback for the duration of the debounce
   // window. Without this, the ConfigWatcher detects the config.json write
@@ -1439,6 +1544,7 @@ export async function commitConfigWrite(
 
   clearEmbeddingBackendCache();
   invalidateConfigCache();
+  rescheduleHeartbeatIfTimezoneChanged(preWrite, raw);
   // Reinitialize providers so the live registry reflects the new config.
   // Suppress disk writes inside loadConfig() — we just wrote the raw config
   // and the first-launch seed path would overwrite it with full defaults.
@@ -1523,6 +1629,7 @@ async function handlePatchConfig({ body }: RouteHandlerArgs) {
   normalizeManagedProfileWrites(body);
   rejectManagedProfileDeletion(body as Record<string, unknown>);
   rejectMcpTransportHeaderWrite(body);
+  stripMcpFromConfigWrite(body as Record<string, unknown>);
 
   const raw = loadRawConfig();
   const patch = body as Record<string, unknown>;
@@ -1532,11 +1639,13 @@ async function handlePatchConfig({ body }: RouteHandlerArgs) {
   }
   deepMergeOverwrite(raw, patch);
   scrubRemovedServiceModes(raw);
+  scrubNulledAcpAgentLeaves(raw);
   seedSttProviderForSparseBlock(raw);
 
   await commitConfigWrite(raw, "patch");
 
   const merged = applyContextDefaultsToRawConfig(loadRawConfig());
+  overlayWorkspaceMcpForConfigRead(merged);
   sanitizeMcpTransportHeadersForSettingsRead(merged);
   overlayEffectiveProfilesForWire(merged);
   enrichProfilesForWire(merged);
@@ -1599,6 +1708,7 @@ async function handleSetConfig({ body }: RouteHandlerArgs) {
   stripWireOnlyProfileKeys(patchShape);
   normalizeManagedProfileWrites(patchShape);
   rejectManagedProfileDeletion(patchShape);
+  rejectMcpConfigSetPath(path, value);
   rejectMcpTransportHeaderWrite(patchShape);
 
   const raw = loadRawConfig();
@@ -1637,6 +1747,7 @@ async function handleSetConfig({ body }: RouteHandlerArgs) {
       written.source = "managed";
     }
   }
+  scrubNulledAcpAgentLeaves(raw);
   // A SET can create `services.stt` with a leaf like `language` and no
   // `provider`, which SttServiceSchema requires whenever the block exists;
   // the same seeding that guards PATCH keeps this write's persisted block
@@ -1714,6 +1825,18 @@ async function handleReplaceInferenceProfile({
   const isManaged =
     MANAGED_PROFILE_NAMES.has(name) &&
     (existingProfile == null || existingProfile.source === "managed");
+  if (CODE_OWNED_PROFILE_NAMES.has(name)) {
+    // A code-owned profile resolves from the catalog whatever the workspace
+    // holds, so even a status re-enable would persist a stub that never
+    // governs anything. Reject the write rather than accept a silent no-op.
+    // Checked ahead of the availability gate below so the code-owned backups,
+    // which are always available yet are not `DEFAULT_PROFILE_KEYS` members,
+    // report why the write is refused rather than claiming they do not exist.
+    throw new BadRequestError(
+      `Profile "${name}" is code-owned and cannot be edited. ` +
+        `Duplicate it to a custom profile to customize.`,
+    );
+  }
   // A flag-gated managed name (`os-beta`) with no materialized entry cannot
   // be patched: it only resolves while the flag reconcile has created its
   // stub, so writing status here would persist an entry that fights the
@@ -1726,15 +1849,6 @@ async function handleReplaceInferenceProfile({
   ) {
     throw new BadRequestError(
       `Profile "${name}" is not currently available and cannot be edited.`,
-    );
-  }
-  if (CODE_OWNED_PROFILE_NAMES.has(name)) {
-    // A code-owned profile resolves from the catalog whatever the workspace
-    // holds, so even a status re-enable would persist a stub that never
-    // governs anything. Reject the write rather than accept a silent no-op.
-    throw new BadRequestError(
-      `Profile "${name}" is code-owned and cannot be edited. ` +
-        `Duplicate it to a custom profile to customize.`,
     );
   }
   if (isManaged) {
@@ -1808,6 +1922,59 @@ async function handleReplaceInferenceProfile({
         );
       }
     });
+    // A fallback target must stay a standard profile: converting one to a
+    // mix would leave another profile's fallbackProfile pointing at a mix,
+    // which `LLMSchema.superRefine` rejects on the next full reparse.
+    for (const [otherName, other] of Object.entries(existingProfiles)) {
+      if (otherName !== name && other?.fallbackProfile === name) {
+        throw new BadRequestError(
+          `Profile "${otherName}" declares profile "${name}" as its fallbackProfile; a fallback must be a standard profile, so "${name}" cannot become a mix.`,
+        );
+      }
+    }
+  }
+
+  // `fallbackProfile` references another profile by name. As with `mix`, the
+  // cross-profile integrity rules `LLMSchema.superRefine` enforces on
+  // full-config load (target exists, no self-reference, target is not a mix,
+  // single hop) must be checked here against the live profile set; otherwise
+  // a dangling or chained pointer would persist and break the next full
+  // config reparse.
+  if (parsed.data.fallbackProfile != null) {
+    const fallback = parsed.data.fallbackProfile;
+    if (fallback === name) {
+      throw new BadRequestError(
+        `Profile "${name}" cannot declare itself as its fallbackProfile.`,
+      );
+    }
+    const { llm: parsedLlm } = getConfig();
+    const existingProfiles = getEffectiveProfilesForProvider(
+      parsedLlm.profiles,
+      parsedLlm.defaultProvider ?? null,
+    );
+    const target = existingProfiles[fallback];
+    if (target == null) {
+      throw new BadRequestError(
+        `Profile "${name}" declares fallbackProfile "${fallback}" which is not defined.`,
+      );
+    }
+    if (target.mix != null) {
+      throw new BadRequestError(
+        `Profile "${name}" declares fallbackProfile "${fallback}" which is a mix profile; a fallback must be a standard profile.`,
+      );
+    }
+    if (target.fallbackProfile != null) {
+      throw new BadRequestError(
+        `Profile "${name}" declares fallbackProfile "${fallback}" which sets its own fallbackProfile; fallback is a single hop, chains are not allowed.`,
+      );
+    }
+    for (const [otherName, other] of Object.entries(existingProfiles)) {
+      if (otherName !== name && other?.fallbackProfile === name) {
+        throw new BadRequestError(
+          `Profile "${otherName}" already declares profile "${name}" as its fallbackProfile; fallback is a single hop, chains are not allowed.`,
+        );
+      }
+    }
   }
 
   // When the UI sends provider but no provider_connection, derive the connection
@@ -2256,11 +2423,14 @@ export const ROUTES: RouteDefinition[] = [
       allowedPrincipalTypes: ACTOR_PRINCIPALS,
     },
     summary: "Set embedding config",
-    description: "Change the embedding provider and optionally model.",
+    description:
+      "Change the embedding provider, model, and optional custom endpoint.",
     tags: ["config"],
     requestBody: z.object({
       provider: z.string(),
       model: z.string().optional(),
+      baseUrl: z.string().optional(),
+      dimensions: z.number().int().positive().nullable().optional(),
     }),
     handler: handleSetEmbeddingConfig,
   },

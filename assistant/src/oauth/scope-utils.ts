@@ -24,6 +24,78 @@ export function scopeDifference(
   );
 }
 
+/**
+ * Split a scope list the way the provider writes it.
+ *
+ * Providers (GitHub, Slack) may return comma-separated scopes regardless of
+ * the separator used to join outbound authorize URLs, so the default tolerates
+ * both spaces and commas. A provider that explicitly configures a non-default
+ * separator (Linear uses ",") is honored, keeping configured scopes
+ * round-tripping symmetrically.
+ *
+ * The one parser for both directions: token responses and authorize
+ * parameters. Two copies would let a provider-format fix land on one and not
+ * the other.
+ */
+export function parseScopeList(
+  raw: string,
+  scopeSeparator: string = " ",
+): string[] {
+  const splitPattern = scopeSeparator === " " ? /[ ,]/ : scopeSeparator;
+  return raw
+    .split(splitPattern)
+    .map((scope) => scope.trim())
+    .filter(Boolean);
+}
+
+/**
+ * The scopes the stored access token is expected to carry.
+ *
+ * A provider that asks for user scopes alongside bot scopes issues two grants
+ * from one authorization. `exchangeCodeForTokens` stores the `authed_user`
+ * token in that case and records that token's own grant as `grantedScopes`, so
+ * coverage has to be measured against the request that produced the stored
+ * token: `user_scope` where the provider sends one, the `scope` parameter
+ * otherwise. Measuring a user grant against the bot request reports scopes the
+ * authorization could never place on that token.
+ */
+export function expectedScopesForStoredToken(
+  defaultScopes: string[],
+  authorizeParams: Record<string, string> | undefined,
+  scopeSeparator?: string,
+): string[] {
+  const userScope = authorizeParams?.user_scope;
+  if (typeof userScope !== "string") {
+    return defaultScopes;
+  }
+  const parsed = parseScopeList(userScope, scopeSeparator);
+  return parsed.length > 0 ? parsed : defaultScopes;
+}
+
+/**
+ * The required scopes a stored grant lacks. Requirements come from the request
+ * that produced the stored token ({@link expectedScopesForStoredToken}), so a
+ * provider's bot-only scopes are never demanded of a user token. An empty
+ * requirement or an unrecorded grant reports nothing, because unknown scope
+ * data must never read as a failure.
+ */
+export function missingScopesForStoredToken(
+  defaultScopes: string[],
+  authorizeParams: Record<string, string> | undefined,
+  scopeSeparator: string | undefined,
+  grantedScopes: string[],
+): string[] {
+  const expected = expectedScopesForStoredToken(
+    defaultScopes,
+    authorizeParams,
+    scopeSeparator,
+  );
+  if (expected.length === 0 || grantedScopes.length === 0) {
+    return [];
+  }
+  return scopeDifference(expected, grantedScopes);
+}
+
 const GMAIL_FULL_ACCESS_SCOPE = "https://mail.google.com/";
 const GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly";
 

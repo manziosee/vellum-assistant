@@ -7,9 +7,15 @@ import { describe, expect, test } from "bun:test";
 import type { FeedItem } from "@vellumai/assistant-api";
 
 import {
+  clearAllArgs,
   getFeedItemScheduleId,
   getFeedItemSkillId,
+  getVisibleFeedItems,
+  guardianLabelKey,
+  markAllReadArgs,
   resolveFeedItemTitle,
+  resolveThreadName,
+  sortFeedItems,
 } from "./utils";
 
 function feedItem(overrides: Partial<FeedItem> = {}): FeedItem {
@@ -108,5 +114,123 @@ describe("resolveFeedItemTitle", () => {
   test("falls back to a fixed name when the summary flattens to nothing", () => {
     const item = feedItem({ summary: "```\nnpm run build\n```" });
     expect(resolveFeedItemTitle(item)).toBe("Notification");
+  });
+});
+
+function guardianItem(
+  status: NonNullable<FeedItem["guardianRequest"]>["status"],
+  overrides: Partial<FeedItem> = {},
+): FeedItem {
+  return feedItem({
+    id: `guardian:req-${status}`,
+    urgency: "high",
+    guardianRequest: {
+      requestId: `req-${status}`,
+      kind: "tool_approval",
+      intent: "approval",
+      status,
+    },
+    ...overrides,
+  });
+}
+
+describe("guardian feed item derivations", () => {
+  test("a pending guardian item stays visible despite high urgency", () => {
+    const pending = guardianItem("pending");
+    const plainHighUrgency = feedItem({ id: "urgent", urgency: "high" });
+    const visible = getVisibleFeedItems([pending, plainHighUrgency]);
+    expect(visible.map((i) => i.id)).toEqual([pending.id]);
+  });
+
+  test("a pending guardian item sorts ahead of higher-priority items", () => {
+    const pending = guardianItem("pending");
+    const louder = feedItem({ id: "louder", priority: 90 });
+    expect(sortFeedItems([louder, pending]).map((i) => i.id)).toEqual([
+      pending.id,
+      louder.id,
+    ]);
+  });
+
+  test("bulk payloads exclude pending guardian ids and include receipts", () => {
+    const pending = guardianItem("pending");
+    const receipt = guardianItem("approved", {
+      id: "guardian:req-approved",
+      urgency: "medium",
+    });
+    const routine = feedItem({ id: "routine" });
+    const visible = [pending, receipt, routine];
+
+    expect(clearAllArgs(visible).ids.sort()).toEqual(
+      [receipt.id, routine.id].sort(),
+    );
+    expect(markAllReadArgs(visible).ids.sort()).toEqual(
+      [receipt.id, routine.id].sort(),
+    );
+  });
+
+  test("a guardian item is named for what its state asks of the user", () => {
+    expect(guardianLabelKey(guardianItem("pending"))).toBe(
+      "category.guardianAction",
+    );
+    // Settled: nothing is needed of anyone, so it is named for what it was.
+    expect(guardianLabelKey(guardianItem("approved"))).toBe(
+      "category.guardianRequest",
+    );
+    const question = feedItem({
+      guardianRequest: {
+        requestId: "req-q",
+        kind: "pending_question",
+        intent: "question",
+        status: "pending",
+      },
+    });
+    expect(guardianLabelKey(question)).toBe("category.guardianAnswer");
+    // A question that was answered asks nothing more.
+    expect(
+      guardianLabelKey({
+        ...question,
+        guardianRequest: { ...question.guardianRequest!, status: "approved" },
+      }),
+    ).toBe("category.guardianQuestion");
+    expect(guardianLabelKey(feedItem())).toBeNull();
+  });
+});
+
+describe("resolveThreadName", () => {
+  const titles = new Map([["conv-1", "Weekly report"]]);
+
+  test("names the item's conversation when the lists carry its title", () => {
+    expect(
+      resolveThreadName(
+        feedItem({ conversationId: "conv-1", sourceLabel: "Heartbeat" }),
+        titles,
+      ),
+    ).toBe("Weekly report");
+  });
+
+  test("falls back to an informative source label", () => {
+    expect(
+      resolveThreadName(
+        feedItem({ conversationId: "conv-gone", sourceLabel: "Heartbeat" }),
+        titles,
+      ),
+    ).toBe("Heartbeat");
+    expect(
+      resolveThreadName(feedItem({ sourceLabel: "Heartbeat" }), titles),
+    ).toBe("Heartbeat");
+  });
+
+  test.each(["Conversation", "Other"])(
+    "leaves the line out for the generic %s source label",
+    (sourceLabel) => {
+      expect(resolveThreadName(feedItem({ sourceLabel }), titles)).toBeNull();
+    },
+  );
+
+  test("leaves the line out when nothing names the thread", () => {
+    expect(resolveThreadName(feedItem(), titles)).toBeNull();
+    expect(
+      resolveThreadName(feedItem({ conversationId: "conv-gone" }), titles),
+    ).toBeNull();
   });
 });

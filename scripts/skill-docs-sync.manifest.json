@@ -3,19 +3,19 @@
   "skills": {
     "acp": {
       "docsSlug": "acp",
-      "sha256": "721a130b51cc08112b057387fe43a6427d2987c8a36631ed84c6ee2131ea64e9"
+      "sha256": "856f7eb970aec89fd8095cb58315df7c675c81903a1add2b9b8962151a4ac27e"
     },
     "app-builder": {
       "docsSlug": "app-builder",
-      "sha256": "09c28514c0187b9f94a8e97c55c062999d741016ff3e8d693357b6b5cc0a1e98"
+      "sha256": "9fff654b8f611331996267476a21d47a6eacd260ac2d800e92be92d5db373a5e"
     },
     "computer-use": {
       "docsSlug": "computer-use",
-      "sha256": "648ad44fd3c3d052893aaa2b71b8478c73b1c786993aa3ede2aa6298b3a3cf5e"
+      "sha256": "7f19d29f8244b323daf1f27a6779e28c8232300d01cc6a41a01d93e7a7db223e"
     },
     "contacts": {
       "docsSlug": "contacts",
-      "sha256": "8dd93ed4ba48690e223f2af4719743b1fd1cb1ece530f13a58d961d871db592d"
+      "sha256": "d32a898db0fa4ce155e83766ef893661b5dc458e98ac134f8421adff6fed9501"
     },
     "document-editor": {
       "docsSlug": "document",
@@ -31,15 +31,15 @@
     },
     "media-processing": {
       "docsSlug": "media-processing",
-      "sha256": "2355e860b9ae5c06036ca2ef206679647a9c73ff38af50a23268503959f189cd"
+      "sha256": "aa38b7020be5ef92cd4f065b9d30a135947cd800bb09884b3fdc3323a49c8ac8"
     },
     "messaging": {
       "docsSlug": "messaging",
-      "sha256": "c6f265b9d8bdef9d84b5b5cef3ca19b5cf0a1f270fd64bf4b0f94d9172d23657"
+      "sha256": "5303770a66d0b52704ce6d7393f2c21704146b34c9f91b5d441a87479bd81cb3"
     },
     "phone-calls": {
       "docsSlug": "phone-calls",
-      "sha256": "99a65fbcc7b683812aba75beb5865526d70476a0ef826a2f5002e5582b7803b1"
+      "sha256": "cdfe66613ff51eda90db034a77b4cfcb8fabd5970b3730d1ff31612ae94c4f41"
     },
     "playbooks": {
       "docsSlug": "playbooks",
@@ -47,15 +47,15 @@
     },
     "schedule": {
       "docsSlug": "schedule",
-      "sha256": "536613209f592d138a42bd95c28e7bf619b327f1091807465012c2bf842b37e4"
+      "sha256": "ebfad7b3518fab2bf210721459566c0071046bab83428804c8cf8c73a9d4afe9"
     },
     "skill-management": {
       "docsSlug": "skill-management",
-      "sha256": "cc095fdb54af9ab614227aca110449b7ae6d4466e80ee4b36f0b9ce04e7aa92d"
+      "sha256": "57dac1438ed7c7587a5cff1a9140155479fc8e4df3022e9189c919bac6d12bb4"
     },
     "subagent": {
       "docsSlug": "subagent",
-      "sha256": "f178e78b1f230b565880164a8b2535f25760ac496d1aa27fdd409a9b0825f1be"
+      "sha256": "099293c722a13d35f99bb92b03ff73acdd7e7ac3c3e5e6d7c28b48aa3cc18099"
     },
     "transcribe": {
       "docsSlug": "transcribe",

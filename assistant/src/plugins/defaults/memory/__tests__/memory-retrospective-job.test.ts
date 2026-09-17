@@ -2,6 +2,7 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { beforeEach, describe, expect, mock, test } from "bun:test";
 
+import type { AgentLoopExitReason } from "../../../../hooks/types.js";
 import { getWorkspaceDir } from "../paths.js";
 
 // ---------------------------------------------------------------------------
@@ -19,6 +20,7 @@ let mockState: StateRow = null;
 let stateUpserts: Array<{
   conversationId: string;
   lastProcessedMessageId: string;
+  lastProcessedCreatedAt?: number | null;
   lastRunAt: number;
   rememberedLog?: string[];
 }> = [];
@@ -48,7 +50,14 @@ let priorRetroId: string | null = null;
 let priorRetroOwnerId = "src-conv-1";
 let priorRetroMessages: Array<{ role: string; content: string }> = [];
 
-let mockWakeResult: { invoked: boolean; reason?: string } = { invoked: true };
+// `exitReason` mirrors what the real wake reports for a completed run: the
+// model answered without asking for another tool. The finalizer reads it to
+// tell a finished review from one something else cut short.
+let mockWakeResult: {
+  invoked: boolean;
+  reason?: string;
+  exitReason?: AgentLoopExitReason;
+} = { invoked: true, exitReason: "no_tool_calls" };
 let mockWakeThrows: Error | null = null;
 let wakeCalls: Array<{
   conversationId: string;
@@ -108,6 +117,21 @@ let loadedConversations: Record<string, { processing: boolean }> = {};
 // the stale-flag override's age check. Absent ids read as null (stampless).
 let processingStartedAtById: Record<string, number | null> = {};
 
+// The source conversation's recorded wire surface (what its last live turn
+// sent to the provider, and whether that turn's prompt rendered the
+// delegation section). `null` = no live turn has recorded one yet.
+let mockSourceToolSurface: {
+  tools: Array<Record<string, unknown>>;
+  delegateIndependentTasks: boolean | null;
+} | null = null;
+let toolSurfaceReads: string[] = [];
+mock.module("../../../../persistence/conversation-tool-surface.js", () => ({
+  getConversationToolSurface: (conversationId: string) => {
+    toolSurfaceReads.push(conversationId);
+    return mockSourceToolSurface;
+  },
+}));
+
 const watchdogEvents: Array<{
   checkName: string;
   value?: number | null;
@@ -141,6 +165,7 @@ mock.module("../memory-retrospective-state.js", () => ({
   upsertRetrospectiveState: (args: {
     conversationId: string;
     lastProcessedMessageId: string;
+    lastProcessedCreatedAt?: number | null;
     lastRunAt: number;
     rememberedLog?: string[];
   }) => {
@@ -324,15 +349,16 @@ mock.module("../../../../persistence/jobs-store.js", () => ({
   },
 }));
 
-// The v3-tier gate. Drives both `buildForkInstruction`'s skill-authoring
-// section (proc-to-skills) and the wake's origin pin behavior. Default inactive
-// (remember-only), matching a stock install; tests flip it on to assert the
-// authoring section.
-let mockV3TierActive = false;
+// Retrospective skill improvement is distinct from the v3 tier. Keep v3 live
+// while flipping the authoring gate so these tests prove the job reads the
+// dedicated predicate rather than using the broader tier predicate.
+let mockV3TierActive = true;
+let mockSkillImprovementActive = false;
 mock.module("../../../../config/memory-v3-gate.js", () => ({
   isMemoryEnabled: (config?: { memory?: { enabled?: boolean } }) =>
     config?.memory?.enabled !== false,
   isV3TierActive: () => mockV3TierActive,
+  isSkillImprovementActive: () => mockSkillImprovementActive,
   isMemoryV3Live: () => mockV3TierActive,
   usesConceptPageMemory: (memory?: {
     enabled?: boolean;
@@ -481,7 +507,7 @@ describe("memoryRetrospectiveJob", () => {
     priorRetroId = null;
     priorRetroOwnerId = "src-conv-1";
     priorRetroMessages = [];
-    mockWakeResult = { invoked: true };
+    mockWakeResult = { invoked: true, exitReason: "no_tool_calls" };
     mockWakeThrows = null;
     wakeCalls = [];
     deletedConversationIds = [];
@@ -496,7 +522,10 @@ describe("memoryRetrospectiveJob", () => {
     processingStartedAtById = {};
     mockResolvedUserSlug = "alice";
     resolveUserSlugCalls = [];
-    mockV3TierActive = false;
+    mockV3TierActive = true;
+    mockSkillImprovementActive = false;
+    mockSourceToolSurface = null;
+    toolSurfaceReads = [];
   });
 
   test("first-run happy path: no state row, no prior retrospective, both pointer fields set on success", async () => {
@@ -510,6 +539,11 @@ describe("memoryRetrospectiveJob", () => {
     }
     expect(stateUpserts).toHaveLength(1);
     expect(stateUpserts[0]!.lastProcessedMessageId).toBe("m3");
+    // The cutoff's `createdAt` rides along so the cursor keeps bounding reads
+    // after a regenerate deletes m3.
+    expect(stateUpserts[0]!.lastProcessedCreatedAt).toBe(
+      Date.parse("2026-05-11T10:10:00Z"),
+    );
     expect(lastRunAtBumps).toHaveLength(0);
     expect(wakeCalls).toHaveLength(1);
     // Forks off the source so future runs can find it via
@@ -822,7 +856,7 @@ describe("memoryRetrospectiveJob", () => {
   // -------------------------------------------------------------------------
 
   test("invoked wake with NO persisted run output: no_usable_output, cursor and log untouched, window retryable", async () => {
-    mockWakeResult = { invoked: true };
+    mockWakeResult = { invoked: true, exitReason: "no_tool_calls" };
     // The fork persisted nothing (e.g. a swallowed provider rejection or a
     // zero-output max-tokens stop).
     messagesByConversationId["fork-conv-1"] = [];
@@ -843,14 +877,19 @@ describe("memoryRetrospectiveJob", () => {
         value: 1,
         detail: {
           outcome: "no_usable_output",
-          reason: "run persisted no memory-writing tool call",
+          // The failure reason names what was missing, so an operator reading
+          // the job row can tell a lost write from an unfinished review.
+          reason: "run committed neither a memory write nor a concluding reply",
         },
       },
     ]);
   });
 
-  test("invoked wake whose run persisted only analysis text (no tool calls): no_usable_output, prior retrospective preserved", async () => {
-    mockWakeResult = { invoked: true };
+  test("a run whose reply reads as a conclusion but that the provider cut short: no_usable_output, prior retrospective preserved", async () => {
+    // Same persisted text as a finished review, but the loop ended on the
+    // output-token ceiling rather than on the model's own stop, so the reply
+    // is a fragment of a review, not a verdict on the window.
+    mockWakeResult = { invoked: true, exitReason: "max_tokens_reached" };
     priorRetroId = "prior-retro-1";
     messagesByConversationId["fork-conv-1"] = [
       {
@@ -866,14 +905,38 @@ describe("memoryRetrospectiveJob", () => {
     const outcome = await memoryRetrospectiveJob(makeJob(), stubConfig);
 
     expect(outcome.kind).toBe("no_usable_output");
+    if (outcome.kind === "no_usable_output") {
+      expect(outcome.reason).toBe(
+        "run replied without saving anything, but ended on max_tokens_reached rather than a completed review",
+      );
+    }
     expect(stateUpserts).toHaveLength(0);
     // Only this run's own fork is deleted; the prior retrospective (the
     // dedup baseline for the retry) is preserved.
     expect(deletedConversationIds).toEqual(["fork-conv-1"]);
   });
 
-  test("run-message load failure classifies as no_usable_output (fail-closed), not success", async () => {
+  test("a run the loop never reported a terminal exit for cannot advance on a reply alone", async () => {
+    // A checkpoint handoff runs no terminal exit event, so the run resumes
+    // elsewhere and this fork holds an unfinished review.
     mockWakeResult = { invoked: true };
+    messagesByConversationId["fork-conv-1"] = [
+      {
+        role: "assistant",
+        content: JSON.stringify([{ type: "text", text: "Nothing to save." }]),
+        createdAt: Date.parse("2026-05-11T10:20:00Z"),
+        metadata: null,
+      },
+    ];
+
+    const outcome = await memoryRetrospectiveJob(makeJob(), stubConfig);
+
+    expect(outcome.kind).toBe("no_usable_output");
+    expect(stateUpserts).toHaveLength(0);
+  });
+
+  test("run-message load failure classifies as no_usable_output (fail-closed), not success", async () => {
+    mockWakeResult = { invoked: true, exitReason: "no_tool_calls" };
     // Fork-kind conversation with no stamps and no leading instruction row:
     // `loadRetrospectiveRunMessages` returns null (indeterminate).
     conversationOverrides["fork-conv-1"] = {
@@ -896,7 +959,7 @@ describe("memoryRetrospectiveJob", () => {
   });
 
   test("checkpoint-persisted saves on a fork-kind tail count as usable output (rebase-after-live cannot fake no-output)", async () => {
-    mockWakeResult = { invoked: true };
+    mockWakeResult = { invoked: true, exitReason: "no_tool_calls" };
     conversationOverrides["fork-conv-1"] = {
       source: "memory-retrospective-fork",
       forkParentMessageId: null,
@@ -945,7 +1008,7 @@ describe("memoryRetrospectiveJob", () => {
   });
 
   test("scaffold_managed_skill counts as durable work even with zero remembers", async () => {
-    mockWakeResult = { invoked: true };
+    mockWakeResult = { invoked: true, exitReason: "no_tool_calls" };
     messagesByConversationId["fork-conv-1"] = [
       {
         role: "assistant",
@@ -982,7 +1045,7 @@ describe("memoryRetrospectiveJob", () => {
   });
 
   test("a remember whose execution FAILED (is_error tool_result) is not durable evidence and its facts stay out of the log", async () => {
-    mockWakeResult = { invoked: true };
+    mockWakeResult = { invoked: true, exitReason: "no_tool_calls" };
     messagesByConversationId["fork-conv-1"] = [
       {
         role: "assistant",
@@ -1023,41 +1086,91 @@ describe("memoryRetrospectiveJob", () => {
     expect(lastRunAtBumps).toHaveLength(1);
   });
 
-  test("explicit no-findings reply advances the cursor without fabricating a memory write", async () => {
-    mockWakeResult = { invoked: true };
+  // A finished review that found nothing advances on the SHAPE of the run,
+  // never on the wording of the reply. Each phrasing below is a correct
+  // conclusion the model reached on its own; the window it reviewed is
+  // consumed, and the health counter records which kind of success it was.
+  test.each([
+    "Nothing new to save.",
+    "Nothing new to save beyond those two facts.",
+    "Nothing else new to save.",
+    "Done.",
+    "I reviewed the window. Nothing new to save. Here is my reasoning about why each item was already covered by prior passes.",
+  ])(
+    "a completed review that saved nothing advances the cursor: %s",
+    async (reply) => {
+      mockWakeResult = { invoked: true, exitReason: "no_tool_calls" };
+      messagesByConversationId["fork-conv-1"] = [
+        {
+          role: "assistant",
+          content: JSON.stringify([{ type: "text", text: reply }]),
+          createdAt: Date.parse("2026-05-11T10:20:00Z"),
+          metadata: null,
+        },
+      ];
+
+      const outcome = await memoryRetrospectiveJob(makeJob(), stubConfig);
+
+      expect(outcome.kind).toBe("invoked");
+      if (outcome.kind === "invoked") {
+        expect(outcome.noFindings).toBe(true);
+      }
+      expect(stateUpserts).toHaveLength(1);
+      expect(stateUpserts[0]!.lastProcessedMessageId).toBe("m3");
+      expect(stateUpserts[0]!.rememberedLog).toEqual([]);
+      expect(
+        watchdogEvents.filter(
+          (e) => e.checkName === "memory_retrospective_run",
+        ),
+      ).toEqual([
+        {
+          checkName: "memory_retrospective_run",
+          value: 1,
+          detail: { outcome: "invoked", noFindings: true },
+        },
+      ]);
+    },
+  );
+
+  test("narration followed by an empty final response has not concluded and does not advance", async () => {
+    // The reply that proves an empty-handed review must be the run's final
+    // word: text that went live mid-run followed by an empty last response
+    // is an unfinished review, not a conclusion.
+    mockWakeResult = { invoked: true, exitReason: "no_tool_calls" };
     messagesByConversationId["fork-conv-1"] = [
       {
         role: "assistant",
         content: JSON.stringify([
-          { type: "text", text: "Nothing new to save." },
+          { type: "text", text: "Let me look through the window carefully." },
         ]),
         createdAt: Date.parse("2026-05-11T10:20:00Z"),
+        metadata: null,
+      },
+      {
+        role: "assistant",
+        content: JSON.stringify([]),
+        createdAt: Date.parse("2026-05-11T10:20:05Z"),
         metadata: null,
       },
     ];
 
     const outcome = await memoryRetrospectiveJob(makeJob(), stubConfig);
 
-    // A reviewed-and-no-findings pass is a legitimate success: the mandated
-    // exact reply is the positive persisted artifact, the cursor advances,
-    // and the remembered log gains nothing.
-    expect(outcome.kind).toBe("invoked");
-    expect(stateUpserts).toHaveLength(1);
-    expect(stateUpserts[0]!.lastProcessedMessageId).toBe("m3");
-    expect(stateUpserts[0]!.rememberedLog).toEqual([]);
+    expect(outcome.kind).toBe("no_usable_output");
+    if (outcome.kind === "no_usable_output") {
+      expect(outcome.reason).toBe(
+        "run committed neither a memory write nor a concluding reply",
+      );
+    }
+    expect(stateUpserts).toHaveLength(0);
   });
 
-  test("analysis prose that merely mentions the no-findings phrase does not advance", async () => {
-    mockWakeResult = { invoked: true };
+  test("a run whose only text is whitespace has committed nothing and does not advance", async () => {
+    mockWakeResult = { invoked: true, exitReason: "no_tool_calls" };
     messagesByConversationId["fork-conv-1"] = [
       {
         role: "assistant",
-        content: JSON.stringify([
-          {
-            type: "text",
-            text: "I reviewed the window. Nothing new to save. Here is my reasoning about why each item was already covered by prior passes.",
-          },
-        ]),
+        content: JSON.stringify([{ type: "text", text: "   \n  " }]),
         createdAt: Date.parse("2026-05-11T10:20:00Z"),
         metadata: null,
       },
@@ -1069,8 +1182,8 @@ describe("memoryRetrospectiveJob", () => {
     expect(stateUpserts).toHaveLength(0);
   });
 
-  test("no-findings reply cannot advance a run that attempted a save and failed", async () => {
-    mockWakeResult = { invoked: true };
+  test("a spoken conclusion cannot advance a run that attempted a save and failed", async () => {
+    mockWakeResult = { invoked: true, exitReason: "no_tool_calls" };
     messagesByConversationId["fork-conv-1"] = [
       {
         role: "assistant",
@@ -1112,13 +1225,18 @@ describe("memoryRetrospectiveJob", () => {
 
     // The run demonstrably had findings (it attempted a save); the failed
     // write must stay retryable rather than being papered over by a
-    // no-findings claim.
+    // no-findings claim, and the job row must say a write was lost.
     expect(outcome.kind).toBe("no_usable_output");
+    if (outcome.kind === "no_usable_output") {
+      expect(outcome.reason).toBe(
+        "run attempted 1 memory write(s), none of which persisted a successful result",
+      );
+    }
     expect(stateUpserts).toHaveLength(0);
   });
 
   test("a remember tool_use with NO persisted tool_result is not durable evidence", async () => {
-    mockWakeResult = { invoked: true };
+    mockWakeResult = { invoked: true, exitReason: "no_tool_calls" };
     messagesByConversationId["fork-conv-1"] = [
       {
         role: "assistant",
@@ -1142,7 +1260,7 @@ describe("memoryRetrospectiveJob", () => {
   });
 
   test("retry after a no_usable_output run advances only once durable output exists", async () => {
-    mockWakeResult = { invoked: true };
+    mockWakeResult = { invoked: true, exitReason: "no_tool_calls" };
     messagesByConversationId["fork-conv-1"] = [];
 
     const first = await memoryRetrospectiveJob(makeJob(), stubConfig);
@@ -1216,7 +1334,7 @@ describe("memoryRetrospectiveJob", () => {
   });
 
   test("wake allows memory saves + skill authoring and suppresses the internal wake surface", async () => {
-    mockV3TierActive = true;
+    mockSkillImprovementActive = true;
     await memoryRetrospectiveJob(makeJob(), stubConfig);
 
     expect(forkCalls).toHaveLength(1);
@@ -1239,8 +1357,9 @@ describe("memoryRetrospectiveJob", () => {
     expect(opts.hintRole).toBe("user");
   });
 
-  test("wake is remember-only when proc-to-skills is inactive", async () => {
-    mockV3TierActive = false;
+  test("wake is remember-only when skill improvement is disabled on a live v3 tier", async () => {
+    mockV3TierActive = true;
+    mockSkillImprovementActive = false;
     await memoryRetrospectiveJob(makeJob(), stubConfig);
 
     expect(wakeCalls).toHaveLength(1);
@@ -1735,8 +1854,66 @@ describe("memoryRetrospectiveJob", () => {
     expect(wakeCalls[0]!.opts.toolContextPin).toEqual({
       hasNoClient: false,
       transportInterface: "web",
+      clientOs: "web",
       requestOrigin: "memory_retrospective",
     });
+  });
+
+  test("replays the source's recorded wire tool surface verbatim on the fork wake", async () => {
+    mockSourceToolSurface = {
+      tools: [
+        { name: "bash", description: "Run", input_schema: {} },
+        { name: "remember", description: "Save", input_schema: {} },
+        { name: "bell_jingle", description: "Ring", input_schema: {} },
+        { type: "web_search_20250305", name: "web_search", max_uses: 5 },
+      ],
+      delegateIndependentTasks: true,
+    };
+
+    await memoryRetrospectiveJob(makeJob(), stubConfig);
+
+    expect(toolSurfaceReads).toEqual(["src-conv-1"]);
+    expect(wakeCalls).toHaveLength(1);
+    // The exact recorded array rides to the wake; the fork sends it in place
+    // of the surface it would resolve for itself.
+    expect(wakeCalls[0]!.opts.wireToolDefinitions).toEqual(
+      mockSourceToolSurface.tools,
+    );
+    // The delegation-section state the source's prompt rendered rides with
+    // it, so the fork's system prompt matches too.
+    expect(wakeCalls[0]!.opts.delegateIndependentTasks).toBe(true);
+    // The execution-side pin still rides alongside it.
+    expect(wakeCalls[0]!.opts.toolGateMode).toBe("execution");
+    expect(wakeCalls[0]!.opts.toolContextPin).toBeDefined();
+  });
+
+  test("a surface recorded without the delegation state leaves the fork to derive the section", async () => {
+    // A row written before the state was recorded: the array still replays,
+    // and the prompt gate falls back to the wake's own answer.
+    mockSourceToolSurface = {
+      tools: [{ name: "remember", description: "Save", input_schema: {} }],
+      delegateIndependentTasks: null,
+    };
+
+    await memoryRetrospectiveJob(makeJob(), stubConfig);
+
+    expect(wakeCalls).toHaveLength(1);
+    expect(wakeCalls[0]!.opts.wireToolDefinitions).toEqual(
+      mockSourceToolSurface.tools,
+    );
+    expect("delegateIndependentTasks" in wakeCalls[0]!.opts).toBe(false);
+  });
+
+  test("no recorded source surface → no wireToolDefinitions; the pin alone shapes the wire", async () => {
+    mockSourceToolSurface = null;
+
+    await memoryRetrospectiveJob(makeJob(), stubConfig);
+
+    expect(toolSurfaceReads).toEqual(["src-conv-1"]);
+    expect(wakeCalls).toHaveLength(1);
+    expect("wireToolDefinitions" in wakeCalls[0]!.opts).toBe(false);
+    expect("delegateIndependentTasks" in wakeCalls[0]!.opts).toBe(false);
+    expect(wakeCalls[0]!.opts.toolContextPin).toBeDefined();
   });
 
   test("execution mode is unconditional → toolContextPin rides even without a resolved profile", async () => {
@@ -1771,7 +1948,11 @@ describe("memoryRetrospectiveJob", () => {
         id: "m2",
         createdAt: Date.parse("2026-05-11T10:05:00Z"),
         role: "user",
-        metadata: JSON.stringify({ userMessageInterface: "macos" }),
+        metadata: JSON.stringify({
+          userMessageInterface: "macos",
+          client: { os: "macos" },
+          clientOsFromRequest: true,
+        }),
       },
       {
         id: "m3",
@@ -1792,6 +1973,7 @@ describe("memoryRetrospectiveJob", () => {
     expect(wakeCalls[0]!.opts.toolContextPin).toEqual({
       hasNoClient: false,
       transportInterface: "macos",
+      clientOs: "macos",
       requestOrigin: "memory_retrospective",
     });
   });
@@ -1815,6 +1997,7 @@ describe("memoryRetrospectiveJob", () => {
     expect(wakeCalls[0]!.opts.toolContextPin).toEqual({
       hasNoClient: false,
       transportInterface: "macos",
+      clientOs: "macos",
       requestOrigin: "memory_retrospective",
     });
   });
@@ -2439,7 +2622,7 @@ describe("memoryRetrospectiveJob", () => {
   });
 
   test("proc-to-skills active: instruction carries the pre-check + dedup + companion-file directives", async () => {
-    mockV3TierActive = true;
+    mockSkillImprovementActive = true;
 
     await memoryRetrospectiveJob(makeJob(), stubConfig);
 

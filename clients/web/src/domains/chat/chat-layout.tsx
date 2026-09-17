@@ -8,14 +8,15 @@ import {
   type ReactNode,
 } from "react";
 import {
-  Outlet,
   useLocation,
   useNavigate,
   useNavigationType,
 } from "react-router";
 import { SIDE_MENU_TILE_SIZE } from "@vellumai/design-library";
 
+import { assistantStateCanServeChat } from "@/assistant/lifecycle";
 import { useAssistantLifecycleStore } from "@/assistant/lifecycle-store";
+import { useClientFeatureFlagStore } from "@/stores/client-feature-flag-store";
 import {
   selectChatFocusActive,
   selectHeaderCenterHidden,
@@ -32,8 +33,8 @@ import {
   setLocalNumber,
 } from "@/utils/local-settings";
 import {
+  conversationIdForPath,
   isAboutAssistantPath,
-  isConversationChatPath,
   isConversationPath,
   routes,
 } from "@/utils/routes";
@@ -41,6 +42,7 @@ import {
 import { useChatLayoutSlotsStore } from "@/components/layout/chat-layout-slots-store";
 import { useElectronDockSync } from "@/domains/chat/hooks/use-electron-dock-sync";
 import { useNativeRecentChatsSync } from "@/domains/chat/hooks/use-native-recent-chats-sync";
+import { useNativeWidgetSnapshotSync } from "@/domains/chat/hooks/use-native-widget-snapshot-sync";
 import { useOpenAppFromChat } from "@/domains/chat/hooks/use-open-app-from-chat";
 import { DRAWER_SURFACE_BACKGROUND } from "@/domains/chat/utils/drawer-surface";
 import {
@@ -60,9 +62,12 @@ import { useChatLayoutDrawerGestures } from "@/domains/chat/hooks/use-chat-layou
 import { useChatLayoutShortcuts } from "@/domains/chat/hooks/use-chat-layout-shortcuts";
 import { useConversationActions } from "@/domains/chat/hooks/use-conversation-actions";
 import { useConversationGroupActions } from "@/domains/chat/hooks/use-conversation-group-actions";
+import { useConversationListDeepLink } from "@/domains/chat/hooks/use-conversation-list-deep-link";
+import { useMaterializedDraftReconcile } from "@/domains/chat/hooks/use-materialized-draft-reconcile";
 import { useGroupNameRequestStore } from "@/domains/chat/group-name-request-store";
 import { useCanUseInternalThreadActions } from "@/lib/auth/internal-thread-actions";
 import {
+  keptAppId,
   navigateToConversation,
   navigateToNewConversation,
 } from "@/utils/conversation-navigation";
@@ -86,8 +91,8 @@ import { requestComposerFocus } from "./composer-focus";
 import { LazyBoundary } from "@/components/lazy-boundary";
 import { RuntimeUpgradeBanner } from "@/components/runtime-upgrade-banner";
 import { StatusBanner } from "@/components/status-banner";
-import { SidebarTipCard } from "@/components/tips/sidebar-tip-card";
-import { ensureTipsFirstSeenAt } from "@/utils/tips-storage";
+import { AssistantSleepStage } from "@/domains/chat/components/assistant-sleep-stage";
+import { useAssistantSleepStageStore } from "@/stores/assistant-sleep-stage-store";
 import { AssistantSideMenu } from "@/domains/chat/components/assistant-side-menu";
 import { PreferencesMenu } from "@/domains/chat/components/preferences-menu";
 import { useCommandPaletteOrchestrator } from "@/domains/chat/hooks/use-command-palette-orchestrator";
@@ -96,16 +101,24 @@ import { ResearchResultsOverlay } from "@/domains/chat/onboarding-research/resea
 import { OnboardingCheckinOverlay } from "@/components/onboarding-checkin-overlay";
 import { OnboardingAvatarApplier } from "@/components/onboarding-avatar-applier";
 import { VoiceSessionPillHost } from "@/domains/chat/components/voice-session-pill-host";
+import { AssistantDesktopPreview } from "@/domains/chat/desktop/assistant-desktop-preview";
+import { AssistantDesktopAffordance } from "@/domains/chat/desktop/assistant-desktop-affordance";
 import { useLiveVoiceSessionController } from "@/domains/chat/voice/live-voice/use-live-voice-session-controller";
 import { useSeedLiveVoiceSnapshot } from "@/domains/chat/voice/live-voice/use-seed-live-voice-snapshot";
 import { VoiceRoom } from "@/domains/chat/voice/voice-room/voice-room";
 import { useIsVoiceRoomVisible } from "@/domains/chat/voice/voice-room/use-is-voice-room-visible";
 import { ChatConversationHeader } from "./chat-conversation-header";
+import { ChatLayoutFrame } from "./chat-layout-frame";
 import { ChatLayoutHeader } from "./chat-layout-header";
+import { useDocumentHeaderVisible } from "./hooks/use-document-header-visible";
 import {
   ArchiveAllConfirmDialog,
   useArchiveAllConfirmation,
 } from "./components/archive-all-confirm-dialog";
+import {
+  DeleteConversationConfirmDialog,
+  useDeleteConversationConfirmation,
+} from "./components/delete-conversation-confirm-dialog";
 import { GroupNameDialogFromStore } from "./group-name-dialog-from-store";
 import { RenameDialogFromStore } from "./rename-dialog-from-store";
 import { useTranslation } from "@/i18n";
@@ -156,14 +169,26 @@ interface SideMenuRenderArgs {
  */
 export function ChatLayout({
   topBarAccessory,
+  topBarPill,
 }: {
   /**
    * Persistent element for the header's top-right, after the per-route
    * slot content (currently the notifications bell). Injected by
    * `routes.tsx` because its implementation lives in another domain,
    * which this layout must not import directly.
+   *
+   * Restated in the mobile drawer's glyph row, so only a control the drawer
+   * is meant to carry belongs here.
    */
   topBarAccessory?: ReactNode;
+  /**
+   * Persistent element for the header's top-right, ahead of
+   * {@link topBarAccessory}, and nowhere else. Its own slot because the
+   * drawer's glyph row seats icon-sized controls beside the close button and
+   * a full pill does not fit there; the accessory slot reaches that row and
+   * this one does not.
+   */
+  topBarPill?: ReactNode;
 } = {}) {
   const { t } = useTranslation("chat");
   const navigate = useNavigate();
@@ -192,7 +217,15 @@ export function ChatLayout({
   const assistantStateKind = useAssistantLifecycleStore(
     (s) => s.assistantState.kind,
   );
-  const isAssistantActive = assistantStateKind === "active";
+  const selfHostedChatEnabled =
+    useClientFeatureFlagStore.use.selfHostedAssistant();
+  // `active` and flagged `self_hosted` both serve the conversation list.
+  // Gating on `active` alone leaves self-hosted queries pending forever,
+  // so the Home Screen widgets never receive a snapshot.
+  const isAssistantActive = assistantStateCanServeChat(
+    assistantStateKind,
+    selfHostedChatEnabled,
+  );
 
   // Live-voice session controller. Owned at layout scope — not by the
   // composer — so a session survives every chat-side navigation (thread
@@ -205,7 +238,7 @@ export function ChatLayout({
   useSeedLiveVoiceSnapshot();
 
   // Subscribe to the sidebar conversation list at the layout level so every
-  // chat-layout child route (home, library, contacts, identity, chat)
+  // chat-layout child route (library, contacts, identity, chat)
   // inherits a populated sidebar on direct navigation — not just /assistant.
   // TanStack Query handles dedup with any other consumer using the same key.
   // `isLoading` (first fetch actually in flight), not `isPending`: the query
@@ -213,8 +246,9 @@ export function ChatLayout({
   // fetching, which would leave the sidebar under placeholders for as long as
   // the assistant took to come up (or forever, if it never did).
   //
-  // `isAssistantActive` is the assistant record: does this assistant exist and
-  // is it provisioned. Whether its pod is reachable is a separate question,
+  // `isAssistantActive` is whether this assistant can serve chat: a
+  // provisioned `active` record, or a `self_hosted` one with the chat
+  // flag on. Whether its pod is reachable is a separate question,
   // answered inside the query hook itself, since these keys are shared with
   // call sites that pass no gate of their own.
   const {
@@ -224,10 +258,17 @@ export function ChatLayout({
     isError: conversationsFailed,
     refetch: retryConversations,
   } = useConversationListQuery(assistantId, isAssistantActive);
-  const { conversationGroups } = useConversationGroupsQuery(
-    assistantId,
-    isAssistantActive,
-  );
+  const {
+    conversationGroups,
+    isPending: isGroupsPending,
+    isError: groupsFailed,
+  } = useConversationGroupsQuery(assistantId, isAssistantActive);
+
+  // A client-minted conversation key stops being a draft once the server's own
+  // list carries a row for it. Mounted against the list this layout already
+  // subscribes to, so it costs no request. See
+  // `./hooks/use-materialized-draft-reconcile.ts`.
+  useMaterializedDraftReconcile(conversations);
 
   // Whether the transcript is on screen, resolved here because this is where
   // the route, the viewer and the viewport are all in hand. One owner, so
@@ -245,7 +286,7 @@ export function ChatLayout({
   // Track processing/attention indicators for every conversation in
   // the sidebar, on every chat-layout child route. Mounted at layout
   // scope so the bus-driven `interaction_resolved` subscriber and the
-  // post-reconnect reconcile sweep stay live across home, library,
+  // post-reconnect reconcile sweep stay live across library,
   // contacts, identity, and chat — not only inside `/assistant`.
   useAttentionTracking({
     assistantId,
@@ -281,6 +322,26 @@ export function ChatLayout({
     !isConversationListPending && !conversationsFailed,
   );
 
+  // And into the iOS shell's widget snapshot, which backs the Home Screen
+  // widgets (unread and in-progress counts, the three most recent chats).
+  // No-op off Capacitor iOS, and resolved carries the same meaning it does
+  // for the recent-chats sync above: an unresolved `[]` would blank the
+  // widgets for as long as the list failed to load. It covers BOTH queries
+  // here, because the widget snapshot carries group subtitles as well as the
+  // rows, and the groups query serves its own `[]` fallback while pending,
+  // gated, or errored: either input resolving alone would overwrite a valid
+  // snapshot with one whose subtitles are all missing.
+  useNativeWidgetSnapshotSync(
+    assistantId,
+    conversations,
+    conversationGroups,
+    isAssistantActive,
+    !isConversationListPending &&
+      !conversationsFailed &&
+      !isGroupsPending &&
+      !groupsFailed,
+  );
+
   // Header slots come from a module-level store so gated routes
   // (which see `ActiveAssistantGate`'s `<Outlet />` as their
   // nearest outlet) can register content without the lost-Provider
@@ -290,11 +351,12 @@ export function ChatLayout({
   // supplements are present and no explicit `topBarCenter` override
   // exists, ChatLayout renders ChatConversationHeader with conversation
   // actions from the shared useConversationActions instance.
-  // Non-chat routes (e.g. HomePageRoute) write `null` to topBarCenter
-  // and never set supplements, so they get an empty center as before.
+  // Non-chat routes write `null` to topBarCenter and never set
+  // supplements, so they get an empty center as before.
   const topBarCenterSlot = useChatLayoutSlotsStore.use.topBarCenter();
   const headerSupplements = useChatLayoutSlotsStore.use.headerSupplements();
   const topBarRightSlot = useChatLayoutSlotsStore.use.topBarRightSlot();
+  const mobileTopBar = useChatLayoutSlotsStore.use.mobileTopBar();
   const showInternalActions = useCanUseInternalThreadActions();
   const isNative = useIsNativePlatform();
   const electron = isElectron();
@@ -305,7 +367,6 @@ export function ChatLayout({
     selectHeaderControlsHidden,
   );
   const headerCenterHidden = useInChatOnboardingStore(selectHeaderCenterHidden);
-  const navTourActive = useInChatOnboardingStore.use.navTourActive();
   const tourActive = useInChatOnboardingStore(selectTourActive);
 
   // --- Assistant identity from store (written by ChatPage) ---
@@ -468,6 +529,19 @@ export function ChatLayout({
 
   const [drawerOpen, setDrawerOpen] = useState<boolean>(false);
 
+  // The two shapes the conversation list takes, as callbacks the deep-link
+  // drain below can hold. Blurring first is what the toggle and the swipe do:
+  // without it iOS keeps the soft keyboard up and the drawer slides in behind
+  // it looking stuck.
+  const openDrawerForDeepLink = useCallback(() => {
+    (document.activeElement as HTMLElement | null)?.blur();
+    setDrawerOpen(true);
+  }, []);
+  // Uncollapsing writes the persisted preference, same as the toggle: the user
+  // asked to see the list, and reverting it a moment later would be the
+  // surprise.
+  const expandSidebarForDeepLink = useCallback(() => setCollapsed(false), []);
+
   useEffect(() => {
     if (!isMobile) {
       setDrawerOpen(false);
@@ -483,12 +557,14 @@ export function ChatLayout({
     setDrawerOpen(false);
   }, [location.key]);
 
-  // The tips new-user grace clock anchors to first app use. Stamping here
-  // (not only in the tip hook) covers mobile, where the drawer-gated tip
-  // card may not mount for days.
-  useEffect(() => {
-    ensureTipsFirstSeenAt();
-  }, []);
+  // The Home Screen widgets' unread chip and unread line
+  // (`deeplink.openConversations`), drained after the close-on-navigation
+  // effect above so an open it grants on the same commit is not undone by it.
+  useConversationListDeepLink({
+    isMobile,
+    openDrawer: openDrawerForDeepLink,
+    expandSidebar: expandSidebarForDeepLink,
+  });
 
   useEffect(() => {
     if (!sidebarCollapseRequested) {
@@ -509,6 +585,9 @@ export function ChatLayout({
   // sidebar until the session ends or the room is minimized (the session
   // then continues behind the composer voice bar / title-bar pill).
   const voiceRoomVisible = useIsVoiceRoomVisible();
+  // The sleep stage covers this same box; while it is up the thread under it
+  // leaves the tab order and the accessibility tree, as it does for the room.
+  const sleepStageVisible = useAssistantSleepStageStore.use.visible();
 
   const drawerVisible = isMobile && drawerOpen;
 
@@ -620,19 +699,20 @@ export function ChatLayout({
     [navigate],
   );
 
-  // --- Sidebar conversation actions (pin / rename / archive / mark / move) ---
+  // --- Sidebar conversation actions (pin / rename / archive / delete / mark / move) ---
   //
   // The sidebar's hover-revealed "…" menu reads its items from these
   // handlers; without them the popover renders empty (every menu item
   // resolves to `null`). The CRUD hook lives at the layout level so the
   // sidebar's action wiring stays live on every chat-layout child route
-  // (home, library, contacts, identity) — not only inside a conversation
+  // (library, contacts, identity), not only inside a conversation
   // where ChatPage is mounted.
   const prePinGroupIdsRef = useRef<Map<string, string | undefined>>(new Map());
 
   const {
     handleArchiveConversation,
     handleUnarchiveConversation,
+    handleDeleteConversation,
     handleMarkConversationUnread,
     handleMarkConversationRead,
     handleTogglePinConversation,
@@ -661,6 +741,16 @@ export function ChatLayout({
   } = useArchiveAllConfirmation({
     assistantId,
     archiveAllInGroup: handleArchiveAllInGroup,
+  });
+
+  const {
+    pending: pendingDeleteConversation,
+    requestDelete,
+    confirmDelete,
+    cancelDelete,
+  } = useDeleteConversationConfirmation({
+    assistantId,
+    deleteConversation: handleDeleteConversation,
   });
 
   // The move-to-group menu's "New group…" item and the group actions menu's
@@ -722,6 +812,7 @@ export function ChatLayout({
         showInternalActions={showInternalActions}
         onArchive={handleArchiveConversation}
         onUnarchive={handleUnarchiveConversation}
+        onDelete={requestDelete}
         onMarkUnread={handleMarkConversationUnread}
         onMarkRead={handleMarkConversationRead}
         onPinToggle={handleTogglePinConversation}
@@ -754,6 +845,17 @@ export function ChatLayout({
     }
   }, [commandPalette.isOpen, paletteEverOpened]);
 
+  // Menu commands that act on the open conversation take the row from
+  // `activeConversation`, which resolves background, scheduled, and archived
+  // threads the foreground `conversations` list deliberately omits. They
+  // no-op while no conversation is open.
+  const withActiveConversation =
+    (action: (conversation: Conversation) => void) => () => {
+      if (activeConversation) {
+        action(activeConversation);
+      }
+    };
+
   // Electron host commands (File menu / global hotkeys). The hook is a
   // no-op on the web host. Handlers close over the latest state via an
   // internal ref, so we don't need to memoize them. Composer focus is
@@ -769,23 +871,15 @@ export function ChatLayout({
       if (!activeConversationId) {
         return;
       }
-      const target = routes.conversation(activeConversationId);
-      if (location.pathname !== target) {
-        void navigate(target);
+      // The app sub-route is another presentation of the same conversation,
+      // so the comparison is by id rather than by whole path.
+      if (conversationIdForPath(location.pathname) !== activeConversationId) {
+        void navigate(routes.conversation(activeConversationId, keptAppId()));
       }
       requestComposerFocus();
     },
-    markCurrentUnread: () => {
-      if (!activeConversationId) {
-        return;
-      }
-      const conversation = conversations.find(
-        (c) => c.conversationId === activeConversationId,
-      );
-      if (conversation) {
-        handleMarkConversationUnread(conversation);
-      }
-    },
+    markCurrentUnread: withActiveConversation(handleMarkConversationUnread),
+    togglePinConversation: withActiveConversation(handleTogglePinConversation),
     markAllRead: () => {
       void handleMarkAllReadInGroup(conversations);
     },
@@ -794,9 +888,6 @@ export function ChatLayout({
     },
     sidebarToggle: () => {
       toggleSidebar();
-    },
-    home: () => {
-      void navigate(routes.home);
     },
     commandPalette: () => {
       void openCommandPaletteWindow()
@@ -878,38 +969,13 @@ export function ChatLayout({
   // attention tracking, message reconciliation) rely on it persisting
   // across route changes.
   const isOnConversationRoute = isConversationPath(location.pathname);
+  const documentHeaderVisible = useDocumentHeaderVisible();
   const sidebarActiveConversationId = isOnConversationRoute
     ? (activeConversationId ?? undefined)
     : undefined;
 
-  // Sidebar pinned-app open. The viewer panel only renders under ChatPage
-  // (mounted at `/assistant` index + `/assistant/conversations/:id`), so a
-  // pinned-app click from home / library / identity / inspector etc. would
-  // mutate the viewer store with no surface to display against. Navigate
-  // to a chat route first when off-chat, then run the shared open flow.
-  //
-  // See `use-open-app-from-chat.ts` for the full-width loadApp flow shared
-  // with the transcript / assets-pill open path.
   const openAppFromChat = useOpenAppFromChat();
   const activeAppId = useViewerStore.use.activeAppId();
-  const handleOpenAppFromSidebar = useCallback(
-    async (appId: string) => {
-      // Off a chat route the viewer panel has no surface to render against, so
-      // we must land on one before opening the app. Routing to `/assistant`
-      // isn't neutral: the chat index auto-bootstraps to the last active /
-      // latest conversation (`use-conversation-loader`), which resurfaces the
-      // stale conversation behind the app and once it's closed (LUM-2691) —
-      // `activeConversationId` persists across route changes for SSE /
-      // attention consumers, so it doesn't reflect the user's intent. Opening
-      // over a fresh silent draft hands the loader an explicit id it won't
-      // override and leaves a clean new-chat surface on close.
-      if (!isConversationChatPath(location.pathname)) {
-        navigateToNewConversation(navigate, { silent: true });
-      }
-      await openAppFromChat(appId);
-    },
-    [location.pathname, navigate, openAppFromChat],
-  );
 
   // Inspector affordance for the sidebar context menu. The topbar variant
   // (in `chat-page.tsx`) uses `useConversationSecondaryActions` so it can
@@ -956,11 +1022,12 @@ export function ChatLayout({
       isIntelligenceActive={isIdentityActive}
       onOpenIntelligence={handleOpenIdentity}
       activeAppId={activeAppId ?? undefined}
-      onOpenApp={handleOpenAppFromSidebar}
+      onOpenApp={openAppFromChat}
       onPinConversation={handleTogglePinConversation}
       onRenameConversation={handleRenameConversation}
       onArchiveConversation={handleArchiveConversation}
       onUnarchiveConversation={handleUnarchiveConversation}
+      onDeleteConversation={requestDelete}
       onMarkConversationUnread={handleMarkConversationUnread}
       onMarkConversationRead={handleMarkConversationRead}
       onCreateGroup={handleRequestCreateEmptyGroup}
@@ -974,6 +1041,11 @@ export function ChatLayout({
       onMoveToGroup={handleMoveToGroup}
       onCreateGroupInto={handleRequestCreateGroup}
       onRemoveFromGroup={handleRemoveFromGroup}
+      leadingAction={
+        args.variant === "overlay" ? (
+          <AssistantDesktopAffordance onToggle={args.onClose} />
+        ) : undefined
+      }
       /* The same injected control the header carries, restated in the
          drawer's glyph row where the mock puts it. Sourced from the prop
          rather than imported, because it lives in another domain. */
@@ -988,17 +1060,6 @@ export function ChatLayout({
           triggerVariant={args.variant === "overlay" ? "pill" : "item"}
         />
       }
-      // The overlay subtree mounts mid edge-swipe while still off-screen;
-      // mounting the tip card there stamps an impression for a tip never
-      // seen, so the overlay only gets it once the drawer settles open.
-      // Hidden during the avatar tour for the same reason (plus noise) —
-      // the tour owns the sidebar's attention.
-      tipCard={
-        (args.variant === "overlay" && !drawerOpen) ||
-        navTourActive ? undefined : (
-          <SidebarTipCard />
-        )
-      }
       onClose={args.onClose}
     />
   );
@@ -1008,33 +1069,11 @@ export function ChatLayout({
   // mainly matters for the fade transition. Desktop is deliberately excluded:
   // its room is an inset panel mounted INSIDE `<main>`, so blurring `<main>`
   // would blur the room along with the chat behind it. Reachability is handled
-  // by `chatContent` below on both platforms, not here.
+  // by `ChatLayoutFrame` on both platforms, not here.
   const mainRoomClass =
     voiceRoomVisible && isMobile
       ? "blur-sm opacity-40 transition-[filter,opacity]"
       : "";
-
-  // The route content, held inert while the voice room covers it.
-  //
-  // The room paints over the chat but does not remove it from the page, so
-  // without this the composer, transcript and their controls stay tabbable and
-  // screen-reader reachable behind an opaque panel. `inert` takes the whole
-  // subtree out of the tab order and the accessibility tree at once, which
-  // neither the blur nor `aria-modal` does: the desktop room is deliberately
-  // non-modal so the header and sidenav stay usable, and scoping the gate to
-  // this wrapper is what keeps that chrome reachable while the content under
-  // the panel is not.
-  //
-  // The wrapper carries `<main>`'s own flex classes so the route content sees
-  // the same flex parent it would without it.
-  const chatContent = (
-    <div
-      className="flex min-h-0 min-w-0 flex-1 flex-col"
-      inert={voiceRoomVisible}
-    >
-      <Outlet />
-    </div>
-  );
 
   return (
     <>
@@ -1044,7 +1083,7 @@ export function ChatLayout({
           host renders null when there is no session to show. */}
       {!isPopout && isMobile ? <VoiceSessionPillHost variant="row" /> : null}
 
-      {!isPopout && (
+      {!isPopout && !documentHeaderVisible && (
         <ChatLayoutHeader
           isMobile={isMobile}
           drawerOpen={drawerOpen}
@@ -1058,6 +1097,7 @@ export function ChatLayout({
           // the tour runs, so it doubles as the dim signal.)
           controlsDimmed={headerCenterHidden}
           topBarCenter={topBarCenter}
+          mobileTopBar={mobileTopBar}
           // The voice-session pill is composed here — NOT registered through
           // useChatLayoutSlotsStore — because slot registration is owned by
           // per-route hooks that unmount on navigation, exactly when the pill
@@ -1072,6 +1112,8 @@ export function ChatLayout({
           topBarRightSlot={
             <>
               {topBarRightSlot}
+              {topBarPill}
+              {!isMobile && <AssistantDesktopAffordance />}
               {topBarAccessory}
             </>
           }
@@ -1093,27 +1135,33 @@ export function ChatLayout({
         </div>
       ) : null}
 
-      {isMobile ? (
-        <>
-          <main
-            className={`relative flex min-w-0 flex-1 min-h-0 flex-col overflow-hidden ${mainRoomClass}`}
+      <ChatLayoutFrame
+        isPopout={isPopout}
+        mainRoomClass={mainRoomClass}
+        routeContentInert={voiceRoomVisible || sleepStageVisible}
+        desktopNavigation={
+          <aside
+            id="chat-side-menu"
+            ref={setSideMenuAside}
+            className="w-fit shrink-0 overflow-hidden"
+            aria-label={t("chatLayout.navigationAria")}
           >
-            {chatContent}
-            {/* A popout narrowed below the mobile breakpoint lands in this
-                branch, still headerless, so it still needs the floating
-                session surface (see the desktop popout branch below). */}
-            {isPopout ? <VoiceSessionPillHost variant="standalone" /> : null}
-          </main>
-          {/* The drawer is a sibling of `<main>`, not a child of it, even
-              though it is the chat body's own navigation. `mainRoomClass`
-              puts a `filter` + `opacity` on `<main>` while the voice room is
-              up, and both make it a stacking context AND (for the filter) the
-              containing block for `position: fixed` descendants. Nested,
-              the drawer would come up blurred at 40% opacity, offset to
-              `<main>`'s box instead of the viewport, and sealed below the
-              room by its parent's tier: the menu button read as dead. Out
-              here its z-40 sorts against the room directly. */}
-          {drawerGestures.present ? (
+            {renderSideMenu({
+              collapsed: effectiveCollapsed,
+              variant: "rail",
+              width: sidebarWidth,
+              onWidthChange: handleSidebarWidthChange,
+            })}
+          </aside>
+        }
+        desktopPreview={<AssistantDesktopPreview />}
+        sleepStage={<AssistantSleepStage />}
+        popoutVoiceSession={
+          <VoiceSessionPillHost variant="standalone" />
+        }
+        desktopVoiceRoom={<VoiceRoom variant="content" />}
+        mobileDrawer={
+          drawerGestures.present ? (
             <div
               ref={drawerRef}
               className="fixed inset-0"
@@ -1152,11 +1200,11 @@ export function ChatLayout({
                   hosts is transparent, so this one fill covers both the menu
                   and the safe-area padding ring around it, which is what
                   keeps tinted strips off the notch / home-indicator edges on
-                  iOS. It thins toward the chat side (Figma 7842-83305), so
-                  the page stays legible behind the drawer while the column of
-                  navigation itself rests on solid ground. Painting it here
-                  rather than on the menu also keeps it one layer: two
-                  translucent fills would compose back to opaque. No border:
+                  iOS. The fill is fully opaque (Figma 7842-83305), so the
+                  chat never bleeds through the sheet. Painting it here
+                  rather than on the menu keeps one owner of the surface
+                  color; a second fill on the menu would composite over this
+                  one and shift the drawn color off its token. No border:
                   the sheet covers the full screen, so there is no edge to draw.
                   No bottom padding either: the SideMenu root clips its
                   children (`overflow-hidden`), so a bottom inset places the
@@ -1185,54 +1233,9 @@ export function ChatLayout({
                 })}
               </aside>
             </div>
-          ) : null}
-        </>
-      ) : isPopout ? (
-        <main
-          className={`relative flex min-w-0 flex-1 min-h-0 flex-col overflow-hidden p-4 ${mainRoomClass}`}
-        >
-          {chatContent}
-          {/* Pop-outs render no header, but they DO support in-window
-              conversation switching (Cmd+Up/Down) — so a live session started
-              here can lose its owning composer exactly like in the main
-              window. The standalone variant floats the pill (or the failed
-              chip) over the top-right corner; it renders nothing while the
-              on-screen composer owns the session. */}
-          <VoiceSessionPillHost variant="standalone" />
-        </main>
-      ) : (
-        <div className="flex min-w-0 flex-1 gap-4 p-4 min-h-0 overflow-hidden flex-col md:flex-row">
-          <aside
-            id="chat-side-menu"
-            ref={setSideMenuAside}
-            // No width of its own: the wrapper shrink-wraps the SideMenu
-            // nav, which owns the rail width (drag-resize mutates it outside
-            // React until pointer-up). The tour's slide-away effect animates
-            // this element imperatively; overflow-hidden clips the nav
-            // mid-slide.
-            className="w-fit shrink-0 overflow-hidden"
-            aria-label={t("chatLayout.navigationAria")}
-          >
-            {renderSideMenu({
-              collapsed: effectiveCollapsed,
-              variant: "rail",
-              width: sidebarWidth,
-              onWidthChange: handleSidebarWidthChange,
-            })}
-          </aside>
-          <main
-            className={`relative flex min-w-0 flex-1 min-h-0 flex-col overflow-hidden ${mainRoomClass}`}
-          >
-            {chatContent}
-            {/* Live-voice room, desktop: an inset panel scoped to the content
-                area, so the title bar above and the sidenav beside it stay
-                visible and interactive. Self-gates on
-                `useIsVoiceRoomVisible()`; the composer's voice bar and
-                transcript render underneath, hidden by it. */}
-            <VoiceRoom variant="content" />
-          </main>
-        </div>
-      )}
+          ) : null
+        }
+      />
 
       {/* Focused research-onboarding results — a full-viewport layer ON TOP of
           the normal layout (not a separate render branch), so `ActiveChatView`
@@ -1260,6 +1263,11 @@ export function ChatLayout({
         pending={pendingArchiveAll}
         onConfirm={confirmArchiveAll}
         onCancel={cancelArchiveAll}
+      />
+      <DeleteConversationConfirmDialog
+        pending={pendingDeleteConversation}
+        onConfirm={confirmDelete}
+        onCancel={cancelDelete}
       />
       <GroupNameDialogFromStore
         createGroup={createGroup}

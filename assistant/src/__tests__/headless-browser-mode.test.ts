@@ -41,6 +41,16 @@ function makeFakeCdp(
     dispose() {
       _cdpDisposed = true;
     },
+    setCdpSessionId() {},
+    async listTabs() {
+      return [];
+    },
+    async selectTab(tabId: number) {
+      return { tabId };
+    },
+    async closeTab(tabId: number) {
+      return { tabId, closed: true };
+    },
   };
 }
 
@@ -142,12 +152,15 @@ mock.module("../tools/network/url-safety.js", () => ({
 
 import {
   executeBrowserClick,
+  executeBrowserClose,
+  executeBrowserDetach,
   executeBrowserNavigate,
   executeBrowserScreenshot,
   executeBrowserSnapshot,
   formatModeSelectionFailure,
   parseBrowserMode,
 } from "../tools/browser/browser-execution.js";
+import { CHROME_WEB_STORE_INSTALL_URL } from "../tools/browser/browser-status-constants.js";
 import type { ToolContext } from "../tools/types.js";
 
 // Restore all module mocks after this file completes so they don't
@@ -303,8 +316,11 @@ describe("formatModeSelectionFailure", () => {
     expect(formatted).toContain(
       "host browser proxy exists but is not connected",
     );
-    expect(formatted).toContain("Remediation:");
-    expect(formatted).toContain("extension is installed and enabled");
+    expect(formatted).toContain("Setup details:");
+    expect(formatted).toContain("Chrome extension");
+    expect(formatted).toContain(CHROME_WEB_STORE_INSTALL_URL);
+    expect(formatted).toContain("www.vellum.ai/downloads");
+    expect(formatted).toContain("Offer those first");
   });
 
   test("renders cdp-inspect transport_error with remediation", () => {
@@ -328,8 +344,54 @@ describe("formatModeSelectionFailure", () => {
     expect(formatted).toContain('Browser mode "cdp-inspect" failed');
     expect(formatted).toContain("cdp-inspect: FAILED at send");
     expect(formatted).toContain("Discovery code: unreachable");
-    expect(formatted).toContain("Remediation:");
+    expect(formatted).toContain("Setup details:");
     expect(formatted).toContain("--remote-debugging-port");
+    expect(formatted).toContain(CHROME_WEB_STORE_INSTALL_URL);
+  });
+
+  test("includes the Chrome Web Store install URL for host-bridge failures", () => {
+    const diagnostics: AttemptDiagnostic[] = [
+      {
+        candidateKind: "host-bridge",
+        inclusionReason: "auto candidate",
+        stage: "send",
+        errorCode: "transport_error",
+        errorMessage: "desktop client could not reach Chrome",
+      },
+    ];
+
+    const error = new CdpError("transport_error", "Host bridge unreachable", {
+      attemptDiagnostics: diagnostics,
+    });
+
+    const formatted = formatModeSelectionFailure("auto", error);
+
+    expect(formatted).toContain("Setup details:");
+    expect(formatted).toContain(CHROME_WEB_STORE_INSTALL_URL);
+    expect(formatted).toContain("www.vellum.ai/downloads");
+  });
+
+  test("phone surfaces do not invent an in-app browser panel", () => {
+    const diagnostics: AttemptDiagnostic[] = [
+      {
+        candidateKind: "extension",
+        inclusionReason: "pinned mode: extension",
+        stage: "candidate_selection",
+        errorCode: "transport_error",
+        errorMessage: "not connected",
+      },
+    ];
+    const formatted = formatModeSelectionFailure(
+      "extension",
+      new CdpError("transport_error", "not connected", {
+        attemptDiagnostics: diagnostics,
+      }),
+      { transportInterface: "ios", clientOs: "ios" },
+    );
+    expect(formatted).toContain("no in-app browser");
+    expect(formatted).toContain("Do not describe a browser panel");
+    expect(formatted).toContain(CHROME_WEB_STORE_INSTALL_URL);
+    expect(formatted).toContain("www.vellum.ai/downloads");
   });
 });
 
@@ -347,6 +409,7 @@ describe("browser_mode wiring through tool execution", () => {
     );
     expect(result.isError).toBe(true);
     expect(result.content).toContain('Invalid browser_mode "bogus"');
+    expect(result.content).not.toContain(CHROME_WEB_STORE_INSTALL_URL);
     expect(cdpSendCalls).toEqual([]);
   });
 
@@ -368,6 +431,28 @@ describe("browser_mode wiring through tool execution", () => {
   });
 
   // ── Pinned extension with no proxy returns remediation error ───
+
+  test("navigation timeout offers the desktop app and Chrome extension", async () => {
+    cdpSendHandler = (method, params) => {
+      if (method === "Page.navigate") {
+        throw new Error(
+          "Navigation to https://intranet.example.com timed out after 15000ms",
+        );
+      }
+      return defaultCdpHandler(method, params);
+    };
+
+    const result = await executeBrowserNavigate(
+      { url: "https://intranet.example.com" },
+      ctx,
+    );
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("Navigation failed");
+    expect(result.content).toContain("timed out");
+    expect(result.content).toContain(CHROME_WEB_STORE_INSTALL_URL);
+    expect(result.content).toContain("www.vellum.ai/downloads");
+    expect(result.content).toContain("Offer those first");
+  });
 
   test("pinned extension with no proxy returns remediation-rich error in navigate", async () => {
     factoryThrowError = new CdpError(
@@ -396,8 +481,9 @@ describe("browser_mode wiring through tool execution", () => {
     expect(result.content).toContain(
       "extension: FAILED at candidate_selection",
     );
-    expect(result.content).toContain("Remediation:");
-    expect(result.content).toContain("extension is installed and enabled");
+    expect(result.content).toContain("Setup details:");
+    expect(result.content).toContain("Chrome extension");
+    expect(result.content).toContain(CHROME_WEB_STORE_INSTALL_URL);
     // Factory should not have been called for CDP
     expect(cdpSendCalls).toEqual([]);
   });
@@ -425,7 +511,7 @@ describe("browser_mode wiring through tool execution", () => {
     );
     expect(result.isError).toBe(true);
     expect(result.content).toContain('Browser mode "extension" failed');
-    expect(result.content).toContain("Remediation:");
+    expect(result.content).toContain("Setup details:");
   });
 
   // ── cdp-debugger alias normalization ──────────────────────────
@@ -456,7 +542,7 @@ describe("browser_mode wiring through tool execution", () => {
     // The error should reference the canonical cdp-inspect name
     expect(result.content).toContain('Browser mode "cdp-inspect" failed');
     expect(result.content).toContain("Discovery code: unreachable");
-    expect(result.content).toContain("Remediation:");
+    expect(result.content).toContain("Setup details:");
     expect(result.content).toContain("--remote-debugging-port");
   });
 
@@ -518,7 +604,7 @@ describe("browser_mode wiring through tool execution", () => {
       "Reason: HTTP discovery failed (unreachable)",
     );
     expect(result.content).toContain("Discovery code: unreachable");
-    expect(result.content).toContain("Remediation:");
+    expect(result.content).toContain("Setup details:");
   });
 
   test("click tool returns remediation error on pinned mode failure", async () => {
@@ -550,7 +636,7 @@ describe("browser_mode wiring through tool execution", () => {
     expect(result.content).toContain(
       "extension: FAILED at candidate_selection",
     );
-    expect(result.content).toContain("Remediation:");
+    expect(result.content).toContain("Setup details:");
   });
 
   // ── Transport-classified host-browser errors produce failover diagnostics ──
@@ -583,8 +669,9 @@ describe("browser_mode wiring through tool execution", () => {
     expect(result.content).toContain('Browser mode "extension" failed');
     expect(result.content).toContain("extension: FAILED at send");
     expect(result.content).toContain("Reason: Host browser not reachable");
-    expect(result.content).toContain("Remediation:");
-    expect(result.content).toContain("extension is installed and enabled");
+    expect(result.content).toContain("Setup details:");
+    expect(result.content).toContain("Chrome extension");
+    expect(result.content).toContain(CHROME_WEB_STORE_INSTALL_URL);
   });
 
   test("pinned extension with timeout transport error surfaces failover diagnostics in snapshot", async () => {
@@ -607,10 +694,46 @@ describe("browser_mode wiring through tool execution", () => {
     expect(result.isError).toBe(true);
     expect(result.content).toContain('Browser mode "extension" failed');
     expect(result.content).toContain("extension: FAILED at send");
-    expect(result.content).toContain("Remediation:");
+    expect(result.content).toContain("Setup details:");
   });
 
   // ── Per-conversation sticky backend kind ─────────────────────────
+
+  for (const release of [executeBrowserDetach, executeBrowserClose]) {
+    test.each(["local", "extension", "cdp-inspect"])(
+      `${release.name} on desktop preserves the normal %s session's backend`,
+      async (mode) => {
+        const first = await executeBrowserSnapshot({ browser_mode: mode }, ctx);
+        expect(first.isError).toBe(false);
+
+        factoryModeCalls.length = 0;
+        const desktop = await release(
+          {},
+          {
+            ...ctx,
+            cdpClient: makeFakeCdp(
+              "cdp-inspect",
+              `desktop-browser:${ctx.conversationId}`,
+            ),
+          },
+        );
+        expect(desktop.isError).toBe(false);
+        expect(factoryModeCalls).toEqual([]);
+
+        const resumed = await executeBrowserSnapshot({}, ctx);
+        expect(resumed.isError).toBe(false);
+        expect(factoryModeCalls).toEqual([mode]);
+      },
+    );
+
+    test(`${release.name} on the normal browser still resets automatic selection`, async () => {
+      await executeBrowserSnapshot({ browser_mode: "extension" }, ctx);
+      expect((await release({}, ctx)).isError).toBe(false);
+      factoryModeCalls.length = 0;
+      expect((await executeBrowserSnapshot({}, ctx)).isError).toBe(false);
+      expect(factoryModeCalls).toEqual(["auto"]);
+    });
+  }
 
   test("auto-mode call after an explicit pin sticks to the pinned kind", async () => {
     const first = await executeBrowserNavigate(

@@ -15,7 +15,10 @@
 
 import { beforeEach, describe, expect, mock, test } from "bun:test";
 
-import { IpcCallError } from "@vellumai/gateway-client/ipc-client";
+import {
+  IpcCallError,
+  IpcConnectError,
+} from "@vellumai/gateway-client/ipc-client";
 import { z } from "zod";
 
 let ipcCalls: { method: string; params?: Record<string, unknown> }[] = [];
@@ -243,6 +246,16 @@ describe("contacts read API relays from the gateway", () => {
     expect(contactStoreReadGuard).not.toHaveBeenCalled();
   });
 
+  test("list surfaces a missing gateway socket as 503", async () => {
+    ipcError = new IpcConnectError("connect ENOENT", "ENOENT");
+
+    await expect(handleListContacts({ limit: "50" })).rejects.toMatchObject({
+      statusCode: 503,
+      code: "SERVICE_UNAVAILABLE",
+    });
+    expect(contactStoreReadGuard).not.toHaveBeenCalled();
+  });
+
   test("get relays to contacts_get_rich and serializes the gateway ACL fields", async () => {
     ipcResult = { ok: true, contact: gatewayContact };
 
@@ -316,6 +329,7 @@ const nativeGatewayRead = {
   contactType: "human",
   lastInteraction: 9200,
   interactionCount: 11,
+  autoApproveThreshold: "high",
   createdAt: 1000,
   updatedAt: 1500,
   channels: [
@@ -376,6 +390,9 @@ describe("filtered/native contact reads: daemon filters, gateway hydrates teleme
     // (4/4200/4100).
     expect(contact.interactionCount).toBe(11);
     expect(contact.lastInteraction).toBe(9200);
+    expect(
+      (contact as { autoApproveThreshold?: string | null }).autoApproveThreshold,
+    ).toBe("high");
     const channel = contact.channels[0] as Record<string, unknown>;
     expect(channel.interactionCount).toBe(11);
     expect(channel.lastSeenAt).toBe(9100);
@@ -404,6 +421,9 @@ describe("filtered/native contact reads: daemon filters, gateway hydrates teleme
     const [contact] = result.contacts;
     expect(contact.interactionCount).toBe(0);
     expect(contact.lastInteraction).toBeNull();
+    expect(
+      (contact as { autoApproveThreshold?: string | null }).autoApproveThreshold,
+    ).toBeNull();
     const channel = contact.channels[0] as Record<string, unknown>;
     expect(channel.interactionCount).toBe(0);
     expect(channel.lastSeenAt).toBeNull();

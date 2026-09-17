@@ -20,7 +20,12 @@
  */
 
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  waitFor,
+} from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, useLocation } from "react-router";
 
@@ -51,15 +56,13 @@ const CHECKOUT_URL = "https://stripe.test/checkout/session";
 
 type Captured = { body?: unknown };
 let upgradeCall: Captured | null = null;
-let machineTierCall: Captured | null = null;
-let storageTierCall: Captured | null = null;
-let creditTierCall: Captured | null = null;
+let changePackageCall: Captured | null = null;
 let openedUrl: string | null = null;
 // True puts the app in the iOS Capacitor shell for the anchor-routing tests.
 let nativePlatform = false;
-// When non-null, the change-machine-tier call rejects with this — drives the
+// When non-null, the change-package call rejects with this, driving the
 // error path (the hook toasts and the caller keeps the modal open).
-let machineTierError: unknown = null;
+let changePackageError: unknown = null;
 // Read fixtures returned by the mocked SDK so post-mutation invalidation
 // refetches resolve deterministically instead of hitting the network.
 let subscriptionFixture: SubscriptionResponse | null = null;
@@ -78,20 +81,15 @@ mock.module("@/generated/api/sdk.gen", () => ({
       response: { ok: true },
     });
   },
-  organizationsBillingSubscriptionChangeMachineTierCreate: (opts: Captured) => {
-    machineTierCall = opts;
-    if (machineTierError !== null) {
-      return Promise.reject(machineTierError);
+  organizationsBillingSubscriptionChangePackageCreate: (opts: Captured) => {
+    changePackageCall = opts;
+    if (changePackageError !== null) {
+      return Promise.reject(changePackageError);
     }
-    return Promise.resolve({ data: {}, response: { ok: true } });
-  },
-  organizationsBillingSubscriptionChangeStorageTierCreate: (opts: Captured) => {
-    storageTierCall = opts;
-    return Promise.resolve({ data: {}, response: { ok: true } });
-  },
-  organizationsBillingSubscriptionChangeCreditTierCreate: (opts: Captured) => {
-    creditTierCall = opts;
-    return Promise.resolve({ data: {}, response: { ok: true } });
+    return Promise.resolve({
+      data: { status: "ok", package: null },
+      response: { ok: true },
+    });
   },
   organizationsBillingSubscriptionRetrieve: () =>
     Promise.resolve({ data: subscriptionFixture, response: { ok: true } }),
@@ -394,12 +392,10 @@ function continueButton(): HTMLButtonElement {
 
 beforeEach(() => {
   upgradeCall = null;
-  machineTierCall = null;
-  storageTierCall = null;
-  creditTierCall = null;
+  changePackageCall = null;
   openedUrl = null;
   nativePlatform = false;
-  machineTierError = null;
+  changePackageError = null;
   onboardingHangs = false;
   subscriptionFixture = null;
   plansFixture = null;
@@ -482,7 +478,7 @@ describe("CustomPlanModal — base subscriber", () => {
     selectOption("Storage", "30 GB");
     expect(continueButton().disabled).toBe(true);
 
-    selectOption("Credit bundle", "No extra credits");
+    selectOption("Usage bundle", "No extra usage");
     expect(continueButton().disabled).toBe(false);
   });
 
@@ -515,7 +511,7 @@ describe("CustomPlanModal — base subscriber", () => {
 
     selectOption("Machine size", "Large machine (4 vCPU, 8 GiB)");
     selectOption("Storage", "30 GB");
-    selectOption("Credit bundle", "50 credits");
+    selectOption("Usage bundle", "50 credits");
 
     // $20 base + $60 machine + $10 storage + $50 credits.
     getByText("$140/mo");
@@ -526,7 +522,7 @@ describe("CustomPlanModal — base subscriber", () => {
       "Platform fee: $20/mo",
       "Large machine (4 vCPU, 8 GiB)",
       "30 GB storage",
-      "$50 of bundled credits",
+      "50 credits",
     ]);
   });
 
@@ -539,7 +535,7 @@ describe("CustomPlanModal — base subscriber", () => {
 
     selectOption("Machine size", "Large machine (4 vCPU, 8 GiB)");
     selectOption("Storage", "30 GB");
-    selectOption("Credit bundle", "50 credits");
+    selectOption("Usage bundle", "50 credits");
 
     expect(deltaLine()).toBeNull();
     expect(strikethroughs()).toEqual([]);
@@ -552,7 +548,7 @@ describe("CustomPlanModal — base subscriber", () => {
 
     selectOption("Machine size", "Large machine (4 vCPU, 8 GiB)");
     selectOption("Storage", "30 GB");
-    selectOption("Credit bundle", "No extra credits");
+    selectOption("Usage bundle", "No extra usage");
     fireEvent.click(continueButton());
 
     await waitFor(() => expect(upgradeCall).not.toBeNull());
@@ -631,7 +627,7 @@ describe("CustomPlanModal — eligible Pro subscriber", () => {
       "Platform fee: $20/mo",
       "Medium machine (2.5 vCPU, 5 GiB)",
       "10 GB storage",
-      "No extra credits",
+      "No extra usage",
     ]);
 
     // Changing any dimension diverges from the seed and enables Continue.
@@ -650,7 +646,7 @@ describe("CustomPlanModal — eligible Pro subscriber", () => {
       "Platform fee: $20/mo",
       "Medium machine (2.5 vCPU, 5 GiB)",
       "10 GB storage",
-      "No extra credits",
+      "No extra usage",
     ]);
     expect(deltaLine()).toBeNull();
     expect(strikethroughs()).toEqual([]);
@@ -670,7 +666,7 @@ describe("CustomPlanModal — eligible Pro subscriber", () => {
       "Platform fee: $20/mo",
       "Medium machine (2.5 vCPU, 5 GiB)Large machine (4 vCPU, 8 GiB)",
       "10 GB storage",
-      "No extra credits",
+      "No extra usage",
     ]);
 
     // Only the changed row's check goes green; the rest stay grey.
@@ -720,9 +716,7 @@ describe("CustomPlanModal — eligible Pro subscriber", () => {
     fireEvent.click(continueButton());
 
     getByText("Create a custom plan");
-    expect(machineTierCall).toBeNull();
-    expect(storageTierCall).toBeNull();
-    expect(creditTierCall).toBeNull();
+    expect(changePackageCall).toBeNull();
     expect(queryByTestId("resize-takeover")).toBeNull();
   });
 
@@ -744,7 +738,7 @@ describe("CustomPlanModal — eligible Pro subscriber", () => {
     const rows = recapRows();
     expect(rows).toContain(BASELINE_MACHINE_LABEL);
     expect(rows).toContain("10 GB storage");
-    expect(rows).toContain("No extra credits");
+    expect(rows).toContain("No extra usage");
   });
 
   test("the baseline machine is offered to nobody else", () => {
@@ -829,17 +823,19 @@ describe("CustomPlanModal — eligible Pro subscriber", () => {
     expect(strikethroughs()).toContain(BASELINE_MACHINE_LABEL);
     fireEvent.click(continueButton());
 
-    await waitFor(() => expect(machineTierCall).not.toBeNull());
-    expect(machineTierCall!.body).toEqual({ machine_tier: "medium" });
-    // Storage and credit stayed at their seeded values, so neither dispatches.
-    expect(storageTierCall).toBeNull();
-    expect(creditTierCall).toBeNull();
+    await waitFor(() => expect(changePackageCall).not.toBeNull());
+    // Storage and credit travel at their seeded values alongside the change.
+    expect(changePackageCall!.body).toEqual({
+      machine_tier: "medium",
+      storage_tier: "xs",
+      credit_tier: null,
+    });
     // Baseline → medium is an upgrade, so the resize takeover opens.
     const takeover = await findByTestId("resize-takeover");
     expect(takeover.getAttribute("data-mode")).toBe("resize");
   });
 
-  test("Continue dispatches only the changed tiers and opens the resize takeover", async () => {
+  test("Continue posts the whole selection to change-package and opens the resize takeover", async () => {
     // Current config is medium machine / 10 GB (xs) storage / no credits.
     const { getByRole, findByTestId } = renderPage(proMightySubscription());
 
@@ -848,14 +844,17 @@ describe("CustomPlanModal — eligible Pro subscriber", () => {
     // Raise the machine, keep storage at its current size, add a credit bundle.
     selectOption("Machine size", "Large machine (4 vCPU, 8 GiB)");
     selectOption("Storage", "10 GB");
-    selectOption("Credit bundle", "50 credits");
+    selectOption("Usage bundle", "50 credits");
     fireEvent.click(continueButton());
 
-    await waitFor(() => expect(machineTierCall).not.toBeNull());
-    expect(machineTierCall!.body).toEqual({ machine_tier: "large" });
-    expect(creditTierCall!.body).toEqual({ credit_tier: "credits_50" });
-    // Storage is unchanged, so no storage-tier request fires.
-    expect(storageTierCall).toBeNull();
+    await waitFor(() => expect(changePackageCall).not.toBeNull());
+    // One call carries every dimension as explicit tiers, the unchanged
+    // storage included; the server diffs and applies it as one change.
+    expect(changePackageCall!.body).toEqual({
+      machine_tier: "large",
+      storage_tier: "xs",
+      credit_tier: "credits_50",
+    });
 
     // A machine change resizes the assistant, so the takeover opens.
     const takeover = await findByTestId("resize-takeover");
@@ -877,8 +876,12 @@ describe("CustomPlanModal — eligible Pro subscriber", () => {
     selectOption("Machine size", "Medium machine (2.5 vCPU, 5 GiB)");
     fireEvent.click(continueButton());
 
-    await waitFor(() => expect(machineTierCall).not.toBeNull());
-    expect(machineTierCall!.body).toEqual({ machine_tier: "medium" });
+    await waitFor(() => expect(changePackageCall).not.toBeNull());
+    expect(changePackageCall!.body).toEqual({
+      machine_tier: "medium",
+      storage_tier: "xs",
+      credit_tier: null,
+    });
     // The modal closes and the takeover never opens for a downgrade.
     await waitFor(() => expect(queryByText("Create a custom plan")).toBeNull());
     expect(queryByTestId("resize-takeover")).toBeNull();
@@ -901,7 +904,7 @@ describe("CustomPlanModal — eligible Pro subscriber", () => {
   });
 
   test("a failed dispatch keeps the modal open and skips the takeover", async () => {
-    machineTierError = { detail: "Payment failed. Your card was declined." };
+    changePackageError = { detail: "Payment failed. Your card was declined." };
     const { getByRole, getByText, queryByTestId } = renderPage(
       proMightySubscription(),
     );
@@ -910,12 +913,64 @@ describe("CustomPlanModal — eligible Pro subscriber", () => {
 
     selectOption("Machine size", "Large machine (4 vCPU, 8 GiB)");
     selectOption("Storage", "10 GB");
-    selectOption("Credit bundle", "No extra credits");
+    selectOption("Usage bundle", "No extra usage");
     fireEvent.click(continueButton());
 
-    await waitFor(() => expect(machineTierCall).not.toBeNull());
+    await waitFor(() => expect(changePackageCall).not.toBeNull());
     // The hook toasted; the configurator stays open and the takeover is absent.
     getByText("Create a custom plan");
+    expect(queryByTestId("resize-takeover")).toBeNull();
+  });
+});
+
+describe("CustomPlanModal: a fee-less (Mighty) Pro sub", () => {
+  // Only the Mighty package is sold without the platform fee, and a custom
+  // plan always carries it, so leaving Mighty for a custom plan adds (and
+  // bills) the fee even when every tier stays the same.
+  test("opens with the fee row marked as a change and Continue enabled", () => {
+    const { getByRole } = renderPage(
+      proMightySubscription({ has_platform_fee: false }),
+    );
+
+    fireEvent.click(getByRole("button", { name: "Configure" }));
+
+    // The seeded tiers are unchanged, yet the fee is new: Continue is live.
+    expect(continueButton().disabled).toBe(false);
+    expect(recapRows()).toEqual([
+      "Platform fee: $20/mo",
+      "Medium machine (2.5 vCPU, 5 GiB)",
+      "10 GB storage",
+      "No extra usage",
+    ]);
+    // The fee row's check goes green; nothing is struck through (there was no
+    // previous fee to strike).
+    const checks = checkIconClasses();
+    expect(checks[0]).toContain("text-[var(--system-positive-strong)]");
+    expect(strikethroughs()).toEqual([]);
+    // previous = medium 3500 + xs 500 = 4000 ($40) with no fee;
+    // new = base 2000 + medium 3500 + xs 500 = 6000 ($60); delta = +$20/mo.
+    const delta = deltaLine();
+    expect(delta).not.toBeNull();
+    expect(delta!.textContent).toBe("+$20/mo compared to previous ($40)");
+  });
+
+  test("Continue with the seeded tiers posts them so the fee is added", async () => {
+    const { getByRole, queryByText, queryByTestId } = renderPage(
+      proMightySubscription({ has_platform_fee: false }),
+    );
+
+    fireEvent.click(getByRole("button", { name: "Configure" }));
+    fireEvent.click(continueButton());
+
+    await waitFor(() => expect(changePackageCall).not.toBeNull());
+    expect(changePackageCall!.body).toEqual({
+      machine_tier: "medium",
+      storage_tier: "xs",
+      credit_tier: null,
+    });
+    // No ceiling moved and the bundle is unchanged: the modal closes with no
+    // takeover to run.
+    await waitFor(() => expect(queryByText("Create a custom plan")).toBeNull());
     expect(queryByTestId("resize-takeover")).toBeNull();
   });
 });
@@ -946,7 +1001,7 @@ describe("CustomPlanModal — Pro plan holding a deprecated (legacy) credit bund
       "Platform fee: $20/mo",
       "Medium machine (2.5 vCPU, 5 GiB)",
       "10 GB storage",
-      "$25 of bundled credits",
+      "25 credits",
     ]);
   });
 
@@ -956,7 +1011,7 @@ describe("CustomPlanModal — Pro plan holding a deprecated (legacy) credit bund
     );
 
     fireEvent.click(getByRole("button", { name: "Configure" }));
-    openSelect("Credit bundle");
+    openSelect("Usage bundle");
 
     // The held legacy bundle appears so the current selection is visible, but
     // it's disabled — a new config can never pick it.
@@ -978,11 +1033,14 @@ describe("CustomPlanModal — Pro plan holding a deprecated (legacy) credit bund
     selectOption("Machine size", "Large machine (4 vCPU, 8 GiB)");
     fireEvent.click(continueButton());
 
-    await waitFor(() => expect(machineTierCall).not.toBeNull());
-    expect(machineTierCall!.body).toEqual({ machine_tier: "large" });
-    // The held credit is unchanged, so it's neither re-sent nor dropped.
-    expect(creditTierCall).toBeNull();
-    expect(storageTierCall).toBeNull();
+    await waitFor(() => expect(changePackageCall).not.toBeNull());
+    // The held legacy credit travels unchanged, so it is kept rather than
+    // dropped (the server allows a retired bundle only when unchanged).
+    expect(changePackageCall!.body).toEqual({
+      machine_tier: "large",
+      storage_tier: "xs",
+      credit_tier: "credits_25",
+    });
     const takeover = await findByTestId("resize-takeover");
     expect(takeover.getAttribute("data-mode")).toBe("resize");
   });
@@ -993,14 +1051,14 @@ describe("CustomPlanModal — Pro plan holding a deprecated (legacy) credit bund
     const { getByRole } = renderPage(freeSubscription());
 
     fireEvent.click(getByRole("button", { name: "Configure" }));
-    openSelect("Credit bundle");
+    openSelect("Usage bundle");
 
     const labels = optionLabels();
     expect(labels.some((l) => l.startsWith("50 credits"))).toBe(true);
     expect(labels.some((l) => l.startsWith("25 credits"))).toBe(false);
   });
 
-  test("an untouched deprecated credit bundle is not recapped as 'No extra credits'", () => {
+  test("an untouched deprecated credit bundle is not recapped as 'No extra usage'", () => {
     const { getByRole } = renderPage(
       proMightySubscription({ selected_credit_tier: "credits_25" }),
     );
@@ -1013,7 +1071,7 @@ describe("CustomPlanModal — Pro plan holding a deprecated (legacy) credit bund
       "Platform fee: $20/mo",
       "Medium machine (2.5 vCPU, 5 GiB)",
       "10 GB storage",
-      "$25 of bundled credits",
+      "25 credits",
     ]);
     expect(strikethroughs()).toEqual([]);
     expect(deltaLine()).toBeNull();
@@ -1037,7 +1095,7 @@ describe("CustomPlanModal — Pro plan holding a deprecated (legacy) credit bund
       "Platform fee: $20/mo",
       "Medium machine (2.5 vCPU, 5 GiB)",
       "250 GB storage",
-      "No extra credits",
+      "No extra usage",
     ]);
     // base $20 + medium $35 + legacy 250 GB $60.
     getByText("$115/mo");
@@ -1074,5 +1132,37 @@ describe("CustomPlanModal — Pro plan holding a deprecated (legacy) credit bund
     selectOption("Machine size", "Medium machine (2.5 vCPU, 5 GiB)");
 
     expect(deltaLine()).toBeNull();
+  });
+});
+
+describe("CustomPlanModal: bundle picker wording", () => {
+  test("the bundle picker's chrome reads as usage, not credits", () => {
+    const { getByRole, getByText } = renderPage(freeSubscription());
+
+    fireEvent.click(getByRole("button", { name: "Configure" }));
+
+    // Label, trigger aria-label, placeholder, and docs aria-label all use the
+    // usage wording; the catalog options themselves are untouched.
+    getByText("Add a usage bundle:");
+    const trigger = selectTrigger("Usage bundle");
+    expect(trigger.textContent).toContain("Select a usage bundle");
+    expect(docsLink(CREDIT_DOCS_URL).getAttribute("aria-label")).toBe(
+      "Learn more about usage bundles",
+    );
+
+    // The sentinel option and its recap row follow suit.
+    selectOption("Usage bundle", "No extra usage");
+    expect(recapRows()).toContain("No extra usage");
+  });
+
+  test("a seeded no-bundle Pro sub strikes through the usage wording", () => {
+    const { getByRole } = renderPage(proMightySubscription());
+
+    fireEvent.click(getByRole("button", { name: "Configure" }));
+    selectOption("Usage bundle", "50 credits");
+
+    // The previous "none" value is struck with the same usage wording the
+    // sentinel row uses, so the recap never mixes the two vocabularies.
+    expect(strikethroughs()).toEqual(["No extra usage"]);
   });
 });

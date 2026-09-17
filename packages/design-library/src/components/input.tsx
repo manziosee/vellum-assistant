@@ -36,15 +36,15 @@ const fieldVariants = cva(
         ].join(" "),
       },
       density: {
-        input: "h-9 px-3 py-1.5",
+        input: "h-8 px-2 py-1.5",
         textarea: "min-h-[72px] px-3 py-2 resize-y",
       },
       hasLeftIcon: { true: "", false: "" },
       hasRightIcon: { true: "", false: "" },
     },
     compoundVariants: [
-      { density: "input", hasLeftIcon: true, class: "pl-9" },
-      { density: "input", hasRightIcon: true, class: "pr-9" },
+      { density: "input", hasLeftIcon: true, class: "pl-8" },
+      { density: "input", hasRightIcon: true, class: "pr-8" },
     ],
     defaultVariants: {
       invalid: false,
@@ -111,7 +111,7 @@ function Input({
           <span
             aria-hidden
             data-testid="input-left-icon"
-            className="pointer-events-none absolute left-3 flex items-center text-[var(--content-tertiary)]"
+            className="pointer-events-none absolute left-2 flex items-center text-[var(--content-tertiary)]"
           >
             {leftIcon}
           </span>
@@ -131,6 +131,16 @@ function Input({
               hasLeftIcon: leftIcon != null,
               hasRightIcon: rightIcon != null,
             }),
+            // A number input's spin buttons are UA chrome: the box behind the
+            // chevrons is painted by the browser widget and no pseudo-element
+            // lets us clear it (Firefox exposes none at all). Suppressing the
+            // widget is the only way to be rid of it, so number fields render
+            // as plain text fields. Scoped by `[type=number]` so no other
+            // input's native affordances are touched.
+            "[&[type=number]]:[appearance:textfield]",
+            "[&[type=number]::-webkit-outer-spin-button]:[appearance:none]",
+            "[&[type=number]::-webkit-inner-spin-button]:[appearance:none]",
+            "[&[type=number]::-webkit-inner-spin-button]:m-0",
             className,
           )}
         />
@@ -138,7 +148,7 @@ function Input({
           <span
             aria-hidden
             data-testid="input-right-icon"
-            className="pointer-events-none absolute right-3 flex items-center text-[var(--content-tertiary)]"
+            className="pointer-events-none absolute right-2 flex items-center text-[var(--content-tertiary)]"
           >
             {rightIcon}
           </span>

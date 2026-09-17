@@ -15,13 +15,9 @@
  * daemon's client-facing HTTP surface owns the distinct `guardian_actions_*`
  * operationIds (`guardian_actions_pending` / `guardian_actions_decision`),
  * which do not change.
- *
- * Destination lookups are deliberately split into a single-message lookup
- * (`get_by_destination_message`) and a pending-list read
- * (`list_pending_by_destination`) so each response schema has exactly one
- * shape instead of a params-dependent polymorphic result.
  */
 
+import { GuardianRequestStatusSchema } from "@vellumai/service-contracts/guardian-requests";
 import { z } from "zod";
 
 import {
@@ -33,19 +29,11 @@ import {
 // Enums
 // ---------------------------------------------------------------------------
 
-const GUARDIAN_REQUEST_STATUS_VALUES = [
-  "pending",
-  "approved",
-  "denied",
-  "expired",
-  "cancelled",
-] as const;
-
-export const GuardianRequestStatusSchema = z.enum(
+export {
   GUARDIAN_REQUEST_STATUS_VALUES,
-);
-
-export type GuardianRequestStatus = z.infer<typeof GuardianRequestStatusSchema>;
+  type GuardianRequestStatus,
+  GuardianRequestStatusSchema,
+} from "@vellumai/service-contracts/guardian-requests";
 
 const GUARDIAN_REQUEST_KIND_VALUES = [
   "access_request",
@@ -189,17 +177,43 @@ export const GUARDIAN_REQUESTS_IPC_METHODS = {
   decide: "guardian_requests_decide",
   expire: "guardian_requests_expire",
   expireInteractionBound: "guardian_requests_expire_interaction_bound",
-  sweepExpired: "guardian_requests_sweep_expired",
+  listExpiredPending: "guardian_requests_list_expired_pending",
   createDelivery: "guardian_requests_create_delivery",
   updateDelivery: "guardian_requests_update_delivery",
   listDeliveries: "guardian_requests_list_deliveries",
-  getByDestinationMessage: "guardian_requests_get_by_destination_message",
+  listDeliveriesByChat: "guardian_requests_list_deliveries_by_chat",
   listPendingByDestination: "guardian_requests_list_pending_by_destination",
   listPendingByScope: "guardian_requests_list_pending_by_scope",
   inScope: "guardian_requests_in_scope",
   getByCallSession: "guardian_requests_get_by_call_session",
   getByPendingQuestion: "guardian_requests_get_by_pending_question",
 } as const;
+
+/**
+ * The delivery-row statuses this codebase writes and matches on.
+ *
+ * `GuardianRequestDeliverySchema.status` stays a plain `z.string()` rather
+ * than an enum built from these: the column is persisted, so a row written
+ * by a different build must still read rather than throw on parse. These
+ * constants exist so a call site names a value instead of spelling it, not
+ * to close the set.
+ *
+ * `pending` is the creation default; `sent` and `failed` carry the
+ * notification delivery result the recorder maps in; `expired` is stamped
+ * when the request itself expires; `withdrawn` is the daemon's per-surface
+ * receipt that a card was durably withdrawn, which the gateway's
+ * per-request expire preserves and a retrying withdrawal skips.
+ */
+export const DELIVERY_STATUS = {
+  pending: "pending",
+  sent: "sent",
+  failed: "failed",
+  expired: "expired",
+  withdrawn: "withdrawn",
+} as const;
+
+export type DeliveryStatus =
+  (typeof DELIVERY_STATUS)[keyof typeof DELIVERY_STATUS];
 
 export type GuardianRequestsIpcMethod =
   (typeof GUARDIAN_REQUESTS_IPC_METHODS)[keyof typeof GUARDIAN_REQUESTS_IPC_METHODS];
@@ -240,10 +254,15 @@ export type GuardianRequestMutationIpcResponse = z.infer<
 
 /**
  * Request for `guardian_requests_create`. `id` is REQUIRED and
- * caller-supplied — request ids are load-bearing (deterministic
- * access-request ids; `tool_approval` rows reuse the pending-interaction
- * requestId as PK). `requestCode` is generated gateway-side when omitted.
- * No `sourceType`: the gateway derives it from `sourceChannel`.
+ * caller-supplied. The interaction-promotion paths (`tool_approval`, and
+ * `pending_question` for `ask_question`) reuse the pending-interaction
+ * requestId as PK so a decision can find its interaction; every other
+ * create mints a UUID, including voice `pending_question` rows, which carry
+ * their interaction id in `pendingQuestionId` instead. The id is the row's
+ * primary key and the insert is strict, so a caller that can create
+ * concurrently must mint one unique per call. `requestCode` is generated
+ * gateway-side when omitted. No `sourceType`: the gateway derives it from
+ * `sourceChannel`.
  */
 export const CreateGuardianRequestIpcParamsSchema = z.object({
   id: z.string().min(1),
@@ -418,7 +437,7 @@ const OUTCOME_TYPES_BY_DECISION_STATUS: Record<
 /**
  * Request for `guardian_requests_decide` (status CAS + optional ACL outcome).
  * Decisions only resolve a pending request to approved/denied — expiry has
- * `guardian_requests_expire`/`_sweep_expired` — so a malformed call can never
+ * `guardian_requests_expire`/`_list_expired_pending`, so a malformed call can never
  * apply an `aclOutcome` while leaving the request decidable again. The
  * outcome type must agree with the status: activation/minting only on
  * approval, seeding/blocking only on denial.
@@ -508,26 +527,22 @@ export type ExpireInteractionBoundIpcResponse = z.infer<
   typeof ExpireInteractionBoundIpcResponseSchema
 >;
 
-/** Request for `guardian_requests_sweep_expired` (`now` defaults gateway-side). */
-export const SweepExpiredGuardianRequestsIpcParamsSchema = z.object({
-  now: z.number().optional(),
-});
-
-export type SweepExpiredGuardianRequestsIpcParams = z.infer<
-  typeof SweepExpiredGuardianRequestsIpcParamsSchema
->;
-
 /**
- * Response for `guardian_requests_sweep_expired`: the full expired rows, so
- * the daemon's card-withdrawal/notification fan-out never needs a follow-up
- * read that could fail after the status flip and strand the side effects.
+ * Request for `guardian_requests_list_expired_pending` (`now` defaults
+ * gateway-side; `limit` bounds the batch and is capped gateway-side).
+ * Read-only: the rows stay `pending` until the daemon has run each one's
+ * expiry side effects and confirms with `guardian_requests_expire`, so a
+ * lost response leaves the work discoverable by the next sweep round
+ * instead of silently done. Past-deadline pending rows are undecidable
+ * either way: every decision path checks `expiresAt` before any write.
  */
-export const SweepExpiredGuardianRequestsIpcResponseSchema = z.object({
-  expired: z.array(GuardianRequestSchema),
+export const ListExpiredPendingGuardianRequestsIpcParamsSchema = z.object({
+  now: z.number().optional(),
+  limit: z.number().optional(),
 });
 
-export type SweepExpiredGuardianRequestsIpcResponse = z.infer<
-  typeof SweepExpiredGuardianRequestsIpcResponseSchema
+export type ListExpiredPendingGuardianRequestsIpcParams = z.infer<
+  typeof ListExpiredPendingGuardianRequestsIpcParamsSchema
 >;
 
 // ---------------------------------------------------------------------------
@@ -575,6 +590,22 @@ export type ListGuardianRequestDeliveriesIpcParams = z.infer<
   typeof ListGuardianRequestDeliveriesIpcParamsSchema
 >;
 
+/**
+ * Request for `guardian_requests_list_deliveries_by_chat`: every
+ * delivery row addressed to one channel-native chat, whatever request it
+ * belongs to. Lets transcript importers recognize guardian card
+ * messages (by their recorded message id) as delivery projections
+ * rather than conversation content.
+ */
+export const ListGuardianRequestDeliveriesByChatIpcParamsSchema = z.object({
+  channel: z.string().min(1),
+  chatId: z.string().min(1),
+});
+
+export type ListGuardianRequestDeliveriesByChatIpcParams = z.infer<
+  typeof ListGuardianRequestDeliveriesByChatIpcParamsSchema
+>;
+
 /** Response for `guardian_requests_list_deliveries`. */
 export const GuardianRequestDeliveryListIpcResponseSchema = z.array(
   GuardianRequestDeliverySchema,
@@ -587,21 +618,6 @@ export type GuardianRequestDeliveryListIpcResponse = z.infer<
 // ---------------------------------------------------------------------------
 // Destination + scope lookups
 // ---------------------------------------------------------------------------
-
-/**
- * Request for `guardian_requests_get_by_destination_message` — reaction
- * routing: recover the pending request whose delivered card is the reacted-to
- * message.
- */
-export const GetGuardianRequestByDestinationMessageIpcParamsSchema = z.object({
-  channel: z.string().min(1),
-  chatId: z.string().min(1),
-  messageId: z.string().min(1),
-});
-
-export type GetGuardianRequestByDestinationMessageIpcParams = z.infer<
-  typeof GetGuardianRequestByDestinationMessageIpcParamsSchema
->;
 
 /**
  * Request for `guardian_requests_list_pending_by_destination`. Two forms:
@@ -640,13 +656,15 @@ export type ListPendingGuardianRequestsByScopeIpcParams = z.infer<
 
 /**
  * Request for `guardian_requests_in_scope`: is a decision from this
- * conversation allowed for the request (source match, or delivery match
- * optionally narrowed by `channel`)?
+ * conversation allowed for the request (source match, or delivery match)?
+ * Deliberately not narrowed by delivery channel: `destinationConversationId`
+ * is always an internal conversation id, and every delivery's paired
+ * conversation renders the same actionable in-app card, so a match on any
+ * delivery row legitimizes the conversation.
  */
 export const GuardianRequestInScopeIpcParamsSchema = z.object({
   requestId: z.string().min(1),
   conversationId: z.string().min(1),
-  channel: z.string().optional(),
 });
 
 export type GuardianRequestInScopeIpcParams = z.infer<

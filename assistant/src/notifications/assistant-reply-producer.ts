@@ -22,12 +22,14 @@ import {
   getMessageById,
   parseMessageMetadata,
 } from "../persistence/conversation-crud.js";
+import { isReplaceableTitle } from "../persistence/conversation-title-placeholders.js";
 import {
   isDesktopOriginatedUserMessage,
   isReplyPushIneligibleUserMessage,
   resolveConversationKind,
 } from "../persistence/conversation-types.js";
 import { stringifyMessageContent } from "../persistence/message-content.js";
+import { projectPersistedAssistantContent } from "../persistence/user-facing-content.js";
 import { isDesktopAttended } from "../runtime/desktop-presence.js";
 import { isWebConversationFocused } from "../runtime/web-presence.js";
 import { safeParseRecord } from "../util/json.js";
@@ -36,6 +38,7 @@ import {
   describeMedia,
   mediaEmbeds,
   sanitizeMessagePreview,
+  sanitizeMultilineMessagePreview,
   sanitizeNotificationTitle,
   stripMarkdownForPreview,
 } from "./notification-utils.js";
@@ -43,17 +46,14 @@ import {
 /** Kill switch for this producer, on by default. */
 const ASSISTANT_REPLY_PUSH_FLAG = "assistant-reply-push" as const;
 
-/** Gates the desktop-attended suppression below, on by default. */
-const DESKTOP_PRESENCE_FLAG = "desktop-presence-suppression" as const;
-
 /** Gates the web-focused suppression below, on by default. */
 const WEB_PRESENCE_FLAG = "web-presence-suppression" as const;
 
 /**
- * Collapse whitespace runs ahead of the sanitizers' truncation: blank lines and
- * list indentation would otherwise eat into the copy's length budget.
+ * Flatten a title onto one line. Notification titles cannot wrap, and
+ * `normalizeTitle` discards any string that still contains a newline.
  */
-function collapseWhitespace(value: string): string {
+function flattenTitleWhitespace(value: string): string {
   return value.replace(/\s+/g, " ").trim();
 }
 
@@ -227,11 +227,18 @@ export async function emitAssistantReplyNotification(params: {
     // first: a lock screen renders none of it, and an embed-only reply has to
     // reduce to empty for the fallback to be reachable. A reply with neither
     // text nor media stays silent.
-    const text = stringifyMessageContent(assistantRow.content);
+    // The push preview quotes what the user reads, so it walks the same
+    // user-facing projection the transcript does, keyed on the row's own
+    // marker: a `send_user_message` turn's plain text is private working notes.
+    const text = stringifyMessageContent(
+      projectPersistedAssistantContent(
+        assistantRow.content,
+        assistantRow.metadata,
+      ),
+    );
     const preview =
-      sanitizeMessagePreview(
-        collapseWhitespace(stripMarkdownForPreview(text)),
-      ) || sanitizeMessagePreview(describeReplyMedia(text, assistantMessageId));
+      sanitizeMultilineMessagePreview(stripMarkdownForPreview(text)) ||
+      sanitizeMessagePreview(describeReplyMedia(text, assistantMessageId));
     if (!preview) {
       return;
     }
@@ -241,16 +248,19 @@ export async function emitAssistantReplyNotification(params: {
     // lock screen. Absent `requestedTitle` lets the decision branch derive a
     // title from the body, which reads better than an empty or placeholder
     // conversation title.
-    const requestedTitle = sanitizeNotificationTitle(
-      collapseWhitespace(conversation.title ?? ""),
-    );
+    //
+    // Placeholder titles are plausible non-empty strings and survive
+    // sanitizing. They count as absent so the body supplies the title instead.
+    const storedTitle = conversation.title?.trim() ?? "";
+    const requestedTitle = isReplaceableTitle(storedTitle)
+      ? ""
+      : sanitizeNotificationTitle(flattenTitleWhitespace(storedTitle));
 
     // Read as close to the emit as possible: nothing short-circuits on it.
     // Presence only speaks for a turn the desktop itself opened, on that row's
     // own OS evidence. A turn sent from the phone still needs its push while the
     // desktop sits idle within the attendance window.
     const desktopAttended =
-      isAssistantFeatureFlagEnabled(DESKTOP_PRESENCE_FLAG) &&
       isDesktopOriginatedUserMessage(initiatingMetadata) &&
       readDesktopAttended(rlog);
 

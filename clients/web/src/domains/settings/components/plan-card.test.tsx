@@ -1,7 +1,8 @@
 /**
- * Tests for the PlanCard: verifies the plan name, renewal text, the header's
- * "View All Plans" button, and the side-by-side current / next plan tiles
- * render correctly, plus the header button's navigation wiring. The card shows
+ * Tests for the PlanCard: verifies the plan name, the cancellation line, the
+ * single header button (base-only "View All Plans" or paid-only "Manage
+ * Subscription"), and the side-by-side current / next plan tiles render
+ * correctly, plus the header button's navigation wiring. The card shows
  * no credit bundle label and no invoices button; invoices render in an inline
  * table on the billing page.
  *
@@ -46,8 +47,17 @@ import {
   makeSuperPackage,
   makeUltraPackage,
 } from "@/domains/settings/billing/plans/pro-package-test-fixtures";
+import { formatGraceDate } from "@/domains/settings/hooks/use-billing-portal-session";
 import * as takeoverAvatarStash from "@/lib/billing/takeover-avatar-stash";
 import { routes } from "@/utils/routes";
+
+/**
+ * Cycle ends built from local noon, so the printed calendar day holds whatever
+ * the host offset is. A fixed UTC noon does not: it is already the next day
+ * from UTC+12 eastward.
+ */
+const BASE_PERIOD_END = new Date(2026, 6, 10, 12).toISOString();
+const PRO_PERIOD_END = new Date(2026, 7, 10, 12).toISOString();
 
 // Capture navigate() targets so the action-button wiring can be asserted
 // without a live Router.
@@ -87,10 +97,6 @@ let changePackageImpl: () => Promise<{
 });
 let currentSub: SubscriptionResponse = baseSubscription();
 let currentPlans: PlanListResponse = basePlansResponse();
-/** Managed spend this cycle, against Mighty's $25 bundle. */
-let usageTotalUsd = "10";
-let usageShouldFail = false;
-let usageTotalsCalls = 0;
 
 mock.module("@/generated/api/sdk.gen", () => ({
   ...sdkGen,
@@ -106,16 +112,6 @@ mock.module("@/generated/api/sdk.gen", () => ({
     Promise.resolve({ data: currentSub, response: { ok: true } }),
   organizationsBillingPlansRetrieve: () =>
     Promise.resolve({ data: currentPlans, response: { ok: true } }),
-  organizationsBillingUsageTotalsRetrieve: () => {
-    usageTotalsCalls += 1;
-    if (usageShouldFail) {
-      return Promise.reject(new Error("totals unavailable"));
-    }
-    return Promise.resolve({
-      data: { total_usd: usageTotalUsd, event_count: 4 },
-      response: { ok: true },
-    });
-  },
 }));
 
 // Stub the toaster: the no_op change-package branch toasts, and no <Toaster />
@@ -151,10 +147,10 @@ mock.module("@/lib/billing/takeover-avatar-stash", () => ({
   },
 }));
 
-// The wallet behind the bundle. The real hook reads the billing summary
+// The wallet behind the grants. The real hook reads the billing summary
 // through the platform gate and the org store, neither of which these tests
-// drive; a paid tile only asks it what the wallet holds, while a free tile
-// reads its whole bar off the usage-grant figures.
+// drive; every tile reads its bar off the usage-grant figures and asks the
+// wallet only whether anything is left behind them.
 let walletBalance: string | null = null;
 // The hook's BYOK suppression, which pins its flags down over a wallet that is
 // genuinely empty. Mirrored here so a test can hand the card that shape.
@@ -187,25 +183,6 @@ mock.module("@/components/add-credits-modal", () => ({
 }));
 
 const { PlanCard } = await import("./plan-card");
-const { useClientFeatureFlagStore } =
-  await import("@/stores/client-feature-flag-store");
-
-/** Drives the `obscure-credits` client flag the way the app's LD sync does. */
-function setObscureCredits(value: boolean): void {
-  act(() => {
-    useClientFeatureFlagStore
-      .getState()
-      .setFlags({ obscureCredits: value }, null);
-  });
-}
-
-/** The panel's reset date, formatted the way the panel formats it. */
-function resetLabel(iso: string): string {
-  return new Intl.DateTimeFormat("en", {
-    month: "short",
-    day: "numeric",
-  }).format(new Date(iso));
-}
 
 function basePlansResponse(): PlanListResponse {
   return {
@@ -238,7 +215,7 @@ function baseSubscription(): SubscriptionResponse {
     status: "active",
     renewal_date: null,
     current_period_start: null,
-    current_period_end: "2026-07-10T00:00:00Z",
+    current_period_end: BASE_PERIOD_END,
     cancel_at_period_end: false,
     cancel_at: null,
     entitlements: { managed_email: false, phone_number: false },
@@ -255,17 +232,18 @@ function plansWithSuper(): PlanListResponse {
   return plans;
 }
 
-/** A subscriber currently on the Mighty Pro package. */
+/** A subscriber currently on the Mighty Pro package, bundle and all. */
 function proMightySubscription(): SubscriptionResponse {
   return {
     plan_id: "pro",
     status: "active",
     renewal_date: null,
     current_period_start: null,
-    current_period_end: "2026-08-10T00:00:00Z",
+    current_period_end: PRO_PERIOD_END,
     cancel_at_period_end: false,
     cancel_at: null,
     package: { key: "mighty", name: "Mighty", version: 1, customized: false },
+    selected_credit_tier: "credits_25",
     entitlements: { managed_email: false, phone_number: false },
   };
 }
@@ -318,10 +296,11 @@ function proUltraSubscription(): SubscriptionResponse {
     status: "active",
     renewal_date: null,
     current_period_start: null,
-    current_period_end: "2026-08-10T00:00:00Z",
+    current_period_end: PRO_PERIOD_END,
     cancel_at_period_end: false,
     cancel_at: null,
     package: { key: "ultra", name: "Ultra", version: 1, customized: false },
+    selected_credit_tier: "credits_115",
     entitlements: { managed_email: false, phone_number: false },
   };
 }
@@ -415,12 +394,12 @@ const FREE_CHIPS = ["Small Machine", "4 GB Storage", "Pay as you go credits"];
 const MIGHTY_CHIPS = [
   "Small Machine",
   "10 GB Storage",
-  "$25 in credits included",
+  "Mighty usage, reset monthly",
 ];
 const SUPER_CHIPS = [
   "Medium Machine",
   "30 GB Storage",
-  "$45 in credits included",
+  "Super usage, reset monthly",
   "Assistant email and subdomain",
 ];
 
@@ -479,19 +458,32 @@ afterEach(() => {
 });
 
 describe("PlanCard", () => {
-  test("shows the plan name and renewal text for a base plan", () => {
+  test("shows the plan name for a base plan", () => {
     const html = renderCard(baseSubscription(), basePlansResponse());
     expect(html).toContain("plan-card-name");
     expect(html).toContain("Free");
     expect(html).toContain("Current");
-    expect(html).toContain("plan-card-renews");
-    expect(html).toContain("auto renew");
+    expect(html).not.toContain("plan-card-period-end");
   });
 
   test("shows the plans button for a base plan", () => {
     const html = renderCard(baseSubscription(), basePlansResponse());
     expect(html).toContain("plan-card-plans-button");
     expect(html).toContain("View All Plans");
+  });
+
+  test("a base plan shows no Manage Subscription button", () => {
+    const html = renderCard(baseSubscription(), basePlansResponse());
+    expect(html).not.toContain("plan-card-manage-subscription-button");
+    expect(html).not.toContain("Manage Subscription");
+  });
+
+  test("a paid Pro plan shows only the Manage Subscription button", () => {
+    const html = renderCard(proMightySubscription(), plansWithSuper());
+    expect(html).toContain("plan-card-manage-subscription-button");
+    expect(html).toContain("Manage Subscription");
+    expect(html).not.toContain("plan-card-plans-button");
+    expect(html).not.toContain("View All Plans");
   });
 
   test("does not render the invoices button (moved to inline table)", () => {
@@ -663,6 +655,8 @@ describe("PlanCard", () => {
       expect(html).not.toContain(label);
     }
     expect(html).not.toContain("plan-card-price");
+    // The renewal date is the subscription's own, so it survives the miss.
+    expect(html).toContain("plan-card-period-end");
   });
 
   test("a clean pin on an older package version shows no chips or price", () => {
@@ -682,6 +676,11 @@ describe("PlanCard", () => {
       expect(current.queryByText(label)).toBeNull();
     }
     expect(current.queryByTestId("plan-card-price")).toBeNull();
+    // The renewal date is the subscription's own, so the footer keeps it even
+    // with no price to quote beside it.
+    expect(current.getByTestId("plan-card-period-end").textContent).toBe(
+      "Resets on Aug 10",
+    );
     // Super is still the next package up, but its CTA quotes no delta.
     const next = within(nextTile(host));
     expect(next.getByText("Super")).toBeTruthy();
@@ -692,24 +691,6 @@ describe("PlanCard", () => {
 });
 
 describe("PlanCard action button", () => {
-  test("a Pro user's View All Plans click opens the plan-aware takeover", async () => {
-    const onManage = mock(() => {});
-    const { findByTestId } = renderCardInteractive(
-      proMightySubscription(),
-      plansWithSuper(),
-      onManage,
-    );
-
-    fireEvent.click(await findByTestId("plan-card-plans-button"));
-
-    // navigate() fires from the click handler; await it so the assertion never
-    // races the handler's commit in the CI runner.
-    await waitFor(() => {
-      expect(navigateArgs).toEqual([[routes.plans, undefined]]);
-    });
-    expect(onManage).not.toHaveBeenCalled();
-  });
-
   test("a base user's View All Plans click opens the plans takeover", async () => {
     const onManage = mock(() => {});
     const { findByTestId } = renderCardInteractive(
@@ -728,10 +709,42 @@ describe("PlanCard action button", () => {
     expect(onManage).not.toHaveBeenCalled();
   });
 
-  test("an empty catalog falls back to onManage (AdjustPlanModal)", async () => {
+  test("a Pro user's Manage Subscription click opens the plan-aware takeover", async () => {
     const onManage = mock(() => {});
     const { findByTestId } = renderCardInteractive(
       proMightySubscription(),
+      plansWithSuper(),
+      onManage,
+    );
+
+    fireEvent.click(await findByTestId("plan-card-manage-subscription-button"));
+
+    await waitFor(() => {
+      expect(navigateArgs).toEqual([[routes.plans, undefined]]);
+    });
+    expect(onManage).not.toHaveBeenCalled();
+  });
+
+  test("an empty catalog's Manage Subscription falls back to onManage", async () => {
+    const onManage = mock(() => {});
+    const { findByTestId } = renderCardInteractive(
+      proMightySubscription(),
+      emptyCatalogPlans(),
+      onManage,
+    );
+
+    fireEvent.click(await findByTestId("plan-card-manage-subscription-button"));
+
+    await waitFor(() => {
+      expect(onManage).toHaveBeenCalledTimes(1);
+    });
+    expect(navigateArgs).toEqual([]);
+  });
+
+  test("a base user's empty catalog falls back to onManage (AdjustPlanModal)", async () => {
+    const onManage = mock(() => {});
+    const { findByTestId } = renderCardInteractive(
+      baseSubscription(),
       emptyCatalogPlans(),
       onManage,
     );
@@ -746,7 +759,7 @@ describe("PlanCard action button", () => {
     expect(navigateArgs).toEqual([]);
   });
 
-  test("a customized Pro sub's View All Plans opens the plans takeover", async () => {
+  test("a customized Pro sub's Manage Subscription opens the plans takeover", async () => {
     const onManage = mock(() => {});
     // A customized pin routes to the takeover alongside every other Pro sub; the
     // takeover's own CTAs handle the customized state's transitions.
@@ -763,7 +776,7 @@ describe("PlanCard action button", () => {
       onManage,
     );
 
-    fireEvent.click(await findByTestId("plan-card-plans-button"));
+    fireEvent.click(await findByTestId("plan-card-manage-subscription-button"));
 
     await waitFor(() => {
       expect(navigateArgs).toEqual([[routes.plans, undefined]]);
@@ -782,7 +795,7 @@ describe("PlanCard action button", () => {
       onManage,
     );
 
-    fireEvent.click(await findByTestId("plan-card-plans-button"));
+    fireEvent.click(await findByTestId("plan-card-manage-subscription-button"));
 
     await waitFor(() => {
       expect(navigateArgs).toEqual([[routes.plans, undefined]]);
@@ -790,7 +803,7 @@ describe("PlanCard action button", () => {
     expect(onManage).not.toHaveBeenCalled();
   });
 
-  test("a from-scratch custom Pro sub's View All Plans opens the takeover", async () => {
+  test("a from-scratch custom Pro sub's Manage Subscription opens the takeover", async () => {
     const onManage = mock(() => {});
     // A Pro sub built from scratch — no stock lineage, pinned but customized —
     // routes to the takeover like every other Pro sub with a live catalog.
@@ -807,7 +820,7 @@ describe("PlanCard action button", () => {
       onManage,
     );
 
-    fireEvent.click(await findByTestId("plan-card-plans-button"));
+    fireEvent.click(await findByTestId("plan-card-manage-subscription-button"));
 
     await waitFor(() => {
       expect(navigateArgs).toEqual([[routes.plans, undefined]]);
@@ -815,7 +828,7 @@ describe("PlanCard action button", () => {
     expect(onManage).not.toHaveBeenCalled();
   });
 
-  test("a cancelling custom Pro sub's View All Plans stays on the fallback", async () => {
+  test("a cancelling custom Pro sub's Manage Subscription stays on the fallback", async () => {
     const onManage = mock(() => {});
     // A customized/unpinned sub pending cancellation keeps the manage modal,
     // which surfaces the cancellation state and the "Keep your Plan" action; the
@@ -834,7 +847,7 @@ describe("PlanCard action button", () => {
       onManage,
     );
 
-    fireEvent.click(await findByTestId("plan-card-plans-button"));
+    fireEvent.click(await findByTestId("plan-card-manage-subscription-button"));
 
     await waitFor(() => {
       expect(onManage).toHaveBeenCalledTimes(1);
@@ -854,7 +867,7 @@ describe("PlanCard action button", () => {
       onManage,
     );
 
-    fireEvent.click(await findByTestId("plan-card-plans-button"));
+    fireEvent.click(await findByTestId("plan-card-manage-subscription-button"));
 
     await waitFor(() => {
       expect(navigateArgs).toEqual([[routes.plans, undefined]]);
@@ -862,7 +875,7 @@ describe("PlanCard action button", () => {
     expect(onManage).not.toHaveBeenCalled();
   });
 
-  test("an unpaid custom Pro sub's View All Plans stays on the fallback", async () => {
+  test("an unpaid custom Pro sub's Manage Subscription stays on the fallback", async () => {
     const onManage = mock(() => {});
     // A custom sub in a non-entitlement status (e.g. unpaid) is switch-ineligible,
     // so it keeps the manage modal — the takeover would bounce every CTA back to
@@ -881,7 +894,7 @@ describe("PlanCard action button", () => {
       onManage,
     );
 
-    fireEvent.click(await findByTestId("plan-card-plans-button"));
+    fireEvent.click(await findByTestId("plan-card-manage-subscription-button"));
 
     await waitFor(() => {
       expect(onManage).toHaveBeenCalledTimes(1);
@@ -1113,25 +1126,18 @@ describe("PlanCard recommended upgrade — change-package", () => {
 });
 
 /**
- * The flag-on cases render interactively rather than through
- * `renderToStaticMarkup`: a static render reads Zustand's *initial* state (its
- * `getServerSnapshot`), so a flag driven through the store would still read
- * off there. Interactive renders also let the usage query settle.
+ * The usage-balance cases render interactively rather than through
+ * `renderToStaticMarkup` so the billing reads can settle.
  */
-describe("PlanCard with obscure-credits on", () => {
+describe("PlanCard usage balance", () => {
   beforeEach(() => {
-    usageTotalUsd = "10";
-    usageShouldFail = false;
-    usageTotalsCalls = 0;
     walletBalance = null;
     byokSuppressed = false;
     availableUsageBalance = null;
     totalUsageBalance = null;
-    setObscureCredits(true);
   });
 
   afterEach(() => {
-    setObscureCredits(false);
     walletBalance = null;
     byokSuppressed = false;
     availableUsageBalance = null;
@@ -1139,94 +1145,131 @@ describe("PlanCard with obscure-credits on", () => {
   });
 
   test("a Pro clean pin trades its price footer for the usage balance", async () => {
+    totalUsageBalance = "25.00";
+    availableUsageBalance = "15.00";
     const { container, findByTestId, queryByTestId } = renderCardInteractive(
       proMightySubscription(),
       plansWithSuper(),
       () => {},
     );
 
-    // $10 of Mighty's $25 bundle spent this cycle.
+    // $10 of the $25 the cycle granted is gone.
     const panel = await findByTestId("plan-usage-balance");
-    expect(panel.textContent).toContain("Usage Balance");
+    expect(panel.textContent).toContain("Current Usage");
+    expect(panel.textContent).toContain("Resets on Aug 10");
     expect(panel.textContent).toContain("40% used");
-    expect(panel.textContent).toContain(
-      `Resets ${resetLabel("2026-08-10T00:00:00Z")}`,
-    );
     // The bar is the replacement, so the monthly price must not stand beside
-    // it on the current tile.
+    // it on the current tile, and the panel dates the renewal on its own.
     expect(queryByTestId("plan-card-price")).toBeNull();
+    expect(queryByTestId("plan-card-period-end")).toBeNull();
     expect(within(currentTile(container)).queryByText("$30/month")).toBeNull();
   });
 
-  test("both tiles name the package's usage instead of a dollar bundle", () => {
-    const { container } = renderCardInteractive(
-      proMightySubscription(),
+  test("a cancelling sub prints no renewal date", async () => {
+    // A sub that is ending does not renew, and the header's cancellation line
+    // already says when it stops.
+    totalUsageBalance = "25.00";
+    availableUsageBalance = "15.00";
+    const { findByTestId, getByTestId, queryByTestId } = renderCardInteractive(
+      { ...proMightySubscription(), cancel_at_period_end: true },
       plansWithSuper(),
       () => {},
     );
 
-    const current = within(currentTile(container));
-    expect(current.getByText("Mighty usage, reset monthly")).toBeTruthy();
-    expect(current.queryByText("$25 in credits included")).toBeNull();
-    // Machine and storage chips keep their own copy.
-    expect(current.getByText("10 GB Storage")).toBeTruthy();
-
-    const next = within(nextTile(container));
-    expect(next.getByText("Super usage, reset monthly")).toBeTruthy();
-    expect(next.queryByText("$45 in credits included")).toBeNull();
+    const panel = await findByTestId("plan-usage-balance");
+    expect(panel.textContent).toContain("40% used");
+    expect(queryByTestId("plan-usage-period-end")).toBeNull();
+    // The header line formats in the runtime's default locale, so it is
+    // compared against the helper that writes it.
+    expect(getByTestId("plan-card-cancels").textContent).toContain(
+      formatGraceDate(PRO_PERIOD_END),
+    );
   });
 
-  test("both tiles wrap their short chips into a row, usage below", () => {
+  test("a non-entitlement-status sub prints no renewal date", async () => {
+    // An `unpaid` sub keeps the `current_period_end` it last held, but the
+    // platform bears it no entitlement, so nothing renews on that date.
+    totalUsageBalance = "25.00";
+    availableUsageBalance = "15.00";
+    const { findByTestId, queryByTestId } = renderCardInteractive(
+      { ...proMightySubscription(), status: "unpaid" },
+      plansWithSuper(),
+      () => {},
+    );
+
+    const panel = await findByTestId("plan-usage-balance");
+    expect(panel.textContent).toContain("40% used");
+    expect(queryByTestId("plan-usage-period-end")).toBeNull();
+  });
+
+  test("both tiles receive their package's spec chips", () => {
     const { container } = renderCardInteractive(
       proMightySubscription(),
       plansWithSuper(),
       () => {},
     );
 
-    for (const [tile, usageLabel] of [
-      [currentTile(container), "Mighty usage, reset monthly"],
-      [nextTile(container), "Super usage, reset monthly"],
+    // How those chips lay out belongs to the tile; plan-tile.test.tsx owns it.
+    for (const [tile, labels] of [
+      [currentTile(container), MIGHTY_CHIPS],
+      [nextTile(container), SUPER_CHIPS],
     ] as const) {
-      // Child 0 is the header row; child 1 is the chip container.
-      const chips = tile.children[1] as HTMLElement;
-      const wrapRow = chips.firstElementChild as HTMLElement;
-      expect(wrapRow.className).toContain("flex-wrap");
-      expect(wrapRow.textContent).toContain("Machine");
-      expect(wrapRow.textContent).toContain("Storage");
-      expect(wrapRow.textContent).not.toContain(usageLabel);
-      // The usage chip is the first full-width row underneath (Super's email
-      // extra takes another below it).
-      expect(chips.children[1]?.textContent).toBe(usageLabel);
+      for (const label of labels) {
+        expect(within(tile).getByText(label)).toBeTruthy();
+      }
     }
   });
 
-  test("shows neither the bar nor the price when the usage read fails", async () => {
-    usageShouldFail = true;
-    const { container } = renderCardInteractive(
+  test("no grant figures keeps the price row and dates the renewal beside it", async () => {
+    // An older platform omits both usage-grant fields, or the summary has not
+    // loaded, so there is no honest reading. The tile keeps its price rather
+    // than an empty footer, and the renewal date the subscription itself
+    // carries moves beside the price instead of vanishing with the panel.
+    const { container, getByTestId, queryByTestId } = renderCardInteractive(
       proMightySubscription(),
       plansWithSuper(),
       () => {},
     );
 
-    await waitFor(() => {
-      expect(usageTotalsCalls).toBeGreaterThan(0);
-    });
     await act(async () => {
       await Promise.resolve();
     });
-    // No honest number to draw, and the price it replaced must not come back.
     expect(
       container.querySelector('[data-testid="plan-usage-balance"]'),
     ).toBeNull();
+    expect(queryByTestId("plan-usage-period-end")).toBeNull();
     expect(
-      container.querySelector('[data-testid="plan-card-price"]'),
-    ).toBeNull();
+      within(currentTile(container)).getByTestId("plan-card-price").textContent,
+    ).toBe("$30/month");
+    expect(getByTestId("plan-card-period-end").textContent).toBe(
+      "Resets on Aug 10",
+    );
   });
 
-  test("a Custom sub with a credit tier gets the bar and still no chips", async () => {
-    // A customized pin matches no stock package, so the bar is measured
-    // against the credit tier the sub actually holds.
-    usageTotalUsd = "9";
+  test("no grant figures on a cancelling sub prints no renewal beside the price", async () => {
+    // The price row follows the panel's rule: a sub that is ending does not
+    // renew, and the header's cancellation line already says when it stops.
+    const { container, getByTestId, queryByTestId } = renderCardInteractive(
+      { ...proMightySubscription(), cancel_at_period_end: true },
+      plansWithSuper(),
+      () => {},
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(
+      within(currentTile(container)).getByTestId("plan-card-price").textContent,
+    ).toBe("$30/month");
+    expect(queryByTestId("plan-card-period-end")).toBeNull();
+    expect(getByTestId("plan-card-cancels")).toBeTruthy();
+  });
+
+  test("a Custom sub reads the same summary and still shows no chips", async () => {
+    // A customized pin matches no stock package, but the bar never needs one:
+    // the summary's grant figures say what the sub actually holds.
+    totalUsageBalance = "45.00";
+    availableUsageBalance = "36.00";
     const { container, findByTestId } = renderCardInteractive(
       customProSubscription("credits_45"),
       plansWithCreditTiers(),
@@ -1235,39 +1278,63 @@ describe("PlanCard with obscure-credits on", () => {
 
     const panel = await findByTestId("plan-usage-balance");
     expect(panel.textContent).toContain("20% used");
-    expect(usageTotalsCalls).toBeGreaterThan(0);
+    // The Custom sub holds a bundle, so its cycle end is a reset.
+    expect(panel.textContent).toContain("Resets on Aug 10");
     // A Custom sub still enumerates nothing and still quotes no price.
     const current = within(currentTile(container));
     expect(current.queryByText("Mighty usage, reset monthly")).toBeNull();
-    expect(current.queryByText("$25 in credits included")).toBeNull();
     expect(current.queryByText("10 GB Storage")).toBeNull();
     expect(current.queryByTestId("plan-card-price")).toBeNull();
   });
 
-  test("a Custom sub with no credit tier gets no bar and no read", async () => {
-    const { container } = renderCardInteractive(
+  test("a Custom sub with no live grants reads as fully spent", async () => {
+    // Every grant is spent: a full bar. With no bundle to turn over, the date
+    // names a renewal rather than a reset (see `UsagePeriodEnd`).
+    totalUsageBalance = "0.00";
+    availableUsageBalance = "0.00";
+    const { findByTestId, queryByTestId, queryByText } = renderCardInteractive(
       customProSubscription(null),
       plansWithCreditTiers(),
       () => {},
     );
 
-    await act(async () => {
-      await Promise.resolve();
-    });
-    // Nothing states what this sub includes, so there is no denominator and
-    // the endpoint is never asked.
+    const panel = await findByTestId("plan-usage-balance");
+    expect(panel.textContent).toContain("100% used");
+    expect(panel.textContent).toContain("Renews on Aug 10");
     expect(
-      container.querySelector('[data-testid="plan-usage-balance"]'),
-    ).toBeNull();
+      panel
+        .querySelector('[data-slot="progress-bar-fill"]')
+        ?.getAttribute("style"),
+    ).toContain("--system-negative-strong");
+    expect(queryByTestId("plan-card-price")).toBeNull();
+    // The wallet is not known to be empty, so nothing is being offered.
     expect(
-      container.querySelector('[data-testid="plan-card-price"]'),
+      queryByText("Add credits to continue using your assistant"),
     ).toBeNull();
-    expect(usageTotalsCalls).toBe(0);
+  });
+
+  test("no live grants with an empty wallet alarms and offers credits", async () => {
+    totalUsageBalance = "0.00";
+    availableUsageBalance = "0.00";
+    walletBalance = "0";
+    const { findByTestId, getByText } = renderCardInteractive(
+      customProSubscription(null),
+      plansWithCreditTiers(),
+      () => {},
+    );
+
+    const panel = await findByTestId("plan-usage-balance");
+    expect(panel.textContent).toContain("100% used");
+    expect(
+      getByText("Add credits to continue using your assistant"),
+    ).toBeTruthy();
   });
 
   test("a spent bundle with an empty wallet alarms and offers credits", async () => {
-    // Mighty's whole $25 bundle spent, and no purchased credits behind it.
-    usageTotalUsd = "25";
+    // The whole $25 the cycle granted is gone, and no purchased credits
+    // behind it.
+    totalUsageBalance = "25.00";
+    availableUsageBalance = "0.00";
     walletBalance = "0";
     const { findByTestId, getByText, queryByTestId } = renderCardInteractive(
       proMightySubscription(),
@@ -1295,7 +1362,8 @@ describe("PlanCard with obscure-credits on", () => {
     // The hook holds `isExhausted` down for a provably BYOK chat route, where
     // a turn never spends the managed wallet. This surface reports the wallet
     // itself, so an empty one alarms regardless of how chat dispatches.
-    usageTotalUsd = "25";
+    totalUsageBalance = "25.00";
+    availableUsageBalance = "0.00";
     walletBalance = "0";
     byokSuppressed = true;
     const { findByTestId, getByText } = renderCardInteractive(
@@ -1312,9 +1380,10 @@ describe("PlanCard with obscure-credits on", () => {
   });
 
   test("a spent bundle turns negative with credits still in hand", async () => {
-    // 100% of the included usage, and the wallet still covers the next turn.
+    // 100% of the granted usage, and the wallet still covers the next turn.
     // The reading goes red anyway; only the strip waits on the wallet.
-    usageTotalUsd = "25";
+    totalUsageBalance = "25.00";
+    availableUsageBalance = "0.00";
     walletBalance = "12.50";
     const { findByTestId, getByText, queryByText, queryByTestId } =
       renderCardInteractive(
@@ -1343,6 +1412,8 @@ describe("PlanCard with obscure-credits on", () => {
     // The strip belongs to a spent bundle, and so does the negative reading.
     // Below 100% the tile reads the same as it always has, whatever the wallet
     // says.
+    totalUsageBalance = "25.00";
+    availableUsageBalance = "15.00";
     walletBalance = "0";
     const { findByTestId, queryByText } = renderCardInteractive(
       proMightySubscription(),
@@ -1380,7 +1451,6 @@ describe("PlanCard with obscure-credits on", () => {
       container.querySelector('[data-testid="plan-usage-balance"]'),
     ).toBeNull();
     expect(current.getByText("Pay as you go credits")).toBeTruthy();
-    expect(usageTotalsCalls).toBe(0);
   });
 
   test("a free plan hides Free Forever once its usage-grant bar renders", async () => {
@@ -1388,22 +1458,21 @@ describe("PlanCard with obscure-credits on", () => {
     // takes the footer over from the price row.
     totalUsageBalance = "5.00";
     availableUsageBalance = "1.60";
-    const { container, findByTestId } = renderCardInteractive(
+    const { container, findByTestId, queryByTestId } = renderCardInteractive(
       baseSubscription(),
       basePlansResponse(),
       () => {},
     );
 
     const panel = await findByTestId("plan-usage-balance");
-    expect(panel.textContent).toContain("Usage Balance");
+    expect(panel.textContent).toContain("Current Usage");
     expect(panel.textContent).toContain("68% used");
-    // A grant is not a cycle, so nothing resets.
-    expect(panel.textContent).not.toContain("Resets");
+    // The base fixture carries a `current_period_end`, so this proves the gate
+    // is the plan rather than the field.
+    expect(queryByTestId("plan-usage-period-end")).toBeNull();
     const current = within(currentTile(container));
     expect(current.queryByTestId("plan-card-price")).toBeNull();
     expect(current.queryByText("Free Forever")).toBeNull();
-    // The whole reading comes off the summary, so no usage window is read.
-    expect(usageTotalsCalls).toBe(0);
   });
 
   test("a free plan that was never granted credit keeps only its price row", async () => {
@@ -1466,27 +1535,5 @@ describe("PlanCard with obscure-credits on", () => {
     expect(
       queryByText("Add credits to continue using your assistant"),
     ).toBeNull();
-  });
-
-  test("the free tile is untouched while the flag is off", async () => {
-    setObscureCredits(false);
-    totalUsageBalance = "5.00";
-    availableUsageBalance = "1.60";
-    const { container } = renderCardInteractive(
-      baseSubscription(),
-      basePlansResponse(),
-      () => {},
-    );
-
-    await act(async () => {
-      await Promise.resolve();
-    });
-    expect(
-      container.querySelector('[data-testid="plan-usage-balance"]'),
-    ).toBeNull();
-    expect(
-      within(currentTile(container)).getByTestId("plan-card-price").textContent,
-    ).toBe("Free Forever");
-    expect(usageTotalsCalls).toBe(0);
   });
 });

@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test";
 
-import type { ApprovalAction } from "../runtime/channel-approval-types.js";
 import { parseCallbackData } from "../runtime/routes/channel-route-shared.js";
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -16,29 +15,32 @@ describe("parseCallbackData", () => {
     expect(result).not.toBeNull();
     expect(result!.action).toBe(expectedAction);
     expect(result!.requestId).toBe("req-123");
-    expect(result!.source).toBe("telegram_button");
+    expect(result!.source).toBe("button");
   });
 
-  test.each<[string, string]>([
-    ["apr:req-123:approve_10m", "approve_once"],
-    ["apr:req-123:approve_conversation", "approve_once"],
-    ["apr:req-123:approve_always", "approve_once"],
-  ])(
-    'maps legacy action "%s" to %s (backward compat)',
-    (data, expectedAction) => {
-      const result = parseCallbackData(data);
-      expect(result).not.toBeNull();
-      expect(result!.action).toBe(expectedAction as ApprovalAction);
-      expect(result!.requestId).toBe("req-123");
-    },
-  );
+  // The parser never maps one action id onto another: an id outside the
+  // approval vocabulary is no action, whatever it resembles.
+  test.each([
+    "apr:req-123:approve_10m",
+    "apr:req-123:approve_conversation",
+    "apr:req-123:approve_always",
+  ])('returns null for the unrecognized action id in "%s"', (data) => {
+    expect(parseCallbackData(data)).toBeNull();
+  });
 
-  test("parses slack source channel", () => {
-    const result = parseCallbackData("apr:req-789:approve_once", "slack");
-    expect(result).not.toBeNull();
-    expect(result!.action).toBe("approve_once");
-    expect(result!.requestId).toBe("req-789");
-    expect(result!.source).toBe("slack_button");
+  test("every channel's button press attributes as the button modality", () => {
+    for (const channel of ["slack", "telegram", "whatsapp", "discord"]) {
+      const result = parseCallbackData("apr:req-789:approve_once", channel);
+      expect(result).not.toBeNull();
+      expect(result!.action).toBe("approve_once");
+      expect(result!.requestId).toBe("req-789");
+      expect(result!.source).toBe("button");
+    }
+  });
+
+  test("an in-app surface press attributes as vellum_surface", () => {
+    const result = parseCallbackData("apr:req-789:approve_once", "vellum");
+    expect(result!.source).toBe("vellum_surface");
   });
 
   test("returns null for unknown action", () => {

@@ -8,10 +8,15 @@ import type { CredentialCache } from "../credential-cache.js";
 import { credentialKey } from "../credential-key.js";
 import { mutateConfigFile } from "../config-file-utils.js";
 import { getLogger } from "../logger.js";
+import {
+  ensurePlatformIdentityIds,
+  peekPlatformAssistantId,
+} from "../platform-identity.js";
 import { ExponentialBackoff } from "../util/exponential-backoff.js";
+import { listWebhookIngressRoutes } from "../db/webhook-ingress-route-store.js";
 import {
   VELAY_ALLOWED_PATHS_HEADER,
-  VELAY_ALLOWED_PATHS_HEADER_VALUE,
+  buildVelayAllowedPathsHeaderValue,
 } from "./allowed-paths.js";
 import { bridgeVelayHttpRequest } from "./http-bridge.js";
 import { closeWebSocket } from "./bridge-utils.js";
@@ -40,6 +45,9 @@ const HEARTBEAT_READ_TIMEOUT_MS = 60_000;
 // ever chopping an established call.
 const TUNNEL_REFRESH_AFTER_MS = 3_300_000;
 const TUNNEL_REFRESH_BUSY_RETRY_MS = 30_000;
+// A lifecycle that registers several webhook routes in a row should cost one
+// reconnect, not one per route, so rule refreshes coalesce over this window.
+const RULES_REFRESH_DEBOUNCE_MS = 5_000;
 
 export type WebSocketConstructorWithOptions = {
   new (
@@ -102,6 +110,7 @@ export class VelayTunnelClient {
   private heartbeatTimer: unknown = null;
   private readTimeoutTimer: unknown = null;
   private refreshTimer: unknown = null;
+  private rulesRefreshTimer: unknown = null;
   // Set when the refresh deadline passed while the tunnel was busy: the
   // refresh then fires as soon as the tunnel drains (last bridged
   // connection or in-flight HTTP request completes) instead of waiting for
@@ -190,6 +199,34 @@ export class VelayTunnelClient {
     this.connectForCredentialRefresh(reason);
   }
 
+  /**
+   * Reconnect so Velay sees the current path rules. Only a live tunnel needs
+   * this: the next connect reads the registry itself, so a client that is
+   * stopped or disconnected already picks the change up. Deferred while the
+   * tunnel is busy, the same way the load-balancer refresh is. The socket to
+   * refresh is resolved when the debounce fires rather than captured when it
+   * is armed, so a reconnect during the debounce window still advertises the
+   * rules that landed after it connected.
+   */
+  requestRulesRefresh(reason: string): void {
+    if (!this.running || !this.ws || this.rulesRefreshTimer) {
+      return;
+    }
+    this.rulesRefreshTimer = this.timerApi.setTimeout(() => {
+      this.rulesRefreshTimer = null;
+      const ws = this.ws;
+      if (!this.running || !ws) {
+        return;
+      }
+      if (this.isTunnelBusy()) {
+        this.refreshDue = true;
+        return;
+      }
+      log.info({ reason }, "Reconnecting Velay tunnel to advertise new rules");
+      this.performTunnelRefresh(ws);
+    }, RULES_REFRESH_DEBOUNCE_MS);
+  }
+
   start(): void {
     if (this.running) return;
     this.running = true;
@@ -218,6 +255,10 @@ export class VelayTunnelClient {
     }
     this.clearHeartbeat();
     this.clearTunnelRefresh();
+    if (this.rulesRefreshTimer) {
+      this.timerApi.clearTimeout(this.rulesRefreshTimer);
+      this.rulesRefreshTimer = null;
+    }
     const ws = this.ws;
     this.ws = null;
     this.webSocketBridge.closeAll();
@@ -232,8 +273,27 @@ export class VelayTunnelClient {
     await this.connect();
   }
 
+  /**
+   * A registry read failure must never block the tunnel: fall back to an
+   * empty path list, which the header builder turns into legacy or
+   * statics-only rules.
+   */
+  private readRegisteredWebhookPaths(): string[] {
+    try {
+      return listWebhookIngressRoutes().map((route) => route.path);
+    } catch (err) {
+      log.error(
+        { err },
+        "Failed to read webhook ingress routes for tunnel rules",
+      );
+      return [];
+    }
+  }
+
   private async connect(): Promise<void> {
-    if (!this.running || this.connecting) return;
+    if (!this.running || this.connecting) {
+      return;
+    }
     this.connecting = true;
 
     if (this.isPublicIngressDisabled()) {
@@ -245,16 +305,10 @@ export class VelayTunnelClient {
     }
 
     let apiKeyRaw: string | undefined;
-    let platformAssistantIdRaw: string | undefined;
     try {
-      [apiKeyRaw, platformAssistantIdRaw] = await Promise.all([
-        this.options.credentials.get(
-          credentialKey("vellum", "assistant_api_key"),
-        ),
-        this.options.credentials.get(
-          credentialKey("vellum", "platform_assistant_id"),
-        ),
-      ]);
+      apiKeyRaw = await this.options.credentials.get(
+        credentialKey("vellum", "assistant_api_key"),
+      );
     } catch (err) {
       this.connecting = false;
       log.warn({ err }, "Failed to read Velay tunnel credentials");
@@ -271,7 +325,6 @@ export class VelayTunnelClient {
     }
 
     const apiKey = apiKeyRaw?.trim();
-    const platformAssistantId = platformAssistantIdRaw?.trim() || undefined;
     if (!apiKey) {
       this.connecting = false;
       if (this.consumePendingCredentialRefresh("assistant API key missing")) {
@@ -281,7 +334,8 @@ export class VelayTunnelClient {
       this.scheduleReconnect();
       return;
     }
-    const expectedAssistantId = platformAssistantId;
+    await ensurePlatformIdentityIds();
+    const expectedAssistantId = peekPlatformAssistantId();
 
     let registerUrl: string;
     try {
@@ -302,9 +356,13 @@ export class VelayTunnelClient {
         headers: {
           Authorization: `Api-Key ${apiKey}`,
           // Declares the path allowlist Velay enforces for inbound proxied
-          // traffic on this tunnel. See ./allowed-paths.ts for the route
-          // inventory and the platform-side enforcement (ATL-402).
-          [VELAY_ALLOWED_PATHS_HEADER]: VELAY_ALLOWED_PATHS_HEADER_VALUE,
+          // traffic on this tunnel. Read per attempt so a reconnect picks up
+          // webhook routes registered since the last one. See
+          // ./allowed-paths.ts for the route inventory and the platform-side
+          // enforcement (ATL-402).
+          [VELAY_ALLOWED_PATHS_HEADER]: buildVelayAllowedPathsHeaderValue(() =>
+            this.readRegisteredWebhookPaths(),
+          ),
         },
       });
       ws.binaryType = "arraybuffer";

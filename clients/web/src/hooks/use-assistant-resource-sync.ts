@@ -2,9 +2,9 @@
  * Bus consumer for assistant-level resource cache invalidation.
  *
  * Routes `sync_changed` tags (avatar, identity, config, sounds, schedules,
- * apps, documents, plugins) and discrete SSE events (`home_feed_updated`,
- * `relationship_state_updated`, `identity_changed`, `avatar_updated`) into
- * TanStack Query cache invalidations.
+ * apps, documents, plugins, activation progress) and discrete SSE events
+ * (`home_feed_updated`, `relationship_state_updated`, `identity_changed`,
+ * `avatar_updated`) into TanStack Query cache invalidations.
  *
  * Also handles `sse.opened` (non-fresh) to invalidate cached resources on
  * reconnect — the client may have missed `sync_changed` events during the
@@ -33,10 +33,13 @@ import { useEffect, useRef } from "react";
 import { useQueryClient, type QueryClient } from "@tanstack/react-query";
 
 import { invalidateMemoryQueries } from "@/domains/intelligence/memory-graph/invalidate-memory-queries";
-import { invalidatePluginQueries } from "@/domains/intelligence/plugins/invalidate-plugin-queries";
+import { invalidatePluginQueries } from "@/lib/invalidate-plugin-queries";
+import { mcpQueryKeys } from "@/domains/settings/mcp/mcp-query-keys";
 import {
+  activationProgressGetQueryKey,
   configGetQueryKey,
   configLlmCallsitesGetQueryKey,
+  homeStateGetQueryKey,
   identityGetQueryKey,
   inferenceProfilesGetQueryKey,
   schedulesGetQueryKey,
@@ -44,7 +47,9 @@ import {
   soundsConfigGetQueryKey,
 } from "@/generated/daemon/@tanstack/react-query.gen";
 import { avatarQueryKey } from "@/hooks/use-assistant-avatar";
+import { chooserRowAvatarQueryKeyPrefix } from "@/hooks/use-chooser-row-avatar";
 import { useBusSubscription } from "@/hooks/use-bus-subscription";
+import { supersedePlatformAvatar } from "@/hooks/use-platform-avatar-urls";
 import { getClientId } from "@/lib/telemetry/client-identity";
 import { SYNC_TAGS } from "@/lib/sync/types";
 
@@ -110,9 +115,7 @@ export function useAssistantResourceSync(
         for (const tag of event.tags) {
           switch (tag) {
             case SYNC_TAGS.assistantAvatar:
-              void queryClient.invalidateQueries({
-                queryKey: avatarQueryKey(assistantId),
-              });
+              onAvatarChanged(queryClient, assistantId);
               break;
             case SYNC_TAGS.assistantIdentity:
               void queryClient.invalidateQueries({
@@ -139,6 +142,7 @@ export function useAssistantResourceSync(
               // `memory.v3.live`), so a config write on any client can change
               // what the Memory surface must render.
               invalidateMemoryQueries(queryClient, assistantId);
+              invalidateMcpQueries(queryClient, assistantId);
               break;
             case SYNC_TAGS.assistantSounds:
               void queryClient.invalidateQueries({
@@ -186,6 +190,15 @@ export function useAssistantResourceSync(
               break;
             case SYNC_TAGS.pluginsList:
               invalidatePluginQueries(queryClient, assistantId);
+              invalidateMcpQueries(queryClient, assistantId);
+              break;
+            case SYNC_TAGS.mcpList:
+              invalidateMcpQueries(queryClient, assistantId);
+              break;
+            case SYNC_TAGS.activationProgress:
+              void queryClient.invalidateQueries({
+                queryKey: activationProgressGetQueryKey(pathOpts),
+              });
               break;
           }
         }
@@ -198,14 +211,20 @@ export function useAssistantResourceSync(
         });
         return;
 
+      // The daemon rewrites the relationship snapshot at a turn boundary,
+      // which is also when the feed can have gained an item, so the feed is
+      // marked stale alongside the snapshot itself. The snapshot carries the
+      // capability tiers the activation checklist reads to decide which tasks
+      // have a connected account behind them, so a mail or calendar
+      // connection made on another client has to reach this query or an
+      // eligible task stays hidden.
       case "relationship_state_updated":
         void queryClient.invalidateQueries({
           predicate: (query) =>
             isGeneratedQueryKey(query.queryKey, "homeFeedGet"),
         });
         void queryClient.invalidateQueries({
-          predicate: (query) =>
-            isGeneratedQueryKey(query.queryKey, "homeStateGet"),
+          queryKey: homeStateGetQueryKey(pathOpts),
         });
         return;
 
@@ -216,9 +235,7 @@ export function useAssistantResourceSync(
         return;
 
       case "avatar_updated":
-        void queryClient.invalidateQueries({
-          queryKey: avatarQueryKey(assistantId),
-        });
+        onAvatarChanged(queryClient, assistantId);
         return;
     }
   });
@@ -237,6 +254,36 @@ export function useAssistantResourceSync(
       reconnectSweepTimerRef.current = null;
       refreshAssistantResources(queryClient, assistantId);
     }, RECONNECT_SWEEP_DEBOUNCE_MS);
+  });
+}
+
+/**
+ * An avatar change on the connected assistant. Beyond the query sweep, drops
+ * the row's synced `avatarUrl` and platform lookup entry: the platform copy
+ * lags the live change, and while set it keeps the chooser's live/cache paths
+ * disabled. The reconnect sweep does not do this, since nothing is known to
+ * have changed there.
+ */
+function onAvatarChanged(queryClient: QueryClient, assistantId: string): void {
+  supersedePlatformAvatar(queryClient, assistantId);
+  invalidateAvatarQueries(queryClient, assistantId);
+}
+
+/** The canonical avatar cache plus every chooser row variant for the same id. */
+function invalidateAvatarQueries(
+  queryClient: QueryClient,
+  assistantId: string,
+  refetchType?: "active" | "none",
+): void {
+  void queryClient.invalidateQueries({
+    queryKey: avatarQueryKey(assistantId),
+    refetchType,
+  });
+  // Chooser-row queries are disabled for the connected row, so this only
+  // marks them stale for when the user switches away and back.
+  void queryClient.invalidateQueries({
+    queryKey: chooserRowAvatarQueryKeyPrefix(assistantId),
+    refetchType: "none",
   });
 }
 
@@ -272,10 +319,8 @@ function refreshAssistantResources(
     queryKey: configGetQueryKey(pathOpts),
     refetchType,
   });
-  void queryClient.invalidateQueries({
-    queryKey: avatarQueryKey(assistantId),
-    refetchType,
-  });
+  invalidateMcpQueries(queryClient, assistantId, refetchType);
+  invalidateAvatarQueries(queryClient, assistantId, refetchType);
   invalidateMemoryQueries(queryClient, assistantId, refetchType);
   void queryClient.invalidateQueries({
     queryKey: soundsConfigGetQueryKey(pathOpts),
@@ -315,7 +360,11 @@ function refreshAssistantResources(
     refetchType,
   });
   void queryClient.invalidateQueries({
-    predicate: (query) => isGeneratedQueryKey(query.queryKey, "homeStateGet"),
+    queryKey: homeStateGetQueryKey(pathOpts),
+    refetchType,
+  });
+  void queryClient.invalidateQueries({
+    queryKey: activationProgressGetQueryKey(pathOpts),
     refetchType,
   });
 }
@@ -330,4 +379,19 @@ function isGeneratedQueryKey(
     typeof firstKeyPart === "object" &&
     (firstKeyPart as { _id?: unknown })._id === id
   );
+}
+
+function invalidateMcpQueries(
+  queryClient: QueryClient,
+  assistantId: string,
+  refetchType: "active" | "none" = "active",
+): void {
+  void queryClient.invalidateQueries({
+    queryKey: mcpQueryKeys.list(assistantId),
+    refetchType,
+  });
+  void queryClient.invalidateQueries({
+    queryKey: mcpQueryKeys.details(assistantId),
+    refetchType,
+  });
 }

@@ -982,6 +982,7 @@ describe("OpenAIProvider", () => {
     );
 
     expect(lastCreateParams!.max_completion_tokens).toBe(64000);
+    expect(lastCreateParams).not.toHaveProperty("max_tokens");
   });
 
   // -----------------------------------------------------------------------
@@ -1962,7 +1963,7 @@ describe("FireworksProvider reasoning_effort ceiling", () => {
   test('DeepSeek V4 Pro accepts "max" unclamped', async () => {
     const fw = new FireworksProvider(
       "fw-key",
-      "accounts/fireworks/models/deepseek-v4-pro",
+      "accounts/fireworks/models/deepseek-v4-pro-0813",
     );
     await fw.sendMessage([userMsg("hi")], {
       systemPrompt: "system",
@@ -1974,7 +1975,7 @@ describe("FireworksProvider reasoning_effort ceiling", () => {
   test('DeepSeek V4 Pro accepts "xhigh" unclamped', async () => {
     const fw = new FireworksProvider(
       "fw-key",
-      "accounts/fireworks/models/deepseek-v4-pro",
+      "accounts/fireworks/models/deepseek-v4-pro-0813",
     );
     await fw.sendMessage([userMsg("hi")], {
       systemPrompt: "system",
@@ -2015,7 +2016,7 @@ describe("FireworksProvider reasoning_effort ceiling", () => {
   test("effort below ceiling is forwarded verbatim", async () => {
     const fw = new FireworksProvider(
       "fw-key",
-      "accounts/fireworks/models/deepseek-v4-pro",
+      "accounts/fireworks/models/deepseek-v4-pro-0813",
     );
     await fw.sendMessage([userMsg("hi")], {
       systemPrompt: "system",
@@ -2045,9 +2046,72 @@ describe("FireworksProvider reasoning_effort ceiling", () => {
       systemPrompt: "system",
       config: {
         effort: "max",
-        model: "accounts/fireworks/models/deepseek-v4-pro",
+        model: "accounts/fireworks/models/deepseek-v4-pro-0813",
       },
     });
     expect(lastCreateParams!.reasoning_effort).toBe("max");
+  });
+});
+
+// GLM 5.3 accepts only low|high|max and 4xxes on the in-between tiers, so
+// the catalog's `supportedEfforts` snaps them down (see
+// snapReasoningEffortToSupported).
+describe("FireworksProvider sparse reasoning_effort support (GLM 5.3)", () => {
+  beforeEach(() => {
+    fakeChunks = [];
+    lastCreateParams = null;
+  });
+
+  const send = async (
+    model: string,
+    effort: "none" | "low" | "medium" | "high" | "xhigh" | "max",
+  ) => {
+    const fw = new FireworksProvider("fw-key", model);
+    await fw.sendMessage([userMsg("hi")], {
+      systemPrompt: "system",
+      config: { effort },
+    });
+    return lastCreateParams!.reasoning_effort;
+  };
+
+  test('GLM 5.3 snaps "medium" down to "low"', async () => {
+    expect(await send("accounts/fireworks/models/glm-5p3", "medium")).toBe(
+      "low",
+    );
+  });
+
+  test('GLM 5.3 snaps "xhigh" down to "high"', async () => {
+    expect(await send("accounts/fireworks/models/glm-5p3", "xhigh")).toBe(
+      "high",
+    );
+  });
+
+  test("GLM 5.3 forwards supported values verbatim", async () => {
+    expect(await send("accounts/fireworks/models/glm-5p3", "low")).toBe("low");
+    expect(await send("accounts/fireworks/models/glm-5p3", "high")).toBe(
+      "high",
+    );
+    expect(await send("accounts/fireworks/models/glm-5p3", "max")).toBe("max");
+  });
+
+  test('GLM 5.3 Flash snaps "medium"/"xhigh" the same way', async () => {
+    expect(
+      await send("accounts/fireworks/models/glm-5p3-flash", "medium"),
+    ).toBe("low");
+    expect(await send("accounts/fireworks/models/glm-5p3-flash", "xhigh")).toBe(
+      "high",
+    );
+  });
+
+  test('effort: "none" is not snapped (opt-out keeps its own handling)', async () => {
+    expect(await send("accounts/fireworks/models/glm-5p3", "none")).toBe(
+      "none",
+    );
+  });
+
+  test("models without supportedEfforts are unaffected", async () => {
+    expect(
+      await send("accounts/fireworks/models/deepseek-v4-pro-0813", "medium"),
+    ).toBe("medium");
   });
 });

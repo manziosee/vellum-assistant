@@ -1,5 +1,5 @@
 import "./env-seed";
-import { app, net, protocol, session, shell } from "electron";
+import { app, net, Notification, protocol, session, shell } from "electron";
 import { pathToFileURL } from "node:url";
 import path from "node:path";
 
@@ -8,13 +8,12 @@ import { installCommandPaletteWindow } from "@vellumai/electron-desktop/command-
 import { getDeviceId } from "@vellumai/electron-desktop/device-id";
 import { installDictationOverlay } from "@vellumai/electron-desktop/dictation-overlay-window";
 import {
-  authorizePairedGatewayForwardPlan,
-  executeGatewayForwardPlan,
-  planGatewayForward,
-  planPairedGatewayForward,
+  forwardGatewayRequest,
+  forwardPairedGatewayRequest,
   type GatewayForwardFetcher,
 } from "@vellumai/electron-desktop/gateway-forward";
 import { installPermissionHandler } from "@vellumai/electron-desktop/permissions";
+import { installPairedGatewayRequestGuard } from "@vellumai/electron-desktop/paired-gateway-request-guard";
 import {
   executePlatformForwardPlan,
   planPlatformForward,
@@ -42,7 +41,6 @@ import { resolveAllowedOrigin } from "./app-origin";
 import { writeCliLocator } from "./cli-installer";
 import { provisionCliForWrapper } from "./cli-path-installer";
 import { handle, handleSync, on } from "./ipc";
-import { installPairedGatewayRequestGuard } from "./paired-gateway-request-guard";
 import { hasPendingDeepLinks, installDeepLinks } from "./deep-links.client";
 import { handleBundleFile, installMacBundleWorkflow } from "./bundles";
 import {
@@ -53,6 +51,7 @@ import {
 } from "./file-open.client";
 import { installAvatarIpc } from "@vellumai/electron-desktop/avatar";
 import { installConnectivityProbe } from "@vellumai/electron-desktop/connectivity-probe";
+import { installDownloads } from "@vellumai/electron-desktop/downloads";
 import { installIdentityIpc } from "@vellumai/electron-desktop/identity";
 import {
   configureNotifications,
@@ -66,8 +65,8 @@ import {
 } from "@vellumai/electron-desktop/status";
 import "./auxiliary-windows.client";
 import { installDock } from "./dock";
-import { installDownloads } from "./downloads";
 import { installShare } from "./share";
+import { installWindowAttentionFeature } from "./window-attention";
 import {
   installEscapeMonitor,
   setDictationRecording,
@@ -107,6 +106,15 @@ import {
 } from "./move-to-applications";
 import { markRelocationSkipped } from "./install-location";
 import { installNativeAuth } from "./native-auth.client";
+import {
+  createNativeNotificationFactory,
+  registerNativeNotificationCategories,
+} from "./native-notifications";
+import {
+  ensureNotifierDelegate,
+  isNotifierSupported,
+  restoreNotifierDelegate,
+} from "./notifier";
 import { installPermissionsService } from "./permissions-service";
 import {
   installCompanionWindow,
@@ -278,6 +286,7 @@ const registerAppProtocol = (): void => {
     const proxied = await forwardGatewayRequest(
       request,
       getAllowedGatewayPorts,
+      gatewayForwardFetcher,
     );
     if (proxied) return proxied;
 
@@ -289,14 +298,16 @@ const registerAppProtocol = (): void => {
     const pairedProxied = await forwardPairedGatewayRequest(
       request,
       getPairedGatewayTargets,
+      getPairedGuardianAccessToken,
+      gatewayForwardFetcher,
     );
     if (pairedProxied) {
       return pairedProxied;
     }
 
-    // Platform API routes (`/v1/*`, `/_allauth/*`, `/accounts/*`) forward to
-    // the cloud platform so managed mode works in packaged builds. Mirrors the
-    // Vite dev-server proxy (`clients/web/vite.config.ts` server.proxy entries).
+    // Platform API and first-party session-replay routes (`/v1/*`,
+    // `/_allauth/*`, `/accounts/*`, `/_sr/*`) forward to the cloud platform
+    // so managed mode and desktop replay ingest work in packaged builds.
     const platformProxied = await forwardPlatformRequest(request, platformUrl);
     if (platformProxied) return platformProxied;
 
@@ -319,41 +330,6 @@ const registerAppProtocol = (): void => {
 
 const gatewayForwardFetcher: GatewayForwardFetcher = (url, init) =>
   net.fetch(url, init);
-
-/**
- * Forward a gateway data-plane request (`/assistant/__gateway/{port}/*`) to the
- * local gateway on loopback, or return `null` when the URL is not a gateway
- * request. `net.fetch` runs in the main process, so the renderer only ever
- * talks to its own secure `app://` origin; main does the `http://127.0.0.1`
- * hop.
- */
-const forwardGatewayRequest = async (
-  request: GlobalRequest,
-  getAllowedPorts: () => Set<number>,
-): Promise<Response | null> =>
-  executeGatewayForwardPlan(
-    planGatewayForward(request, getAllowedPorts),
-    request,
-    gatewayForwardFetcher,
-  );
-
-/**
- * Forward a paired-gateway data-plane request
- * (`/assistant/__gateway-paired/{assistantId}/*`) to the remote gateway an
- * imported pairing recorded as its `runtimeUrl`, or return `null` when the URL
- * is not a paired-gateway request. Main does the remote hop so the renderer
- * stays same-origin.
- */
-const forwardPairedGatewayRequest = async (
-  request: GlobalRequest,
-  getTargets: () => Map<string, string>,
-): Promise<Response | null> => {
-  const plan = await authorizePairedGatewayForwardPlan(
-    planPairedGatewayForward(request, getTargets),
-    getPairedGuardianAccessToken,
-  );
-  return executeGatewayForwardPlan(plan, request, gatewayForwardFetcher);
-};
 
 const resolvedConfig = resolveLocalConfigFromEnv(process.env);
 handleSync("vellum:config:get", () => ({
@@ -430,7 +406,10 @@ app
 
     if (!isDev) {
       registerAppProtocol();
-      installPairedGatewayRequestGuard();
+      installPairedGatewayRequestGuard({
+        appOrigin: { protocol: `${APP_PROTOCOL}:`, host: APP_HOST },
+        resolveAllowedOrigin,
+      });
     }
     registerVellumAppProtocol(
       path.join(app.getPath("userData"), BUNDLES_DIR_NAME),
@@ -485,14 +464,38 @@ app
     installShare();
     // Files renderer downloads into ~/Downloads instead of prompting a Save
     // panel. Distinct from `installShare`, which is the "send elsewhere" intent.
-    installDownloads();
+    installDownloads({ handle });
     installPowerEvents();
+    // The addon takes the notifications the assistant avatar can ride on only
+    // when it says it can have them: an unbundled run loads it fine and then
+    // reports unsupported, because UNUserNotificationCenter raises there.
+    // `isSupported` ships with `create` rather than being left to the shared
+    // module's default; see the delegate rule in README.md.
+    const nativeNotifications = isNotifierSupported()
+      ? createNativeNotificationFactory()
+      : null;
     configureNotifications({
       ipc: { handle },
       ensureVisible: ensureMainWindowVisible,
       logger: log,
+      ...(nativeNotifications ?? {}),
     });
+    if (nativeNotifications) {
+      // Electron builds its notification presenter lazily, on the first
+      // `Notification.isSupported()` or `new Notification()`, and the presenter
+      // claims the notification center's delegate and discards responses for
+      // identifiers it does not own. Building it here, with nothing on screen,
+      // and re-asserting the addon's delegate straight after leaves the addon
+      // in front of it for the life of the process, forwarding what it does not
+      // own. The categories are then written after the presenter exists, so
+      // Electron's own category read-modify-write cannot land on top of them.
+      Notification.isSupported();
+      ensureNotifierDelegate();
+      registerNativeNotificationCategories();
+      app.on("before-quit", restoreNotifierDelegate);
+    }
     installNotifications();
+    installWindowAttentionFeature();
     // Register the status channel before the tray installs so the tray's
     // initial render reflects any status the renderer publishes during
     // bootstrap rather than briefly showing the default idle dot.
@@ -516,9 +519,11 @@ app
     installMainWindow();
 
     // After the main window, so the surface opens over a running app rather
-    // than being the first thing on screen at launch. Present from here on,
-    // unless the user has hidden it from the tray: the app being frontmost is
-    // not one of its states.
+    // than being the first thing on screen at launch. Open from here on,
+    // unless the user has hidden it from the tray, and on screen whenever the
+    // app itself is not in front: it stands in for the app while the user is
+    // working somewhere else, and steps off while Vellum is the frontmost app
+    // with its window showing.
     //
     // A launch that has nobody signed in yet leaves it closed, and the window
     // that opens it later is the app's own, once it has an assistant to

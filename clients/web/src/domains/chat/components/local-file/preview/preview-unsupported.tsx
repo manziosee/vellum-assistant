@@ -3,15 +3,12 @@ import type { ReactNode } from "react";
 import { Download, ExternalLink } from "lucide-react";
 import { Button, Typography } from "@vellumai/design-library";
 
-import { formatAttachmentSize } from "@/domains/chat/components/chat-attachments/utils";
+import { formatAttachmentSize } from "@/utils/attachment-utils";
 import {
   LocalFileIcon,
   localFileKindFromFilename,
-} from "@/domains/chat/components/local-file/local-file-icon";
+} from "@/components/local-file/local-file-icon";
 import { useTranslation } from "@/i18n";
-
-/** Shown for a file no reader covers, whatever its format. */
-const PREVIEW_UNSUPPORTED_MESSAGE = "No preview for this file type";
 
 interface PreviewUnsupportedProps {
   filename: string;
@@ -70,7 +67,7 @@ export function PreviewUnsupported({
         variant="body-small-default"
         className="text-[var(--content-tertiary)]"
       >
-        {PREVIEW_UNSUPPORTED_MESSAGE}
+        {t("previewUnsupported.noPreviewForType")}
       </Typography>
       <span className="flex flex-wrap items-center gap-2">
         <Button

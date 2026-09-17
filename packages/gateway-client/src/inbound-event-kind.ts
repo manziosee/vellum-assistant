@@ -1,0 +1,160 @@
+/**
+ * The inbound event families, named.
+ *
+ * Every inbound event is one of these, and the kind decides which pipeline
+ * stages apply: only user-authored text (message, edit) can carry a
+ * verification code or an invite, only a message starts an agent turn, and
+ * edit/delete/reaction/button all refer to another message rather than
+ * standing alone. A payload can also encode its family in the field that
+ * carries it: `isEdit`, the sentinel string `"message_deleted"`, the
+ * `"reaction:"` prefix, the presence of `callbackData` at all. Replayed
+ * retry payloads arrive with only those encodings, so
+ * {@link resolveInboundEventKind} derives the kind from them exactly once;
+ * nothing else may sniff them.
+ */
+
+export const INBOUND_EVENT_KINDS = [
+  "message",
+  "edit",
+  "delete",
+  "reaction",
+  "button",
+] as const;
+
+export type InboundEventKind = (typeof INBOUND_EVENT_KINDS)[number];
+
+export function isInboundEventKind(value: string): value is InboundEventKind {
+  return (INBOUND_EVENT_KINDS as readonly string[]).includes(value);
+}
+
+/**
+ * The one place the field encodings are read. A payload stamped with a
+ * kind wins outright; an unstamped one (a replayed retry payload) is
+ * classified by the fields that carry its family. The fallback order is
+ * specific-before-generic: reaction prefixes and the delete sentinel are
+ * particular `callbackData` values, so they are tested before the generic
+ * button reading.
+ */
+export function resolveInboundEventKind(fields: {
+  eventKind?: string;
+  isEdit?: boolean;
+  callbackData?: string;
+  callbackQueryId?: string;
+}): InboundEventKind {
+  if (fields.eventKind !== undefined && isInboundEventKind(fields.eventKind)) {
+    return fields.eventKind;
+  }
+  if (fields.isEdit === true) {
+    return "edit";
+  }
+  const cb = fields.callbackData;
+  if (cb !== undefined && cb.length > 0) {
+    if (cb === "message_deleted") {
+      return "delete";
+    }
+    if (cb.startsWith("reaction:") || cb.startsWith("reaction_removed:")) {
+      return "reaction";
+    }
+    return "button";
+  }
+  if (fields.callbackQueryId !== undefined) {
+    return "button";
+  }
+  return "message";
+}
+
+/**
+ * Whether an event of this kind refers to another message rather than
+ * standing alone as new content. Referring events never mint a
+ * conversation of their own and never carry ingestable attachments.
+ */
+export function inboundEventRefersToAnotherMessage(
+  kind: InboundEventKind,
+): boolean {
+  return kind !== "message";
+}
+
+import {
+  classifyReactionEmojiSpelling,
+  parseDiscordEmojiMention,
+  reactionEmojiIdentity,
+  type ReactionEmojiKind,
+} from "@vellumai/service-contracts/reactions";
+
+/** The structured payload of a reaction event. */
+export interface InboundReactionPayload {
+  op: "added" | "removed";
+  /**
+   * The emoji in the channel's own spelling, which is what the channel's
+   * write path and the model both consume: Discord's outbound route parses
+   * a custom emoji back out of its `<:name:id>` mention form. Kept as the
+   * wire's token rather than replaced by the typed fields below, because
+   * the dedup id embeds it and the model hands it back to `react_to_message`
+   * verbatim.
+   */
+  emoji: string;
+  /** Which namespace {@link emoji} was drawn from. */
+  emojiKind: ReactionEmojiKind;
+  /**
+   * The emoji's name in that namespace: the character itself for `unicode`,
+   * the bare name for `shortcode` and `custom`. Never the mention form.
+   */
+  emojiName: string;
+  /** The channel's id for a `custom` emoji, absent for every other kind. */
+  emojiId?: string;
+  /** Whether a `custom` emoji animates. Absent for every other kind. */
+  emojiAnimated?: boolean;
+  /**
+   * Provider id of the message reacted to, in the same namespace as
+   * `source.messageId`.
+   */
+  targetMessageId: string;
+}
+
+/**
+ * The one reader of a reaction event's payload. A structured `reaction`
+ * field wins; a replayed retry payload persisted before the field carries
+ * the `"reaction:<emoji>"` / `"reaction_removed:<emoji>"` string in
+ * `callbackData` with the target on `sourceMetadata.messageId`, and is
+ * parsed here alone. Returns null when the event is not a reaction or
+ * names no emoji or target.
+ */
+export function resolveInboundReactionPayload(fields: {
+  eventKind?: string;
+  reaction?: Omit<InboundReactionPayload, "emojiKind" | "emojiName"> &
+    Partial<Pick<InboundReactionPayload, "emojiKind" | "emojiName">>;
+  callbackData?: string;
+  sourceMetadata?: { messageId?: string };
+}): InboundReactionPayload | null {
+  if (fields.reaction) {
+    const { op, emoji, targetMessageId } = fields.reaction;
+    if (emoji.length === 0 || targetMessageId.length === 0) {
+      return null;
+    }
+    return {
+      op,
+      emoji,
+      targetMessageId,
+      ...reactionEmojiIdentity(fields.reaction),
+    };
+  }
+  const cb = fields.callbackData;
+  const target = fields.sourceMetadata?.messageId;
+  if (cb === undefined || target === undefined || target.length === 0) {
+    return null;
+  }
+  const removed = cb.startsWith("reaction_removed:");
+  const added = !removed && cb.startsWith("reaction:");
+  if (!added && !removed) {
+    return null;
+  }
+  const emoji = cb.slice(cb.indexOf(":") + 1);
+  return emoji.length > 0
+    ? {
+        op: removed ? "removed" : "added",
+        emoji,
+        targetMessageId: target,
+        ...classifyReactionEmojiSpelling(emoji),
+      }
+    : null;
+}

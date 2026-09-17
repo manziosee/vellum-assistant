@@ -3,11 +3,13 @@ import { useSyncExternalStore } from "react";
 
 import {
   type ProviderRedirectOptions,
+  readAttributionParams,
   startProviderRedirect,
 } from "@/domains/account/social-auth";
 import { sanitizeReturnTo } from "@/domains/account/return-to";
 import { getSession } from "@/lib/auth/allauth-client";
-import { hasOnboardedAssistant } from "@/domains/onboarding/onboarded-assistant";
+import { userHasOnboardedAssistant } from "@/domains/onboarding/onboarded-assistant";
+import { isNewAssistantFunnel } from "@/domains/onboarding/onboarding-destination";
 import { resolveSignupCheckoutDestination } from "@/lib/billing/post-auth-checkout";
 import { isPlatformLocal, startLoopbackAuth } from "@/lib/auth/loopback-auth";
 import { useResolvedAssistantsStore } from "@/stores/resolved-assistants-store";
@@ -15,6 +17,10 @@ import { isLocalClient } from "@/lib/local-mode";
 import { isElectron } from "@/runtime/is-electron";
 import { setMenuPlatformSession } from "@/runtime/menu";
 import { primeElectronSessionToken } from "@/runtime/session-token";
+import {
+  captureInstallReferrer,
+  markInstallReferrerSpent,
+} from "@/runtime/install-referrer";
 import {
   isBiometricEnabled,
   setBiometricEnabled,
@@ -42,6 +48,13 @@ interface NativeAuthPlugin {
     baseURL: string;
     loginHint?: string;
     intent?: string;
+    /**
+     * Allowlisted campaign params. The shell appends them as query params on
+     * its token POST: allauth headless posts JSON, so the platform reads
+     * attribution off `request.GET`. Omitted when empty, so a shell that
+     * predates this field sees an unchanged call.
+     */
+    attribution?: Record<string, string>;
     postAuthDestination: string;
   }): Promise<{ sessionToken: string }>;
   consumeRestoredAuth(): Promise<{
@@ -121,12 +134,16 @@ export function useIsNativePlatform(): boolean {
  *
  * Throws on user cancellation (`USER_CANCELLED`) and any other error; the
  * caller decides whether to surface or swallow.
+ *
+ * `attribution` is an explicit override; absent it, this resolves the flow's
+ * attribution itself, so every native entry carries one.
  */
 export async function startNativeLogin(options?: {
   baseURL?: string;
   returnTo?: string | null;
   loginHint?: string;
   intent?: string;
+  attribution?: Record<string, string>;
 }): Promise<void> {
   // Every native auth entry routes through the shared stale-stash cleanup. The
   // direct login form (`login-page.tsx`) calls this without going through
@@ -134,6 +151,11 @@ export async function startNativeLogin(options?: {
   // prior native checkout-signup could leak into a later login and wrongly
   // resume checkout from privacy.
   clearStaleNativeCheckoutStash(options?.intent, options?.returnTo);
+
+  // Attribution resolves here for the same reason: the direct login form is
+  // the auth entry a fresh Play install reaches, and the install referrer is
+  // the only attribution such an install carries.
+  const attribution = await resolveNativeAttribution(options?.attribution);
 
   const baseURL = options?.baseURL ?? deriveAuthBaseURL();
   const destination = sanitizeReturnTo(
@@ -144,6 +166,7 @@ export async function startNativeLogin(options?: {
     baseURL,
     ...(options?.loginHint ? { loginHint: options.loginHint } : {}),
     ...(options?.intent ? { intent: options.intent } : {}),
+    ...(attribution ? { attribution } : {}),
     postAuthDestination: destination,
   });
 
@@ -205,6 +228,8 @@ async function completeNativeLogin(
   if (isNativePlatform()) {
     await waitForNativeSessionCookie();
   }
+
+  markInstallReferrerSpent();
 
   // Persist the token in native secure storage for biometric session recovery.
   // Respects the user's opt-out preference; storeBiometricToken is also
@@ -287,19 +312,19 @@ export function getSessionTokenFromCookies(): string | null {
  * Post-auth destination for the native (Capacitor/Electron) flows. Delegates
  * the signup checkout-stash + destination decision to the shared
  * `resolveSignupCheckoutDestination`. A first-run signup routes through
- * consent (privacy) first. An already-onboarded assistant skips privacy and
+ * consent (privacy) first. A returning user skips hosting, privacy, and
  * research. A login keeps its `returnTo` unless that target is the first-run
- * funnel and the assistant is already onboarded.
+ * funnel and the user is already onboarded.
  */
 export function resolveNativePostAuthDestination(
   intent: string | undefined,
   returnTo: string | null | undefined,
 ): string | null {
   const isSignup = intent === "signup";
-  const alreadyOnboarded = hasOnboardedAssistant(
+  const returningUser = userHasOnboardedAssistant(
     useResolvedAssistantsStore.getState().assistants,
   );
-  if (alreadyOnboarded) {
+  if (returningUser) {
     const skipTarget = isFirstRunOnboardingReturnTo(returnTo)
       ? routes.assistant
       : (returnTo ?? (isSignup ? routes.assistant : null));
@@ -316,14 +341,23 @@ export function resolveNativePostAuthDestination(
   return isSignup ? destination : (returnTo ?? null);
 }
 
+/**
+ * Whether `returnTo` names the first-run funnel a returning user should skip.
+ * A walk carrying the new-assistant marker is provisioning, so it is first-run
+ * for the assistant it is about to create and must not be skipped.
+ */
 function isFirstRunOnboardingReturnTo(
   returnTo: string | null | undefined,
 ): boolean {
   if (!returnTo) {
     return false;
   }
-  const pathname = returnTo.split(/[?#]/)[0] ?? returnTo;
+  const [pathname = returnTo, search = ""] = returnTo.split(/[?#]/);
+  if (isNewAssistantFunnel(new URLSearchParams(search))) {
+    return false;
+  }
   return (
+    pathname === routes.onboarding.hosting ||
     pathname === routes.onboarding.privacy ||
     pathname === routes.onboarding.research
   );
@@ -356,6 +390,30 @@ export function clearStaleNativeCheckoutStash(
 }
 
 /**
+ * Attribution to hand the native shell, drawn from exactly one source.
+ *
+ * A caller's override wins outright, then URL params: they carry the user's
+ * current, explicit campaign context. The Play install referrer is the
+ * fallback, and it is the only attribution a Play install carries at all (such
+ * an install arrives with no URL params).
+ *
+ * The two are never merged: `persist_attribution` on the platform stores a row
+ * as one coherent unit from a single source, so it must not be handed fields
+ * spliced from two. First touch across repeat signups is already held there by
+ * the empty-row backfill guard.
+ */
+async function resolveNativeAttribution(
+  override: Record<string, string> | undefined,
+): Promise<Record<string, string> | undefined> {
+  const current = override ?? readAttributionParams(window.location.search);
+  if (Object.keys(current).length > 0) {
+    return current;
+  }
+  const referrer = await captureInstallReferrer();
+  return Object.keys(referrer).length > 0 ? referrer : undefined;
+}
+
+/**
  * Unified auth-flow entry point that transparently chooses between the
  * native plugin path and the web form-POST path.
  *
@@ -384,6 +442,7 @@ export async function startAuthFlow(
         ),
         loginHint: options.loginHint,
         intent: options.intent,
+        attribution: options.attribution,
       });
     } catch (err) {
       // Capacitor translates native `call.reject(msg, code)` into a
@@ -413,6 +472,13 @@ export async function startAuthFlow(
       });
       if (result?.sessionToken) {
         primeElectronSessionToken(result.sessionToken);
+        // Reconcile the account before choosing where login lands. Keep this
+        // dynamic because auth-store imports this module.
+        const { useAuthStore, whenPlatformSessionSettled } = await import(
+          "@/stores/auth-store"
+        );
+        await useAuthStore.getState().refreshSession();
+        await whenPlatformSessionSettled();
         await setMenuPlatformSession(true);
         const destination = sanitizeReturnTo(
           resolveNativePostAuthDestination(options.intent, options.returnTo),

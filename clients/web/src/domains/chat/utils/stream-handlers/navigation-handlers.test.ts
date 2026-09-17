@@ -20,6 +20,8 @@ import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
 import type { StreamHandlerContext } from "@/domains/chat/utils/stream-handlers/types";
 import type { OpenPanelEvent, OpenUrlEvent } from "@vellumai/assistant-api";
 import { stubViewportAxes } from "@/hooks/viewport-axes.test-helper";
+import { showOpenAppRoute, showPath } from "@/stores/open-app.test-helper";
+import { routes } from "@/utils/routes";
 
 const submitSurfaceActionCalls: Array<{
   assistantId: string;
@@ -85,17 +87,20 @@ const originalWindow = globalThis.window;
 function setMockWindow({
   origin = "https://app.vellum.ai",
   open,
+  vellum,
 }: {
   origin?: string;
   open?:
     | ((url?: string, target?: string, features?: string) => Window | null)
     | null;
+  vellum?: unknown;
 } = {}): void {
   Object.defineProperty(globalThis, "window", {
     configurable: true,
     value: {
       location: { origin },
       open,
+      vellum,
     },
   });
 }
@@ -266,6 +271,22 @@ describe("handleOpenUrl", () => {
     expect(setError).toHaveBeenCalledTimes(1);
     expect(setNotice).not.toHaveBeenCalled();
   });
+
+  it("ignores settings URLs for another Electron host OS", () => {
+    setMockWindow({
+      open: null,
+      vellum: { platform: "electron", hostOS: "macos" },
+    });
+    const { ctx, setError, setNotice } = makeOpenUrlCtx();
+
+    handleOpenUrl(
+      makeOpenUrlEvent("ms-settings:privacy-microphone"),
+      ctx,
+    );
+
+    expect(setError).not.toHaveBeenCalled();
+    expect(setNotice).not.toHaveBeenCalled();
+  });
 });
 
 describe("handleOpenConversation", () => {
@@ -273,6 +294,7 @@ describe("handleOpenConversation", () => {
     useViewerStore.getState().reset();
     useConversationStore.getState().reset();
     useSubagentStore.getState().reset();
+    showPath(routes.assistant);
   });
 
   it("switches to and focuses the target conversation by default", () => {
@@ -299,11 +321,7 @@ describe("handleOpenConversation", () => {
       coarsePointer: false,
     });
     useConversationStore.getState().setActiveConversationId("conv-origin");
-    useViewerStore.setState({
-      mainView: "app",
-      activeAppId: "app-1",
-      openedAppState: { appId: "app-1", name: "My App", html: "<h1>hi</h1>" },
-    });
+    showOpenAppRoute({ conversationId: "conv-origin" });
     const push = mock((_url: string) => {});
     const ctx = { router: { push } } as unknown as StreamHandlerContext;
 
@@ -320,6 +338,33 @@ describe("handleOpenConversation", () => {
       expect(useConversationStore.getState().activeConversationId).toBe(
         "conv-target",
       );
+      expect(push).toHaveBeenCalledWith(
+        "/assistant/conversations/conv-target/app/app-1",
+      );
+    } finally {
+      restoreViewport();
+      useViewerStore.getState().reset();
+    }
+  });
+
+  it("drops the app from the URL on a narrow viewport, which has no split", () => {
+    const restoreViewport = stubViewportAxes({
+      narrow: true,
+      coarsePointer: true,
+    });
+    useConversationStore.getState().setActiveConversationId("conv-origin");
+    showOpenAppRoute({ conversationId: "conv-origin" });
+    const push = mock((_url: string) => {});
+    const ctx = { router: { push } } as unknown as StreamHandlerContext;
+
+    try {
+      handleOpenConversation(
+        { type: "open_conversation", conversationId: "conv-target" },
+        ctx,
+      );
+
+      expect(useViewerStore.getState().mainView).toBe("chat");
+      expect(push).toHaveBeenCalledWith("/assistant/conversations/conv-target");
     } finally {
       restoreViewport();
       useViewerStore.getState().reset();

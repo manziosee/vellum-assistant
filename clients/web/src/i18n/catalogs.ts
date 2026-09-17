@@ -34,6 +34,9 @@
  * Reference: https://vite.dev/guide/features#dynamic-import
  */
 import enAccount from "@/i18n/locales/en/account.json";
+import enActivation from "@/i18n/locales/en/activation.json";
+import enActivationTasks from "@/i18n/locales/en/activation-tasks.json";
+import enAssistantInbox from "@/i18n/locales/en/assistant-inbox.json";
 import enChannels from "@/i18n/locales/en/channels.json";
 import enContacts from "@/i18n/locales/en/contacts.json";
 import enCredentialRequests from "@/i18n/locales/en/credential-requests.json";
@@ -85,6 +88,9 @@ export const FALLBACK_CATALOGS: LocaleCatalogs = {
   contacts: enContacts,
   onboarding: enOnboarding,
   intelligence: enIntelligence,
+  activation: enActivation,
+  "activation-tasks": enActivationTasks,
+  "assistant-inbox": enAssistantInbox,
 };
 
 /** Loaders for the locales that are not bundled into the entry chunk. */
@@ -110,6 +116,9 @@ const CATALOG_LOADERS: Record<
     contacts: () => import("@/i18n/locales/es/contacts.json"),
     onboarding: () => import("@/i18n/locales/es/onboarding.json"),
     intelligence: () => import("@/i18n/locales/es/intelligence.json"),
+    activation: () => import("@/i18n/locales/es/activation.json"),
+    "activation-tasks": () => import("@/i18n/locales/es/activation-tasks.json"),
+    "assistant-inbox": () => import("@/i18n/locales/es/assistant-inbox.json"),
   },
   ru: {
     common: () => import("@/i18n/locales/ru/common.json"),
@@ -129,6 +138,55 @@ const CATALOG_LOADERS: Record<
     contacts: () => import("@/i18n/locales/ru/contacts.json"),
     onboarding: () => import("@/i18n/locales/ru/onboarding.json"),
     intelligence: () => import("@/i18n/locales/ru/intelligence.json"),
+    activation: () => import("@/i18n/locales/ru/activation.json"),
+    "activation-tasks": () => import("@/i18n/locales/ru/activation-tasks.json"),
+    "assistant-inbox": () => import("@/i18n/locales/ru/assistant-inbox.json"),
+  },
+  zh: {
+    common: () => import("@/i18n/locales/zh/common.json"),
+    chat: () => import("@/i18n/locales/zh/chat.json"),
+    schedules: () => import("@/i18n/locales/zh/schedules.json"),
+    account: () => import("@/i18n/locales/zh/account.json"),
+    channels: () => import("@/i18n/locales/zh/channels.json"),
+    settings: () => import("@/i18n/locales/zh/settings.json"),
+    workspace: () => import("@/i18n/locales/zh/workspace.json"),
+    terminal: () => import("@/i18n/locales/zh/terminal.json"),
+    "remote-web": () => import("@/i18n/locales/zh/remote-web.json"),
+    "credential-requests": () =>
+      import("@/i18n/locales/zh/credential-requests.json"),
+    logs: () => import("@/i18n/locales/zh/logs.json"),
+    library: () => import("@/i18n/locales/zh/library.json"),
+    home: () => import("@/i18n/locales/zh/home.json"),
+    contacts: () => import("@/i18n/locales/zh/contacts.json"),
+    onboarding: () => import("@/i18n/locales/zh/onboarding.json"),
+    intelligence: () => import("@/i18n/locales/zh/intelligence.json"),
+    activation: () => import("@/i18n/locales/zh/activation.json"),
+    "activation-tasks": () => import("@/i18n/locales/zh/activation-tasks.json"),
+    "assistant-inbox": () => import("@/i18n/locales/zh/assistant-inbox.json"),
+  },
+  "zh-TW": {
+    common: () => import("@/i18n/locales/zh-TW/common.json"),
+    chat: () => import("@/i18n/locales/zh-TW/chat.json"),
+    schedules: () => import("@/i18n/locales/zh-TW/schedules.json"),
+    account: () => import("@/i18n/locales/zh-TW/account.json"),
+    channels: () => import("@/i18n/locales/zh-TW/channels.json"),
+    settings: () => import("@/i18n/locales/zh-TW/settings.json"),
+    workspace: () => import("@/i18n/locales/zh-TW/workspace.json"),
+    terminal: () => import("@/i18n/locales/zh-TW/terminal.json"),
+    "remote-web": () => import("@/i18n/locales/zh-TW/remote-web.json"),
+    "credential-requests": () =>
+      import("@/i18n/locales/zh-TW/credential-requests.json"),
+    logs: () => import("@/i18n/locales/zh-TW/logs.json"),
+    library: () => import("@/i18n/locales/zh-TW/library.json"),
+    home: () => import("@/i18n/locales/zh-TW/home.json"),
+    contacts: () => import("@/i18n/locales/zh-TW/contacts.json"),
+    onboarding: () => import("@/i18n/locales/zh-TW/onboarding.json"),
+    intelligence: () => import("@/i18n/locales/zh-TW/intelligence.json"),
+    activation: () => import("@/i18n/locales/zh-TW/activation.json"),
+    "activation-tasks": () =>
+      import("@/i18n/locales/zh-TW/activation-tasks.json"),
+    "assistant-inbox": () =>
+      import("@/i18n/locales/zh-TW/assistant-inbox.json"),
   },
 };
 

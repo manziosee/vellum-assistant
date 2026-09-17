@@ -1,6 +1,6 @@
 import {
+  COMPANION_BASE_AVATAR_BOX,
   COMPANION_INTRO_BEATS,
-  COMPANION_NEAR_EDGE,
 } from "@vellumai/ipc-contract";
 import type {
   CompanionIntroAction,
@@ -10,6 +10,7 @@ import type { CSSProperties, Ref } from "react";
 
 import { useTranslation } from "@/i18n";
 
+import { companionLayoutFor } from "@/components/companion-layout";
 import type {
   CompanionSurfaceCardGrowth,
   CompanionSurfaceGrowth,
@@ -33,30 +34,21 @@ import type {
  * the canvas in every state (see `CompanionSurface`), so the card hangs off
  * that instead and never moves for the whole run.
  *
- * **It costs the canvas nothing.** The window is already sized for the tallest
- * state the surface has, which is the typing card, and that height is reserved
- * on the `cardGrowth` side of the avatar. No beat of the introduction opens the
- * composer, so that whole region is free while the run is on, and the card is
- * drawn into it. Growing the window for the introduction would have meant
- * moving it, and moving it would have meant re-deciding growth and placement in
- * the main process for a card that is on screen once in an install's life.
+ * **It costs the canvas nothing.** The window already reserves a card's height
+ * on the `cardGrowth` side of the avatar (`COMPANION_BASE_CARD_HEIGHT`), and
+ * nothing else draws into that region, so the card is drawn there. Growing the
+ * window for the introduction would have meant moving it, and moving it would
+ * have meant re-deciding growth and placement in the main process for a card
+ * that is on screen once in an install's life.
  */
-
-/** Gap between the avatar's edge and the card, in base layout points. */
-const AVATAR_GAP = 12;
-
-/** The avatar's box the layout is authored at, as `CompanionSurface` has it. */
-const AVATAR_BOX = 44;
 
 /**
  * The card's width, fixed rather than measured.
  *
  * Prose has no natural width, so measuring would size the card to whichever
- * beat happened to say the most and change its shape as the run advanced. This
- * is the same bargain the typing card makes, and it fits the canvas at every
- * size: the window reaches `maxPillWidth - avatarBox / 2` past the avatar in
- * both directions (`geometryFor` in `companion-window.ts`), which is 338 at the
- * size this layout is authored at.
+ * beat happened to say the most and change its shape as the run advanced. It
+ * fits the canvas at every size, which main sizes by its own `maxReach`
+ * (`geometryFor` in `companion-window.ts`).
  */
 const CARD_WIDTH = 244;
 
@@ -73,12 +65,10 @@ const CARD_WIDTH = 244;
  * checks against nothing, which is how a renamed beat becomes a card printing
  * its own key path at someone.
  *
- * **`talk` and `type` quote the pill.** Their titles are the labels on the two
- * controls the beat spotlights, so they are not free copy: when the surface
- * itself is translated (`companion-surface.tsx` is still English throughout),
- * these two titles move with the labels, in the same edit and to the same
- * words. A card reading "Hablar" beside a button reading "Talk" points at
- * nothing.
+ * **`talk` quotes the pill.** Its title is the label on the control the beat
+ * spotlights, so it is not free copy: it moves with that label, in the same
+ * edit and to the same words. A card reading "Hablar" beside a button reading
+ * "Talk" points at nothing.
  */
 const INTRO_COPY_KEYS = {
   meet: {
@@ -88,10 +78,6 @@ const INTRO_COPY_KEYS = {
   talk: {
     title: "companionIntro.talk.title",
     body: "companionIntro.talk.body",
-  },
-  type: {
-    title: "companionIntro.type.title",
-    body: "companionIntro.type.body",
   },
   menu: {
     title: "companionIntro.menu.title",
@@ -112,8 +98,7 @@ const INTRO_COPY_KEYS = {
  */
 export const introSpotlight = (
   beat: CompanionIntroBeat | null,
-): "talk" | "type" | undefined =>
-  beat === "talk" || beat === "type" ? beat : undefined;
+): "talk" | undefined => (beat === "talk" ? beat : undefined);
 
 /**
  * The phase the surface holds while a beat is on screen, or `null` to leave the
@@ -142,6 +127,16 @@ export interface CompanionIntroProps {
   growth?: CompanionSurfaceGrowth;
   /** Which side of the avatar has the canvas to hold the card. */
   cardGrowth?: CompanionSurfaceCardGrowth;
+  /**
+   * The creature's box and the pill's, in points, as `CompanionSurface` takes
+   * them.
+   *
+   * The card hangs off the creature and has to clear whatever the pill draws
+   * beside it, so it needs the same two numbers the surface does. Defaulted to
+   * the size the layout is authored at, which is what Storybook draws.
+   */
+  avatarBox?: number;
+  optionsBox?: number;
   /** The assistant's avatar colour, for the progress dots. */
   accentHex?: string;
   /**
@@ -171,6 +166,8 @@ export function CompanionIntro({
   beat,
   growth = "right",
   cardGrowth = "up",
+  avatarBox = COMPANION_BASE_AVATAR_BOX,
+  optionsBox = COMPANION_BASE_AVATAR_BOX,
   accentHex,
   assistantName,
   cardRef,
@@ -181,29 +178,31 @@ export function CompanionIntro({
   const isLast = index === COMPANION_INTRO_BEATS.length - 1;
   const copy = INTRO_COPY_KEYS[beat];
 
-  // The pill's own horizontal anchoring, repeated rather than shared, because
-  // the card is a sibling of the pill and not inside it: it must not inherit
-  // the width that animates from beat to beat. Anchoring to the same edge is
-  // what makes the card and the pill read as one object being annotated.
-  const placement: CSSProperties =
-    growth === "left"
-      ? { right: "50%", marginRight: -(AVATAR_BOX / 2) }
-      : { left: "50%", marginLeft: -(AVATAR_BOX / 2) };
+  // The same derivation `CompanionSurface` places the pill by, so the card and
+  // the pill are arranged around one creature rather than two readings of it.
+  const { inUnits, avatarHalf, lineAt, edgeAt, introStepOff } =
+    companionLayoutFor(avatarBox, optionsBox);
+  // Clears whichever of the creature and the pill reaches further on this side,
+  // and then the gap. Stepping off the creature alone would put the card inside
+  // a pill taller than it, since the pill stands on the creature's baseline
+  // rather than being centred on it and every beat but `meet` holds it open.
+  const stepOff = inUnits(introStepOff(cardGrowth));
 
-  // The vertical half: sit against the canvas edge the avatar is near, then
-  // step off the avatar by its own half box plus the gap. `100%` names the
-  // canvas without this side having to know how tall the host made it, which is
-  // the same trick the surface's own anchor uses.
-  const anchor: CSSProperties =
-    cardGrowth === "up"
-      ? {
-          top: `calc(100% - ${COMPANION_NEAR_EDGE}px)`,
-          transform: `translateY(calc(-100% - ${AVATAR_BOX / 2 + AVATAR_GAP}px))`,
-        }
-      : {
-          top: COMPANION_NEAR_EDGE,
-          transform: `translateY(${AVATAR_BOX / 2 + AVATAR_GAP}px)`,
-        };
+  // Hung off the avatar's own edge, which is the point the host positioned this
+  // window around and the point the pill is measured from too. Not off the
+  // pill: that box changes width from beat to beat as controls are spotlighted,
+  // and a card pinned to it would slide about while being read.
+  const placement: CSSProperties = edgeAt(growth, -avatarHalf);
+
+  // The vertical half: sit on the avatar's own line, then step off it far
+  // enough to clear what is drawn there.
+  const anchor: CSSProperties = {
+    top: lineAt(cardGrowth, 0),
+    transform:
+      cardGrowth === "up"
+        ? `translateY(calc(-100% - ${stepOff}px))`
+        : `translateY(${stepOff}px)`,
+  };
 
   return (
     <div
@@ -219,15 +218,15 @@ export function CompanionIntro({
       // The card is not a drag handle. Everything else on this surface is, and
       // a press that both read a sentence and flung the pill across the desktop
       // would be the one interaction here nobody could undo.
-      onMouseDown={(event) => {
+      onPointerDown={(event) => {
         event.stopPropagation();
       }}
     >
       {/* Clamped, because the only variable in this card is a name the user
           chose and there is no length it has to be. The card's width is fixed
-          and its height is borrowed from the canvas the typing card reserves,
-          so a title free to wrap is a title free to grow the card past what it
-          was drawn into. Two lines holds every name worth reading. */}
+          and its height is borrowed from the canvas main reserves for it, so a
+          title free to wrap is a title free to grow the card past what it was
+          drawn into. Two lines holds every name worth reading. */}
       <p className="line-clamp-2 text-[13px] leading-tight font-medium text-white">
         {/* The first beat is the introduction proper, so it is the one that
             says the name. Two keys rather than one with an empty argument: a

@@ -10,7 +10,11 @@ import type { ReactNode } from "react";
 
 import type { SwipeAction } from "@/hooks/use-swipe-to-reveal";
 import type { TFunction } from "@/i18n";
-import type { FeedItem, FeedItemStatus } from "@vellumai/assistant-api";
+import {
+  type FeedItem,
+  type FeedItemStatus,
+  isPendingGuardianFeedItem,
+} from "@vellumai/assistant-api";
 import { ActionMenu, cn, Tooltip } from "@vellumai/design-library";
 
 import { buildReadToggle } from "./read-toggle";
@@ -120,14 +124,19 @@ export function buildRecapActions({
     });
   }
 
-  actions.push({
-    id: "dismiss",
-    label: t("actions.dismiss"),
-    icon: Trash2,
-    onSelect: () => onDismiss(item.id),
-    destructive: true,
-    swipeEdge: "trailing",
-  });
+  // The live projection of an unresolved guardian request offers no
+  // dismiss: resolution is what retires it, and its terminal receipt
+  // becomes dismissible like any other item.
+  if (!isPendingGuardianFeedItem(item)) {
+    actions.push({
+      id: "dismiss",
+      label: t("actions.dismiss"),
+      icon: Trash2,
+      onSelect: () => onDismiss(item.id),
+      destructive: true,
+      swipeEdge: "trailing",
+    });
+  }
 
   return actions;
 }
@@ -150,9 +159,13 @@ export function swipeActionsFor(
     });
 }
 
-/** A glyph control in the row's trailing cell, square unless it carries a label. */
+/**
+ * A glyph control in the row's trailing cell, square unless it carries a label.
+ * Sized to the title line it shares with the timestamp, so revealing the
+ * controls never grows the row.
+ */
 const ACTION_CONTROL_CLASS = cn(
-  "flex h-8 w-8 shrink-0 cursor-pointer items-center justify-center rounded-md",
+  "flex h-6 w-6 shrink-0 cursor-pointer items-center justify-center rounded-md",
   "text-[var(--content-secondary)] transition-colors",
   "hover:bg-[var(--surface-hover)] hover:text-[var(--content-default)]",
 );

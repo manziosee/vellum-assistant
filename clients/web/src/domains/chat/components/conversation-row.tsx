@@ -24,7 +24,7 @@ import {
   renderConversationMenuItems,
   type ConversationMenuItemsProps,
 } from "@/domains/chat/components/conversation-actions-menu";
-import { useTranslation } from "@/i18n";
+import { useTranslation, type TFunction } from "@/i18n";
 import { useLongPressSheet } from "@/hooks/use-long-press-sheet";
 import {
   hasThreadStatus,
@@ -42,7 +42,9 @@ import {
   canMarkUnread,
   isConversationPinned,
 } from "@/utils/conversation-predicates";
+import { useDisplayConversationTitle } from "@/utils/conversation-title";
 import { isPointerCoarse } from "@/utils/pointer";
+import { useConversationMenuShortcuts } from "@/domains/chat/hooks/use-conversation-menu-shortcuts";
 import type { SwipeAction } from "@/hooks/use-swipe-to-reveal";
 
 import {
@@ -76,6 +78,10 @@ export function buildMenuProps(
     onUnarchive: ctx.onUnarchive
       ? () => ctx.onUnarchive?.(conversation)
       : undefined,
+    onDelete:
+      ctx.onDelete && hasId && !conversation.draft
+        ? () => ctx.onDelete?.(conversation)
+        : undefined,
     onMarkRead:
       ctx.onMarkRead && canMarkRead(conversation)
         ? () => ctx.onMarkRead?.(conversation)
@@ -137,6 +143,7 @@ const skipNestedControls = (target: Element | null) =>
 function buildSwipeActions(
   ctx: ConversationListContextValue,
   conversation: Conversation,
+  t: TFunction<"chat">,
 ): { leadingActions: SwipeAction[]; trailingActions: SwipeAction[] } {
   const isChannel = isChannelConversation(conversation);
 
@@ -148,7 +155,9 @@ function buildSwipeActions(
     const isPinned = isConversationPinned(conversation);
     leadingActions.push({
       id: "pin",
-      label: isPinned ? "Unpin" : "Pin",
+      label: isPinned
+        ? t("conversationActions.unpin")
+        : t("conversationActions.pin"),
       icon: isPinned ? PinOff : Pin,
       onSelect: () => ctx.onPin?.(conversation),
     });
@@ -162,14 +171,14 @@ function buildSwipeActions(
   if (isArchived && ctx.onUnarchive) {
     trailingActions.push({
       id: "unarchive",
-      label: "Unarchive",
+      label: t("conversationActions.unarchive"),
       icon: ArchiveRestore,
       onSelect: () => ctx.onUnarchive?.(conversation),
     });
   } else if (!isArchived && ctx.onArchive) {
     trailingActions.push({
       id: "archive",
-      label: "Archive",
+      label: t("conversationActions.archive"),
       icon: Archive,
       variant: "destructive",
       onSelect: () => ctx.onArchive?.(conversation),
@@ -188,6 +197,7 @@ export function ConversationRow({
   const ctx = useConversationListContext();
   const { conversationId } = conversation;
   const { t } = useTranslation("chat");
+  const displayTitle = useDisplayConversationTitle();
 
   const isProcessing =
     conversationId === ctx.activeConversationId
@@ -213,9 +223,14 @@ export function ConversationRow({
   const { leadingActions, trailingActions } = buildSwipeActions(
     ctx,
     conversation,
+    t,
   );
 
   const isTouch = isPointerCoarse();
+  // The bound commands act on the active conversation, so only that row's
+  // menu may advertise them.
+  const isActiveConversation = conversationId === ctx.activeConversationId;
+  const shortcuts = useConversationMenuShortcuts(isActiveConversation);
   // The swipe and the long-press sheet are the paths that replace the inline
   // ellipsis, and both are armed by a coarse pointer, so a device that has
   // neither hover nor a coarse pointer (a hoverless stylus) keeps the ellipsis:
@@ -224,13 +239,17 @@ export function ConversationRow({
 
   const panelItem = (
     <SwipeActionReveal
+      // The row's shape, which is `PanelItem`'s radius: the layer a swipe
+      // reveals behind the row inherits it, so no corner of the layer shows
+      // past the row's own.
+      className="rounded-[6px]"
       leadingActions={leadingActions}
       trailingActions={trailingActions}
     >
       <PanelItem
-        label={conversation.title ?? t("conversationRow.untitled")}
+        label={displayTitle(conversation.title)}
         marqueeOnHover={marquee}
-        active={conversationId === ctx.activeConversationId}
+        active={isActiveConversation}
         onSelect={() => select(conversationId)}
         badge={
           hasThreadStatus(status) ? (
@@ -239,7 +258,9 @@ export function ConversationRow({
         }
         badgeBare
         trailingAction={
-          showsEllipsis ? <ConversationActionsMenu {...menuProps} /> : undefined
+          showsEllipsis ? (
+            <ConversationActionsMenu {...menuProps} shortcuts={shortcuts} />
+          ) : undefined
         }
         className={cn(
           // `!` forces this over PanelItem's own max-md:py-3: cross-package
@@ -254,9 +275,12 @@ export function ConversationRow({
           // The wash belongs to the row rather than the panel: declared on the
           // menu it would reach every active PanelItem in the drawer, and a
           // tinted pill that publishes `--panel-item-bg` and no active value
-          // of its own would lose its colour to it.
+          // of its own would lose its colour to it. It reads through the
+          // row's hover property first so the active row matches whatever
+          // its card hovers in: the assistant card publishes an accent wash
+          // for hover, and a value stated on the row itself would beat it.
           ctx.overlayCards
-            ? "min-h-[var(--side-menu-tile-size)] [--panel-item-active:var(--surface-hover)]"
+            ? "min-h-[var(--side-menu-tile-size)] [--panel-item-active:var(--panel-item-hover,var(--surface-hover))]"
             : "h-[30px]",
         )}
       />
@@ -292,6 +316,7 @@ export function ConversationRow({
         {renderConversationMenuItems({
           Primitive: ContextMenu,
           t,
+          shortcuts,
           ...menuProps,
         })}
       </ContextMenu.Content>

@@ -158,6 +158,45 @@ export function isSystemCardMetadata(
 }
 
 /**
+ * Marker for a turn whose whole reply was the `<no_response/>` sentinel: the
+ * assistant deliberately chose silence. The row's content keeps the raw
+ * sentinel (the model reads its own convention back from history); clients
+ * switch on the marker to render a quiet standalone notice and to resolve
+ * their pending-response state, instead of showing the sentinel text or
+ * waiting forever for a reply that was never coming.
+ */
+export const NO_RESPONSE_MESSAGE_KIND = "no_response";
+
+/**
+ * Shared predicate for the deliberate-silence marker, mirroring
+ * {@link isSystemCardMetadata} so display merging, transcript rendering, and
+ * turn grouping cannot drift.
+ */
+export function isNoResponseMetadata(
+  metadata: Record<string, unknown> | null | undefined,
+): boolean {
+  return metadata?.messageKind === NO_RESPONSE_MESSAGE_KIND;
+}
+
+/**
+ * Marker for an assistant-authored reaction row: the assistant reacted with
+ * an emoji, and the row records it durably. The reaction fact itself lives
+ * in the row's `providerMeta.reaction` envelope, same as inbound reaction
+ * rows; this kind carries the display and grouping semantics, keeping the
+ * row a standalone turn (never merged into adjacent assistant speech, where
+ * consolidation would fold its sentinel text into a bubble and drop the
+ * envelope from the wire).
+ */
+export const REACTION_MESSAGE_KIND = "reaction";
+
+/** Shared predicate for the assistant-reaction marker. */
+export function isReactionMessageMetadata(
+  metadata: Record<string, unknown> | null | undefined,
+): boolean {
+  return metadata?.messageKind === REACTION_MESSAGE_KIND;
+}
+
+/**
  * True when a role-`"user"` row is internal scaffolding rather than a person's
  * prompt: a daemon-injected run lifecycle notification (subagent
  * `subagentNotification`, ACP run `acpNotification`, or any wake trigger, the
@@ -228,6 +267,97 @@ export function isVoiceSessionUserMessage(
 }
 
 /**
+ * Metadata key naming which of a row's attachments arrived as ambient camera
+ * frames rather than files the user picked. Exported so the SQL prefilter that
+ * finds candidate rows and the reader below name the same key.
+ */
+export const SIGHT_FRAME_ATTACHMENT_IDS_KEY = "sightFrameAttachmentIds";
+
+/** Metadata key naming computer-use screenshots automatically linked to a reply. */
+export const COMPUTER_USE_SCREENSHOT_ATTACHMENT_IDS_KEY =
+  "computerUseScreenshotAttachmentIds";
+
+/**
+ * The row's attachments that arrived as ambient camera frames, by attachment
+ * id. A user attachment carries no metadata of its own, so the marking lives on
+ * the message and refers to the attachments by id.
+ *
+ * Tolerant of any metadata shape: a row without the key, or one whose value is
+ * not an array of ids, yields nothing. Retention consumers therefore treat an
+ * untagged conversation exactly like one that predates the tag.
+ */
+export function sightFrameAttachmentIdsFromMetadata(
+  metadata: Record<string, unknown> | null | undefined,
+): string[] {
+  const ids = metadata?.[SIGHT_FRAME_ATTACHMENT_IDS_KEY];
+  if (!Array.isArray(ids)) {
+    return [];
+  }
+  return ids.filter(
+    (id): id is string => typeof id === "string" && id.length > 0,
+  );
+}
+
+/**
+ * Attachment ids whose placement on this row was automatic computer-use
+ * screenshot promotion. Malformed and legacy metadata conservatively yields
+ * no marked attachments.
+ */
+export function computerUseScreenshotAttachmentIdsFromMetadata(
+  metadata: Record<string, unknown> | null | undefined,
+): string[] {
+  const ids = metadata?.[COMPUTER_USE_SCREENSHOT_ATTACHMENT_IDS_KEY];
+  if (!Array.isArray(ids)) {
+    return [];
+  }
+  return ids.filter(
+    (id): id is string => typeof id === "string" && id.length > 0,
+  );
+}
+
+/**
+ * True when a stored `messages.metadata` column belongs to a standalone
+ * ambient camera keep: a row the call's own gate sampled, which no one spoke.
+ *
+ * The raw-column counterpart to {@link sightFrameAttachmentIdsFromMetadata},
+ * for consumers holding the JSON string a row was written with rather than a
+ * parsed bag: the memory rebuild's re-embed scan and the retrospective's
+ * accounting both ask this question of rows they never otherwise decode. It
+ * lives here, beside the key and the parser, so the two cannot drift.
+ *
+ * BOTH halves are required, and the tag alone is not enough. A genuine spoken
+ * turn carries the same tag whenever a parked frame rode it (see
+ * `calls/voice-session-bridge.ts`), which in camera mode is every turn the
+ * user speaks, so keying on the tag would read real speech as machine
+ * output. `scripted` is what separates them: the standalone persist sets it
+ * (`live-voice/live-voice-photo.ts`), while a spoken turn leaves it absent
+ * and the persist stamps the `false` default durably. The pair is the
+ * signature of a keep; `scripted` on its own belongs to every auto-sent row,
+ * onboarding prompts included, which are none of this predicate's business.
+ *
+ * Absent or unparseable metadata is not a keep. Both callers use this to hold
+ * keeps BACK from work, so a row whose marking cannot be read is treated as
+ * ordinary content and still gets indexed or reviewed, which is the direction
+ * that loses nothing.
+ */
+export function messageMetadataIsAmbientSightKeep(
+  metadata: string | null,
+): boolean {
+  if (!metadata) {
+    return false;
+  }
+  try {
+    const parsed = JSON.parse(metadata) as Record<string, unknown>;
+    return (
+      parsed.scripted === true &&
+      sightFrameAttachmentIdsFromMetadata(parsed).length > 0
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
  * True when the row that opened the turn was sent from a desktop app, on that
  * row's own evidence.
  *
@@ -254,7 +384,7 @@ export function isDesktopOriginatedUserMessage(
     return false;
   }
   const clientOs = parseClientOs((client as Record<string, unknown>).os);
-  return clientOs === "macos" || clientOs === "windows";
+  return clientOs === "macos" || clientOs === "windows" || clientOs === "linux";
 }
 
 /**
@@ -339,6 +469,41 @@ export function isReplyPushIneligibleUserMessage(
  */
 export const UNGROUPED_GROUP_ID = "system:all";
 export const PINNED_GROUP_ID = "system:pinned";
+
+/**
+ * The `conversations.source` that makes a thread a member of the
+ * assistant-initiated section ({@link ASSISTANT_INITIATED_GROUP_ID}).
+ *
+ * Opt-in and stamped at creation, by a producer declaring "this is a thread
+ * I started because it is worth the user's time" - a heartbeat realization,
+ * an observation the user did not ask for. Deliberately NOT the notification
+ * pipeline's `'notification'`: the conversations that stamp carries are the
+ * transactional flows (guardian call approvals, confirmation / access /
+ * question / tool-grant requests, channel delivery trails - the
+ * `requiresConversation` producers), which belong to the bell and to Chats,
+ * and matching on it would also sweep every historical row into the section
+ * the day the flag turns on. A dedicated source makes membership all-new by
+ * construction: nothing stamps it until a producer passes it through
+ * `conversationMetadata.source` on its notification signal (see
+ * `notifications/conversation-pairing.ts`), so the section holds exactly the
+ * threads written for it and nothing retroactively.
+ */
+// FROZEN: persisted `conversations.source` value. Never rename it.
+export const ASSISTANT_INITIATED_SOURCE = "assistant_initiated";
+
+/**
+ * The section holding the conversations the assistant started on its own:
+ * the threads stamped {@link ASSISTANT_INITIATED_SOURCE} at creation.
+ *
+ * A pseudo-group in the same sense as {@link UNGROUPED_GROUP_ID}: no row
+ * carries it in `group_id`. Those conversations are filed nowhere (NULL
+ * `group_id`), so without the split they land in Chats; membership is
+ * decided by `source`, not by the column this id names. It is spelled as a
+ * group id anyway so a client selects the section through the `groupId`
+ * parameter every other section already uses, rather than through a filter
+ * only this one section knows about.
+ */
+export const ASSISTANT_INITIATED_GROUP_ID = "system:assistant";
 
 /**
  * The `origin_channel` value for a conversation started in Vellum itself

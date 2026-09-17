@@ -3,6 +3,7 @@ import type {
   AcpSessionSpawnedEvent,
   AcpSessionUpdateEvent,
   AcpSessionUsageEvent,
+  AcpSessionModelUpdateEvent,
   AcpSessionCompletedEvent,
   AcpSessionErrorEvent,
 } from "@vellumai/assistant-api";
@@ -69,6 +70,18 @@ export function handleAcpSessionUsage(event: AcpSessionUsageEvent): void {
   });
 }
 
+export function handleAcpSessionModelUpdate(
+  event: AcpSessionModelUpdateEvent,
+): void {
+  useAcpRunStore.getState().setModel({
+    acpSessionId: event.acpSessionId,
+    modelRevisionEpoch: event.modelRevisionEpoch,
+    modelRevision: event.modelRevision,
+    model: event.model,
+    availableModels: event.availableModels,
+  });
+}
+
 export function handleAcpSessionCompleted(
   event: AcpSessionCompletedEvent,
 ): void {
@@ -120,8 +133,19 @@ export function handleAcpAuthRequired(event: AcpAuthRequiredEvent): void {
   if (!toolUseId) {
     return;
   }
-  useInteractionStore.getState().showAcpConnect({
-    toolUseId,
-    reason: "auth_required",
-  });
+  useInteractionStore.getState().showAcpConnect(
+    {
+      toolUseId,
+      reason: "auth_required",
+      // The run entry's parent, not whatever conversation is on screen:
+      // `acp_auth_required` is a global event, so it can land after the user
+      // has navigated away from the chat that started the run.
+      conversationId: entry?.parentConversationId ?? null,
+    },
+    // Happening now, not restored. A resumed run keeps its original spawning
+    // tool call, so a second rejection arrives under the anchor whose card the
+    // user dismissed after the first sign-in, and the dismissal must not
+    // swallow it.
+    { supersedesDismissal: true },
+  );
 }

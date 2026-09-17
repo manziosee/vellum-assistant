@@ -38,6 +38,7 @@ describe("API_KEY_PROVIDERS", () => {
     expect(API_KEY_PROVIDERS).toContain("anthropic");
     expect(API_KEY_PROVIDERS).toContain("openai");
     expect(API_KEY_PROVIDERS).toContain("gemini");
+    expect(API_KEY_PROVIDERS).not.toContain("vellum");
   });
 
   test("includes search providers", () => {
@@ -45,5 +46,9 @@ describe("API_KEY_PROVIDERS", () => {
     expect(API_KEY_PROVIDERS).toContain("perplexity");
     expect(API_KEY_PROVIDERS).toContain("tavily");
     expect(API_KEY_PROVIDERS).toContain("firecrawl");
+  });
+
+  test("includes custom for OpenAI-compatible memory embeddings", () => {
+    expect(API_KEY_PROVIDERS).toContain("custom");
   });
 });

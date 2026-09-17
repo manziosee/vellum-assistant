@@ -27,7 +27,13 @@
  * `deliverGatedInbound` below for the ordering.
  */
 
-import { meetsAdmissionFloor } from "@vellumai/gateway-client";
+import {
+  ACCESS_DENIED_NOT_APPROVED_REPLY,
+  isTrustClass,
+  meetsAdmissionFloor,
+  PLUGIN_ADMISSION_DENIED_NOTICE_PATH,
+  PluginAdmissionDeniedNoticeSchema,
+} from "@vellumai/gateway-client";
 
 import {
   findDeclaredRoute,
@@ -37,7 +43,10 @@ import {
   verifyDeclaredSignature,
   type VerificationRejection,
 } from "../../channels/ingress-verification.js";
-import { readPluginInbound } from "../../channels/plugin-inbound.js";
+import {
+  readPluginInbound,
+  unscopedPluginId,
+} from "../../channels/plugin-inbound.js";
 import type { IngressInbound } from "../../channels/ingress-inbound.js";
 import type { IngressSigner } from "../../channels/plugin-ingress.js";
 import {
@@ -181,12 +190,94 @@ async function forwardToPlugin(forward: PluginForward): Promise<Response> {
   return forwarded;
 }
 
+/**
+ * Ask the plugin to send the canned access-denial reply.
+ *
+ * The ranked floor stops the vendor delivery from reaching the plugin, because
+ * that path is free to run a turn. The sender still needs to hear that they
+ * were not admitted. Only the plugin can send on its vendor, so this is a
+ * separate, structured notice: no vendor payload, no turn.
+ *
+ * The vendor ACK does not depend on this hop. A missing route or a failed
+ * send is logged and absorbed.
+ */
+async function notifyPluginAdmissionDenied(opts: {
+  forward: PluginForward;
+  plugin: string;
+  routePath: string;
+  admissionPolicy: string;
+  trustClass: string;
+  conversationExternalId: string;
+  actorExternalId: string;
+  externalMessageId: string;
+}): Promise<void> {
+  const {
+    forward,
+    plugin,
+    routePath,
+    admissionPolicy,
+    trustClass,
+    conversationExternalId,
+    actorExternalId,
+    externalMessageId,
+  } = opts;
+  try {
+    const notice = PluginAdmissionDeniedNoticeSchema.parse({
+      reason: "admission_floor",
+      plugin,
+      ingressRoute: routePath,
+      admissionPolicy,
+      trustClass: isTrustClass(trustClass) ? trustClass : "unknown",
+      conversationExternalId,
+      actorExternalId,
+      externalMessageId,
+      replyText: ACCESS_DENIED_NOT_APPROVED_REPLY,
+    });
+    const body = JSON.stringify(notice);
+    const noticeReq = new Request(
+      "http://gateway/internal/plugin-admission-denied",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body,
+      },
+    );
+    const response = await proxyForwardToResponse(noticeReq, {
+      baseUrl: forward.config.assistantRuntimeBaseUrl,
+      path: pluginRouteUpstreamPath(plugin, PLUGIN_ADMISSION_DENIED_NOTICE_PATH),
+      serviceToken: mintServiceToken(),
+      timeoutMs: forward.config.runtimeTimeoutMs,
+      fetchImpl: forward.fetchImpl,
+    });
+    if (response.status >= 400) {
+      log.warn(
+        { plugin, path: routePath, status: response.status },
+        "Plugin admission-denied notice failed",
+      );
+    }
+  } catch (err) {
+    log.warn(
+      { err, plugin, path: routePath },
+      "Plugin admission-denied notice failed",
+    );
+  }
+}
+
 export interface PluginWebhookHandlerDeps {
   config: GatewayConfig;
   /** Approved-ingress view; cached by the caller so this stays off the disk. */
   resolve: () => PluginIngressResolution;
   /** Signing secrets, read through the TTL cache so rotation is picked up. */
   credentials: CredentialCache | undefined;
+  /**
+   * The assistant's configured public ingress base, when there is one.
+   *
+   * Used by HMAC payloads containing `request-url`. A gateway behind a proxy
+   * sees a different URL than the one a vendor signed, and the configured base
+   * is one candidate spelling. Optional so tests and hosts without public
+   * ingress still verify against the remaining candidates.
+   */
+  ingressPublicBaseUrl?: () => string | undefined;
   fetchImpl?: (
     input: string | URL | Request,
     init?: RequestInit,
@@ -216,6 +307,7 @@ export interface PluginWebhookHandlerDeps {
  */
 export function createPluginWebhookHandler(deps: PluginWebhookHandlerDeps) {
   const { config, resolve, credentials, fetchImpl } = deps;
+  const ingressPublicBaseUrl = deps.ingressPublicBaseUrl;
 
   return async (req: Request, plugin: string, path: string) => {
     let match: ReturnType<typeof findDeclaredRoute>;
@@ -288,6 +380,9 @@ export function createPluginWebhookHandler(deps: PluginWebhookHandlerDeps) {
           headers: req.headers,
           body: body.bytes,
           secret: candidate,
+          // Only HMAC payloads containing `request-url` read this context.
+          requestUrl: req.url,
+          publicBaseUrl: ingressPublicBaseUrl?.(),
         });
         rejection = result.ok ? undefined : result.reason;
         return result.ok;
@@ -382,21 +477,35 @@ async function deliverGatedInbound(opts: {
   forward: PluginForward;
 }): Promise<Response> {
   const { inbound, forward } = opts;
-  const { config, plugin, routePath, body } = forward;
+  const { config, plugin, routePath, req, body } = forward;
 
   let parsed: unknown;
-  try {
-    const text = new TextDecoder().decode(body);
-    parsed = text.trim() === "" ? undefined : JSON.parse(text);
-  } catch {
-    // Authentic but unreadable. The signature checked out, so this is the
-    // vendor sending something we cannot parse rather than an attacker; the
-    // plugin may still recognise it.
-    log.warn(
-      { plugin, path: routePath },
-      "Plugin webhook payload is not JSON, forwarding ungated",
-    );
-    return forwardToPlugin(forward);
+  const contentType = (
+    req.headers.get("content-type") ?? ""
+  ).toLowerCase();
+  if (contentType.includes("application/x-www-form-urlencoded")) {
+    // A form-encoded delivery (Twilio's webhooks are always this shape).
+    // Parsed into a flat record so the inbound declaration's field paths can
+    // read the vendor's parameter names exactly as they sit on the wire.
+    // Without this branch the JSON parse below throws on every form body and
+    // the delivery is forwarded ungated — a delivery the gate was declared to
+    // read, silently exempted from it.
+    const params = new URLSearchParams(new TextDecoder().decode(body));
+    parsed = Object.fromEntries(params.entries());
+  } else {
+    try {
+      const text = new TextDecoder().decode(body);
+      parsed = text.trim() === "" ? undefined : JSON.parse(text);
+    } catch {
+      // Authentic but unreadable. The signature checked out, so this is the
+      // vendor sending something we cannot parse rather than an attacker; the
+      // plugin may still recognise it.
+      log.warn(
+        { plugin, path: routePath },
+        "Plugin webhook payload is not JSON, forwarding ungated",
+      );
+      return forwardToPlugin(forward);
+    }
   }
 
   const reading = readPluginInbound({
@@ -491,21 +600,40 @@ async function deliverGatedInbound(opts: {
   // receives the message. For a built-in channel that is the runtime's own
   // admission stage; here there is nothing downstream but the plugin, so a
   // floor unenforced here is a floor unenforced at all, and an unknown sender
-  // would reach a plugin free to answer them.
+  // would reach a plugin free to answer them. The vendor body stays here. A
+  // separate notice asks the plugin to send the canned denial, which is the
+  // same line built-in channels send, without running a turn.
   const { admissionPolicy, trustVerdict } = admission;
-  if (
-    admissionPolicy &&
-    !meetsAdmissionFloor(admissionPolicy, trustVerdict?.trustClass ?? "unknown")
-  ) {
+  const trustClass = trustVerdict?.trustClass ?? "unknown";
+  if (admissionPolicy && !meetsAdmissionFloor(admissionPolicy, trustClass)) {
     log.info(
       {
         plugin,
         path: routePath,
         admissionPolicy,
-        trustClass: trustVerdict?.trustClass ?? "unknown",
+        trustClass,
       },
       "Plugin inbound message denied by the admission floor",
     );
+    await notifyPluginAdmissionDenied({
+      forward,
+      plugin,
+      routePath,
+      admissionPolicy,
+      trustClass,
+      conversationExternalId: unscopedPluginId(
+        plugin,
+        reading.event.message.conversationExternalId,
+      ),
+      actorExternalId: unscopedPluginId(
+        plugin,
+        reading.event.actor.actorExternalId,
+      ),
+      externalMessageId: unscopedPluginId(
+        plugin,
+        reading.event.message.externalMessageId,
+      ),
+    });
     commitInboundEvent(dedupKey);
     return Response.json({ ok: true }, { status: 200 });
   }

@@ -19,12 +19,13 @@ import { Download, X } from "lucide-react";
 import { Button, toast, Typography } from "@vellumai/design-library";
 
 import { LazyBoundary } from "@/components/lazy-boundary";
-import { formatAttachmentSize } from "@/domains/chat/components/chat-attachments/utils";
+import { formatAttachmentSize } from "@/utils/attachment-utils";
 import {
   LocalFileIcon,
   localFileKindFromFilename,
-} from "@/domains/chat/components/local-file/local-file-icon";
+} from "@/components/local-file/local-file-icon";
 import { previewByteCapFor } from "@/domains/chat/components/local-file/local-file-limits";
+import { PdfPageSkeleton } from "@/domains/chat/components/chat-attachments/pdf-page-skeleton";
 import { PreviewSkeleton } from "@/domains/chat/components/local-file/preview/preview-skeleton";
 import { PreviewUnsupported } from "@/domains/chat/components/local-file/preview/preview-unsupported";
 import {
@@ -80,7 +81,7 @@ function previewFor(
     case "text":
       return <TextPreview blob={blob} filename={filename} />;
     case "pdf":
-      return <PdfFilePreview blob={blob} />;
+      return <PdfFilePreview blob={blob} filename={filename} />;
     case "image":
     case "audio":
     case "video":
@@ -161,6 +162,14 @@ export function FilePreviewContainer({
   // the panel must not wrap it in a second scroller.
   let showsCsvGrid = false;
 
+  // One placeholder for every stage before a reader takes over (fetching the
+  // bytes, then resolving the reader's chunk), shaped like what is coming:
+  // a PDF resolves into a page, and swapping prose lines for a page shape
+  // partway through is the jump this placeholder exists to avoid. The other
+  // readers render prose-like content, which is what `PreviewSkeleton` draws.
+  const loadingPlaceholder =
+    previewKind === "pdf" ? <PdfPageSkeleton /> : <PreviewSkeleton />;
+
   let body: ReactNode;
   if (isUnsupported) {
     body = (
@@ -217,11 +226,11 @@ export function FilePreviewContainer({
       </div>
     );
   } else if (probe.status === "loading" || isPending || blob === undefined) {
-    body = <PreviewSkeleton />;
+    body = loadingPlaceholder;
   } else {
     showsCsvGrid = previewKind === "csv";
     body = (
-      <LazyBoundary fallback={<PreviewSkeleton />}>
+      <LazyBoundary fallback={loadingPlaceholder}>
         {previewFor(previewKind, blob, documentName)}
       </LazyBoundary>
     );

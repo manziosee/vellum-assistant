@@ -13,6 +13,7 @@ import { getDb } from "../persistence/db-connection.js";
 import { initializeDb } from "../persistence/db-init.js";
 import {
   isUnsendableImageSource,
+  mediaSourceDescriptor,
   resolveMediaReferences,
   UNSENDABLE_IMAGE_FORMAT_NOTE,
 } from "../providers/media-resolve.js";
@@ -221,6 +222,111 @@ describe("resolveMediaReferences image validation", () => {
   });
 });
 
+describe("resolveMediaReferences attachment id", () => {
+  beforeEach(resetTables);
+
+  test("carries a file block's attachment id across reference resolution", async () => {
+    // Resolving a reference rebuilds the block around freshly read bytes. The
+    // id is the block's only remaining link to its attachment row, so it has to
+    // survive the rebuild.
+    const conv = createConversation();
+    const stored = await createInlineAttachment(
+      conv.id,
+      conv.createdAt,
+      "notes.txt",
+      "text/plain",
+      Buffer.from("hello").toString("base64"),
+    );
+    const message = userMessage([
+      {
+        type: "file",
+        source: {
+          type: "workspace_ref",
+          media_type: "text/plain",
+          attachmentId: stored.id,
+          sizeBytes: stored.sizeBytes,
+          filename: "notes.txt",
+        },
+        _attachmentId: stored.id,
+      },
+    ]);
+
+    const [resolved] = await resolveMediaReferences([message]);
+
+    const block = resolved.content[0];
+    expect(block.type).toBe("file");
+    expect(block).toMatchObject({
+      source: { type: "base64" },
+      _attachmentId: stored.id,
+    });
+  });
+
+  test("omits the field when the source block carries no id", async () => {
+    const conv = createConversation();
+    const stored = await createInlineAttachment(
+      conv.id,
+      conv.createdAt,
+      "plain.txt",
+      "text/plain",
+      Buffer.from("hi").toString("base64"),
+    );
+    const message = userMessage([
+      {
+        type: "file",
+        source: {
+          type: "workspace_ref",
+          media_type: "text/plain",
+          attachmentId: stored.id,
+          sizeBytes: stored.sizeBytes,
+          filename: "plain.txt",
+        },
+      },
+    ]);
+
+    const [resolved] = await resolveMediaReferences([message]);
+
+    expect("_attachmentId" in resolved.content[0]).toBe(false);
+  });
+});
+
+describe("mediaSourceDescriptor", () => {
+  // The fragment every media stub embeds. Both the retry path's stubs and the
+  // camera-frame stub read it from here, so this pins what they all report.
+  test("describes a reference from its persisted size hint", () => {
+    expect(
+      mediaSourceDescriptor({
+        type: "workspace_ref",
+        media_type: "image/jpeg",
+        attachmentId: "att-1",
+        sizeBytes: 1024,
+      }),
+    ).toBe("image/jpeg, 1024 bytes");
+  });
+
+  test("describes an inline block from its base64 length", () => {
+    // 8 base64 chars decode to 6 bytes.
+    expect(
+      mediaSourceDescriptor({
+        type: "base64",
+        media_type: "image/png",
+        data: "AAAAAAAA",
+      }),
+    ).toBe("image/png, 6 bytes");
+  });
+
+  test("covers non-image media too", () => {
+    expect(
+      mediaSourceDescriptor({
+        type: "workspace_ref",
+        media_type: "application/pdf",
+        attachmentId: "att-2",
+        sizeBytes: 42,
+        filename: "notes.pdf",
+      }),
+    ).toBe("application/pdf, 42 bytes");
+  });
+});
+
 describe("isUnsendableImageSource", () => {
   beforeEach(resetTables);
 
@@ -306,5 +412,82 @@ describe("unsendable-image notice", () => {
     expect(text).toBe(
       "a.png, b.png were not sent to the model: the files are not PNG, JPEG, GIF, or WebP images. Convert them and attach them again to include them.",
     );
+  });
+});
+
+describe("resolveMediaReferences file workspace_ref stay-on-disk", () => {
+  beforeEach(resetTables);
+
+  test("does not inline over-cap text or extracted_text", async () => {
+    const conv = createConversation();
+    const stored = await createInlineAttachment(
+      conv.id,
+      conv.createdAt,
+      "oversized-content.txt",
+      "text/plain",
+      Buffer.from("hello-over-cap").toString("base64"),
+    );
+    const messages: Message[] = [
+      userMessage([
+        {
+          type: "file",
+          source: {
+            type: "workspace_ref",
+            media_type: "text/plain",
+            attachmentId: stored.id,
+            sizeBytes: 8_000_001,
+            filename: "oversized-content.txt",
+          },
+          extracted_text: "this dump must not be resent",
+        },
+      ]),
+    ];
+
+    const resolved = await resolveMediaReferences(messages);
+    const block = resolved[0]!.content[0]!;
+    expect(block.type).toBe("file");
+    if (block.type !== "file") {
+      throw new Error("expected a file block");
+    }
+    expect(block.source.type).toBe("workspace_ref");
+    expect(block.extracted_text).toBeUndefined();
+    expect(JSON.stringify(resolved)).not.toContain("this dump must not be resent");
+    expect(JSON.stringify(resolved)).not.toContain("hello-over-cap");
+  });
+
+  test("does not inline video bytes or extracted_text", async () => {
+    const conv = createConversation();
+    const stored = await createInlineAttachment(
+      conv.id,
+      conv.createdAt,
+      "clip.mp4",
+      "video/mp4",
+      Buffer.from("not-a-real-video").toString("base64"),
+    );
+    const messages: Message[] = [
+      userMessage([
+        {
+          type: "file",
+          source: {
+            type: "workspace_ref",
+            media_type: "video/mp4",
+            attachmentId: stored.id,
+            sizeBytes: stored.sizeBytes,
+            filename: "clip.mp4",
+          },
+          extracted_text: "dump of the video as text",
+        },
+      ]),
+    ];
+
+    const resolved = await resolveMediaReferences(messages);
+    const block = resolved[0]!.content[0]!;
+    expect(block.type).toBe("file");
+    if (block.type !== "file") {
+      throw new Error("expected a file block");
+    }
+    expect(block.source.type).toBe("workspace_ref");
+    expect(block.extracted_text).toBeUndefined();
+    expect(JSON.stringify(resolved)).not.toContain("dump of the video");
   });
 });

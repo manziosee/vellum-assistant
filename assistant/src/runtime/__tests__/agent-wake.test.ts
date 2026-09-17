@@ -18,9 +18,10 @@
  * route captured calls back to the originating conversation's probe arrays.
  */
 
-import { beforeEach, describe, expect, mock, test } from "bun:test";
+import { beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 
 import type { DiskPressureStatus } from "../../daemon/disk-pressure-guard.js";
+import { desktopAutomationLease } from "../../desktop/desktop-automation-lease.js";
 
 // ── Per-conversation capture registry ────────────────────────────────
 //
@@ -266,6 +267,7 @@ const recordRequestLogCalls: Array<{
 }> = [];
 const recordUsageCalls: Array<{
   conversationId: string;
+  providerName: string | undefined;
   inputTokens: number;
   outputTokens: number;
   model: string;
@@ -279,7 +281,7 @@ const recordUsageCalls: Array<{
 }> = [];
 mock.module("../../daemon/conversation-usage.js", () => ({
   recordUsage: (
-    ctx: { conversationId: string },
+    ctx: { conversationId: string; providerName?: string },
     inputTokens: number,
     outputTokens: number,
     model: string,
@@ -300,6 +302,7 @@ mock.module("../../daemon/conversation-usage.js", () => ({
   ) => {
     recordUsageCalls.push({
       conversationId: ctx.conversationId,
+      providerName: ctx.providerName,
       inputTokens,
       outputTokens,
       model,
@@ -345,6 +348,7 @@ import {
   deleteConversation,
   setConversation,
 } from "../../daemon/conversation-registry.js";
+import { stripAgedSightFrames } from "../../daemon/conversation-sight-frames.js";
 import { ContextOverflowError, type Message } from "../../providers/types.js";
 import {
   __resetWakeChainForTests,
@@ -498,6 +502,13 @@ function makeWakeConversation(options: {
         `tools:${snapshotAllowedTools()?.join(",") ?? "all"}`,
       );
     },
+    // Mirrors Conversation.setPreactivatedSkillIds; the wake's tool-scope
+    // restore calls it, and a double without it throws inside the restore
+    // closure, leaving every field restored after it untouched.
+    preactivatedSkillIds: undefined as string[] | undefined,
+    setPreactivatedSkillIds(ids: string[] | undefined) {
+      this.preactivatedSkillIds = ids;
+    },
     get wakePersonaOverride() {
       return wakePersonaOverride;
     },
@@ -519,6 +530,11 @@ function makeWakeConversation(options: {
         return runBody(input, onEvent, options);
       },
     },
+    // The wake trims its own run input, the way the orchestrator's pre-run
+    // pass trims a normal turn's. Empty capture times leave the array
+    // untouched, which is what every case but the camera one wants.
+    trimAgedSightFrames: (msgs: Message[]) =>
+      stripAgedSightFrames(msgs, wakeSightFrameCaptureTimes).messages,
     messages,
     getMessages: () => messages,
     isProcessing: () => processing,
@@ -581,6 +597,8 @@ function makeWakeConversation(options: {
       probe.callSequence.push("maybeCompact");
       return null;
     },
+    // The wake rebuilds the loop prompt under its per-turn stamps.
+    syncLoopSystemPrompt: () => {},
     // Consumed by the wake's over-window pre-flight (suppressed wakes only).
     contextWindowManager: {
       estimateInputTokens: () => options.estimatedInputTokens ?? 0,
@@ -603,8 +621,12 @@ function makeWakeConversation(options: {
   return conversation as unknown as WakeConversation;
 }
 
+/** Tagged camera frames the fake conversation's trim resolves against. */
+let wakeSightFrameCaptureTimes = new Map<string, number>();
+
 beforeEach(() => {
   __resetWakeChainForTests();
+  wakeSightFrameCaptureTimes = new Map();
   wakeConvRegistry.clear();
   recordRequestLogCalls.length = 0;
   recordUsageCalls.length = 0;
@@ -932,6 +954,62 @@ describe("wakeAgentForOpportunity", () => {
     expect(conversation.personaOverrideSets).toEqual([]);
   });
 
+  test("bounds camera frames in the run input it sends", async () => {
+    // The wake sends its run input itself and keeps the in-loop budget gate
+    // disabled, so neither the orchestrator's pre-run pass nor the loop's
+    // post-compaction transform ever sees this array. Without its own trim a
+    // long camera session would send every frame it captured.
+    wakeSightFrameCaptureTimes = new Map([
+      ["f1", 1000],
+      ["f2", 2000],
+      ["f3", 3000],
+      ["f4", 4000],
+    ]);
+    const frame = (attachmentId: string): Message => ({
+      role: "user",
+      content: [
+        {
+          type: "image",
+          source: { type: "base64", media_type: "image/png", data: "AAAAAAAA" },
+          _attachmentId: attachmentId,
+        },
+      ],
+    });
+    const conversation = makeWakeConversation({
+      baseline: [frame("f1"), frame("f2"), frame("f3"), frame("f4")],
+      scriptedAssistant: {
+        role: "assistant",
+        content: [{ type: "text", text: "" }],
+      },
+    });
+
+    await wakeAgentForOpportunity(
+      {
+        conversationId: conversation.conversationId,
+        hint: "look around",
+        source: "unit-test",
+      },
+      { resolveTarget: async () => conversation },
+    );
+
+    const input = conversation.runCalls[0]!.input;
+    const images = input.flatMap((message) =>
+      message.content.filter((block) => block.type === "image"),
+    );
+    const stubs = input.flatMap((message) =>
+      message.content.filter(
+        (block) =>
+          block.type === "text" &&
+          block.text.startsWith("[Camera frame omitted from context:"),
+      ),
+    );
+    expect(images).toHaveLength(2);
+    expect(stubs).toHaveLength(2);
+    // The trim replaces blocks in place, so the wake's tail accounting still
+    // indexes the same positions.
+    expect(input.filter((m) => m.role === "user").length).toBeGreaterThan(0);
+  });
+
   test("silent no-op when agent produces no tool calls and no text", async () => {
     const conversation = makeWakeConversation({
       baseline: [
@@ -1090,10 +1168,10 @@ describe("wakeAgentForOpportunity", () => {
       },
     });
 
-    // Mirror formatShellOutput on large output: ~20KB body + a recovery marker
-    // pointing at the full-output temp file. The default tool_result budget
-    // would re-truncate the marker off; the caller passes a larger maxChars.
-    const marker = '<output_truncated limit="20K" file="/tmp/bg-xyz.txt" />';
+    // Mirror formatShellOutput on large output: ~20KB body + a truncation
+    // marker. The default tool_result budget would slice the marker off; the
+    // caller passes a larger maxChars.
+    const marker = '<output_truncated limit="20K" />';
     const big = `${"x".repeat(20_000)}\n${marker}`;
 
     await wakeAgentForOpportunity(
@@ -1114,8 +1192,7 @@ describe("wakeAgentForOpportunity", () => {
     const text = (
       conversation.persistedTailCalls[0]!.content as Array<{ text: string }>
     )[0]!.text;
-    // The trailing recovery marker survives (not re-truncated off) and the
-    // fence is still well-formed.
+    // The trailing truncation marker survives and the fence is well-formed.
     expect(text).toContain(marker);
     expect(text).toContain('<external_content source="tool_result">');
     expect(text.endsWith("</background_event>")).toBe(true);
@@ -1288,6 +1365,50 @@ describe("wakeAgentForOpportunity", () => {
     expect(conversation.toolContextPin).toBeUndefined();
   });
 
+  test("applies wireToolDefinitions and the delegation state alongside the allowlist and restores both after the wake", async () => {
+    const replay = [
+      { name: "remember", description: "Save", input_schema: {} },
+      { name: "bell_jingle", description: "Ring", input_schema: {} },
+    ];
+    let replayDuringRun: unknown;
+    let delegationDuringRun: unknown;
+    const conversation = makeWakeConversation({
+      runImpl: async (input) => {
+        replayDuringRun = conversation.wireToolReplay;
+        delegationDuringRun = conversation.delegateIndependentTasksReplay;
+        return runResult([
+          ...input,
+          { role: "assistant", content: [{ type: "text", text: "Saved." }] },
+        ]);
+      },
+    });
+
+    const result = await wakeAgentForOpportunity(
+      {
+        conversationId: conversation.conversationId,
+        hint: "review for memories",
+        source: "memory-retrospective",
+        allowedTools: ["remember"],
+        toolGateMode: "execution",
+        wireToolDefinitions: replay,
+        delegateIndependentTasks: true,
+      },
+      { resolveTarget: async () => conversation },
+    );
+
+    expect(result).toEqual({ invoked: true, producedToolCalls: false });
+    // The replay array is live on the conversation for the duration of the
+    // run (the tool resolver returns it as the wire array), as is the
+    // delegation-section state the source's prompt rendered (the prompt
+    // build reads it)...
+    expect(replayDuringRun).toEqual(replay);
+    expect(delegationDuringRun).toBe(true);
+    // ...and both are cleared alongside the allowlist + gate mode after the
+    // wake.
+    expect(conversation.wireToolReplay).toBeUndefined();
+    expect(conversation.delegateIndependentTasksReplay).toBeUndefined();
+  });
+
   test("defaults to the wire gate mode when toolGateMode is absent", async () => {
     let gateModeDuringRun: string | undefined;
     const conversation = makeWakeConversation({
@@ -1447,6 +1568,47 @@ describe("wakeAgentForOpportunity", () => {
     expect(conversation.pushedMessages[1]).toEqual(toolResultUserMsg);
     expect(conversation.pushedMessages[2]).toEqual(followupAssistant);
   });
+
+  for (const fails of [false, true]) {
+    test(`releases desktop control before a ${fails ? "failed" : "completed"} wake drains the queue`, async () => {
+      const conversation = makeWakeConversation({
+        scriptedAssistant: {
+          role: "assistant",
+          content: [{ type: "text", text: "reply" }],
+        },
+        ...(fails
+          ? {
+              runImpl: async () => {
+                throw new Error("wake failed");
+              },
+            }
+          : {}),
+      });
+      const release = spyOn(desktopAutomationLease, "releaseForConversation");
+      const setProcessing = conversation.setProcessing.bind(conversation);
+      conversation.setProcessing = (processing) => {
+        if (!processing) {
+          expect(release).toHaveBeenCalledWith(conversation.conversationId);
+        }
+        setProcessing(processing);
+      };
+      try {
+        const result = await wakeAgentForOpportunity(
+          {
+            conversationId: conversation.conversationId,
+            hint: "x",
+            source: "unit-test",
+          },
+          { resolveTarget: async () => conversation },
+        );
+        expect(result.invoked).toBe(!fails);
+        expect(release).toHaveBeenCalledTimes(1);
+        expect(conversation.drainQueueCalls).toBe(1);
+      } finally {
+        release.mockRestore();
+      }
+    });
+  }
 
   test("marks processing true during the run and false afterwards", async () => {
     const conversation = makeWakeConversation({
@@ -1748,7 +1910,13 @@ describe("wakeAgentForOpportunity", () => {
       { resolveTarget: async () => conversation },
     );
 
-    expect(result).toEqual({ invoked: true, producedToolCalls: false });
+    // The result carries how the run ended, so a caller that treats output as
+    // a finished answer can see that something else ended this one.
+    expect(result).toEqual({
+      invoked: true,
+      producedToolCalls: false,
+      exitReason: "error",
+    });
     // The checkpoint's flush pushed + persisted the partial tail.
     expect(conversation.pushedMessages.length).toBeGreaterThan(0);
     expect(conversation.persistedTailCalls.length).toBeGreaterThan(0);
@@ -1770,7 +1938,11 @@ describe("wakeAgentForOpportunity", () => {
       { resolveTarget: async () => conversation },
     );
 
-    expect(result).toEqual({ invoked: true, producedToolCalls: false });
+    expect(result).toEqual({
+      invoked: true,
+      producedToolCalls: false,
+      exitReason: "no_tool_calls",
+    });
   });
 
   test("reports no_output on a clean empty reply when the caller requires usable output", async () => {
@@ -2982,6 +3154,96 @@ describe("wakeAgentForOpportunity", () => {
     expect(recordUsageCalls[0]).toMatchObject({
       overrideProfile: "source-profile",
       forceOverrideProfile: true,
+      selectionSeed: conversation.conversationId,
+    });
+  });
+
+  test("rerouted wake records usage under the profile that actually served", async () => {
+    // The wake resolved its own profile before the run; the request then hit
+    // an outage-shaped failure and `RetryProvider` escalated to a backup
+    // profile on a different provider, stamping both `actualProvider` and
+    // `actualInferenceProfile` on the response the loop reports.
+    const usageEvent: AgentEvent = {
+      type: "usage",
+      inputTokens: 100,
+      outputTokens: 5,
+      model: "claude-sonnet-5",
+      actualProvider: "anthropic",
+      actualInferenceProfile: "backupProfile",
+      providerDurationMs: 10,
+      rawRequest: { request: "rerouted wake" },
+      rawResponse: { response: "real reply" },
+    };
+    const conversation = makeWakeConversation({
+      baseline: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+      scriptedEvents: [usageEvent],
+      scriptedAssistant: {
+        role: "assistant",
+        content: [{ type: "text", text: "real reply" }],
+      },
+    });
+
+    await wakeAgentForOpportunity(
+      {
+        conversationId: conversation.conversationId,
+        hint: "do reply",
+        source: "unit-test",
+        callSite: "memoryRetrospective",
+      },
+      { resolveTarget: async () => conversation },
+    );
+
+    // All three attribution facets of the row must describe the same call.
+    // Provider and model already followed the backup off the event; the
+    // profile has to follow it too or the row contradicts itself.
+    expect(recordUsageCalls).toHaveLength(1);
+    expect(recordUsageCalls[0]).toMatchObject({
+      providerName: "anthropic",
+      model: "claude-sonnet-5",
+      overrideProfile: "backupProfile",
+      forceOverrideProfile: true,
+      selectionSeed: conversation.conversationId,
+    });
+  });
+
+  test("non-rerouted wake keeps its own profile resolution", async () => {
+    // No reroute: the event carries no `actualInferenceProfile`, so the wake's
+    // own pre-run resolution stands and nothing is floated above the call site.
+    const usageEvent: AgentEvent = {
+      type: "usage",
+      inputTokens: 100,
+      outputTokens: 5,
+      model: "test-model",
+      actualProvider: "test-provider",
+      providerDurationMs: 10,
+      rawRequest: { request: "normal wake" },
+      rawResponse: { response: "real reply" },
+    };
+    const conversation = makeWakeConversation({
+      baseline: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+      scriptedEvents: [usageEvent],
+      scriptedAssistant: {
+        role: "assistant",
+        content: [{ type: "text", text: "real reply" }],
+      },
+    });
+
+    await wakeAgentForOpportunity(
+      {
+        conversationId: conversation.conversationId,
+        hint: "do reply",
+        source: "unit-test",
+        callSite: "memoryRetrospective",
+      },
+      { resolveTarget: async () => conversation },
+    );
+
+    expect(recordUsageCalls).toHaveLength(1);
+    expect(recordUsageCalls[0]).toMatchObject({
+      providerName: "test-provider",
+      model: "test-model",
+      overrideProfile: null,
+      forceOverrideProfile: false,
       selectionSeed: conversation.conversationId,
     });
   });

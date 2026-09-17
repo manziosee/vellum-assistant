@@ -165,23 +165,6 @@ mock.module("../persistence/attachments-store.js", () => ({
   uploadAttachment: () => ({ id: "att-1" }),
   linkAttachmentToMessage: () => {},
 }));
-mock.module("../memory/retriever.js", () => ({
-  buildMemoryRecall: async () => ({
-    enabled: false,
-    degraded: false,
-    reason: null,
-    provider: "mock",
-    model: "mock",
-    injectedText: "",
-    semanticHits: 0,
-    mergedCount: 0,
-    selectedCount: 0,
-    injectedTokens: 0,
-    latencyMs: 0,
-    topCandidates: [],
-  }),
-  injectMemoryRecallAsUserBlock: (msgs: Message[]) => msgs,
-}));
 mock.module("../memory/query-builder.js", () => ({
   buildMemoryQuery: () => "",
 }));
@@ -245,6 +228,12 @@ import {
   setConversation,
 } from "../daemon/conversation-registry.js";
 import { resetPluginRegistryAndRegisterDefaults } from "../plugins/defaults/index.js";
+import {
+  MEMORY_POINTER_PREFIX,
+  wrapMemoryPointerBlock,
+} from "../plugins/defaults/memory/memory-marker.js";
+import { MEMORY_V3_POINTER_BLOCK_ID } from "../plugins/defaults/memory/v3/types.js";
+import { registerPluginInjectors } from "../plugins/injector-registry.js";
 import { AnthropicProvider } from "../providers/anthropic/client.js";
 import { OpenAIResponsesProvider } from "../providers/openai/responses-provider.js";
 import {
@@ -347,9 +336,35 @@ function anthropicTurnStartTtls(
 
 let calls: RecordedProviderCall[] = [];
 
+/** The memory-v3 pointer the test injector below splices onto turn 1. */
+const TURN1_POINTER = wrapMemoryPointerBlock(
+  "Already in context above, relevant again this turn:\nmemory/concepts/plans.md § Alpha",
+);
+
 beforeAll(async () => {
   clearConversations();
   resetPluginRegistryAndRegisterDefaults();
+  // Stand in for the memory-v3 pointer injector on the OPENING turn only:
+  // the real one needs live lanes and a selector, but the render pipeline
+  // treats the block by id and placement, which is what this test covers.
+  let pointerTurnsLeft = 1;
+  registerPluginInjectors("test-memory-v3-pointer", [
+    {
+      name: "test-memory-v3-pointer",
+      order: 1002,
+      async produce() {
+        if (pointerTurnsLeft <= 0) {
+          return null;
+        }
+        pointerTurnsLeft -= 1;
+        return {
+          id: MEMORY_V3_POINTER_BLOCK_ID,
+          text: TURN1_POINTER,
+          placement: "after-memory-prefix",
+        };
+      },
+    },
+  ]);
 
   const { provider, calls: recorded } = createMockProvider([
     textResponse("ok"),
@@ -389,7 +404,34 @@ describe("prompt cache cross-turn stability: render pipeline", () => {
     });
   });
 
-  test("no spotlight in play means neither turn flags the latest user message as volatile", () => {
+  test("turn 1's pointer stays on turn 1's message, byte-identical in turn 2, and never migrates to the new tail", () => {
+    const hasPointer = (message: Message): boolean =>
+      message.role === "user" &&
+      message.content.some(
+        (block) =>
+          block.type === "text" && block.text.startsWith(MEMORY_POINTER_PREFIX),
+      );
+    const turn1 = calls[0].messages;
+    const turn2 = calls[1].messages;
+    const pointerIndex = turn1.findIndex(hasPointer);
+    expect(pointerIndex).toBeGreaterThanOrEqual(0);
+    expect(
+      turn1[pointerIndex].content.some(
+        (block) => block.type === "text" && block.text === TURN1_POINTER,
+      ),
+    ).toBe(true);
+    // The persisted pointer rides history unchanged: the same message, at the
+    // same index, with the same bytes.
+    expect(JSON.stringify(turn2[pointerIndex])).toBe(
+      JSON.stringify(turn1[pointerIndex]),
+    );
+    // Turn 2 rendered no pointer of its own, and turn 1's did not move onto
+    // the new tail.
+    expect(turn2.filter(hasPointer)).toHaveLength(1);
+    expect(hasPointer(turn2[turn2.length - 1])).toBe(false);
+  });
+
+  test("a persisted pointer on the opening message does not flag it volatile in either turn", () => {
     for (const call of calls) {
       const config = call.options?.config as
         | Record<string, unknown>
@@ -492,8 +534,9 @@ describe("prompt cache cross-turn stability: Anthropic wire", () => {
 });
 
 describe("prompt cache cross-turn stability: volatile first turn", () => {
-  // A memory-v3 spotlight on the opening message makes it volatile across
-  // turns, but it is still fixed within its own turn. The system prompt, the
+  // A caller may flag the opening message volatile across turns
+  // (`mutableLatestUserMessage`, for a per-turn block it will not resend),
+  // but the message is still fixed within its own turn. The system prompt, the
   // tools, and the message itself must therefore still be written once, so
   // that turn's tool-loop iterations read the prefix back instead of
   // re-billing it. Leaving the request unmarked spends a full-prompt write on

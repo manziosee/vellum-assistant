@@ -1,5 +1,5 @@
 /**
- * Tests for `ToolDetailPanel` — the side-drawer body for a tool-call step.
+ * Tests for `ToolDetailPanel`, the side-drawer body for a tool-call step.
  *
  * Runs under happy-dom (see clients/web/test-setup.ts) so we can render
  * interactively and assert click / clipboard behavior.
@@ -68,8 +68,8 @@ const render = (ui: Parameters<typeof rtlRender>[0]) =>
  * folds into the materialized snapshot, so this writes the snapshot.
  */
 function seedHistory(messages: DisplayMessage[]) {
-  // History now folds into the materialized snapshot — the single source the
-  // drawer reads — so seed it there.
+  // History folds into the materialized snapshot (the single source the
+  // drawer reads), so seed it there.
   useChatSessionStore.setState({ snapshot: snap(messages) });
 }
 
@@ -111,21 +111,112 @@ afterEach(() => {
 });
 
 describe("ToolDetailPanel", () => {
-  test("renders the activity title, friendly tool name, input JSON and output", () => {
-    const { getByText, getAllByText, container } = render(
+  test("renders the activity title, friendly tool name, parameters and output", () => {
+    const { getAllByText, getByText, container } = render(
       <ToolDetailPanel detail={makeDetail()} onClose={noop} />,
     );
 
-    // Activity renders in both the header title and the body.
+    // The header owns the activity sentence, and the body does not repeat it.
     expect(
-      getAllByText("Spawning subagent to research Toronto's location").length,
-    ).toBeGreaterThan(0);
-    // Friendly tool name (title-cased from snake_case).
-    expect(getByText("Subagent Spawn")).toBeDefined();
-    // Input JSON + output appear inside <pre> blocks.
+      getAllByText("Spawning subagent to research Toronto's location"),
+    ).toHaveLength(1);
+    // The tool is named once, in the header beneath the activity.
+    expect(getAllByText("Subagent Spawn")).toHaveLength(1);
+    // Each parameter is a field of its key and its value, not a JSON literal.
+    expect(getByText("label")).toBeDefined();
+    expect(getByText("toronto-location")).toBeDefined();
     const text = container.textContent ?? "";
-    expect(text).toContain('"toronto-location"');
+    expect(text).not.toContain('"toronto-location"');
     expect(text).toContain("Toronto is in Ontario, Canada.");
+  });
+
+  test("keeps the raw input, activity included, one disclosure away", () => {
+    const detail = makeDetail({
+      input: {
+        activity: "Spawning subagent to research Toronto's location",
+        label: "toronto-location",
+      },
+    });
+    const { getByText, queryByText, container } = render(
+      <ToolDetailPanel detail={detail} onClose={noop} />,
+    );
+
+    // The header already shows the activity sentence, so it is not a field.
+    expect(queryByText("activity")).toBeNull();
+    expect(container.textContent).not.toContain('"activity"');
+
+    act(() => {
+      fireEvent.click(getByText("Raw input"));
+    });
+
+    expect(container.textContent).toContain('"activity"');
+    expect(container.textContent).toContain('"toronto-location"');
+  });
+
+  test("shows only the raw input when the call has no parameters", () => {
+    const { getByText, queryByText } = render(
+      <ToolDetailPanel detail={makeDetail({ input: {} })} onClose={noop} />,
+    );
+
+    expect(queryByText("Parameters")).toBeNull();
+    expect(getByText("Raw input")).toBeDefined();
+  });
+
+  test("renders a structured parameter as labelled fields, not JSON", () => {
+    const detail = makeDetail({
+      toolName: "acme_crm_upsert_contact",
+      input: {
+        record: {
+          stage: "qualified",
+          owner: { team: "growth" },
+          tags: ["inbound", "trial"],
+        },
+      },
+    });
+    const { getByText, container } = render(
+      <ToolDetailPanel detail={detail} onClose={noop} />,
+    );
+
+    expect(getByText("record")).toBeDefined();
+    expect(getByText("stage")).toBeDefined();
+    expect(getByText("qualified")).toBeDefined();
+    // A small object reads as key and value pairs on one line.
+    expect(getByText("owner")).toBeDefined();
+    expect(getByText("team")).toBeDefined();
+    // A short list reads as one line.
+    expect(getByText("inbound, trial")).toBeDefined();
+    expect(container.textContent).not.toContain('"stage"');
+  });
+
+  test("sets long text as a copyable code block", () => {
+    const query =
+      "SELECT week, count(DISTINCT person_id) AS users FROM events GROUP BY week ORDER BY week";
+    const detail = makeDetail({
+      toolName: "mcp__analytics__exec",
+      input: { query },
+    });
+    const { getByText, getAllByLabelText } = render(
+      <ToolDetailPanel detail={detail} onClose={noop} />,
+    );
+
+    expect(getByText(query).tagName).toBe("PRE");
+    // One copy button for the query, one for the output.
+    expect(getAllByLabelText("Copy")).toHaveLength(2);
+  });
+
+  test("counts the items past the first twenty instead of listing them", () => {
+    const ids = Array.from({ length: 23 }, (_, index) => `id-${index + 1}`);
+    const detail = makeDetail({
+      toolName: "acme_bulk_archive",
+      input: { ids },
+    });
+    const { getByText, queryByText } = render(
+      <ToolDetailPanel detail={detail} onClose={noop} />,
+    );
+
+    expect(getByText("id-20")).toBeDefined();
+    expect(queryByText("id-21")).toBeNull();
+    expect(getByText("3 more in Raw input")).toBeDefined();
   });
 
   test("omits the Technical details label", () => {
@@ -136,38 +227,37 @@ describe("ToolDetailPanel", () => {
     expect(queryByText("Technical details")).toBeNull();
   });
 
-  test("renders the Risk Level notice with the tolerance hint but not the raw reason", () => {
-    const { getByTestId, getByText, queryByText } = render(
+  test("shows the risk level as a pill, without the raw classifier reason", () => {
+    const { getByTestId, queryByText } = render(
       <ToolDetailPanel
         detail={makeDetail({ riskReason: "File edit (default)" })}
         onClose={noop}
       />,
     );
 
-    expect(getByText("Risk Level")).toBeDefined();
-    expect(getByTestId("risk-notice").getAttribute("data-risk-level")).toBe(
+    expect(getByTestId("risk-badge").getAttribute("data-risk-level")).toBe(
       "low",
     );
-    // Level and tolerance read as one sentence inside the notice.
+    expect(getByTestId("risk-badge").textContent).toBe("Low");
+    // The tolerance sentence is the pill's tooltip, not standing copy.
     expect(
-      getByText("Low → Auto-approved at Conservative tolerance or higher"),
-    ).toBeDefined();
-    // The classifier's rule-match string is internal jargon — never shown.
+      queryByText("Auto-approved at Conservative tolerance or higher"),
+    ).toBeNull();
+    // The classifier's rule-match string is internal jargon, never shown.
     expect(queryByText("File edit (default)")).toBeNull();
     // The trust-rule affordance was removed from the drawer.
     expect(queryByText("Create Trust Rule")).toBeNull();
   });
 
-  test("hides the Risk Level section when the call has no risk level", () => {
-    const { queryByText, queryByTestId } = render(
+  test("shows no pill when the call has no risk level", () => {
+    const { queryByTestId } = render(
       <ToolDetailPanel
         detail={makeDetail({ riskLevel: undefined })}
         onClose={noop}
       />,
     );
 
-    expect(queryByText("Risk Level")).toBeNull();
-    expect(queryByTestId("risk-notice")).toBeNull();
+    expect(queryByTestId("risk-badge")).toBeNull();
   });
 
   test("does not render a Create Trust Rule button even when the call resolves live", () => {
@@ -185,23 +275,178 @@ describe("ToolDetailPanel", () => {
     expect(queryByText("Create Trust Rule")).toBeNull();
   });
 
-  test("hides the Output section when result is empty", () => {
-    const { queryByText } = render(
+  test("reports an empty result rather than dropping the Output section", () => {
+    const { getByText, getByTestId } = render(
       <ToolDetailPanel detail={makeDetail({ result: "" })} onClose={noop} />,
     );
 
-    expect(queryByText("Output")).toBeNull();
+    expect(getByText("Output")).toBeDefined();
+    expect(getByTestId("tool-output-notice").textContent).toBe(
+      "The tool returned no output.",
+    );
   });
 
-  test("hides the Output section when result is undefined", () => {
+  test("collapses whitespace in the header title", () => {
+    // The activity sentence is model-written; a newline in it would render as
+    // a gap in a single-line header.
+    const { container } = render(
+      <ToolDetailPanel
+        detail={makeDetail({
+          activity: "  Reading the risk helpers\n  and the badge styles  ",
+        })}
+        onClose={noop}
+      />,
+    );
+
+    // Asserted on the raw node rather than through `getByText`, whose default
+    // normalizer collapses whitespace itself and so cannot tell a sanitized
+    // title from an unsanitized one.
+    const heading = container.querySelector("[title]");
+    expect(heading?.getAttribute("title")).toBe(
+      "Reading the risk helpers and the badge styles",
+    );
+    expect(heading?.textContent).toBe(
+      "Reading the risk helpers and the badge styles",
+    );
+  });
+
+  test("falls back to the phase title when there is no activity", () => {
+    const { getByText } = render(
+      <ToolDetailPanel
+        detail={makeDetail({ activity: "", title: "Spawning subagent" })}
+        onClose={noop}
+      />,
+    );
+
+    expect(getByText("Spawning subagent")).toBeDefined();
+  });
+
+  test("says a denied call did not run", () => {
+    const { getByText, getByTestId } = render(
+      <ToolDetailPanel
+        detail={makeDetail({ result: undefined, status: "denied" })}
+        onClose={noop}
+      />,
+    );
+
+    expect(getByText("Output")).toBeDefined();
+    expect(getByTestId("tool-output-notice").textContent).toBe(
+      "This tool call was not approved, so it did not run.",
+    );
+  });
+
+  test("keeps saying a denied call did not run once its denial result lands", () => {
+    // The daemon answers a refusal with a result addressed to the model. It is
+    // not output, so the reader still sees why the call did not run.
+    const { getByTestId, queryByText } = render(
+      <ToolDetailPanel
+        detail={makeDetail({
+          result:
+            'Permission denied. The "subagent_spawn" tool was not allowed. Do NOT retry this tool call immediately.',
+          status: "denied",
+        })}
+        onClose={noop}
+      />,
+    );
+
+    expect(getByTestId("tool-output-notice").textContent).toBe(
+      "This tool call was not approved, so it did not run.",
+    );
+    expect(queryByText(/Do NOT retry/)).toBeNull();
+  });
+
+  test("picks up a denial that lands while the drawer is open", () => {
+    // The payload was captured before the guardian answered, so the snapshot
+    // still says the call was running. The live tool call carries the decision.
+    seedHistory([
+      {
+        id: "m1",
+        role: "assistant",
+        toolCalls: [
+          {
+            id: "tc-1",
+            name: "subagent_spawn",
+            confirmationDecision: "denied",
+          },
+        ],
+      } as DisplayMessage,
+    ]);
+    const { getByTestId } = render(
+      <ToolDetailPanel
+        detail={makeDetail({ result: undefined, status: "running" })}
+        onClose={noop}
+      />,
+    );
+
+    expect(getByTestId("tool-output-notice").textContent).toBe(
+      "This tool call was not approved, so it did not run.",
+    );
+  });
+
+  test("treats a timed-out confirmation as not approved", () => {
+    seedHistory([
+      {
+        id: "m1",
+        role: "assistant",
+        toolCalls: [
+          {
+            id: "tc-1",
+            name: "subagent_spawn",
+            confirmationDecision: "timed_out",
+          },
+        ],
+      } as DisplayMessage,
+    ]);
+    const { getByTestId } = render(
+      <ToolDetailPanel
+        detail={makeDetail({ result: undefined, status: "running" })}
+        onClose={noop}
+      />,
+    );
+
+    expect(getByTestId("tool-output-notice").textContent).toBe(
+      "This tool call was not approved, so it did not run.",
+    );
+  });
+
+  test("clamps a long result behind Show more", () => {
+    const long = "a line of output\n".repeat(200);
+    const { getByText, queryByText } = render(
+      <ToolDetailPanel detail={makeDetail({ result: long })} onClose={noop} />,
+    );
+
+    const toggle = getByText("Show more");
+    expect(toggle).toBeDefined();
+    act(() => {
+      fireEvent.click(toggle);
+    });
+    expect(getByText("Show less")).toBeDefined();
+    expect(queryByText("Show more")).toBeNull();
+  });
+
+  test("leaves a short result unclamped", () => {
     const { queryByText } = render(
+      <ToolDetailPanel
+        detail={makeDetail({ result: "two words" })}
+        onClose={noop}
+      />,
+    );
+
+    expect(queryByText("Show more")).toBeNull();
+  });
+
+  test("reports no output for a call that finished without a result", () => {
+    const { getByText, getByTestId } = render(
       <ToolDetailPanel
         detail={makeDetail({ result: undefined, status: "completed" })}
         onClose={noop}
       />,
     );
 
-    expect(queryByText("Output")).toBeNull();
+    expect(getByText("Output")).toBeDefined();
+    expect(getByTestId("tool-output-notice").textContent).toBe(
+      "The tool returned no output.",
+    );
   });
 
   test("shows a Running placeholder while running with no result", () => {
@@ -216,6 +461,164 @@ describe("ToolDetailPanel", () => {
     expect(getByText("Running…")).toBeDefined();
   });
 
+  test("labels a denied edit as requested, not applied", () => {
+    const { getByText, queryByText } = render(
+      <ToolDetailPanel
+        detail={makeDetail({
+          toolName: "file_edit",
+          input: { path: "a.ts", old_string: "one", new_string: "two" },
+          result: undefined,
+          status: "denied",
+        })}
+        onClose={noop}
+      />,
+    );
+
+    // The diff describes what was asked for; only a call that succeeded had it
+    // applied, so a denied one must not read as a change that happened.
+    expect(getByText("Requested changes")).toBeDefined();
+    expect(queryByText("Changes")).toBeNull();
+  });
+
+  test("labels a successful edit as applied", () => {
+    const { getByText } = render(
+      <ToolDetailPanel
+        detail={makeDetail({
+          toolName: "file_edit",
+          input: { path: "a.ts", old_string: "one", new_string: "two" },
+          result: "Applied 1 edit",
+          status: "completed",
+        })}
+        onClose={noop}
+      />,
+    );
+
+    expect(getByText("Changes")).toBeDefined();
+  });
+
+  test("shows the edited path when it arrives as file_path", () => {
+    const { getByText } = render(
+      <ToolDetailPanel
+        detail={makeDetail({
+          toolName: "file_edit",
+          // The daemon's alias table rewrites `file_path` to `path` only for
+          // aliased tool names, so a direct `file_edit` call still carries this
+          // spelling, and every surface that shows a path accepts all three.
+          input: {
+            file_path: "src/deep/module.ts",
+            old_string: "one",
+            new_string: "two",
+          },
+          result: "Applied 1 edit",
+        })}
+        onClose={noop}
+      />,
+    );
+
+    expect(getByText("src/deep/module.ts")).toBeDefined();
+  });
+
+  test("shows a write's file even when its input carries stray edit keys", () => {
+    const { getByText, queryByTestId } = render(
+      <ToolDetailPanel
+        detail={makeDetail({
+          toolName: "file_write",
+          // The write schemas are `z.looseObject`, so unread fields survive
+          // validation. The rendering follows the tool, not the input keys.
+          input: {
+            path: "src/a.ts",
+            content: "const written = true;",
+            old_string: "",
+            new_string: "",
+          },
+          result: "Wrote 1 line to src/a.ts",
+        })}
+        onClose={noop}
+      />,
+    );
+
+    expect(getByText("const written = true;")).toBeDefined();
+    expect(queryByTestId("file-diff")).toBeNull();
+  });
+
+  test("names the path the tool reads when both spellings are present", () => {
+    const { getByText, queryByText } = render(
+      <ToolDetailPanel
+        detail={makeDetail({
+          toolName: "file_write",
+          // `path` is what the executor reads, and what the alias table
+          // rewrites the other spelling into, so it wins either way.
+          input: {
+            path: "src/executed.ts",
+            file_path: "src/ignored.ts",
+            content: "const a = 1;",
+          },
+          result: "Wrote 1 line",
+        })}
+        onClose={noop}
+      />,
+    );
+
+    expect(getByText("src/executed.ts")).toBeDefined();
+    expect(queryByText("src/ignored.ts")).toBeNull();
+  });
+
+  test("labels a denied write as requested, the same as a denied edit", () => {
+    const { getByText, queryByText } = render(
+      <ToolDetailPanel
+        detail={makeDetail({
+          toolName: "file_write",
+          input: { path: "src/a.ts", content: "const a = 1;\n" },
+          result: undefined,
+          status: "denied",
+        })}
+        onClose={noop}
+      />,
+    );
+
+    // A write and an edit are the same event, so the rule that only a
+    // successful call reads as applied has to hold for both.
+    expect(getByText("Requested changes")).toBeDefined();
+    expect(queryByText("Changes")).toBeNull();
+  });
+
+  test("shows a written file as content, not as an escaped JSON string", () => {
+    const { getByText, queryByText } = render(
+      <ToolDetailPanel
+        detail={makeDetail({
+          toolName: "file_write",
+          input: {
+            path: "src/a.ts",
+            content: 'const greeting = "hi";\nexport default greeting;\n',
+          },
+          result: "Wrote 2 lines to src/a.ts",
+        })}
+        onClose={noop}
+      />,
+    );
+
+    // The file reaches the panel inside the input bag, which is the one place
+    // the generic body prints a string with its quotes and newlines escaped.
+    expect(getByText("Changes")).toBeDefined();
+    expect(getByText("src/a.ts")).toBeDefined();
+    expect(queryByText(/\\n/)).toBeNull();
+  });
+
+  test("reads a bash command stored under the legacy cmd key", () => {
+    const { getByText } = render(
+      <ToolDetailPanel
+        detail={makeDetail({
+          toolName: "bash",
+          input: { cmd: "git status --short" },
+          result: "clean",
+        })}
+        onClose={noop}
+      />,
+    );
+
+    expect(getByText("git status --short")).toBeDefined();
+  });
+
   test("clicking close fires onClose", () => {
     const onClose = mock(() => {});
     const { getByLabelText } = render(
@@ -227,16 +630,28 @@ describe("ToolDetailPanel", () => {
   });
 
   test("copy button writes the content to the clipboard", () => {
-    const { getAllByLabelText } = render(
+    const { getAllByLabelText, getByText } = render(
       <ToolDetailPanel detail={makeDetail()} onClose={noop} />,
     );
 
-    // Two copy buttons: one for input, one for output.
+    // Short parameters are fields with nothing to copy, so at rest only the
+    // output has a copy button. Opening the raw input adds its own.
+    expect(getAllByLabelText("Copy")).toHaveLength(1);
+    act(() => {
+      fireEvent.click(getByText("Raw input"));
+    });
     const copyButtons = getAllByLabelText("Copy");
     expect(copyButtons.length).toBe(2);
 
     fireEvent.click(copyButtons[0]!);
     expect(writeText).toHaveBeenCalledTimes(1);
+    expect(writeText).toHaveBeenCalledWith(
+      JSON.stringify(
+        { label: "toronto-location", role: "researcher" },
+        null,
+        2,
+      ),
+    );
   });
 
   test("thinking variant renders the reasoning markdown without input/output sections", () => {

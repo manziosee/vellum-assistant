@@ -3,6 +3,7 @@
 import Link from "next/link";
 
 import { DocsContent } from "@/app/docs/_components/docs-content";
+import { DocsVideo } from "@/app/docs/_components/docs-video";
 import { SectionHeading } from "@/app/docs/_components/section-heading";
 import { TableOfContents } from "@/app/docs/_components/table-of-contents";
 
@@ -22,6 +23,8 @@ export function HostingOptionsLocalHostingContent() {
   return (
     <>
       <DocsContent title="Local hosting" breadcrumb="Docs / Hosting options / Local hosting">
+        <DocsVideo video="local-hosting-setup" />
+
         <section id="overview">
           <SectionHeading id="overview" level={2}>
             Overview
@@ -37,7 +40,7 @@ export function HostingOptionsLocalHostingContent() {
             . If you want local instead, this page is for you.
           </p>
           <p className="mb-4 text-stone-600 dark:text-stone-400">
-            Local hosting means your assistant runs on your Mac. Your data
+            Local hosting means your assistant runs on your Mac or Windows PC. Your data
             stays on your machine, the assistant has direct access to your
             files and tools, and there&apos;s no cloud infrastructure to
             manage. The tradeoff: it&apos;s only available when your computer
@@ -45,7 +48,7 @@ export function HostingOptionsLocalHostingContent() {
           </p>
           <p className="mb-0 text-stone-600 dark:text-stone-400">
             Today, local hosting uses native (the assistant runs directly
-            as a process on your Mac). Docker and Apple Container options are
+            as a process on your Mac or Windows PC). Docker and Apple Container options are
             on the roadmap and will provide better isolation while keeping
             everything local.
           </p>
@@ -64,9 +67,9 @@ export function HostingOptionsLocalHostingContent() {
               </span>
             </SectionHeading>
             <p className="mb-4 text-stone-600 dark:text-stone-400">
-              The assistant runs directly as a process on your Mac. No
-              containers, no virtual machines. This is what you get when you
-              install Vellum today.
+              The assistant runs directly as a process on your Mac or Windows PC. No
+              containers, no virtual machines. Choose local hosting in the desktop app;
+              installing the app alone does not switch a cloud assistant to local hosting.
             </p>
             <dl className="mb-0 space-y-3">
               <div className="rounded-xl border border-stone-200 p-4 dark:border-moss-600/50">
@@ -234,10 +237,10 @@ export function HostingOptionsLocalHostingContent() {
             If you need 24/7 availability or want the assistant sandboxed away
             from your personal machine, check out{" "}
             <Link
-              href="/docs/hosting-options/advanced-options"
+              href="/docs/hosting-options"
               className="font-semibold text-emerald-700 underline hover:text-emerald-800"
             >
-              Advanced options
+              Hosting options
             </Link>{" "}
             for Vellum Cloud and User-Hosted Remote.
           </p>
@@ -249,12 +252,12 @@ export function HostingOptionsLocalHostingContent() {
           </SectionHeading>
           <p className="mb-4 text-stone-600 dark:text-stone-400">
             With any local option, the assistant is only available when your
-            computer is awake. If your Mac is asleep or shut down, scheduled
+            computer is awake. If your computer is asleep or shut down, scheduled
             tasks won&apos;t fire and the assistant can&apos;t respond until
             it wakes back up.
           </p>
           <p className="mb-0 text-stone-600 dark:text-stone-400">
-            For most people using their primary Mac, this means the assistant
+            For most people using their primary computer, this means the assistant
             works great during the workday and whenever the computer is active.
             If you need always-on availability without buying dedicated
             hardware, Vellum Cloud is the better fit.

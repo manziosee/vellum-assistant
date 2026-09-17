@@ -1,11 +1,14 @@
 import { useCallback, useEffect, useState } from "react";
 
+import type { VellumBridge } from "@vellumai/ipc-contract";
+
 import {
   isElectron,
   type SystemPermissionKind,
   type SystemPermissionStateItem,
   type SystemPermissionsState,
 } from "@/runtime/is-electron";
+import { detectElectronHostOS } from "@/runtime/platform-detection";
 
 export type {
   SystemPermissionKind,
@@ -24,6 +27,36 @@ export const SYSTEM_PERMISSION_KINDS: SystemPermissionKind[] = [
   "notifications",
 ];
 
+const SYSTEM_PERMISSION_SETTINGS_URLS: Readonly<
+  Record<
+    string,
+    { hostOS: "macos" | "windows"; kind: SystemPermissionKind }
+  >
+> = {
+  "ms-settings:privacy-microphone": {
+    hostOS: "windows",
+    kind: "microphone",
+  },
+  "ms-settings:privacy-speech": {
+    hostOS: "windows",
+    kind: "speechRecognition",
+  },
+  "ms-settings:privacy-graphicscaptureprogrammatic": {
+    hostOS: "windows",
+    kind: "screen",
+  },
+  "ms-settings:notifications": {
+    hostOS: "windows",
+    kind: "notifications",
+  },
+  "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone":
+    { hostOS: "macos", kind: "microphone" },
+  "x-apple.systempreferences:com.apple.preference.security?Privacy_SpeechRecognition":
+    { hostOS: "macos", kind: "speechRecognition" },
+  "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture":
+    { hostOS: "macos", kind: "screen" },
+};
+
 export function supportsSystemPermissions(): boolean {
   return (
     isElectron() && typeof window.vellum?.permissions?.getState === "function"
@@ -39,11 +72,17 @@ export async function getSystemPermissionsState(): Promise<SystemPermissionsStat
 
 export async function requestSystemPermission(
   kind: SystemPermissionKind,
+  presentation?: Parameters<VellumBridge["permissions"]["request"]>[1],
 ): Promise<SystemPermissionStateItem | null> {
   if (!supportsSystemPermissions()) {
     return null;
   }
-  return await window.vellum!.permissions!.request(kind);
+  const request = window.vellum!.permissions!
+    .request as VellumBridge["permissions"]["request"];
+  if (presentation && detectElectronHostOS() === "macos") {
+    return await request(kind, presentation);
+  }
+  return await request(kind);
 }
 
 export async function openSystemPermissionSettings(
@@ -53,6 +92,28 @@ export async function openSystemPermissionSettings(
     return null;
   }
   return await window.vellum!.permissions!.openSettings(kind);
+}
+
+export type SystemPermissionSettingsUrlOutcome =
+  | "opened"
+  | "ignored"
+  | "unrecognized";
+
+export function dispatchSystemPermissionSettingsUrl(
+  url: string,
+): SystemPermissionSettingsUrlOutcome {
+  const target = SYSTEM_PERMISSION_SETTINGS_URLS[url];
+  if (!target) {
+    return "unrecognized";
+  }
+  if (
+    detectElectronHostOS() !== target.hostOS ||
+    !supportsSystemPermissions()
+  ) {
+    return "ignored";
+  }
+  void openSystemPermissionSettings(target.kind);
+  return "opened";
 }
 
 export async function quitAndReopenForPermissions(): Promise<void> {

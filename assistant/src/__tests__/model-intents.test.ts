@@ -20,13 +20,16 @@ describe("model intents", () => {
       "claude-haiku-4-5-20251001",
     );
     expect(resolveModelIntent("anthropic", "quality-optimized")).toBe(
-      "claude-fable-5",
+      "claude-fable-5-1",
     );
     expect(resolveModelIntent("anthropic", "vision-optimized")).toBe(
       "claude-opus-4-6",
     );
     expect(resolveModelIntent("openai", "latency-optimized")).toBe(
       "gpt-5.6-luna",
+    );
+    expect(resolveModelIntent("gemini", "cost-optimized")).toBe(
+      "gemini-3.1-flash-lite",
     );
     expect(resolveModelIntent("gemini", "latency-optimized")).toBe(
       "gemini-3.1-flash-lite",
@@ -47,7 +50,7 @@ describe("model intents", () => {
       "anthropic/claude-haiku-4.5",
     );
     expect(resolveModelIntent("vercel-ai-gateway", "quality-optimized")).toBe(
-      "anthropic/claude-fable-5",
+      "anthropic/claude-fable-5.1",
     );
     expect(resolveModelIntent("vercel-ai-gateway", "vision-optimized")).toBe(
       "anthropic/claude-opus-4.6",

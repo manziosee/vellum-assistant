@@ -1,5 +1,7 @@
 import { refreshBackgroundWakeIntent } from "../background-wake/publisher.js";
+import { resolveSingleRouteProfileKey } from "../config/llm-resolver.js";
 import { getConfig } from "../config/loader.js";
+import { findConversation } from "../daemon/conversation-registry.js";
 import {
   checkDiskPressureBackgroundGate,
   diskPressureBackgroundSkipLogFields,
@@ -7,15 +9,22 @@ import {
 } from "../daemon/disk-pressure-background-gate.js";
 import { processMessage } from "../daemon/process-message.js";
 import { INTERNAL_GUARDIAN_TRUST_CONTEXT } from "../daemon/trust-context.js";
+import { emitBackgroundFailureSignal } from "../notifications/background-failure-signal.js";
 import { emitNotificationSignal } from "../notifications/emit-signal.js";
+import { emitScheduleResultNotification } from "../notifications/schedule-result-producer.js";
 import { getConversation } from "../persistence/conversation-crud.js";
 import { isLifecycleQuiesced } from "../persistence/lifecycle-quiesce.js";
 import { invalidateAssistantInferredItemsForConversation } from "../plugins/defaults/memory/task-memory-cleanup.js";
+import { dispatchProviderResolvable } from "../providers/provider-resolvability.js";
 import { wakeAgentForOpportunity } from "../runtime/agent-wake.js";
 import { broadcastMessage } from "../runtime/assistant-event-hub.js";
-import { runBackgroundJob } from "../runtime/background-job-runner.js";
+import {
+  type BackgroundJobErrorKind,
+  runBackgroundJob,
+} from "../runtime/background-job-runner.js";
 import { publishConversationListChanged } from "../runtime/sync/resource-sync-events.js";
 import { runSequencesOnce } from "../sequence/engine.js";
+import { getSubagentManager } from "../subagent/index.js";
 import type { TurnFailure } from "../telemetry/turn-outcome.js";
 import { recordWatchdogEvent } from "../telemetry/watchdog-events-store.js";
 import { getLogger } from "../util/logger.js";
@@ -49,6 +58,13 @@ import {
   scheduleRetry,
   setScheduleRunConversationId,
 } from "./schedule-store.js";
+import {
+  getScheduleToolSurfaceSnapshot,
+  getScheduleToolSurfaceState,
+  isScheduleToolSurfaceReady,
+  MCP_NOT_READY_DEFER_MS,
+  scheduleModeNeedsToolSurface,
+} from "./tool-surface-readiness.js";
 import { buildWakeScheduleOptions } from "./wake-schedule-options.js";
 import {
   isScheduleWorkerAdministrativelyStopped,
@@ -59,6 +75,77 @@ import {
 } from "./worker-control.js";
 
 const log = getLogger("scheduler");
+
+/** How often {@link awaitDelegatedWork} re-checks the run's conversation. */
+const DELEGATED_WORK_POLL_MS = 100;
+
+/**
+ * Consecutive quiet polls required before delegated work counts as settled.
+ *
+ * Two, not one: a child clears its in-flight marker as it delivers its
+ * terminal notification, and the parent registers the continuation that
+ * notification starts a hop later. One quiet read can land inside that gap and
+ * call a run finished while its real answer is still on the way.
+ */
+const DELEGATED_WORK_QUIET_POLLS = 2;
+
+/**
+ * Wait for work a scheduled turn delegated before the run is called done.
+ *
+ * A turn that consults a subagent resolves as soon as its own reply is
+ * written: the child runs on, and its terminal notification then starts the
+ * continuation that writes the reply the guidance actually informed. The
+ * schedule's result producer fires once per run and reads the conversation's
+ * latest assistant row, so completing at the first resolve ships the
+ * pre-consult reply and drops the informed one for good.
+ *
+ * Returns immediately for a conversation that never delegated anything, which
+ * is the ordinary case, so no scheduled run pays for this unless it spawned.
+ *
+ * Bounded by what is left of the schedule turn timeout, so the whole run (its
+ * turn plus the work it delegated) stays inside the one ceiling that stops a
+ * wedged schedule from blocking the next tick. Exhausting the ceiling is not a
+ * failure: the run still completes and still produces a result, just from
+ * whatever had been written by then.
+ */
+async function awaitDelegatedWork(
+  conversationId: string,
+  runStartedAt: number,
+  rlog: typeof log,
+): Promise<void> {
+  if (!conversationId || conversationId.startsWith("bootstrap-error:")) {
+    return;
+  }
+  const conversation = findConversation(conversationId);
+  if (!conversation) {
+    return;
+  }
+  // Terminal children stay readable for their retention window, so this asks
+  // "did this conversation ever delegate?" and skips the polling entirely for
+  // the schedules that never do.
+  if (getSubagentManager().getChildrenOf(conversationId).length === 0) {
+    return;
+  }
+
+  const deadline =
+    runStartedAt + getConfig().timeouts.scheduleTurnTimeoutSec * 1000;
+  let quiet = 0;
+  while (Date.now() < deadline) {
+    if (conversation.hasInFlightWork()) {
+      quiet = 0;
+    } else {
+      quiet += 1;
+      if (quiet >= DELEGATED_WORK_QUIET_POLLS) {
+        return;
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, DELEGATED_WORK_POLL_MS));
+  }
+  rlog.warn(
+    { conversationId },
+    "Delegated work still in flight at the schedule turn ceiling; producing the result from what is written",
+  );
+}
 
 import type { ScheduleMessageOptions } from "./scheduler-types.js";
 
@@ -223,25 +310,82 @@ async function handleExecutionFailure(params: {
   job: ScheduleJob;
   errorMsg: string;
   isOneShot: boolean;
+  /**
+   * Classified failure cause from the runner, when the failing path had one.
+   * Keys the exhaustion alert's dedupe so same-cause failures across jobs
+   * collapse; absent means a generic exception, which keys per schedule.
+   */
+  errorKind?: BackgroundJobErrorKind;
+  /**
+   * The failing turn's carried classification, when the failure was a
+   * non-throwing turn failure. The exhaustion alert renders its authored
+   * message and scopes by the route that actually served the runs.
+   */
+  turnFailure?: TurnFailure;
 }): Promise<void> {
   const decision = decideRetry(params.job);
   await applyRetryDecision({
     job: params.job,
     isOneShot: params.isOneShot,
-    errorMsg: params.errorMsg,
     decision,
     scheduleRetry,
     failOneShotPermanently,
     resetRetryCount,
-    emitAlert: (_title, _summary, dedupKey) =>
-      emitScheduleActivityFailed({
-        jobId: params.job.id,
-        jobName: params.job.name,
+    emitAlert: () => {
+      const fallbackProviderScope = resolveScheduleProviderScope(params.job);
+      const carried = params.turnFailure;
+      emitBackgroundFailureSignal({
+        jobName: `schedule:${params.job.id}`,
+        displayName: `schedule:${params.job.name}`,
+        sourceChannel: "scheduler",
+        sourceContextId: params.job.id,
+        errorKind: params.errorKind ?? "exception",
         errorMessage: params.errorMsg,
-        dedupKey,
-      }),
+        ...(carried?.failureCode !== undefined
+          ? { failureCode: carried.failureCode }
+          : {}),
+        ...(carried?.userMessage !== undefined
+          ? { failureSummary: carried.userMessage }
+          : {}),
+        ...(carried?.errorCategory !== undefined
+          ? { errorCategory: carried.errorCategory }
+          : {}),
+        ...(carried?.connectionName !== undefined
+          ? { connectionName: carried.connectionName }
+          : {}),
+        ...(carried?.profileName !== undefined
+          ? { profileName: carried.profileName }
+          : {}),
+        ...(fallbackProviderScope !== undefined
+          ? { fallbackProviderScope }
+          : {}),
+      });
+    },
     log,
   });
+}
+
+/**
+ * The provider scope a schedule's failing runs resolved through: its pinned
+ * profile when that names a single provider route, else the route the
+ * mainAgent winner actually served (a deleted pin falls through to it). A
+ * mix pin, no named winner, or an unreadable config yield no scope, so the
+ * exhaustion alert keys per schedule rather than claiming one scope for
+ * arms that can span providers.
+ */
+function resolveScheduleProviderScope(job: ScheduleJob): string | undefined {
+  try {
+    return resolveSingleRouteProfileKey("mainAgent", getConfig().llm, {
+      ...(job.inferenceProfile
+        ? { overrideProfile: job.inferenceProfile }
+        : {}),
+      // Dispatch's own resolvability predicate, so a stale pin dispatch
+      // rejected (force-deleted connection) is not accepted as the scope.
+      isResolvableProvider: dispatchProviderResolvable,
+    });
+  } catch {
+    return undefined;
+  }
 }
 
 /** The running scheduler, retained so shutdown can stop it. */
@@ -297,7 +441,7 @@ export function startScheduler(): SchedulerHandle {
   scheduleWorkerSupervisor = createWorkerSupervisor({
     label: "Schedule worker",
     probe: probeScheduleWorker,
-    respawn: () => spawnScheduleWorkerProcess({ detached: false }),
+    respawn: () => spawnScheduleWorkerProcess(),
     isSuppressed: isScheduleWorkerAdministrativelyStopped,
     killChild: (pid) => {
       try {
@@ -563,6 +707,32 @@ export async function runDueSchedulesOnce(
         `Schedule not run: plugin "${sourcePlugin}" is disabled, uninstalled, or no longer declares this schedule.`,
       );
       mark("skipped");
+      continue;
+    }
+
+    if (
+      scheduleModeNeedsToolSurface(job.mode) &&
+      !isScheduleToolSurfaceReady()
+    ) {
+      log.info(
+        {
+          jobId: job.id,
+          name: job.name,
+          mode: job.mode,
+          toolSurfaceState: getScheduleToolSurfaceState(),
+          ...getScheduleToolSurfaceSnapshot(),
+        },
+        "Deferring tool-backed schedule until the MCP tool surface is ready",
+      );
+      try {
+        await deferClaimedSchedule(job.id, Date.now() + MCP_NOT_READY_DEFER_MS);
+      } catch (err) {
+        log.warn(
+          { err, jobId: job.id },
+          "Failed to defer claimed schedule while MCP tool surface is not ready",
+        );
+      }
+      result.skipped += 1;
       continue;
     }
 
@@ -896,8 +1066,15 @@ export async function runDueSchedulesOnce(
     let conversationId: string;
     let ok: boolean;
     let errorMsg: string | undefined;
+    let errorKind: BackgroundJobErrorKind | undefined;
+    let failedTurn: TurnFailure | undefined;
     const conversationReused = reusedConversationId != null;
     let runConversationId = reusedConversationId;
+    // Captured before the run so the post-run "did this run notify?" probe has
+    // a lower bound. A reused conversation carries every prior run's
+    // notifications, and without this bound the first run to notify would
+    // silence the fallback for every run after it.
+    const runStartedAt = Date.now();
     const runId = await createScheduleRun(job.id, reusedConversationId);
 
     if (reusedConversationId) {
@@ -929,17 +1106,20 @@ export async function runDueSchedulesOnce(
         if (turnFailure) {
           ok = false;
           errorMsg = describeTurnFailure(turnFailure);
+          errorKind = "model_provider";
+          failedTurn = turnFailure;
         } else {
           ok = true;
         }
       } catch (err) {
         ok = false;
         errorMsg = err instanceof Error ? err.message : String(err);
+        errorKind = "exception";
       }
     } else {
-      // Fresh-bootstrap path: route through the shared runner so failures
-      // surface via `activity.failed` and we get the standard timeout +
-      // error-classification policy applied to every background producer.
+      // Fresh-bootstrap path: route through the shared runner for the
+      // standard timeout + error-classification policy applied to every
+      // background producer.
       // The runner fires `onConversationCreated` synchronously after bootstrap
       // (before `processMessage` starts) so the macOS sidebar gets the new
       // conversation immediately rather than after the up-to-30-min job ends.
@@ -962,7 +1142,12 @@ export async function runDueSchedulesOnce(
         groupId: resolveScheduleConversationGroupId(job),
         conversationType: "scheduled",
         scheduleJobId: job.id,
-        suppressFailureNotifications: job.quiet === true,
+        // The retry policy owns the single user-facing alert for a failing
+        // schedule (fired once, when retries are exhausted). Letting the
+        // runner also emit per attempt would notify for failures that a
+        // retry may yet recover, and pair every exhaustion alert with a
+        // duplicate.
+        suppressFailureNotifications: true,
         onConversationCreated: async (newConversationId) => {
           runConversationId = newConversationId;
           await setScheduleRunConversationId(runId, newConversationId);
@@ -988,10 +1173,31 @@ export async function runDueSchedulesOnce(
       }
       ok = result.ok;
       errorMsg = result.error?.message;
+      errorKind = result.errorKind;
+      failedTurn = result.turnFailure;
     }
 
     if (ok) {
+      // The turn resolved, but work it delegated may still be running. Settle
+      // that before the run is called done and its one result is produced.
+      await awaitDelegatedWork(conversationId, runStartedAt, log);
       await completeScheduleRun(runId, { status: "ok" });
+      // Automatic completion notification for successful execute-mode runs.
+      // Quiet schedules skip this fallback so a clean tick stays silent.
+      // Explicit in-run delivery (e.g. `assistant notifications send`) is
+      // unaffected because it never goes through this producer.
+      // Awaited rather than fired and forgotten: the schedule worker can exit
+      // once the tick's loop drains, and a detached emit would race that exit.
+      if (!job.quiet) {
+        await emitScheduleResultNotification({
+          scheduleId: job.id,
+          scheduleName: job.name,
+          conversationId,
+          runId,
+          runStartedAt,
+          rlog: log,
+        });
+      }
       if (isOneShot) {
         await completeOneShot(job.id);
       }
@@ -1016,6 +1222,8 @@ export async function runDueSchedulesOnce(
         job,
         errorMsg: errorMsg ?? "Schedule run failed",
         isOneShot,
+        ...(errorKind !== undefined ? { errorKind } : {}),
+        ...(failedTurn !== undefined ? { turnFailure: failedTurn } : {}),
       });
 
       // Only skip invalidation when the conversation was *actually* reused,
@@ -1038,43 +1246,4 @@ export async function runDueSchedulesOnce(
   }
 
   return result;
-}
-
-/**
- * Emit an `activity.failed` notification for a schedule whose retries have
- * been exhausted. Fires once when the retry policy has given up, so the
- * dedupeKey caller is the per-attempt key passed in by `applyRetryDecision`
- * (already includes the job id and a timestamp).
- */
-function emitScheduleActivityFailed(args: {
-  jobId: string;
-  jobName: string;
-  errorMessage: string;
-  dedupKey: string;
-}): void {
-  emitNotificationSignal({
-    sourceChannel: "scheduler",
-    sourceContextId: args.jobId,
-    sourceEventName: "activity.failed",
-    dedupeKey: args.dedupKey,
-    contextPayload: {
-      jobName: `schedule:${args.jobName}`,
-      errorMessage: args.errorMessage,
-      errorKind: "exception",
-    },
-    attentionHints: {
-      requiresAction: false,
-      urgency: "medium",
-      isAsyncBackground: true,
-      visibleInSourceNow: false,
-    },
-  }).catch((emitErr) => {
-    log.warn(
-      {
-        err: emitErr instanceof Error ? emitErr.message : String(emitErr),
-        jobId: args.jobId,
-      },
-      "Failed to emit activity.failed notification for exhausted schedule",
-    );
-  });
 }

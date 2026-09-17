@@ -1,6 +1,14 @@
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 
 import { setConfig } from "../../__tests__/helpers/set-config.js";
+import {
+  MAX_OUTPUT_LENGTH,
+  OUTPUT_TRUNCATED_TAG,
+  SHELL_DID_NOT_START_MESSAGE,
+} from "../shared/shell-output.js";
 import type { ToolContext } from "../types.js";
 
 // ---------------------------------------------------------------------------
@@ -197,5 +205,89 @@ describe("foreground stdin handling", () => {
     expect(result.isError).toBeFalsy();
     expect(result.content).toContain("done");
     expect(result.content).not.toContain("ENXIO");
+  });
+});
+
+describe("foreground command execution", () => {
+  let tmpDir = "";
+
+  beforeEach(async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), "bash-exec-"));
+  });
+
+  afterEach(async () => {
+    if (tmpDir) {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("a command that writes a file must actually create it", async () => {
+    const result = await shellTool.execute(
+      {
+        command: "printf ran > proof.txt",
+        activity: "test",
+      },
+      { ...makeContext(), workingDir: tmpDir },
+    );
+
+    expect(result.isError).toBeFalsy();
+    expect(result.content).not.toBe(SHELL_DID_NOT_START_MESSAGE);
+    expect(await readFile(join(tmpDir, "proof.txt"), "utf-8")).toBe("ran");
+  });
+});
+
+describe("streaming stdout cap", () => {
+  let tmpDir = "";
+
+  beforeEach(async () => {
+    events.length = 0;
+    _clearRegistryForTesting();
+    tmpDir = await mkdtemp(join(tmpdir(), "bash-cap-"));
+  });
+
+  afterEach(async () => {
+    _clearRegistryForTesting();
+    if (tmpDir) {
+      await rm(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("foreground drops stdout past the cap and lets the process finish", async () => {
+    const result = await shellTool.execute(
+      {
+        command: `${process.execPath} -e "process.stdout.write('x'.repeat(100000)); require('node:fs').writeFileSync('sentinel.txt','done')"`,
+        activity: "test",
+      },
+      { ...makeContext(), workingDir: tmpDir },
+    );
+
+    expect(result.isError).toBeFalsy();
+    expect(result.content).toContain(OUTPUT_TRUNCATED_TAG);
+    expect(result.content).not.toContain("file=");
+    expect(result.content.length).toBeLessThan(MAX_OUTPUT_LENGTH + 80);
+    expect(await readFile(join(tmpDir, "sentinel.txt"), "utf-8")).toBe("done");
+  });
+
+  test("background drops stdout past the cap and lets the process finish", async () => {
+    const result = await shellTool.execute(
+      {
+        command: `${process.execPath} -e "process.stdout.write('x'.repeat(100000)); require('node:fs').writeFileSync('sentinel.txt','done')"`,
+        activity: "test",
+        background: true,
+      },
+      { ...makeContext(), workingDir: tmpDir },
+    );
+    expect(result.isError).toBeFalsy();
+
+    await waitFor(() => completedEvents().length > 0);
+    const completed = completedEvents();
+    expect(completed).toHaveLength(1);
+    expect(completed[0]).toMatchObject({ status: "completed", exitCode: 0 });
+    expect(String(completed[0]?.output)).toContain(OUTPUT_TRUNCATED_TAG);
+    expect(String(completed[0]?.output)).not.toContain("file=");
+    expect(String(completed[0]?.output).length).toBeLessThan(
+      MAX_OUTPUT_LENGTH + 80,
+    );
+    expect(await readFile(join(tmpDir, "sentinel.txt"), "utf-8")).toBe("done");
   });
 });

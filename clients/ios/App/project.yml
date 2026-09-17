@@ -51,6 +51,11 @@ targetTemplates:
       # target re-adds the single icon it ships with so that
       # ASSETCATALOG_COMPILER_APPICON_NAME (set per-target via xcconfig)
       # resolves to a bundled resource.
+      #
+      # `AvatarIcons.xcassets` rides along in this sweep, the same way
+      # `Assets.xcassets` does: every target ships every avatar alternate
+      # icon, so there is nothing to re-add per target. The xcconfigs turn
+      # them into alternates via Config/AvatarIcons.xcconfig.
       - path: App
         excludes:
           - "Info.plist"
@@ -62,6 +67,20 @@ targetTemplates:
           - "capacitor.config.json"
           - "config.xml"
           - "public"
+          - "Shared/AvatarCache.swift"
+          - "Shared/CommunicationContent.swift"
+          - "Shared/SenderPayload.swift"
+          - "LocalNotificationCoordinator.swift"
+          - "SenderNotificationPlugin.swift"
+      # The local sender owner is app-only. Listing its files here keeps both
+      # the coordinator and Capacitor plugin out of every extension target.
+      - path: App/LocalNotificationCoordinator.swift
+      - path: App/SenderNotificationPlugin.swift
+      # Notification communication helpers are listed file by file so their
+      # membership stays explicit across the app and extension targets.
+      - path: App/Shared/AvatarCache.swift
+      - path: App/Shared/CommunicationContent.swift
+      - path: App/Shared/SenderPayload.swift
       # Capacitor-managed resources. These are produced by `bunx cap
       # sync ios` and gitignored, so they may not exist when xcodegen
       # runs locally before the first sync. `optional: true` lets
@@ -139,6 +158,10 @@ targetTemplates:
       # already sweep the same directory up via `AppEnvironment`'s `App`
       # source path.
       - path: App/Shared
+        excludes:
+          - AvatarCache.swift
+          - CommunicationContent.swift
+          - SenderPayload.swift
     settings:
       configs:
         Debug:
@@ -155,6 +178,60 @@ targetTemplates:
     # targets, so the three app schemes are the only ones worth having.
     preBuildScripts: *projectSpecFreshnessGuard
 
+  # Notification Service Extension. iOS runs it for every push carrying
+  # `mutable-content: 1`. One per environment for the same prefix rule as
+  # VoiceActivity. From `App/Shared` it compiles the App Group identifier and
+  # notification communication helpers it shares with the host app. The App
+  # Intents and ActivityKit files there belong to VoiceActivity.
+  NotificationServiceEnvironment:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: NotificationService
+        excludes:
+          - "Info.plist"
+      - path: App/Shared
+        includes:
+          - AppGroupID.swift
+          - AvatarCache.swift
+          - CommunicationContent.swift
+          - SenderPayload.swift
+    settings:
+      configs:
+        Debug:
+          OTHER_SWIFT_FLAGS: '$(inherited) "-DDEBUG"'
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: DEBUG
+        Release:
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: ""
+    preBuildScripts: *projectSpecFreshnessGuard
+
+  # Share Sheet extension. One per environment for the same prefix rule as
+  # VoiceActivity. Compiles only the Shared files it needs: App Intents and
+  # ActivityKit in that folder belong to VoiceActivity, and compiling them
+  # here would register the same intents twice.
+  ShareExtensionEnvironment:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: ShareExtension
+        excludes:
+          - "Info.plist"
+      - path: App/Shared
+        includes:
+          - AppGroupID.swift
+          - BundleURLScheme.swift
+          - RecentChatsStore.swift
+          - ShareDeepLink.swift
+          - ShareInbox.swift
+    settings:
+      configs:
+        Debug:
+          OTHER_SWIFT_FLAGS: '$(inherited) "-DDEBUG"'
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: DEBUG SHARE_EXTENSION
+        Release:
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: SHARE_EXTENSION
+    preBuildScripts: *projectSpecFreshnessGuard
+
 targets:
   App:
     templates: [AppEnvironment]
@@ -165,6 +242,10 @@ targets:
       Release: App/Config/App.xcconfig
     dependencies:
       - target: VoiceActivity
+        embed: true
+      - target: Share
+        embed: true
+      - target: NotificationService
         embed: true
 
   "App Staging":
@@ -177,6 +258,10 @@ targets:
     dependencies:
       - target: "VoiceActivity Staging"
         embed: true
+      - target: "Share Staging"
+        embed: true
+      - target: "NotificationService Staging"
+        embed: true
 
   "App Dev":
     templates: [AppEnvironment]
@@ -187,6 +272,10 @@ targets:
       Release: App/Config/App-Dev.xcconfig
     dependencies:
       - target: "VoiceActivity Dev"
+        embed: true
+      - target: "Share Dev"
+        embed: true
+      - target: "NotificationService Dev"
         embed: true
 
   VoiceActivity:
@@ -206,3 +295,71 @@ targets:
     configFiles:
       Debug: App/Config/Extension-Dev.xcconfig
       Release: App/Config/Extension-Dev.xcconfig
+
+  Share:
+    templates: [ShareExtensionEnvironment]
+    configFiles:
+      Debug: App/Config/Share.xcconfig
+      Release: App/Config/Share.xcconfig
+
+  "Share Staging":
+    templates: [ShareExtensionEnvironment]
+    configFiles:
+      Debug: App/Config/Share-Staging.xcconfig
+      Release: App/Config/Share-Staging.xcconfig
+
+  "Share Dev":
+    templates: [ShareExtensionEnvironment]
+    configFiles:
+      Debug: App/Config/Share-Dev.xcconfig
+      Release: App/Config/Share-Dev.xcconfig
+
+  NotificationService:
+    templates: [NotificationServiceEnvironment]
+    configFiles:
+      Debug: App/Config/NotificationService.xcconfig
+      Release: App/Config/NotificationService.xcconfig
+
+  "NotificationService Staging":
+    templates: [NotificationServiceEnvironment]
+    configFiles:
+      Debug: App/Config/NotificationService-Staging.xcconfig
+      Release: App/Config/NotificationService-Staging.xcconfig
+
+  "NotificationService Dev":
+    templates: [NotificationServiceEnvironment]
+    configFiles:
+      Debug: App/Config/NotificationService-Dev.xcconfig
+      Release: App/Config/NotificationService-Dev.xcconfig
+
+  # Logic-only unit tests for the framework-free helpers under `App/`.
+  # Sources are listed file by file rather than as the whole `App`
+  # directory, which is full of Capacitor plugins this host-less bundle
+  # cannot link. Keeps the suite to seconds, and to no app target.
+  AppTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: AppTests
+      - path: App/Attribution.swift
+      - path: App/NotificationCategories.swift
+      - path: App/LocalNotificationCoordinator.swift
+      # The Foundation-only notification helpers. The Intents rewrite stays
+      # out: donating an interaction needs a
+      # real notification, which a host-less bundle has no way to produce.
+      - path: App/Shared/AvatarCache.swift
+      - path: App/Shared/SenderPayload.swift
+      - path: App/Shared
+        includes:
+          - AppGroupID.swift
+          - BundleURLScheme.swift
+          - RecentChatsStore.swift
+          - ShareDeepLink.swift
+          - ShareInbox.swift
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: "YES"
+        PRODUCT_BUNDLE_IDENTIFIER: ai.vellum.assistant.AppTests
+    scheme:
+      testTargets:
+        - AppTests

@@ -7,6 +7,8 @@
  * memory feature (`src/memory/*`).
  */
 
+import { throwIfCancelled } from "@vellumai/plugin-api";
+
 import { getConfig, getConfigReadOnly } from "../../../config/loader.js";
 import { usesConceptPageMemory } from "../../../config/memory-v3-gate.js";
 import { RiskLevel } from "../../../permissions/types.js";
@@ -51,6 +53,8 @@ export const rememberTool = {
     context: ToolContext,
   ): Promise<ToolExecutionResult> {
     const typedInput = input as unknown as RememberInput;
+    // The append below writes the memory buffer, so a cancelled turn stops here.
+    throwIfCancelled(context);
     const result = handleRemember(
       typedInput,
       context.conversationId,
@@ -123,7 +127,7 @@ export const recallTool = {
 export const deleteMemoryPageTool = {
   name: "delete_memory_page",
   description:
-    "Delete one concept page from your memory wiki, addressed by slug (its path under `memory/concepts/` minus `.md` — e.g. `alice`, `people/alice`, `procs/git-flow`). Use during a consolidation/maintenance pass to retire a page you merged into another, renamed (write the new page, then delete the old slug), or dropped as a dead stub. Only concept pages can be deleted — the index files (`recent.md`, `essentials.md`, `threads.md`, `buffer.md`) are rewritten with file_write/file_edit, never deleted. Idempotent: deleting a slug that is already gone is not an error. The immutable archive retains buffer history, so removing a page never loses source facts.",
+    "Delete one concept page from your memory wiki, addressed by slug (its path under `memory/concepts/` minus `.md`, e.g. `alice`, `people/alice`, `procs/git-flow`). Use during a consolidation/maintenance pass to retire a page you merged into another, renamed (write the new page, then delete the old slug), or dropped as a dead stub. Only concept pages can be deleted: the index files (`recent.md`, `essentials.md`, `threads.md`) are rewritten with file_write/file_edit, never deleted, and `buffer.md` is never written by you at all; the runtime removes the entries it handed you once the pass completes. Idempotent: deleting a slug that is already gone is not an error. The immutable archive retains buffer history, so removing a page never loses source facts.",
   category: "memory",
   executionTarget: "sandbox",
   defaultRiskLevel: RiskLevel.Low,
@@ -164,10 +168,17 @@ export const deleteMemoryPageTool = {
       };
     }
 
+    throwIfCancelled(context);
+
     try {
       await deletePage(getWorkspaceDir(), slug);
       return { content: `Deleted memory page "${slug}".`, isError: false };
     } catch (err) {
+      // A cancelled turn is not a delete failure: let it reach the executor's
+      // abort handling instead of being rendered as a tool error.
+      if (context.signal?.aborted) {
+        throw err;
+      }
       return {
         content: `Error deleting memory page "${slug}": ${
           err instanceof Error ? err.message : String(err)

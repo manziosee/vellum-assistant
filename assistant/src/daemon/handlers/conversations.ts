@@ -1,5 +1,6 @@
 import { peekAcpSessionManager } from "../../acp/index.js";
-import { decideGuardianRequest } from "../../channels/gateway-guardian-requests.js";
+import { GUARDIAN_TERMINAL_REASON_SUPERSEDED } from "../../api/responses/home.js";
+import { syncTerminalGuardianRequestStatus } from "../../approvals/guardian-request-status-sync.js";
 import {
   clearAll,
   getConversation,
@@ -43,8 +44,6 @@ export function handleConfirmationResponse(msg: ConfirmationResponse): void {
     if (conversation.hasPendingConfirmation(msg.requestId)) {
       touchConversation(conversationId);
       conversation.handleConfirmationResponse(msg.requestId, decision, {
-        selectedPattern: msg.selectedPattern,
-        selectedScope: msg.selectedScope,
         emissionContext: { source: "button" },
       });
       return;
@@ -112,7 +111,9 @@ export function cancelGeneration(conversationId: string): boolean {
   // unwanted model activity after the user pressed stop. Terminal children
   // stay readable: the conversation survives the stop, and its next turn may
   // still `subagent_read` a completed child's result.
-  getSubagentManager().abortAllForParent(conversationId);
+  getSubagentManager().abortAllForParent(conversationId, undefined, {
+    userCancelled: true,
+  });
   // Cancel any in-flight ACP agent sessions this conversation spawned, for the
   // same reason: a backgrounded ACP prompt would otherwise keep running (and
   // holding a child process) past the stop and, on completion, enqueue a
@@ -506,6 +507,24 @@ export function supersedePendingInteractionsOnEnqueue(
   conversationId: string,
   enqueuedRequestId: string,
 ): void {
+  denyPendingConfirmationsOnSupersession(conversationId);
+  steerOnEnqueuedMessageIfQuestionParked(conversationId, enqueuedRequestId);
+}
+
+/**
+ * Step 1 of {@link supersedePendingInteractionsOnEnqueue} on its own: deny the
+ * confirmations the in-flight turn left pending, notify clients, and sync the
+ * gateway request status before clearing the prompter's records.
+ *
+ * Split out for the interrupt path, which aborts the running turn itself and
+ * so needs the denials without the steer. A steer works by promoting a queued
+ * message, and an interrupting message never joins the queue, so there would
+ * be nothing for it to promote; the interrupt's own abort settles a parked
+ * `ask_question` the same way a steer's does.
+ */
+export function denyPendingConfirmationsOnSupersession(
+  conversationId: string,
+): void {
   const conversation = findConversation(conversationId);
   if (!conversation) {
     return;
@@ -524,26 +543,22 @@ export function supersedePendingInteractionsOnEnqueue(
           source: "auto_deny" as const,
         });
         // Sync the gateway request so stale "pending" rows aren't matched
-        // by later guardian reply routing. Fire-and-forget from this sync
-        // path: the in-memory denial is authoritative, and a CAS miss
+        // by later guardian reply routing, and withdraw the request's
+        // delivered approval cards so no surface keeps offering a decision
+        // that can no longer resolve anything. Fire-and-forget from this
+        // sync path: the in-memory denial is authoritative, and a CAS miss
         // (already decided elsewhere) is expected and harmless.
-        void decideGuardianRequest({
-          id: interaction.requestId,
-          expectedStatus: "pending",
+        void syncTerminalGuardianRequestStatus({
+          requestId: interaction.requestId,
           status: "denied",
-        }).catch((err) => {
-          log.warn(
-            { err, requestId: interaction.requestId },
-            "Auto-deny guardian request status sync failed",
-          );
+          syncContext: "supersede-on-enqueue",
+          terminalReason: GUARDIAN_TERMINAL_REASON_SUPERSEDED,
         });
       }
     }
     conversation.denyAllPendingConfirmations();
     pendingInteractions.removeByConversation(conversationId);
   }
-
-  steerOnEnqueuedMessageIfQuestionParked(conversationId, enqueuedRequestId);
 }
 
 // ---------------------------------------------------------------------------

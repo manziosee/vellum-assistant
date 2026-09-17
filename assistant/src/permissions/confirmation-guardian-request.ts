@@ -8,7 +8,7 @@
  * generic event hub — lets the hub stay a pure pub/sub primitive with no
  * dependency on the conversation registry or guardian bridge.
  *
- * Channel guardian decisions (reactions, buttons, text) all route through the
+ * Channel guardian decisions (buttons, text) all route through the
  * guardian-request pipeline, so without this record none of them can resolve the
  * confirmation.
  *
@@ -73,10 +73,9 @@ export async function createGuardianRequestForConfirmation(
     const sourceChannel = trustContext?.sourceChannel ?? "vellum";
     const inputRecord = msg.input as Record<string, unknown>;
     const activityRaw =
-      (typeof inputRecord.activity === "string"
+      typeof inputRecord.activity === "string"
         ? inputRecord.activity
-        : undefined) ??
-      (typeof inputRecord.reason === "string" ? inputRecord.reason : undefined);
+        : undefined;
     // Tool approvals are decisionable: without a bound principal nobody could
     // ever decide them (mirrors the gateway create's integrity guard).
     const guardianPrincipalId = trustContext?.guardianPrincipalId;
@@ -135,7 +134,7 @@ export async function createGuardianRequestForConfirmation(
     if (err instanceof IntegrityError) {
       // The confirmation could not be promoted to a guardian request
       // (e.g. its trust context resolved no guardianPrincipalId). Channel
-      // guardian decisions — reactions, buttons, and text — all route through
+      // guardian decisions (buttons and text) all route through
       // the guardian-request pipeline, so without this record none of them can resolve
       // the confirmation. Surface it rather than swallowing: for a guardian's
       // own confirmation a bound principal should always be present.

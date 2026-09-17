@@ -11,8 +11,12 @@
 
 import { existsSync, rmSync } from "node:fs";
 import { mkdir, readdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 
+import {
+  computeAppSourceFingerprint,
+  writeAppSourceFingerprint,
+} from "../apps/source-fingerprint.js";
 import { getLogger } from "../util/logger.js";
 import { ensureCompilerTools } from "./compiler-tools.js";
 import {
@@ -428,6 +432,8 @@ export async function runCompile(
     };
   }
 
+  const sourceFingerprint = computeAppSourceFingerprint(appDir);
+
   // Clear stale dist/ output so removed assets (e.g. CSS) don't persist
   if (existsSync(distDir)) {
     rmSync(distDir, { recursive: true, force: true });
@@ -469,7 +475,7 @@ export async function runCompile(
   const cacheNodeModules = join(getCacheDir(), "node_modules");
   const nodePath = [preactParent, cacheNodeModules]
     .filter((p) => existsSync(p))
-    .join(":");
+    .join(delimiter);
 
   // Shell out to esbuild CLI
   const args = [
@@ -497,6 +503,7 @@ export async function runCompile(
     stdout: "pipe",
     stderr: "pipe",
     env: { ...process.env, NODE_PATH: nodePath },
+    windowsHide: true,
   });
 
   await proc.exited;
@@ -547,6 +554,15 @@ export async function runCompile(
     }
 
     await writeFile(join(distDir, "index.html"), html);
+  }
+
+  try {
+    writeAppSourceFingerprint(appDir, distDir, sourceFingerprint);
+  } catch (err) {
+    log.warn(
+      { err, appDir, distDir },
+      "Failed to write source fingerprint after compile",
+    );
   }
 
   const durationMs = Math.round(performance.now() - start);

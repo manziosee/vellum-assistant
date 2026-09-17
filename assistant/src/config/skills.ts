@@ -18,20 +18,31 @@ import {
 
 import { z } from "zod";
 
+import type { ClientOs } from "../channels/types.js";
 import { getDefaultPluginSkillRoots } from "../plugins/defaults/main.js";
 import { isPluginDisabled } from "../plugins/disabled-state.js";
 import { parseFrontmatterFields } from "../skills/frontmatter.js";
 import type { InlineCommandExpansion } from "../skills/inline-command-expansions.js";
 import { parseInlineCommandExpansions } from "../skills/inline-command-expansions.js";
+import {
+  normalizeSkillPlatforms,
+  SKILL_PLATFORM_VALUES,
+  type SkillPlatform,
+} from "../skills/platform-compatibility.js";
 import { parseToolManifestFile } from "../skills/tool-manifest.js";
 import { computeSkillVersionHash } from "../skills/version-hash.js";
 import type { OwnerInfo } from "../tools/types.js";
+import { isBunVirtualPath } from "../util/bundled-asset.js";
 import { getLogger } from "../util/logger.js";
 import {
   getWorkspaceDirDisplay,
   getWorkspacePluginsDir,
   getWorkspaceSkillsDir,
 } from "../util/platform.js";
+import {
+  hasPluginManifest,
+  readPluginManifest,
+} from "../util/plugin-manifest.js";
 import { stripCommentLines } from "../util/strip-comment-lines.js";
 import { isAssistantFeatureFlagEnabled } from "./assistant-feature-flags.js";
 import { getConfig } from "./loader.js";
@@ -50,6 +61,7 @@ const VellumMetadataSchema = z
     "avoid-when": z.array(z.string()).optional(),
     category: z.string().optional(),
     "always-candidate": z.boolean().optional(),
+    platforms: z.array(z.enum(SKILL_PLATFORM_VALUES)).optional(),
   })
   .passthrough();
 
@@ -128,6 +140,8 @@ export interface SkillSummary {
    * the model must judge, not embedding similarity.
    */
   alwaysCandidate?: boolean;
+  /** Host operating systems on which this skill may be offered and loaded. */
+  platforms?: SkillPlatform[];
   /** Parsed inline command expansion descriptors (`!\`command\``) found in the skill body. */
   inlineCommandExpansions?: InlineCommandExpansion[];
 }
@@ -184,6 +198,8 @@ export interface SkillToolEntry {
   executor: string;
   /** Where the tool script runs. */
   execution_target: "host" | "sandbox";
+  /** Client operating systems that may expose this tool. Unset means all. */
+  supported_client_os?: ClientOs[];
 }
 
 /**
@@ -209,17 +225,13 @@ export interface SkillToolManifestMeta {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-function getSkillsDir(): string {
-  return getWorkspaceSkillsDir();
-}
-
 export function getBundledSkillsDir(): string {
   const dir = import.meta.dir;
 
   // In compiled Bun binaries, import.meta.dir points into the virtual
   // /$bunfs/ filesystem where non-JS assets don't exist.  Fall back to
   // the macOS .app bundle Resources dir or next to the binary.
-  if (dir.startsWith("/$bunfs/")) {
+  if (isBunVirtualPath(dir)) {
     const execDir = dirname(process.execPath);
     // macOS .app bundle: binary is in Contents/MacOS/, resources in Contents/Resources/
     const resourcesPath = join(execDir, "..", "Resources", "bundled-skills");
@@ -238,7 +250,7 @@ export function getBundledSkillsDir(): string {
 
 // ─── Frontmatter parsing ─────────────────────────────────────────────────────
 
-interface ParsedFrontmatter {
+export interface ParsedFrontmatter {
   name: string;
   displayName: string;
   description: string;
@@ -251,6 +263,7 @@ interface ParsedFrontmatter {
   avoidWhen?: string[];
   category?: string;
   alwaysCandidate?: boolean;
+  platforms?: SkillPlatform[];
   inlineCommandExpansions?: InlineCommandExpansion[];
 }
 
@@ -265,7 +278,7 @@ function normalizeStringArray(raw: unknown): string[] | undefined {
   return result.length > 0 ? result : undefined;
 }
 
-function parseFrontmatter(
+export function parseFrontmatter(
   content: string,
   skillFilePath: string,
 ): ParsedFrontmatter | null {
@@ -373,6 +386,8 @@ function parseFrontmatter(
       ? vellum["always-candidate"]
       : undefined;
 
+  const platforms = normalizeSkillPlatforms(vellum?.platforms);
+
   const strippedBody = stripCommentLines(body);
 
   // Parse inline command expansions from the body (after frontmatter/comment stripping)
@@ -398,6 +413,7 @@ function parseFrontmatter(
     avoidWhen,
     category,
     alwaysCandidate,
+    platforms,
     inlineCommandExpansions,
   };
 }
@@ -558,6 +574,7 @@ function readSkillFromDirectory(
       avoidWhen: parsed.avoidWhen,
       category: parsed.category,
       alwaysCandidate: parsed.alwaysCandidate,
+      platforms: parsed.platforms,
       inlineCommandExpansions: parsed.inlineCommandExpansions,
     };
   } catch (err) {
@@ -614,6 +631,7 @@ function readBundledSkillFromDirectory(
       avoidWhen: parsed.avoidWhen,
       category: parsed.category,
       alwaysCandidate: parsed.alwaysCandidate,
+      platforms: parsed.platforms,
       inlineCommandExpansions: parsed.inlineCommandExpansions,
     };
   } catch (err) {
@@ -682,6 +700,7 @@ function loadBundledSkills(): SkillSummary[] {
       avoidWhen: skill.avoidWhen,
       category: skill.category,
       alwaysCandidate: skill.alwaysCandidate,
+      platforms: skill.platforms,
       inlineCommandExpansions: skill.inlineCommandExpansions,
     });
   }
@@ -715,8 +734,7 @@ function discoverSkillDirectories(skillsDir: string): string[] {
 }
 
 /**
- * Whether `pluginDir` carries a plugin manifest the runtime can load: a
- * parseable `package.json` with a non-empty string `name`. This mirrors the
+ * Whether `pluginDir` carries a plugin manifest the runtime can load. This mirrors the
  * external plugin loader (`buildPluginFromDir`), which builds a plugin from
  * any such directory and derives the plugin's identity from `package.json`
  * `name` — it imposes no match between that `name` and the directory name.
@@ -726,31 +744,20 @@ function discoverSkillDirectories(skillsDir: string): string[] {
  * requiring the two to match would silently drop the resident skills of every
  * such plugin even though the runtime loads its hooks and tools fine.
  *
- * The caller is responsible for the missing-`package.json` case (it emits a
+ * The caller is responsible for the missing-manifest case (it emits a
  * diagnostic warning); this function only judges a manifest that is present.
  */
 function hasLoadablePluginManifest(pluginDir: string): boolean {
-  const manifestPath = join(pluginDir, "package.json");
-  if (!existsSync(manifestPath)) {
-    return false;
-  }
-  let parsed: unknown;
   try {
-    parsed = JSON.parse(readFileSync(manifestPath, "utf-8"));
+    readPluginManifest(pluginDir);
+    return true;
   } catch (err) {
     log.warn(
-      { err, manifestPath },
-      "Skipping plugin dir with unparseable package.json for resident skills",
+      { err, pluginDir },
+      "Skipping plugin dir with an invalid manifest for resident skills",
     );
     return false;
   }
-  return (
-    typeof parsed === "object" &&
-    parsed !== null &&
-    "name" in parsed &&
-    typeof (parsed as { name: unknown }).name === "string" &&
-    (parsed as { name: string }).name.length > 0
-  );
 }
 
 /**
@@ -866,15 +873,15 @@ function discoverInstalledPluginResidentSkills(): SkillSummary[] {
     }
     const pluginDir = join(pluginsDir, entry.name);
 
-    // A directory under `plugins/` with no `package.json` is not a plugin the
+    // A directory under `plugins/` with no supported manifest is not a plugin the
     // runtime can load, so its skills are never surfaced. This is an easy
     // footgun — a plugin dropped in without its manifest looks installed but
     // silently contributes nothing — so warn loudly with the path rather than
     // skipping in silence, to make the misconfiguration diagnosable.
-    if (!existsSync(join(pluginDir, "package.json"))) {
+    if (!hasPluginManifest(pluginDir)) {
       log.warn(
         { pluginDir },
-        "Plugin directory is missing package.json — skipping; its skills will not be available. Add a package.json with a `name`.",
+        "Plugin directory is missing package.json and plugin.json; its skills will not be available.",
       );
       continue;
     }
@@ -972,6 +979,7 @@ function skillSummaryFromDefinition(
     avoidWhen: skill.avoidWhen,
     category: skill.category,
     alwaysCandidate: skill.alwaysCandidate,
+    platforms: skill.platforms,
     inlineCommandExpansions: skill.inlineCommandExpansions,
   };
 }
@@ -1035,6 +1043,7 @@ export function loadSkillCatalog(
             avoidWhen: parsed.avoidWhen,
             category: parsed.category,
             alwaysCandidate: parsed.alwaysCandidate,
+            platforms: parsed.platforms,
             inlineCommandExpansions: parsed.inlineCommandExpansions,
           });
         } catch (err) {
@@ -1101,7 +1110,7 @@ export function loadSkillCatalog(
   }
 
   // Load managed (user) skills, which take precedence over bundled skills with the same ID
-  const skillsDir = getSkillsDir();
+  const skillsDir = getWorkspaceSkillsDir();
   const directories = discoverSkillDirectories(skillsDir);
 
   for (const directory of directories) {
@@ -1182,6 +1191,7 @@ export function loadSkillCatalog(
           avoidWhen: parsed.avoidWhen,
           category: parsed.category,
           alwaysCandidate: parsed.alwaysCandidate,
+          platforms: parsed.platforms,
           inlineCommandExpansions: parsed.inlineCommandExpansions,
         };
 
@@ -1340,7 +1350,7 @@ function loadSkillDefinition(skill: SkillSummary): SkillLookupResult {
   } else {
     loaded = readSkillFromDirectory(
       skill.directoryPath,
-      getSkillsDir(),
+      getWorkspaceSkillsDir(),
       skill.source,
     );
   }

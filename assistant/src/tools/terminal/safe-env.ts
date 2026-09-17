@@ -5,7 +5,14 @@
  *
  * Shared by the sandbox bash tool and skill sandbox runner.
  */
-import { readdirSync } from "node:fs";
+import { readdirSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+
+import {
+  pathListDelimiter,
+  prependUniquePathEntries,
+} from "@vellumai/environments/shell";
 
 import { getGatewayInternalBaseUrl } from "../../config/env.js";
 import { getDataDir, getWorkspaceDir } from "../../util/platform.js";
@@ -47,22 +54,27 @@ export const SAFE_ENV_VARS = [
   "VELLUM_PLATFORM_URL",
   "VELLUM_ASSISTANT_PLATFORM_URL",
   "VELLUM_DOCS_BASE_URL",
+  "VELLUM_WEB_URL",
+  "VELLUM_MARKETING_URL",
   "VELLUM_MIGRATION_EXPORT_ALLOWED_HOSTS",
   "VELLUM_MIGRATION_IMPORT_ALLOWED_HOSTS",
-  "CES_CREDENTIAL_URL",
   "CES_MANAGED_MODE",
-  "CES_LOCAL_SOCKET",
+  "CES_CREDENTIAL_URL",
+  "CES_SERVICE_TOKEN",
+  // Child processes (bash, skill sandbox, scheduled scripts) reach CES
+  // over IPC via `CES_BOOTSTRAP_SOCKET_DIR`. CES HTTP credentials are
+  // forwarded so children can fail over to CES HTTP while that transport
+  // still exists.
   // Per-instance port of the assistant-managed Qdrant sidecar, so skill and
   // bash-tool subprocesses that use the vector helpers (e.g. embed/search over
   // `@vellumai/plugin-api`) resolve the same local sidecar as the daemon
-  // (127.0.0.1:<port>). `QDRANT_URL` is intentionally excluded — it flips
+  // (127.0.0.1:<port>). `QDRANT_URL` is intentionally excluded: it flips
   // QdrantManager into external mode and bypasses the local managed lifecycle.
   "QDRANT_HTTP_PORT",
   "IS_CONTAINERIZED",
   "IS_PLATFORM",
   "VELLUM_CLOUD",
   "VELLUM_SANDBOX_RUNTIME",
-  "CES_SERVICE_TOKEN",
   "VELLUM_PROFILER_RUN_ID",
   "VELLUM_PROFILER_MODE",
   "VELLUM_PROFILER_MAX_BYTES",
@@ -74,6 +86,22 @@ export const SAFE_ENV_VARS = [
   "VELLUM_MINIKUBE_STORAGE_SIZE",
   "VELLUM_BACKUP_DIR",
   "VELLUM_BACKUP_KEY_PATH",
+  // VELLUM_PLUGIN_NAME is intentionally absent. The daemon injects the
+  // owning plugin install name after sanitizing the child environment.
+  // Inheriting a parent-supplied value would let an arbitrary process
+  // claim another plugin's credential scope.
+] as const;
+
+export const WINDOWS_SAFE_ENV_VARS = [
+  "SystemRoot",
+  "COMSPEC",
+  "USERPROFILE",
+  "APPDATA",
+  "LOCALAPPDATA",
+  "TEMP",
+  "TMP",
+  "PATHEXT",
+  "SystemDrive",
 ] as const;
 
 export const KATA_SAFE_ENV_VARS = [
@@ -102,6 +130,10 @@ function isKataFamilyRuntime(runtime: string | undefined): boolean {
 
 function kataAptPaths(dataRoot: string): string[] {
   return [
+    // Shims for chroot wrapper scripts with hardcoded absolute paths must
+    // shadow the broken originals in the chroot bin dirs below (see
+    // docker-kata-apt-shims.sh).
+    `${dataRoot}/.host-shims`,
     `${dataRoot}/bin`,
     `${dataRoot}/usr/local/sbin`,
     `${dataRoot}/usr/local/bin`,
@@ -151,6 +183,69 @@ function kataPythonPaths(dataRoot: string): string[] {
   ];
 }
 
+// Bun synthesizes a `node` shim directory (<temp>/bun-node-<hash>/, holding
+// `node` and `bun` symlinks to itself) and prepends it to PATH whenever it
+// starts with no real Node on PATH. That `node` is Bun, which runs a Node CLI
+// under different semantics, so it must never shadow a real interpreter in a
+// sandbox subprocess. It stays when it is the only `node` there is: on a native
+// install (Bun only, no Node) removing it would break every `#!/usr/bin/env
+// node` CLI outright.
+function bunNodeShimParents(sourceEnv: NodeJS.ProcessEnv): string[] {
+  const roots = [
+    tmpdir(),
+    "/tmp",
+    sourceEnv.TMPDIR,
+    sourceEnv.TEMP,
+    sourceEnv.TMP,
+  ];
+  return roots
+    .filter((root): root is string => Boolean(root))
+    .map((root) => root.replace(/[\\/]+$/, ""));
+}
+
+function hasNodeExecutable(dir: string): boolean {
+  for (const name of ["node", "node.exe"]) {
+    try {
+      if (statSync(`${dir}/${name}`).isFile()) {
+        return true;
+      }
+    } catch {
+      // Entry missing or unreadable: not a Node interpreter we can use.
+    }
+  }
+  return false;
+}
+
+function stripBunNodeShimDirs(
+  value: string,
+  sourceEnv: NodeJS.ProcessEnv,
+): string {
+  const parents = bunNodeShimParents(sourceEnv);
+  const separator = pathListDelimiter();
+  const entries = value.split(separator);
+  const kept = entries.filter((entry) => {
+    const normalized = entry.replace(/[\\/]+$/, "");
+    const cut = Math.max(
+      normalized.lastIndexOf("/"),
+      normalized.lastIndexOf("\\"),
+    );
+    if (cut < 0) {
+      return true;
+    }
+    return !(
+      normalized.slice(cut + 1).startsWith("bun-node-") &&
+      parents.includes(normalized.slice(0, cut))
+    );
+  });
+  if (kept.length === entries.length) {
+    return value;
+  }
+  if (!kept.some(hasNodeExecutable)) {
+    return value;
+  }
+  return kept.join(separator);
+}
+
 /**
  * Keys that buildSanitizedEnv always injects into the returned env,
  * independent of what is present in process.env.
@@ -165,26 +260,43 @@ export const ALWAYS_INJECTED_ENV_VARS = [
 function appendUniquePathEntries(
   value: string | undefined,
   entries: readonly string[],
+  separator = pathListDelimiter(),
 ): string {
-  const parts = value ? value.split(":").filter(Boolean) : [];
+  const parts = value ? value.split(separator).filter(Boolean) : [];
   for (const entry of entries) {
     if (!parts.includes(entry)) {
       parts.push(entry);
     }
   }
-  return parts.join(":");
+  return parts.join(separator);
 }
 
-export function buildSanitizedEnv(): Record<string, string> {
+export function buildSanitizedEnv(
+  hostPlatform: NodeJS.Platform = process.platform,
+  sourceEnv: NodeJS.ProcessEnv = process.env,
+  options?: { execPath?: string },
+): Record<string, string> {
   const env: Record<string, string> = {};
-  const isKataRuntime = isKataFamilyRuntime(process.env.VELLUM_SANDBOX_RUNTIME);
+  const isKataRuntime = isKataFamilyRuntime(sourceEnv.VELLUM_SANDBOX_RUNTIME);
+  const platformVars =
+    hostPlatform === "win32" ? WINDOWS_SAFE_ENV_VARS : ([] as const);
   const safeEnvVars = isKataRuntime
-    ? [...SAFE_ENV_VARS, ...KATA_SAFE_ENV_VARS]
-    : SAFE_ENV_VARS;
+    ? [...SAFE_ENV_VARS, ...platformVars, ...KATA_SAFE_ENV_VARS]
+    : [...SAFE_ENV_VARS, ...platformVars];
 
+  const windowsEnv =
+    hostPlatform === "win32"
+      ? new Map(
+          Object.entries(sourceEnv).map(([key, value]) => [
+            key.toLowerCase(),
+            value,
+          ]),
+        )
+      : null;
   for (const key of safeEnvVars) {
-    if (process.env[key] != null) {
-      env[key] = process.env[key]!;
+    const value = windowsEnv?.get(key.toLowerCase()) ?? sourceEnv[key];
+    if (value != null) {
+      env[key] = value;
     }
   }
   if (isKataRuntime) {
@@ -207,9 +319,14 @@ export function buildSanitizedEnv(): Record<string, string> {
       env.BUN_INSTALL = `${env.HOME}/.bun`;
       env.PATH = appendUniquePathEntries(
         `${env.PYTHONUSERBASE}/bin:${env.BUN_INSTALL}/bin`,
-        env.PATH.split(":").filter(Boolean),
+        env.PATH.split(pathListDelimiter()).filter(Boolean),
       );
     }
+  }
+  // Runs after the kata entries are in place: a Node installed into the
+  // persistent apt chroot is what makes dropping Bun's shim safe there.
+  if (env.PATH != null) {
+    env.PATH = stripBunNodeShimDirs(env.PATH, sourceEnv);
   }
   // Always inject an internal gateway base for local control-plane/API calls.
   const internalGatewayBase = getGatewayInternalBaseUrl();
@@ -234,5 +351,29 @@ export function buildSanitizedEnv(): Record<string, string> {
   if (!env.LC_ALL) {
     env.LC_ALL = utf8Locale;
   }
+  prependWindowsAssistantDir(
+    env,
+    hostPlatform,
+    options?.execPath ?? process.execPath,
+  );
   return env;
+}
+
+function prependWindowsAssistantDir(
+  env: Record<string, string>,
+  hostPlatform: NodeJS.Platform,
+  execPath: string,
+): void {
+  if (hostPlatform !== "win32") {
+    return;
+  }
+  const execDir = dirname(execPath);
+  try {
+    if (!statSync(join(execDir, "assistant.exe")).isFile()) {
+      return;
+    }
+  } catch {
+    return;
+  }
+  env.PATH = prependUniquePathEntries(env.PATH, [execDir], hostPlatform);
 }

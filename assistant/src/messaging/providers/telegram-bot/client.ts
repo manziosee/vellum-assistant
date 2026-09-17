@@ -41,23 +41,3 @@ export async function getMe(botToken: string): Promise<TelegramGetMeResponse> {
 
   return resp.json() as Promise<TelegramGetMeResponse>;
 }
-
-/** Result returned by sendMessage. */
-export interface TelegramSendResult {
-  ok: boolean;
-}
-
-/**
- * Send a Telegram text message via the Bot API directly.
- *
- * Delegates to sendTelegramReply which handles text splitting (Telegram's
- * sendMessage API has a 4096-char limit per call).
- */
-export async function sendMessage(
-  chatId: string,
-  text: string,
-): Promise<TelegramSendResult> {
-  const { sendTelegramReply } = await import("./send.js");
-  await sendTelegramReply(chatId, text);
-  return { ok: true };
-}

@@ -32,7 +32,9 @@ const log = getLogger("memory-worker-routes");
 export const embeddingStatusSchema = z.object({
   enabled: z.boolean(),
   degraded: z.boolean(),
-  provider: z.enum(["local", "openai", "gemini", "ollama"]).nullable(),
+  provider: z
+    .enum(["local", "openai", "gemini", "ollama", "custom"])
+    .nullable(),
   model: z.string().nullable(),
   reason: z.string().nullable(),
 });
@@ -62,7 +64,7 @@ const statusResponseSchema = z.object({
 async function startMemoryWorker() {
   let result: { pid: number; alreadyRunning: boolean };
   try {
-    result = await spawnMemoryWorkerProcess({ detached: false });
+    result = await spawnMemoryWorkerProcess();
   } catch (err) {
     const message =
       err instanceof MemoryWorkerSpawnError || err instanceof Error

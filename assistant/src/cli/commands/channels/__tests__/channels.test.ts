@@ -9,7 +9,9 @@ import { Command } from "commander";
 let mockCalls: Array<[string, Record<string, unknown> | undefined]> = [];
 let mockResponses: unknown[] = [];
 
+const actualCliClient = await import("../../../../ipc/cli-client.js");
 mock.module("../../../../ipc/cli-client.js", () => ({
+  ...actualCliClient,
   cliIpcCall: async (method: string, params?: Record<string, unknown>) => {
     mockCalls.push([method, params]);
     return mockResponses.shift() ?? { ok: true, result: { success: true } };
@@ -87,6 +89,32 @@ describe("assistant channels", () => {
       expect(mockCalls[0][0]).toBe("channels_readiness_get");
       expect(mockCalls[0][1]).toEqual({
         queryParams: { includeRemote: "true" },
+      });
+    });
+
+    test("human list output points missing channels at plugin search", async () => {
+      mockResponses = [
+        {
+          ok: true,
+          result: { success: true, snapshots: [emptySnapshot("slack")] },
+        },
+      ];
+      const out = await runCli("channels", "list");
+      expect(out).toContain("assistant plugins search <name>");
+      expect(out).toContain("not listed");
+    });
+
+    test("json list output omits the plugin-search hint", async () => {
+      mockResponses = [
+        {
+          ok: true,
+          result: { success: true, snapshots: [emptySnapshot("slack")] },
+        },
+      ];
+      const out = await runCli("channels", "list", "--json");
+      expect(out).not.toContain("assistant plugins search");
+      expect(JSON.parse(out)).toEqual({
+        snapshots: [emptySnapshot("slack")],
       });
     });
   });

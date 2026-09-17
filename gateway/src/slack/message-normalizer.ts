@@ -43,6 +43,17 @@ type SlackMessageShape = {
   stampTeam: boolean;
   /** Reply in the message's own ts when it has no `thread_ts` (channel + app_mention). */
   fallbackThreadToTs: boolean;
+  /**
+   * Readership override for events whose surface is known without a
+   * `chatType`: an `app_mention` proves a room (mentions happen where other
+   * people are) even though Slack names no room kind for it.
+   */
+  isDirectMessage?: boolean;
+  /**
+   * The message addresses the assistant by name. Slack proves it by sending
+   * the event as an `app_mention`; a plain `message` states nothing.
+   */
+  botMentioned?: boolean;
 };
 
 /**
@@ -110,6 +121,7 @@ function buildNormalizedSlackMessage(
       sourceChannel: "slack",
       receivedAt: new Date().toISOString(),
       message: {
+        eventKind: "message",
         content,
         conversationExternalId: channel,
         externalMessageId,
@@ -125,6 +137,17 @@ function buildNormalizedSlackMessage(
         updateId: eventId,
         messageId: event.ts,
         ...(shape.chatType ? { chatType: shape.chatType } : {}),
+        // A Slack `im` has one human reader; `channel` and `mpim` have many,
+        // and an app_mention proves a room without naming its kind. Stated
+        // only where the surface is proven, never guessed.
+        ...(shape.isDirectMessage !== undefined
+          ? { isDirectMessage: shape.isDirectMessage }
+          : shape.chatType
+            ? { isDirectMessage: shape.chatType === "im" }
+            : {}),
+        ...(shape.botMentioned !== undefined
+          ? { botMentioned: shape.botMentioned }
+          : {}),
         ...(() => {
           const conversationType = slackConversationVisibility(
             channel,
@@ -351,7 +374,12 @@ export function normalizeSlackAppMention(
     routing,
     msg.channel,
     msg.user,
-    { stampTeam: true, fallbackThreadToTs: true },
+    {
+      stampTeam: true,
+      fallbackThreadToTs: true,
+      isDirectMessage: false,
+      botMentioned: true,
+    },
     botToken,
     renderContext,
   );

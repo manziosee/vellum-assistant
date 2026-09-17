@@ -1,12 +1,14 @@
 import { AlertCircle, EllipsisVertical } from "lucide-react";
 
+import { actionMenuDestructiveClasses } from "@vellumai/design-library/components/action-menu";
 import { Button } from "@vellumai/design-library/components/button";
 import { ListRow } from "@vellumai/design-library/components/list-row";
 import { Menu } from "@vellumai/design-library/components/menu";
 import { Tag } from "@vellumai/design-library/components/tag";
 import { Tooltip } from "@vellumai/design-library/components/tooltip";
 
-import { resolveModelDisplayName } from "@/domains/settings/ai/model-display";
+import { catalogModelSupportsText } from "@/assistant/llm-model-catalog";
+import { resolveModelDisplayName } from "@/assistant/model-display";
 import { useTranslation } from "@/i18n";
 import type {
   InferenceProfileSummary,
@@ -181,7 +183,9 @@ export function ProfileRow({
               <Menu.Item onSelect={onOpen}>
                 {isManaged ? t("profileRow.view") : t("profileRow.edit")}
               </Menu.Item>
-              {!isActiveProfile && !isDisabled ? (
+              {!isActiveProfile &&
+              !isDisabled &&
+              catalogModelSupportsText(profile.provider, profile.model) ? (
                 <Menu.Item onSelect={onMakeActive}>
                   {t("profileRow.makeDefault")}
                 </Menu.Item>
@@ -200,7 +204,7 @@ export function ProfileRow({
               {!isManaged ? (
                 <Menu.Item
                   onSelect={onDelete}
-                  className="text-[var(--system-negative-strong)] data-[highlighted]:text-[var(--system-negative-strong)]"
+                  className={actionMenuDestructiveClasses.anchored}
                 >
                   {t("profileRow.delete")}
                 </Menu.Item>

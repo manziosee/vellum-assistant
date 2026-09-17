@@ -6,19 +6,35 @@
  */
 import { randomUUID } from "node:crypto";
 
-import { and, desc, eq, inArray, notInArray } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, notInArray } from "drizzle-orm";
 import { z } from "zod";
 
+import {
+  acpAuthMarkerStillCurrent,
+  MARKER_SCAN_LIMIT,
+} from "../../acp/acp-auth-marker-store.js";
 import { resolveAgentWithAutoInstall } from "../../acp/auto-install.js";
 import { getAcpSessionManager } from "../../acp/index.js";
-import { prepareAgentEnv } from "../../acp/prepare-agent-env.js";
+import {
+  prepareAgentEnv,
+  resolvedClaudeCredentialDigest,
+} from "../../acp/prepare-agent-env.js";
 import { formatResolveFailure } from "../../acp/resolve-agent.js";
 import {
   AcpResumeError,
   AcpSessionNotFoundError,
 } from "../../acp/session-manager.js";
-import type { AcpSessionState } from "../../acp/types.js";
-import type { AssistantEvent } from "../../api/index.js";
+import {
+  type AcpSessionSnapshot,
+  listAcpSessionSnapshots,
+  snapshotHistoryRow,
+  withCurrentAuthMarkers,
+} from "../../acp/session-snapshot.js";
+import { isLiveAcpStatus } from "../../acp/types.js";
+import {
+  AcpSessionModelUpdateEventSchema,
+  type AssistantEvent,
+} from "../../api/index.js";
 import { getConfig } from "../../config/loader.js";
 import { createGuardianRequestForConfirmation } from "../../permissions/confirmation-guardian-request.js";
 import type { UserDecision } from "../../permissions/types.js";
@@ -46,6 +62,10 @@ const log = getLogger("acp-routes");
 const DEFAULT_SESSION_LIMIT = 50;
 const MAX_SESSION_LIMIT = 500;
 
+/** The option shape the `acp_session_model_update` event already publishes. */
+const acpModelOptionsSchema =
+  AcpSessionModelUpdateEventSchema.shape.availableModels;
+
 const sessionEntrySchema = z.object({
   id: z.string(),
   agentId: z.string(),
@@ -58,6 +78,18 @@ const sessionEntrySchema = z.object({
   stopReason: z.string().nullable().optional(),
   task: z.string().optional(),
   parentToolUseId: z.string().optional(),
+  /** Credential failure that ended the run, when one did. Drives the inline
+   *  Connect card on reopen; cleared when a replacement token is stored. */
+  authErrorCode: z.string().optional(),
+  /** Model a live session is running on. Absent for history rows, which have
+   *  no live process to ask. */
+  model: z.string().optional(),
+  /** Models a live session could run on. Absent for history rows. */
+  availableModels: acpModelOptionsSchema.optional(),
+  /** Scopes live model revisions to one assistant process. */
+  modelRevisionEpoch: z.string().uuid().optional(),
+  /** Orders live model state within `modelRevisionEpoch`. */
+  modelRevision: z.number().int().nonnegative().optional(),
   usedTokens: z.number().optional(),
   contextSize: z.number().optional(),
   costAmount: z.number().optional(),
@@ -68,6 +100,27 @@ const sessionEntrySchema = z.object({
 });
 
 type SessionEntry = z.infer<typeof sessionEntrySchema>;
+
+/**
+ * A merged session before its marker has been judged.
+ *
+ * `authErrorCredential` names the credential the failure was refused on. It is
+ * what the comparison needs and is dropped before the response goes out: a
+ * client has no use for it and no way to resolve the other side of the
+ * comparison, so serving it would only widen what leaves the daemon.
+ */
+type MergedSession = AcpSessionSnapshot;
+
+/** Drop internal snapshot metadata before the session goes out on the wire. */
+function stripMarkerCredential({
+  authErrorCredential: _credential,
+  source: _source,
+  resumable: _resumable,
+  cwd: _cwd,
+  ...session
+}: MergedSession): SessionEntry {
+  return session;
+}
 
 // ---------------------------------------------------------------------------
 // Handlers
@@ -176,7 +229,7 @@ function awaitRouteApproval(args: {
     broadcastMessage(confirmationMsg, conversationId);
 
     // Promote the confirmation to a guardian request so channel
-    // guardian decisions (reactions, buttons, text) can resolve it.
+    // guardian decisions (buttons, text) can resolve it.
     void createGuardianRequestForConfirmation(confirmationMsg, conversationId);
   });
 }
@@ -186,9 +239,13 @@ async function spawnSession({ body, abortSignal }: RouteHandlerArgs) {
   const task = body?.task as string | undefined;
   const conversationId = body?.conversationId as string | undefined;
   const cwd = (body?.cwd as string | undefined) ?? process.cwd();
+  const model = body?.model ?? undefined;
 
   if (!agent || !task || !conversationId) {
     throw new BadRequestError("agent, task, and conversationId are required");
+  }
+  if (model !== undefined && typeof model !== "string") {
+    throw new BadRequestError("model must be a string when provided");
   }
 
   // High-risk approval gate. Block BEFORE any side effects — resolution can
@@ -196,7 +253,12 @@ async function spawnSession({ body, abortSignal }: RouteHandlerArgs) {
   // launches the host subprocess — so an unapproved request mutates nothing.
   const decision = await awaitRouteApproval({
     toolName: "acp_spawn",
-    input: { agent, task, cwd },
+    input: {
+      agent,
+      task,
+      cwd,
+      ...(model !== undefined ? { model } : {}),
+    },
     conversationId,
     signal: abortSignal,
   });
@@ -234,17 +296,33 @@ async function spawnSession({ body, abortSignal }: RouteHandlerArgs) {
   );
 
   const manager = getAcpSessionManager();
-  const { acpSessionId, protocolSessionId } = await manager.spawn(
+  const {
+    acpSessionId,
+    protocolSessionId,
+    requestedModel,
+    effectiveModel,
+    modelWarning,
+  } = await manager.spawn(
     agent,
     agentConfig,
     task,
     cwd,
     conversationId,
     broadcastMessage,
+    { model },
   );
 
   log.info({ acpSessionId, protocolSessionId, agent }, "ACP spawn succeeded");
-  return { acpSessionId, protocolSessionId, agent };
+  // A refused model is a warning, not a failed spawn: the session is live on
+  // the agent's own model.
+  return {
+    acpSessionId,
+    protocolSessionId,
+    agent,
+    requestedModel: requestedModel ?? null,
+    effectiveModel: effectiveModel ?? null,
+    ...(modelWarning ? { modelWarning } : {}),
+  };
 }
 
 async function steerSession({ pathParams, body }: RouteHandlerArgs) {
@@ -424,11 +502,71 @@ function closeSession({ pathParams }: RouteHandlerArgs) {
   return { acpSessionId: id, closed: true };
 }
 
-function listSessions({ queryParams }: RouteHandlerArgs) {
+async function listSessions({ queryParams }: RouteHandlerArgs) {
   const limit = parseLimit(queryParams?.limit);
   const conversationId = queryParams?.conversationId;
-  const sessions = listMergedSessions({ limit, conversationId });
-  return { sessions };
+  // Resolved per agent, because precedence is per agent: one alias can carry a
+  // configured token while another falls through to the vault. Memoised across
+  // the request, since each resolution costs a vault read and a conversation's
+  // marked runs are nearly always one agent.
+  const resolvedByAgent = new Map<string, string | undefined>();
+  const resolvedFor = async (agentId: string) => {
+    if (!resolvedByAgent.has(agentId)) {
+      resolvedByAgent.set(
+        agentId,
+        await resolvedClaudeCredentialDigest(agentId),
+      );
+    }
+    return resolvedByAgent.get(agentId);
+  };
+
+  const { sessions: merged, sawEveryHistoryRow } = listAcpSessionSnapshots({
+    limit,
+    conversationId,
+  });
+  // Judged before paging, never after. A stale marker that escaped the page
+  // first would stay in the response as an ordinary row once its code was
+  // struck, so the retained markers would pile up past the limit.
+  const judged = await withCurrentMarkersOnly(merged, resolvedFor);
+  const page = judged.slice(0, limit);
+  if (!conversationId || page.some((s) => s.authErrorCode !== undefined)) {
+    return { sessions: page };
+  }
+  // Rows the page cut that are already in hand. In-memory sessions merge in on
+  // top of the history read, so the merged list can overflow the page even
+  // when the query reached the end of the table, and the marker the client
+  // needs can be sitting in that overflow. Newest-first, so the first match is
+  // the one to surface.
+  const overflowMarker = judged
+    .slice(limit)
+    .find((s) => s.authErrorCode !== undefined);
+  if (overflowMarker) {
+    return { sessions: [...page, overflowMarker] };
+  }
+  if (sawEveryHistoryRow) {
+    // Every row this conversation has has now been looked at, page and
+    // overflow alike, so a marker elsewhere is not a thing that exists. Most
+    // conversations have never had a credential failure, and this is what
+    // keeps the lookup off their path rather than asking the database to
+    // confirm the absence every time.
+    return { sessions: page };
+  }
+  // The page holds no live marker, so the row a client restores the card from
+  // is either outside it or absent. One row, fetched only now, rather than
+  // every marked row loaded on the chance one of them is needed.
+  const marker = await findRecoveryMarker(conversationId, resolvedFor);
+  if (!marker || page.some((s) => s.id === marker.id)) {
+    return { sessions: page };
+  }
+  return { sessions: [...page, stripMarkerCredential(marker)] };
+}
+
+async function withCurrentMarkersOnly(
+  sessions: MergedSession[],
+  resolvedFor: (agentId: string) => Promise<string | undefined>,
+): Promise<SessionEntry[]> {
+  const judged = await withCurrentAuthMarkers(sessions, resolvedFor);
+  return judged.map(stripMarkerCredential);
 }
 
 function bulkDeleteSessions({ queryParams }: RouteHandlerArgs) {
@@ -469,10 +607,7 @@ function deleteSession({ pathParams }: RouteHandlerArgs) {
 
   try {
     const state = manager.getStatus(id);
-    if (
-      !Array.isArray(state) &&
-      (state.status === "running" || state.status === "initializing")
-    ) {
+    if (!Array.isArray(state) && isLiveAcpStatus(state.status)) {
       throw new ConflictError(
         `ACP session "${id}" is still ${state.status}. Cancel or close it before deleting.`,
       );
@@ -521,11 +656,32 @@ export const ROUTES: RouteDefinition[] = [
       task: z.string().describe("Task description"),
       conversationId: z.string(),
       cwd: z.string().describe("Working directory").optional(),
+      model: z
+        .string()
+        .optional()
+        .describe("Optional model id or alias to request for the session."),
     }),
     responseBody: z.object({
       acpSessionId: z.string(),
       protocolSessionId: z.string(),
       agent: z.string(),
+      requestedModel: z
+        .string()
+        .nullable()
+        .describe("The model explicitly requested for this spawn, if any."),
+      effectiveModel: z
+        .string()
+        .nullable()
+        .describe(
+          "The top-level session model reported by the ACP adapter, if any.",
+        ),
+      modelWarning: z
+        .string()
+        .optional()
+        .describe(
+          "Why the requested model was not applied. The session is running " +
+            "on the agent's own model.",
+        ),
     }),
   },
   {
@@ -701,99 +857,68 @@ function parseLimit(raw: string | null | undefined): number {
   return Math.min(Math.floor(n), MAX_SESSION_LIMIT);
 }
 
-function listMergedSessions(opts: {
-  limit: number;
-  conversationId?: string;
-}): SessionEntry[] {
-  const manager = getAcpSessionManager();
-  const inMemory = manager.getStatus() as AcpSessionState[];
-
-  const merged = new Map<string, SessionEntry>();
-  for (const s of inMemory) {
-    if (opts.conversationId && s.parentConversationId !== opts.conversationId) {
-      continue;
-    }
-    merged.set(s.id, {
-      id: s.id,
-      agentId: s.agentId,
-      acpSessionId: s.acpSessionId,
-      parentConversationId: s.parentConversationId,
-      status: s.status,
-      startedAt: s.startedAt,
-      completedAt: s.completedAt ?? null,
-      error: s.error ?? null,
-      stopReason: s.stopReason ?? null,
-      task: s.task,
-      parentToolUseId: s.parentToolUseId,
-      usedTokens: s.latestUsage?.usedTokens,
-      contextSize: s.latestUsage?.contextSize,
-      costAmount: s.latestUsage?.costAmount,
-      costCurrency: s.latestUsage?.costCurrency,
-      inputTokens: s.latestUsage?.inputTokens,
-      outputTokens: s.latestUsage?.outputTokens,
-      eventLog: manager.getBufferedUpdates(s.id),
-    });
-  }
-
+/**
+ * Reach past the page for the one marked run a client would restore the card
+ * from, when the page itself holds none.
+ *
+ * Paging it out is the difference between a user having a way back to auth and
+ * not: a conversation with more recent runs than the page holds would
+ * otherwise hide the one row that matters.
+ *
+ * Asks the database for that row rather than filtering one that was loaded.
+ * Nothing clears a marker, so repeated failures against a credential that is
+ * still current accumulate them, and loading every marked row would pull a
+ * full event log apiece into memory to parse and then discard. This reads the
+ * credential of each marked row (a column, no event log), resolves what its
+ * agent would use now, and only then loads the single row that wins.
+ *
+ * Bounded by the number of distinct agents a conversation has failed under,
+ * which is one in practice, rather than by how often it has failed.
+ */
+async function findRecoveryMarker(
+  conversationId: string,
+  resolvedFor: (agentId: string) => Promise<string | undefined>,
+): Promise<MergedSession | undefined> {
   const db = getDb();
-  const baseQuery = db.select().from(acpSessionHistory);
-  const filtered = opts.conversationId
-    ? baseQuery.where(
-        eq(acpSessionHistory.parentConversationId, opts.conversationId),
-      )
-    : baseQuery;
-  // Fetch only enough rows to fill the requested page after merging with
-  // in-memory sessions. In-memory entries take precedence on id collision,
-  // so we pad by the count that survived the conversation filter to
-  // guarantee we still surface `limit` distinct rows even when every
-  // in-memory session shadows a DB row — without over-fetching when many
-  // unrelated sessions are in memory.
-  const historyRows = filtered
+  // One ordered read of the newest markers, then the answer is decided in
+  // memory. Filtering by agent and credential in SQL meant the planner could
+  // only seek to the conversation and then walk its marked history looking for
+  // a match, so a run of failures against a replaced credential put that walk
+  // back on every snapshot. This shape is the one the index serves: seek,
+  // read in order, stop.
+  const markers = db
+    .select({
+      id: acpSessionHistory.id,
+      agentId: acpSessionHistory.agentId,
+      credential: acpSessionHistory.authErrorCredential,
+    })
+    .from(acpSessionHistory)
+    .where(
+      and(
+        eq(acpSessionHistory.parentConversationId, conversationId),
+        isNotNull(acpSessionHistory.authErrorCode),
+      ),
+    )
     .orderBy(desc(acpSessionHistory.startedAt))
-    .limit(opts.limit + merged.size)
+    .limit(MARKER_SCAN_LIMIT)
     .all();
 
-  for (const row of historyRows) {
-    if (merged.has(row.id)) {
-      continue;
+  for (const marker of markers) {
+    if (
+      acpAuthMarkerStillCurrent(
+        marker.credential,
+        await resolvedFor(marker.agentId),
+      )
+    ) {
+      // Newest-first, so the first match is the one a client would restore
+      // from. Only now is the full row worth loading, by primary key.
+      const row = db
+        .select()
+        .from(acpSessionHistory)
+        .where(eq(acpSessionHistory.id, marker.id))
+        .get();
+      return row ? snapshotHistoryRow(row) : undefined;
     }
-    let eventLog: unknown[] = [];
-    try {
-      const parsed = JSON.parse(row.eventLogJson) as unknown;
-      if (Array.isArray(parsed)) {
-        eventLog = parsed;
-      }
-    } catch (err) {
-      log.warn(
-        { id: row.id, err },
-        "Failed to parse event_log_json for ACP session history row",
-      );
-    }
-    // Rows predating the usage migration carry NULLs for these columns and
-    // degrade to undefined.
-    merged.set(row.id, {
-      id: row.id,
-      agentId: row.agentId,
-      acpSessionId: row.acpSessionId,
-      parentConversationId: row.parentConversationId,
-      status: row.status,
-      startedAt: row.startedAt,
-      completedAt: row.completedAt,
-      error: row.error,
-      stopReason: row.stopReason,
-      task: row.task ?? undefined,
-      parentToolUseId: row.parentToolUseId ?? undefined,
-      usedTokens: row.usedTokens ?? undefined,
-      contextSize: row.contextSize ?? undefined,
-      costAmount: row.costAmount ?? undefined,
-      costCurrency: row.costCurrency ?? undefined,
-      inputTokens: row.inputTokens ?? undefined,
-      outputTokens: row.outputTokens ?? undefined,
-      eventLog,
-    });
   }
-
-  return Array.from(merged.values())
-    .sort((a, b) => b.startedAt - a.startedAt)
-    .slice(0, opts.limit);
+  return undefined;
 }

@@ -10,6 +10,30 @@ import { migrateProviderBaseUrl, seedProviders } from "./oauth-store.js";
 const STALE_GOOGLE_BASE_URL = "https://gmail.googleapis.com/gmail/v1/users/me";
 
 /**
+ * The hosts a Slack credential may be sent to, shared by the person-identity
+ * `slack` provider and the `slack_channel` bot: both read messages, and a file
+ * shared in a message is fetched from the file object's `url_private`,
+ * `url_private_download`, or `thumb_*` URL on `files.slack.com` with the same
+ * Bearer token as the Web API. Slack documents that one file host by name.
+ */
+const SLACK_PROVIDER_INJECTION_TEMPLATES: NonNullable<
+  (typeof PROVIDER_SEED_DATA)[string]["injectionTemplates"]
+> = [
+  {
+    hostPattern: "slack.com",
+    injectionType: "header",
+    headerName: "Authorization",
+    valuePrefix: "Bearer ",
+  },
+  {
+    hostPattern: "files.slack.com",
+    injectionType: "header",
+    headerName: "Authorization",
+    valuePrefix: "Bearer ",
+  },
+];
+
+/**
  * Protocol-level seed data for each well-known OAuth provider.
  *
  * These values are upserted into the `oauth_providers` SQLite table on
@@ -66,6 +90,13 @@ export const PROVIDER_SEED_DATA: Record<
     }>;
     appType?: string;
     setupNotes?: string[];
+    /**
+     * Per-tenant providers only: the host the user supplies at connect time,
+     * which the platform substitutes into `{tenant_host}` URL placeholders.
+     * `pattern` mirrors the platform registry's validation so clients can
+     * reject a malformed host before the request leaves the browser.
+     */
+    tenantHost?: { pattern: string; label: string; placeholder: string };
     identityUrl?: string;
     identityMethod?: string;
     identityHeaders?: Record<string, string>;
@@ -73,6 +104,14 @@ export const PROVIDER_SEED_DATA: Record<
     identityResponsePaths?: string[];
     identityFormat?: string;
     identityOkField?: string;
+    /**
+     * Dot path of the boolean the provider's API puts in every response body
+     * to report success (Slack: `ok`). Ping and the authenticated-request
+     * doors read an explicit `false` under a 2xx as a failed call, since such
+     * a provider hides refusals behind a successful status. Distinct from
+     * `identityOkField`, which governs only the identity call.
+     */
+    responseOkField?: string;
     featureFlag?: string;
     logoUrl?: string;
   }
@@ -92,7 +131,7 @@ export const PROVIDER_SEED_DATA: Record<
     // base URL override (see GMAIL_API_BASE_URL) for their short paths.
     baseUrl: "https://www.googleapis.com",
     displayLabel: "Google",
-    description: "Gmail, Calendar, Drive, and Contacts",
+    description: "Gmail, Calendar, Drive, Docs, Sheets, Slides, and Contacts",
     dashboardUrl: "https://console.cloud.google.com/apis/credentials",
     clientIdPlaceholder: "123456789.apps.googleusercontent.com",
     logoUrl: "https://cdn.simpleicons.org/google",
@@ -137,6 +176,20 @@ export const PROVIDER_SEED_DATA: Record<
         headerName: "Authorization",
         valuePrefix: "Bearer ",
       },
+      // The Sheets and Slides APIs accept the auth/drive scope, so the
+      // existing token covers them; only the hosts need injection entries.
+      {
+        hostPattern: "sheets.googleapis.com",
+        injectionType: "header",
+        headerName: "Authorization",
+        valuePrefix: "Bearer ",
+      },
+      {
+        hostPattern: "slides.googleapis.com",
+        injectionType: "header",
+        headerName: "Authorization",
+        valuePrefix: "Bearer ",
+      },
       {
         hostPattern: "tasks.googleapis.com",
         injectionType: "header",
@@ -169,6 +222,13 @@ export const PROVIDER_SEED_DATA: Record<
     clientIdPlaceholder: null,
     logoUrl:
       "https://cdn.jsdelivr.net/gh/glincker/thesvg@main/public/icons/slack/default.svg",
+    // Sent as the bot `scope` parameter on the same authorize request. This
+    // flow persists the `authed_user` token and stores `authed_user.scope` as
+    // `grantedScopes`; credential health measures that grant against
+    // `user_scope` below, never against this list, so a scope the stored
+    // token needs belongs in `user_scope`. The wider bot set belongs to Socket
+    // Mode installs, which verify the live `x-oauth-scopes` header against
+    // SLACK_REQUIRED_BOT_SCOPES in channel-readiness-service.ts.
     defaultScopes: [
       "channels:join",
       "channels:read",
@@ -186,22 +246,25 @@ export const PROVIDER_SEED_DATA: Record<
       "reactions:write",
     ],
     availableScopes: "https://api.slack.com/scopes",
+    // Carries write scopes because the persisted `authed_user` token is the
+    // only credential this flow stores, so it acts as the installer for every
+    // call including `chat.postMessage`. The manifest's user list is read-only
+    // instead, since a Socket Mode install keeps a bot token beside it.
+    // `files:read` is what lets that token fetch a file shared in a message
+    // from files.slack.com. Credential health measures every stored grant
+    // against this list, so a scope added here reports each existing
+    // connection as `missing_scopes` until it reconnects: that is how a newly
+    // required scope reaches an install.
     authorizeParams: {
       user_scope:
-        "channels:read,channels:history,groups:read,groups:history,im:read,im:history,im:write,mpim:read,mpim:history,users:read,chat:write,search:read,reactions:write",
+        "channels:read,channels:history,groups:read,groups:history,im:read,im:history,im:write,mpim:read,mpim:history,users:read,chat:write,search:read,reactions:write,files:read",
     },
     loopbackPort: 17322,
-    injectionTemplates: [
-      {
-        hostPattern: "slack.com",
-        injectionType: "header",
-        headerName: "Authorization",
-        valuePrefix: "Bearer ",
-      },
-    ],
+    injectionTemplates: SLACK_PROVIDER_INJECTION_TEMPLATES,
     appType: "Slack App",
     identityUrl: "https://slack.com/api/auth.test",
     identityOkField: "ok",
+    responseOkField: "ok",
     identityResponsePaths: ["user", "team"],
     identityFormat: "@${user} (${team})",
   },
@@ -670,6 +733,268 @@ export const PROVIDER_SEED_DATA: Record<
     identityResponsePaths: ["email", "preferred_username"],
   },
 
+  monday: {
+    provider: "monday",
+    authorizeUrl: "https://auth.monday.com/oauth2/authorize",
+    tokenExchangeUrl: "https://auth.monday.com/oauth2/token",
+    pingUrl: "https://api.monday.com/v2",
+    pingMethod: "POST",
+    pingHeaders: { "Content-Type": "application/json" },
+    pingBody: { query: "{ me { id name email } }" },
+    baseUrl: "https://api.monday.com",
+    displayLabel: "monday.com",
+    description: "Boards, items, docs, and updates",
+    dashboardUrl: "https://auth.monday.com/apps",
+    clientIdPlaceholder: null,
+    // Simple Icons does not host a monday.com mark (both `monday` and
+    // `mondaydotcom` 404 on the CDN), so use the documented thesvg fallback.
+    logoUrl:
+      "https://cdn.jsdelivr.net/gh/glincker/thesvg@main/public/icons/monday/default.svg",
+    // monday tokens do not expire under the legacy OAuth flow and no refresh
+    // token is issued, so there is no refreshUrl. The newer OAuth 2.1 flow
+    // adds expiry/refresh/revocation but is opt-in per app version in the
+    // Developer Center and posts JSON (not form-encoded) credentials, so it
+    // is deliberately not used here.
+    defaultScopes: [
+      "me:read",
+      "account:read",
+      "users:read",
+      "teams:read",
+      "workspaces:read",
+      "boards:read",
+      "boards:write",
+      "docs:read",
+      "updates:read",
+      "updates:write",
+      "assets:read",
+      "tags:read",
+      "notifications:write",
+    ],
+    availableScopes: [
+      { scope: "me:read", description: "Read the user's profile information" },
+      {
+        scope: "account:read",
+        description: "Read general information about the account",
+      },
+      {
+        scope: "users:read",
+        description: "Read profile information of the account's users",
+      },
+      {
+        scope: "users:write",
+        description: "Modify profile information of the account's users",
+      },
+      {
+        scope: "teams:read",
+        description: "Read information about the account's teams",
+      },
+      { scope: "teams:write", description: "Modify the account's teams" },
+      {
+        scope: "workspaces:read",
+        description: "Read a user's workspaces data",
+      },
+      {
+        scope: "workspaces:write",
+        description: "Modify a user's workspaces data",
+      },
+      { scope: "boards:read", description: "Read a user's board data" },
+      { scope: "boards:write", description: "Modify a user's board data" },
+      { scope: "docs:read", description: "Read a user's docs" },
+      { scope: "docs:write", description: "Modify a user's docs" },
+      {
+        scope: "updates:read",
+        description: "Read updates and replies the user can see",
+      },
+      {
+        scope: "updates:write",
+        description: "Post or edit updates on behalf of the user",
+      },
+      {
+        scope: "assets:read",
+        description: "Read data from assets the user has access to",
+      },
+      { scope: "tags:read", description: "Read the account's tags" },
+      {
+        scope: "notifications:write",
+        description: "Send notifications on behalf of the user",
+      },
+      {
+        scope: "webhooks:read",
+        description: "Read existing webhooks configuration",
+      },
+      {
+        scope: "webhooks:write",
+        description: "Create and modify webhooks",
+      },
+      {
+        scope: "departments:read",
+        description: "Read the account's department data",
+      },
+      {
+        scope: "departments:write",
+        description: "Modify the account's departments",
+      },
+    ],
+    tokenEndpointAuthMethod: "client_secret_post",
+    // 17337/17338 are taken by eventbrite/calendly (all three providers
+    // landed in parallel and independently picked the next free port at the
+    // time); 17339 is the real next-free slot once all three are seeded
+    // together.
+    loopbackPort: 17339,
+    managedServiceConfigKey: "monday-oauth",
+    injectionTemplates: [
+      {
+        hostPattern: "api.monday.com",
+        injectionType: "header",
+        headerName: "Authorization",
+        valuePrefix: "Bearer ",
+      },
+    ],
+    appType: "App",
+    identityUrl: "https://api.monday.com/v2",
+    identityMethod: "POST",
+    identityHeaders: { "Content-Type": "application/json" },
+    identityBody: { query: "{ me { id name email } }" },
+    identityResponsePaths: ["data.me.name", "data.me.email"],
+    featureFlag: "monday-oauth",
+  },
+
+  eventbrite: {
+    provider: "eventbrite",
+    authorizeUrl: "https://www.eventbrite.com/oauth/authorize",
+    tokenExchangeUrl: "https://www.eventbrite.com/oauth/token",
+    refreshUrl: "https://www.eventbrite.com/oauth/token",
+    pingUrl: "https://www.eventbriteapi.com/v3/users/me/",
+    baseUrl: "https://www.eventbriteapi.com",
+    displayLabel: "Eventbrite",
+    description: "Events, attendees, and ticket orders",
+    dashboardUrl: "https://www.eventbrite.com/platform/api-keys/",
+    clientIdPlaceholder: null,
+    // Simple Icons does not host an Eventbrite mark (cdn.simpleicons.org
+    // 404s), so use the documented thesvg fallback.
+    logoUrl:
+      "https://cdn.jsdelivr.net/gh/glincker/thesvg@main/public/icons/eventbrite/default.svg",
+    // Eventbrite has no granular OAuth scope system: an access token carries
+    // the full permissions of the user who authorized it, and the authorize
+    // endpoint ignores a `scope` parameter. Seed an empty set rather than
+    // inventing scope strings the provider would silently drop (same shape
+    // as Notion).
+    defaultScopes: [],
+    tokenEndpointAuthMethod: "client_secret_post",
+    loopbackPort: 17337,
+    managedServiceConfigKey: "eventbrite-oauth",
+    injectionTemplates: [
+      {
+        hostPattern: "www.eventbriteapi.com",
+        injectionType: "header",
+        headerName: "Authorization",
+        valuePrefix: "Bearer ",
+      },
+    ],
+    appType: "App",
+    identityUrl: "https://www.eventbriteapi.com/v3/users/me/",
+    identityResponsePaths: ["name", "first_name"],
+  },
+
+  calendly: {
+    provider: "calendly",
+    authorizeUrl: "https://auth.calendly.com/oauth/authorize",
+    tokenExchangeUrl: "https://auth.calendly.com/oauth/token",
+    pingUrl: "https://api.calendly.com/users/me",
+    baseUrl: "https://api.calendly.com",
+    displayLabel: "Calendly",
+    description: "Scheduling links and meetings",
+    dashboardUrl: "https://calendly.com/integrations/api_webhooks",
+    clientIdPlaceholder: null,
+    logoUrl: "https://cdn.simpleicons.org/calendly",
+    // A :write scope implicitly grants the matching :read in the same domain,
+    // so the baseline stays at the six that map to reading schedule data and
+    // creating bookings/links. Organization-wide visibility is opt-in.
+    defaultScopes: [
+      "users:read",
+      "event_types:read",
+      "scheduled_events:read",
+      "availability:read",
+      "scheduled_events:write",
+      "scheduling_links:write",
+    ],
+    availableScopes: [
+      { scope: "users:read", description: "Read the connected user's profile" },
+      {
+        scope: "event_types:read",
+        description: "Read event types and their available times",
+      },
+      {
+        scope: "event_types:write",
+        description: "Create and update event types",
+      },
+      {
+        scope: "scheduled_events:read",
+        description: "Read scheduled events and invitees",
+      },
+      {
+        scope: "scheduled_events:write",
+        description: "Create invitees, cancel events, mark no-shows",
+      },
+      {
+        scope: "availability:read",
+        description: "Read busy times and availability schedules",
+      },
+      {
+        scope: "availability:write",
+        description: "Update event type availability",
+      },
+      {
+        scope: "scheduling_links:write",
+        description: "Create single-use scheduling links",
+      },
+      {
+        scope: "shares:write",
+        description: "Create customized single-use scheduling links",
+      },
+      {
+        scope: "organizations:read",
+        description: "Read organization data and memberships",
+      },
+      {
+        scope: "groups:read",
+        description: "Read group details and relationships",
+      },
+      {
+        scope: "webhooks:read",
+        description: "Read webhook subscriptions",
+      },
+      {
+        scope: "webhooks:write",
+        description: "Create and delete webhook subscriptions",
+      },
+      { scope: "contacts:read", description: "Read contact details" },
+      {
+        scope: "contacts:write",
+        description: "Create, update, and delete contacts",
+      },
+    ],
+    tokenEndpointAuthMethod: "client_secret_basic",
+    // 17337 is taken by eventbrite (both providers landed in parallel and
+    // independently picked the next free port at the time); 17338 is the
+    // real next-free slot once both are seeded together.
+    loopbackPort: 17338,
+    managedServiceConfigKey: "calendly-oauth",
+    injectionTemplates: [
+      {
+        hostPattern: "api.calendly.com",
+        injectionType: "header",
+        headerName: "Authorization",
+        valuePrefix: "Bearer ",
+      },
+    ],
+    revokeUrl: "https://auth.calendly.com/oauth/revoke",
+    revokeBodyTemplate: { token: "{access_token}" },
+    appType: "App",
+    identityUrl: "https://api.calendly.com/users/me",
+    identityResponsePaths: ["resource.email", "resource.name"],
+  },
+
   figma: {
     provider: "figma",
     authorizeUrl: "https://www.figma.com/oauth",
@@ -681,10 +1006,151 @@ export const PROVIDER_SEED_DATA: Record<
     dashboardUrl: "https://www.figma.com/developers/apps",
     clientIdPlaceholder: null,
     logoUrl: "https://cdn.simpleicons.org/figma",
-    defaultScopes: ["files:read", "file_comments:write"],
-    availableScopes: "https://developers.figma.com/docs/rest-api/scopes/",
+    // Figma access tokens expire after 90 days and a refresh token is issued
+    // with every grant, so the refresh endpoint is wired up. Both the token
+    // and refresh endpoints authenticate the client with HTTP Basic
+    // (client_secret_basic), not form-encoded credentials.
+    refreshUrl: "https://api.figma.com/v1/oauth/refresh",
+    // Granular scopes only. The legacy `files:read` scope is deprecated by
+    // Figma in favour of the narrower `file_*` scopes and is deliberately
+    // absent here; it stays in availableScopes for BYO apps that still rely
+    // on it. Enterprise-only and org-admin-only scopes (file_variables:*,
+    // library_analytics:read, org:*) are offered but not requested by
+    // default, because Figma rejects the whole authorization request if the
+    // app cannot grant a requested scope. `selections:read` is withheld for
+    // that same reason: it is not offered in the app's OAuth scope list, so
+    // requesting it would fail the entire authorization. `folders:read` is
+    // withheld likewise: Figma documents it, but the app's scope picker only
+    // offers `folder_metadata:read` under Folders. `file_code_connect:write`
+    // is withheld because Figma only offers it to apps owned by an
+    // Organization-plan team, which not every managed app is, and nothing
+    // here uses Code Connect; it stays in availableScopes for BYO apps.
+    defaultScopes: [
+      "current_user:read",
+      "file_content:read",
+      "file_metadata:read",
+      "file_versions:read",
+      "file_comments:read",
+      "file_comments:write",
+      "file_dev_resources:read",
+      "file_dev_resources:write",
+      "folder_metadata:read",
+      "library_content:read",
+      "library_assets:read",
+      "team_library_content:read",
+    ],
+    availableScopes: [
+      {
+        scope: "current_user:read",
+        description: "Read your name, email, and profile image",
+      },
+      {
+        scope: "file_content:read",
+        description:
+          "Read the contents of files, such as nodes and the editor type",
+      },
+      {
+        scope: "file_metadata:read",
+        description: "Read metadata of files",
+      },
+      {
+        scope: "file_versions:read",
+        description: "Read the version history for files you can access",
+      },
+      {
+        scope: "file_comments:read",
+        description: "Read the comments for files",
+      },
+      {
+        scope: "file_comments:write",
+        description: "Post and delete comments and comment reactions in files",
+      },
+      {
+        scope: "file_dev_resources:read",
+        description: "Read dev resources in files",
+      },
+      {
+        scope: "file_dev_resources:write",
+        description: "Write dev resources to files",
+      },
+      {
+        scope: "file_code_connect:write",
+        description: "Write and change component code (Code Connect)",
+      },
+      {
+        scope: "folders:read",
+        description: "List folders and files in folders",
+      },
+      {
+        scope: "folder_metadata:read",
+        description: "Read metadata of folders",
+      },
+      {
+        scope: "library_content:read",
+        description: "Read published components and styles of files",
+      },
+      {
+        scope: "library_assets:read",
+        description: "Read data of individual published components and styles",
+      },
+      {
+        scope: "team_library_content:read",
+        description: "Read published components and styles of teams",
+      },
+      {
+        scope: "selections:read",
+        description: "Read most recent selection in files you can access",
+      },
+      {
+        scope: "file_variables:read",
+        description: "Read variables in files (Enterprise plan only)",
+      },
+      {
+        scope: "file_variables:write",
+        description:
+          "Write variables and collections in files (Enterprise plan only)",
+      },
+      {
+        scope: "library_analytics:read",
+        description: "Read your design system analytics (Enterprise plan only)",
+      },
+      {
+        scope: "webhooks:read",
+        description: "Read metadata of webhooks",
+      },
+      {
+        scope: "webhooks:write",
+        description: "Create and manage webhooks",
+      },
+      {
+        scope: "org:activity_log_read",
+        description:
+          "Read organization activity logs (Enterprise plan, org admin only)",
+      },
+      {
+        scope: "org:ai_metering_usage_read",
+        description:
+          "Read organization AI usage (Enterprise plan, org admin only)",
+      },
+      {
+        scope: "org:developer_log_read",
+        description:
+          "Read organization developer logs (Governance+, org admin only)",
+      },
+      {
+        scope: "org:discovery_read",
+        description:
+          "Read text event data in the organization (Governance+, org admin only)",
+      },
+      {
+        scope: "files:read",
+        description:
+          "Deprecated by Figma. Broad read access to files, folders, users, versions, comments, components, styles, and webhooks",
+      },
+    ],
     tokenEndpointAuthMethod: "client_secret_basic",
     loopbackPort: 17331,
+    managedServiceConfigKey: "figma-oauth",
     injectionTemplates: [
       {
         hostPattern: "api.figma.com",
@@ -695,7 +1161,11 @@ export const PROVIDER_SEED_DATA: Record<
     ],
     appType: "App",
     identityUrl: "https://api.figma.com/v1/me",
-    identityResponsePaths: ["handle", "email"],
+    // GET /v1/me returns a flat user object: { id, handle, img_url, email }.
+    // `id` is the stable account identifier; email is the friendlier label
+    // with handle as the fallback.
+    identityResponsePaths: ["email", "handle"],
+    featureFlag: "figma-oauth",
   },
 
   outlook: {
@@ -760,6 +1230,9 @@ export const PROVIDER_SEED_DATA: Record<
     authorizeUrl: "urn:manual-token",
     tokenExchangeUrl: "urn:manual-token",
     pingUrl: "https://slack.com/api/auth.test",
+    // The bot answers through the same Web API envelope as the person's
+    // integration, and auth.test refuses a revoked token inside an HTTP 200.
+    responseOkField: "ok",
     baseUrl: "https://slack.com/api",
     displayLabel: "Slack Channel",
     description: "Channel bot token",
@@ -769,14 +1242,7 @@ export const PROVIDER_SEED_DATA: Record<
     logoUrl:
       "https://cdn.jsdelivr.net/gh/glincker/thesvg@main/public/icons/slack/default.svg",
     defaultScopes: [],
-    injectionTemplates: [
-      {
-        hostPattern: "slack.com",
-        injectionType: "header",
-        headerName: "Authorization",
-        valuePrefix: "Bearer ",
-      },
-    ],
+    injectionTemplates: SLACK_PROVIDER_INJECTION_TEMPLATES,
   },
 
   // The bot that sits in a server and talks to people there, which is a
@@ -842,6 +1308,366 @@ export const PROVIDER_SEED_DATA: Record<
         valuePrefix: "Bearer ",
       },
     ],
+  },
+  stripe_link: {
+    provider: "stripe_link",
+    authorizeUrl: "https://login.link.com/auth",
+    tokenExchangeUrl: "https://login.link.com/auth/token",
+    refreshUrl: "https://login.link.com/auth/token",
+    revokeUrl: "https://login.link.com/auth/revoke",
+    revokeBodyTemplate: {
+      token: "{access_token}",
+      token_type_hint: "access_token",
+    },
+    pingUrl: "https://api.link.com/userinfo",
+    baseUrl: "https://api.link.com",
+    displayLabel: "Link by Stripe",
+    description: "Wallet payment methods for agent purchases",
+    dashboardUrl: "https://dashboard.stripe.com",
+    // Link issues OAuth clients by request rather than through a self-serve
+    // dashboard, so there is no placeholder shape to suggest.
+    clientIdPlaceholder: null,
+    // Clients draw the bundled Link symbol; this remote fallback carries the
+    // parent Stripe mark because Simple Icons has no Link one (`link` 404s on
+    // the CDN).
+    logoUrl: "https://cdn.simpleicons.org/stripe",
+    defaultScopes: ["payment_methods.agentic", "userinfo:read"],
+    availableScopes: [
+      {
+        scope: "payment_methods.agentic",
+        description:
+          "Create single-use cards and payment tokens against the wallet",
+      },
+      {
+        scope: "userinfo:read",
+        description: "Read the wallet owner's profile (email, name, phone)",
+      },
+    ],
+    tokenEndpointAuthMethod: "client_secret_post",
+    // Link's authorize request also needs a `key` param holding the Stripe
+    // publishable key of the account behind the OAuth client. Vellum's own
+    // key lives in the platform registry, which is the only place it is the
+    // right answer: it pairs with the platform's client_id. Seeding it here
+    // would hand every self-hosted install our merchant identity to send
+    // alongside their own client_id, so BYO is deliberately left without one.
+    // See setupNotes.
+    loopbackPort: 17340,
+    managedServiceConfigKey: "stripe-link-oauth",
+    injectionTemplates: [
+      {
+        hostPattern: "api.link.com",
+        injectionType: "header",
+        headerName: "Authorization",
+        valuePrefix: "Bearer ",
+      },
+    ],
+    appType: "App",
+    setupNotes: [
+      "Link is available in managed mode only. Its authorize endpoint requires a `key` parameter carrying the Stripe publishable key for the account that owns the OAuth client, and a bring-your-own connection has nowhere to put one: authorizeParams is re-stamped from seed data on every startup and no CLI or API surface sets it. Use managed mode, where the platform supplies both halves.",
+    ],
+    // /userinfo returns no id, so email is the only stable-ish handle; phone
+    // backstops a wallet that has one but no email on file.
+    identityUrl: "https://api.link.com/userinfo",
+    identityResponsePaths: ["email", "phone"],
+  },
+  shopify: {
+    provider: "shopify",
+    // Shopify is per-tenant: every OAuth endpoint lives on the merchant's own
+    // myshopify.com domain, so these carry a {tenant_host} placeholder the
+    // platform fills in from the shop domain the user supplies at connect
+    // time. There is no global Shopify authorization host to point at.
+    authorizeUrl: "https://{tenant_host}/admin/oauth/authorize",
+    tokenExchangeUrl: "https://{tenant_host}/admin/oauth/access_token",
+    // Requesting `expiring=1` at token exchange yields a short-lived access
+    // token plus a refresh token, which is refreshed against the same
+    // per-shop endpoint.
+    refreshUrl: "https://{tenant_host}/admin/oauth/access_token",
+    pingUrl: "https://{tenant_host}/admin/api/2026-07/shop.json",
+    baseUrl: "https://{tenant_host}",
+    displayLabel: "Shopify",
+    description: "Products, orders, customers, and inventory",
+    dashboardUrl: "https://shopify.dev/dashboard",
+    clientIdPlaceholder: null,
+    logoUrl: "https://cdn.simpleicons.org/shopify",
+    // Shopify parses `scope` as a comma-separated list. A space-separated
+    // list is read as one malformed scope and the request is rejected.
+    scopeSeparator: ",",
+    // Admin API scopes only: Storefront, Customer Account and Shop APIs are
+    // buyer-facing surfaces an assistant has no use for. Every scope here is
+    // grantable without Shopify approval -- the approval-gated ones
+    // (read_all_orders, customer payment methods, subscription contracts,
+    // dispute evidence) are deliberately absent, because Shopify rejects the
+    // whole authorization request if the app cannot grant a requested scope.
+    // A write_* grant implies its read_* counterpart, so the response may
+    // name only the write scope.
+    defaultScopes: [
+      "read_products",
+      "write_products",
+      "read_orders",
+      "write_orders",
+      "read_draft_orders",
+      "write_draft_orders",
+      "read_customers",
+      "write_customers",
+      "read_inventory",
+      "write_inventory",
+      "read_locations",
+      "read_fulfillments",
+      "write_fulfillments",
+      "read_discounts",
+      "write_discounts",
+      "read_price_rules",
+      "write_price_rules",
+      "read_content",
+      "write_content",
+      "read_reports",
+      // Location, shipping, and marketing writes stay opt-in from the scope
+      // picker: they change store setup rather than day-to-day operations,
+      // and keeping them out of the defaults keeps the install consent short.
+      // write_themes covers listing, duplicating, and publishing themes.
+      // Writing theme files (settings, JSON templates, Liquid) also requires
+      // Shopify's theme-code exemption on the app itself, which is granted
+      // per app in the Shopify dashboard rather than through a scope.
+      "read_themes",
+      "write_themes",
+    ],
+    availableScopes: [
+      {
+        scope: "read_products",
+        description: "Read products, variants, and collections",
+      },
+      {
+        scope: "write_products",
+        description: "Create and update products, variants, and collections",
+      },
+      {
+        scope: "read_orders",
+        description: "Read orders, transactions, and abandoned checkouts",
+      },
+      {
+        scope: "write_orders",
+        description: "Create and update orders and fulfillments",
+      },
+      { scope: "read_draft_orders", description: "Read draft orders" },
+      {
+        scope: "write_draft_orders",
+        description: "Create and update draft orders",
+      },
+      {
+        scope: "read_customers",
+        description: "Read customers, segments, and companies",
+      },
+      {
+        scope: "write_customers",
+        description: "Create and update customers and segments",
+      },
+      {
+        scope: "read_inventory",
+        description: "Read inventory levels and items",
+      },
+      {
+        scope: "write_inventory",
+        description: "Adjust inventory levels and items",
+      },
+      { scope: "read_locations", description: "Read store locations" },
+      { scope: "write_locations", description: "Add and edit store locations" },
+      { scope: "read_fulfillments", description: "Read fulfillment services" },
+      {
+        scope: "write_fulfillments",
+        description: "Create and update fulfillment services",
+      },
+      { scope: "read_discounts", description: "Read discounts" },
+      { scope: "write_discounts", description: "Create and update discounts" },
+      { scope: "read_price_rules", description: "Read price rules" },
+      {
+        scope: "write_price_rules",
+        description: "Create and update price rules",
+      },
+      { scope: "read_themes", description: "Read themes and theme files" },
+      {
+        scope: "write_themes",
+        description: "Create, publish, and edit themes and theme files",
+      },
+      { scope: "read_files", description: "Read files uploaded to the store" },
+      { scope: "write_files", description: "Upload and update files" },
+      {
+        scope: "read_content",
+        description: "Read blog posts, pages, and comments",
+      },
+      {
+        scope: "write_content",
+        description: "Create and update blog posts, pages, and comments",
+      },
+      { scope: "read_gift_cards", description: "Read gift cards" },
+      {
+        scope: "write_gift_cards",
+        description: "Create and update gift cards",
+      },
+      { scope: "read_returns", description: "Read returns" },
+      { scope: "write_returns", description: "Create and update returns" },
+      { scope: "read_markets", description: "Read markets" },
+      { scope: "read_locales", description: "Read shop locales" },
+      {
+        scope: "read_shipping",
+        description: "Read shipping and delivery carrier services",
+      },
+      {
+        scope: "write_shipping",
+        description: "Create and update delivery carrier services",
+      },
+      {
+        scope: "read_reports",
+        description: "Run ShopifyQL sales and analytics queries",
+      },
+      { scope: "read_analytics", description: "Read analytics and reports" },
+      {
+        scope: "read_marketing_events",
+        description: "Read marketing events and activities",
+      },
+      {
+        scope: "write_marketing_events",
+        description: "Create and update marketing events and activities",
+      },
+      { scope: "read_order_edits", description: "Read order edits" },
+      {
+        scope: "write_order_edits",
+        description: "Create and apply order edits",
+      },
+      {
+        scope: "read_metaobjects",
+        description: "Read metaobjects and their definitions",
+      },
+      {
+        scope: "write_metaobjects",
+        description: "Create and update metaobjects",
+      },
+      { scope: "read_translations", description: "Read translated content" },
+      {
+        scope: "read_shopify_payments_payouts",
+        description: "Read Shopify Payments payouts and balance",
+      },
+      {
+        scope: "read_shopify_payments_disputes",
+        description: "Read Shopify Payments disputes",
+      },
+    ],
+    loopbackPort: 17341,
+    managedServiceConfigKey: "shopify-oauth",
+    // Mirrors `extra_config.tenant_host` in the platform provider registry.
+    tenantHost: {
+      pattern: "^[a-z0-9][a-z0-9-]*\\.myshopify\\.com$",
+      label: "Shop domain",
+      placeholder: "your-store.myshopify.com",
+    },
+    injectionTemplates: [
+      {
+        hostPattern: "*.myshopify.com",
+        injectionType: "header",
+        headerName: "X-Shopify-Access-Token",
+        valuePrefix: "",
+      },
+    ],
+    appType: "App",
+    setupNotes: [
+      "Shopify OAuth is per-shop: the authorize, token and API endpoints all live on the merchant's own myshopify.com domain, so connecting requires the shop domain (for example your-store.myshopify.com) alongside the usual credentials.",
+      "The Admin API authenticates with the X-Shopify-Access-Token header rather than an Authorization Bearer header.",
+    ],
+    // The Admin API's shop endpoint nests its payload under "shop"; the
+    // myshopify domain is the stable, human-recognisable handle.
+    identityUrl: "https://{tenant_host}/admin/api/2026-07/shop.json",
+    identityResponsePaths: ["shop.myshopify_domain", "shop.name"],
+    // Gated like monday/figma/stripe-link: the platform side and the
+    // shop-domain input in the clients land separately, and until both are
+    // in place a visible Shopify tile would offer a connect flow that
+    // cannot complete.
+    featureFlag: "shopify-oauth",
+  },
+
+  quickbooks: {
+    provider: "quickbooks",
+    authorizeUrl: "https://appcenter.intuit.com/connect/oauth2",
+    tokenExchangeUrl:
+      "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer",
+    // Access tokens live an hour; refresh tokens 100 days and are rotated on
+    // every refresh, which the platform persists. Both token endpoints
+    // authenticate the client with HTTP Basic.
+    refreshUrl: "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer",
+    tokenEndpointAuthMethod: "client_secret_basic",
+    // No revokeUrl: Intuit's revocation endpoint wants a JSON body under HTTP
+    // Basic client auth, and the daemon's revoke helper only posts an
+    // unauthenticated form body, so a seeded URL would fail silently on every
+    // your-own disconnect. The platform registry revokes managed tokens itself.
+    // Every Accounting API path is scoped to the company (realm) the user
+    // picked on Intuit's consent screen. The realm arrives only as the
+    // callback's `realmId` query parameter; the platform captures it into the
+    // connection's `provider_params` and fills the `{realm_id}` placeholder
+    // server-side, so managed callers send paths relative to the company
+    // (`/query`, `/customer/123`). Production and sandbox keys use different
+    // hosts; the platform picks the host per environment.
+    baseUrl: "https://quickbooks.api.intuit.com/v3/company/{realm_id}",
+    // No pingUrl: the only company-independent probe would still need the
+    // realm in its path, which the ping route cannot fill in (it sends the
+    // URL's origin as a per-request base override, which would also pin a
+    // managed sandbox connection to the production host).
+    displayLabel: "QuickBooks",
+    description: "Invoices, customers, vendors, and accounting data",
+    dashboardUrl: "https://developer.intuit.com/app/developer/dashboard",
+    clientIdPlaceholder: null,
+    logoUrl: "https://cdn.simpleicons.org/quickbooks",
+    // The Accounting scope covers the QuickBooks Online API. Payments is a
+    // separate product the app must be enabled for, and the OpenID scopes
+    // only add the signing-in user's profile, so none are on by default.
+    defaultScopes: ["com.intuit.quickbooks.accounting"],
+    availableScopes: [
+      {
+        scope: "com.intuit.quickbooks.accounting",
+        description:
+          "Read and write QuickBooks Online accounting data: customers, vendors, invoices, bills, payments, items, accounts, and reports",
+      },
+      {
+        scope: "com.intuit.quickbooks.payment",
+        description:
+          "QuickBooks Payments: charges, refunds, bank accounts, and cards (requires a Payments-enabled app)",
+      },
+      { scope: "openid", description: "Sign in with Intuit (OpenID Connect)" },
+      { scope: "profile", description: "The signing-in user's name" },
+      { scope: "email", description: "The signing-in user's email address" },
+      { scope: "phone", description: "The signing-in user's phone number" },
+      { scope: "address", description: "The signing-in user's address" },
+    ],
+    loopbackPort: 17342,
+    managedServiceConfigKey: "quickbooks-oauth",
+    injectionTemplates: [
+      {
+        hostPattern: "quickbooks.api.intuit.com",
+        injectionType: "header",
+        headerName: "Authorization",
+        valuePrefix: "Bearer ",
+      },
+      {
+        hostPattern: "sandbox-quickbooks.api.intuit.com",
+        injectionType: "header",
+        headerName: "Authorization",
+        valuePrefix: "Bearer ",
+      },
+    ],
+    appType: "App",
+    setupNotes: [
+      "QuickBooks scopes every Accounting API call to the company (realm) chosen on Intuit's consent screen. Managed connections carry the realm as provider_params.realm_id and requests are sent relative to /v3/company/{realmId}.",
+      "Intuit development keys only authorize sandbox companies, which live on sandbox-quickbooks.api.intuit.com; production keys use quickbooks.api.intuit.com.",
+      "The Accounting API returns XML unless the request carries Accept: application/json.",
+    ],
+    // CompanyInfo does not repeat the realm (its Id is always "1"); the
+    // platform keys the connection on the captured realm and labels it with
+    // the company name.
+    identityUrl:
+      "https://quickbooks.api.intuit.com/v3/company/{realm_id}/companyinfo/{realm_id}",
+    identityHeaders: { Accept: "application/json" },
+    identityResponsePaths: ["CompanyInfo.CompanyName", "CompanyInfo.LegalName"],
+    // Gated like figma/shopify: the platform side lands separately, and until
+    // the client ids are live a visible tile would offer a connect flow that
+    // cannot complete.
+    featureFlag: "quickbooks-oauth",
   },
 };
 

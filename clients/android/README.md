@@ -51,12 +51,168 @@ For local development, pick the `devDebug` variant in Android Studio. If you
 sync a different `VELLUM_ENVIRONMENT`, build the matching flavor so the WebView
 origin and native auth host agree.
 
-Launcher colors distinguish production, staging, and dev installs. The launch
-screen follows the saved app appearance, falling back to the Android light or
-dark setting until the web app has stored a preference. Android's app night
-mode keeps the OS splash and native overlay on the same theme. Android 11 and
-older skip the OS preview window so the themed native overlay is the first app
-frame.
+The launch screen uses a centered white Vellum wordmark on black. The Android
+12 system splash stays visible until the native loading overlay is attached.
+Both surfaces share the same drawable and colors. Android 11 and older skip the
+OS preview window so the native overlay is the first app frame.
+
+## Launcher Icons
+
+The default launcher icon is the `quirky` eye pair from the avatar library in
+`packages/avatar-catalog`, the same design the iOS app icon uses. The six paths
+in `app/src/main/res/drawable/ic_launcher_foreground.xml` and in the
+pre-adaptive `app/src/main/res/mipmap-anydpi/ic_launcher*.xml` fallbacks are
+copied verbatim from that table and only repositioned by a VectorDrawable
+`<group>`, so the icon stays in sync with the in-app avatars.
+
+Each flavor's `launcher_background` in
+`app/src/<flavor>/res/values/colors.xml` distinguishes the installs: production
+`#4C9B50` (the avatar palette green), staging `#E9C91A`, and dev `#FF88C9`.
+Those three are the shared cross-platform standard: a flavor and the iOS
+`AppIcon-*.icon` bundle for the same environment sit on the same color, which
+the web app names once as `APP_ICON_GROUNDS`. Change one and change the rest
+with it.
+
+### Alternate Icons
+
+A user picks an eyes-on-color launcher icon in the web app under
+Settings -> General -> Preferences -> App icon
+(`clients/web/src/domains/settings/components/app-icon-modal.tsx`), gated on the
+dark `android-avatar-app-icon` flag. Every combination ships: 9 eye styles by 6
+colors, so 54 alternates.
+
+`clients/ios/scripts/generate-android-avatar-icons.ts` writes all of them from
+the avatar catalog as vector XML rather than rasterized PNGs. Edit the script,
+not the files. Regenerate the committed state with
+`bun clients/ios/scripts/generate-android-avatar-icons.ts`, add `--pilot` to cut
+a local run down to a 12-set slice while iterating, and verify with
+`cd clients/ios && bun test scripts/__tests__/android-avatar-icons.test.ts`.
+Measuring where an eye pair's artwork reaches goes through the native
+`@resvg/resvg-js` binding, so install the assistant package's dependencies
+first: `bun install --filter=@vellumai/assistant`. `pr-native-drift.yaml` and
+`ci-main-native-drift.yaml` run that same test and watch both
+`app/src/main/res/**` and `app/src/main/AndroidManifest.xml`, so an edit without
+a regeneration fails CI.
+
+| Generated resource | Count | Contents |
+|--------------------|-------|----------|
+| `drawable/avatar_eyes_fg_<eye>.xml` | 9 | The eye pair on a transparent field, sized for the 72dp an adaptive-icon mask keeps visible |
+| `drawable/avatar_eyes_mono_<eye>.xml` | 9 | The same pair reduced to its sclera silhouette, which a themed icon reads for alpha |
+| `mipmap-anydpi-v26/avatar_eyes_<eye>_<color>.xml` | 54 | Adaptive icon pairing the foreground with a background color |
+| `mipmap-anydpi-v33/avatar_eyes_<eye>_<color>.xml` | 54 | The same adaptive icon plus the monochrome layer |
+| `mipmap-anydpi/avatar_eyes_<eye>_<color>.xml` | 54 | Pre-adaptive fallback that paints its own background and draws the pair 1.5x larger to fill all 108dp |
+| `values/avatar_icon_colors.xml` | 6 colors | The alternate backgrounds, kept apart from the flavor-owned `launcher_background` because an alternate looks the same in every flavor |
+
+The generator also owns the `avatar-icon-aliases` marker block in
+`AndroidManifest.xml`. Android reads the launcher icon off whichever launcher
+component is enabled, so every launcher entry is an `<activity-alias>` targeting
+`.MainActivity`: `.icon.primary`, enabled and drawn with the `ic_launcher`
+artwork, then one disabled `.icon.avatar_eyes_<eye>_<color>` alias per
+alternate. Exactly one launcher-bearing alias is enabled at a time. Each alias
+carries a MAIN/LAUNCHER filter and a copy of `.MainActivity`'s shortcuts
+`<meta-data>`, and nothing else: a launcher reads static shortcuts off the
+component it launched, while deep links resolve through `.MainActivity` alone,
+so cloning its VIEW filters onto 55 components would only multiply the App Links
+verification surface.
+
+`.MainActivity` therefore declares no MAIN/LAUNCHER filter of its own. It holds
+every deep-link filter and the shortcuts `<meta-data>` the aliases copy, carries
+no `android:enabled` attribute, and is never toggled, so the static shortcuts,
+the voice status notification, and the Quick Settings tile, which all name its
+class explicitly, resolve whichever icon is picked.
+
+`AppIconPlugin.java` does the switching, on the same Capacitor contract as iOS:
+`getState` resolves `{supported, current, available}` and `set` resolves `{ok}`
+plus an `error` when it refuses. Toggling a launcher component makes the
+launcher re-resolve the app, which some launchers answer by dropping the running
+task, so `set` only records the target in the `app_icon` SharedPreferences file
+and `handleOnStop` applies it once the activity has left the screen. Until the
+toggle lands, `getState` reports the recorded target as `current`, so the web
+layer's re-read after an apply sees the icon it asked for. An apply enables the
+target before disabling the others and clears the record last, so no launcher
+sees the app with every launcher component off, and an interrupted pass is
+retried rather than half kept. It reads its alias set off the manifest and takes
+`.icon.primary` plus the `.icon.avatar_eyes_*` alternates only, so an activity
+that lands in the `.icon.` namespace for anything else is neither offered in
+`available` nor toggled by an apply.
+
+`load()` runs that same apply before the activity resumes, so a process death
+between `set` and the next background never strands a recorded target. It then
+holds one more invariant: an enabled-state override outlives the install that
+wrote it, so a device carrying an explicit disable on `.icon.primary` alongside
+an applied alternate that the installed build does not declare has no launcher
+entry at all. Whenever no declared alias is drawing the app, `.icon.primary`
+goes back to `COMPONENT_ENABLED_STATE_DEFAULT`.
+
+The web layer addresses an icon by its wire name, `avatar-eyes-<eye>-<color>`,
+the same name iOS uses. Resource and class names admit underscores rather than
+dashes, so an alias suffix is that whole string with every dash swapped for an
+underscore, and the reverse is the same whole-string swap. It round-trips only
+while no catalog id carries a separator of its own, which
+`assertUnderscoreSafeIds` in `clients/ios/scripts/avatar-icon-core.ts` enforces
+on every run.
+
+`getState` reports `supported: true` only on API 26 or newer with at least one
+alternate present. `minSdkVersion` is 24, so an API 24 or 25 device answers
+`supported: false` and the picker draws nothing. `set` applies the same version
+check and resolves `{ok: false, error}` below it, so a caller that skipped
+`supported` cannot leave a target behind for the next background to toggle.
+
+Alternates read at the size of the default launcher icon sitting next to them in
+the picker. Each pair is fitted by the longer edge of its measured artwork
+bounds to a fraction of the 72dp an adaptive mask keeps visible, and the
+pre-adaptive fallback multiplies that scale by 108/72.
+
+| Eye style | Span of the masked square |
+|-----------|---------------------------|
+| `dazed` | 0.55 |
+| `bashful` | 0.40 |
+| Every other style | 0.5 |
+
+The 0.5 default is the framing the default launcher icon uses, so the generated
+`quirky` foreground lands on that icon's own scale, within the rounding step
+that separates a hand-rounded bounding box from a rasterized measurement.
+`dazed` is framed wider so it reads at the size of the rest, and `bashful`
+narrower so it does not draw the same icon as `surprised`, which is the same
+shape. The spans live in `clients/ios/scripts/avatar-icon-core.ts`, shared with
+the iOS generator and mirrored by
+`clients/web/src/components/avatar/app-icon-preview.tsx` so the picker's
+on-screen preview frames a pair the way the launcher does.
+
+### Device QA Checklist
+
+Launcher behavior is physical-device territory; an emulator does not cover it.
+
+- Apply an alternate and reset to the default on both a Pixel launcher and a
+  Samsung One UI launcher. The icon changes when the app goes to the background,
+  not on the press.
+- Pin the app icon to the home screen from a build that declares no aliases,
+  install this build over it, and confirm any resulting pin loss happens at most
+  once. Pin again, switch icons, and record what each launcher does to the pin.
+- Long-press the launcher icon while an alternate is active and confirm the New
+  chat and Start voice shortcuts are still listed. Check the voice status
+  notification tap and the Start voice Quick Settings tile in the same state.
+- Open an auth callback deep link and an HTTPS App Link while an alternate is
+  active. Both resolve through `.MainActivity`, so neither should behave
+  differently.
+- Apply an icon and immediately hand off to a browser, so the handoff is what
+  first backgrounds the app: a sign-in, which `NativeAuthPlugin` sends to the
+  system browser, and a purchase CTA, which opens a Custom Tab through the
+  Capacitor Browser plugin. Either one stops the activity, so the pending toggle
+  applies mid-flow. On each launcher, confirm the sign-in's custom-scheme
+  callback still completes and that coming back from the purchase page lands on
+  a live task rather than one the launcher dropped.
+- Turn on themed icons on Android 13 or newer and confirm every alternate draws
+  its sclera silhouette rather than a blank tile or a filled square.
+- Set an icon, force-stop the app before it reaches the background
+  (`adb shell am force-stop ai.vellum.assistant.dev`), and relaunch. `load()`
+  applies the recorded target.
+- Install on an API 24 or 25 device and confirm the App icon row does not
+  render.
+- Build a release variant (`./gradlew :app:assembleProductionRelease`), which
+  enables `minifyEnabled` and `shrinkResources`, and confirm every alias draws
+  its own icon, so resource shrinking keeps mipmaps referenced only from the
+  manifest.
 
 ## HTTPS App Links
 
@@ -91,6 +247,21 @@ adb shell am start -a android.intent.action.VIEW \
 
 Use the suffixed application ID and matching host when checking staging or dev.
 
+## Billing
+
+The Android shell renders the same billing surfaces as iOS (plan card, plans
+takeover, billing settings) but sells nothing in-app: there is no Google Play
+Billing integration, and every purchase CTA opens the matching page on the
+hosted web app in the system browser instead of starting a checkout inside the
+WebView. The handoff lives in
+`clients/web/src/lib/billing/android-billing-handoff.ts`; it goes through the
+Capacitor Browser plugin because a plain navigation would stay in the WebView
+and a bare VIEW intent would bounce straight back via the verified App Links
+above. Because the purchase runs on the hosted web app in a plain browser
+context, Stripe returns to the hosted web page there rather than through the
+custom-scheme `billing/checkout-complete` deep link; the manifest still claims
+that scheme for checkouts launched from a native context.
+
 ## Native Auth
 
 The `NativeAuth` Capacitor plugin opens WorkOS AuthKit in the system browser,
@@ -118,13 +289,17 @@ absent. Scanning a connect link switches the native shell to the validated
 server, opens `<server>/assistant/pair`, and keeps an existing server path
 prefix intact. Cold and warm app launches use the same route.
 
-Only the validated server base is saved after the pairing page loads; the
-same deferred write appends the server, with its label, to the remembered
-list. The one-time device code is kept out of app preferences and the
-generated Capacitor configuration. HTTPS is required except for `localhost`,
-`127.0.0.1`, and the Android emulator host alias `10.0.2.2`. Use `adb reverse`
-when a physical development device needs to reach a service through
-`localhost`.
+A server the list does not already hold joins it, with its label, as soon as
+the link is scanned, matching iOS, so the chooser can still offer it when the
+pairing page never loads. What a scan alone cannot claim is deferred until that
+page loads: the active slot, so an unreachable server never displaces the one
+already working, and any label a server is already remembered under, so an
+unpaired link can fill in a missing name but cannot rewrite one an earlier
+pairing established. The one-time device code is kept out of app preferences
+and the generated Capacitor configuration. HTTPS is required except for
+`localhost`, `127.0.0.1`, and the Android emulator host alias `10.0.2.2`. Use
+`adb reverse` when a physical development device needs to reach a service
+through `localhost`.
 
 Paired servers accumulate in a remembered list, stored as JSON `{name?, url}`
 entries in the same `self_hosted_server` SharedPreferences file as the active
@@ -149,9 +324,13 @@ If Android terminates the app before the pairing page loads, scan the connect
 link again. The shell intentionally does not save the one-time code for process
 restoration.
 
-If a saved or newly scanned server cannot load, the native recovery dialog can
-retry it or clear the saved server and return to Vellum Cloud. A failed new
-server is never promoted over the last server that loaded successfully.
+If a saved or newly scanned server cannot load, whether the connection is
+refused outright or a tunnel provider answers on the server's behalf with its
+own error page, the native recovery dialog offers Retry or Choose Assistant.
+Choose Assistant clears the active slot and recreates onto the Vellum Cloud
+chooser, which lists every remembered server including the one that just
+failed. A failed new server is never promoted over the last server that loaded
+successfully.
 
 ## Biometric Session Recovery
 
@@ -214,8 +393,134 @@ voice launches.
 
 ## Native notifications
 
-Android registers FCM on `vellum-alerts`, renders foreground pushes once, and handles background pushes and taps.
-FCM needs Play services and untracked `google-services.json`; failures retry on resume.
+Android registers FCM on the `vellum-alerts` channel and handles pushes and
+taps. FCM needs Play services and an untracked `google-services.json`;
+failures retry on resume.
+
+`AndroidPushRegistration.getCapabilities` advertises
+`native-notification-render` on token registration. The platform sends
+data-only pushes only to tokens that claim it, so a build that cannot render
+one natively must never claim it. The claim is deliberately not gated on
+`push-avatar-sender`: that flag is the platform's own switch for the data-only
+shape, while the capability says which tokens could render one, so a shell that
+can render natively says so whether the flag is on or off.
+
+The token capability is not live foreground ownership. New web code negotiates
+that separately with a versioned, page-generation-bound
+`AndroidPushRegistration.setNotificationOwnership` handshake only after the
+coordinator-backed local route is ready. The identity adapter is installed
+before the first asynchronous capability or foreground announcement. Page
+start, renderer loss, activity destruction, and bridge destruction enqueue a
+serialized clear. A stale call from an older page generation cannot restore
+ownership. These clears do not reset retained delivery results. Ownership
+negotiation is intentionally independent of `local-notification-avatar`, so
+turning assistant presentation off cannot send a local request back through an
+unshared deduplication lane.
+
+`SafeMessagingService` routes each push to exactly one owner. A push carrying a
+Firebase notification block keeps the existing `PushNotificationsPlugin`
+route. Data-only FCM and app-originated local requests after the ownership
+handshake use the process-wide `NotificationDeliveryCoordinator`. Both
+normalize the first semantically present correlation id, delivery id, or
+request key with the same trim and 512 UTF-16 code-unit bound. An overlength
+higher-precedence candidate fails closed rather than falling through. This full
+string key is separate from the numeric Android notification id, and the
+original SSE delivery id remains the acknowledgment id.
+`local-notification-avatar` controls whether a qualifying local request asks
+for assistant presentation. With it off, the same coordinator posts the app or
+plain presentation.
+
+Negotiated foreground data-only FCM visits the web runtime only for the same
+active-conversation, chat-route, and page-visible suppression decision used by
+SSE. If display is still required, it returns to the shared native coordinator
+for the only banner and channel-owned sound. Bounded process-RAM focus
+tombstones use the canonical key across FCM-first and SSE-first arrival, so
+navigating away between matching events does not reopen display. Before live
+ownership, compatibility routes remain available. After a coordinator claim,
+every success, duplicate, blocked result, timeout, malformed bridge response,
+or failure remains native-owned and cannot schedule a JavaScript fallback.
+Only a native process restart clears the bounded coordinator memory.
+
+`NativePushRenderer` posts the native notification. With a sender it is a
+`MessagingStyle` conversation: the avatar is the large icon, the assistant's
+name is the message line, and the conversation title is the header. Without a
+sender it matches what Firebase would have rendered. `vellum-alerts` is the only
+channel a payload may name: it is created if it is missing, because from API 26
+posting to a channel that does not exist is a silent no-op, and any other name
+posts here anyway and is logged once. Existing is not enough, since the voice
+session channel and Firebase's own fallback both exist and both post silently.
+The coordinator's full key and Android's numeric notification id serve
+different purposes. The coordinator prevents duplicate ownership across FCM
+and SSE without hashing away the full correlation identity. The numeric id
+still gives Android a stable integer for posting and replacement.
+
+Each conversation notification also publishes a long-lived dynamic shortcut,
+which is what gives Android the conversation treatment. The shortcut intent is
+the conversation's own app link, never the push's identifiers, so a tap opens
+the thread from a cold or a warm start and a week-old shortcut cannot replay a
+stale delivery. That link names the baked cloud host, and `MainActivity` refuses
+an app link while a self-hosted origin is configured, so a self-hosted install
+publishes no shortcut at all rather than one that only foregrounds the app. Two
+conversations keep a shortcut at a time: a product cap on how much of the
+launcher's list a notification may claim. The launcher's own budget counts the
+static New chat and Start voice entries towards the same total, but they are
+manifest shortcuts, so a dynamic push can only ever evict another dynamic one.
+The shortcuts leave with the token on `AndroidPushRegistration.unregister`, once
+that unregister has actually reached the push plugin, so the next account does
+not inherit the previous one's conversation titles and avatars.
+
+`AvatarCache` keeps the sender avatars on disk under the cache directory, eight
+at a time, evicted least-recently-used, each file re-hashed against the name it
+is filed under before it is drawn, and deleted when it no longer hashes to that
+name or has grown past the 512 KB cap. The avatar is resolved once the renderer
+confirms a notification can be posted at all, and before it is posted: the cache
+first, then an HTTPS download verified against the pushed sha256. The download
+runs inside `onMessageReceived` with a 3 s connect timeout, a 2 s read timeout,
+and a 3 s total budget that starts before the response head and spans the body,
+since the per-read timeout restarts on every chunk. A head that arrives slowly
+spends the body's share rather than adding to it, and one that spends all of it
+gives up before a byte of body is read. The budget is only read between chunks
+and Android fixes the socket timeout when the connection is made, so the read
+that crosses it still runs its own timeout out: a connect, the budget, and that
+last read bound a responding host at 8 s. The local cache read carries the cap
+but no deadline, having no host to trickle it. A miss just posts without an
+avatar.
+
+### Device QA checklist
+
+Native rendering needs a physical device with Play services and a data-only
+push from a lower environment. This local checklist supplements the canonical
+[notification avatar and local delivery QA ledger](../../docs/notification-avatar-local-qa.md),
+which owns statuses, the two-flag matrix, compatibility cases, and rollout
+gates. Verify:
+
+- Killed, background, and foreground delivery each post exactly one banner,
+  never two.
+- Foreground delivery during a cold start, before the web layer has loaded,
+  still posts.
+- A push arriving right after a WebView reload, while the web runtime has no
+  handler yet, still posts exactly one banner.
+- The first push for a new avatar hash downloads and shows the avatar; the
+  next push for the same hash shows it from the cache with no visible delay.
+- A push whose `sender_avatar_url` is missing posts without an avatar.
+- Tapping a notification opens the conversation it came from.
+- The conversation appears as a launcher shortcut; tapping it opens that
+  conversation from both a cold and a warm start rather than replaying the
+  push, and a third conversation evicts the oldest of ours without disturbing
+  New chat or Start voice.
+- Signing out clears our conversation shortcuts and leaves New chat and Start
+  voice in place.
+- A push arriving while a self-hosted origin is configured posts its banner and
+  publishes no launcher shortcut.
+- On API 24 or 25 the notification plays the default sound.
+- A push naming an unknown channel still arrives, on `vellum-alerts`.
+- Focused delivery suppresses both FCM-first and SSE-first orders while the
+  matching conversation route is visible, without losing the original SSE
+  acknowledgment id.
+- Reloading the WebView clears page ownership but does not make an already
+  claimed full key eligible for another banner or sound.
+- All four combinations of `push-avatar-sender` and
+  `local-notification-avatar` preserve exactly one delivery owner.
 
 ## Structure
 
@@ -231,7 +536,9 @@ clients/
     │   └── src/main/
     │       ├── AndroidManifest.xml
     │       ├── java/ai/vellum/assistant/
+    │       │   ├── Attribution.java
     │       │   ├── ConnectDeepLink.java
+    │       │   ├── InstallReferrerPlugin.java
     │       │   ├── MainActivity.java
     │       │   ├── NativeAuthPlugin.java
     │       │   ├── NativeBiometricPlugin.java
@@ -299,14 +606,15 @@ wrong identity.
 Release builds enable resource shrinking and R8 optimization. Capacitor plugin
 annotations and methods are retained by `app/proguard-rules.pro`.
 
-## Google Play Internal Releases
+## Google Play Releases
 
 `.github/workflows/release-android.yaml` is the reusable Android release
-workflow. It builds a signed AAB, retains it as an artifact, and uploads it to
-the matching Play internal track through the Android Publisher API. The
-publisher uses Google's official Android Publisher client and repository-owned
-code, not an external Play publishing action. Production-track promotion
-remains manual.
+workflow. It builds a signed AAB, retains it as an artifact, and publishes it
+through the Android Publisher API. Dev and staging releases use their matching
+app's internal track. Production releases use the production track with a
+completed rollout, which submits the release for Play review and publishing.
+The publisher uses Google's official Android Publisher client and
+repository-owned code, not an external Play publishing action.
 When Firebase configuration is available, the workflow validates that it
 matches the selected flavor before including it in the build.
 
@@ -331,8 +639,8 @@ GitHub variables. `GCP_SERVICE_ACCOUNT` must match the environment's
 Never commit Firebase configuration, the keystore, or decoded secret material.
 The workflow removes restored files even when a build fails.
 
-`ANDROID_FIREBASE_CONFIG_B64` remains optional so signing and internal
-distribution do not depend on push setup. When it is absent, the workflow emits
+`ANDROID_FIREBASE_CONFIG_B64` remains optional so signing and Play distribution
+do not depend on push setup. When it is absent, the workflow emits
 a warning and the resulting AAB has no native push support. When it is present,
 malformed base64, invalid JSON, or a package mismatch fails the build.
 
@@ -343,7 +651,7 @@ distribution independently with these repository variables:
 |----------|------------------|
 | `ANDROID_DEV_RELEASE_ENABLED` | Dev releases |
 | `ANDROID_STAGING_RELEASE_ENABLED` | Staging releases |
-| `ANDROID_PRODUCTION_RELEASE_ENABLED` | Production releases |
+| `ANDROID_PRODUCTION_RELEASE_ENABLED` | Production releases to the Play production track |
 
 Set only `ANDROID_DEV_RELEASE_ENABLED` to `true` to test the dev app on its Play
 internal track. Leave the staging and production variables unset or set to
@@ -354,7 +662,7 @@ schedule.
 
 ### Manual Play Prerequisites
 
-Complete the following setup before enabling internal-track uploads:
+Complete the following setup before enabling Google Play publishing:
 
 1. Apply the platform Terraform stacks that enable the Android Publisher API
    in the dev, staging, and production GCP projects.
@@ -367,13 +675,16 @@ Complete the following setup before enabling internal-track uploads:
    upload a completed release.
 5. In Play Console, grant each environment's `GCP_SERVICE_ACCOUNT` access only
    to its matching app, with **View app information (read-only)** and
-   **Release apps to testing tracks**. Do not grant production publishing.
+   **Release apps to testing tracks**. For `ai.vellum.assistant`, also grant the
+   production environment's service account **Release to production, exclude
+   devices, and use Play App Signing**.
 6. Configure the repository and environment secrets above.
 7. Complete each Play listing, privacy policy, Data Safety form, content rating,
    and the declarations required for microphone and camera permissions.
 
-Before wider rollout, test the internal-track AAB on a physical device and
-verify its identity, web origin, authentication, keyboard, and file sharing.
+Before enabling `ANDROID_PRODUCTION_RELEASE_ENABLED`, test a signed production
+AAB on the production app's internal track using a physical device. Verify its
+identity, web origin, authentication, keyboard, and file sharing.
 
 ### Manual Firebase Prerequisites
 

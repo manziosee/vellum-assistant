@@ -16,32 +16,58 @@
  * in its ambient declaration.
  */
 import type {
+  PairingFailureReason,
+  PublicBaseUrlRejection,
+} from "@vellumai/service-contracts/remote-web-pairing";
+
+import type {
   AppVersionInfo,
   AssistantStatus,
   BundleScanData,
+  ChordBinding,
+  ChordRegistrationResult,
+  CompanionAnnotationPhase,
+  CompanionAnnotationStroke,
+  CompanionAnnotationTool,
+  CompanionCoachmark,
   CompanionCharacter,
   CompanionContext,
   CompanionIntroAction,
+  CompanionPopoverAnswer,
+  CompanionPopoverView,
+  CompanionPicker,
+  CompanionCapturePick,
+  CompanionCaptureSources,
   CompanionSurfaceState,
   ConnectivityState,
+  ScreenCaptureFrame,
+  WatchCaptureTarget,
   DeepLink,
   DictationOverlayHitRegion,
   DictationOverlayMessage,
   DictationOverlayState,
   DictationPartialEvent,
   DictationPartialsResult,
+  DictationOfferAnswer,
   DictationTranscribeResult,
-  FnPushToTalkResult,
+  DownloadDoneEvent,
+  ModifierHold,
+  ModifierHoldRegistrationResult,
   HelperRestartResult,
   HelperState,
   HotkeyEvent,
+  HotkeySelection,
   Lockfile,
   LockfileWriteResult,
   LocalAssistantStatusResult,
   NotificationActionEvent,
+  PrepareNotificationIdentityPayload,
   PowerEvent,
+  VoiceModeChord,
+  VoiceModeChordRegistrationResult,
   ResolvedHotkey,
   ShowNotificationPayload,
+  ResetNotificationIdentitiesPayload,
   SystemPermissionKind,
   SystemPermissionStateItem,
   SystemPermissionsState,
@@ -52,6 +78,7 @@ import type {
   VoiceActivityContent,
   VoiceActivityControl,
   VoiceActivityStart,
+  WindowAttentionPayload,
 } from "./types";
 
 /**
@@ -70,16 +97,57 @@ export interface LocalUpgradeOptions {
   force?: boolean;
 }
 
-export type ElectronHostOS = "macos" | "windows";
+export type ElectronHostOS = "macos" | "windows" | "linux";
 
 /**
- * Result of `localMode.connectImport`. On success `assistantId` is the unique
- * local id the pairing was registered under, and `accessOnly` is true when the
- * bundle carried no refresh credential (the token expires without renewal).
+ * What a pairing step failed on, for callers picking recovery copy. The
+ * bridge's name for `@vellumai/service-contracts`'s `PairingFailureReason`,
+ * which owns the union and the retryable classification read off it. That
+ * package is zod-only and environment-neutral, so the preload takes on nothing
+ * at runtime: this is a type-only import.
  */
-export type LocalConnectImportResult =
-  | { ok: true; assistantId: string; accessOnly: boolean }
-  | { ok: false; error: string };
+export type LocalPairingFailureReason = PairingFailureReason;
+
+/**
+ * A refused pairing step. `error` is ready to display, and is what a caller
+ * with no copy of its own shows. `rejection` accompanies an `invalid-address`
+ * refusal and says why the address was refused, so a localized caller renders
+ * its own catalog copy instead of the host's English.
+ */
+export interface LocalPairingFailure {
+  ok: false;
+  error: string;
+  reason?: LocalPairingFailureReason;
+  rejection?: PublicBaseUrlRejection;
+}
+
+/**
+ * Result of `localMode.pairingStart`. `handle` is an opaque key for the
+ * follow-up `pairingPoll` / `pairingCancel`; the device code it stands for
+ * stays in the host process. `userCode` is the code to approve on the
+ * assistant's machine, or null when the address already carried an approved
+ * device code and the first poll imports outright.
+ */
+export type LocalPairingStartResult =
+  | {
+      ok: true;
+      handle: string;
+      userCode: string | null;
+      expiresAt: string;
+      intervalSeconds: number;
+    }
+  | LocalPairingFailure;
+
+/**
+ * Result of one `localMode.pairingPoll` attempt. `pending` carries the cadence
+ * to wait before the next one; `imported` means the pairing is registered
+ * under `assistantId`, with `accessOnly` true when the exchange yielded no
+ * refresh credential (the access expires without renewal).
+ */
+export type LocalPairingPollResult =
+  | { ok: true; status: "pending"; expiresAt: string; intervalSeconds: number }
+  | { ok: true; status: "imported"; assistantId: string; accessOnly: boolean }
+  | LocalPairingFailure;
 
 /**
  * One paired-device row as returned by `localMode.listDevices`. Structural
@@ -96,6 +164,10 @@ export interface LocalPairedDeviceRecord {
   issuedAt: number | null;
   expiresAt: number | null;
   lastUsedAt: number | null;
+  /** Raw User-Agent observed when this device paired, or null. */
+  pairingUserAgent?: string | null;
+  /** Name the device reported for itself when pairing, or null. */
+  clientReportedName?: string | null;
   /** True when this row is the hosting machine's own guardian credential. */
   isCurrentHost?: boolean;
 }
@@ -107,6 +179,22 @@ export type LocalListDevicesResult =
 export type LocalRevokeDeviceResult =
   { ok: true } | { ok: false; error: string };
 
+/**
+ * A local assistant's avatar as read off its workspace by the host. `null`
+ * is a conclusive absence (no entry, no workspace, no avatar); malformed
+ * arguments and files the host cannot serve produce `ok: false`.
+ */
+export type LocalAssistantAvatar =
+  | {
+      kind: "character";
+      traits: { bodyShape: string; eyeStyle: string; color: string };
+    }
+  | { kind: "image"; imageBase64: string };
+
+export type LocalReadAssistantAvatarResult =
+  | { ok: true; avatar: LocalAssistantAvatar | null }
+  | { ok: false; error: string };
+
 export interface VellumBridge {
   platform: "electron";
   hostOS?: ElectronHostOS;
@@ -116,6 +204,13 @@ export interface VellumBridge {
   };
   text: {
     insertIntoFrontApp(text: string): Promise<TextInsertionResult>;
+    /**
+     * Undo the last edit in the application in front, the way its Edit menu
+     * would. For putting Vellum's dictation in the place of one another app
+     * pasted a moment ago. Absent on shells without a voice key, which are
+     * the shells with nothing to put in another app's place.
+     */
+    undoInFrontApp?(): Promise<TextInsertionResult>;
     openAutomationSettings(): Promise<void>;
   };
   auth: {
@@ -148,13 +243,66 @@ export interface VellumBridge {
     restart(): Promise<HelperRestartResult>;
     onState(callback: (state: HelperState) => void): () => void;
     /**
-     * The macOS Fn push-to-talk surface. Absent on shells with no global
-     * push-to-talk trigger (the Windows shell, whose configurable global
-     * chord ships separately).
+     * The global keyboard bindings. macOS exposes the held modifier set the
+     * voice key rides on (`setModifierHold`) and the chords a call answers
+     * (`setChords`); Windows exposes the voice mode shortcut's bare-modifier
+     * chord (`setVoiceModeChord`) plus registration-state events. Absent on
+     * shells with no global trigger.
      */
     hotkey?: {
-      fnPushToTalk(enable: boolean): Promise<FnPushToTalkResult>;
+      setVoiceModeChord?(
+        activator: VoiceModeChord | null,
+      ): Promise<VoiceModeChordRegistrationResult>;
+      /**
+       * Point the hold detector at a modifier set, or clear it with `off`.
+       * Absent on shells whose helper cannot watch the raw keyboard.
+       */
+      setModifierHold?(
+        hold: ModifierHold,
+      ): Promise<ModifierHoldRegistrationResult>;
+      /**
+       * Watch for a modifier set pressed with one of a few keys, or clear the
+       * binding with `off`. Absent on shells whose helper cannot watch the
+       * raw keyboard.
+       *
+       * Events come back to the window that registered them rather than to
+       * whichever one the user last focused, since the binding is armed by
+       * the window that can answer it and a chord means nothing anywhere
+       * else.
+       */
+      setChords?(binding: ChordBinding): Promise<ChordRegistrationResult>;
+      /**
+       * What is highlighted in the application in front, or `null` when
+       * nothing is. Absent on shells whose helper cannot read it.
+       */
+      readFrontSelection?(): Promise<HotkeySelection | null>;
+      onRegistrationChange?(callback: (active: boolean) => void): () => void;
       onEvent(callback: (event: HotkeyEvent) => void): () => void;
+    };
+    /**
+     * Which of the named applications are running, by bundle identifier.
+     * Absent on shells whose helper cannot ask the workspace.
+     */
+    apps?: {
+      running(bundleIds: readonly string[]): Promise<string[]>;
+      /**
+       * Ask an application to quit. Only the apps in `FN_CLAIMANTS` can be
+       * asked; anything else resolves `false` without asking.
+       */
+      quit(bundleId: string): Promise<boolean>;
+      /** The bundle identifier of the application in front, or `null`. */
+      frontmost(): Promise<string | null>;
+    };
+    /**
+     * Whether the user is typing or clicking anywhere, without which keys or
+     * where. For a surface offering to replace an edit: any press after that
+     * edit means it is no longer the last one, and a click moves the cursor
+     * the replacement would land at. Absent on shells whose helper does not
+     * watch the input stream.
+     */
+    input?: {
+      setActivityWatch(enable: boolean): Promise<boolean>;
+      onActivity(callback: () => void): () => void;
     };
     dictation: {
       setPartials(
@@ -179,9 +327,7 @@ export interface VellumBridge {
        * PCM — the offline transcript authority. Result arrives via
        * `onTranscribed`.
        */
-      transcribe?(
-        audio: ArrayBuffer,
-      ): Promise<DictationTranscribeResult>;
+      transcribe?(audio: ArrayBuffer): Promise<DictationTranscribeResult>;
       onTranscribed?(
         callback: (event: DictationPartialEvent) => void,
       ): () => void;
@@ -189,7 +335,13 @@ export interface VellumBridge {
   };
   permissions: {
     getState(): Promise<SystemPermissionsState>;
-    request(kind: SystemPermissionKind): Promise<SystemPermissionStateItem>;
+    request(
+      kind: SystemPermissionKind,
+      presentation?: Pick<
+        ShowNotificationPayload,
+        "presentation" | "identity" | "sender"
+      >,
+    ): Promise<SystemPermissionStateItem>;
     openSettings(
       kind: SystemPermissionKind,
     ): Promise<SystemPermissionStateItem>;
@@ -211,14 +363,31 @@ export interface VellumBridge {
      * Publish the traits the assistant's character is composed from, so
      * surfaces that can render it live do, rather than showing the still that
      * `setAvatar` ships. `null` when the avatar is a custom image or absent.
+     * `accentHex` is the avatar's accent as `#rrggbb`, carried separately
+     * because an uploaded image has one and no traits; `null` when the
+     * avatar has no colour yet. Omitted by a web bundle that predates it.
      */
-    setCharacter(character: CompanionCharacter | null): void;
+    setCharacter(
+      character: CompanionCharacter | null,
+      accentHex?: string | null,
+    ): void;
   };
   dock: {
     setBadge(count: number): void;
   };
   share: {
     shareFile(bytes: Uint8Array, filename: string): Promise<void>;
+  };
+  downloads: {
+    /** Terminal reports for downloads this window initiated. */
+    onDone(callback: (event: DownloadDoneEvent) => void): () => void;
+    /**
+     * Reveal a completed download in the host's file manager (Finder,
+     * File Explorer). `id` comes from a `"completed"` `onDone` event; main
+     * resolves it to the saved path itself and ignores unknown ids, so the
+     * renderer can never point this at an arbitrary file.
+     */
+    reveal(id: string): Promise<void>;
   };
   localMode: {
     hatch(
@@ -242,6 +411,14 @@ export interface VellumBridge {
       assistantId: string,
       name: string,
     ): Promise<LockfileWriteResult>;
+    /**
+     * Stamp `onboardedAt` on an existing lockfile entry. Update-only on the
+     * same terms as `renameLockfileAssistant`, and keeps an existing stamp.
+     */
+    stampLockfileAssistantOnboarded(
+      assistantId: string,
+      onboardedAt: string,
+    ): Promise<LockfileWriteResult>;
     replacePlatformAssistants(
       platformAssistants: Array<Record<string, unknown>>,
       organizationId?: string,
@@ -262,15 +439,22 @@ export interface VellumBridge {
      */
     unpair(assistantId: string): Promise<LockfileWriteResult>;
     /**
-     * Register a pairing bundle printed by `vellum pair` on another machine:
-     * persist the guardian token and create a `cloud: "paired"` lockfile
-     * entry, the write counterpart of `unpair`. `name` picks the local id
-     * (its slug); omitted, the id derives from the bundle's device id.
+     * Begin pairing with the assistant at `address`, either a pairing link
+     * copied from its "Pair a device" card or a bare `https://host` URL. The
+     * host runs the device-code exchange, so neither the device code nor the
+     * credentials it buys cross this boundary.
      */
-    connectImport(
-      bundle: string,
-      name?: string,
-    ): Promise<LocalConnectImportResult>;
+    pairingStart(address: string): Promise<LocalPairingStartResult>;
+    /**
+     * One exchange attempt for a live pairing session. An approved code
+     * persists the guardian token and creates a `cloud: "paired"` lockfile
+     * entry in the same call, the write counterpart of `unpair`. `name` picks
+     * the local id (its slug); omitted, the id derives from the assistant's
+     * address.
+     */
+    pairingPoll(handle: string, name?: string): Promise<LocalPairingPollResult>;
+    /** Forget a pending pairing session. */
+    pairingCancel(handle: string): Promise<{ ok: boolean }>;
     sleep(assistantId: string): Promise<{ ok: boolean; error?: string }>;
     wake(
       assistantId: string,
@@ -287,6 +471,13 @@ export interface VellumBridge {
       | { ok: true; accessToken: string }
       | { ok: false; status: number; error: string }
     >;
+    /**
+     * Read a local assistant's avatar straight off its workspace, so the
+     * chooser can render it even while that assistant is asleep.
+     */
+    readAssistantAvatar(
+      assistantId: string,
+    ): Promise<LocalReadAssistantAvatarResult>;
   };
   menu: {
     setPlatformSession(has: boolean): Promise<void>;
@@ -354,7 +545,25 @@ export interface VellumBridge {
     show(
       payload: ShowNotificationPayload,
     ): Promise<{ success: boolean; errorMessage?: string }>;
+    /** Registers this preload's renderer lifetime before identity publication. */
+    registerIdentityPublisher?(publisherSessionId?: string): Promise<boolean>;
+    /** Optional until every installed desktop preload supports preparation. */
+    prepareIdentity?(
+      payload: PrepareNotificationIdentityPayload,
+    ): Promise<void>;
+    /** Optional until every installed desktop preload supports scoped reset. */
+    resetIdentities?(
+      payload: ResetNotificationIdentitiesPayload,
+    ): Promise<void>;
     onAction(callback: (event: NotificationActionEvent) => void): () => void;
+    /**
+     * Authoritative state of the window this renderer belongs to, pushed from
+     * main. Vellum windows disable background throttling, which also disables
+     * the Page Visibility API, so the renderer cannot read this for itself.
+     */
+    onWindowAttention(
+      callback: (payload: WindowAttentionPayload) => void,
+    ): () => void;
   };
   bundleConfirm: {
     getData(): Promise<BundleScanData | null>;
@@ -416,6 +625,14 @@ export interface VellumBridge {
     /** Nudge the window, for dragging the surface around the desktop. */
     moveBy(dx: number, dy: number): void;
     /**
+     * The hand has let go of the surface.
+     *
+     * Sent after every press ends, whether or not it moved anything: main
+     * knows whether a drag was in flight and what, if anything, the release
+     * settles. Mid-call, it is the drop that docks the bar to an edge.
+     */
+    release(): void;
+    /**
      * Ask for a live-voice session, which is what Talk does.
      *
      * The surface is its own renderer and holds no session, so the press is
@@ -431,8 +648,146 @@ export interface VellumBridge {
      * surface draws a single control and the window holding the session is the
      * only side that knows which edge a press is. What comes back is `watching`
      * on `onState`.
+     *
+     * `pick` is the row of the picker the start edge came from, when it came
+     * from one. Main resolves a tab to the window showing it and hands the
+     * result to the session as its target; what comes back is `captureTarget`
+     * on `onState`, and the frame main draws around it.
      */
-    toggleWatch(): void;
+    toggleWatch(pick?: CompanionCapturePick): void;
+    /**
+     * What a session could read right now: the displays, the Chrome tabs, and
+     * the windows on screen, for the picker Teach opens.
+     *
+     * Listed on demand rather than pushed, because the desktop changes under
+     * every push and the list is only worth anything at the moment it is drawn.
+     * Absent on a shell that predates the picker, which the surface reads as
+     * having nothing to offer and starts the whole-screen session instead.
+     */
+    listCaptureSources?(): Promise<CompanionCaptureSources>;
+    /**
+     * Show the running call a display, a window or a Chrome tab, or stop.
+     *
+     * `pick` is the row of the picker the press came from; a press with none
+     * is the stop. Main resolves a tab the way `toggleWatch` does and hands
+     * the target to the window holding the session as the `setScreenShare`
+     * command; what comes back is `screenShare` on `onState`. Absent on a
+     * shell that predates the share, which the surface reads as having
+     * nothing to offer.
+     */
+    setScreenShare?(pick?: CompanionCapturePick): void;
+    /**
+     * Turn the frame around the shared surface into something the user can
+     * draw on, or give the mouse back to the desktop.
+     *
+     * Main's own state rather than a command passed on, unlike everything
+     * either side of it here: it decides whether a window main opened takes
+     * mouse events, which is not a fact any renderer can hold. What comes
+     * back is `annotating` on `onState`, which is what draws the control
+     * held down and what tells the frame it is the one taking presses.
+     *
+     * Absent on a shell that predates the drawing, which the surface reads
+     * as having nothing to offer, the bargain `setScreenShare` makes.
+     */
+    setAnnotating?(annotating: boolean): void;
+    /**
+     * Choose what a press on the frame draws while the mode is on.
+     *
+     * Main's the way the mode is: the pill chooses and the frame draws, and
+     * neither window can tell the other. What comes back is
+     * `annotationTool` on `onState`. Absent on a shell that predates the
+     * shapes, which the surface reads as having only the pencil to offer.
+     */
+    setAnnotationTool?(tool: CompanionAnnotationTool): void;
+    /**
+     * The same mode, flipped rather than set, for a press that has to be its
+     * own way back and no view of which way that is.
+     *
+     * The keyboard's version of the control above: the mode is main's, so
+     * main is the side that can say what turning it over means. A renderer
+     * deciding from the last pushed state would answer with the mode as it
+     * was when that push left.
+     */
+    toggleAnnotating?(): void;
+    /**
+     * Take down everything on the shared surface without ending the share:
+     * the assistant's marks, and the user's own ink.
+     *
+     * Main's, since it holds the marks and opened the frame the ink is on.
+     * What comes back is `coachmarks` gone from `onState` and `marksCleared`
+     * stepped on it, which is what the frame's drawing layer drops its ink
+     * on. Absent on a shell that predates the control, which the surface
+     * reads as having no clear to offer.
+     */
+    clearMarks?(): void;
+    /**
+     * A mark the user is drawing over the shared surface, from the frame's
+     * own window: `drawing` while the hand is still on it, `released` when it
+     * comes off, carrying every stroke still on the overlay.
+     *
+     * Delivered to the window holding the session as the `annotateShare`
+     * command, since that is the window that takes the frames and the only
+     * one that can draw the strokes onto them.
+     */
+    annotateShare?(
+      phase: CompanionAnnotationPhase,
+      strokes: readonly CompanionAnnotationStroke[],
+      ink: string,
+    ): void;
+    /**
+     * The user is scrolling the app under the frame, or has moved the
+     * pointer since, from the frame's own window while it is taking presses.
+     *
+     * A window taking presses takes the wheel with them and cannot forward
+     * it, so on `true` main makes the frame click-through with mouse-move
+     * forwarded, which lets the rest of the scroll reach the app underneath
+     * and still shows the renderer where the pointer is; on `false` it takes
+     * the mouse back. Refused while drawing is off, since there is no mouse
+     * to hand back. Absent on a shell that predates it, which the frame
+     * reads as having no scroll to let through.
+     */
+    setFrameScrolling?(scrolling: boolean): void;
+    /**
+     * One frame of `target`, as the helper takes it, for the window holding a
+     * shared call to hand to the session. Resolves to null when no frame
+     * could be taken: the window has gone, the display was unplugged, or
+     * Screen Recording is not granted.
+     */
+    captureScreen?(
+      target: WatchCaptureTarget,
+    ): Promise<ScreenCaptureFrame | null>;
+    /**
+     * A frame of `target` has reached the call, so the assistant has now been
+     * shown that surface.
+     *
+     * Told rather than inferred, and told here rather than at the capture.
+     * Taking a frame is not showing it: it is prepared, uploaded and sent
+     * afterwards, and any of those can fail or be voided by a reconnect. Main
+     * refuses marks measured against a surface the call has not been shown
+     * ({@link CompanionSurfaceState.coachmarks}), and a capture counted as a
+     * showing would open that gate for a picture nobody received.
+     *
+     * Only the window holding the session knows the frame arrived, which is
+     * why this comes from the renderer rather than being settled in main.
+     */
+    sharedFrame?(target: WatchCaptureTarget): void;
+    /**
+     * A preview of one row of the picker, as a JPEG data URL, for the tile
+     * that row is drawn as.
+     *
+     * The same capture {@link captureScreen} takes, asked for small and
+     * asked for many at once: the picker draws a grid of what the desktop is
+     * showing rather than a list of titles, and a title is a poor way to
+     * find the window you mean. Resolves to null on every refusal the frame
+     * path has, plus the one this call adds: a window that closed between
+     * being listed and being drawn. The tile falls back to the owning app's
+     * icon, so a preview nobody could take costs a picture rather than a row.
+     *
+     * A Chrome tab is never asked for. It has no window of its own until it
+     * has been shown, and showing it to draw a picker would move the user's
+     * browser under them.
+     */
+    captureSourceThumbnail?(target: WatchCaptureTarget): Promise<string | null>;
     /**
      * Answer the summary question a finished watch session leaves on the
      * surface: open the report now, or not.
@@ -443,29 +798,56 @@ export interface VellumBridge {
      */
     answerWatchRetro(open: boolean): void;
     /**
+     * Answer the offer a dictation's words are standing on, naming the offer
+     * the card was drawn against. See the `answerDictationOffer` command;
+     * every answer travels, since the window that made the offer is the one
+     * holding it.
+     */
+    answerDictationOffer(answer: DictationOfferAnswer, offerId: string): void;
+    /**
+     * Answer the popover beside the surface, naming the popover it was drawn
+     * for. See the `answerCompanionPopover` command.
+     */
+    answerPopover(answer: CompanionPopoverAnswer, popoverId: string): void;
+    /**
+     * Report the size of the popover's card for the popover it is drawing, so
+     * main can size its window and show it once it has been measured.
+     */
+    setPopoverSize(popoverId: string, width: number, height: number): void;
+    /**
+     * Show the popover whole (Review, Enter), put it off (Not Now), or back to
+     * its short form. See `CompanionPopoverView`.
+     */
+    setPopoverView(popoverId: string, view: CompanionPopoverView): void;
+    /**
+     * Report how tall the popover drawn on a call's bar stands above the
+     * bar's centre line, from the surface's own window, so main can make the
+     * canvas tall enough to hold it.
+     */
+    setAttachedPopoverHeight(popoverId: string, height: number): void;
+    /**
+     * Open a picker from the call bar in the popover, or close it. See the
+     * `toggleCompanionPicker` command.
+     */
+    togglePicker?(picker: CompanionPicker): void;
+    /**
+     * Open a web link from the popover in the user's browser. Main refuses any
+     * scheme but http and https.
+     */
+    openLink(url: string): void;
+    /**
+     * Whether the surface is on screen to draw a prompt beside, so a caller
+     * that would otherwise bring the app forward can leave it where it is.
+     */
+    takesPrompts(): Promise<boolean>;
+    /**
      * Bring Vellum forward on the conversation the user was last in, which is
      * what pressing the avatar asks for.
      */
     activate(): void;
     /**
-     * Whether the surface's composer is open, and with it whether the window
-     * may take key status.
-     *
-     * The counterpart to `setInteractive`: mouse events are granted only while
-     * the pointer is on the pill, and keystrokes only while there is a field to
-     * put them in. A floating panel that held the keyboard after its field
-     * closed would swallow what the user typed next into the app they are
-     * actually working in.
-     */
-    setComposing(composing: boolean): void;
-    /**
-     * Send what the user typed. See the `companionSubmit` command: the first
-     * message of a composer's life starts a conversation, the rest continue it,
-     * and none of them raise the app.
-     */
-    submit(message: string, startsConversation: boolean): void;
-    /**
-     * Publish the assistant's name and the tail of the open conversation.
+     * Publish the assistant's name and what the app's window knows about the
+     * turn and the sessions it is running.
      *
      * The one call here the surface's own route does *not* make: it comes from
      * the window holding the conversation, the way `voiceActivity.update` comes
@@ -490,15 +872,6 @@ export interface VellumBridge {
      * describe the surface differently.
      */
     showContextMenu(): void;
-    /**
-     * Open a link from the card in the user's browser.
-     *
-     * The surface's window denies every navigation and every `window.open`, so
-     * an anchor cannot follow itself: the URL is handed to main, which is the
-     * side allowed to open anything. Main validates the scheme, since a URL
-     * arriving over IPC is untrusted whatever drew the anchor.
-     */
-    openLink(url: string): void;
   };
   popout: {
     open(conversationId: string): Promise<void>;
@@ -534,6 +907,7 @@ export const VELLUM_BRIDGE_KEYS = [
   "icon",
   "dock",
   "share",
+  "downloads",
   "localMode",
   "menu",
   "mainWindow",

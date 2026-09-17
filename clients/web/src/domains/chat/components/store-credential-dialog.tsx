@@ -31,9 +31,17 @@ const SLOT_BY_DETECTION_LABEL: Record<string, CredentialSlot> = {
   "GitLab Token": { service: "gitlab", field: "token" },
   "Stripe Secret Key": { service: "stripe", field: "secret_key" },
   "Stripe Restricted Key": { service: "stripe", field: "restricted_key" },
-  "Slack Bot Token": { service: "slack", field: "bot_token" },
-  "Slack User Token": { service: "slack", field: "user_token" },
-  "Slack App Token": { service: "slack", field: "app_token" },
+  // Link's OAuth tokens normally live on the connection, not here. They are
+  // mapped anyway because Link documents driving link-cli from a hand-exported
+  // LINK_ACCESS_TOKEN, so one can reach the composer as a pasted string.
+  "Link Access Token": { service: "stripe_link", field: "access_token" },
+  "Link Refresh Token": { service: "stripe_link", field: "refresh_token" },
+  // Slack channel credentials live under `slack_channel`; the bare `slack`
+  // provider is the OAuth integration, whose token is held on its connection
+  // rather than in the credential store.
+  "Slack Bot Token": { service: "slack_channel", field: "bot_token" },
+  "Slack User Token": { service: "slack_channel", field: "user_token" },
+  "Slack App Token": { service: "slack_channel", field: "app_token" },
   "Telegram Bot Token": { service: "telegram", field: "bot_token" },
   "Anthropic API Key": { service: "anthropic", field: "api_key" },
   "OpenAI API Key": { service: "openai", field: "api_key" },
@@ -62,6 +70,7 @@ const SLOT_BY_DETECTION_LABEL: Record<string, CredentialSlot> = {
   "Perplexity API Key": { service: "perplexity", field: "api_key" },
   "Tavily API Key": { service: "tavily", field: "api_key" },
   "Firecrawl API Key": { service: "firecrawl", field: "api_key" },
+  "Resend API Key": { service: "resend", field: "api_key" },
 };
 
 /**

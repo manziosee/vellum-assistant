@@ -2,11 +2,13 @@ import {
   ChevronDown,
   ChevronUp,
   CircleUser,
+  Gift,
+  List,
   MessageSquareText,
   Settings as SettingsIcon,
   Shield,
 } from "lucide-react";
-import { lazy, useState } from "react";
+import { lazy, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router";
 
 import {
@@ -19,38 +21,43 @@ import {
 } from "@vellumai/design-library";
 
 import { LazyBoundary } from "@/components/lazy-boundary";
+import {
+  prefetchShareFeedbackModal,
+  ShareFeedbackModalLazy,
+} from "@/components/share-feedback-modal-lazy";
 import { ThemeToggle } from "@/components/theme-toggle";
 import type { PreferencesUsage } from "@/domains/chat/hooks/use-preferences-usage";
 import { usePreferencesUsage } from "@/domains/chat/hooks/use-preferences-usage";
+import { useEffectiveActivationListId } from "@/hooks/use-activation-enabled";
 import { useBillingBalanceStatus } from "@/hooks/use-billing-balance-status";
-import { useObscureCredits } from "@/hooks/use-obscure-credits-flag";
 import { useTouchMobile } from "@/hooks/use-touch-mobile";
 import { usePlatformGate } from "@/hooks/use-platform-gate";
 import { displayedCreditsUsd } from "@/lib/billing/displayed-credits";
+import { prefetchRoute } from "@/lib/prefetch-route";
 import { isElectron } from "@/runtime/is-electron";
 import { useAuthStore, useIsAuthenticated } from "@/stores/auth-store";
 import { openUrl } from "@/runtime/browser";
-import { useIsNativeAndroid } from "@/runtime/platform-detection";
+import { emitActivationEvent } from "@/utils/activation-telemetry";
 import { adminUrl, routes } from "@/utils/routes";
 
 import { CreditsCard } from "./credits-card";
 import { PreferencesUsagePanel } from "./preferences-usage-panel";
+import { SIDEBAR_PILL_GAP_CLASSES } from "@/components/sidebar-nav-geometry";
 import { useTranslation } from "@/i18n";
 
-// Modal only opens when the user clicks "Share Feedback" — defer loading
-// until then to keep the modal's form deps (markdown editor, etc.) out of
-// the initial bundle.
-const ShareFeedbackModal = lazy(() =>
-  import("@/components/share-feedback-modal").then((m) => ({
-    default: m.ShareFeedbackModal,
-  })),
-);
-
-// Same treatment for the top-up checkout, which only the usage panel's
-// exhausted strip opens.
+// The top-up checkout only opens from the usage panel's exhausted strip, so
+// its chunk stays out of the initial bundle until then.
 const AddCreditsModal = lazy(() =>
   import("@/components/add-credits-modal").then((m) => ({
     default: m.AddCreditsModal,
+  })),
+);
+
+// The referral modal only opens from the earn-credits row, so its chunk stays
+// out of the initial bundle until then.
+const ReferralModal = lazy(() =>
+  import("@/components/referral-modal").then((m) => ({
+    default: m.ReferralModal,
   })),
 );
 
@@ -63,26 +70,28 @@ const AddCreditsModal = lazy(() =>
 /**
  * Whether the credits row belongs below the usage panel.
  *
- * Under `obscure-credits` the dollar balance stays hidden while the included
- * bundle still has room: the bar is the reading that matters there, and a
- * second number beside it only invites the arithmetic the flag exists to
- * avoid. Once the bundle is spent the next turn draws on the wallet instead,
- * so the row that names it comes back, unless the wallet is empty too and the
- * panel's add-credits strip is already saying so.
+ * The dollar balance stays hidden whenever there is a usage reading to stand
+ * in for it. While the included bundle has room the bar is the reading that
+ * matters, and a second number beside it only invites the arithmetic the
+ * usage-relative view exists to avoid. Once the bundle is spent the panel
+ * itself says the next turn draws on extra usage credits, and once the wallet
+ * is empty too its add-credits strip takes over, so the row never earns its
+ * place.
  *
  * With no reading to hide behind, the row stays: the panel renders nothing
  * without one, and hiding the row too would leave the menu with no balance and
- * no way to buy more. With the flag off the row is whatever it has always
- * been.
+ * no way to buy more.
+ *
+ * `settled` is what keeps that last clause from firing early. The row needs
+ * only the summary while the panel needs the subscription too, so an unguarded
+ * `usage == null` shows the row in the gap between the two and then swaps it
+ * for the panel. Waiting means the menu picks one of them and keeps it.
  */
 export function showsMenuCredits(
-  obscureCredits: boolean,
   usage: PreferencesUsage | null,
+  settled: boolean,
 ): boolean {
-  if (!obscureCredits || usage == null) {
-    return true;
-  }
-  return usage.spent && !usage.exhausted;
+  return settled && usage == null;
 }
 
 export interface PreferencesMenuProps {
@@ -117,6 +126,23 @@ export function PreferencesMenu({
      both unmount their content on close, and the strip closes the menu as it
      opens the checkout. */
   const [isAddCreditsOpen, setIsAddCreditsOpen] = useState(false);
+  const [isEarnCreditsOpen, setIsEarnCreditsOpen] = useState(false);
+
+  /* Warm the chunks this menu leads to as it opens rather than on the click
+     that needs them, so they are usually already there by the time they are
+     asked for. Settings is the expensive one: it is two lazy chunks, the
+     layout and its landing page, and the router resolves both before it will
+     commit, holding the previous screen with no feedback for the whole wait.
+     Once per mount: chunks are module-cached after the first fetch. */
+  const hasPrefetchedMenuTargets = useRef(false);
+  useEffect(() => {
+    if (!isOpen || hasPrefetchedMenuTargets.current) {
+      return;
+    }
+    hasPrefetchedMenuTargets.current = true;
+    prefetchShareFeedbackModal();
+    prefetchRoute(routes.settings.root);
+  }, [isOpen]);
 
   if (!isAuthenticated) {
     return null;
@@ -130,13 +156,22 @@ export function PreferencesMenu({
          so it can't be transparent like `ghost`. */
       <Button
         variant="ghost"
-        leftIcon={<CircleUser />}
-        className="min-h-[var(--side-menu-tile-size,36px)] min-w-0 rounded-full border border-[var(--border-base)] bg-[var(--surface-lift)] px-3"
+        /* Sized as the drawer's rows and the New Chat pill beside it: large
+           body label, 16px glyph on a phone, and the rows' 8px between glyph
+           and label. The glyph is content rather than `leftIcon`, whose box
+           the button sizes inline at 14px. The leading inset is the rows'
+           8px plus the chip's 4px lead-in to its 16px glyph, less the 1px
+           border, so this label starts where the assistant row's does (40px
+           in, see `SIDEBAR_MOBILE_CHIP_CLASSES`). */
+        className="min-h-[var(--side-menu-tile-size,36px)] min-w-0 gap-2 rounded-full border border-[var(--border-base)] bg-[var(--surface-lift)] pr-3 pl-[15px] max-md:text-body-large-default"
       >
+        <CircleUser aria-hidden className="size-3.5 shrink-0 max-md:size-4" />
         {/* `truncate` is belt-and-braces: the label is a fixed short string,
             but the pill shares its row with New Chat and must never grow
             wide enough to overlap it at narrow viewports. */}
-        <span className="min-w-0 truncate">{t("preferencesMenu.preferences")}</span>
+        <span className="min-w-0 truncate">
+          {t("preferencesMenu.preferences")}
+        </span>
       </Button>
     ) : collapsed ? (
       /* Collapsed, the same tile every other rail entry reduces to: a circle
@@ -179,6 +214,8 @@ export function PreferencesMenu({
         label={t("preferencesMenu.preferences")}
         expandChevron={isOpen ? ChevronDown : ChevronUp}
         active={isOpen}
+        /* Its label on the line every other rail pill's starts on. */
+        className={SIDEBAR_PILL_GAP_CLASSES}
         data-tour-id="settings"
       />
     );
@@ -188,6 +225,7 @@ export function PreferencesMenu({
       onClose={closeMenu}
       onShareFeedback={() => setIsFeedbackOpen(true)}
       onAddCredits={() => setIsAddCreditsOpen(true)}
+      onEarnCredits={() => setIsEarnCreditsOpen(true)}
       activeConversationId={activeConversationId}
     />
   );
@@ -199,7 +237,9 @@ export function PreferencesMenu({
           <BottomSheet.Trigger asChild>{trigger}</BottomSheet.Trigger>
           <BottomSheet.Content className="max-h-[85dvh]">
             <BottomSheet.Header className="sr-only">
-              <BottomSheet.Title>{t("preferencesMenu.preferences")}</BottomSheet.Title>
+              <BottomSheet.Title>
+                {t("preferencesMenu.preferences")}
+              </BottomSheet.Title>
             </BottomSheet.Header>
             <BottomSheet.Body className="pt-0">{content}</BottomSheet.Body>
           </BottomSheet.Content>
@@ -217,7 +257,7 @@ export function PreferencesMenu({
               event.preventDefault();
               content?.focus();
             }}
-            className="w-64 rounded-lg p-4"
+            className="w-64"
           >
             {content}
           </Popover.Content>
@@ -225,15 +265,13 @@ export function PreferencesMenu({
       )}
 
       {isFeedbackOpen ? (
-        <LazyBoundary>
-          <ShareFeedbackModal
-            open={isFeedbackOpen}
-            onClose={() => setIsFeedbackOpen(false)}
-            assistantId={assistantId}
-            assistantVersion={assistantVersion}
-            activeConversationId={activeConversationId}
-          />
-        </LazyBoundary>
+        <ShareFeedbackModalLazy
+          open={isFeedbackOpen}
+          onClose={() => setIsFeedbackOpen(false)}
+          assistantId={assistantId}
+          assistantVersion={assistantVersion}
+          activeConversationId={activeConversationId}
+        />
       ) : null}
 
       {isAddCreditsOpen ? (
@@ -241,6 +279,15 @@ export function PreferencesMenu({
           <AddCreditsModal
             open={isAddCreditsOpen}
             onOpenChange={setIsAddCreditsOpen}
+          />
+        </LazyBoundary>
+      ) : null}
+
+      {isEarnCreditsOpen ? (
+        <LazyBoundary>
+          <ReferralModal
+            open={isEarnCreditsOpen}
+            onOpenChange={setIsEarnCreditsOpen}
           />
         </LazyBoundary>
       ) : null}
@@ -252,6 +299,7 @@ interface PreferencesMenuContentProps {
   onClose: () => void;
   onShareFeedback: () => void;
   onAddCredits: () => void;
+  onEarnCredits: () => void;
   activeConversationId?: string | null;
 }
 
@@ -259,29 +307,34 @@ function PreferencesMenuContent({
   onClose,
   onShareFeedback,
   onAddCredits,
+  onEarnCredits,
   activeConversationId,
 }: PreferencesMenuContentProps) {
   const { t } = useTranslation("chat");
+  const { t: tActivation } = useTranslation("activation");
   const navigate = useNavigate();
   const user = useAuthStore.use.user();
   const platformGate = usePlatformGate();
+  /* The Inspiration List entry rides the same gate as every other activation
+     surface, resolved in the one place that owns it. */
+  const activationListId = useEffectiveActivationListId();
   const {
     enabled: showBillingRows,
     balance: effectiveBalance,
     availableUsageBalance,
   } = useBillingBalanceStatus();
-  const isNativeAndroid = useIsNativeAndroid();
   /* The same reading the usage panel below draws, composed once so the row and
      the bar can never disagree about how much of the bundle is left. */
-  const obscureCredits = useObscureCredits();
-  const usage = usePreferencesUsage({ conversationId: activeConversationId });
-  const showCredits = showsMenuCredits(obscureCredits, usage);
+  const { usage, settled } = usePreferencesUsage({
+    conversationId: activeConversationId,
+  });
+  const showCredits = showsMenuCredits(usage, settled);
 
   return (
     <>
       <ThemeToggle className="px-2 py-0" />
 
-      <div className="my-2 border-t border-[var(--border-subtle)]" />
+      <div className="my-1 h-px bg-[var(--border-base)]" />
 
       <PreferencesUsagePanel
         conversationId={activeConversationId}
@@ -289,36 +342,51 @@ function PreferencesMenuContent({
           onClose();
           navigate(routes.settings.usageBilling);
         }}
-        onAddCredits={
-          isNativeAndroid
-            ? undefined
-            : () => {
-                onClose();
-                onAddCredits();
-              }
-        }
+        onAddCredits={() => {
+          onClose();
+          onAddCredits();
+        }}
       />
 
       {showBillingRows && effectiveBalance !== null && showCredits ? (
         <div className="my-2">
           <CreditsCard
             balance={formatWholeCredits(
-              displayedCreditsUsd(
-                obscureCredits,
-                effectiveBalance,
-                availableUsageBalance,
-              ),
+              displayedCreditsUsd(effectiveBalance, availableUsageBalance),
             )}
-            onAddCredits={
-              isNativeAndroid
-                ? undefined
-                : () => {
-                    onClose();
-                    navigate(routes.settings.usageBilling);
-                  }
-            }
+            onAddCredits={() => {
+              onClose();
+              navigate(routes.settings.usageBilling);
+            }}
           />
         </div>
+      ) : null}
+
+      {/* The row rides the billing gate like the credits card above it. The
+          modal itself says whether the account can earn, so the menu does not
+          ask ahead of time and no referral code is minted until someone opens
+          it. */}
+      {showBillingRows ? (
+        <PanelItem
+          icon={Gift}
+          label={t("preferencesMenu.earnCredits")}
+          onSelect={() => {
+            onClose();
+            onEarnCredits();
+          }}
+        />
+      ) : null}
+
+      {activationListId !== null ? (
+        <PanelItem
+          icon={List}
+          label={tActivation("menu.inspirationList")}
+          onSelect={() => {
+            onClose();
+            emitActivationEvent("activation_list_opened");
+            navigate(routes.activationList);
+          }}
+        />
       ) : null}
 
       {(platformGate === "full" || isElectron()) && (

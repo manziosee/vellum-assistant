@@ -21,6 +21,8 @@ import { describe, expect, mock, test } from "bun:test";
 import type { TranscriptItem } from "@/domains/chat/transcript/types";
 import {
   classifyScrollPosition,
+  haveSameItemKeys,
+  shouldGestureLoadOlder,
   decideItemsChangeAction,
   findAnchorIndex,
   findLatestUserAnchorKey,
@@ -30,6 +32,8 @@ import {
 import type { TranscriptHandle } from "@/domains/chat/transcript/transcript";
 
 import { textBody } from "@/domains/chat/utils/message-test-helpers";
+import { buildTranscriptItems } from "./build-items";
+import { isStandaloneCameraFramePrepend } from "./transcript-scroll-utils";
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
@@ -65,6 +69,82 @@ function makeUserMessage(id: string): TranscriptItem {
 function items(ids: readonly string[]): TranscriptItem[] {
   return ids.map(makeMessage);
 }
+
+function cameraItems(ids: readonly string[]): TranscriptItem[] {
+  return buildTranscriptItems({
+    messages: ids.map((id) => ({ id, role: "user", isCameraFrame: true })),
+    pendingSecret: null,
+    pendingConfirmation: null,
+    isThinking: false,
+  });
+}
+
+describe("grouped camera frame scroll identity", () => {
+  test("resolves persisted and client frame aliases after a host changes", () => {
+    const next = cameraItems(["f1", "f2", "f3"]);
+    const group = next[0];
+    if (group?.kind !== "message") {
+      throw new Error("Expected a message group");
+    }
+    group.cameraFrames![1]!.clientMessageId = "client-f2";
+    expect(findAnchorIndex(next, "f2")).toBe(0);
+    expect(findAnchorIndex(next, "client-f2")).toBe(0);
+    expect(findAnchorIndex(next, "missing")).toBe(-1);
+    expect(findAnchorIndex([...next, makeMessage("f2")], "f2")).toBe(1);
+  });
+
+  test("pagination correction retains the saved height delta inside an enlarged group", () => {
+    const previousItems = cameraItems(["f3", "f4"]);
+    const next = cameraItems(["f1", "f2", "f3", "f4"]);
+    expect(
+      decideItemsChangeAction({
+        items: next,
+        previousItems,
+        conversationId: "conv-123",
+        savedAnchor: { key: "f3", scrollTop: 100, scrollHeight: 1800 },
+      }),
+    ).toEqual({
+      kind: "anchor-correct",
+      newIndex: 0,
+      savedScrollTop: 100,
+      savedScrollHeight: 1800,
+    });
+    expect(isStandaloneCameraFramePrepend(previousItems[0], next[0])).toBe(
+      true,
+    );
+  });
+
+  test("only earlier frames count as a prepend of the same standalone run", () => {
+    const previous = cameraItems(["f3", "f4"])[0];
+    expect(
+      isStandaloneCameraFramePrepend(
+        previous,
+        cameraItems(["f3", "f4", "f5"])[0],
+      ),
+    ).toBe(false);
+    expect(
+      isStandaloneCameraFramePrepend(
+        previous,
+        cameraItems(["f1", "f3", "f4", "f5"])[0],
+      ),
+    ).toBe(true);
+    expect(
+      isStandaloneCameraFramePrepend(
+        previous,
+        cameraItems(["f1", "f4", "f3"])[0],
+      ),
+    ).toBe(false);
+    expect(
+      isStandaloneCameraFramePrepend(previous, cameraItems(["f1", "f2"])[0]),
+    ).toBe(false);
+    expect(
+      isStandaloneCameraFramePrepend(previous, makeUserMessage("speech")),
+    ).toBe(false);
+    expect(
+      isStandaloneCameraFramePrepend(undefined, cameraItems(["f1"])[0]),
+    ).toBe(false);
+  });
+});
 
 /** Build ScrollMetrics positioned at a given distance from the bottom,
  *  for a transcript with `scrollHeight = 1800, clientHeight = 800`
@@ -111,6 +191,7 @@ function makeHandle(): TranscriptHandle & {
   return {
     scrollToLatest,
     scrollToMessage: mock((): boolean => false),
+    keepFocusedFieldVisible: mock((): boolean => false),
     getScrollElement,
     getContentElement,
     getViewportHeight,
@@ -704,5 +785,109 @@ describe("integration — items-effect dispatch on underfilled viewport", () => 
       onLoadOlder();
     }
     expect(onLoadOlder).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// haveSameItemKeys — the no-progress guard for the underfilled auto-fetch
+// ---------------------------------------------------------------------------
+
+describe("haveSameItemKeys", () => {
+  test("same rows in the same order compare equal", () => {
+    const prev = [makeMessage("m1"), makeMessage("m2")];
+    const next = [makeMessage("m1"), makeMessage("m2")];
+    expect(haveSameItemKeys(prev, next)).toBe(true);
+  });
+
+  test("an in-place update to a row (same key) still compares equal", () => {
+    // Streaming replaces the item object but keeps its key; the guard must
+    // not read that as progress.
+    const prev = [makeMessage("m1")];
+    const next = [makeMessage("m1")];
+    expect(prev[0]).not.toBe(next[0]);
+    expect(haveSameItemKeys(prev, next)).toBe(true);
+  });
+
+  test("a prepended row is progress", () => {
+    const prev = [makeMessage("m2")];
+    const next = [makeMessage("m1"), makeMessage("m2")];
+    expect(haveSameItemKeys(prev, next)).toBe(false);
+  });
+
+  test("a removed row is progress", () => {
+    const prev = [makeMessage("m1"), makeMessage("m2")];
+    const next = [makeMessage("m2")];
+    expect(haveSameItemKeys(prev, next)).toBe(false);
+  });
+
+  test("a replaced key at equal length is progress", () => {
+    const prev = [makeMessage("m1"), makeMessage("m2")];
+    const next = [makeMessage("m1"), makeMessage("m3")];
+    expect(haveSameItemKeys(prev, next)).toBe(false);
+  });
+
+  test.each([
+    { ids: ["f1", "f2", "f3", "f4"] },
+    { ids: ["f1", "f3"] },
+    { ids: ["f1", "f4", "f3"] },
+    { ids: ["f1", "f3", "f2"] },
+  ])("changed grouped frame identities count as progress: %j", ({ ids }) => {
+    const prev = cameraItems(["f1", "f2", "f3"]);
+    const next = cameraItems(ids);
+    expect(prev[0]?.key).toBe(next[0]?.key);
+    expect(haveSameItemKeys(prev, next)).toBe(false);
+  });
+
+  test("an echoed frame with the same client identity is not pagination progress", () => {
+    const prev = cameraItems(["f1", "client-f2"]);
+    const next = cameraItems(["f1", "stored-f2"]);
+    const group = next[0];
+    if (group?.kind !== "message") {
+      throw new Error("Expected a message group");
+    }
+    group.cameraFrames![1]!.clientMessageId = "client-f2";
+    expect(haveSameItemKeys(prev, next)).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// shouldGestureLoadOlder — the underfilled-transcript gesture load path
+// ---------------------------------------------------------------------------
+
+describe("shouldGestureLoadOlder", () => {
+  const UNDERFILLED = { scrollTop: 0, scrollHeight: 400, clientHeight: 600 };
+  const READY = { hasMore: true, isLoadingOlder: false, hasConversation: true };
+
+  test("underfilled element with more history loads on a gesture", () => {
+    expect(shouldGestureLoadOlder(UNDERFILLED, READY)).toBe(true);
+  });
+
+  test("a scrollable element defers to the scroll handler", () => {
+    // Filled past the viewport: scroll events fire normally, so the gesture
+    // path stands down.
+    expect(
+      shouldGestureLoadOlder(
+        { scrollTop: 100, scrollHeight: 2_000, clientHeight: 600 },
+        READY,
+      ),
+    ).toBe(false);
+  });
+
+  test("no further history means no fetch", () => {
+    expect(
+      shouldGestureLoadOlder(UNDERFILLED, { ...READY, hasMore: false }),
+    ).toBe(false);
+  });
+
+  test("an in-flight load is not doubled", () => {
+    expect(
+      shouldGestureLoadOlder(UNDERFILLED, { ...READY, isLoadingOlder: true }),
+    ).toBe(false);
+  });
+
+  test("no conversation means no fetch", () => {
+    expect(
+      shouldGestureLoadOlder(UNDERFILLED, { ...READY, hasConversation: false }),
+    ).toBe(false);
   });
 });

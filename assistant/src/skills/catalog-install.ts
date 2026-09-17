@@ -14,13 +14,53 @@ import { homedir } from "node:os";
 import { dirname, join, posix, resolve, sep } from "node:path";
 import { gunzipSync } from "node:zlib";
 
+import {
+  MALFORMED_USTAR_SIZE,
+  parseUstarSizeField,
+} from "../archive/ustar-size.js";
 import { getPlatformBaseUrl } from "../config/env.js";
 import { loadSkillCatalog } from "../config/skills.js";
+import { isBunVirtualPath } from "../util/bundled-asset.js";
 import { getLogger } from "../util/logger.js";
-import { getWorkspaceSkillsDir } from "../util/platform.js";
+import { addToPathEnv, getWorkspaceSkillsDir } from "../util/platform.js";
 import { computeSkillHash, writeInstallMeta } from "./install-meta.js";
+import {
+  isSkillCompatibleWithPlatform,
+  normalizeSkillPlatforms,
+  type SkillPlatform,
+  skillPlatformUnavailableMessage,
+} from "./platform-compatibility.js";
 
 const log = getLogger("catalog-install");
+
+/**
+ * `bun install` argv for a skill's declared dependencies. Lifecycle scripts
+ * are suppressed: skill archives (catalog tarballs, skills.sh, ClawHub) are
+ * unsigned, so a `preinstall`/`postinstall` hook would be arbitrary code
+ * execution at install time. Mirrors plugin install in
+ * `cli/lib/install-plugin-dependencies.ts`.
+ */
+export const SKILL_DEPENDENCY_INSTALL_ARGS: readonly string[] = Object.freeze([
+  "install",
+  "--omit=dev",
+  "--ignore-scripts",
+  "--no-save",
+]);
+
+export class SkillArchiveError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SkillArchiveError";
+  }
+}
+
+function parseTarSize(header: Buffer): number {
+  try {
+    return parseUstarSizeField(header);
+  } catch {
+    throw new SkillArchiveError(MALFORMED_USTAR_SIZE);
+  }
+}
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -33,6 +73,7 @@ export interface CatalogSkill {
   includes?: string[];
   version?: string;
   updatedAt?: string;
+  platforms?: SkillPlatform[];
   metadata?: {
     icon?: string;
     emoji?: string;
@@ -42,6 +83,7 @@ export interface CatalogSkill {
       "avoid-when"?: string[];
       "feature-flag"?: string;
       category?: string;
+      platforms?: SkillPlatform[];
     };
   };
 }
@@ -59,7 +101,7 @@ export interface CatalogSkill {
 export function getRepoSkillsDir(): string | undefined {
   const importDir = import.meta.dir;
 
-  if (importDir.startsWith("/$bunfs/")) {
+  if (isBunVirtualPath(importDir)) {
     const execDir = dirname(process.execPath);
     // macOS .app bundle: binary in Contents/MacOS/, resources in Contents/Resources/
     const resourcesPath = join(
@@ -111,6 +153,7 @@ interface RawCatalogEntry {
   updatedAt?: unknown;
   display_name?: unknown;
   category?: unknown;
+  platforms?: unknown;
   updated_at?: unknown;
   metadata?: CatalogSkill["metadata"];
 }
@@ -144,6 +187,9 @@ function normalizeCatalogEntry(raw: unknown): CatalogSkill | null {
   const displayName = nested?.["display-name"] ?? asStr(entry.display_name);
   const icon = asStr(entry.icon) ?? asStr(entry.metadata?.icon);
   const updatedAt = asStr(entry.updatedAt) ?? asStr(entry.updated_at);
+  const platforms = normalizeSkillPlatforms(
+    nested?.platforms ?? entry.platforms,
+  );
 
   return {
     id,
@@ -154,6 +200,7 @@ function normalizeCatalogEntry(raw: unknown): CatalogSkill | null {
     ...(entry.includes ? { includes: entry.includes } : {}),
     ...(entry.version ? { version: entry.version } : {}),
     ...(updatedAt ? { updatedAt } : {}),
+    ...(platforms ? { platforms } : {}),
     metadata: {
       ...entry.metadata,
       ...(icon ? { icon } : {}),
@@ -161,6 +208,7 @@ function normalizeCatalogEntry(raw: unknown): CatalogSkill | null {
         ...nested,
         ...(displayName ? { "display-name": displayName } : {}),
         ...(category ? { category } : {}),
+        ...(platforms ? { platforms } : {}),
       },
     },
   };
@@ -287,11 +335,13 @@ export function extractTarToDir(tarBuffer: Buffer, destDir: string): boolean {
     // File type (byte 156): '5' = directory, '0' or '\0' = regular file
     const typeFlag = header[156];
 
-    // File size (bytes 124-135, octal)
-    const sizeStr = header.subarray(124, 136).toString("utf-8").trim();
-    const size = parseInt(sizeStr, 8) || 0;
+    const size = parseTarSize(header);
 
     offset += 512; // past header
+    const paddedSize = Math.ceil(size / 512) * 512;
+    if (offset + paddedSize > tarBuffer.length) {
+      throw new SkillArchiveError("tar entry size exceeds archive length");
+    }
 
     // Skip directories and empty names
     if (name && typeFlag !== 53 /* '5' */) {
@@ -310,7 +360,7 @@ export function extractTarToDir(tarBuffer: Buffer, destDir: string): boolean {
     }
 
     // Skip to next header (data padded to 512 bytes)
-    offset += Math.ceil(size / 512) * 512;
+    offset += paddedSize;
   }
   return foundSkillMd;
 }
@@ -401,12 +451,14 @@ export async function installSkillDependenciesIfPresent(
   if (!existsSync(join(skillDir, "package.json"))) {
     return;
   }
-  const bunPath = `${homedir()}/.bun/bin`;
+  const env = { ...process.env };
+  addToPathEnv(env, [join(homedir(), ".bun", "bin")]);
   await new Promise<void>((resolve, reject) => {
-    const child = spawn("bun", ["install"], {
+    const child = spawn("bun", [...SKILL_DEPENDENCY_INSTALL_ARGS], {
       cwd: skillDir,
       stdio: "inherit",
-      env: { ...process.env, PATH: `${bunPath}:${process.env.PATH}` },
+      env,
+      windowsHide: true,
     });
     child.on("error", reject);
     child.on("close", (code) => {
@@ -610,7 +662,8 @@ export async function resolveCatalog(
 /**
  * Attempt to find and install a skill from the first-party catalog.
  * Returns true if the skill was installed, false if not found in catalog.
- * Throws on install failures (network, filesystem, etc).
+ * Throws when the skill is unsupported on this host or on install failures
+ * (network, filesystem, etc).
  *
  * When `catalog` is provided it is used directly, avoiding a redundant
  * network fetch — pass a pre-resolved catalog when calling in a loop.
@@ -638,6 +691,9 @@ export async function autoInstallFromCatalog(
   const entry = skills.find((s) => s.id === skillId);
   if (!entry) {
     return false;
+  }
+  if (!isSkillCompatibleWithPlatform(entry)) {
+    throw new Error(skillPlatformUnavailableMessage(skillId, entry));
   }
 
   // If the skill already exists on disk, reuse it instead of attempting a

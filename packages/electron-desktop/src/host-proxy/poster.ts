@@ -15,7 +15,9 @@
  * via the optional refreshAuth callback and retries once.
  */
 
-export type PresenceState = "active" | "idle" | "away";
+import type { DesktopPresenceState } from "@vellumai/service-contracts/desktop-presence";
+
+export type PresenceState = DesktopPresenceState;
 
 // ---------------------------------------------------------------------------
 // Payload interfaces — match the daemon route request bodies
@@ -74,6 +76,8 @@ export interface HostCuResultPayload {
   executionError?: string;
   secondaryWindows?: string;
   userGuidance?: string;
+  /** Per-phase helper timings in milliseconds; older helpers send none. */
+  timings?: Record<string, number>;
 }
 
 export type HostAppControlState = "running" | "missing" | "minimized";

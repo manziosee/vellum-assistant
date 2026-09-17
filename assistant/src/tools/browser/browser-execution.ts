@@ -1,11 +1,21 @@
 import { optimizeImageForTransport } from "../../agent/image-optimize.js";
+import type { BrowserOperationContext as ToolContext } from "../../browser/types.js";
 import { getConfig } from "../../config/loader.js";
 import { HostBrowserProxy } from "../../daemon/host-browser-proxy.js";
 import type { ImageContent } from "../../providers/types.js";
 import { wrapUntrustedContent } from "../../security/untrusted-content.js";
+import {
+  DESKTOP_HELP_GUIDANCE,
+  HUMAN_VERIFICATION_GUIDANCE,
+} from "../../util/browser-human-verification.js";
 import { getLogger } from "../../util/logger.js";
 import { truncate } from "../../util/truncate.js";
 import { safeStringSlice } from "../../util/unicode.js";
+import {
+  appendLoggedInBrowserOffer,
+  formatLoggedInBrowserOffer,
+  shouldOfferLoggedInBrowser,
+} from "../capability-offer.js";
 import { credentialBroker } from "../credentials/broker.js";
 import { BROWSER_FILL_CAPABILITY } from "../credentials/tool-policy.js";
 import {
@@ -16,7 +26,7 @@ import {
   sanitizeUrlForOutput,
   sanitizeUrlStringForOutput,
 } from "../network/url-safety.js";
-import type { ToolContext, ToolExecutionResult } from "../types.js";
+import type { ToolExecutionResult } from "../types.js";
 import {
   type AuthChallenge,
   detectAuthChallenge,
@@ -39,7 +49,8 @@ import {
   BROWSER_STATUS_MODES,
   type BrowserStatusMode,
   CDP_INSPECT_STATUS_DISCOVERY_CODE,
-  EXTENSION_STATUS_ERROR_MARKER,
+  CHROME_EXTENSION_INSTALL_HINT,
+  DESKTOP_APP_INSTALL_HINT,
 } from "./browser-status-constants.js";
 import {
   formatAxSnapshot,
@@ -256,7 +267,7 @@ export const EXTRACT_LINKS_EXPRESSION = `
 (() => {
   const anchors = Array.from(document.querySelectorAll('a[href]'));
   return anchors.slice(0, 200).map(a => ({
-    text: (a.textContent || '').trim().slice(0, 80),
+    text: Array.from((a.textContent || '').trim()).slice(0, 80).join(''),
     href: a.href,
   }));
 })()
@@ -296,10 +307,10 @@ export function parseBrowserMode(
 const REMEDIATION_HINTS: Record<string, string[]> = {
   // Extension backend
   "extension:transport_error": [
-    "Ensure the Vellum browser extension is installed and enabled, or that the macOS desktop client is running for host browser proxy mode.",
-    "For extension mode: check that the extension WebSocket connection is active (extension popup → status).",
-    "For macOS host browser proxy: verify the desktop client is running and has an active SSE connection to the assistant.",
-    "Try reconnecting the extension or restarting the desktop client.",
+    CHROME_EXTENSION_INSTALL_HINT,
+    DESKTOP_APP_INSTALL_HINT,
+    "Make sure Chrome is open with the Vellum extension enabled, or that the desktop app is running.",
+    "In the extension popup, check that the status shows connected.",
   ],
   // cdp-inspect backend — discovery-level failures
   "cdp-inspect:unreachable": [
@@ -332,15 +343,16 @@ const REMEDIATION_HINTS: Record<string, string[]> = {
   ],
   // Host-bridge backend (desktop SSE bridge → user's Chrome debug port)
   "host-bridge:unreachable": [
-    "Ensure Chrome on the user's machine is on version 146 or higher (chrome://settings/help).",
-    'Ensure "Allow remote debugging for this browser instance" is toggled on at chrome://inspect/#remote-debugging.',
-    "Verify the desktop client is running and has an active SSE connection to the assistant.",
-    "Installing the Vellum Chrome extension is the preferred path and avoids the debug-port requirement.",
+    CHROME_EXTENSION_INSTALL_HINT,
+    DESKTOP_APP_INSTALL_HINT,
+    "The Chrome extension is the preferred path and avoids the debug-port requirement.",
+    "If using remote debugging instead, Chrome 146+ must have remote debugging enabled at chrome://inspect/#remote-debugging.",
   ],
   "host-bridge:transport_error": [
-    "The desktop client could not reach Chrome's remote-debugging endpoint on the user's machine.",
-    "Ensure Chrome is running with remote debugging enabled, or install the Vellum Chrome extension (preferred).",
-    "Verify the desktop client is running and connected.",
+    CHROME_EXTENSION_INSTALL_HINT,
+    DESKTOP_APP_INSTALL_HINT,
+    "The desktop app could not reach Chrome's remote-debugging endpoint.",
+    "Install the Chrome extension, or enable remote debugging and confirm the desktop app is running.",
   ],
   // Local/Playwright backend
   "local:transport_error": [
@@ -355,13 +367,15 @@ const REMEDIATION_HINTS: Record<string, string[]> = {
  * pinned-mode failure. Includes:
  *   - the requested mode
  *   - ordered attempted modes with exact failure reasons
- *   - a remediation checklist tailored by backend and failure code
+ *   - a logged-in-browser offer (desktop app and Chrome extension)
+ *   - setup details tailored by backend and failure code
  *
  * Exported for testing.
  */
 export function formatModeSelectionFailure(
   requestedMode: BrowserMode,
   error: CdpError,
+  context?: Pick<ToolContext, "transportInterface" | "clientOs">,
 ): string {
   const lines: string[] = [];
   lines.push(`Error: Browser mode "${requestedMode}" failed.`);
@@ -386,10 +400,12 @@ export function formatModeSelectionFailure(
     lines.push("");
   }
 
-  // Collect remediation hints
+  lines.push(formatLoggedInBrowserOffer(context));
+  lines.push("");
+
   const hints = collectRemediationHints(diagnostics, error);
   if (hints.length > 0) {
-    lines.push("Remediation:");
+    lines.push("Setup details:");
     for (const hint of hints) {
       lines.push(`  - ${hint}`);
     }
@@ -504,6 +520,9 @@ async function acquireCdpClientWithMode(
     }
   | { cdp?: never; browserMode?: never; errorResult: ToolExecutionResult }
 > {
+  if (context.cdpClient) {
+    return { cdp: context.cdpClient, browserMode: "cdp-inspect" };
+  }
   const modeResult = parseBrowserMode(input);
   if (!modeResult.ok) {
     return {
@@ -566,7 +585,7 @@ async function acquireCdpClientWithMode(
         if (retryErr instanceof CdpError) {
           return {
             errorResult: {
-              content: formatModeSelectionFailure("auto", retryErr),
+              content: formatModeSelectionFailure("auto", retryErr, context),
               isError: true,
             },
           };
@@ -577,7 +596,7 @@ async function acquireCdpClientWithMode(
     if (err instanceof CdpError && browserMode !== "auto") {
       return {
         errorResult: {
-          content: formatModeSelectionFailure(browserMode, err),
+          content: formatModeSelectionFailure(browserMode, err, context),
           isError: true,
         },
       };
@@ -656,6 +675,7 @@ function wrapWithKindMemo(
 function formatCdpSendDiagnostics(
   err: unknown,
   browserMode: BrowserMode,
+  context?: Pick<ToolContext, "transportInterface" | "clientOs">,
 ): string | null {
   if (
     err instanceof CdpError &&
@@ -663,9 +683,58 @@ function formatCdpSendDiagnostics(
     err.code === "transport_error" &&
     err.attemptDiagnostics
   ) {
-    return formatModeSelectionFailure(browserMode, err);
+    return formatModeSelectionFailure(browserMode, err, context);
   }
   return null;
+}
+
+/**
+ * Format a browser-tool catch as a tool-response error. Mode-selection
+ * failures already carry the logged-in-browser offer. Reachability and
+ * auth failures get the same offer appended so the model relays a product
+ * the user can turn on instead of asking for a screenshot.
+ */
+function formatBrowserToolFailure(
+  operation: string,
+  err: unknown,
+  browserMode: BrowserMode,
+  context: Pick<ToolContext, "transportInterface" | "clientOs">,
+): string {
+  const diagnosticMessage = formatCdpSendDiagnostics(err, browserMode, context);
+  if (diagnosticMessage) {
+    return diagnosticMessage;
+  }
+  const msg = err instanceof Error ? err.message : String(err);
+  const base = `Error: ${operation} failed: ${msg}`;
+  if (shouldOfferLoggedInBrowser(msg)) {
+    return appendLoggedInBrowserOffer(base, context);
+  }
+  return base;
+}
+
+function appendLoginFormGuidance(
+  lines: string[],
+  context: ToolContext,
+  backendKind: string,
+): void {
+  lines.push("Handle this by interacting with the login form:");
+  lines.push("1. Take a snapshot to find the sign-in form elements");
+  lines.push(
+    "2. Use credential fill to enter email/password from the credential vault",
+  );
+  lines.push(
+    "3. For email verification codes, use ui_show with a form to request the code mid-turn",
+  );
+  lines.push(
+    "4. Do NOT give up or suggest manual sign-in - handle the login flow yourself",
+  );
+  if (backendKind === "local") {
+    lines.push("");
+    lines.push(
+      "If this page needs SSO, a company VPN, or a login a fresh browser cannot complete:",
+    );
+    lines.push(formatLoggedInBrowserOffer(context));
+  }
 }
 
 // ── Shared element resolution ────────────────────────────────────────
@@ -684,6 +753,17 @@ function formatCdpSendDiagnostics(
 export type ResolvedElement =
   | { kind: "backend"; backendNodeId: number; eid: string }
   | { kind: "selector"; selector: string };
+
+function snapshotConversationId(context: ToolContext): string {
+  return context.cdpClient?.conversationId ?? context.conversationId;
+}
+
+function clearBrowserSessionState(context: ToolContext): void {
+  browserManager.clearSnapshotBackendNodeMap(snapshotConversationId(context));
+  if (!context.cdpClient) {
+    browserManager.clearPreferredBackendKind(context.conversationId);
+  }
+}
 
 /**
  * Resolve an element reference (either `element_id` from a prior
@@ -811,6 +891,9 @@ export async function executeBrowserNavigate(
     typeof input.target_client_id === "string" && input.target_client_id !== ""
       ? input.target_client_id
       : undefined;
+  if (context.cdpClient && forceNewTab) {
+    await cdp.send("Vellum.createTab", {}, context.signal);
+  }
   if (cdp.kind === "extension" && useActiveTab) {
     // Explicit opt-out: target the currently-active tab. Clear any
     // conversation pin and reset the live session so this navigate is
@@ -1127,7 +1210,7 @@ export async function executeBrowserNavigate(
     // Navigation changed the page content, so clear stale snapshot
     // mappings regardless of backend. The backendNodeId map is shared
     // per-conversation state that needs to be invalidated on any nav.
-    browserManager.clearSnapshotBackendNodeMap(context.conversationId);
+    browserManager.clearSnapshotBackendNodeMap(snapshotConversationId(context));
 
     // Auto-dismiss common blocker modals (regulatory notices, cookie
     // banners) that aren't exposed in the accessibility tree. Runs
@@ -1232,19 +1315,7 @@ export async function executeBrowserNavigate(
                 ),
               );
               lines.push("");
-              lines.push("Handle this by interacting with the login form:");
-              lines.push(
-                "1. Take a snapshot to find the sign-in form elements",
-              );
-              lines.push(
-                "2. Use credential fill to enter email/password from the credential vault",
-              );
-              lines.push(
-                "3. For email verification codes, use ui_show with a form to request the code mid-turn",
-              );
-              lines.push(
-                "4. Do NOT give up or suggest manual sign-in - handle the login flow yourself",
-              );
+              appendLoginFormGuidance(lines, context, cdp.kind);
             }
           } else {
             lines.push("");
@@ -1252,8 +1323,14 @@ export async function executeBrowserNavigate(
               "⚠️ CAPTCHA/Cloudflare verification detected on this page.",
             );
             lines.push(
-              "This challenge requires human verification. Surface this clearly: the page cannot be accessed until the verification is solved manually.",
+              context.cdpClient
+                ? DESKTOP_HELP_GUIDANCE
+                : HUMAN_VERIFICATION_GUIDANCE,
             );
+            if (cdp.kind === "local") {
+              lines.push("");
+              lines.push(formatLoggedInBrowserOffer(context));
+            }
           }
         } else {
           // Login / 2FA / OAuth - the agent should handle these itself
@@ -1269,17 +1346,7 @@ export async function executeBrowserNavigate(
             ),
           );
           lines.push("");
-          lines.push("Handle this by interacting with the login form:");
-          lines.push("1. Take a snapshot to find the sign-in form elements");
-          lines.push(
-            "2. Use credential fill to enter email/password from the credential vault",
-          );
-          lines.push(
-            "3. For email verification codes, use ui_show with a form to request the code mid-turn",
-          );
-          lines.push(
-            "4. Do NOT give up or suggest manual sign-in - handle the login flow yourself",
-          );
+          appendLoginFormGuidance(lines, context, cdp.kind);
         }
       }
     } catch {
@@ -1310,14 +1377,16 @@ export async function executeBrowserNavigate(
       };
     }
 
-    const diagnosticMessage = formatCdpSendDiagnostics(err, browserMode);
-    if (diagnosticMessage) {
-      return { content: diagnosticMessage, isError: true };
-    }
-
-    const msg = err instanceof Error ? err.message : String(err);
     log.error({ err, url: safeRequestedUrl }, "Navigation failed");
-    return { content: `Error: Navigation failed: ${msg}`, isError: true };
+    return {
+      content: formatBrowserToolFailure(
+        "Navigation",
+        err,
+        browserMode,
+        context,
+      ),
+      isError: true,
+    };
   } finally {
     cdp.dispose();
   }
@@ -1353,7 +1422,7 @@ export async function executeBrowserSnapshot(
     const { elements, selectorMap: backendNodeMap } = transformAxTree(rawTree);
 
     browserManager.storeSnapshotBackendNodeMap(
-      context.conversationId,
+      snapshotConversationId(context),
       backendNodeMap,
     );
 
@@ -1373,7 +1442,11 @@ export async function executeBrowserSnapshot(
       isError: false,
     };
   } catch (err) {
-    const diagnosticMessage = formatCdpSendDiagnostics(err, browserMode);
+    const diagnosticMessage = formatCdpSendDiagnostics(
+      err,
+      browserMode,
+      context,
+    );
     if (diagnosticMessage) {
       return { content: diagnosticMessage, isError: true };
     }
@@ -1432,7 +1505,11 @@ export async function executeBrowserScreenshot(
       contentBlocks: [imageBlock],
     };
   } catch (err) {
-    const diagnosticMessage = formatCdpSendDiagnostics(err, browserMode);
+    const diagnosticMessage = formatCdpSendDiagnostics(
+      err,
+      browserMode,
+      context,
+    );
     if (diagnosticMessage) {
       return { content: diagnosticMessage, isError: true };
     }
@@ -1487,6 +1564,7 @@ export async function executeBrowserAttach(
     const diagnosticMessage = formatCdpSendDiagnostics(
       err,
       acquired.browserMode,
+      context,
     );
     if (diagnosticMessage) {
       return { content: diagnosticMessage, isError: true };
@@ -1533,6 +1611,7 @@ export async function executeBrowserDetach(
     const diagnosticMessage = formatCdpSendDiagnostics(
       err,
       acquired.browserMode,
+      context,
     );
     if (diagnosticMessage) {
       return { content: diagnosticMessage, isError: true };
@@ -1545,8 +1624,7 @@ export async function executeBrowserDetach(
     // Vellum.detach round-trip failed (target gone, transport dropped).
     // browser_detach is the user's recovery path — leaving a stale
     // sticky backend or snapshot map behind would defeat its purpose.
-    browserManager.clearSnapshotBackendNodeMap(context.conversationId);
-    browserManager.clearPreferredBackendKind(context.conversationId);
+    clearBrowserSessionState(context);
     cdp.dispose();
   }
 }
@@ -1598,8 +1676,7 @@ export async function executeBrowserClose(
         // Tolerate detach failures (already detached, tab closed, etc.)
       }
     }
-    browserManager.clearSnapshotBackendNodeMap(context.conversationId);
-    browserManager.clearPreferredBackendKind(context.conversationId);
+    clearBrowserSessionState(context);
     return {
       content:
         "Browser session cleared. (Your Chrome tab was not closed — close it yourself if desired.)",
@@ -1609,6 +1686,7 @@ export async function executeBrowserClose(
     const diagnosticMessage = formatCdpSendDiagnostics(
       err,
       acquired.browserMode,
+      context,
     );
     if (diagnosticMessage) {
       return { content: diagnosticMessage, isError: true };
@@ -1627,7 +1705,10 @@ export async function executeBrowserClick(
   input: Record<string, unknown>,
   context: ToolContext,
 ): Promise<ToolExecutionResult> {
-  const { resolved, error } = resolveElement(context.conversationId, input);
+  const { resolved, error } = resolveElement(
+    snapshotConversationId(context),
+    input,
+  );
   if (error) {
     return { content: error, isError: true };
   }
@@ -1667,6 +1748,7 @@ export async function executeBrowserClick(
     const diagnosticMessage = formatCdpSendDiagnostics(
       err,
       acquired.browserMode,
+      context,
     );
     if (diagnosticMessage) {
       return { content: diagnosticMessage, isError: true };
@@ -1739,7 +1821,10 @@ export async function executeBrowserType(
   input: Record<string, unknown>,
   context: ToolContext,
 ): Promise<ToolExecutionResult> {
-  const { resolved, error } = resolveElement(context.conversationId, input);
+  const { resolved, error } = resolveElement(
+    snapshotConversationId(context),
+    input,
+  );
   if (error) {
     return { content: error, isError: true };
   }
@@ -1797,6 +1882,7 @@ export async function executeBrowserType(
     const diagnosticMessage = formatCdpSendDiagnostics(
       err,
       acquired.browserMode,
+      context,
     );
     if (diagnosticMessage) {
       return { content: diagnosticMessage, isError: true };
@@ -1829,7 +1915,7 @@ export async function executeBrowserPressKey(
   let targetDescription: string | null = null;
   let resolved: ResolvedElement | null = null;
   if (hasTarget) {
-    const res = resolveElement(context.conversationId, input);
+    const res = resolveElement(snapshotConversationId(context), input);
     if (res.error) {
       return { content: res.error, isError: true };
     }
@@ -1872,6 +1958,7 @@ export async function executeBrowserPressKey(
     const diagnosticMessage = formatCdpSendDiagnostics(
       err,
       acquired.browserMode,
+      context,
     );
     if (diagnosticMessage) {
       return { content: diagnosticMessage, isError: true };
@@ -1947,6 +2034,7 @@ export async function executeBrowserScroll(
     const diagnosticMessage = formatCdpSendDiagnostics(
       err,
       acquired.browserMode,
+      context,
     );
     if (diagnosticMessage) {
       return { content: diagnosticMessage, isError: true };
@@ -1965,7 +2053,10 @@ export async function executeBrowserSelectOption(
   input: Record<string, unknown>,
   context: ToolContext,
 ): Promise<ToolExecutionResult> {
-  const { resolved, error } = resolveElement(context.conversationId, input);
+  const { resolved, error } = resolveElement(
+    snapshotConversationId(context),
+    input,
+  );
   if (error) {
     return { content: error, isError: true };
   }
@@ -2083,6 +2174,7 @@ export async function executeBrowserSelectOption(
     const diagnosticMessage = formatCdpSendDiagnostics(
       err,
       acquired.browserMode,
+      context,
     );
     if (diagnosticMessage) {
       return { content: diagnosticMessage, isError: true };
@@ -2101,7 +2193,10 @@ export async function executeBrowserHover(
   input: Record<string, unknown>,
   context: ToolContext,
 ): Promise<ToolExecutionResult> {
-  const { resolved, error } = resolveElement(context.conversationId, input);
+  const { resolved, error } = resolveElement(
+    snapshotConversationId(context),
+    input,
+  );
   if (error) {
     return { content: error, isError: true };
   }
@@ -2138,6 +2233,7 @@ export async function executeBrowserHover(
     const diagnosticMessage = formatCdpSendDiagnostics(
       err,
       acquired.browserMode,
+      context,
     );
     if (diagnosticMessage) {
       return { content: diagnosticMessage, isError: true };
@@ -2233,6 +2329,7 @@ export async function executeBrowserWaitFor(
     const diagnosticMessage = formatCdpSendDiagnostics(
       err,
       acquired.browserMode,
+      context,
     );
     if (diagnosticMessage) {
       return { content: diagnosticMessage, isError: true };
@@ -2318,6 +2415,7 @@ export async function executeBrowserExtract(
     const diagnosticMessage = formatCdpSendDiagnostics(
       err,
       acquired.browserMode,
+      context,
     );
     if (diagnosticMessage) {
       return { content: diagnosticMessage, isError: true };
@@ -2346,7 +2444,10 @@ export async function executeBrowserFillCredential(
     return { content: "Error: field is required.", isError: true };
   }
 
-  const { resolved, error } = resolveElement(context.conversationId, input);
+  const { resolved, error } = resolveElement(
+    snapshotConversationId(context),
+    input,
+  );
   if (error) {
     return { content: error, isError: true };
   }
@@ -2453,6 +2554,7 @@ export async function executeBrowserFillCredential(
     const diagnosticMessage = formatCdpSendDiagnostics(
       err,
       acquired.browserMode,
+      context,
     );
     if (diagnosticMessage) {
       return { content: diagnosticMessage, isError: true };
@@ -2485,10 +2587,11 @@ function modeTradeoffs(mode: StatusCheckMode): string[] {
   return MODE_TRADEOFFS[mode];
 }
 
-function extensionSetupActions(): string[] {
+function extensionConnectionActions(): string[] {
   return [
-    "Install the Vellum Assistant Chrome extension from the Chrome Web Store: https://chromewebstore.google.com/detail/vellum-assistant-browser/hphbdmpffeigpcdjkckleobjmhhokpne",
-    "Open the extension and pair with your assistant.",
+    CHROME_EXTENSION_INSTALL_HINT,
+    DESKTOP_APP_INSTALL_HINT,
+    "Tell the user to make sure a browser is open with the Vellum Chrome extension on.",
   ];
 }
 
@@ -2517,49 +2620,14 @@ function extractDiscoveryCodes(error: CdpError): string[] {
   return dedupeStrings(codes);
 }
 
-function containsTokenCaseInsensitive(text: string, token: string): boolean {
-  return text.toLowerCase().includes(token.toLowerCase());
-}
-
 function probeFailureActions(mode: StatusCheckMode, error: CdpError): string[] {
   const actions: string[] = [];
-  const message = error.message.toLowerCase();
   const discoveryCodes = extractDiscoveryCodes(error).map((c) =>
     c.toLowerCase(),
   );
 
   if (mode === BROWSER_STATUS_MODE.EXTENSION) {
-    actions.push(...extensionSetupActions());
-    if (
-      containsTokenCaseInsensitive(
-        message,
-        EXTENSION_STATUS_ERROR_MARKER.UNAUTHORIZED_ORIGIN,
-      )
-    ) {
-      actions.push(
-        "Ensure this extension ID is present in chrome-extension-allowlist.local.json in $GATEWAY_SECURITY_DIR and restart the assistant.",
-      );
-    }
-    if (
-      containsTokenCaseInsensitive(
-        message,
-        EXTENSION_STATUS_ERROR_MARKER.NATIVE_MESSAGING_HOST,
-      )
-    ) {
-      actions.push(
-        "Reinstall the native messaging host manifest and confirm it allows this extension ID.",
-      );
-    }
-    if (
-      containsTokenCaseInsensitive(
-        message,
-        EXTENSION_STATUS_ERROR_MARKER.HTTP_401,
-      )
-    ) {
-      actions.push(
-        "Re-pair the extension so it refreshes its local relay credential.",
-      );
-    }
+    actions.push(...extensionConnectionActions());
   }
 
   if (mode === BROWSER_STATUS_MODE.CDP_INSPECT) {
@@ -2619,7 +2687,7 @@ async function probePinnedBrowserMode(
       return {
         ok: false,
         error: err,
-        diagnostic: formatModeSelectionFailure(mode, err),
+        diagnostic: formatModeSelectionFailure(mode, err, context),
       };
     }
     const wrapped = new CdpError(
@@ -2630,7 +2698,7 @@ async function probePinnedBrowserMode(
     return {
       ok: false,
       error: wrapped,
-      diagnostic: formatModeSelectionFailure(mode, wrapped),
+      diagnostic: formatModeSelectionFailure(mode, wrapped, context),
     };
   } finally {
     cdp?.dispose();
@@ -2651,7 +2719,7 @@ async function checkExtensionModeStatus(
       autoCandidate,
       summary:
         "Extension mode is unavailable: no Chrome Extension is connected.",
-      userActions: extensionSetupActions(),
+      userActions: extensionConnectionActions(),
       tradeoffs: modeTradeoffs(BROWSER_STATUS_MODE.EXTENSION),
       details: { transport: "extension-ws" },
     };

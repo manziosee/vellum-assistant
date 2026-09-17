@@ -233,7 +233,7 @@ export function HostingOptionsCloudHostingContent() {
           <p className="mb-4 text-stone-600 dark:text-stone-400">
             The distinction is between tools that run on the
             assistant&apos;s computer (the cloud container) versus tools
-            that run on yours (your Mac, through the desktop app):
+            that run on yours (your Mac or Windows PC, through the desktop app):
           </p>
           <ul className="mb-4 list-disc space-y-2 pl-6 text-stone-600 dark:text-stone-400">
             <li>
@@ -321,10 +321,10 @@ export function HostingOptionsCloudHostingContent() {
             instead if you need maximum data control or fully offline
             operation, or at{" "}
             <Link
-              href="/docs/hosting-options/advanced-options"
+              href="/docs/hosting-options/gcp"
               className="font-semibold text-emerald-700 underline hover:text-emerald-800"
             >
-              advanced options
+              GCP
             </Link>{" "}
             if you want 24/7 availability on your own infrastructure.
           </p>
@@ -352,7 +352,7 @@ export function HostingOptionsCloudHostingContent() {
             <li>
               Optional: install the{" "}
               <Link
-                href="https://www.vellum.ai/download"
+                href="https://www.vellum.ai/downloads"
                 className="font-semibold text-emerald-700 underline hover:text-emerald-800"
               >
                 desktop app

@@ -49,6 +49,10 @@
     "deleteConfirmMessage": "¿Eliminar \"{name}\"? Esta acción no se puede deshacer.",
     "cancel": "Cancelar",
     "confirmDelete": "Sí, eliminar",
+    "cancelOneTime": "Cancelar recordatorio",
+    "cancelOneTimeConfirmMessage": "¿Cancelar \"{name}\"? No se ejecutará.",
+    "confirmCancelOneTime": "Sí, cancelar",
+    "cancelOneTimeFailed": "No se pudo cancelar el recordatorio.",
     "viewUsage": "Ver el uso",
     "turnOnToRun": "Activa esta programación para ejecutarla",
     "running": "Ejecutando…",
@@ -58,7 +62,8 @@
     "toggleFailed": "No se pudo cambiar el estado de la programación.",
     "notUsedForWorkflow": "No se usa en ejecuciones de flujo de trabajo",
     "enabled": "Activada",
-    "disabled": "Desactivada"
+    "disabled": "Desactivada",
+    "timezone": "Zona horaria"
   },
   "systemTaskDetail": {
     "openMemorySettings": "Abrir la configuración de Memoria",

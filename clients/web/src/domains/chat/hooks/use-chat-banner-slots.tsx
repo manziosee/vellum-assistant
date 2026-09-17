@@ -10,7 +10,7 @@ import { type ReactNode, useMemo } from "react";
 
 import { DiscordNudgeBanner } from "@/components/nudges/discord-nudge-banner";
 import { GitHubNudgeBanner } from "@/components/nudges/github-nudge-banner";
-import { MacOSAppBanner } from "@/components/nudges/macos-app-banner";
+import { DesktopAppBanner } from "@/components/nudges/desktop-app-banner";
 import { NativeAppBanner } from "@/components/nudges/native-app-banner";
 import { QueuedMessagesDrawer } from "@/domains/chat/components/queued-messages-drawer";
 import type { DisplayMessage } from "@/domains/chat/types/types";
@@ -48,7 +48,8 @@ export function useChatBannerSlots({
 }: UseChatBannerSlotsParams): ChatBannerSlots {
   const {
     showBanner,
-    nativeAppPlatform,
+    mobilePromotion,
+    desktopAppPlatform,
     nudge,
     showGitHubBanner,
     githubNudge,
@@ -60,14 +61,15 @@ export function useChatBannerSlots({
     if (showBanner) {
       return (
         <div className="w-full px-3 pb-2 sm:px-6">
-          {nativeAppPlatform ? (
+          {mobilePromotion ? (
             <NativeAppBanner
-              platform={nativeAppPlatform}
+              promotion={mobilePromotion}
               onDownload={nudge.handleDownload}
               onDismiss={nudge.handleBannerDismiss}
             />
           ) : (
-            <MacOSAppBanner
+            <DesktopAppBanner
+              platform={desktopAppPlatform}
               onDownload={nudge.handleDownload}
               onDismiss={nudge.handleBannerDismiss}
             />
@@ -98,7 +100,8 @@ export function useChatBannerSlots({
     return null;
   }, [
     showBanner,
-    nativeAppPlatform,
+    mobilePromotion,
+    desktopAppPlatform,
     nudge,
     showGitHubBanner,
     githubNudge,

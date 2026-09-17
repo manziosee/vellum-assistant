@@ -16,6 +16,8 @@
  *     etc.); those are retired by this package.
  */
 
+import { NOTIFICATION_AVATAR_MAX_LOCAL_BYTES } from "@vellumai/avatar-manifest/notification-avatar";
+
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
@@ -25,10 +27,30 @@
  * focused renderer window via `vellum:command` IPC; the renderer routes
  * them through the event bus.
  */
+/**
+ * How long a `startVoice` request stays live once asked for, in the renderer
+ * that parked it.
+ *
+ * The park exists for one race, a request that lands before the layout that
+ * owns sessions mounts, which resolves in seconds or not at all. A bound is
+ * what stops a request bounced by a route guard from opening a session out of
+ * nowhere on some later mount. Here in the contract because the shell reads
+ * it too: the companion draws a dial for the request and has to know how long
+ * one can still turn into a session.
+ */
+export const VOICE_START_REQUEST_TTL_MS = 60_000;
+
 export type VellumCommand =
   | { kind: "newConversation" }
   | { kind: "currentConversation" }
   | { kind: "markCurrentUnread" }
+  /**
+   * Pin the conversation the user is looking at, or unpin it when it is
+   * already pinned. One kind for both edges because the renderer owns the
+   * pinned state; main builds a single static menu item and never learns
+   * which edge a press is.
+   */
+  | { kind: "togglePinConversation" }
   | { kind: "openSettings" }
   | { kind: "shareFeedback" }
   | { kind: "find" }
@@ -37,7 +59,6 @@ export type VellumCommand =
   | { kind: "logout" }
   | { kind: "rePair" }
   | { kind: "sidebarToggle" }
-  | { kind: "home" }
   | { kind: "popOut" }
   | { kind: "previousConversation" }
   | { kind: "nextConversation" }
@@ -67,6 +88,17 @@ export type VellumCommand =
    */
   | { kind: "startVoice" }
   /**
+   * Take back a `startVoice` that has been asked for and not yet served, which
+   * is what ending the companion's dial means.
+   *
+   * A command rather than a session control, because there may be no session
+   * to control yet: the request is parked or partway through its preflight,
+   * and the layout that owns sessions may not even be mounted. The root
+   * layout consumes commands for the life of the window, so this one lands
+   * whatever route the app is on. See {@link VOICE_START_REQUEST_TTL_MS}.
+   */
+  | { kind: "cancelVoiceStart" }
+  /**
    * Turn a watch session on or off, the way the companion surface's Watch
    * option asks.
    *
@@ -79,8 +111,62 @@ export type VellumCommand =
    * floating surface precisely because they are working somewhere else, and
    * here that work is the subject: raising the app would cover the very thing
    * the session exists to observe.
+   *
+   * `target` is what the session should read, when the press chose one: a
+   * display or a window, as the companion's picker resolved it. Only the start
+   * edge reads it. Absent is the whole screen, which is what a press from a
+   * surface with no picker asks for and what a session always read before
+   * there was one.
    */
-  | { kind: "toggleWatch" }
+  | { kind: "toggleWatch"; target?: WatchCaptureTarget }
+  /**
+   * Show the running call what the user is looking at, or stop.
+   *
+   * `target` is what to share, as the companion's picker resolved it: a
+   * display or a window. A command carrying one starts the share, or moves a
+   * running one to the new target; a command carrying none is the stop. The
+   * window holding the session takes frames of the target and hands each to
+   * the session as a `sight_frame`, so the transcript is the record of what
+   * the call was shown.
+   *
+   * Like `toggleWatch`, this does not raise the app: what is shared is the
+   * user's own work, and raising Vellum would cover it.
+   */
+  | { kind: "setScreenShare"; target?: WatchCaptureTarget }
+  /**
+   * A mark the user has drawn over the surface a call is being shown.
+   *
+   * `drawing` is the pointer down and every move under it. The mark is still
+   * being made, so the window holding the session holds its frames: a view
+   * sent mid-stroke would be of a circle half drawn, around nothing.
+   * `released` is the hand coming off, which is the moment the mark means
+   * something, and it carries every stroke still on the overlay.
+   *
+   * Strokes rather than a picture, because the overlay is never in the
+   * pixels: a capture excludes Vellum's own windows (`ScreenCapture.swift`),
+   * so the window that takes the frame is the one that has to draw them onto
+   * it. See {@link CompanionAnnotationStroke} for the coordinates.
+   *
+   * Like `setScreenShare`, this does not raise the app: the user is drawing
+   * on their own work, and raising Vellum would cover the thing they are
+   * pointing at.
+   */
+  | {
+      kind: "annotateShare";
+      phase: CompanionAnnotationPhase;
+      strokes: readonly CompanionAnnotationStroke[];
+      /**
+       * The colour the marks were drawn in, as `#rrggbb`.
+       *
+       * Carried rather than resolved again on the other side. The frame's
+       * window is the one that drew them, and the assistant's accent is
+       * resolved there from state that window has and the window taking the
+       * frames does not (the character's own palette). Sending the colour is
+       * what makes the copy on the frame the same drawing the user made,
+       * rather than a second resolution that can differ.
+       */
+      ink: string;
+    }
   /**
    * Answer the question the surface asks once a watch session's summary is
    * written: open it now, or not.
@@ -98,6 +184,34 @@ export type VellumCommand =
    */
   | { kind: "answerWatchRetro"; open: boolean }
   /**
+   * Answer the offer the surface makes when a dictation ends with its words
+   * still in hand: put Vellum's version in place of what another app pasted,
+   * get that app off the key, take the words to the clipboard, or leave
+   * things as they are. `offerId` names the offer the card was drawn
+   * against, and an answer to one that no longer stands is dropped. See
+   * {@link CompanionDictationOffer}.
+   */
+  | {
+      kind: "answerDictationOffer";
+      answer: DictationOfferAnswer;
+      offerId: string;
+    }
+  /**
+   * Answer the popover the companion drew, naming the popover it was drawn
+   * for. See {@link CompanionPopover}.
+   */
+  | {
+      kind: "answerCompanionPopover";
+      popoverId: string;
+      answer: CompanionPopoverAnswer;
+    }
+  /**
+   * Open a picker from the call bar in the popover, or close it when it is
+   * the one open. Never raises the app: the point is choosing without
+   * leaving what the user is doing.
+   */
+  | { kind: "toggleCompanionPicker"; picker: CompanionPicker }
+  /**
    * Start a live-voice session, or end the one that is running.
    *
    * The keyboard's version of Talk. It differs from `startVoice` in the one
@@ -108,25 +222,21 @@ export type VellumCommand =
    */
   | { kind: "toggleVoice" }
   /**
-   * Send what the user typed on the companion surface, the way its Type option
-   * asks.
+   * The user pressed a control the assistant was pointing at on the shared
+   * surface, which is the step it was walking them through being done.
    *
-   * **The surface has its own thread.** Opening the composer starts a
-   * conversation and every follow-up continues it, rather than sending into
-   * whatever the app happens to have selected: the user reached past the app to
-   * a floating avatar, so they are starting something, not resuming a thread
-   * they cannot see. `startsConversation` marks the first message of a
-   * composer's life; the rest land in the conversation that one created, which
-   * is the app's active one by then.
+   * `label` is the control's own name as the surface reports it, the same
+   * word the assistant was told it had pointed at. The window holding the
+   * session puts the press to the call as the user's turn, so the assistant
+   * hears the step is done and says what comes next without anyone having to
+   * say so. A press on a surface with no session up lands nowhere, which is
+   * right: there is no one to tell.
    *
-   * Like `startVoice`, this does not raise the app. The user reached for a
-   * floating surface precisely because they are working somewhere else.
+   * Like `annotateShare`, this does not raise the app. The user is working
+   * in the app they were pointed at, and the whole point is that they stay
+   * there.
    */
-  | {
-      kind: "companionSubmit";
-      message: string;
-      startsConversation: boolean;
-    }
+  | { kind: "coachmarkPressed"; label: string }
   | { kind: "cancelDictation" }
   | { kind: "replayOnboarding" }
   | { kind: "replayHatchFailure" }
@@ -163,13 +273,117 @@ export interface ResolvedHotkey {
 
 export type HotkeyEventState = "down" | "up";
 
-export interface HotkeyEvent {
-  kind: "fnPushToTalk";
-  state: HotkeyEventState;
+/** A modifier key a binding can be built from, as the helpers name them. */
+export type KeyboardModifier =
+  "function" | "control" | "shift" | "option" | "command";
+
+export type VoiceModeChordModifier = KeyboardModifier;
+
+export type VoiceModeChord =
+  | { kind: "off" }
+  | { kind: "modifierOnly"; modifiers: VoiceModeChordModifier[] };
+
+/**
+ * Which binding an edge came from, and what a pair of them means.
+ *
+ * `voiceModeChord` is a completed tap (the Windows helper), reported as a
+ * `down`/`up` pair once the keys are already back up: a tap is only known to
+ * be one after it ends, so the pair says "a tap happened" rather than
+ * bracketing anything. Consumers read the `down` and discard the `up`.
+ *
+ * `modifierHold` brackets a hold (the macOS helper). `down` arrives while the
+ * keys are still down and `up` when they are not, so the two edges are a
+ * span, and something that has to run for exactly as long as the keys are
+ * held can run across it.
+ *
+ * `chord` is a modifier set and a key pressed together, reported once as a
+ * `down` and never bracketed: a chord is over the moment it happens, and what
+ * it asks for takes no time. The host takes the press, so it reaches nothing
+ * else.
+ */
+export type HotkeyEventKind = "voiceModeChord" | "modifierHold" | "chord";
+
+/**
+ * Why a `modifierHold` closed.
+ *
+ * A consumer reading the span as a gesture needs the difference: a set that
+ * came back up on its own may have been a tap, while a chord passing through
+ * the held state (`chord`) never was one, and a hold closed from underneath
+ * (`cancelled`: the binding cleared, the helper going away) is neither.
+ */
+export type ModifierHoldUpReason = "released" | "chord" | "cancelled";
+
+/**
+ * What the user has highlighted in the application in front. Read by the
+ * helper over Accessibility when the app asks (`readFrontSelection`), which a
+ * hold does once it has armed, so a hold made with something selected can be
+ * about the selection. Bounded at the helper; `truncated` says the text is a
+ * prefix.
+ */
+export interface HotkeySelection {
+  text: string;
+  truncated: boolean;
+  /**
+   * Whether the control the selection sits in takes text. For a selection
+   * Accessibility handed over, the element reports its text as settable; for
+   * one that had to be copied out (see `FrontSelection.selectionFromCopy` in
+   * the helper), the focused control is a text control. A hold that is asked
+   * to change an editable selection can put the result back in its place;
+   * over anything else the words are a question.
+   */
+  editable: boolean;
 }
 
-export type FnPushToTalkResult =
+export interface HotkeyEvent {
+  kind: HotkeyEventKind;
+  state: HotkeyEventState;
+  /** Only on a `modifierHold` `up`. */
+  reason?: ModifierHoldUpReason;
+  /**
+   * Which key was pressed. Only on a `chord`, as the character the key
+   * carries unmodified on the user's own layout.
+   */
+  key?: string;
+}
+
+/** Whether a helper took a binding, or why it did not. */
+export type HotkeyRegistrationResult =
   { ok: true; enabled: boolean } | { ok: false; reason: string };
+
+export type VoiceModeChordRegistrationResult = HotkeyRegistrationResult;
+
+/**
+ * The binding a hold is watched on: every modifier of the set down together,
+ * with nothing else. `off` is a binding the user has cleared.
+ */
+export type ModifierHold =
+  { kind: "off" } | { kind: "modifierOnly"; modifiers: KeyboardModifier[] };
+
+export type ModifierHoldRegistrationResult = HotkeyRegistrationResult;
+
+/**
+ * The chords a host watches for: every modifier of the set held together, and
+ * one of `keys` pressed under them. `off` is a binding nothing is asking for.
+ *
+ * Keys are the characters on their keycaps, so the letter the user sees is the
+ * letter that answers on every layout, and the host resolves a press through
+ * the layout rather than through what the key would have typed (Option+S types
+ * "ß" and is still the S key).
+ *
+ * A press that matches belongs to the app, so the host takes it rather than
+ * letting it reach whatever is in front. That is why a binding is armed for
+ * exactly as long as something can answer it: outside that, the keys are the
+ * user's own and their application's.
+ *
+ * Exactly the modifiers named, too. Another one joining makes it a different
+ * shortcut, which is what keeps this out of the way of the ones the user
+ * already has.
+ */
+export type ChordBinding =
+  | { kind: "off" }
+  | { kind: "chord"; modifiers: KeyboardModifier[]; keys: readonly string[] };
+
+export type ChordRegistrationResult = HotkeyRegistrationResult;
 
 // ---------------------------------------------------------------------------
 // System permissions
@@ -252,6 +466,24 @@ export interface PowerEvent {
 }
 
 // ---------------------------------------------------------------------------
+// Downloads
+// ---------------------------------------------------------------------------
+
+/**
+ * Terminal report for one renderer-initiated download, pushed to the
+ * originating window. `id` is an opaque main-process token: the renderer
+ * hands it back to `downloads.reveal` and main resolves it to the saved
+ * path itself, so no filesystem path ever travels renderer-to-main.
+ * `id` is only present when `state` is `"completed"`: an interrupted
+ * download has no file to reveal.
+ */
+export interface DownloadDoneEvent {
+  id?: string;
+  filename: string;
+  state: "completed" | "interrupted";
+}
+
+// ---------------------------------------------------------------------------
 // Deep links
 // ---------------------------------------------------------------------------
 
@@ -288,13 +520,16 @@ export type DeepLink =
     }
   /**
    * `<scheme>://connect`: the pair-page "Open in the Vellum app" hand-off
-   * and `vellum pair --qr --app` QR codes. `url` is a validated https server
-   * base; `bundle` (pairing bundle) is secret material and must never be
-   * logged or breadcrumbed. Fields absent when their query params were
-   * missing or malformed. The link never carries the `code` query param
-   * (device code): the renderer has no consumer for it.
+   * and `vellum pair --app` QR codes. `url` is a validated https server
+   * base and `code` the device code it carries, which the local-mode host
+   * exchanges for pairing credentials. `code` is credential material and
+   * must never be logged or breadcrumbed; it rides only alongside a usable
+   * `url`. `legacy` marks a link that carried a `bundle` param from an app
+   * version whose connect dialog took a pasted pairing bundle: only the
+   * presence crosses this seam, never the payload. Fields absent when
+   * their query params were missing or malformed.
    */
-  | { kind: "connect"; url?: string; bundle?: string }
+  | { kind: "connect"; url?: string; code?: string; legacy?: true }
   | { kind: "unknown"; url: string };
 
 // ---------------------------------------------------------------------------
@@ -373,9 +608,10 @@ export type VoiceActivityPhase = (typeof VOICE_ACTIVITY_PHASES)[number];
 export interface VoiceActivityContent {
   phase: VoiceActivityPhase;
   /**
-   * User-facing phase copy, passed through from the web layer verbatim
-   * (`liveVoiceSurfaceLabel`), so the surface shows exactly what the voice room
-   * shows. Main and the surface own no phase wording of their own. The wording
+   * User-facing phase copy, passed through from the web layer verbatim: the
+   * web resolves `liveVoiceSurfaceLabelKey` through its own catalog, so the
+   * surface shows exactly what the voice room shows, in the language the app is
+   * in. Main and the surface own no phase wording of their own. The wording
    * deploys continuously with the web bundle while the shell ships on release
    * cadence, so a `switch` over `phase` on this side would fossilize.
    */
@@ -498,6 +734,140 @@ export const NOTIFICATION_CATEGORIES = [
 
 export type NotificationCategory = (typeof NOTIFICATION_CATEGORIES)[number];
 
+/**
+ * What a notification avatar's SHA-256 has to look like: 64 lowercase hex
+ * characters. The hash names the file a host writes the avatar to, so anything
+ * else could escape the cache directory. Shared by the IPC boundary that
+ * accepts it and the cache that writes it.
+ */
+export const NOTIFICATION_AVATAR_HASH_PATTERN = /^[0-9a-f]{64}$/;
+
+/**
+ * The longest base64 payload the notification-avatar channel carries: base64
+ * of {@link NOTIFICATION_AVATAR_MAX_LOCAL_BYTES}, the cap the renderer drops a
+ * heavier render at. A payload past this is malformed rather than merely
+ * large, and the host has to cache it on disk, so the boundary refuses it
+ * instead of writing it. Derived from the byte cap rather than restated, so
+ * the two cannot drift.
+ */
+export const NOTIFICATION_AVATAR_BASE64_MAX_CHARS =
+  Math.ceil(NOTIFICATION_AVATAR_MAX_LOCAL_BYTES / 3) * 4;
+
+export const NOTIFICATION_IDENTITY_MAX_CHARS = 512;
+export const NOTIFICATION_SENDER_NAME_MAX_CHARS = 256;
+export const NOTIFICATION_DELIVERY_KEY_MAX_CHARS = 512;
+
+export const NOTIFICATION_PRESENTATIONS = ["assistant", "app"] as const;
+export type NotificationPresentation =
+  (typeof NOTIFICATION_PRESENTATIONS)[number];
+
+export const NOTIFICATION_NAME_PROVENANCES = [
+  "event",
+  "identity-store",
+  "verified-memory",
+  "title",
+] as const;
+export type NotificationNameProvenance =
+  (typeof NOTIFICATION_NAME_PROVENANCES)[number];
+
+export const VERIFIED_NOTIFICATION_NAME_PROVENANCES = [
+  "event",
+  "identity-store",
+  "verified-memory",
+] as const;
+export type VerifiedNotificationNameProvenance =
+  (typeof VERIFIED_NOTIFICATION_NAME_PROVENANCES)[number];
+
+/** Stable routing identity captured before notification work becomes async. */
+export interface NotificationIdentity {
+  scopeId: string;
+  assistantId: string;
+  nativeSenderId: string;
+}
+
+export interface NotificationAvatar {
+  /** Base64 PNG with no data URL prefix. */
+  avatarBase64: string;
+  /** SHA-256 of the PNG as 64 lowercase hex characters. */
+  avatarHash: string;
+}
+
+/**
+ * The assistant a notification is from, for the platforms that render a sender
+ * rather than the app: its name goes on the first line and its notification
+ * avatar becomes the icon.
+ */
+export interface NotificationSender extends NotificationAvatar {
+  id: string;
+  name: string;
+}
+
+/**
+ * A verified identity snapshot prepared before a notification is posted.
+ * Hosts keep these snapshots in process memory only.
+ */
+export interface PrepareNotificationIdentityPayload {
+  identity: NotificationIdentity;
+  scopeEpoch: number;
+  identityRevision: number;
+  /** Identifies one renderer lifetime for native generation translation. */
+  publisherSessionId?: string;
+  name?: string;
+  nameProvenance?: VerifiedNotificationNameProvenance;
+  avatar?: NotificationAvatar;
+}
+
+/** Invalidates one assistant or every assistant in a captured scope. */
+export interface ResetNotificationIdentitiesPayload {
+  scopeId: string;
+  scopeEpoch: number;
+  /** Identifies one renderer lifetime for native generation translation. */
+  publisherSessionId?: string;
+  assistantId?: string;
+  /** Revision tombstone for a targeted reset within the current scope epoch. */
+  identityRevision?: number;
+}
+
+/** Starts one renderer lifetime before it can publish native identity state. */
+export interface RegisterNotificationIdentityPublisherPayload {
+  publisherSessionId: string;
+}
+
+export interface NotificationDeliveryIdentifiers {
+  correlationId?: string;
+  deliveryId?: string;
+  requestKey?: string;
+}
+
+/** Resolve the full process-local deduplication key without truncation. */
+export function resolveNotificationDeliveryKey(
+  identifiers: NotificationDeliveryIdentifiers,
+): string | null {
+  for (const candidate of [
+    identifiers.correlationId,
+    identifiers.deliveryId,
+    identifiers.requestKey,
+  ]) {
+    const trimmed = candidate?.trim();
+    if (trimmed) {
+      return trimmed;
+    }
+  }
+  return null;
+}
+
+export type NotificationDeliveryResult =
+  | { status: "posted" }
+  | { status: "duplicate" }
+  | { status: "blocked"; reason?: string }
+  | {
+      status: "failed";
+      postingMayHaveBegun: boolean;
+      errorMessage?: string;
+    }
+  | { status: "unknown"; errorMessage?: string }
+  | { status: "unavailable"; reason?: string };
+
 /** Renderer → main payload for posting a native notification. */
 export interface ShowNotificationPayload {
   category: NotificationCategory;
@@ -507,11 +877,35 @@ export interface ShowNotificationPayload {
   conversationId?: string;
   toolCallId?: string;
   deepLinkMetadata?: Record<string, unknown>;
+  correlationId?: string;
+  requestKey?: string;
+  /** Absent on legacy payloads. Missing presentation never enables cache use. */
+  presentation?: NotificationPresentation;
+  /** Scoped routing identity for prepared sender lookup and tap handling. */
+  identity?: NotificationIdentity;
+  /** Identifies which name source was selected for assistant presentation. */
+  nameProvenance?: NotificationNameProvenance;
+  /** Omits duplicate group/subtitle text when the title supplies the name. */
+  suppressGroupTitle?: boolean;
+  /**
+   * Absent unless the renderer has a notification avatar to send, which leaves
+   * the notification with the app icon and the title on line one.
+   */
+  sender?: NotificationSender;
 }
 
 export type TextInsertionResult =
   | { status: "inserted" }
   | { status: "vellum-focused" }
+  /**
+   * Nothing in the application in front takes text, so no paste was sent and
+   * the clipboard was left alone.
+   *
+   * Its own answer rather than one of the failures below, because nothing
+   * failed: the words were never handed to the system. The caller still holds
+   * them and is the side that decides where they go instead.
+   */
+  | { status: "no-text-field" }
   | { status: "automation-denied" }
   | { status: "blocked" };
 
@@ -525,6 +919,26 @@ export interface NotificationActionEvent {
   conversationId?: string;
   toolCallId?: string;
   deepLinkMetadata?: Record<string, unknown>;
+  correlationId?: string;
+  requestKey?: string;
+  identity?: NotificationIdentity;
+}
+
+// ---------------------------------------------------------------------------
+// Window attention
+// ---------------------------------------------------------------------------
+
+/**
+ * Main → renderer: authoritative state of the window this renderer runs in,
+ * never another one. A conversation pop-out is its own window and reads its
+ * own state, so the main window minimizing behind it changes nothing here.
+ * Kept as three independent booleans so consumers pick their own strictness
+ * without another contract change.
+ */
+export interface WindowAttentionPayload {
+  visible: boolean;
+  focused: boolean;
+  minimized: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -612,6 +1026,7 @@ export interface LockfileAssistant {
   runtimeUrl?: string;
   species?: string;
   hatchedAt?: string;
+  onboardedAt?: string;
   organizationId?: string;
   platformAssistantId?: string;
   platformBaseUrl?: string;
@@ -667,8 +1082,8 @@ export const COMPANION_GROWTHS = ["right", "left"] as const;
 export type CompanionGrowth = (typeof COMPANION_GROWTHS)[number];
 
 /**
- * Which way the typing card grows out of the composer row, which holds the line
- * the pill occupied.
+ * Which side of the avatar the canvas reserves the card's height on, which is
+ * where the introduction's card is drawn.
  *
  * The vertical half of {@link CompanionGrowth}, decided the same way and for a
  * sharper reason. macOS refuses to place a window frame above the top of the
@@ -690,6 +1105,31 @@ export const COMPANION_CARD_GROWTHS = ["up", "down"] as const;
 export type CompanionCardGrowth = (typeof COMPANION_CARD_GROWTHS)[number];
 
 /**
+ * Which edge of the display the call's bar rests on.
+ *
+ * A call takes the surface to an edge the way a meeting's controls sit on one,
+ * and the user picks which by dropping the bar there mid-call. `bottom` is the
+ * shape the bar is designed around. Along the top and bottom the bar keeps its
+ * row; along the sides it stands up as a column, since a row lying against a
+ * side edge would reach into the middle of the screen.
+ *
+ * Main decides and remembers it, for the reason it decides the growths: the
+ * edge is a fact about where the window was put, and the renderer has to be
+ * told it to draw the bar the way the window was placed for.
+ */
+export const COMPANION_DOCKS = ["bottom", "top", "left", "right"] as const;
+
+export type CompanionDock = (typeof COMPANION_DOCKS)[number];
+
+/**
+ * Whether a dock stands the bar up. Named once, since both sides of the bridge
+ * branch on it: main sizes the canvas for the column and the renderer draws
+ * one.
+ */
+export const companionDockIsSide = (dock: CompanionDock): boolean =>
+  dock === "left" || dock === "right";
+
+/**
  * How big the companion is drawn, as a named step rather than a number.
  *
  * Named rather than free, because the avatar's box is not a style: it is the
@@ -698,11 +1138,13 @@ export type CompanionCardGrowth = (typeof COMPANION_CARD_GROWTHS)[number];
  * state. A continuous scale would be a layout nobody had ever looked at; five
  * steps are five layouts, each checkable in Storybook.
  *
- * `medium` is the default. `small` is the size the surface's layout is authored
- * at, which every other step scales from. `ridiculous` is the joke at the end
- * of the scale, and it is a real step rather than a gag drawn some other way:
- * every length on the surface is stated in `small`, so the largest step costs
- * one number here and is drawn by the same code as the other four.
+ * `medium` is the default. Every length on the surface is stated at 44 points
+ * and scaled from there, and which named step that is depends on the axis: it
+ * is `small` on the avatar's table and `medium` on the options' (see
+ * {@link COMPANION_OPTIONS_SIZE_BOXES}). `ridiculous` is the joke at the end of
+ * the scale, and it is a real step rather than a gag drawn some other way: the
+ * largest step costs one number per table and is drawn by the same code as the
+ * other four.
  */
 export const COMPANION_SIZES = [
   "small",
@@ -715,7 +1157,7 @@ export const COMPANION_SIZES = [
 export type CompanionSize = (typeof COMPANION_SIZES)[number];
 
 /** The avatar's box in points, per named size. The scale is this over `small`. */
-export const COMPANION_SIZE_BOXES: Record<CompanionSize, number> = {
+export const COMPANION_AVATAR_SIZE_BOXES: Record<CompanionSize, number> = {
   small: 44,
   medium: 66,
   large: 88,
@@ -726,6 +1168,29 @@ export const COMPANION_SIZE_BOXES: Record<CompanionSize, number> = {
   // display is too short for it, so the oversize step lands on paths the other
   // four already take near an edge.
   ridiculous: 220,
+};
+
+/**
+ * The options pill's box in points, per named size.
+ *
+ * One notch below the creature's table at every step, because a control strip
+ * and a mascot are not read at the same size: the creature is a character on
+ * the desktop and wants to be seen, and the pill is a row of controls that
+ * wants to be reachable. The same name on both axes should leave the pill
+ * comfortably shorter than the creature holding it out.
+ *
+ * The pill is authored at 44 and {@link companionScaleFor} still divides by
+ * {@link COMPANION_BASE_AVATAR_BOX}, so these are scales of that one layout:
+ * `small` is that layout at 32/44 and `medium` is it at 1:1. Nothing here is a
+ * second set of dimensions, which is what keeps the five steps five drawings of
+ * the same surface.
+ */
+export const COMPANION_OPTIONS_SIZE_BOXES: Record<CompanionSize, number> = {
+  small: 32,
+  medium: 44,
+  large: 66,
+  huge: 88,
+  ridiculous: 110,
 };
 
 /**
@@ -742,21 +1207,223 @@ export const COMPANION_SIZE_BOXES: Record<CompanionSize, number> = {
 export const DEFAULT_COMPANION_SIZE: CompanionSize = "medium";
 
 /**
+ * The two things on the surface a user sizes, sized separately.
+ *
+ * An avatar big enough to read from across the room does not mean a pill that
+ * wide, and both axes take the same five names ({@link COMPANION_SIZES}), so
+ * there is one vocabulary and two answers rather than two scales to learn. Each
+ * axis reads its own table, since the same name means a different box on each.
+ * `avatar` sizes the creature, its glow and its bob; `options` sizes the pill,
+ * the call's body and the introduction's card.
+ */
+export const COMPANION_SIZE_AXES = ["avatar", "options"] as const;
+
+export type CompanionSizeAxis = (typeof COMPANION_SIZE_AXES)[number];
+
+/**
+ * The box one axis draws a named size at.
+ *
+ * The one place a name becomes a number, so nothing downstream has to remember
+ * which of the two tables its axis reads. Names are what the menus offer and
+ * what the store keeps; boxes are what the geometry is done in.
+ */
+export const companionBoxFor = (
+  axis: CompanionSizeAxis,
+  size: CompanionSize,
+): number =>
+  axis === "avatar"
+    ? COMPANION_AVATAR_SIZE_BOXES[size]
+    : COMPANION_OPTIONS_SIZE_BOXES[size];
+
+/**
  * The avatar's box the companion's layout is authored at, and the size every
  * other length in that layout is stated in.
  *
- * The scale is the box in {@link COMPANION_SIZE_BOXES} over this one. The
- * renderer draws at this size and scales the whole surface by that factor, so
- * the two processes never hold two sets of dimensions.
+ * The scale is the box in either size table over this one. The renderer draws
+ * at this size and scales the whole surface by that factor, so the two
+ * processes never hold two sets of dimensions.
  */
-export const COMPANION_BASE_AVATAR_BOX = COMPANION_SIZE_BOXES.small;
+export const COMPANION_BASE_AVATAR_BOX = COMPANION_AVATAR_SIZE_BOXES.small;
 
-/** Room the pill's shadow paints outside its box, at the base size. */
+/**
+ * The creature's artwork inside that box, which is inset on every side.
+ *
+ * The visible creature rather than the box around it. The box is bigger than
+ * the drawing so the glow has somewhere to fall off into and the bob has
+ * somewhere to rise into, and `CompanionSurface` draws both the still and the
+ * composed avatar at this size so nothing moves when one replaces the other.
+ */
+export const COMPANION_BASE_AVATAR_IMAGE = 28;
+
+/**
+ * Room the pill's shadow and the avatar's glow paint outside their own boxes,
+ * at the base size.
+ */
 export const COMPANION_BASE_CANVAS_PAD = 24;
 
 /**
+ * The height the canvas reserves on the card side of the avatar, at the base
+ * size.
+ *
+ * Every pill is exactly {@link COMPANION_BASE_AVATAR_BOX} tall; the one thing
+ * taller is the introduction's card, which is drawn into this reservation. The
+ * number was sized for the typing card the surface no longer draws and is
+ * deliberately left where it was: the canvas is what main places and clamps,
+ * and shrinking it would move a surface every user has already parked.
+ *
+ * Held here rather than beside the placement rules because
+ * {@link companionCardSideFor} sizes the canvas from it.
+ */
+export const COMPANION_BASE_CARD_HEIGHT = 290;
+
+/**
+ * The widest the pill draws at the base size, measured from its avatar-facing
+ * edge.
+ *
+ * An outer width, padding included: the renderer draws a pill as its measured
+ * body plus its own clearance at either end, and that whole width is what has
+ * to fit.
+ *
+ * A ceiling rather than a width, since every other state is as wide as its
+ * content. Main sizes the canvas to hold this much beyond the gap, so a state
+ * that wanted more would be clipped by the window.
+ *
+ * Generous on purpose. The call row is a handlebar that grows with what it
+ * carries, and the canvas is click-through, so room the pill never uses costs
+ * the desktop nothing where a control clipped off the end costs the user the
+ * control.
+ */
+export const COMPANION_BASE_MAX_PILL_WIDTH = 400;
+
+/**
+ * The room between the avatar's edge and the options pill beside it, at the
+ * base size.
+ *
+ * A gap rather than a shared edge. The avatar is a creature standing on the
+ * desktop and the pill is what it is holding out, so the two read as one
+ * surface by sitting near each other rather than by being fused into a single
+ * outline. It is also what gives the glow somewhere to fall off into, instead
+ * of ending against the pill's border.
+ */
+export const COMPANION_BASE_GAP = 12;
+
+/**
+ * The scale a box is drawn at: the box over the size the layout is authored at.
+ *
+ * The one conversion from points into the units every length on the surface is
+ * stated in, so neither side of the bridge divides by the base box on its own.
+ */
+export const companionScaleFor = (box: number): number =>
+  box / COMPANION_BASE_AVATAR_BOX;
+
+/**
+ * How far below the avatar's centre the pill's bottom sits, for a given avatar
+ * box.
+ *
+ * The creature's visible bottom rather than its box's. The box runs past the
+ * artwork on every side to hold the glow and the bob's slack, so a pill lined
+ * up with the box reads as sitting below the creature rather than beside it.
+ * The bob lifts the creature off this line and returns to it, which is what
+ * makes the line the thing the eye keeps coming back to.
+ */
+export const companionBaselineFor = (avatarBox: number): number =>
+  (COMPANION_BASE_AVATAR_IMAGE / 2) * companionScaleFor(avatarBox);
+
+/**
+ * The tallest the pill the surface rests in has ever been drawn, at the
+ * authored avatar box.
+ *
+ * Here rather than in the renderer alone because main places the window by it:
+ * this shape is centred on the avatar, so a placement that did not know how
+ * far below that centre it reached would rest the surface low enough to hang
+ * its lower rim off the bottom of the display.
+ *
+ * **Now a floor rather than a measurement.** The pill no longer grows under
+ * the pointer: it draws in onto the creature and goes out, so nothing the
+ * surface draws is this tall any more and the renderer no longer reads this
+ * number. It stays because the room it reserves is room the surface already
+ * had, and giving it back would move every companion that rests near the
+ * bottom of a display up against the edge as a side effect of an animation
+ * change. Retiring it is its own change, and takes the term below with it.
+ */
+export const COMPANION_BASE_RESTING_PILL_HEIGHT = 35;
+
+/**
+ * How far past the call bar's own box its lit edge is drawn, at the authored
+ * options box. Small, and it still decides whether the light lands on screen.
+ */
+export const COMPANION_BASE_CALL_RING = 2;
+
+/**
+ * How far below the avatar's centre the lowest thing the surface can draw
+ * sits, for a given pair of boxes.
+ *
+ * **The whole surface, not the state it happens to be in.** The window is
+ * placed once and does not move when the pointer arrives or a call starts, so
+ * the room kept under it has to answer for every state it can enter from
+ * there. Three things are centred on that point: the creature's own artwork,
+ * the resting pill, and the call's bar, which stands on the centre rather than
+ * beside it and is sized by the options box instead of the avatar's. The last
+ * two are the lowest at some size; the pill's term is now a floor over a shape
+ * that has stopped growing, and {@link COMPANION_BASE_RESTING_PILL_HEIGHT}
+ * says why it is still here.
+ *
+ * Whole points, as every distance the window is placed by is: the options
+ * sizes are not whole multiples of the authored box, and a reach carrying a
+ * repeating fraction is an avatar centre that lands between points.
+ */
+export const companionLowerReachFor = (
+  avatarBox: number,
+  optionsBox: number,
+): number =>
+  Math.round(
+    Math.max(
+      companionBaselineFor(avatarBox),
+      (COMPANION_BASE_RESTING_PILL_HEIGHT / 2) * companionScaleFor(avatarBox),
+      optionsBox / 2 + COMPANION_BASE_CALL_RING * companionScaleFor(optionsBox),
+    ),
+  );
+
+/**
+ * That gap for a given pair of boxes.
+ *
+ * Scaled by the smaller of the two, because the gap is breathing room and the
+ * smaller object is the one that decides how much of it there is: a modest
+ * avatar beside an enormous pill wants the modest avatar's clearance, not the
+ * chasm the pill's own scale would ask for.
+ *
+ * Derived here rather than on each side of the bridge, for the reason
+ * {@link companionNearEdgeFor} is: main sizes the canvas to hold the pill's
+ * reach past the avatar and the renderer positions the pill by the same
+ * distance, so two copies of this drifting is a pill drawn somewhere main did
+ * not leave room for.
+ */
+export const companionGapFor = (
+  avatarBox: number,
+  optionsBox: number,
+): number =>
+  (COMPANION_BASE_GAP * Math.min(avatarBox, optionsBox)) /
+  COMPANION_BASE_AVATAR_BOX;
+
+/**
+ * The room the canvas keeps outside everything drawn into it, for a given pair
+ * of boxes.
+ *
+ * The larger of the two scales, because the pad holds two overflows and either
+ * one can be the bigger: the pill's shadow grows with the options size and the
+ * avatar's glow with the avatar's. Sizing it from the smaller would clip
+ * whichever of the two the user made large.
+ */
+export const companionPadFor = (
+  avatarBox: number,
+  optionsBox: number,
+): number =>
+  COMPANION_BASE_CANVAS_PAD *
+  Math.max(companionScaleFor(avatarBox), companionScaleFor(optionsBox));
+
+/**
  * How far the avatar's centre sits from the canvas edge the card does *not*
- * grow into: its own half-box, plus the shadow's room.
+ * grow into, for a given pair of boxes.
  *
  * **The cross-process invariant.** Main places the window by it and the
  * renderer anchors the avatar by it, so the two agreeing is what makes the
@@ -764,11 +1431,54 @@ export const COMPANION_BASE_CANVAS_PAD = 24;
  * side, because two copies of this formula drifting is the avatar drawn
  * somewhere other than where main believes it is.
  *
- * The far edge is however far away the canvas is, which neither side has to
- * state: `100%` names the canvas in the renderer, and main sizes it.
+ * What has to clear that edge depends on which way the card grows, because the
+ * pill stands on the creature's baseline ({@link companionBaselineFor}) rather
+ * than on its box: growing up, the near side holds the avatar's own half box,
+ * which runs below that line and is where the glow paints; growing down, the
+ * pill stands on the baseline and reaches a whole options box back past it,
+ * which pokes above a smaller creature. The larger of the two is taken so the
+ * answer is the same either way, since a flip moves the canvas rather than
+ * resizing it, and a near edge that changed with the direction would shift the
+ * avatar by the difference.
+ *
+ * The far edge is {@link companionCardSideFor}, which the renderer never has to
+ * state: `100%` names the canvas there, and main sizes it.
  */
-export const COMPANION_NEAR_EDGE =
-  COMPANION_BASE_AVATAR_BOX / 2 + COMPANION_BASE_CANVAS_PAD;
+export const companionNearEdgeFor = (
+  avatarBox: number,
+  optionsBox: number,
+): number =>
+  Math.max(avatarBox / 2, optionsBox - companionBaselineFor(avatarBox)) +
+  companionPadFor(avatarBox, optionsBox);
+
+/**
+ * How far the avatar's centre sits from the canvas edge the card *does* grow
+ * into, for a given pair of boxes.
+ *
+ * The far half of {@link companionNearEdgeFor}, taken over both growths for the
+ * same reason. Growing up, the card stands on the creature's baseline and rises
+ * its whole height from there; growing down, its composer row holds that line
+ * and the rest of the card falls away below it. The avatar's own half box is
+ * the floor under both, for a creature taller than the card beside it.
+ *
+ * Only main consumes this: the renderer names that edge with `100%` and lets
+ * main size the canvas. It lives here to sit beside the constants it reads.
+ */
+export const companionCardSideFor = (
+  avatarBox: number,
+  optionsBox: number,
+): number => {
+  const scale = companionScaleFor(optionsBox);
+  const baseline = companionBaselineFor(avatarBox);
+  return (
+    Math.max(
+      COMPANION_BASE_CARD_HEIGHT * scale - baseline,
+      (COMPANION_BASE_CARD_HEIGHT - COMPANION_BASE_AVATAR_BOX) * scale +
+        baseline,
+      avatarBox / 2,
+    ) + companionPadFor(avatarBox, optionsBox)
+  );
+};
 
 /**
  * The assistant's character, as the three trait ids it is composed from.
@@ -787,19 +1497,6 @@ export interface CompanionCharacter {
   bodyShape: string;
   eyeStyle: string;
   color: string;
-}
-
-/**
- * One side of one exchange, condensed for the companion surface's card.
- *
- * Text and a side, and nothing else: no ids, no attachments, no tool calls, no
- * surfaces. The card is a glance at where the conversation got to, so anything
- * richer crossing this bridge would be an invitation to render a transcript on
- * a surface floating over someone else's work.
- */
-export interface CompanionTurn {
-  role: "user" | "assistant";
-  text: string;
 }
 
 /**
@@ -822,13 +1519,613 @@ export interface CompanionTurn {
 export type CompanionWatchRetro = "pending" | "ready";
 
 /**
+ * Words a dictation produced that the surface is holding out to the user,
+ * and why they were not simply typed where the user was.
+ *
+ * Two things end a hold with the words still in hand, and the surface draws
+ * the same card for both. `claimed`: another dictation app heard the key
+ * too, since nothing on macOS owns one, and has already pasted its own
+ * version, so Vellum offers to put its own in place instead, to get that app
+ * off the key, or to leave it. `no-text-field`: nothing in the application
+ * in front takes text, so no paste was sent at all and the only place left
+ * to put the words is the clipboard.
+ *
+ * The reason is what the card reads to pick its answers, since the two cases
+ * can offer nothing in common: there is no app to quit when none claimed the
+ * key, and nowhere to "use" the words when nothing takes text. `text` is
+ * bounded at {@link COMPANION_DICTATION_OFFER_MAX} on both.
+ */
+interface OfferedDictation {
+  /**
+   * Which offer this is, minted where the words are parked and carried back
+   * on the answer.
+   *
+   * The same bargain {@link VoiceActivityControl.requestId} makes. A hold
+   * replacing an offer reaches main before it reaches the surface, so a press
+   * on the card still on screen can arrive after main is already holding
+   * different words. Copying those would put on the pasteboard something the
+   * user never read, and dismissing them would answer a question they were
+   * never asked, so the press names its offer and a press for one that no
+   * longer stands is dropped.
+   */
+  id: string;
+  text: string;
+}
+
+export type CompanionDictationOffer =
+  | (OfferedDictation & { reason: "claimed"; app: string })
+  | (OfferedDictation & { reason: "no-text-field" });
+
+/**
+ * The most an offered dictation can be, in characters. One bound for the
+ * store, the surface and the insert, so what the user reads on the card is
+ * what "use" puts in the document. Far above any hold's worth of speech.
+ */
+export const COMPANION_DICTATION_OFFER_MAX = 2000;
+
+/**
+ * What the user pressed on the offer's card.
+ *
+ * Which of these a card draws is the offer's reason to decide, and each is
+ * answered by the side that can act on it: `use` and `quit` reach the window
+ * holding the words and the way into the application they came from, `copy`
+ * is main's because main owns the pasteboard and the surface's window never
+ * takes focus, and `dismiss` acts on nothing. Every one of them travels, so
+ * the window still publishing the offer stops.
+ */
+export type DictationOfferAnswer = "use" | "quit" | "copy" | "dismiss";
+
+/**
+ * Something the assistant needs the user to see or answer while they are away
+ * from the app's window: the tool approvals the turn is blocked on, a
+ * credential it asked for, or a surface it put up. The companion draws it in a
+ * popover beside the creature, and a call's bar carries the short forms as a
+ * row of its own, since a voice call has no other way to show a picture, a
+ * link or a pair of buttons.
+ *
+ * Published by the app's window, which holds the conversation, already worded
+ * and bounded, so the popover renders text and never interprets a tool call.
+ * `id` names what is shown, carried back on every answer so a press on a
+ * popover that has since been replaced is dropped. For approvals it is every
+ * pending request id joined, so a new request arriving is a new popover.
+ */
+export type CompanionPopover =
+  | {
+      kind: "approvals";
+      id: string;
+      /** Every approval the turn is waiting on, oldest first. Never empty. */
+      items: readonly CompanionApproval[];
+    }
+  | {
+      kind: "secret";
+      id: string;
+      /** The service the credential is for, in words, or empty. */
+      service: string;
+      /** The integration the service matches, for its logo, when known. */
+      providerKey?: string;
+      /** What the request says it is for. Empty otherwise. */
+      detail: string;
+      /** The field's label ("Password", "API key"). */
+      label: string;
+      placeholder: string;
+    }
+  | {
+      kind: "card";
+      id: string;
+      title: string;
+      subtitle: string;
+      /** Markdown. Links and images in it are the reason this kind exists. */
+      body: string;
+      actions: readonly CompanionPopoverAction[];
+    }
+  | {
+      /** A surface the popover cannot draw, named so it can be opened. */
+      kind: "surface";
+      id: string;
+      title: string;
+    }
+  | {
+      /**
+       * The microphones a call can listen through, opened from the call bar.
+       * `id` is always {@link COMPANION_PICKER_MICROPHONES}.
+       */
+      kind: "microphones";
+      id: string;
+      /** Every microphone, System Default first. */
+      options: readonly CompanionPickerOption[];
+      /** The option in use. Empty is System Default. */
+      selected: string;
+      /** Inputs exist but cannot be named until mic access is granted. */
+      needsPermission: boolean;
+    }
+  | {
+      /**
+       * The voices the assistant can speak in, opened from the call bar.
+       * `id` is always {@link COMPANION_PICKER_VOICES}.
+       */
+      kind: "voices";
+      id: string;
+      /** Grouped by accent, as Settings lists them. */
+      groups: readonly CompanionVoiceGroup[];
+      /** The voice in use. */
+      selected: string;
+    };
+
+/** The pickers the call bar opens in the popover. */
+export const COMPANION_PICKER_MICROPHONES = "microphones";
+export const COMPANION_PICKER_VOICES = "voices";
+export type CompanionPicker =
+  | typeof COMPANION_PICKER_MICROPHONES
+  | typeof COMPANION_PICKER_VOICES;
+
+/** One row of a picker. */
+export interface CompanionPickerOption {
+  id: string;
+  label: string;
+}
+
+/** Voices sharing an accent, under its heading. */
+export interface CompanionVoiceGroup {
+  accent: string;
+  voices: readonly CompanionVoiceOption[];
+}
+
+export interface CompanionVoiceOption {
+  /** The managed voice's model id. */
+  id: string;
+  /** Its character traits, as Settings words them. */
+  label: string;
+  /** A hosted sample the popover plays for a preview. Empty when none. */
+  sampleUrl: string;
+  /** The platform default voice. */
+  isDefault: boolean;
+}
+
+/** The most rows a picker carries. */
+export const COMPANION_PICKER_OPTIONS_MAX = 200;
+
+/** One tool approval, as the popover puts it to the user. */
+export interface CompanionApproval {
+  /** The confirmation's request id. */
+  id: string;
+  /** What the assistant wants to do, in words. */
+  title: string;
+  /** Why, when the request says. Empty otherwise. */
+  detail: string;
+  /**
+   * The macOS privacy pane the request is about, when it asks for one the app
+   * can open. The popover then offers to open it with the approval.
+   */
+  permission?: CompanionPopoverPermission;
+}
+
+/** The most approvals one popover lists. */
+export const COMPANION_POPOVER_APPROVALS_MAX = 20;
+
+/**
+ * Whether a popover has a short form: a single row a call's bar can carry, or
+ * a pill beside the idle creature. Approvals and a credential do; a card and a
+ * surface are only ever drawn whole.
+ */
+export const companionPopoverHasRow = (popover: CompanionPopover): boolean =>
+  popover.kind === "approvals" || popover.kind === "secret";
+
+/** The privacy panes an approval can open from the popover. */
+export const COMPANION_POPOVER_PERMISSIONS = [
+  "accessibility",
+  "screen",
+  "microphone",
+] as const;
+export type CompanionPopoverPermission =
+  (typeof COMPANION_POPOVER_PERMISSIONS)[number];
+
+export interface CompanionPopoverAction {
+  id: string;
+  label: string;
+  style: "primary" | "secondary" | "destructive";
+}
+
+/** How wide a popover card is drawn, in points. A row is as wide as its words. */
+export const COMPANION_POPOVER_CARD_WIDTH = 360;
+/** The widest the popover's window is drawn, in points. */
+export const COMPANION_POPOVER_MAX_WIDTH = 680;
+/**
+ * The transparent room between the popover's window and its card, in points,
+ * which holds the card's shadow.
+ */
+export const COMPANION_POPOVER_INSET = 12;
+/** The tallest the popover's window is drawn, in points. */
+export const COMPANION_POPOVER_MAX_HEIGHT = 560;
+
+/** The most a popover's body can be, in characters. */
+export const COMPANION_POPOVER_BODY_MAX = 8000;
+/** The most actions a popover card carries. */
+export const COMPANION_POPOVER_ACTIONS_MAX = 6;
+/** The longest credential the popover sends, in characters. */
+export const COMPANION_POPOVER_SECRET_MAX = 10_000;
+
+/**
+ * What the user pressed on the popover, for the window that holds what it
+ * shows.
+ *
+ * Approvals are answered one at a time, named by `itemId`. `settings` is an
+ * approval's allow that also opens the privacy pane it asked for. `secret`
+ * carries the credential typed into the form. `open` brings the app forward on
+ * the conversation; on a surface it also stops the popover offering it, since
+ * the user has gone to answer it there.
+ *
+ * `pick` chooses a row of a picker.
+ *
+ * Not Now, Review and Enter are not here: they change only what the companion
+ * shows, which main holds (see {@link CompanionPopoverView}).
+ */
+export type CompanionPopoverAnswer =
+  | { kind: "allow"; itemId: string }
+  | { kind: "deny"; itemId: string }
+  | { kind: "settings"; itemId: string }
+  | { kind: "secret"; value: string }
+  | { kind: "action"; actionId: string }
+  | { kind: "open" }
+  | { kind: "dismiss" }
+  | { kind: "pick"; optionId: string };
+
+/**
+ * How the companion is showing the popover, which is main's to hold because
+ * the call's bar and the popover's own window both draw from it.
+ *
+ * - `row`: the short form, a pill beside the creature or a row on the bar.
+ * - `expanded`: drawn whole after Review or Enter (the numbered approvals, the
+ *   credential form). A card and a surface are always drawn whole.
+ * - `deferred`: put off with Not Now. Nothing is drawn but a count on the
+ *   call's bar, and a new popover arriving shows itself again.
+ */
+export type CompanionPopoverView = "row" | "expanded" | "deferred";
+
+/**
+ * What a watch session reads, once the user has picked: one display or one
+ * window.
+ *
+ * The two shapes the host can actually capture. A display is named by its
+ * `CGDirectDisplayID`, which is what Electron's `Display.id` is on macOS, and a
+ * window by its `CGWindowID`, which is what the window server names a window
+ * and what a screenshot of one window is taken by. Both travel from the
+ * companion's pick to the session's stream and on to the native helper, so the
+ * frame drawn around the picked surface and the pixels the session reads are
+ * one and the same thing.
+ *
+ * A browser tab is not one of these. The picker offers tabs, but a tab is
+ * captured as the window it is in once the browser has been told to show it,
+ * so by the time a target exists the tab has become a window.
+ */
+export type WatchCaptureTarget =
+  { kind: "display"; displayId: number } | { kind: "window"; windowId: number };
+
+/**
+ * Which edge of a drawing an `annotateShare` command is: the hand still on
+ * it, or the hand off it. See the command.
+ */
+export type CompanionAnnotationPhase = "drawing" | "released";
+
+/**
+ * What a press on the shared surface draws: the pointer's own path, or a
+ * shape stretched between the press and the release.
+ *
+ * `freehand` is the hand's path as it went. The other three are the shapes
+ * a hand cannot draw cleanly over someone else's work: a line between two
+ * points, the box on the drag's corners, and the ellipse inscribed in that
+ * box. Main holds which one is current ({@link CompanionSurfaceState.annotationTool}),
+ * since the pill chooses it and the frame draws with it.
+ */
+export const COMPANION_ANNOTATION_TOOLS = [
+  "freehand",
+  "line",
+  "box",
+  "circle",
+] as const;
+export type CompanionAnnotationTool =
+  (typeof COMPANION_ANNOTATION_TOOLS)[number];
+
+/**
+ * One mark the user drew over the shared surface, as the points the pointer
+ * passed through.
+ *
+ * **In fractions of the shared surface, from `0` to `1`.** The overlay is a
+ * window sized in points and the frame is a JPEG scaled to fit a bound, so
+ * neither side's pixels mean anything to the other; a fraction of the surface
+ * is the one description both agree on, and it survives the scaling that
+ * happens between them.
+ *
+ * A polyline whatever the tool was. A freehand circle is not a circle anything
+ * should straighten, and a shape tool's line, box or ellipse is sent as the
+ * points along it rather than as a shape, so the frame it is drawn onto needs
+ * one idea of what a mark is. Thinned on the way in
+ * ({@link COMPANION_ANNOTATION_MIN_STEP}), so a slow hand does not send a
+ * point per frame.
+ */
+export interface CompanionAnnotationStroke {
+  points: readonly { x: number; y: number }[];
+}
+
+/**
+ * How far the pointer must travel before a stroke takes another point, in
+ * fractions of the shared surface's smaller side.
+ *
+ * A stroke is sampled off pointer moves, which arrive at the display's rate
+ * and land on the same pixel whenever the hand pauses. Roughly a couple of
+ * points on a laptop display: below the width of the line being drawn, so
+ * the thinning is invisible, and enough that a deliberate circle is tens of
+ * points rather than hundreds.
+ */
+export const COMPANION_ANNOTATION_MIN_STEP = 0.002;
+
+/**
+ * How much of a drawing crosses the bridge: strokes per command, and points
+ * per stroke.
+ *
+ * Bounds rather than a promise about how anyone draws. The command is
+ * validated in main, and a drawing is the one payload on this surface whose
+ * size is set by how long a user holds the mouse down. Past either bound the
+ * oldest is dropped, so a very long stroke keeps its recent shape.
+ */
+export const COMPANION_ANNOTATION_MAX_STROKES = 24;
+export const COMPANION_ANNOTATION_MAX_POINTS = 512;
+
+/**
+ * How thick the line is, in fractions of the shared surface's smaller side.
+ *
+ * A fraction for the reason the points are one: the overlay draws in the
+ * window's points and the frame is drawn on in the JPEG's pixels, and a mark
+ * that weighed differently in the two would be a heavier or fainter line in
+ * the transcript than the one the user made. About five points on a laptop
+ * display: a deliberate circle, not a highlighter.
+ */
+export const COMPANION_ANNOTATION_STROKE = 0.006;
+
+/**
+ * One thing the assistant is pointing at on the surface a call is being
+ * shown: the bounds of the thing, and a line about what to do with it.
+ *
+ * **In fractions of the shared surface, from `0` to `1`**, for the reason
+ * {@link CompanionAnnotationStroke} carries fractions. The overlay is a
+ * window sized in points, and what the mark was resolved from is measured in
+ * the target's own units; a fraction of the surface is the one description
+ * both ends agree on, and it survives the scaling between them.
+ *
+ * The bounds are the thing itself rather than the ring drawn for it. The ring
+ * goes outside them, so the control a user is being pointed at stays as
+ * visible as it was before anything was drawn on it.
+ *
+ * For an extent that is itself the message: a region of an image, an area of
+ * a canvas, a panel being named as a whole. To send someone to one control,
+ * see {@link CompanionCoachmarkPoint}.
+ */
+export interface CompanionCoachmarkRegion {
+  kind: "region";
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  caption?: string;
+}
+
+/**
+ * A place on the surface, drawn as an arrow aimed at it.
+ *
+ * **The ordinary way to point, because aim survives error and extent does
+ * not.** A ring asserts where a thing ends as well as where it is, and an
+ * element's bounds are the least trustworthy thing the accessibility tree
+ * reports about it: a control's frame is its hit area, which can be twice the
+ * size of the glyph inside it, and a row can be named by the small triangle
+ * that discloses it. Every one of those rings the wrong shape while knowing
+ * the right place. An arrow makes the weaker claim, so it stays true where the
+ * ring does not.
+ *
+ * `x` and `y` are the point being indicated, not a corner: the arrow's tip
+ * lands there and its tail hangs off whichever side has the room.
+ */
+export interface CompanionCoachmarkPoint {
+  kind: "point";
+  x: number;
+  y: number;
+  caption?: string;
+}
+
+/**
+ * What is drawn on the shared surface: an arrow at something, or a ring
+ * around some extent of it.
+ *
+ * Tagged rather than inferred from which fields are set, because the tag is
+ * the thing that decides what `x` and `y` mean. A corner and a point are
+ * different claims, and a reader that guessed between them by looking for a
+ * width would be one field away from drawing a mark half its own size out of
+ * place.
+ */
+export type CompanionCoachmark =
+  CompanionCoachmarkRegion | CompanionCoachmarkPoint;
+
+/**
+ * How many marks stand at once, and how long a caption may be.
+ *
+ * A mark is where to look next, so a surface covered in them is nowhere to
+ * look. The bound is low because it is the shape of the feature rather than a
+ * safeguard: past a few marks at once, what is being drawn is not a place to
+ * go but a diagram, and the call is where a diagram gets explained.
+ */
+export const COMPANION_COACHMARK_MAX = 4;
+export const COMPANION_COACHMARK_CAPTION_MAX = 80;
+
+/**
+ * Why a set of marks did not go up, or `null` for marks that did.
+ *
+ * Named refusals rather than one boolean, because the assistant can act on
+ * the difference and each one has its own answer: nothing shared is answered
+ * by asking the user to share, a surface owned by another conversation is not
+ * answered at all, and a surface that moved is answered by looking again.
+ * Told only that it failed, an assistant would ask for a share that is
+ * already running.
+ *
+ * Here rather than beside either end of the call. The window layer decides it
+ * and the host-proxy executor words it, and the file that words it says in as
+ * many words that it must not reach into the windows for anything.
+ */
+export type CoachmarkRefusal =
+  "unshared" | "not-this-call" | "stale-surface" | "superseded";
+
+/**
+ * One thing to point at: a control named, or a rectangle given.
+ *
+ * **Naming is the one to reach for.** The accessibility tree holds the exact
+ * frame of every labelled control on the surface, so a name resolves to where
+ * the thing actually is; a rectangle is a guess at it, measured off a picture
+ * that has been scaled and compressed on its way to whoever is guessing. The
+ * rectangle form remains for what the tree cannot name (a canvas, an image,
+ * a plugin's own drawing), where there is nothing to resolve against.
+ */
+export type CoachmarkRequest =
+  | { target: string; caption?: string }
+  | { x: number; y: number; width: number; height: number; caption?: string };
+
+/** Whether a request named a control or gave bounds outright. */
+export const namesATarget = (
+  request: CoachmarkRequest,
+): request is { target: string; caption?: string } => "target" in request;
+
+/**
+ * A mark that went up, and what it turned out to be.
+ *
+ * `matched` is the label the surface actually uses, which is not always the
+ * one that was asked for: a control found by a forgiving comparison is
+ * reported under its own name so the caller can say the same word the user
+ * can see.
+ */
+export type PlacedCoachmark = CompanionCoachmark & { matched?: string };
+
+/**
+ * Why a named control could not be turned into a mark.
+ *
+ * Each carries the labels that were on the surface, because the answer to all
+ * three is the same shape: say what is there instead of drawing at a guess.
+ * `ambiguous` lists the ones that fit, the others everything there was.
+ */
+export interface CoachmarkUnresolved {
+  target: string;
+  reason: "no-tree" | "ambiguous" | "no-match";
+  candidates: readonly string[];
+  /**
+   * How many labels the surface carried, which can be more than `candidates`
+   * holds. The host bounds the list at the point it reads the accessibility
+   * tree, since a web page is ten thousand elements and any of them can be
+   * carrying a paragraph of `aria-label`. The count is what lets the reader
+   * say how many names it is not showing.
+   */
+  candidateCount?: number;
+}
+
+/**
+ * What became of a set of marks.
+ *
+ * Three outcomes rather than a nullable refusal, because a named control that
+ * does not resolve is neither a placement nor a refusal of the surface: the
+ * share is fine and the caller simply named something that is not there.
+ */
+export type CoachmarkResult =
+  | { kind: "placed"; marks: readonly PlacedCoachmark[] }
+  | { kind: "refused"; refusal: CoachmarkRefusal }
+  | { kind: "unresolved"; unresolved: CoachmarkUnresolved };
+
+/**
+ * One frame of a {@link WatchCaptureTarget}, as the helper took it: a JPEG,
+ * with the size it was encoded at. Base64 rather than bytes because it
+ * crosses the bridge as JSON.
+ */
+export interface ScreenCaptureFrame {
+  jpegBase64: string;
+  width: number;
+  height: number;
+}
+
+/**
+ * What the companion's picker offers a press of Teach: a display, a window,
+ * or a Chrome tab, with what a person needs to tell them apart.
+ *
+ * Decoration on the {@link WatchCaptureTarget} shapes rather than the target
+ * itself, because a list is read and a target is captured: a title and an
+ * icon are how the user finds the window, and neither is anything the session
+ * needs once it has been found.
+ *
+ * `index` on a display is its position in the host's list, which is how a
+ * display is named to a person ("Screen 2"), since a display id is not. The
+ * renderer owns that wording.
+ *
+ * A tab is named by Chrome's own window id and the tab's index in it, which are
+ * the two handles Chrome's scripting interface takes; neither is a window the
+ * window server knows. Picking one has the host activate the tab and resolve
+ * it to the Chrome window showing it, so the surface never has to know how.
+ */
+export type CompanionCaptureSource =
+  | {
+      kind: "display";
+      displayId: number;
+      index: number;
+      primary: boolean;
+    }
+  | {
+      kind: "window";
+      windowId: number;
+      title: string;
+      app: string;
+      /** The owning app's icon as a data URL, when the host could read one. */
+      icon?: string;
+    }
+  | {
+      kind: "tab";
+      chromeWindowId: number;
+      tabIndex: number;
+      title: string;
+      /** Chrome's icon as a data URL, when the host could read one. */
+      icon?: string;
+    };
+
+/** What the host lists for the picker, in the order the picker draws it. */
+export interface CompanionCaptureSources {
+  displays: Extract<CompanionCaptureSource, { kind: "display" }>[];
+  tabs: Extract<CompanionCaptureSource, { kind: "tab" }>[];
+  windows: Extract<CompanionCaptureSource, { kind: "window" }>[];
+  /**
+   * False when the process that takes every capture has no Screen Recording
+   * grant, so nothing listed could be shown or shared until the user allows
+   * it. Absent on a shell that predates the check, which reads as granted.
+   */
+  screenRecordingGranted?: boolean;
+}
+
+/**
+ * What to capture, as the side asking for it can say it.
+ *
+ * Three of these are a press on one row of the picker: the source with its
+ * decoration removed. A tab is still a tab here, since only main can turn one
+ * into a window; the other two are already targets.
+ *
+ * `pointerDisplay` is the fourth and comes from no row at all. It is what a
+ * keyboard gesture means by "this screen", named as the question rather than
+ * as an answer because the answer is the pointer's, and the pointer is main's
+ * to read at the moment the press lands. A renderer that resolved it first
+ * would be handing over where the mouse was a round trip ago.
+ */
+export type CompanionCapturePick =
+  | { kind: "display"; displayId: number }
+  | { kind: "pointerDisplay" }
+  | { kind: "window"; windowId: number }
+  | { kind: "tab"; chromeWindowId: number; tabIndex: number };
+
+/**
  * What the app's own window knows that the surface cannot.
  *
  * The surface is a renderer with no assistant and no conversation in it, so
- * both facts are published by the window that has them. One payload rather than
- * two channels: they describe the same assistant at the same moment, and a
- * surface drawing one assistant's name over another's words is exactly the skew
- * two independently-pushed facts would produce.
+ * every fact here is published by the window that has them. One payload rather
+ * than a channel per fact: they describe the same assistant at the same
+ * moment, and a surface drawing a stale session beside a fresh name is exactly
+ * the skew independently-pushed facts would produce.
  */
 export interface CompanionContext {
   /**
@@ -836,21 +2133,12 @@ export interface CompanionContext {
    * verbatim rather than deciding what an unnamed assistant is called.
    */
   assistantName: string;
-  /** The conversation's tail, most recent last. */
-  turns: CompanionTurn[];
   /**
-   * Whether a turn is in flight right now.
+   * Whether a turn is in flight right now, which is what the surface draws its
+   * working ring from.
    *
-   * The surface has the tail of the conversation but no idea whether it is
-   * still being written: the last turn on a finished exchange and the last turn
-   * on one the assistant is still working through are the same rows. This is
-   * the difference, and it is what the surface draws its working ring from.
-   *
-   * Published rather than inferred for the same reason the turns are. The turn
-   * lives in the window that owns the conversation, and a surface guessing from
-   * the shape of the tail would be wrong in both directions: a user message with
-   * no reply yet is not proof of a live turn, and an assistant message already
-   * on screen is no proof the turn behind it has ended.
+   * Published rather than inferred: the turn lives in the window that owns the
+   * conversation, and the surface has no view of that conversation at all.
    */
   working: boolean;
   /**
@@ -888,7 +2176,122 @@ export interface CompanionContext {
    * the truthful reading of silence.
    */
   captureCount?: number;
+  /**
+   * What the running session is reading, when it was started on a pick.
+   *
+   * Published by the window that owns the session rather than remembered by
+   * main from the press, for the reason `watching` is: the press is a request
+   * and this is what the session actually did with it. A session started with
+   * no pick, or on an assistant too old to honour one, reads the whole screen
+   * and reports nothing here, so the frame main draws follows the read and not
+   * the wish.
+   */
+  captureTarget?: WatchCaptureTarget;
+  /**
+   * Whether a session started from this window can be told what to read.
+   *
+   * The assistant the session would run on has to understand a target on its
+   * stream, and only this window knows that assistant's version. The surface
+   * offers the picker on a positive answer and starts the whole-screen session
+   * it always started on anything else, so a pick is never taken from a user
+   * that nothing downstream could honour.
+   *
+   * Optional and defaulted to false, the bargain `watching` makes: a publisher
+   * that does not say is one whose sessions cannot be aimed.
+   */
+  watchTargets?: boolean;
+  /**
+   * What the running call is being shown, while the user shares a display or
+   * a window with it. Absent when nothing is shared.
+   *
+   * Published by the window that owns the session rather than remembered by
+   * main from the press, for the reason `captureTarget` is: the press is a
+   * request, and this is what the session did with it, so the surface draws
+   * the share as on only once frames can flow to a session that takes them.
+   */
+  screenShare?: WatchCaptureTarget;
+  /**
+   * Which conversation the running call belongs to, while one is sharing.
+   *
+   * The marks the assistant places are addressed to a surface and say nothing
+   * about who asked for them, so without this main cannot tell the call's own
+   * conversation from any other the same user has running. A background turn
+   * would otherwise draw on a call it has no part in and be told it worked.
+   *
+   * Published with `screenShare` and withheld with it: a share that cannot
+   * flow is one nothing can be pointed at, so an id beside it would name a
+   * conversation with nothing to own.
+   */
+  callConversationId?: string;
+  /**
+   * Whether the call in this window can be shown the screen at all: a session
+   * is running and its assistant understands the frame. The surface offers
+   * the share on a positive answer and nothing on anything else, the bargain
+   * `watchTargets` makes.
+   */
+  screenShareEnabled?: boolean;
+  /**
+   * What a dictation started from the keyboard has got to, when one is running.
+   *
+   * The surface is the only thing on screen while the user is dictating into
+   * another app, so it is the only thing that can say a microphone is open.
+   * Published rather than inferred for the reason `working` is: the recording
+   * lives in the window that owns it, and the surface's own window has no view
+   * of it.
+   *
+   * Optional and absent means nothing is being dictated, which is the truthful
+   * reading of a publisher that never mentions it.
+   */
+  dictating?: CompanionDictating;
+  /**
+   * The words recognised so far in that dictation, or empty before any are.
+   *
+   * The tail of them rather than all of them: this crosses a process boundary
+   * on every recognition result, and the surface draws one line of it, so the
+   * end is the part worth sending. {@link COMPANION_DICTATION_TAIL} is where
+   * that is cut.
+   *
+   * Revised as it arrives, since a recogniser rewrites its own guesses, which
+   * is why it is shown and not what gets inserted anywhere.
+   */
+  dictationText?: string;
+  /**
+   * Vellum's version of a dictation another app pasted, while the offer to
+   * use it stands. Absent when there is none. See
+   * {@link CompanionDictationOffer}.
+   */
+  dictationOffer?: CompanionDictationOffer;
+  /**
+   * What the assistant needs the user to see or answer, while there is
+   * something. Absent when there is nothing. See {@link CompanionPopover}.
+   */
+  popover?: CompanionPopover;
+  /**
+   * Whether the call's assistant has managed voices to pick from, so the call
+   * bar draws its voice chevron. Absent is a publisher that predates it.
+   */
+  voicesPickable?: boolean;
 }
+
+/**
+ * How much of a running dictation the surface is given, in characters.
+ *
+ * The pill draws one line and clips what will not fit, so this is a bound on
+ * what crosses rather than on what is seen: enough that the line is always
+ * full, little enough that a long dictation does not grow the payload with
+ * every word.
+ */
+export const COMPANION_DICTATION_TAIL = 120;
+
+/**
+ * How far a keyboard dictation has got, in the two states the user can act on.
+ *
+ * `listening` is a microphone that is open, which is the one they can still
+ * change by letting go. `transcribing` is the wait afterwards, which they
+ * cannot, and which exists as its own state because it is the stretch where
+ * nothing else says anything is happening.
+ */
+export type CompanionDictating = "listening" | "transcribing";
 
 /**
  * The feature flag key Teach is behind, as the app's window wrote it into
@@ -931,7 +2334,7 @@ export const WATCH_FLAG = "teach";
  * to say where its own off switch is, and the right-click menu it points at is
  * the only part of this the user cannot find by looking at the pill.
  */
-export const COMPANION_INTRO_BEATS = ["meet", "talk", "type", "menu"] as const;
+export const COMPANION_INTRO_BEATS = ["meet", "talk", "menu"] as const;
 
 export type CompanionIntroBeat = (typeof COMPANION_INTRO_BEATS)[number];
 
@@ -949,40 +2352,65 @@ export type CompanionIntroAction = (typeof COMPANION_INTRO_ACTIONS)[number];
 
 /** What main tells the companion renderer. */
 export interface CompanionSurfaceState {
+  /** See {@link CompanionContext.dictating}. */
+  dictating?: CompanionDictating;
+  /** See {@link CompanionContext.dictationText}. */
+  dictationText?: string;
   growth: CompanionGrowth;
   /**
-   * Which way the typing card unfurls, and with it where the avatar sits inside
-   * the canvas. See {@link CompanionCardGrowth}: main owns the window position,
-   * so main is the only side that can decide this.
+   * Which side of the avatar the canvas reserves the card's height on, and with
+   * it where the avatar sits inside the canvas. See {@link CompanionCardGrowth}:
+   * main owns the window position, so main is the only side that can decide
+   * this.
    */
   cardGrowth: CompanionCardGrowth;
   /**
-   * The avatar's box in points, which is the whole of the surface's scale.
+   * Which edge of the display the call's bar rests on. See
+   * {@link CompanionDock}.
    *
-   * One number rather than the named size, because the name is a lookup both
-   * sides would then have to hold the same copy of. Everything the surface
-   * draws derives from this, so the renderer scales itself by this over the
-   * size the layout is authored at. See {@link COMPANION_SIZE_BOXES}.
+   * Optional, and absence means a shell that predates the docks, which the
+   * renderer reads as `bottom`: the one edge every shell has ever put the bar
+   * on.
+   */
+  dock?: CompanionDock;
+  /**
+   * The edge a call's drag would drop the bar on if the hand let go now, or
+   * absent while no such drag is in flight.
+   *
+   * Set for the length of the drag and cleared on the release, so the window
+   * that shows the four edges as places to drop on knows which one to light.
+   * Absent rather than `null` outside a drag, for the reason `dock` is
+   * optional: a shell that has never heard of docks pushes the same shape as
+   * one between drags.
+   */
+  docking?: CompanionDock;
+  /**
+   * The avatar's box in points, which is the creature's whole scale.
+   *
+   * Numbers rather than the named sizes, because a name is a lookup both sides
+   * would then have to hold the same copy of. See {@link companionBoxFor}, and
+   * {@link COMPANION_SIZE_AXES} for why there are two of them.
    */
   avatarBox: number;
   /**
-   * The assistant's display name, for the composer's placeholder.
+   * The pill's box in points, which is the scale of everything that is not the
+   * creature: the pill, the call's body and the introduction.
+   *
+   * The renderer draws the surface at this over the size its layout is authored
+   * at and scales the creature inside that by the ratio between the two boxes,
+   * so every length beside the avatar stays stated once, at the base size.
+   *
+   * Optional, and absence means a shell that predates the second axis, which
+   * the renderer reads as {@link CompanionSurfaceState.avatarBox}.
+   */
+  optionsBox?: number;
+  /**
+   * The assistant's display name, for the introduction's first beat.
    *
    * Empty until the app's window publishes one, which the surface reads as
-   * "not known yet" and covers with its own fallback wording.
+   * "not known yet" and introduces the creature without a name.
    */
   assistantName: string;
-  /**
-   * The tail of the conversation the surface belongs to, most recent last, or
-   * empty when there is none to show.
-   *
-   * Published by the renderer that owns the conversation and held here for the
-   * same reason the session is: the surface's own renderer can reload, and a
-   * card that came back blank would read as the conversation having been lost.
-   * It is what lets an exchange started from Type be read without going back to
-   * the app at all.
-   */
-  turns: CompanionTurn[];
   /**
    * Whether a turn is in flight, as the window holding it last reported.
    *
@@ -1023,6 +2451,17 @@ export interface CompanionSurfaceState {
    * Optional, and absence means there is nothing to draw.
    */
   watchRetro?: CompanionWatchRetro;
+  /** Vellum's version of a dictation another app pasted, while offered. */
+  dictationOffer?: CompanionDictationOffer;
+  /**
+   * What the assistant is putting in front of the user beside the surface,
+   * while something is. See {@link CompanionPopover}.
+   */
+  popover?: CompanionPopover;
+  /** Whether the call bar's voice chevron has a catalog to open. */
+  voicesPickable?: boolean;
+  /** How the popover is being shown, while there is one. */
+  popoverView?: CompanionPopoverView;
 
   /**
    * How many screen reads the running session has taken, from the window that
@@ -1038,6 +2477,108 @@ export interface CompanionSurfaceState {
    * {@link CompanionSurfaceState.watching} makes with absence.
    */
   captureCount?: number;
+  /**
+   * What the running session is reading, as the window that owns it reported.
+   * See {@link CompanionContext.captureTarget}. Absent is the whole screen.
+   */
+  captureTarget?: WatchCaptureTarget;
+  /**
+   * Whether a press of Teach may offer a choice of what to read. See
+   * {@link CompanionContext.watchTargets}. Read it as `watchTargets === true`,
+   * the way `watching` is read: a shell or a window that never said is one
+   * whose sessions read the whole screen.
+   */
+  watchTargets?: boolean;
+  /**
+   * See {@link CompanionContext.screenShare}. Absent is nothing shared, on
+   * every shell including one that predates the field.
+   */
+  screenShare?: WatchCaptureTarget;
+  /**
+   * See {@link CompanionContext.screenShareEnabled}. Read it as
+   * `screenShareEnabled === true`, for the reason `watchTargets` is read that
+   * way: the control this decides starts capturing the user's screen.
+   */
+  screenShareEnabled?: boolean;
+  /**
+   * Whether the frame around the shared surface is taking the mouse, so the
+   * user can draw on what they are showing.
+   *
+   * The one thing on this state main owns outright rather than passes on. It
+   * is a fact about a window main opened and main makes click-through, and
+   * the two windows that read it read it for opposite reasons: the frame
+   * because it is the one drawing, and the pill because it draws the control
+   * that turned it on. A mode either of them kept for itself would be a mode
+   * the other could disagree with.
+   *
+   * Never on without a share, and lowered by main when one ends: a screen
+   * that has stopped being shown is a screen the user's clicks belong to.
+   *
+   * Read it as `annotating === true`, for the reason `watching` is read that
+   * way: a shell that predates the field is one whose frame takes no mouse,
+   * and a control drawn held down over a frame that is not would be a lie
+   * about where the next click goes.
+   */
+  annotating?: boolean;
+  /**
+   * What a press on the frame draws while `annotating`: the pointer's path or
+   * one of the shapes. See {@link CompanionAnnotationTool}.
+   *
+   * Main's, alongside `annotating` and for the same reason: the pill is where
+   * it is chosen and the frame is where it is drawn with, and the two are
+   * different windows. Kept across the mode going off and on, so the tool a
+   * user reached for is the one under their hand next time. Absent on a shell
+   * that predates it, which reads as freehand, the one tool that shell had.
+   */
+  annotationTool?: CompanionAnnotationTool;
+
+  /**
+   * How many times the user has cleared the shared surface from the pill.
+   *
+   * A running count rather than an event, the way `captureCount` is. The
+   * frame's drawing layer holds the user's own ink and main never sees it,
+   * so a press on the pill reaches that ink only on the state everything
+   * else reaches it on. A step in the number is one clear. The value a
+   * window mounts with is history, since main replays its state into a
+   * window it has just opened, and a layer that dropped its ink on the
+   * replay would be clearing for a press made before it existed.
+   *
+   * The assistant's marks need no such signal: main holds those and takes
+   * them down itself. Absent on a shell that predates the control, which
+   * reads as no clears yet.
+   */
+  marksCleared?: number;
+
+  /**
+   * What the assistant is pointing at on the shared surface, drawn on the
+   * frame around it. See {@link CompanionCoachmark}.
+   *
+   * Main's rather than the app window's, in the sense that main decides
+   * whether any of them stand: the coordinates are fractions of the surface
+   * the frame is drawn around, so a mark only means anything while the frame
+   * is around the surface the marks were resolved against. Main takes them
+   * down when it is not.
+   *
+   * Optional, and absence means nothing is being pointed at. An empty array
+   * never travels: a shell with nothing to draw says nothing.
+   */
+  coachmarks?: readonly CompanionCoachmark[];
+
+  /**
+   * How far below the top of the framed surface anything the frame draws
+   * there has to start, in the frame window's own pixels, to be seen.
+   *
+   * Main's, because it is a fact about where main put the window: a whole
+   * display is framed to its full bounds so the edge is the screen's, and the
+   * menu bar draws over the top of that window. A label placed against the
+   * edge would sit under the bar. This is the bar's height, read from the
+   * gap between the display's bounds and its work area.
+   *
+   * Absent for a window frame, whose top edge is the window's own title bar
+   * and inside the frame, and absent when nothing is framed. A shell that
+   * predates the field reads as no inset, which is the frame as it was.
+   */
+  frameInsetTop?: number;
 
   /**
    * Whether Watch is offered at all, as the flag was last evaluated for the
@@ -1064,6 +2605,14 @@ export interface CompanionSurfaceState {
    */
   character?: CompanionCharacter;
   /**
+   * The avatar's accent as `#rrggbb`: the colour the resting capsule and the
+   * display's edge glow light in. Carried apart from `character` because an
+   * uploaded image has an accent and no traits. `undefined` when the avatar
+   * has no colour yet, or on a shell that predates the field, where the
+   * surface falls back to the character's palette colour.
+   */
+  accentHex?: string;
+  /**
    * The live-voice session the surface is showing, or `null` when none is
    * running.
    *
@@ -1073,6 +2622,21 @@ export interface CompanionSurfaceState {
    * that only shows itself on hover is a live microphone the user cannot see.
    */
   call: VoiceActivityState | null;
+  /**
+   * Whether Talk has been pressed and no session has answered it yet.
+   *
+   * The press leaves the surface at once and the session it asks for opens in
+   * the app's window, behind whatever the user is working in, after a network
+   * round trip. Without this the pill draws nothing across that wait, and a
+   * press that changes nothing on screen reads as a press that did nothing.
+   * Main sets it on the press and clears it when the session's `start`
+   * arrives, when the window asked declines by sending `end` with no session
+   * running, when the user ends the dial from the pill, or after a bound.
+   *
+   * Optional, and absence means not dialing, the bargain
+   * {@link CompanionSurfaceState.watching} makes with absence.
+   */
+  dialing?: boolean;
   /**
    * The assistant's avatar as a base64 PNG, or `undefined` when there is none.
    *

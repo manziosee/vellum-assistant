@@ -4,13 +4,13 @@ import { type ReactNode, useEffect, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { AddCreditsModal } from "@/components/add-credits-modal";
+import { ReferralModal } from "@/components/referral-modal";
 import { AutoTopUpCard } from "@/domains/settings/components/auto-top-up-card";
 import {
   organizationsBillingSummaryRetrieveOptions,
   organizationsBillingSummaryRetrieveQueryKey,
   useOrganizationsBillingSummaryCreateMutation,
 } from "@/generated/api/@tanstack/react-query.gen";
-import { useObscureCredits } from "@/hooks/use-obscure-credits-flag";
 import { displayedCreditsUsd } from "@/lib/billing/displayed-credits";
 import { Button } from "@vellumai/design-library/components/button";
 import { Card } from "@vellumai/design-library/components/card";
@@ -24,7 +24,6 @@ import {
   DailyCreditLimitCard,
 } from "./daily-credit-limit-card";
 import { LowBalanceAlertCard } from "./low-balance-alert-card";
-import { ReferralModal } from "./referral-modal";
 
 export const BOOTSTRAP_MAX_RETRIES = 3;
 export const BOOTSTRAP_RETRY_DELAY_MS = 2000;
@@ -48,7 +47,6 @@ function formatCreditsShort(value: string): string {
 export function BillingPanel() {
   const { t } = useTranslation("settings");
   const queryClient = useQueryClient();
-  const obscureCredits = useObscureCredits();
 
   const { data, isLoading, isError } = useQuery(
     organizationsBillingSummaryRetrieveOptions(),
@@ -140,10 +138,9 @@ export function BillingPanel() {
     if (!summary) {
       return null;
     }
-    // Under the flag the tile names only the credit bought or earned on top
-    // of the usage grants; the bar on the Plan tile measures those.
+    // The tile names only the credit bought or earned on top of the usage
+    // grants; the bar on the Plan tile measures those.
     const shown = displayedCreditsUsd(
-      obscureCredits,
       summary.effective_balance,
       summary.available_usage_balance,
     );
@@ -209,11 +206,11 @@ export function BillingPanel() {
         </div>
         <div
           id={DAILY_CREDIT_LIMIT_ANCHOR_ID}
-          className="mt-6 scroll-mt-4 border-t border-[var(--border-base)] pt-6"
+          className="mt-6 scroll-mt-4 border-t border-[var(--border-subtle)] pt-6"
         >
           <DailyCreditLimitCard />
         </div>
-        <div className="mt-6 border-t border-[var(--border-base)] pt-6">
+        <div className="mt-6 border-t border-[var(--border-subtle)] pt-6">
           <div className="flex flex-col gap-4">
             <Toggle
               checked={lowBalanceExpanded}

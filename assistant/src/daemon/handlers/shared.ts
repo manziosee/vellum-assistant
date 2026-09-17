@@ -15,8 +15,13 @@ import { ConfirmationDecisionSchema } from "../../api/responses/conversation-mes
 import { getConfig } from "../../config/loader.js";
 import type { LLMCallSite, Speed } from "../../config/schemas/llm.js";
 import { ipcCall as gatewayIpcCall } from "../../ipc/gateway-client.js";
+import type { ProviderMessageMetadata } from "../../messaging/provider-message-metadata.js";
 import type { SecretPromptResult } from "../../permissions/secret-prompt-types.js";
 import type { ConversationCreateType } from "../../persistence/conversation-types.js";
+import {
+  isPrivateAssistantText,
+  projectUserFacingContent,
+} from "../../persistence/user-facing-content.js";
 import { resolveMediaSourceData } from "../../providers/media-resolve.js";
 import { isPlaceholderSentinelText } from "../../providers/placeholder-sentinels.js";
 import type { MediaSource } from "../../providers/types.js";
@@ -27,6 +32,7 @@ import { unwrapExternalContentForDisplay } from "../../security/untrusted-conten
 import type { CredentialInjectionTemplate } from "../../tools/credentials/policy-types.js";
 import { getLogger } from "../../util/logger.js";
 import { joinWithSpacing } from "../../util/text-spacing.js";
+import { safeStringSlice } from "../../util/unicode.js";
 import { estimateBase64Bytes } from "../assistant-attachments.js";
 import { conversationSupportsDynamicUi } from "../channel-ui-capability.js";
 import { findConversation } from "../conversation-registry.js";
@@ -224,6 +230,14 @@ export interface ConversationCreateOptions {
    */
   slackInbound?: SlackInboundMessageMetadata;
   /**
+   * Neutral per-row channel envelope captured at the channel ingress
+   * boundary, the non-Slack counterpart of `slackInbound`. When present (and
+   * the turn channel matches its `source`), persistence writes it as the
+   * message's `providerMeta` metadata key so the stored row can say which
+   * external message it is, in which thread, from whom.
+   */
+  channelInbound?: ProviderMessageMetadata;
+  /**
    * Conversation type for newly created conversations. When omitted,
    * defaults to `"standard"` (visible in the sidebar). Set to
    * `"background"` for plugin-driven conversations that should not
@@ -251,7 +265,7 @@ function clampAttachmentText(text: string): string {
   if (text.length <= HISTORY_ATTACHMENT_TEXT_LIMIT) {
     return text;
   }
-  return `${text.slice(0, HISTORY_ATTACHMENT_TEXT_LIMIT)}<truncated />`;
+  return `${safeStringSlice(text, 0, HISTORY_ATTACHMENT_TEXT_LIMIT)}<truncated />`;
 }
 
 interface FileBlockMetadata {
@@ -349,13 +363,30 @@ function renderFileBlockForHistory(
   )}`;
 }
 
+/**
+ * @param metadata The row's stored `messages.metadata` (raw JSON string or the
+ * parsed record). Only used to read the row's own
+ * `assistantTextVisibility` marker: a row a `send_user_message` turn wrote
+ * renders its plain text as working notes and its tool calls as the reply.
+ * Omit it for content that is not a persisted assistant row.
+ */
 export function renderHistoryContent(
-  content: unknown,
+  rawContent: unknown,
   attachmentBlocks?: ReadonlyArray<
     ConversationMessageAttachment | null | undefined
   >,
   messageId?: string,
+  metadata?: unknown,
 ): RenderedHistoryContent {
+  // A row whose turn routed its reply through `send_user_message` carries
+  // private working notes, so every consumer of this render (web history,
+  // channel delivery, the CLI) walks the projected content rather than the
+  // model-native blocks. Keyed on the row's own marker, so a row from a call,
+  // a subagent, a fallback turn, or any turn written with the flag off is
+  // untouched.
+  const content = projectUserFacingContent(rawContent, {
+    toolGated: isPrivateAssistantText(metadata),
+  });
   if (!Array.isArray(content)) {
     let text: string;
     if (content == null) {

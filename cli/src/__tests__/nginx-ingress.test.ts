@@ -72,7 +72,9 @@ import {
   hasIpv6Loopback,
   buildRemoteWebIndexHtml,
   cloudWebHubUrl,
+  MAX_PRESERVED_MODULE_PRELOADS,
   ensureTunnelEdge,
+  EDGE_TEMPLATE_VERSION,
   startRemoteWebIngress,
   stopContainerTunnelEdge,
   stopIngressNginx,
@@ -264,6 +266,56 @@ describe("buildIngressNginxConfig", () => {
     expect(remoteConf).toContain("location / {\n      return 404;\n    }");
   });
 
+  test("compresses text asset types", () => {
+    expect(remoteConf).toContain(
+      "gzip_types application/javascript application/json application/wasm image/svg+xml text/css text/plain;",
+    );
+  });
+
+  test("compresses only the static SPA surface, never a proxied response", () => {
+    // Compression is opt-in per location: this server also proxies
+    // authenticated /v1 and /webhooks traffic, and a compressed response
+    // carrying both a secret and attacker-influenced content over TLS is the
+    // BREACH side channel. The tuning at http scope stays inert.
+    expect(remoteConf).not.toMatch(/^ {2}gzip on;$/m);
+    const blocks = locationBlocks(remoteConf);
+    expect(
+      blocks
+        .filter((b) => b.body.includes("gzip on;"))
+        .map((b) => b.matcher)
+        .sort(),
+    ).toEqual([
+      "= /assistant/__remote-index.html",
+      "^~ /assistant/",
+      "^~ /assistant/assets/",
+    ]);
+    expect(
+      blocks
+        .filter(
+          (b) => b.body.includes("proxy_pass") && b.body.includes("gzip on;"),
+        )
+        .map((b) => b.matcher),
+    ).toEqual([]);
+  });
+
+  test("revalidates the shell and forbids storing only the inline config", () => {
+    const blocks = locationBlocks(remoteConf);
+    const cacheControlOf = (matcher: string) =>
+      blocks
+        .find((b) => b.matcher === matcher)
+        ?.body.match(/add_header Cache-Control "([^"]+)"/)?.[1];
+    expect(cacheControlOf("= /assistant/__remote-index.html")).toBe("no-cache");
+    expect(cacheControlOf("^~ /assistant/")).toBe("no-cache");
+    expect(cacheControlOf("^~ /assistant/assets/")).toBe(
+      "public, max-age=31536000, immutable",
+    );
+    // Only the inline __config return, which nginx gives no validator, still
+    // refuses storage. A second no-store means a revalidating location
+    // regressed to re-sending its whole body on every load.
+    expect(cacheControlOf("= /assistant/__config")).toBe("no-store");
+    expect(remoteConf.match(/no-store/g)).toHaveLength(1);
+  });
+
   test("serves remote web config for the SPA", () => {
     expect(remoteConf).toContain("location = /assistant/__config {");
     expect(remoteConf).toContain("default_type application/json;");
@@ -411,22 +463,61 @@ describe("buildRemoteWebIndexHtml", () => {
     expect(result).toContain("\\u003c/script\\u003e");
   });
 
-  test("drops modulepreload hints but keeps the entry script and stylesheet", () => {
+  test("keeps the consolidated boot graph's modulepreload hints", () => {
     const html = [
       "<html><head>",
       '<link rel="modulepreload" crossorigin href="/assistant/assets/a-1.js">',
       '<link rel="modulepreload" crossorigin href="/assistant/assets/b-2.js">',
-      '<link rel="stylesheet" crossorigin href="/assistant/assets/main-3.css">',
-      '<script type="module" crossorigin src="/assistant/assets/index-4.js"></script>',
+      '<link rel="modulepreload" crossorigin href="/assistant/assets/c-3.js">',
+      '<link rel="modulepreload" crossorigin href="/assistant/assets/d-4.js">',
+      '<link rel="stylesheet" crossorigin href="/assistant/assets/main-5.css">',
+      '<script type="module" crossorigin src="/assistant/assets/index-6.js"></script>',
+      "</head><body></body></html>",
+    ].join("\n");
+
+    const result = buildRemoteWebIndexHtml(html, { mode: "remote-gateway" });
+
+    expect(result.match(/rel="modulepreload"/g)).toHaveLength(4);
+    expect(result).toContain('href="/assistant/assets/a-1.js"');
+    expect(result).toContain('href="/assistant/assets/main-5.css"');
+    expect(result).toContain('src="/assistant/assets/index-6.js"');
+  });
+
+  test("strips a whole-graph preload set past the threshold, keeping entry and stylesheet", () => {
+    const preloads = Array.from(
+      { length: MAX_PRESERVED_MODULE_PRELOADS + 1 },
+      (_, i) =>
+        `<link rel="modulepreload" crossorigin href="/assistant/assets/chunk-${i}.js">`,
+    );
+    const html = [
+      "<html><head>",
+      ...preloads,
+      '<link rel="stylesheet" crossorigin href="/assistant/assets/main-x.css">',
+      '<script type="module" crossorigin src="/assistant/assets/index-y.js"></script>',
       "</head><body></body></html>",
     ].join("\n");
 
     const result = buildRemoteWebIndexHtml(html, { mode: "remote-gateway" });
 
     expect(result).not.toContain("modulepreload");
-    expect(result).not.toContain("/assistant/assets/a-1.js");
-    expect(result).toContain('href="/assistant/assets/main-3.css"');
-    expect(result).toContain('src="/assistant/assets/index-4.js"');
+    expect(result).not.toContain("/assistant/assets/chunk-0.js");
+    expect(result).toContain('href="/assistant/assets/main-x.css"');
+    expect(result).toContain('src="/assistant/assets/index-y.js"');
+  });
+
+  test("keeps exactly the threshold count of hints", () => {
+    const preloads = Array.from(
+      { length: MAX_PRESERVED_MODULE_PRELOADS },
+      (_, i) =>
+        `<link rel="modulepreload" crossorigin href="/assistant/assets/chunk-${i}.js">`,
+    );
+    const html = `<html><head>${preloads.join("\n")}</head><body></body></html>`;
+
+    const result = buildRemoteWebIndexHtml(html, { mode: "remote-gateway" });
+
+    expect(result.match(/rel="modulepreload"/g)).toHaveLength(
+      MAX_PRESERVED_MODULE_PRELOADS,
+    );
   });
 });
 
@@ -734,13 +825,37 @@ function mockUnkillableNginx(pid: number): void {
   installKillMock();
 }
 
+/**
+ * The multi-line `location <matcher> { ... }` blocks of a generated config,
+ * so a test can assert what a location does rather than how its lines are
+ * ordered. Single-line denylist locations carry no directives worth reading
+ * and are skipped by the trailing-brace match.
+ */
+function locationBlocks(
+  conf: string,
+): Array<{ matcher: string; body: string }> {
+  const blocks: Array<{ matcher: string; body: string }> = [];
+  const opener = /^ {4}location ([^{]+?) \{$/gm;
+  let match: RegExpExecArray | null;
+  while ((match = opener.exec(conf)) !== null) {
+    const end = conf.indexOf("\n    }", opener.lastIndex);
+    blocks.push({
+      matcher: match[1],
+      body: conf.slice(opener.lastIndex, end === -1 ? undefined : end),
+    });
+  }
+  return blocks;
+}
+
 const PRODUCTION_HUB_URL = "https://www.vellum.ai/assistant";
 
 /**
  * Mirror of the SPA config fingerprint the edge records in its ingress state
  * (sha256 over the edge template version and the injected config JSON). Pins
  * both the injected config shape and the hash format; assumes the
- * production-pinned environment. `template` tracks `EDGE_TEMPLATE_VERSION`.
+ * production-pinned environment. The version itself is imported rather than
+ * mirrored: bumping it is the correct response to any template edit, so a
+ * copy here would fail every such edit without naming a defect.
  */
 function spaConfigHash(
   opts: { assistantName?: string; assistantId?: string } = {},
@@ -748,7 +863,7 @@ function spaConfigHash(
   return createHash("sha256")
     .update(
       JSON.stringify({
-        template: 5,
+        template: EDGE_TEMPLATE_VERSION,
         config: {
           mode: "remote-gateway",
           apiBaseUrl: "/v1",

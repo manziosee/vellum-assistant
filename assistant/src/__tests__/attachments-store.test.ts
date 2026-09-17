@@ -3,6 +3,10 @@ import { join } from "node:path";
 import { beforeEach, describe, expect, test } from "bun:test";
 
 import {
+  offloadOversizedText,
+  OVERSIZED_CONTENT_FILENAME_PREFIX,
+} from "../daemon/port-oversized-content.js";
+import {
   attachInlineAttachmentToMessage,
   AttachmentUploadError,
   createInlineAttachment,
@@ -16,12 +20,14 @@ import {
   isValidBase64,
   linkAttachmentToMessage,
   MAX_UPLOAD_BYTES,
+  resolveAttachmentsForPersist,
   uploadAttachment,
   validateAttachmentUpload,
 } from "../persistence/attachments-store.js";
 import {
   addMessage,
   createConversation,
+  deleteMessageById,
 } from "../persistence/conversation-crud.js";
 import { getConversationDirPath } from "../persistence/conversation-disk-view.js";
 import { getDb } from "../persistence/db-connection.js";
@@ -454,6 +460,29 @@ describe("createInlineAttachment (workspace_ref persistence)", () => {
       stored.id,
     ]);
   });
+
+  test("offloadOversizedText writes the original bytes next to the conversation", async () => {
+    const conv = createConversation();
+    const original = "x".repeat(32);
+    const result = await offloadOversizedText(
+      original,
+      {
+        conversationId: conv.id,
+        conversationCreatedAt: conv.createdAt,
+      },
+      16,
+    );
+
+    expect(result.attachmentId).toBeDefined();
+    const filePath = getFilePathForAttachment(result.attachmentId!);
+    expect(filePath).toBeTruthy();
+    expect(result.filename).toBeDefined();
+    expect(filePath!.endsWith(result.filename!)).toBe(true);
+    expect(
+      result.filename!.startsWith(`${OVERSIZED_CONTENT_FILENAME_PREFIX}-`),
+    ).toBe(true);
+    expect(readFileSync(filePath!).toString("utf8")).toBe(original);
+  });
 });
 
 describe("attachInlineAttachmentToMessage filename collisions", () => {
@@ -569,6 +598,25 @@ describe("linkAttachmentToMessage + getAttachmentsForMessage", () => {
     expect(linked[1].originalFilename).toBe("second.txt");
   });
 
+  test("reuses a repeated message attachment link with its original position", async () => {
+    const conv = createConversation();
+    const msg = await addMessage(conv.id, "assistant", "One file");
+    const stored = await uploadAttachment("frame.png", "image/png", "AAAA");
+
+    expect(linkAttachmentToMessage(msg.id, stored.id, 4)).toBe(stored.id);
+    expect(linkAttachmentToMessage(msg.id, stored.id, 0)).toBe(stored.id);
+
+    const links = rawGet<{ count: number; position: number }>(
+      "test:repeatedAttachmentLink",
+      `SELECT COUNT(*) AS count, MIN(position) AS position
+       FROM message_attachments
+       WHERE message_id = ? AND attachment_id = ?`,
+      msg.id,
+      stored.id,
+    );
+    expect(links).toEqual({ count: 1, position: 4 });
+  });
+
   test("returns empty for message with no attachments", async () => {
     const conv = createConversation();
     const msg = await addMessage(conv.id, "assistant", "No attachments");
@@ -676,6 +724,115 @@ describe("deleteOrphanAttachments", () => {
 });
 
 // ---------------------------------------------------------------------------
+// resolveAttachmentsForPersist
+// ---------------------------------------------------------------------------
+
+describe("resolveAttachmentsForPersist", () => {
+  beforeEach(resetTables);
+
+  // One implementation behind every send path that turns ids into a persisted
+  // user message (HTTP send, processMessage, the voice bridge), so its shape is
+  // pinned here rather than at each caller.
+  test("hydrates ids into the shape a persisted message stores", async () => {
+    const stored = await uploadAttachment("photo.png", "image/png", "ZnJhbWU=");
+
+    expect(resolveAttachmentsForPersist([stored.id])).toEqual([
+      {
+        id: stored.id,
+        filename: "photo.png",
+        mimeType: "image/png",
+        data: "ZnJhbWU=",
+      },
+    ]);
+  });
+
+  test("carries the source path only for attachments that have one", async () => {
+    const withPath = await uploadAttachment(
+      "from-disk.txt",
+      "text/plain",
+      "AA==",
+    );
+    const plain = await uploadAttachment("typed.txt", "text/plain", "BB==");
+    rawRun(
+      "test:setSourcePath",
+      "UPDATE attachments SET source_path = ? WHERE id = ?",
+      "/tmp/from-disk.txt",
+      withPath.id,
+    );
+
+    const resolved = resolveAttachmentsForPersist([withPath.id, plain.id]);
+
+    expect(resolved[0]).toMatchObject({ filePath: "/tmp/from-disk.txt" });
+    expect(resolved[1]).not.toHaveProperty("filePath");
+  });
+
+  test("drops ids with no attachment row", async () => {
+    const stored = await uploadAttachment("kept.txt", "text/plain", "AA==");
+
+    const resolved = resolveAttachmentsForPersist([stored.id, "att-missing"]);
+
+    expect(resolved.map((a) => a.id)).toEqual([stored.id]);
+  });
+
+  test("returns nothing for an empty id list", () => {
+    expect(resolveAttachmentsForPersist([])).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// deleteMessageById orphan cleanup
+// ---------------------------------------------------------------------------
+
+describe("deleteMessageById attachment cleanup", () => {
+  beforeEach(resetTables);
+
+  test("collects an attachment the deleted message alone referenced", async () => {
+    const conv = createConversation();
+    const msg = await addMessage(conv.id, "user", "With attachment");
+    const stored = await uploadAttachment("shot.txt", "text/plain", "ZGF0YQ==");
+    linkAttachmentToMessage(msg.id, stored.id, 0);
+    const filePath = getFilePathForAttachment(stored.id);
+
+    deleteMessageById(msg.id);
+
+    expect(getAttachmentById(stored.id)).toBeNull();
+    expect(existsSync(filePath!)).toBe(false);
+  });
+
+  test("retained ids survive the delete, row and bytes", async () => {
+    // A caller rolling a message back rather than deleting it: the attachment
+    // returns to the uploaded-but-unlinked state every attachment sits in
+    // between upload and send, so a later message can still reference it.
+    const conv = createConversation();
+    const msg = await addMessage(conv.id, "user", "Rolled back");
+    const stored = await uploadAttachment("shot.txt", "text/plain", "ZGF0YQ==");
+    linkAttachmentToMessage(msg.id, stored.id, 0);
+    const filePath = getFilePathForAttachment(stored.id);
+
+    deleteMessageById(msg.id, { retainAttachmentIds: [stored.id] });
+
+    expect(getAttachmentById(stored.id)).not.toBeNull();
+    expect(existsSync(filePath!)).toBe(true);
+    // The row is gone even though its attachment stayed.
+    expect(getAttachmentsForMessage(msg.id)).toHaveLength(0);
+  });
+
+  test("retaining one id does not spare the others on the row", async () => {
+    const conv = createConversation();
+    const msg = await addMessage(conv.id, "user", "Two attachments");
+    const kept = await uploadAttachment("kept.txt", "text/plain", "AAAA");
+    const dropped = await uploadAttachment("dropped.txt", "text/plain", "BBBB");
+    linkAttachmentToMessage(msg.id, kept.id, 0);
+    linkAttachmentToMessage(msg.id, dropped.id, 1);
+
+    deleteMessageById(msg.id, { retainAttachmentIds: [kept.id] });
+
+    expect(getAttachmentById(kept.id)).not.toBeNull();
+    expect(getAttachmentById(dropped.id)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // validateAttachmentUpload
 // ---------------------------------------------------------------------------
 
@@ -735,9 +892,9 @@ describe("validateAttachmentUpload", () => {
   test("accepts shell scripts as text attachments", () => {
     expect(validateAttachmentUpload("script.sh", "text/plain").ok).toBe(true);
     expect(validateAttachmentUpload("script.SH", "text/plain").ok).toBe(true);
-    expect(
-      validateAttachmentUpload("setup.sh", "application/x-sh").ok,
-    ).toBe(true);
+    expect(validateAttachmentUpload("setup.sh", "application/x-sh").ok).toBe(
+      true,
+    );
     expect(
       validateAttachmentUpload("run.sh", "application/x-shellscript").ok,
     ).toBe(true);
@@ -760,9 +917,9 @@ describe("validateAttachmentUpload", () => {
     expect(
       validateAttachmentUpload("PROGRAM.EXE", "application/octet-stream").ok,
     ).toBe(false);
-    expect(validateAttachmentUpload("INSTALL.DMG", "application/octet-stream").ok).toBe(
-      false,
-    );
+    expect(
+      validateAttachmentUpload("INSTALL.DMG", "application/octet-stream").ok,
+    ).toBe(false);
   });
 
   test("rejects unsupported MIME types", () => {

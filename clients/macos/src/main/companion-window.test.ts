@@ -1,10 +1,30 @@
-import { beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { EventEmitter } from "node:events";
 
 import {
+  companionAnnotationInkSchema,
+  companionAnnotationStrokeSchema,
+  companionAnnotationToolSchema,
+  companionCoachmarkSchema,
+  COMPANION_COACHMARK_MAX,
+  COMPANION_BASE_AVATAR_BOX,
+  COMPANION_BASE_MAX_PILL_WIDTH,
+  COMPANION_BASE_RESTING_PILL_HEIGHT,
+  COMPANION_POPOVER_INSET,
+  VOICE_START_REQUEST_TTL_MS,
   COMPANION_SIZES,
+  companionLowerReachFor,
+  companionBoxFor,
+  companionCardSideFor,
+  companionNearEdgeFor,
+  companionScaleFor,
+  type CompanionDock,
+  type CompanionSize,
+  type CompanionSizeAxis,
   type CompanionSurfaceState,
   type VellumCommand,
 } from "@vellumai/ipc-contract";
+import { companionSizeSubmenus } from "@vellumai/electron-desktop/companion-menu";
 
 // The module under test reaches `main-window.ts` to hand Talk to the renderer
 // that owns the live-voice session, and that chain loads `electron-store`, a
@@ -38,6 +58,31 @@ let windowsRaised = 0;
 /** Whether the app's window exists, which is what decides between those two. */
 let mainWindowOpen = true;
 
+/** Whether the app's window is on screen, as opposed to put away or minimised. */
+let mainWindowVisible = true;
+
+/**
+ * Whether the surface's window exists. Closed by the tray and by the assistant
+ * going away, and opened again by the same two, so a case can open one over an
+ * app that is already in front. Reset before each case.
+ */
+let companionOpen = true;
+
+/**
+ * The app's window, as far as this module reads it: whether it exists and
+ * whether it is showing. One object, so a focus event can name it by identity.
+ */
+const mainWindow = {
+  isDestroyed: () => false,
+  isVisible: () => mainWindowVisible,
+};
+
+/** Where the canvas's origin is, which is what the window reports and moves. */
+let origin = { x: 0, y: 0 };
+
+/** Every bounds main has asked the window server for, most recent last. */
+const boundsSet: { x: number; y: number; width: number; height: number }[] = [];
+
 const surface = {
   webContents: {
     send: (_channel: string, state: CompanionSurfaceState) => {
@@ -47,11 +92,50 @@ const surface = {
   // The surface's own flag going away closes the window, which a case moving
   // the flags can reach. Nothing here has a window server behind it, so this
   // only has to be callable.
-  close: () => {},
+  close: () => {
+    companionOpen = false;
+  },
   on: () => {},
+  isDestroyed: () => false,
+  /** Whether it may become key, which a form on the bar lends it. */
+  focusable: false,
+  setFocusable: (focusable: boolean) => {
+    surface.focusable = focusable;
+  },
+  /** Whether it is key: `focus` makes it so, and nothing here resigns it. */
+  key: false,
+  focus: () => {
+    if (surface.focusable) {
+      surface.key = true;
+    }
+  },
+  /** Whether the surface is on screen: off it while the app is in front. */
+  visible: true,
+  hide: () => {
+    surface.visible = false;
+  },
+  showInactive: () => {
+    surface.visible = true;
+  },
+  getPosition: () => [origin.x, origin.y],
+  setPosition: (x: number, y: number) => {
+    origin = { x, y };
+  },
+  setBounds: (bounds: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  }) => {
+    boundsSet.push(bounds);
+    origin = { x: bounds.x, y: bounds.y };
+  },
 };
 
 type Invoker = (args: unknown[]) => unknown;
+
+/** The renderer behind IPC sends, including the lifecycle a running call owns. */
+const mainRenderer = new EventEmitter();
 
 /** Channel to handler, with the channel's schema applied the way `on` does. */
 const listeners = new Map<string, Invoker>();
@@ -62,25 +146,242 @@ const register =
   (
     channel: string,
     schema: { parse: (input: unknown) => unknown },
-    fn: (args: never) => unknown,
+    fn: (args: never, event: { sender: EventEmitter }) => unknown,
   ): void => {
-    into.set(channel, (args) => fn(schema.parse(args) as never));
+    into.set(channel, (args) =>
+      fn(schema.parse(args) as never, { sender: mainRenderer }),
+    );
   };
+
+/**
+ * The system's "Reduce motion", which decides whether a call moves the surface
+ * at once or glides it. On by default so every case about *where* the surface
+ * goes reads its answer synchronously; the cases about the glide itself turn
+ * it off.
+ */
+let reducedMotion = true;
+
+/**
+ * The display the window server answers for whatever point it is asked, the
+ * one the surface is placed against. Mutable so a case can change the display
+ * under a surface that is mid-move, as unplugging or rescaling one does.
+ */
+const NEAREST_DISPLAY = {
+  bounds: { x: 0, y: 0, width: 1440, height: 900 },
+  workArea: { x: 0, y: 0, width: 1440, height: 900 },
+};
+let nearestDisplay = NEAREST_DISPLAY;
+
+/** Main's application listeners, so a case can bring the app forward. */
+const appListeners: {
+  event: string;
+  listener: (...args: unknown[]) => void;
+}[] = [];
+
+/** Fire an application event main registered, as the OS would. */
+const fireAppEvent = (event: string, ...args: unknown[]): void => {
+  for (const entry of [...appListeners]) {
+    if (entry.event === event) {
+      entry.listener({}, ...args);
+    }
+  }
+};
 
 mock.module("electron", () => ({
   BrowserWindow: { getAllWindows: () => [] },
+  systemPreferences: {
+    getAnimationSettings: () => ({ prefersReducedMotion: reducedMotion }),
+  },
+  app: {
+    on: (event: string, listener: (...args: unknown[]) => void) => {
+      appListeners.push({ event, listener });
+    },
+  },
   // Stubbed for the same reason as the rest of this mock: the module under
   // test imports it, and an export missing from a whole-module mock fails the
   // file at load rather than in the case that uses it.
   Menu: { buildFromTemplate: () => ({ popup: () => undefined }) },
-  shell: { openExternal: () => Promise.resolve() },
+  // The pasteboard the offer's Copy writes to. Recorded rather than counted,
+  // since what a case has to be able to say is which words were taken.
+  clipboard: {
+    writeText: (text: string) => {
+      copied.push(text);
+    },
+  },
+  // The browser a popover's link opens in. Recorded, since what a case has
+  // to say is which links were let through.
+  shell: {
+    openExternal: (url: string) => {
+      opened.push(url);
+      return Promise.resolve();
+    },
+  },
   screen: {
     getCursorScreenPoint: () => ({ x: 0, y: 0 }),
-    getDisplayNearestPoint: () => ({
-      workArea: { x: 0, y: 0, width: 1440, height: 900 },
-    }),
-    on: () => undefined,
+    getDisplayNearestPoint: () => nearestDisplay,
+    getAllDisplays: () => displays,
+    getPrimaryDisplay: () => displays[0],
+    on: (event: string, listener: () => void) => {
+      screenListeners.push({ event, listener });
+    },
   },
+}));
+
+/** Every text main has put on the pasteboard, most recent last. */
+const copied: string[] = [];
+
+/** Every link main has opened in the browser, most recent last. */
+const opened: string[] = [];
+
+/** Main's display listeners, so a case can rearrange the displays. */
+const screenListeners: { event: string; listener: () => void }[] = [];
+
+/** Fire the display event main registered, as the window server would. */
+const fireDisplayEvent = (event: string): void => {
+  for (const entry of [...screenListeners]) {
+    if (entry.event === event) {
+      entry.listener();
+    }
+  }
+};
+
+/**
+ * The displays the window server has, by id, for a session framing one of
+ * them. Two by default, so a case can pick the one the surface is not on.
+ */
+let displays: {
+  id: number;
+  bounds: { x: number; y: number; width: number; height: number };
+  workArea: { x: number; y: number; width: number; height: number };
+}[] = [];
+
+/**
+ * Where the helper says a picked window is, or null when it is off screen.
+ * The frame polls this; a case sets it and lets the poll run.
+ */
+let windowBounds: {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+} | null = null;
+
+/** Every window id the frame has asked the helper about, most recent last. */
+const boundsAsked: number[] = [];
+
+/** What the picker's list resolves to, and what a pressed row resolves to. */
+const listedSources = {
+  displays: [
+    { kind: "display" as const, displayId: 1, index: 0, primary: true },
+  ],
+  tabs: [],
+  windows: [],
+};
+let resolvedPick:
+  | { kind: "display"; displayId: number }
+  | { kind: "window"; windowId: number }
+  | null = null;
+const picksResolved: unknown[] = [];
+
+// The desktop half of the picker asks a helper process, Chrome and the window
+// server, none of which exist here. What this file holds is what main does
+// with the answers: where it puts the frame, and what it dispatches.
+/** The resolution itself, swappable so a case can hold one open. */
+let resolvedPickAsync: (pick: unknown) => Promise<typeof resolvedPick> = async (
+  pick,
+) => {
+  picksResolved.push(pick);
+  return resolvedPick;
+};
+
+/** What the helper answers for a frame of a shared target, by the target. */
+const framesAsked: unknown[] = [];
+let capturedFrame: {
+  jpegBase64: string;
+  width: number;
+  height: number;
+} | null = { jpegBase64: "/9j/", width: 16, height: 9 };
+
+/** What the helper was asked to take a picker preview of. */
+const thumbnailsAsked: unknown[] = [];
+let capturedThumbnail: string | null = "data:image/jpeg;base64,/9j/";
+
+/**
+ * What the helper answers when a mark names a control, and every ask that
+ * reached it: a mark resolved through the tree is the path that replaces
+ * guessing at coordinates, so the queries matter as much as the answer.
+ */
+const locatesAsked: { target: unknown; query: string }[] = [];
+let located: unknown = {
+  found: true,
+  label: "Share",
+  role: "AXButton",
+  x: 120,
+  y: 80,
+  width: 60,
+  height: 20,
+};
+
+/**
+ * A lookup held open, so a case can decide what else happens while a name is
+ * still being resolved. Nothing when the answer comes back at once, which is
+ * every case that is not about that gap.
+ */
+let locateHeldBy: Promise<void> | null = null;
+
+mock.module("./companion-capture-sources", () => ({
+  listCaptureSources: async () => listedSources,
+  resolveCapturePick: (pick: unknown) => resolvedPickAsync(pick),
+  captureTargetFrame: async (
+    target: unknown,
+    onError?: (err: unknown) => void,
+  ) => {
+    framesAsked.push(target);
+    if (frameError !== null) {
+      onError?.(frameError);
+    }
+    return capturedFrame;
+  },
+  captureSourceThumbnail: async (target: unknown) => {
+    thumbnailsAsked.push(target);
+    return capturedThumbnail;
+  },
+  windowBoundsFor: async (windowId: number) => {
+    boundsAsked.push(windowId);
+    return windowBounds;
+  },
+  locateOnTarget: async (target: unknown, query: string) => {
+    locatesAsked.push({ target, query });
+    if (locateHeldBy !== null) {
+      await locateHeldBy;
+    }
+    return located;
+  },
+}));
+
+/** Whether the helper holds Screen Recording, as main reads it. */
+let screenGranted = true;
+/** What a frame was refused with, or null when frames come back. */
+let frameError: unknown = null;
+/** The refusal the permission module recognises as a missing grant. */
+const SCREEN_REFUSAL = new Error("Screen Recording permission denied");
+/** Every permission main sent the user to Settings for. */
+const settingsOpened: string[] = [];
+
+mock.module("./screen-recording-permission", () => ({
+  screenRecordingGranted: async () => screenGranted,
+  isScreenRecordingRefusal: (err: unknown) => err === SCREEN_REFUSAL,
+  answerScreenRecordingRefusal: async (ask: () => Promise<unknown>) => {
+    await ask();
+  },
+}));
+
+mock.module("./permissions-service", () => ({
+  getPermissionsService: () => ({
+    openSettings: async (kind: string) => {
+      settingsOpened.push(kind);
+    },
+  }),
 }));
 
 mock.module("./ipc", () => ({
@@ -92,10 +393,11 @@ mock.module("./ipc", () => ({
 const visibilityListeners: (() => void)[] = [];
 
 mock.module("./main-window", () => ({
-  // Only its existence is read: it is what decides whether a press is
-  // dispatched straight into a renderer or has to build one first, and
-  // whether a visibility change is the window being destroyed.
-  current: () => (mainWindowOpen ? {} : null),
+  // Its existence decides whether a press is dispatched straight into a
+  // renderer or has to build one first, and whether a visibility change is the
+  // window being destroyed; whether it is showing decides, with the app's
+  // activation, whether the surface is on the screen.
+  current: () => (mainWindowOpen ? mainWindow : null),
   dispatchToMain: (command: VellumCommand) => {
     dispatched.push(command);
   },
@@ -108,14 +410,175 @@ mock.module("./main-window", () => ({
   },
 }));
 
+/**
+ * The display's edge glow, which main opens for a watch session and closes
+ * after it. Kept apart from the surface so a push to both is two sends on two
+ * windows, and so a case can see the light come on and go out.
+ */
+type GlowWindow = {
+  bounds: { x: number; y: number; width: number; height: number };
+  closed: boolean;
+  level: [string, number] | null;
+  webContents: {
+    send: (channel: string, state: CompanionSurfaceState) => void;
+  };
+  getBounds: () => { x: number; y: number; width: number; height: number };
+  setBounds: (bounds: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  }) => void;
+  setAlwaysOnTop: (flag: boolean, level: string, relative: number) => void;
+  close: () => void;
+  isDestroyed: () => boolean;
+  on: () => void;
+  once: (event: string, listener: () => void) => void;
+  /** Whether the frame is on screen: hidden while its window is not. */
+  visible: boolean;
+  hide: () => void;
+  showInactive: () => void;
+  isVisible: () => boolean;
+  /** Whether presses go through it, which is the whole of drawing mode. */
+  clickThrough: boolean;
+  /**
+   * Whether mouse-move still reaches the page while presses go through,
+   * which is how the frame knows to take the mouse back after a scroll.
+   */
+  forwarded: boolean;
+  setIgnoreMouseEvents: (
+    ignore: boolean,
+    options?: { forward?: boolean },
+  ) => void;
+  /** Whether it may become key, which is what lets its cursor show. */
+  focusable: boolean;
+  setFocusable: (focusable: boolean) => void;
+  /** Whether it is key: `focus` makes it so, and nothing here resigns it. */
+  key: boolean;
+  focus: () => void;
+};
+let glow: GlowWindow | null = null;
+/**
+ * Every other window main has opened, by kind: the frame, and the edges a
+ * call's drag can drop the bar on. `glow` is the frame's own alias, since most
+ * cases about a second window are about that one.
+ */
+const others = new Map<string, GlowWindow>();
+const glowPushes: CompanionSurfaceState[] = [];
+/** The BrowserWindow options the frame was last opened with. */
+let glowOptions: Record<string, unknown> | undefined;
+
+const openGlow = (options: {
+  kind: string;
+  position?: { x: number; y: number } | (() => { x: number; y: number });
+  width: number;
+  height: number;
+  browserWindow?: Record<string, unknown>;
+}): GlowWindow => {
+  const frame = options.kind === "companion-watch-frame";
+  if (frame) {
+    glowOptions = options.browserWindow;
+  }
+  const at =
+    typeof options.position === "function"
+      ? options.position()
+      : (options.position ?? { x: 0, y: 0 });
+  const window: GlowWindow = {
+    bounds: { ...at, width: options.width, height: options.height },
+    closed: false,
+    level: null,
+    webContents: {
+      send: (_channel, state) => {
+        glowPushes.push(state);
+      },
+    },
+    getBounds: () => window.bounds,
+    setBounds: (bounds) => {
+      window.bounds = bounds;
+    },
+    setAlwaysOnTop: (_flag, level, relative) => {
+      window.level = [level, relative];
+    },
+    close: () => {
+      window.closed = true;
+      others.delete(options.kind);
+      if (frame) {
+        glow = null;
+      }
+    },
+    isDestroyed: () => false,
+    on: () => {},
+    // Painted at once: the real window's first paint is the renderer's.
+    once: (event, listener) => {
+      if (event === "ready-to-show") {
+        listener();
+      }
+    },
+    visible: true,
+    hide: () => {
+      window.visible = false;
+    },
+    showInactive: () => {
+      window.visible = true;
+    },
+    isVisible: () => window.visible,
+    // How main opens it, and where it goes back to whenever drawing is off.
+    clickThrough: true,
+    forwarded: false,
+    setIgnoreMouseEvents: (ignore, options) => {
+      window.clickThrough = ignore;
+      window.forwarded = ignore && options?.forward === true;
+    },
+    focusable: options.browserWindow?.focusable !== false,
+    setFocusable: (focusable) => {
+      window.focusable = focusable;
+    },
+    key: false,
+    focus: () => {
+      // The real one refuses a window that may not become key.
+      if (window.focusable) {
+        window.key = true;
+      }
+    },
+  };
+  others.set(options.kind, window);
+  if (frame) {
+    glow = window;
+  }
+  return window;
+};
+
+/** The edges a call's drag can drop the bar on, while a drag is in flight. */
+const zonesWindow = (): GlowWindow | null =>
+  others.get("companion-dock-zones") ?? null;
+
 mock.module("@vellumai/electron-desktop/floating-window", () => ({
-  createFloatingWindow: () => surface,
-  getFloatingWindow: () => surface,
+  createFloatingWindow: (options: {
+    kind: string;
+    width: number;
+    height: number;
+    position?: { x: number; y: number } | (() => { x: number; y: number });
+  }) => {
+    if (options.kind !== "companion") {
+      return openGlow(options);
+    }
+    // Shown on creation, the way the real one is.
+    companionOpen = true;
+    surface.visible = true;
+    return surface;
+  },
+  getFloatingWindow: (kind: string) =>
+    kind === "companion"
+      ? companionOpen
+        ? surface
+        : null
+      : (others.get(kind) ?? null),
 }));
 
 mock.module("@vellumai/electron-desktop/avatar", () => ({
   getAvatarPng: () => null,
   getCharacter: () => null,
+  getAccentHex: () => null,
   onAvatarChange: () => () => {},
 }));
 
@@ -138,10 +601,34 @@ mock.module("@vellumai/electron-desktop/settings", () => ({
   },
 }));
 
+/**
+ * The size the store holds for each axis.
+ *
+ * A record rather than one answer for both, because the two axes are read and
+ * written separately and a mock that ignored the axis would let a resize apply
+ * a pick to the wrong half of the surface without failing anything.
+ */
+const sizes: Record<CompanionSizeAxis, CompanionSize> = {
+  avatar: "small",
+  options: "small",
+};
+
+/**
+ * The edge the store holds for the call bar, which is what the next call reads
+ * and what a drop writes.
+ */
+let storedDock: CompanionDock = "bottom";
+
 mock.module("@vellumai/electron-desktop/window-state", () => ({
-  readCompanionSize: () => "small",
+  readCompanionSize: (axis: CompanionSizeAxis) => sizes[axis],
   readCompanionHidden: () => false,
-  writeCompanionSize: () => {},
+  writeCompanionSize: (axis: CompanionSizeAxis, size: CompanionSize) => {
+    sizes[axis] = size;
+  },
+  readCompanionCallDock: () => storedDock,
+  writeCompanionCallDock: (dock: CompanionDock) => {
+    storedDock = dock;
+  },
   writeCompanionHidden: () => {},
   // Stubbed rather than omitted, like every other export here: the module
   // under test imports these, and one missing from a whole-module mock is a
@@ -156,15 +643,86 @@ const {
   growthFor,
   cardGrowthFor,
   avatarOffsetFor,
+  companionContextMenuTemplate,
+  defaultAvatarCentre,
+  dockedAvatarCentre,
   geometryFor,
+  nearestDock,
   placeCanvas,
   callOnUpdate,
+  callSurfaceFor,
+  COMPANION_DIAL_TIMEOUT_MS,
+  COMPANION_GLIDE_MS,
+  dialOnTalk,
+  glideProgress,
   introOnAdvance,
+  resetCompanionSurfacePosition,
+  setCompanionSurfaceSize,
   shouldShowCompanionSurface,
+  showCompanionCoachmarks,
   installCompanionWindow,
+  shownPopover,
 } = await import("./companion-window");
 
+const { popoverBoundsFor, POPOVER_GAP } =
+  await import("./companion-popover-window");
+
+const {
+  __resetFrameScrollWatchForTesting,
+  frameScrollEnded,
+  provideFrameScrollWatch,
+} = await import("./frame-scroll-watch");
+
+const {
+  __resetCoachmarkPressWatchForTesting,
+  coachmarkPressed,
+  provideCoachmarkPressWatch,
+} = await import("./coachmark-press-watch");
+
 installCompanionWindow();
+
+/**
+ * The module holds the canvas it was last asked for, so a case that picks a
+ * size leaves it there. Put both axes back and forget the window's position.
+ */
+beforeEach(() => {
+  __resetFrameScrollWatchForTesting();
+  __resetCoachmarkPressWatchForTesting();
+  sizes.avatar = "small";
+  sizes.options = "small";
+  setCompanionSurfaceSize("avatar", "small");
+  origin = { x: 0, y: 0 };
+  nearestDisplay = NEAREST_DISPLAY;
+  boundsSet.length = 0;
+  glow = null;
+  others.clear();
+  glowPushes.length = 0;
+  displays = [
+    {
+      id: 1,
+      bounds: { x: 0, y: 0, width: 1440, height: 900 },
+      workArea: { x: 0, y: 0, width: 1440, height: 900 },
+    },
+    {
+      id: 2,
+      bounds: { x: 1440, y: 0, width: 1920, height: 1080 },
+      workArea: { x: 1440, y: 0, width: 1920, height: 1080 },
+    },
+  ];
+  windowBounds = null;
+  boundsAsked.length = 0;
+  copied.length = 0;
+  opened.length = 0;
+  resolvedPick = null;
+  picksResolved.length = 0;
+  // The user is working somewhere else, with the app's window open behind
+  // them: the state the surface exists for.
+  mainWindowOpen = true;
+  mainWindowVisible = true;
+  companionOpen = true;
+  fireAppEvent("did-resign-active");
+  surface.visible = true;
+});
 
 /** Put a set of evaluated flags in settings and tell main they changed. */
 const setFlags = (next: Record<string, boolean>): void => {
@@ -202,7 +760,6 @@ const state = (): CompanionSurfaceState => {
 /** A context as the app's window publishes one. */
 const context = (over: Record<string, unknown> = {}) => ({
   assistantName: "Ziggy",
-  turns: [],
   working: false,
   ...over,
 });
@@ -220,6 +777,27 @@ const START = {
 } as const;
 
 /**
+ * The size the placement cases are written against, which is the one the
+ * renderer's layout is authored at. Every other size is the same arithmetic
+ * scaled, which `geometryFor` has its own cases for.
+ */
+const GEOMETRY = geometryFor("small", "small");
+const RISE_ABOVE = GEOMETRY.riseAbove;
+const DROP_BELOW = GEOMETRY.dropBelow;
+
+/** A creature far larger than the controls beside it, and the reverse. */
+const BIG_CREATURE = geometryFor("huge", "small");
+const BIG_OPTIONS = geometryFor("small", "huge");
+
+/**
+ * The part of the base reach the geometry does not publish: the pill's widest,
+ * at the options size {@link GEOMETRY} is drawn in. Bound to the contract for
+ * the cases that are about it rather than the sum.
+ */
+const MAX_PILL_WIDTH =
+  COMPANION_BASE_MAX_PILL_WIDTH * companionScaleFor(GEOMETRY.optionsBox);
+
+/**
  * The growth direction is the only rule in the companion window worth testing
  * without a window server: everything else is Electron plumbing. It decides
  * which way the pill unfurls out of the avatar, and getting it wrong runs the
@@ -230,8 +808,10 @@ const START = {
 // cases readable.
 const DISPLAY = { x: 0, width: 1440 };
 
-// 360 - 44: the clearance the body needs on the side it grows into.
-const NEEDED = 316;
+// The clearance the pill needs on the side it grows into, measured from the
+// avatar's centre the way the room on each side is: the avatar's half box, the
+// gap, then the widest body.
+const NEEDED = GEOMETRY.maxReach;
 
 describe("growthFor", () => {
   test("grows rightward with room to the right", () => {
@@ -255,6 +835,33 @@ describe("growthFor", () => {
     expect(growthFor(DISPLAY.width - NEEDED + 1, DISPLAY, GEOMETRY)).toBe(
       "left",
     );
+  });
+
+  /**
+   * The gap and the avatar's half box are part of the clearance, not slack the
+   * pill can be squeezed into. A test measured against the body alone would
+   * pass with the pill's leading edge already off the display.
+   */
+  test("counts the gap and the half box as room the pill needs", () => {
+    expect(growthFor(DISPLAY.width - MAX_PILL_WIDTH, DISPLAY, GEOMETRY)).toBe(
+      "left",
+    );
+  });
+
+  /**
+   * The room is measured from the avatar's centre while the pill starts at the
+   * avatar's edge, so the half box is the difference between fitting and
+   * clipping. Room enough for the gap and the widest body still cuts the
+   * controls off.
+   */
+  test("flips when only the avatar's half box is missing on the right", () => {
+    expect(
+      growthFor(
+        DISPLAY.width - (NEEDED - GEOMETRY.avatarBox / 2),
+        DISPLAY,
+        GEOMETRY,
+      ),
+    ).toBe("left");
   });
 
   test("measures against the display's own origin, not the screen's", () => {
@@ -285,16 +892,6 @@ describe("growthFor", () => {
  * dragged back, because there is nothing left on screen to grab.
  */
 
-/**
- * The size the placement cases are written against, which is the one the
- * renderer's layout is authored at. Every other size is the same arithmetic
- * scaled, which `geometryFor` has its own cases for.
- */
-const GEOMETRY = geometryFor("small");
-const CANVAS_WIDTH = GEOMETRY.canvasWidth;
-const RISE_ABOVE = GEOMETRY.riseAbove;
-const DROP_BELOW = GEOMETRY.dropBelow;
-
 /** A 1440x900 display with the menu bar taken off the top. */
 const WORK_AREA = { x: 0, y: 25, width: 1440, height: 875 };
 
@@ -305,6 +902,40 @@ const centreOf = (
 ) => ({
   x: placed.origin.x + geometry.canvasWidth / 2,
   y: placed.origin.y + avatarOffsetFor(placed.cardGrowth, geometry),
+});
+
+describe("the room kept under the surface", () => {
+  /**
+   * The window is placed once and does not move when the pointer arrives or a
+   * call starts, so the room under it answers for every state it can enter
+   * from there. Each of the three is the lowest at some size.
+   */
+  test("clears the pill a pointer grows, not only the creature", () => {
+    const centre = defaultAvatarCentre(WORK_AREA, GEOMETRY);
+    const grownPill =
+      centre.y +
+      (COMPANION_BASE_RESTING_PILL_HEIGHT / 2) *
+        companionScaleFor(GEOMETRY.avatarBox);
+
+    expect(grownPill).toBeLessThanOrEqual(25 + 875);
+  });
+
+  test("clears the call's bar, which the options box sizes", () => {
+    for (const geometry of [GEOMETRY, BIG_OPTIONS]) {
+      const centre = defaultAvatarCentre(WORK_AREA, geometry);
+      expect(centre.y + geometry.optionsBox / 2).toBeLessThanOrEqual(25 + 875);
+    }
+  });
+
+  /** And a drag can put the surface no lower than the same rule allows. */
+  test("holds a drag to the same room", () => {
+    const dragged = centreOf(
+      placeCanvas({ x: 700, y: 9000 }, WORK_AREA, GEOMETRY),
+    );
+    expect(dragged.y).toBe(
+      900 - companionLowerReachFor(GEOMETRY.avatarBox, GEOMETRY.optionsBox),
+    );
+  });
 });
 
 describe("placeCanvas", () => {
@@ -329,10 +960,31 @@ describe("placeCanvas", () => {
     ).toBe(22);
   });
 
-  test("holds the avatar at the bottom edge rather than past it", () => {
+  /**
+   * The lowest thing the surface can draw lands on the edge, not its box. The
+   * box carries the glow and the bob's slack, and stopping short of the edge
+   * by however much of it is empty reads as the surface refusing to go where
+   * it is dragged. See `companionLowerReachFor` for what is measured instead.
+   */
+  test("holds the surface's lowest ink on the bottom edge", () => {
     expect(
       centreOf(placeCanvas({ x: 700, y: 9000 }, WORK_AREA, GEOMETRY)).y,
-    ).toBe(900 - 22);
+    ).toBe(
+      900 - companionLowerReachFor(GEOMETRY.avatarBox, GEOMETRY.optionsBox),
+    );
+  });
+
+  /** And the slack grows with the creature, so the rule has to be read per size. */
+  test("reads that bottom off the size the creature is drawn at", () => {
+    expect(
+      centreOf(
+        placeCanvas({ x: 700, y: 9000 }, WORK_AREA, BIG_CREATURE),
+        BIG_CREATURE,
+      ).y,
+    ).toBe(
+      900 -
+        companionLowerReachFor(BIG_CREATURE.avatarBox, BIG_CREATURE.optionsBox),
+    );
   });
 
   /**
@@ -341,9 +993,15 @@ describe("placeCanvas", () => {
    * corner is exactly where the surface is meant to rest.
    */
   test("lets the avatar reach the corner the surface opens in", () => {
+    const reach = companionLowerReachFor(
+      GEOMETRY.avatarBox,
+      GEOMETRY.optionsBox,
+    );
     expect(
-      centreOf(placeCanvas({ x: 1440 - 22, y: 900 - 22 }, WORK_AREA, GEOMETRY)),
-    ).toEqual({ x: 1440 - 22, y: 900 - 22 });
+      centreOf(
+        placeCanvas({ x: 1440 - 22, y: 900 - reach }, WORK_AREA, GEOMETRY),
+      ),
+    ).toEqual({ x: 1440 - 22, y: 900 - reach });
   });
 
   test("clamps against the display it is given, not the primary one", () => {
@@ -398,6 +1056,47 @@ describe("placeCanvas", () => {
   });
 });
 
+describe("defaultAvatarCentre", () => {
+  /**
+   * The margin is to the creature's visible bottom, so it is the same gap off
+   * the edge at every size rather than that gap plus the box's own slack.
+   */
+  test("opens a margin above the work area's bottom edge", () => {
+    const centre = defaultAvatarCentre(WORK_AREA, GEOMETRY);
+    expect(centre.x).toBe(720);
+    expect(centre.y).toBe(
+      25 +
+        875 -
+        2 -
+        companionLowerReachFor(GEOMETRY.avatarBox, GEOMETRY.optionsBox),
+    );
+  });
+
+  /**
+   * The gap a user actually sees, which is the whole point of measuring it
+   * this way: the same 8pt under a creature at any size.
+   */
+  test("leaves the same visible gap at every size", () => {
+    for (const geometry of [GEOMETRY, BIG_CREATURE, BIG_OPTIONS]) {
+      const centre = defaultAvatarCentre(WORK_AREA, geometry);
+      const visibleBottom =
+        centre.y +
+        companionLowerReachFor(geometry.avatarBox, geometry.optionsBox);
+      expect(25 + 875 - visibleBottom).toBe(2);
+    }
+  });
+
+  test("centres on the display it is given, not the primary one", () => {
+    const secondary = { x: 1440, y: 0, width: 2560, height: 1415 };
+    expect(defaultAvatarCentre(secondary, GEOMETRY).x).toBe(1440 + 1280);
+  });
+
+  test("lands where placeCanvas leaves it alone", () => {
+    const wanted = defaultAvatarCentre(WORK_AREA, GEOMETRY);
+    expect(centreOf(placeCanvas(wanted, WORK_AREA, GEOMETRY))).toEqual(wanted);
+  });
+});
+
 describe("cardGrowthFor", () => {
   test("grows up with room for the card above the avatar", () => {
     expect(cardGrowthFor(500, WORK_AREA, GEOMETRY)).toBe("up");
@@ -448,6 +1147,1128 @@ describe("avatarOffsetFor", () => {
   });
 });
 
+describe("the dial", () => {
+  test("starts on a press with no session on the surface", () => {
+    expect(dialOnTalk(null)).toBe(true);
+  });
+
+  /**
+   * The window that owns the session spends the press on the call the user is
+   * in, so nothing is coming that a dial could wait for.
+   */
+  test("does not start over a running session", () => {
+    expect(dialOnTalk({ ...START })).toBe(false);
+  });
+
+  /**
+   * A dial that closed while its request could still become a session would
+   * reopen on that session a moment later, so the bound outlives the request.
+   */
+  test("outlives the request it is drawn for", () => {
+    expect(COMPANION_DIAL_TIMEOUT_MS).toBeGreaterThan(
+      VOICE_START_REQUEST_TTL_MS,
+    );
+  });
+
+  /**
+   * The press that ends a dial takes the request back by a command the root
+   * layout consumes, since the session's own controls are heard only where a
+   * session is owned and a dial can be ended before any layout owns one.
+   */
+  test("ending it takes the request back through a command", () => {
+    mainWindowOpen = true;
+    dispatched.length = 0;
+    send("vellum:companion:startVoice");
+    dispatched.length = 0;
+
+    send("vellum:voiceActivity:control", { action: "endSession" });
+
+    expect(dispatched).toEqual([{ kind: "cancelVoiceStart" }]);
+    expect(state().dialing).toBe(false);
+  });
+
+  test("an end with no dial takes nothing back", () => {
+    mainWindowOpen = true;
+    send("vellum:voiceActivity:end");
+    dispatched.length = 0;
+
+    send("vellum:voiceActivity:control", { action: "endSession" });
+
+    expect(dispatched).toEqual([]);
+  });
+});
+
+/**
+ * When the surface is the call's rather than the pill: taken to the bottom of
+ * the display, the creature standing beside it, the display's edge lit.
+ */
+describe("the call surface", () => {
+  test("is the pill with nothing running", () => {
+    expect(callSurfaceFor(null, false)).toBe(false);
+  });
+
+  test("is the call's from the dial, before any session answers", () => {
+    expect(callSurfaceFor(null, true)).toBe(true);
+  });
+
+  test("is the call's for a running session", () => {
+    expect(callSurfaceFor({ ...START }, false)).toBe(true);
+  });
+});
+
+/**
+ * The surface the call takes: the handlebar goes to the bottom centre of the
+ * display from the dial until the call ends, and then the pill goes home.
+ *
+ * Under "Reduce motion", so each move lands in the same beat it is asked for.
+ * These cases are about where the surface ends up, which is the same point
+ * either way; how it gets there has cases of its own below.
+ */
+describe("the surface a call takes", () => {
+  /** The screen the electron mock answers for, whatever point it is asked. */
+  const SCREEN = { x: 0, y: 0, width: 1440, height: 900 };
+  const centre = (): { x: number; y: number } => ({
+    x: origin.x + GEOMETRY.canvasWidth / 2,
+    y: origin.y + avatarOffsetFor(state().cardGrowth, GEOMETRY),
+  });
+  const bottomCentre = defaultAvatarCentre(SCREEN, GEOMETRY);
+  /** Somewhere the user parked the pill, away from where a call puts it. */
+  const park = (): { x: number; y: number } => {
+    send("vellum:companion:moveBy", 300 - centre().x, 200 - centre().y);
+    return centre();
+  };
+
+  beforeEach(() => {
+    mainWindowOpen = true;
+    send("vellum:voiceActivity:end");
+    send("vellum:voiceActivity:control", { action: "endSession" });
+  });
+
+  test("goes to the bottom centre of the display on the dial", () => {
+    park();
+    send("vellum:companion:startVoice");
+    expect(centre()).toEqual(bottomCentre);
+  });
+
+  /**
+   * A call is a microphone, not a screen: the frame around the display is
+   * the watch session's, and a call alone leaves it dark.
+   */
+  test("does not light the display's edge", () => {
+    send("vellum:companion:startVoice");
+    send("vellum:voiceActivity:start", START);
+    expect(glow).toBeNull();
+    send("vellum:voiceActivity:end");
+  });
+
+  test("goes home once the call is over", () => {
+    const home = park();
+    send("vellum:companion:startVoice");
+    send("vellum:voiceActivity:start", START);
+    send("vellum:voiceActivity:end");
+    expect(centre()).toEqual(home);
+  });
+
+  test("goes home when the dial is declined", () => {
+    const home = park();
+    send("vellum:companion:startVoice");
+    send("vellum:voiceActivity:end");
+    expect(centre()).toEqual(home);
+  });
+
+  test("goes home when the user ends the dial", () => {
+    const home = park();
+    send("vellum:companion:startVoice");
+    send("vellum:voiceActivity:control", { action: "endSession" });
+    expect(centre()).toEqual(home);
+  });
+
+  /**
+   * The bottom centre is a default, not a pin: the user can drag the handlebar
+   * for the length of the call, and it is the pill's home they go back to.
+   */
+  test("stays draggable for the call and still goes home after it", () => {
+    const home = park();
+    send("vellum:companion:startVoice");
+    send("vellum:companion:moveBy", -200, -100);
+    expect(centre()).not.toEqual(bottomCentre);
+    send("vellum:voiceActivity:end");
+    expect(centre()).toEqual(home);
+  });
+
+  test("does not move again for a session answering a dial", () => {
+    send("vellum:companion:startVoice");
+    send("vellum:companion:moveBy", -200, -100);
+    const dragged = centre();
+    send("vellum:voiceActivity:start", START);
+    expect(centre()).toEqual(dragged);
+  });
+
+  test("is the call's for a session started in the app, not only for a dial", () => {
+    park();
+    send("vellum:voiceActivity:start", START);
+    expect(centre()).toEqual(bottomCentre);
+    send("vellum:voiceActivity:end");
+  });
+});
+
+/**
+ * The edge a call's bar rests on. The bottom by default, and any of the four
+ * once the user has dragged the bar there mid-call and let go: the drag moves
+ * the surface as freely as an idle drag does, the edges are shown for as long
+ * as it is in flight, and the release docks the bar to the nearest one. The
+ * sides stand the bar up, which is a canvas of another shape.
+ *
+ * Under "Reduce motion", as the call's cases are, so each move lands in the
+ * beat it is asked for.
+ */
+describe("the edge a call's bar docks to", () => {
+  const SCREEN = { x: 0, y: 0, width: 1440, height: 900 };
+  const SIDE = geometryFor("small", "small", "left");
+  /** The canvas main is drawing in, read off the last bounds it asked for. */
+  const canvas = (): typeof GEOMETRY =>
+    boundsSet.at(-1)?.height === SIDE.canvasHeight ? SIDE : GEOMETRY;
+  const centre = (): { x: number; y: number } => ({
+    x: origin.x + canvas().canvasWidth / 2,
+    y: origin.y + avatarOffsetFor(state().cardGrowth, canvas()),
+  });
+  /** Where a dock lands the avatar, read back the way `avatarCentre` reads it. */
+  const landing = (
+    dock: CompanionDock,
+    geometry: typeof GEOMETRY = GEOMETRY,
+  ): { x: number; y: number } => {
+    const placed = placeCanvas(
+      dockedAvatarCentre(dock, SCREEN, geometry),
+      SCREEN,
+      geometry,
+    );
+    return {
+      x: placed.origin.x + geometry.canvasWidth / 2,
+      y: placed.origin.y + avatarOffsetFor(placed.cardGrowth, geometry),
+    };
+  };
+  /** Drag the bar so the avatar rests on a point, mid-call or not. */
+  const dragTo = (point: { x: number; y: number }): void => {
+    send("vellum:companion:moveBy", point.x - centre().x, point.y - centre().y);
+  };
+  const release = (): void => {
+    send("vellum:companion:release");
+  };
+
+  beforeEach(() => {
+    mainWindowOpen = true;
+    storedDock = "bottom";
+  });
+
+  /**
+   * Leave the bar docked to the bottom for the next case, the way a fresh
+   * install has it. The module holds the dock it was last dropped on, and a
+   * reset mid-call is the one way back that goes through the store.
+   */
+  afterEach(() => {
+    send("vellum:voiceActivity:end");
+    send("vellum:voiceActivity:control", { action: "endSession" });
+    send("vellum:companion:startVoice");
+    resetCompanionSurfacePosition();
+    send("vellum:voiceActivity:control", { action: "endSession" });
+    storedDock = "bottom";
+  });
+
+  describe("geometryFor", () => {
+    test("builds the ordinary canvas for the top and bottom", () => {
+      expect(geometryFor("small", "small", "top")).toEqual(GEOMETRY);
+      expect(geometryFor("small", "small", "bottom")).toEqual(GEOMETRY);
+    });
+
+    /**
+     * The column is centred on the avatar, so the canvas has to reach as far
+     * below it as above; and it has to hold half the column, the gap and the
+     * whole creature standing at its end.
+     */
+    test("builds a canvas symmetric about the avatar for a side", () => {
+      for (const dock of ["left", "right"] as const) {
+        const side = geometryFor("small", "small", dock);
+        expect(side.riseAbove).toBe(side.dropBelow);
+        expect(side.canvasHeight).toBe(side.riseAbove * 2);
+        expect(side.canvasWidth).toBe(GEOMETRY.canvasWidth);
+        const scale = companionScaleFor(side.optionsBox);
+        expect(side.riseAbove).toBeGreaterThanOrEqual(
+          (COMPANION_BASE_MAX_PILL_WIDTH * scale) / 2 + side.avatarBox,
+        );
+      }
+    });
+  });
+
+  describe("dockedAvatarCentre", () => {
+    test("is the bottom centre for the bottom", () => {
+      expect(dockedAvatarCentre("bottom", SCREEN, GEOMETRY)).toEqual(
+        defaultAvatarCentre(SCREEN, GEOMETRY),
+      );
+    });
+
+    /** As high as the canvas above the avatar lets the window server go. */
+    test("settles as high as the work area allows for the top", () => {
+      const top = landing("top");
+      expect(top.x).toBe(SCREEN.width / 2);
+      expect(top.y).toBe(SCREEN.y + DROP_BELOW);
+    });
+
+    test("stands the sides at the display's vertical centre, a margin in", () => {
+      const reach = companionLowerReachFor(SIDE.avatarBox, SIDE.optionsBox);
+      expect(dockedAvatarCentre("left", SCREEN, SIDE)).toEqual({
+        x: 2 + reach,
+        y: SCREEN.height / 2,
+      });
+      expect(dockedAvatarCentre("right", SCREEN, SIDE)).toEqual({
+        x: SCREEN.width - 2 - reach,
+        y: SCREEN.height / 2,
+      });
+    });
+  });
+
+  describe("nearestDock", () => {
+    test("is the edge the point is closest to", () => {
+      expect(nearestDock({ x: 700, y: 850 }, SCREEN)).toBe("bottom");
+      expect(nearestDock({ x: 700, y: 40 }, SCREEN)).toBe("top");
+      expect(nearestDock({ x: 30, y: 450 }, SCREEN)).toBe("left");
+      expect(nearestDock({ x: 1400, y: 450 }, SCREEN)).toBe("right");
+    });
+
+    test("resolves a tie to the bottom, the shape the bar is designed around", () => {
+      expect(nearestDock({ x: 720, y: 450 }, SCREEN)).toBe("bottom");
+    });
+
+    test("measures against the work area it is given, not the origin", () => {
+      const second = { x: 1440, y: 0, width: 1920, height: 1080 };
+      expect(nearestDock({ x: 1460, y: 500 }, second)).toBe("left");
+    });
+  });
+
+  test("a call goes to the remembered edge rather than the bottom", () => {
+    storedDock = "top";
+    // The dock is read once at load, so this case reaches it the way a drop
+    // does; the store's read is `window-state.test.ts`'s subject.
+    send("vellum:voiceActivity:start", START);
+    dragTo({ x: 700, y: 30 });
+    release();
+    send("vellum:voiceActivity:end");
+    send("vellum:companion:startVoice");
+    expect(centre()).toEqual(landing("top"));
+    expect(state().dock).toBe("top");
+  });
+
+  /**
+   * The window is built with the call and kept hidden, so the drag has a
+   * window to show rather than one to build and load.
+   */
+  test("a drag mid-call shows the edges and names the one it is heading for", () => {
+    expect(zonesWindow()).toBeNull();
+    send("vellum:companion:startVoice");
+    expect(zonesWindow()?.visible).toBe(false);
+    expect(zonesWindow()?.bounds).toEqual(SCREEN);
+    dragTo({ x: 100, y: 450 });
+    const zones = zonesWindow();
+    expect(zones?.visible).toBe(true);
+    expect(zones?.level).toEqual(["floating", -1]);
+    expect(state().docking).toBe("left");
+    dragTo({ x: 700, y: 60 });
+    expect(state().docking).toBe("top");
+  });
+
+  /**
+   * A click on the creature mid-call is a press the renderer reports moves
+   * for, jitter and all, and it must not flash the edges or move the bar.
+   */
+  test("a press that barely moves is a click, not a drag", () => {
+    send("vellum:companion:startVoice");
+    const docked = centre();
+    send("vellum:companion:moveBy", 1, -1);
+    expect(zonesWindow()?.visible).toBe(false);
+    expect(state().docking).toBeUndefined();
+    release();
+    expect(centre()).toEqual({ x: docked.x + 1, y: docked.y - 1 });
+    expect(state().dock).toBe("bottom");
+  });
+
+  test("an idle drag shows no edges", () => {
+    dragTo({ x: 100, y: 450 });
+    expect(zonesWindow()).toBeNull();
+    expect(state().docking).toBeUndefined();
+    release();
+    expect(state().dock).toBe("bottom");
+  });
+
+  test("the release docks the bar to the edge it was heading for and remembers it", () => {
+    send("vellum:companion:startVoice");
+    dragTo({ x: 100, y: 450 });
+    release();
+    expect(zonesWindow()?.visible).toBe(false);
+    expect(state().docking).toBeUndefined();
+    expect(state().dock).toBe("left");
+    expect(storedDock).toBe("left");
+    expect(centre()).toEqual(landing("left", SIDE));
+  });
+
+  /** The column needs a canvas of its own shape, and the row wants the old one back. */
+  test("a side dock stands the canvas up for the call and lays it back down after", () => {
+    send("vellum:companion:startVoice");
+    dragTo({ x: 1400, y: 450 });
+    release();
+    expect(boundsSet.at(-1)?.height).toBe(SIDE.canvasHeight);
+    expect(state().avatarBox).toBe(SIDE.avatarBox);
+    send("vellum:voiceActivity:end");
+    expect(boundsSet.at(-1)?.height).toBe(GEOMETRY.canvasHeight);
+  });
+
+  test("goes home after a call docked to a side", () => {
+    dragTo({ x: 300, y: 200 });
+    const home = centre();
+    send("vellum:companion:startVoice");
+    dragTo({ x: 1400, y: 450 });
+    release();
+    send("vellum:voiceActivity:end");
+    expect(centre()).toEqual(home);
+  });
+
+  test("the next call stands the bar up on the side it was left on", () => {
+    send("vellum:companion:startVoice");
+    dragTo({ x: 1400, y: 450 });
+    release();
+    send("vellum:voiceActivity:end");
+    send("vellum:companion:startVoice");
+    expect(centre()).toEqual(landing("right", SIDE));
+    expect(boundsSet.at(-1)?.height).toBe(SIDE.canvasHeight);
+  });
+
+  test("a call ending under a drag takes the edges down with it", () => {
+    send("vellum:companion:startVoice");
+    dragTo({ x: 100, y: 450 });
+    expect(zonesWindow()?.visible).toBe(true);
+    send("vellum:voiceActivity:end");
+    expect(zonesWindow()).toBeNull();
+    expect(state().docking).toBeUndefined();
+    // A release arriving after the call has nothing left to dock.
+    release();
+    expect(state().dock).toBe("bottom");
+  });
+
+  test("a reset mid-call puts the bar back on the bottom for this call and the next", () => {
+    send("vellum:companion:startVoice");
+    dragTo({ x: 100, y: 450 });
+    release();
+    expect(state().dock).toBe("left");
+    resetCompanionSurfacePosition();
+    expect(state().dock).toBe("bottom");
+    expect(storedDock).toBe("bottom");
+    expect(centre()).toEqual(landing("bottom"));
+    send("vellum:voiceActivity:end");
+    expect(centre()).toEqual(landing("bottom"));
+  });
+
+  test("the edges follow a drag onto another display", () => {
+    send("vellum:companion:startVoice");
+    const second = displays[1];
+    if (second === undefined) {
+      throw new Error("Expected a second display");
+    }
+    dragTo({ x: 100, y: 450 });
+    nearestDisplay = second;
+    dragTo({ x: 1500, y: 500 });
+    expect(zonesWindow()?.bounds).toEqual(second.workArea);
+    expect(state().docking).toBe("left");
+  });
+});
+
+/**
+ * The menu's "Reset Position": the pill goes back to where the surface opens,
+ * the bottom centre of its display, from wherever the user dragged it.
+ *
+ * Under "Reduce motion", as the call's cases are, so each reset lands in the
+ * beat it is asked for; the reset moves the surface the way the call does,
+ * and the glide has its own cases below.
+ */
+describe("resetCompanionSurfacePosition", () => {
+  const SCREEN = { x: 0, y: 0, width: 1440, height: 900 };
+  const centre = (): { x: number; y: number } => ({
+    x: origin.x + GEOMETRY.canvasWidth / 2,
+    y: origin.y + avatarOffsetFor(state().cardGrowth, GEOMETRY),
+  });
+  const bottomCentre = defaultAvatarCentre(SCREEN, GEOMETRY);
+  const park = (): { x: number; y: number } => {
+    send("vellum:companion:moveBy", 300 - centre().x, 200 - centre().y);
+    return centre();
+  };
+
+  beforeEach(() => {
+    mainWindowOpen = true;
+    send("vellum:voiceActivity:end");
+    send("vellum:voiceActivity:control", { action: "endSession" });
+  });
+
+  test("takes a parked pill back to the bottom centre of its display", () => {
+    park();
+    expect(centre()).not.toEqual(bottomCentre);
+    resetCompanionSurfacePosition();
+    expect(centre()).toEqual(bottomCentre);
+  });
+
+  test("leaves a pill already there where it is", () => {
+    resetCompanionSurfacePosition();
+    const before = centre();
+    resetCompanionSurfacePosition();
+    expect(centre()).toEqual(before);
+    expect(centre()).toEqual(bottomCentre);
+  });
+
+  /**
+   * A call holds the place the pill goes back to when it ends. A reset during
+   * the call is the user saying where the surface belongs, so the call's end
+   * leaves it there rather than sending it back to where it was parked.
+   */
+  test("mid-call, is where the call ends too", () => {
+    park();
+    send("vellum:companion:startVoice");
+    send("vellum:voiceActivity:start", START);
+    send("vellum:companion:moveBy", -200, -100);
+    expect(centre()).not.toEqual(bottomCentre);
+    resetCompanionSurfacePosition();
+    expect(centre()).toEqual(bottomCentre);
+    send("vellum:voiceActivity:end");
+    expect(centre()).toEqual(bottomCentre);
+  });
+});
+
+/**
+ * How the surface gets there: a glide from where it rests to where the call
+ * puts it, and back. Real timers, since the glide is stepped on one, so each
+ * case waits the glide out rather than asserting on a beat of it.
+ */
+describe("the glide between the pill's home and the call's place", () => {
+  const SCREEN = { x: 0, y: 0, width: 1440, height: 900 };
+  const centre = (): { x: number; y: number } => ({
+    x: origin.x + GEOMETRY.canvasWidth / 2,
+    y: origin.y + avatarOffsetFor(state().cardGrowth, GEOMETRY),
+  });
+  const bottomCentre = defaultAvatarCentre(SCREEN, GEOMETRY);
+  const park = (): { x: number; y: number } => {
+    send("vellum:companion:moveBy", 300 - centre().x, 200 - centre().y);
+    return centre();
+  };
+  const wait = (ms: number): Promise<void> =>
+    new Promise((resolve) => setTimeout(resolve, ms));
+  /** Long enough for a glide started just now to have landed. */
+  const settle = (): Promise<void> => wait(COMPANION_GLIDE_MS + 80);
+  /**
+   * Early enough in a glide that it is certainly still in flight, with the
+   * slack of most of its length for a slow machine, and late enough that at
+   * least one frame of it has run.
+   */
+  const MID_FLIGHT_MS = COMPANION_GLIDE_MS / 4;
+  const between = (
+    point: { x: number; y: number },
+    a: { x: number; y: number },
+    b: { x: number; y: number },
+  ): boolean =>
+    point.y > Math.min(a.y, b.y) &&
+    point.y < Math.max(a.y, b.y) &&
+    point.x > Math.min(a.x, b.x) &&
+    point.x < Math.max(a.x, b.x);
+
+  beforeEach(() => {
+    mainWindowOpen = true;
+    reducedMotion = false;
+  });
+
+  /** Leave the surface at rest with no call on it, whatever the case did. */
+  afterEach(async () => {
+    send("vellum:voiceActivity:end");
+    send("vellum:voiceActivity:control", { action: "endSession" });
+    await settle();
+    reducedMotion = true;
+  });
+
+  test("lands exactly on the call's place, over time rather than at once", async () => {
+    const home = park();
+    send("vellum:companion:startVoice");
+    expect(centre()).toEqual(home);
+    await wait(MID_FLIGHT_MS);
+    expect(between(centre(), home, bottomCentre)).toBe(true);
+    await settle();
+    expect(centre()).toEqual(bottomCentre);
+  });
+
+  test("goes home the same way once the call is over", async () => {
+    const home = park();
+    send("vellum:companion:startVoice");
+    await settle();
+    send("vellum:voiceActivity:end");
+    await wait(MID_FLIGHT_MS);
+    expect(between(centre(), home, bottomCentre)).toBe(true);
+    await settle();
+    expect(centre()).toEqual(home);
+  });
+
+  test("moves at once under Reduce motion", () => {
+    reducedMotion = true;
+    const home = park();
+    send("vellum:companion:startVoice");
+    expect(centre()).toEqual(bottomCentre);
+    send("vellum:voiceActivity:end");
+    expect(centre()).toEqual(home);
+  });
+
+  /**
+   * The home is where the pill rested, not where the outbound glide had got
+   * to when the call ended, and the outbound glide does not carry on
+   * underneath the homeward one.
+   */
+  test("a call ending mid-flight sends the pill back to where it rested", async () => {
+    const home = park();
+    send("vellum:companion:startVoice");
+    await wait(MID_FLIGHT_MS);
+    expect(centre()).not.toEqual(home);
+    send("vellum:voiceActivity:end");
+    await settle();
+    expect(centre()).toEqual(home);
+    await settle();
+    expect(centre()).toEqual(home);
+  });
+
+  /**
+   * A call that arrives while the pill is still on its way home reads its
+   * home off the glide's destination rather than the point it has reached,
+   * so the pill goes back to the same place after both calls.
+   */
+  test("a call arriving on the way home remembers that home", async () => {
+    const home = park();
+    send("vellum:companion:startVoice");
+    await settle();
+    send("vellum:voiceActivity:end");
+    await wait(MID_FLIGHT_MS);
+    const passing = centre();
+    expect(passing).not.toEqual(home);
+    send("vellum:companion:startVoice");
+    await settle();
+    expect(centre()).toEqual(bottomCentre);
+    send("vellum:voiceActivity:end");
+    await settle();
+    expect(centre()).toEqual(home);
+    expect(centre()).not.toEqual(passing);
+  });
+
+  test("a drag mid-flight wins over the glide", async () => {
+    park();
+    send("vellum:companion:startVoice");
+    await wait(MID_FLIGHT_MS);
+    const reached = centre();
+    send("vellum:companion:moveBy", -60, -40);
+    const dragged = centre();
+    expect(dragged).toEqual({ x: reached.x - 60, y: reached.y - 40 });
+    await settle();
+    expect(centre()).toEqual(dragged);
+  });
+
+  /**
+   * The canvas is rebuilt around where the avatar rests, and a glide in
+   * flight rests where it is headed: the pick lands it there at once, in the
+   * new canvas, and no frame of the old glide steps across the rebuilt one.
+   */
+  test("a size pick mid-flight lands the glide in the new canvas", async () => {
+    const home = park();
+    send("vellum:companion:startVoice");
+    await wait(MID_FLIGHT_MS);
+    expect(between(centre(), home, bottomCentre)).toBe(true);
+    setCompanionSurfaceSize("options", "huge");
+    const bounds = boundsSet.at(-1);
+    expect({ width: bounds?.width, height: bounds?.height }).toEqual({
+      width: BIG_OPTIONS.canvasWidth,
+      height: BIG_OPTIONS.canvasHeight,
+    });
+    // Read back out of the new canvas, the way main reads it.
+    const centreInNewCanvas = (): { x: number; y: number } => ({
+      x: origin.x + BIG_OPTIONS.canvasWidth / 2,
+      y: origin.y + avatarOffsetFor(state().cardGrowth, BIG_OPTIONS),
+    });
+    // The glide's own target, carried into the new canvas and held to what
+    // that canvas allows: a larger pill reaches further below the avatar, so
+    // the room kept under the surface grows with it and the target the glide
+    // was headed for is now lower than the new geometry permits. See
+    // `companionLowerReachFor`.
+    const bigBottomCentre = centreOf(
+      placeCanvas(bottomCentre, SCREEN, BIG_OPTIONS),
+      BIG_OPTIONS,
+    );
+    expect(centreInNewCanvas()).toEqual(bigBottomCentre);
+    // Still there a frame or more later, where the old glide would have been
+    // passing through a point short of it.
+    await wait(MID_FLIGHT_MS);
+    expect(centreInNewCanvas()).toEqual(bigBottomCentre);
+    send("vellum:voiceActivity:end");
+    await settle();
+    expect(centreInNewCanvas()).toEqual(home);
+  });
+
+  /**
+   * The landing is clamped against the display under the avatar when it
+   * lands, not the one the glide was aimed at: a display that shrinks or goes
+   * mid-flight cannot leave the pill off the edge of the one that is left.
+   */
+  test("lands inside the display under it at landing time", async () => {
+    park();
+    send("vellum:companion:startVoice");
+    await wait(MID_FLIGHT_MS);
+    const shrunk = { x: 0, y: 0, width: 1000, height: 600 };
+    nearestDisplay = { bounds: shrunk, workArea: shrunk };
+    await settle();
+    const placed = placeCanvas(bottomCentre, shrunk, GEOMETRY);
+    expect(centre()).toEqual({
+      x: placed.origin.x + GEOMETRY.canvasWidth / 2,
+      y: placed.origin.y + avatarOffsetFor(placed.cardGrowth, GEOMETRY),
+    });
+    // Inside by the rule the clamp actually applies: the creature's visible
+    // bottom on the edge, not its box's.
+    expect(centre().y).toBeLessThanOrEqual(
+      shrunk.height -
+        companionLowerReachFor(GEOMETRY.avatarBox, GEOMETRY.optionsBox),
+    );
+  });
+
+  /**
+   * The setting is read per move, not per frame: a glide already in flight
+   * lands on its timetable, and the move after the toggle is the one that
+   * happens at once.
+   */
+  test("Reduce motion turned on mid-flight applies from the next move", async () => {
+    const home = park();
+    send("vellum:companion:startVoice");
+    await wait(MID_FLIGHT_MS);
+    reducedMotion = true;
+    expect(between(centre(), home, bottomCentre)).toBe(true);
+    await settle();
+    expect(centre()).toEqual(bottomCentre);
+    send("vellum:voiceActivity:end");
+    expect(centre()).toEqual(home);
+  });
+});
+
+describe("glideProgress", () => {
+  test("starts at the start and ends at the end", () => {
+    expect(glideProgress(0)).toBe(0);
+    expect(glideProgress(1)).toBe(1);
+  });
+
+  test("holds at the ends past them", () => {
+    expect(glideProgress(-0.5)).toBe(0);
+    expect(glideProgress(1.5)).toBe(1);
+  });
+
+  /** An ease-out: ahead of a straight line, and never going back. */
+  test("eases out", () => {
+    let last = 0;
+    for (let t = 0.1; t < 1; t += 0.1) {
+      const now = glideProgress(t);
+      expect(now).toBeGreaterThan(t);
+      expect(now).toBeGreaterThan(last);
+      last = now;
+    }
+  });
+});
+
+/**
+ * The display's edge, lit while a watch session reads it: the whole screen
+ * says it is being read, the way a shared screen is framed.
+ */
+describe("the light a watch session puts on the display", () => {
+  const SCREEN = { x: 0, y: 0, width: 1440, height: 900 };
+
+  beforeEach(() => {
+    mainWindowOpen = true;
+    send("vellum:companion:setContext", context({ watching: false }));
+  });
+
+  test("comes on with the session", () => {
+    send("vellum:companion:setContext", context({ watching: true }));
+    expect(glow).not.toBeNull();
+    expect(glow?.bounds).toEqual(SCREEN);
+  });
+
+  test("sits under the surface", () => {
+    send("vellum:companion:setContext", context({ watching: true }));
+    expect(glow?.level).toEqual(["floating", -1]);
+  });
+
+  test("is told what the surface is told", () => {
+    send("vellum:companion:setContext", context({ watching: true }));
+    glowPushes.length = 0;
+    send(
+      "vellum:companion:setContext",
+      context({ watching: true, captureCount: 2 }),
+    );
+    expect(glowPushes.at(-1)?.captureCount).toBe(2);
+  });
+
+  test("goes out with the session", () => {
+    send("vellum:companion:setContext", context({ watching: true }));
+    send("vellum:companion:setContext", context({ watching: false }));
+    expect(glow).toBeNull();
+  });
+
+  test("stays dark for a context that says nothing about a session", () => {
+    send("vellum:companion:setContext", context({}));
+    expect(glow).toBeNull();
+  });
+
+  /**
+   * The window that owns the session is gone, so nothing is reading the
+   * screen, whatever the last push said.
+   */
+  test("goes out when the window holding the session is destroyed", () => {
+    send("vellum:companion:setContext", context({ watching: true }));
+    mainWindowOpen = false;
+    fireVisibilityChange();
+    expect(glow).toBeNull();
+  });
+
+  test("stays lit through a call", () => {
+    send("vellum:companion:setContext", context({ watching: true }));
+    send("vellum:companion:startVoice");
+    send("vellum:voiceActivity:start", START);
+    expect(glow).not.toBeNull();
+    send("vellum:voiceActivity:end");
+    expect(glow).not.toBeNull();
+    send("vellum:companion:setContext", context({ watching: false }));
+  });
+
+  /**
+   * A session started on a pick frames exactly what it reads. The display
+   * by its id, wherever the surface happens to be; the window by its bounds,
+   * asked of the helper and asked again as it moves.
+   */
+  test("frames the picked display rather than the surface's", () => {
+    send(
+      "vellum:companion:setContext",
+      context({
+        watching: true,
+        captureTarget: { kind: "display", displayId: 2 },
+      }),
+    );
+    expect(glow?.bounds).toEqual({ x: 1440, y: 0, width: 1920, height: 1080 });
+  });
+
+  test("is allowed to cover the menu bar, so it is the whole display", () => {
+    // macOS holds a window to the work area unless told otherwise, and a
+    // frame a menu bar short of the display draws every fraction measured
+    // against the display's picture low by that much.
+    send(
+      "vellum:companion:setContext",
+      context({
+        watching: true,
+        captureTarget: { kind: "display", displayId: 2 },
+      }),
+    );
+    expect(glowOptions?.enableLargerThanScreen).toBe(true);
+  });
+
+  test("is placed again when the picked display changes shape", () => {
+    send(
+      "vellum:companion:setContext",
+      context({
+        watching: true,
+        captureTarget: { kind: "display", displayId: 2 },
+      }),
+    );
+    displays[1] = {
+      ...displays[1],
+      bounds: { x: 1440, y: 0, width: 1080, height: 1920 },
+    };
+    fireDisplayEvent("display-metrics-changed");
+    expect(glow?.bounds).toEqual({ x: 1440, y: 0, width: 1080, height: 1920 });
+  });
+
+  test("is placed again with the surface hidden", () => {
+    send(
+      "vellum:companion:setContext",
+      context({
+        watching: true,
+        captureTarget: { kind: "display", displayId: 2 },
+      }),
+    );
+    companionOpen = false;
+    displays[1] = {
+      ...displays[1],
+      bounds: { x: 1440, y: 0, width: 1080, height: 1920 },
+    };
+    fireDisplayEvent("display-metrics-changed");
+    expect(glow?.bounds).toEqual({ x: 1440, y: 0, width: 1080, height: 1920 });
+  });
+
+  test("falls back to the surface's display for one that is gone", () => {
+    send(
+      "vellum:companion:setContext",
+      context({
+        watching: true,
+        captureTarget: { kind: "display", displayId: 99 },
+      }),
+    );
+    expect(glow?.bounds).toEqual(SCREEN);
+  });
+
+  test("frames the picked window where the helper says it is", async () => {
+    windowBounds = { x: 200, y: 120, width: 800, height: 600 };
+    send(
+      "vellum:companion:setContext",
+      context({
+        watching: true,
+        captureTarget: { kind: "window", windowId: 4242 },
+      }),
+    );
+    await Bun.sleep(0);
+    expect(boundsAsked).toEqual([4242]);
+    expect(glow?.bounds).toEqual({ x: 200, y: 120, width: 800, height: 600 });
+    send("vellum:companion:setContext", context({ watching: false }));
+  });
+
+  test("hides the frame while the picked window is off screen", async () => {
+    windowBounds = { x: 200, y: 120, width: 800, height: 600 };
+    send(
+      "vellum:companion:setContext",
+      context({
+        watching: true,
+        captureTarget: { kind: "window", windowId: 4242 },
+      }),
+    );
+    await Bun.sleep(0);
+    expect(glow?.visible).toBe(true);
+    // Minimized: the helper no longer lists it.
+    windowBounds = null;
+    await Bun.sleep(300);
+    expect(glow).not.toBeNull();
+    expect(glow?.visible).toBe(false);
+    // And back.
+    windowBounds = { x: 10, y: 20, width: 800, height: 600 };
+    await Bun.sleep(300);
+    expect(glow?.visible).toBe(true);
+    expect(glow?.bounds).toEqual({ x: 10, y: 20, width: 800, height: 600 });
+    send("vellum:companion:setContext", context({ watching: false }));
+  });
+
+  test("stops asking after the picked window once the session ends", async () => {
+    windowBounds = { x: 200, y: 120, width: 800, height: 600 };
+    send(
+      "vellum:companion:setContext",
+      context({
+        watching: true,
+        captureTarget: { kind: "window", windowId: 4242 },
+      }),
+    );
+    await Bun.sleep(0);
+    send("vellum:companion:setContext", context({ watching: false }));
+    const asked = boundsAsked.length;
+    await Bun.sleep(300);
+    expect(boundsAsked.length).toBe(asked);
+    expect(glow).toBeNull();
+  });
+
+  test("carries the target and whether one may be picked to the surface", () => {
+    send(
+      "vellum:companion:setContext",
+      context({
+        watching: true,
+        watchTargets: true,
+        captureTarget: { kind: "window", windowId: 7 },
+      }),
+    );
+    expect(state().captureTarget).toEqual({ kind: "window", windowId: 7 });
+    expect(state().watchTargets).toBe(true);
+    send("vellum:companion:setContext", context({}));
+    expect(state().captureTarget).toBeUndefined();
+    expect(state().watchTargets).toBe(false);
+  });
+});
+
+/**
+ * Teach's picker, from main's side: the list it draws, and the pick that
+ * comes back on the toggle channel as the session's target.
+ */
+describe("the picker behind Teach", () => {
+  beforeEach(() => {
+    mainWindowOpen = true;
+    dispatched.length = 0;
+  });
+
+  test("lists what a session could read on demand", async () => {
+    const list = invocable.get("vellum:companion:listCaptureSources");
+    expect(list).toBeDefined();
+    expect(await list?.([])).toEqual({
+      ...listedSources,
+      screenRecordingGranted: true,
+    });
+  });
+
+  test("says when nothing listed could be captured for want of the grant", async () => {
+    screenGranted = false;
+    try {
+      const list = invocable.get("vellum:companion:listCaptureSources");
+      expect(await list?.([])).toEqual({
+        ...listedSources,
+        screenRecordingGranted: false,
+      });
+    } finally {
+      screenGranted = true;
+    }
+  });
+
+  test("a press with no pick is the toggle it always was", () => {
+    send("vellum:companion:toggleWatch");
+    expect(dispatched.at(-1)).toEqual({ kind: "toggleWatch" });
+    expect(picksResolved).toHaveLength(0);
+  });
+
+  test("a pick rides the toggle to the window holding the session", async () => {
+    resolvedPick = { kind: "window", windowId: 4242 };
+    send("vellum:companion:toggleWatch", {
+      kind: "tab",
+      chromeWindowId: 3,
+      tabIndex: 2,
+    });
+    await Bun.sleep(0);
+    expect(picksResolved).toEqual([
+      { kind: "tab", chromeWindowId: 3, tabIndex: 2 },
+    ]);
+    expect(dispatched.at(-1)).toEqual({
+      kind: "toggleWatch",
+      target: { kind: "window", windowId: 4242 },
+    });
+  });
+
+  /**
+   * Only the latest pick may start anything. A slow resolution (the first
+   * one waits on the Automation prompt) outlived by a second pick would
+   * otherwise dispatch beside it: two toggles, one ending what the other
+   * started.
+   */
+  test("a pick superseded by a later one dispatches nothing", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    resolvedPick = { kind: "window", windowId: 1 };
+    const slow = resolvedPickAsync;
+    resolvedPickAsync = async () => {
+      await gate;
+      return { kind: "window", windowId: 1 };
+    };
+    send("vellum:companion:toggleWatch", {
+      kind: "tab",
+      chromeWindowId: 3,
+      tabIndex: 1,
+    });
+    resolvedPickAsync = slow;
+    resolvedPick = { kind: "window", windowId: 2 };
+    send("vellum:companion:toggleWatch", { kind: "window", windowId: 2 });
+    await Bun.sleep(0);
+    release();
+    await Bun.sleep(0);
+    expect(dispatched).toEqual([
+      { kind: "toggleWatch", target: { kind: "window", windowId: 2 } },
+    ]);
+  });
+
+  test("reopening the picker or ending the call supersedes a pending pick", async () => {
+    for (const supersede of ["list", "end"] as const) {
+      dispatched.length = 0;
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const slow = resolvedPickAsync;
+      resolvedPickAsync = async () => {
+        await gate;
+        return { kind: "window", windowId: 1 };
+      };
+      send("vellum:companion:toggleWatch", {
+        kind: "tab",
+        chromeWindowId: 3,
+        tabIndex: 1,
+      });
+      resolvedPickAsync = slow;
+      if (supersede === "list") {
+        await invocable.get("vellum:companion:listCaptureSources")?.([]);
+      } else {
+        send("vellum:companion:startVoice");
+        send("vellum:voiceActivity:start", START);
+        send("vellum:voiceActivity:end");
+      }
+      release();
+      await Bun.sleep(0);
+      expect(dispatched.filter((c) => c.kind === "toggleWatch")).toEqual([]);
+    }
+  });
+
+  test("a dial ending unanswered supersedes a pending pick", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const slow = resolvedPickAsync;
+    resolvedPickAsync = async () => {
+      await gate;
+      return { kind: "window", windowId: 1 };
+    };
+    send("vellum:companion:startVoice");
+    send("vellum:companion:toggleWatch", {
+      kind: "tab",
+      chromeWindowId: 3,
+      tabIndex: 1,
+    });
+    resolvedPickAsync = slow;
+    // The window asked for a session says no: the dial ends with no call.
+    send("vellum:voiceActivity:end");
+    release();
+    await Bun.sleep(0);
+    expect(dispatched.filter((c) => c.kind === "toggleWatch")).toEqual([]);
+  });
+
+  test("a press with no pick supersedes a pending one", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const slow = resolvedPickAsync;
+    resolvedPickAsync = async () => {
+      await gate;
+      return { kind: "window", windowId: 1 };
+    };
+    send("vellum:companion:toggleWatch", {
+      kind: "tab",
+      chromeWindowId: 3,
+      tabIndex: 1,
+    });
+    resolvedPickAsync = slow;
+    send("vellum:companion:toggleWatch");
+    release();
+    await Bun.sleep(0);
+    expect(dispatched).toEqual([{ kind: "toggleWatch" }]);
+  });
+
+  test("a pick that resolves to nothing starts nothing", async () => {
+    resolvedPick = null;
+    send("vellum:companion:toggleWatch", {
+      kind: "tab",
+      chromeWindowId: 3,
+      tabIndex: 2,
+    });
+    await Bun.sleep(0);
+    expect(dispatched).toHaveLength(0);
+  });
+
+  test("refuses a pick that names nothing the contract knows", () => {
+    expect(() => {
+      send("vellum:companion:toggleWatch", { kind: "camera" });
+    }).toThrow();
+  });
+});
+
 describe("the session main holds", () => {
   test("update merges content and leaves the fixed fields alone", () => {
     const running = { ...START };
@@ -485,8 +2306,7 @@ describe("the session main holds", () => {
 describe("introOnAdvance", () => {
   test("walks to the next beat", () => {
     expect(introOnAdvance("meet", "next")).toBe("talk");
-    expect(introOnAdvance("talk", "next")).toBe("type");
-    expect(introOnAdvance("type", "next")).toBe("menu");
+    expect(introOnAdvance("talk", "next")).toBe("menu");
   });
 
   // Past the last beat there is no next one, and `null` is what main reads as
@@ -497,7 +2317,7 @@ describe("introOnAdvance", () => {
 
   test("dismiss ends the run from any beat", () => {
     expect(introOnAdvance("meet", "dismiss")).toBe(null);
-    expect(introOnAdvance("type", "dismiss")).toBe(null);
+    expect(introOnAdvance("talk", "dismiss")).toBe(null);
   });
 
   // A press that arrives after the run is already over. The renderer can be a
@@ -546,46 +2366,122 @@ describe("shouldShowCompanionSurface", () => {
  * nobody ever looked at.
  */
 describe("geometryFor", () => {
-  test("draws `small` at the size the renderer's layout is authored at", () => {
-    const small = geometryFor("small");
-    expect(small.avatarBox).toBe(44);
-    expect(small.canvasWidth).toBe(724);
-    expect(small.canvasHeight).toBe(338);
+  /**
+   * What the width is actually for: the avatar's half box, the gap the pill
+   * hangs off it by, and the widest the pill draws, on both sides so main can
+   * flip the direction without resizing the window, plus the shadow's room.
+   *
+   * Stated as the numbers each step comes to rather than as the sum again. Each
+   * one is a canvas that was looked at, and a formula repeated here would pass
+   * against any change to the formula it repeats.
+   */
+  test("holds the pill's whole reach on both sides of the avatar", () => {
+    const canvases: Record<
+      CompanionSize,
+      { maxReach: number; canvasWidth: number; canvasHeight: number }
+    > = {
+      small: { maxReach: 322, canvasWidth: 692, canvasHeight: 267 },
+      medium: { maxReach: 445, canvasWidth: 962, canvasHeight: 374 },
+      large: { maxReach: 662, canvasWidth: 1420, canvasHeight: 547 },
+      huge: { maxReach: 879, canvasWidth: 1878, canvasHeight: 720 },
+      ridiculous: { maxReach: 1140, canvasWidth: 2520, canvasHeight: 1035 },
+    };
+    for (const size of COMPANION_SIZES) {
+      const { maxReach, canvasWidth, canvasHeight } = geometryFor(size, size);
+      expect({ maxReach, canvasWidth, canvasHeight }).toEqual(canvases[size]);
+    }
   });
 
   /**
-   * The whole surface is one layout multiplied, so every length has to move
-   * together. A canvas that scaled while the pill's reach did not would clip
-   * the controls; the reverse would swallow clicks over empty desktop.
+   * The creature's box is the avatar axis's answer and nothing else's. It is
+   * what main clamps by, so a pill size leaking into it would move where the
+   * mascot is allowed to sit.
    */
-  test("scales every length by the same factor", () => {
-    const small = geometryFor("small");
-    const large = geometryFor("large");
-    const scale = large.avatarBox / small.avatarBox;
-    expect(scale).toBe(2);
-    expect(large.canvasWidth).toBe(small.canvasWidth * scale);
-    expect(large.canvasHeight).toBe(small.canvasHeight * scale);
-    expect(large.riseAbove).toBe(small.riseAbove * scale);
-    expect(large.dropBelow).toBe(small.dropBelow * scale);
-    expect(large.maxPillWidth).toBe(small.maxPillWidth * scale);
+  test("takes the creature's box from the avatar axis alone", () => {
+    for (const options of COMPANION_SIZES) {
+      expect(geometryFor("large", options).avatarBox).toBe(
+        companionBoxFor("avatar", "large"),
+      );
+    }
+  });
+
+  /**
+   * Everything beside the creature is the options axis's answer, starting with
+   * the pill's own box.
+   */
+  test("takes the pill's box from the options axis alone", () => {
+    for (const avatar of COMPANION_SIZES) {
+      expect(geometryFor(avatar, "large").optionsBox).toBe(
+        companionBoxFor("options", "large"),
+      );
+    }
+  });
+
+  /**
+   * The two sides of the avatar at each step, as the numbers they come to.
+   *
+   * Not one scale times the authored pair: a name is a creature and a pill a
+   * notch apart, so the two sides move at different rates and each step is its
+   * own canvas. The authored pair is stated first, since each of these is that
+   * one layout scaled.
+   */
+  test("states both sides of the avatar at every named step", () => {
+    // The pill's bottom sits 14 under the avatar's centre, so its top stands
+    // 30 over it where the creature's box reaches only 22, and the card rises
+    // its whole height off that same line. Both sides then take the pad.
+    expect(
+      companionNearEdgeFor(
+        COMPANION_BASE_AVATAR_BOX,
+        COMPANION_BASE_AVATAR_BOX,
+      ),
+    ).toBe(54);
+    expect(
+      companionCardSideFor(
+        COMPANION_BASE_AVATAR_BOX,
+        COMPANION_BASE_AVATAR_BOX,
+      ),
+    ).toBe(300);
+    const sides: Record<
+      CompanionSize,
+      { riseAbove: number; dropBelow: number }
+    > = {
+      small: { riseAbove: 221, dropBelow: 46 },
+      medium: { riseAbove: 305, dropBelow: 69 },
+      large: { riseAbove: 455, dropBelow: 92 },
+      huge: { riseAbove: 605, dropBelow: 115 },
+      ridiculous: { riseAbove: 805, dropBelow: 230 },
+    };
+    for (const size of COMPANION_SIZES) {
+      const { riseAbove, dropBelow } = geometryFor(size, size);
+      expect({ riseAbove, dropBelow }).toEqual(sides[size]);
+    }
   });
 
   test("grows monotonically through the named steps", () => {
-    const boxes = COMPANION_SIZES.map((size) => geometryFor(size).avatarBox);
+    const boxes = COMPANION_SIZES.map(
+      (size) => geometryFor(size, size).avatarBox,
+    );
     expect(boxes).toEqual([...boxes].sort((a, b) => a - b));
     expect(new Set(boxes).size).toBe(boxes.length);
   });
 
   /**
    * The canvas is a window size, and a window cannot be a fraction of a point.
-   * The offsets are not rounded, because they are arithmetic on the way to a
-   * position that is.
+   * The two offsets are whole points too, and the width is even: the avatar
+   * sits on the canvas's centre line and on the line between the offsets, so a
+   * fraction anywhere here stands the creature on a half point that a resize
+   * cannot land back on. The options axis is where this bites, since its
+   * smaller steps are not whole multiples of the box the layout is authored at.
    */
   test("gives every size a whole-point canvas", () => {
     for (const size of COMPANION_SIZES) {
-      const geometry = geometryFor(size);
+      const geometry = geometryFor(size, size);
       expect(Number.isInteger(geometry.canvasWidth)).toBe(true);
       expect(Number.isInteger(geometry.canvasHeight)).toBe(true);
+      expect(Number.isInteger(geometry.riseAbove)).toBe(true);
+      expect(Number.isInteger(geometry.dropBelow)).toBe(true);
+      expect(Number.isInteger(geometry.maxReach)).toBe(true);
+      expect(geometry.canvasWidth % 2).toBe(0);
     }
   });
 
@@ -596,12 +2492,201 @@ describe("geometryFor", () => {
    */
   test("keeps the canvas asymmetric about the avatar at every size", () => {
     for (const size of COMPANION_SIZES) {
-      const geometry = geometryFor(size);
+      const geometry = geometryFor(size, size);
       expect(geometry.dropBelow).toBeLessThan(geometry.riseAbove);
       expect(geometry.riseAbove + geometry.dropBelow).toBe(
         geometry.canvasHeight,
       );
     }
+  });
+});
+
+/**
+ * The canvas when the creature and the controls are sized apart, which is the
+ * shape the two axes exist for.
+ *
+ * Both sides of the avatar are sized for whichever card direction needs more,
+ * so main can still flip the direction by moving the window rather than
+ * rebuilding it. The cost is a few transparent points of slack in the direction
+ * that needed less, which is what the stated canvases carry: a side short by a
+ * point clips the pill or the card.
+ */
+describe("geometryFor with the two axes apart", () => {
+  const MIXED = [BIG_CREATURE, BIG_OPTIONS];
+
+  test("spends the whole canvas on the two sides of the avatar", () => {
+    for (const geometry of MIXED) {
+      expect(geometry.riseAbove + geometry.dropBelow).toBe(
+        geometry.canvasHeight,
+      );
+      expect(geometry.dropBelow).toBeLessThan(geometry.riseAbove);
+      expect(Number.isInteger(geometry.canvasHeight)).toBe(true);
+    }
+  });
+
+  /**
+   * Each mix as the canvas it comes to rather than as the formula repeated,
+   * since a formula restated here would pass against any change to the formula
+   * it restates.
+   *
+   * The width is where the gap rule shows: the gap is breathing room, so the
+   * smaller of the two boxes decides how much of it there is, and the creature
+   * below takes its small pill's gap rather than the chasm its own scale would
+   * ask for, which would put its reach at 376. The two heights are the two
+   * sides of the avatar: the near edge clears the creature's box and the pill's
+   * top alike, and the far edge clears the card growing either way.
+   */
+  test("holds the pill, the card and the creature at each mix", () => {
+    // An enormous creature's half box, the gap its small pill earns, and that
+    // pill at its widest.
+    expect(BIG_CREATURE).toEqual({
+      avatarBox: 110,
+      optionsBox: 32,
+      maxReach: 355,
+      canvasWidth: 830,
+      riseAbove: 274,
+      dropBelow: 115,
+      canvasHeight: 389,
+    });
+    // A base half box, the base gap, and a pill twice as wide.
+    expect(BIG_OPTIONS).toEqual({
+      avatarBox: 44,
+      optionsBox: 88,
+      maxReach: 834,
+      canvasWidth: 1764,
+      riseAbove: 614,
+      dropBelow: 122,
+      canvasHeight: 736,
+    });
+  });
+
+  test("flips the pill at the reach the options size asks for", () => {
+    expect(
+      growthFor(DISPLAY.width - BIG_CREATURE.maxReach, DISPLAY, BIG_CREATURE),
+    ).toBe("right");
+    expect(
+      growthFor(
+        DISPLAY.width - BIG_CREATURE.maxReach + 1,
+        DISPLAY,
+        BIG_CREATURE,
+      ),
+    ).toBe("left");
+  });
+
+  /**
+   * A display too narrow for the pill either way still grows the designed way,
+   * and an enormous options size beside a small creature is how a 1440pt
+   * display gets there.
+   */
+  test("still grows the designed way where neither side can hold the pill", () => {
+    const enormousOptions = geometryFor("small", "ridiculous");
+    expect(
+      growthFor(
+        DISPLAY.width - enormousOptions.maxReach + 1,
+        DISPLAY,
+        enormousOptions,
+      ),
+    ).toBe("right");
+  });
+});
+
+/**
+ * The menu a right-click on the surface pops, which is where a user actually
+ * reaches for the three things a floating avatar offers: a different size,
+ * its place on the screen back, and making it go away.
+ *
+ * The template rather than the menu: a menu is a native window, and what is
+ * worth stating is what this menu adds to the size pickers it shares with the
+ * tray, which is where they sit and the items that put the surface back and
+ * take it away. The pickers themselves have their own suite in
+ * `companion-menu.test.ts`.
+ */
+describe("companionContextMenuTemplate", () => {
+  /** Only what a menu item is read for here. */
+  type MenuItem = {
+    label?: string;
+    type?: string;
+    click?: () => void;
+  };
+
+  const build = (
+    current: Record<CompanionSizeAxis, CompanionSize> = {
+      avatar: "small",
+      options: "small",
+    },
+  ) => {
+    let hidden = false;
+    let opened = false;
+    let reset = false;
+    const items = companionContextMenuTemplate(current, {
+      open: () => {
+        opened = true;
+      },
+      setSize: () => {},
+      resetPosition: () => {
+        reset = true;
+      },
+      hide: () => {
+        hidden = true;
+      },
+    }) as MenuItem[];
+    return {
+      items,
+      wasHidden: () => hidden,
+      wasOpened: () => opened,
+      wasReset: () => reset,
+    };
+  };
+
+  /**
+   * The way back to Vellum leads, since a press on the creature is a call now
+   * and this is where going back to the app lives.
+   */
+  test("opens with the way back to Vellum", () => {
+    const { items, wasOpened } = build();
+    expect(items.slice(0, 2).map((item) => item.label ?? item.type)).toEqual([
+      "Open Vellum",
+      "separator",
+    ]);
+    items[0]?.click?.();
+    expect(wasOpened()).toBe(true);
+  });
+
+  test("closes with a separator and the way out, past the headings", () => {
+    expect(
+      build()
+        .items.map((item) => item.label ?? item.type)
+        .slice(5),
+    ).toEqual(["separator", "Hide Companion"]);
+  });
+
+  /**
+   * In the group with the sizes rather than beside the way out: it is about
+   * how the surface sits on the screen, which is what the headings are about.
+   */
+  test("offers the surface's place back, right after the headings", () => {
+    const { items, wasReset } = build();
+    expect(items[4]?.label).toBe("Reset Position");
+    items[4]?.click?.();
+    expect(wasReset()).toBe(true);
+  });
+
+  /**
+   * The headings are the shared builder's output rather than a second set of
+   * items, so the surface's menu and the tray's cannot describe the same choice
+   * differently. Compared as data, since the clicks are closures.
+   */
+  test("draws its two headings from the builder the tray reads", () => {
+    const current = { avatar: "ridiculous", options: "medium" } as const;
+    expect(JSON.stringify(build(current).items.slice(2, 4))).toBe(
+      JSON.stringify(companionSizeSubmenus(current, () => {})),
+    );
+  });
+
+  test("the last item takes the surface away", () => {
+    const menu = build();
+    menu.items[6]?.click?.();
+    expect(menu.wasHidden()).toBe(true);
   });
 });
 
@@ -614,18 +2699,32 @@ describe("geometryFor", () => {
  * the canvas, at whatever size.
  */
 describe("placing a larger companion", () => {
-  const LARGE = geometryFor("large");
+  const LARGE = geometryFor("large", "large");
+
+  /**
+   * One size on both axes, then the two mixes. The clamp binds on the creature,
+   * which is the avatar axis's answer, so an enormous pill beside a small
+   * creature must not hold that creature away from the edge, and an enormous
+   * creature beside a small pill must be held by its own whole box.
+   */
+  const SIZED = [LARGE, BIG_CREATURE, BIG_OPTIONS];
 
   test("holds the avatar at the edges by its own box, not the canvas", () => {
-    const placed = placeCanvas({ x: 9000, y: 500 }, WORK_AREA, LARGE);
-    expect(centreOf(placed, LARGE).x).toBe(1440 - LARGE.avatarBox / 2);
+    for (const geometry of SIZED) {
+      const placed = placeCanvas({ x: 9000, y: 500 }, WORK_AREA, geometry);
+      expect(centreOf(placed, geometry).x).toBe(
+        WORK_AREA.x + WORK_AREA.width - geometry.avatarBox / 2,
+      );
+    }
   });
 
   test("still never asks for an origin above the work area", () => {
-    for (const y of [-9000, 0, 25, 100, 400]) {
-      expect(
-        placeCanvas({ x: 700, y }, WORK_AREA, LARGE).origin.y,
-      ).toBeGreaterThanOrEqual(WORK_AREA.y);
+    for (const geometry of SIZED) {
+      for (const y of [-9000, 0, 25, 100, 400]) {
+        expect(
+          placeCanvas({ x: 700, y }, WORK_AREA, geometry).origin.y,
+        ).toBeGreaterThanOrEqual(WORK_AREA.y);
+      }
     }
   });
 
@@ -634,13 +2733,15 @@ describe("placing a larger companion", () => {
    * else. Bigger is a worse ceiling than `small` and still nothing like the
    * canvas half-height the bug was.
    */
-  test("reaches the top, short by its own scaled shadow", () => {
-    const centre = centreOf(
-      placeCanvas({ x: 700, y: -9000 }, WORK_AREA, LARGE),
-      LARGE,
-    );
-    expect(centre.y).toBe(WORK_AREA.y + LARGE.dropBelow);
-    expect(centre.y).toBeLessThan(WORK_AREA.y + LARGE.riseAbove);
+  test("reaches the top, short by the near edge its own canvas asks for", () => {
+    for (const geometry of SIZED) {
+      const centre = centreOf(
+        placeCanvas({ x: 700, y: -9000 }, WORK_AREA, geometry),
+        geometry,
+      );
+      expect(centre.y).toBe(WORK_AREA.y + geometry.dropBelow);
+      expect(centre.y).toBeLessThan(WORK_AREA.y + geometry.riseAbove);
+    }
   });
 
   test("flips the card at its own threshold, not the small one", () => {
@@ -650,6 +2751,58 @@ describe("placing a larger companion", () => {
     expect(
       cardGrowthFor(WORK_AREA.y + LARGE.riseAbove - 1, WORK_AREA, LARGE),
     ).toBe("down");
+  });
+});
+
+/**
+ * A size pick, which is the one moment the canvas is rebuilt.
+ *
+ * What has to survive it is the avatar, not the window. They are not the same
+ * point and the difference is most of the canvas, so a rebuild that kept the
+ * origin would slide the creature by the change in its offset and walk the
+ * thing the user was enlarging off across the desktop.
+ */
+describe("setCompanionSurfaceSize", () => {
+  /**
+   * Where the avatar is parked for the pick: low enough on the display that the
+   * card grows upward at both sizes, and far enough from either side that
+   * nothing is clamped. So the only thing that can move the creature is the
+   * resize itself.
+   */
+  const CENTRE = { x: 722, y: 800 };
+
+  test("rebuilds the canvas around the avatar rather than the origin", () => {
+    // Parked by the path a drag takes. The first delta runs past every edge, so
+    // it lands on a clamp whatever the window was doing beforehand; the second
+    // puts the avatar on `CENTRE`.
+    send("vellum:companion:moveBy", -100000, -100000);
+    send("vellum:companion:moveBy", 700, 754);
+    expect({
+      x: origin.x + GEOMETRY.canvasWidth / 2,
+      y: origin.y + RISE_ABOVE,
+    }).toEqual(CENTRE);
+
+    setCompanionSurfaceSize("options", "huge");
+
+    // One call rather than a size and then a position: two would put the window
+    // at the new size in the old place for a frame.
+    expect(boundsSet).toHaveLength(1);
+    const bounds = boundsSet[0];
+    expect({ width: bounds?.width, height: bounds?.height }).toEqual({
+      width: BIG_OPTIONS.canvasWidth,
+      height: BIG_OPTIONS.canvasHeight,
+    });
+    // The avatar read back out of the new canvas the way main reads it: half
+    // the width across, and the offset the card's direction asks for down.
+    expect({
+      x: (bounds?.x ?? 0) + BIG_OPTIONS.canvasWidth / 2,
+      y: (bounds?.y ?? 0) + BIG_OPTIONS.riseAbove,
+    }).toEqual(CENTRE);
+  });
+
+  test("leaves the other axis where it was", () => {
+    setCompanionSurfaceSize("options", "huge");
+    expect(sizes).toEqual({ avatar: "small", options: "huge" });
   });
 });
 
@@ -802,6 +2955,797 @@ describe("the watch summary main relays", () => {
   });
 });
 
+describe("the offer of Vellum's dictation on the surface", () => {
+  beforeEach(() => {
+    dispatched.length = 0;
+    windowsRaised = 0;
+    mainWindowOpen = true;
+    send("vellum:companion:setContext", context());
+    pushes.length = 0;
+  });
+
+  test("carries the offer through to the surface", () => {
+    send("vellum:companion:setContext", {
+      ...context(),
+      dictationOffer: {
+        reason: "claimed",
+        id: "offer-1",
+        app: "Wispr Flow",
+        text: "Send me the files.",
+      },
+    });
+    expect(state().dictationOffer).toEqual({
+      reason: "claimed",
+      id: "offer-1",
+      app: "Wispr Flow",
+      text: "Send me the files.",
+    });
+  });
+
+  /**
+   * The words and the way into the application they would go to went down
+   * with that window, so an offer left standing is one whose answers do
+   * nothing.
+   */
+  test("stops offering once the window that made the offer is gone", () => {
+    send("vellum:companion:setContext", {
+      ...context(),
+      dictationOffer: {
+        reason: "claimed",
+        id: "offer-1",
+        app: "Wispr Flow",
+        text: "Send me the files.",
+      },
+    });
+    expect(state().dictationOffer).toBeDefined();
+
+    mainWindowOpen = false;
+    fireVisibilityChange();
+
+    expect(state().dictationOffer).toBeUndefined();
+  });
+
+  test("a context with no offer reports none", () => {
+    send("vellum:companion:setContext", context());
+    expect(state().dictationOffer).toBeUndefined();
+  });
+
+  /**
+   * Every answer acts on the application in front, or on nothing, and the
+   * user is standing in that application, so none of them raises the app.
+   */
+  test("forwards every answer without raising the app", () => {
+    for (const answer of ["use", "quit", "copy", "dismiss"] as const) {
+      send("vellum:companion:answerDictationOffer", answer, "offer-2");
+    }
+    expect(dispatched).toEqual([
+      { kind: "answerDictationOffer", answer: "use", offerId: "offer-2" },
+      { kind: "answerDictationOffer", answer: "quit", offerId: "offer-2" },
+      { kind: "answerDictationOffer", answer: "copy", offerId: "offer-2" },
+      { kind: "answerDictationOffer", answer: "dismiss", offerId: "offer-2" },
+    ]);
+    expect(windowsRaised).toBe(0);
+  });
+
+  /**
+   * The one answer main acts on itself. It owns the pasteboard, and neither
+   * window either side of it can write one: the surface's never takes focus,
+   * which is what a renderer's clipboard write needs.
+   */
+  test("a copy takes the offered words to the pasteboard", () => {
+    send("vellum:companion:setContext", {
+      ...context(),
+      dictationOffer: {
+        reason: "no-text-field",
+        id: "offer-2",
+        text: "onions, tomatoes, and a bag of rice",
+      },
+    });
+
+    send("vellum:companion:answerDictationOffer", "copy", "offer-2");
+
+    expect(copied).toEqual(["onions, tomatoes, and a bag of rice"]);
+  });
+
+  /** Every other answer leaves the user's pasteboard as they left it. */
+  test("no other answer touches the pasteboard", () => {
+    send("vellum:companion:setContext", {
+      ...context(),
+      dictationOffer: {
+        reason: "no-text-field",
+        id: "offer-2",
+        text: "onions, tomatoes, and a bag of rice",
+      },
+    });
+
+    for (const answer of ["use", "quit", "dismiss"] as const) {
+      send("vellum:companion:answerDictationOffer", answer, "offer-2");
+    }
+
+    expect(copied).toEqual([]);
+  });
+
+  /**
+   * A press racing the offer's own expiry. The answer still travels, since
+   * the window that published it is the one that has to stop.
+   */
+  test("a copy with nothing waiting takes nothing and still answers", () => {
+    send("vellum:companion:answerDictationOffer", "copy", "offer-2");
+
+    expect(copied).toEqual([]);
+    expect(dispatched).toEqual([
+      { kind: "answerDictationOffer", answer: "copy", offerId: "offer-2" },
+    ]);
+  });
+
+  /**
+   * A press on a card the surface has not repainted yet, after a new hold
+   * has already replaced the offer here. The pasteboard is not given words
+   * the user never read, and the answer still travels named so the window
+   * publishing the new offer can drop it too.
+   */
+  test("a copy naming an offer that has been replaced takes nothing", () => {
+    send("vellum:companion:setContext", {
+      ...context(),
+      dictationOffer: {
+        reason: "no-text-field",
+        id: "offer-3",
+        text: "the words that took its place",
+      },
+    });
+    dispatched.length = 0;
+
+    send("vellum:companion:answerDictationOffer", "copy", "offer-2");
+
+    expect(copied).toEqual([]);
+    expect(dispatched).toEqual([
+      { kind: "answerDictationOffer", answer: "copy", offerId: "offer-2" },
+    ]);
+  });
+});
+
+/**
+ * The popover beside the surface: approvals, a credential, a card or a surface
+ * to open, published by the app's window and drawn in a window of its own, or
+ * as a row of a call's bar.
+ */
+describe("the popover beside the surface", () => {
+  const ONE = {
+    kind: "approvals" as const,
+    id: "req-1",
+    items: [
+      {
+        id: "req-1",
+        title: "Run a command",
+        detail: "Lists the files in your home folder.",
+      },
+    ],
+  };
+  const THREE = {
+    kind: "approvals" as const,
+    id: "req-1,req-2,req-3",
+    items: [
+      ONE.items[0],
+      { id: "req-2", title: "Open Safari", detail: "" },
+      { id: "req-3", title: "Send an email", detail: "" },
+    ],
+  };
+  const SECRET = {
+    kind: "secret" as const,
+    id: "sec-1",
+    service: "Booking.com",
+    detail: "",
+    label: "Password",
+    placeholder: "",
+  };
+  const CARD = {
+    kind: "card" as const,
+    id: "surf-1",
+    title: "A picture",
+    subtitle: "",
+    body: "![a](https://example.com/a.png)",
+    actions: [],
+  };
+
+  const popoverWindow = (): GlowWindow | null =>
+    others.get("companion-popover") ?? null;
+
+  const show = (popover: object, width = 300, height = 60): void => {
+    send("vellum:companion:setContext", context({ popover }));
+    send(
+      "vellum:companion:setPopoverSize",
+      (popover as { id: string }).id,
+      width,
+      height,
+    );
+  };
+
+  beforeEach(() => {
+    send("vellum:voiceActivity:end");
+    send("vellum:companion:setContext", context());
+    dispatched.length = 0;
+    windowsRaised = 0;
+  });
+
+  test("passes the popover through on the state, in its short form", () => {
+    send("vellum:companion:setContext", context({ popover: THREE }));
+
+    expect(state().popover).toEqual(THREE);
+    expect(state().popoverView).toBe("row");
+  });
+
+  test("a card has no short form and is always drawn whole", () => {
+    send("vellum:companion:setContext", context({ popover: CARD }));
+
+    expect(state().popoverView).toBe("expanded");
+  });
+
+  test("drops a popover that fails its bounds and keeps the rest", () => {
+    send(
+      "vellum:companion:setContext",
+      context({
+        watching: true,
+        popover: {
+          ...ONE,
+          items: [{ ...ONE.items[0], title: "x".repeat(10_000) }],
+        },
+      }),
+    );
+
+    expect(state().popover).toBeUndefined();
+    expect(state().watching).toBe(true);
+  });
+
+  /** Otherwise it would open at the size of whatever it showed last. */
+  test("is not shown until its page reports a size for it", () => {
+    send("vellum:companion:setContext", context({ popover: ONE }));
+    expect(popoverWindow()?.visible).toBe(false);
+
+    send("vellum:companion:setPopoverSize", "req-1", 320, 68);
+
+    expect(popoverWindow()?.visible).toBe(true);
+    expect(popoverWindow()?.bounds.width).toBe(320);
+    expect(popoverWindow()?.bounds.height).toBe(68);
+  });
+
+  test("a size reported for another popover shows nothing", () => {
+    const fresh = {
+      ...ONE,
+      id: "req-9",
+      items: [{ ...ONE.items[0], id: "req-9" }],
+    };
+    send("vellum:companion:setContext", context({ popover: fresh }));
+
+    send("vellum:companion:setPopoverSize", "req-0", 320, 68);
+
+    expect(popoverWindow()?.visible).toBe(false);
+  });
+
+  /** Answering one approval in the list must not blink the list away. */
+  test("stays on screen while the same kind of popover is measured again", () => {
+    show(THREE);
+
+    send("vellum:companion:setContext", context({ popover: ONE }));
+
+    expect(popoverWindow()?.visible).toBe(true);
+  });
+
+  test("goes away when there is nothing to show", () => {
+    show(ONE);
+
+    send("vellum:companion:setContext", context());
+
+    expect(popoverWindow()?.visible).toBe(false);
+  });
+
+  test("stands above the idle creature, centred on it", () => {
+    show(CARD, 380, 200);
+
+    const bounds = popoverWindow()?.bounds;
+    expect(bounds).toBeDefined();
+    expect(bounds?.height).toBe(200);
+  });
+
+  /** A call's bar docked to an edge carries the short form as a row itself. */
+  test("keeps its window away while a bottom-docked call's bar carries it", () => {
+    send("vellum:voiceActivity:start", START);
+    resetCompanionSurfacePosition();
+    show(THREE);
+
+    expect(popoverWindow()?.visible === true).toBe(false);
+    expect(state().popoverView).toBe("row");
+  });
+
+  /** Reviewed, the list joins the bar too: one shape, one glow. */
+  test("keeps its window away while the bar carries the reviewed list", () => {
+    send("vellum:voiceActivity:start", START);
+    resetCompanionSurfacePosition();
+    show(THREE, 400, 180);
+
+    send("vellum:companion:setPopoverView", "req-1,req-2,req-3", "expanded");
+
+    expect(popoverWindow()?.visible === true).toBe(false);
+    expect(state().popoverView).toBe("expanded");
+  });
+
+  /** A list or a form is taller than the card room the canvas keeps. */
+  test("grows the canvas to hold what the bar carries, and gives it back", () => {
+    send("vellum:voiceActivity:start", START);
+    resetCompanionSurfacePosition();
+    show(THREE, 400, 180);
+    send("vellum:companion:setPopoverView", "req-1,req-2,req-3", "expanded");
+    const before = boundsSet.at(-1)?.height ?? 0;
+
+    send("vellum:companion:setAttachedPopoverHeight", "req-1,req-2,req-3", 700);
+    const grown = boundsSet.at(-1)?.height ?? 0;
+    expect(grown).toBeGreaterThan(before);
+    expect(grown).toBeGreaterThanOrEqual(700);
+
+    send("vellum:companion:setContext", context());
+    expect(boundsSet.at(-1)?.height ?? 0).toBeLessThan(grown);
+  });
+
+  test("a height reported for another popover grows nothing", () => {
+    send("vellum:voiceActivity:start", START);
+    resetCompanionSurfacePosition();
+    show(THREE, 400, 180);
+    const count = boundsSet.length;
+
+    send("vellum:companion:setAttachedPopoverHeight", "req-0", 700);
+
+    expect(boundsSet.length).toBe(count);
+  });
+
+  /** The form takes typing, and the bar's window is the one drawing it. */
+  test("lends the surface's window the keyboard for a form on the bar", () => {
+    send("vellum:voiceActivity:start", START);
+    resetCompanionSurfacePosition();
+    show(SECRET);
+
+    send("vellum:companion:setPopoverView", "sec-1", "expanded");
+    expect(surface.focusable).toBe(true);
+    expect(surface.key).toBe(true);
+
+    send("vellum:companion:setPopoverView", "sec-1", "deferred");
+    expect(surface.focusable).toBe(false);
+  });
+
+  test("put off, shows nothing, and a new popover shows itself again", () => {
+    show(ONE);
+
+    send("vellum:companion:setPopoverView", "req-1", "deferred");
+    expect(state().popoverView).toBe("deferred");
+    expect(popoverWindow()?.visible).toBe(false);
+
+    show(THREE);
+    expect(state().popoverView).toBe("row");
+    expect(popoverWindow()?.visible).toBe(true);
+  });
+
+  /** Answering one approval in the list leaves the list open on the rest. */
+  test("stays reviewed while approvals are answered", () => {
+    show(THREE);
+    send("vellum:companion:setPopoverView", "req-1,req-2,req-3", "expanded");
+
+    send("vellum:companion:setContext", context({ popover: ONE }));
+
+    expect(state().popoverView).toBe("expanded");
+  });
+
+  test("forgets how it was shown once nothing is left", () => {
+    show(THREE);
+    send("vellum:companion:setPopoverView", "req-1,req-2,req-3", "expanded");
+    send("vellum:companion:setContext", context());
+
+    send("vellum:companion:setContext", context({ popover: THREE }));
+
+    expect(state().popoverView).toBe("row");
+  });
+
+  test("a view for a popover no longer standing is dropped", () => {
+    show(ONE);
+
+    send("vellum:companion:setPopoverView", "req-0", "deferred");
+
+    expect(state().popoverView).toBe("row");
+  });
+
+  /** The credential form takes typing, and nothing else on the popover does. */
+  test("lends the keyboard to the credential form and takes it back", () => {
+    show(SECRET);
+    expect(popoverWindow()?.key).toBe(false);
+
+    send("vellum:companion:setPopoverView", "sec-1", "expanded");
+    expect(popoverWindow()?.focusable).toBe(true);
+    expect(popoverWindow()?.key).toBe(true);
+
+    send("vellum:companion:setPopoverView", "sec-1", "deferred");
+    expect(popoverWindow()?.focusable).toBe(false);
+  });
+
+  test("steps off with the surface while the app is in front", () => {
+    show(ONE);
+
+    fireAppEvent("did-become-active");
+    expect(popoverWindow()?.visible).toBe(false);
+
+    fireAppEvent("did-resign-active");
+    expect(popoverWindow()?.visible).toBe(true);
+  });
+
+  test("takes prompts only while the surface is on screen", () => {
+    const takesPrompts = (): unknown =>
+      invocable.get("vellum:companion:takesPrompts")?.([]);
+
+    expect(takesPrompts()).toBe(true);
+
+    fireAppEvent("did-become-active");
+    expect(takesPrompts()).toBe(false);
+
+    fireAppEvent("did-resign-active");
+    surface.close();
+    expect(takesPrompts()).toBe(false);
+  });
+
+  /** Pressed, it goes: waiting on the submission leaves time to press again. */
+  test("takes an answered approval off at once, and drops a second press", () => {
+    send("vellum:companion:setContext", context({ popover: THREE }));
+
+    send(
+      "vellum:companion:answerPopover",
+      { kind: "allow", itemId: "req-1" },
+      "req-1,req-2,req-3",
+    );
+    send(
+      "vellum:companion:answerPopover",
+      { kind: "allow", itemId: "req-1" },
+      "req-2,req-3",
+    );
+
+    expect(dispatched).toHaveLength(1);
+    expect(state().popover).toEqual({
+      ...THREE,
+      id: "req-2,req-3",
+      items: THREE.items.slice(1),
+    });
+  });
+
+  test("takes the credential form off once confirmed", () => {
+    send("vellum:companion:setContext", context({ popover: SECRET }));
+
+    send(
+      "vellum:companion:answerPopover",
+      { kind: "secret", value: "hunter2" },
+      "sec-1",
+    );
+    send(
+      "vellum:companion:answerPopover",
+      { kind: "secret", value: "hunter2" },
+      "sec-1",
+    );
+
+    expect(dispatched).toHaveLength(1);
+    expect(state().popover).toBeUndefined();
+  });
+
+  /** The window stops publishing it, and the hold has nothing left to hide. */
+  test("forgets an answer once the prompt is gone from what is published", () => {
+    send("vellum:companion:setContext", context({ popover: ONE }));
+    send(
+      "vellum:companion:answerPopover",
+      { kind: "deny", itemId: "req-1" },
+      "req-1",
+    );
+    send("vellum:companion:setContext", context());
+
+    // The same request id published again is a prompt the user has not seen.
+    send("vellum:companion:setContext", context({ popover: ONE }));
+
+    expect(state().popover).toEqual(ONE);
+  });
+
+  /** Several voices are tried in a row, so a pick leaves the list up. */
+  test("keeps the voice picker up after a pick, and passes the pick on", () => {
+    const VOICES = {
+      kind: "voices" as const,
+      id: "voices",
+      groups: [
+        {
+          accent: "American",
+          voices: [
+            { id: "aura-1", label: "Warm", sampleUrl: "", isDefault: true },
+            { id: "aura-2", label: "Bright", sampleUrl: "", isDefault: false },
+          ],
+        },
+      ],
+      selected: "aura-1",
+    };
+    send("vellum:companion:setContext", context({ popover: VOICES }));
+
+    send(
+      "vellum:companion:answerPopover",
+      { kind: "pick", optionId: "aura-2" },
+      "voices",
+    );
+
+    expect(state().popover).toEqual(VOICES);
+    expect(dispatched).toEqual([
+      {
+        kind: "answerCompanionPopover",
+        popoverId: "voices",
+        answer: { kind: "pick", optionId: "aura-2" },
+      },
+    ]);
+  });
+
+  test("a chevron's press opens its picker in the window holding the call", () => {
+    send("vellum:companion:togglePicker", "microphones");
+
+    expect(dispatched).toEqual([
+      { kind: "toggleCompanionPicker", picker: "microphones" },
+    ]);
+    expect(windowsRaised).toBe(0);
+  });
+
+  test("the voice chevron follows what the window publishes", () => {
+    send("vellum:companion:setContext", context({ voicesPickable: true }));
+    expect(state().voicesPickable).toBe(true);
+
+    send("vellum:companion:setContext", context());
+    expect(state().voicesPickable).toBe(false);
+  });
+
+  test("an answer travels without raising the app", () => {
+    send("vellum:companion:setContext", context({ popover: ONE }));
+
+    send(
+      "vellum:companion:answerPopover",
+      { kind: "allow", itemId: "req-1" },
+      "req-1",
+    );
+
+    expect(dispatched).toEqual([
+      {
+        kind: "answerCompanionPopover",
+        popoverId: "req-1",
+        answer: { kind: "allow", itemId: "req-1" },
+      },
+    ]);
+    expect(windowsRaised).toBe(0);
+  });
+
+  /** Another request joining the list renames it, but not the row pressed. */
+  test("an approval's answer lands after the list around it changed", () => {
+    const others = {
+      ...THREE,
+      id: "req-2,req-3,req-4",
+      items: [
+        ...THREE.items.slice(1),
+        { id: "req-4", title: "Save the file", detail: "" },
+      ],
+    };
+    send("vellum:companion:setContext", context({ popover: others }));
+
+    send(
+      "vellum:companion:answerPopover",
+      { kind: "deny", itemId: "req-2" },
+      "req-2,req-3",
+    );
+
+    expect(dispatched).toHaveLength(1);
+  });
+
+  test("an answer naming what no longer stands is dropped", () => {
+    send("vellum:companion:setContext", context({ popover: ONE }));
+
+    send(
+      "vellum:companion:answerPopover",
+      { kind: "allow", itemId: "req-7" },
+      "req-1",
+    );
+    send(
+      "vellum:companion:answerPopover",
+      { kind: "secret", value: "hunter2" },
+      "sec-1",
+    );
+
+    expect(dispatched).toEqual([]);
+  });
+
+  test("open brings the app forward on the conversation", async () => {
+    send("vellum:companion:setContext", context({ popover: CARD }));
+
+    send("vellum:companion:answerPopover", { kind: "open" }, "surf-1");
+    await Promise.resolve();
+
+    expect(windowsRaised).toBe(1);
+    expect(dispatched).toEqual([
+      {
+        kind: "answerCompanionPopover",
+        popoverId: "surf-1",
+        answer: { kind: "open" },
+      },
+      { kind: "currentConversation" },
+    ]);
+  });
+
+  test("is given up when the app's window is destroyed", () => {
+    send("vellum:companion:setContext", context({ popover: ONE }));
+
+    mainWindowOpen = false;
+    fireVisibilityChange();
+
+    expect(state().popover).toBeUndefined();
+  });
+
+  test("opens web links in the browser", () => {
+    send("vellum:companion:openLink", "https://example.com/a?b=c");
+
+    expect(opened).toEqual(["https://example.com/a?b=c"]);
+  });
+
+  /** A link is model output: any other scheme hands the press to whatever claims it. */
+  test("refuses every link that is not http or https", () => {
+    for (const url of [
+      "file:///etc/passwd",
+      "javascript:alert(1)",
+      "vellum://workspace/x",
+      "not a url",
+    ]) {
+      send("vellum:companion:openLink", url);
+    }
+
+    expect(opened).toEqual([]);
+  });
+});
+
+describe("shownPopover", () => {
+  const LIST = {
+    kind: "approvals" as const,
+    id: "a,b",
+    items: [
+      { id: "a", title: "A", detail: "" },
+      { id: "b", title: "B", detail: "" },
+    ],
+  };
+
+  test("passes a popover with nothing answered through as it is", () => {
+    expect(shownPopover(LIST, () => false)).toBe(LIST);
+  });
+
+  test("names what is left of a list for the rows left", () => {
+    expect(shownPopover(LIST, (id) => id === "a")).toEqual({
+      ...LIST,
+      id: "b",
+      items: [LIST.items[1]],
+    });
+  });
+
+  test("shows nothing once everything is answered", () => {
+    expect(shownPopover(LIST, () => true)).toBeUndefined();
+    expect(
+      shownPopover(
+        { kind: "surface", id: "s", title: "Form" },
+        (id) => id === "s",
+      ),
+    ).toBeUndefined();
+  });
+});
+
+describe("popoverBoundsFor", () => {
+  const workArea = { x: 0, y: 0, width: 1440, height: 900 };
+
+  test("hangs above the anchor, centred on it", () => {
+    const bounds = popoverBoundsFor(
+      { centre: { x: 720, y: 860 }, side: "above", clearance: 20, workArea },
+      { width: 344, height: 200 },
+    );
+
+    expect(bounds.x + bounds.width / 2).toBe(720);
+    // The card's edge, inside the window's transparent inset, keeps the gap.
+    expect(bounds.y + bounds.height - COMPANION_POPOVER_INSET).toBe(
+      860 - 20 - POPOVER_GAP,
+    );
+  });
+
+  test("hangs beside a column docked to the left", () => {
+    const bounds = popoverBoundsFor(
+      { centre: { x: 40, y: 450 }, side: "right", clearance: 20, workArea },
+      { width: 344, height: 200 },
+    );
+
+    expect(bounds.x + COMPANION_POPOVER_INSET).toBe(40 + 20 + POPOVER_GAP);
+    expect(bounds.y + bounds.height / 2).toBe(450);
+  });
+
+  /** Pushed back on screen on its own side, it would cover the surface. */
+  test("goes to the opposite side when its own has no room", () => {
+    const bounds = popoverBoundsFor(
+      { centre: { x: 720, y: 60 }, side: "above", clearance: 20, workArea },
+      { width: 344, height: 200 },
+    );
+
+    expect(bounds.y).toBeGreaterThan(60);
+  });
+
+  test("stays inside the work area at the display's edge", () => {
+    const bounds = popoverBoundsFor(
+      { centre: { x: 10, y: 860 }, side: "above", clearance: 20, workArea },
+      { width: 344, height: 200 },
+    );
+
+    expect(bounds.x).toBeGreaterThanOrEqual(0);
+  });
+});
+
+/**
+ * The app's window owns the live session while main only holds the snapshot
+ * drawn on this surface. If that owner disappears, its socket and microphone
+ * disappear with it and the snapshot must not keep claiming a call is live.
+ */
+describe("the call's renderer ownership", () => {
+  beforeEach(() => {
+    mainWindowOpen = true;
+    send("vellum:voiceActivity:end");
+  });
+
+  test("is given up when the window is destroyed", () => {
+    send("vellum:voiceActivity:start", START);
+    expect(state().call).toEqual(START);
+    const before = pushes.length;
+
+    mainWindowOpen = false;
+    fireVisibilityChange();
+
+    expect(state().call).toBeNull();
+    expect(pushes.length).toBeGreaterThan(before);
+    expect(pushes.at(-1)?.call).toBeNull();
+  });
+
+  test("survives the window merely being hidden", () => {
+    send("vellum:voiceActivity:start", START);
+
+    mainWindowVisible = false;
+    fireVisibilityChange();
+
+    expect(state().call).toEqual(START);
+    send("vellum:voiceActivity:end");
+  });
+
+  test("is given up when its renderer loads a new document", () => {
+    send("vellum:voiceActivity:start", START);
+
+    mainRenderer.emit("did-start-navigation", {
+      isMainFrame: true,
+      isSameDocument: false,
+    });
+
+    expect(state().call).toBeNull();
+    expect(pushes.at(-1)?.call).toBeNull();
+  });
+
+  test("is given up when its renderer process exits", () => {
+    send("vellum:voiceActivity:start", START);
+
+    mainRenderer.emit("render-process-gone");
+
+    expect(state().call).toBeNull();
+    expect(pushes.at(-1)?.call).toBeNull();
+  });
+
+  test("survives same-document app navigation", () => {
+    send("vellum:voiceActivity:start", START);
+
+    mainRenderer.emit("did-start-navigation", {
+      isMainFrame: true,
+      isSameDocument: true,
+    });
+
+    expect(state().call).toEqual(START);
+    send("vellum:voiceActivity:end");
+  });
+});
+
 /**
  * The app's window is destroyed while this surface stays open.
  *
@@ -847,23 +3791,16 @@ describe("the watch flag when the app's window goes away", () => {
   });
 
   /**
-   * The tail and the name are a record of what was said and this surface is
-   * still where it is read, the same bargain `clearCompanionWorking` makes.
+   * The name is a record of whose surface this is and the surface is still
+   * where it is read, the same bargain `clearCompanionWorking` makes.
    */
-  test("leaves the conversation and the name standing", () => {
-    send(
-      "vellum:companion:setContext",
-      context({
-        watching: true,
-        turns: [{ role: "user", text: "hello" }],
-      }),
-    );
+  test("leaves the name standing", () => {
+    send("vellum:companion:setContext", context({ watching: true }));
 
     mainWindowOpen = false;
     fireVisibilityChange();
 
     expect(state().assistantName).toBe("Ziggy");
-    expect(state().turns).toEqual([{ role: "user", text: "hello" }]);
   });
 
   test("says nothing when no session was running", () => {
@@ -874,6 +3811,25 @@ describe("the watch flag when the app's window goes away", () => {
     fireVisibilityChange();
 
     expect(pushes.length).toBe(before);
+  });
+
+  /**
+   * A held key's recording lives in the same window, and goes down with it
+   * the same way. Left standing, the pill would go on listening to a
+   * microphone that is no longer open, with the last words it heard in it.
+   */
+  test("gives up a dictation the same way", () => {
+    send(
+      "vellum:companion:setContext",
+      context({ dictating: "listening", dictationText: "the quick brown" }),
+    );
+    expect(state().dictating).toBe("listening");
+
+    mainWindowOpen = false;
+    fireVisibilityChange();
+
+    expect(state().dictating).toBeUndefined();
+    expect(state().dictationText).toBeUndefined();
   });
 });
 
@@ -934,5 +3890,1668 @@ describe("the Watch flag on the pushed state", () => {
 
     expect(pushes.length).toBeGreaterThan(before);
     expect(pushes.at(-1)?.watchEnabled).toBe(false);
+  });
+});
+
+// The identity main holds, which is what opens the surface after a sign-in.
+// Imported after the mocks for the same reason the module under test is.
+const { setName } = await import("@vellumai/electron-desktop/identity");
+
+describe("the surface while the app is in front", () => {
+  test("steps off the screen when the app comes forward", () => {
+    fireAppEvent("did-become-active");
+
+    expect(surface.visible).toBe(false);
+  });
+
+  test("comes back when the user goes to another app", () => {
+    fireAppEvent("did-become-active");
+    fireAppEvent("did-resign-active");
+
+    expect(surface.visible).toBe(true);
+  });
+
+  test("stays while the active app's window is put away", () => {
+    mainWindowVisible = false;
+
+    fireAppEvent("did-become-active");
+
+    expect(surface.visible).toBe(true);
+  });
+
+  test("stays while the active app's window is closed", () => {
+    mainWindowOpen = false;
+
+    fireAppEvent("did-become-active");
+
+    expect(surface.visible).toBe(true);
+  });
+
+  test("steps off once the active app's window shows", () => {
+    mainWindowVisible = false;
+    fireAppEvent("did-become-active");
+
+    mainWindowVisible = true;
+    fireVisibilityChange();
+
+    expect(surface.visible).toBe(false);
+  });
+
+  test("comes back when the window is put away from the tray", () => {
+    fireAppEvent("did-become-active");
+
+    mainWindowVisible = false;
+    fireVisibilityChange();
+
+    expect(surface.visible).toBe(true);
+  });
+
+  test("comes back when the window is closed", () => {
+    fireAppEvent("did-become-active");
+
+    mainWindowOpen = false;
+    fireVisibilityChange();
+
+    expect(surface.visible).toBe(true);
+  });
+
+  test("reads the app's window taking focus as the app being in front", () => {
+    fireAppEvent("browser-window-focus", mainWindow);
+
+    expect(surface.visible).toBe(false);
+  });
+
+  test("does not read a panel taking focus as the app being in front", () => {
+    fireAppEvent("browser-window-focus", {});
+
+    expect(surface.visible).toBe(true);
+  });
+
+  test("opens straight off the screen over an app already in front", () => {
+    surface.close();
+    fireAppEvent("did-become-active");
+
+    setName("Aria");
+
+    expect(companionOpen).toBe(true);
+    expect(surface.visible).toBe(false);
+    setName(null);
+  });
+
+  test("opens on the screen when the user is working elsewhere", () => {
+    surface.close();
+
+    setName("Aria");
+
+    expect(companionOpen).toBe(true);
+    expect(surface.visible).toBe(true);
+    setName(null);
+  });
+
+  test("a surface put away by the tray is not brought back by the app", () => {
+    surface.close();
+    fireAppEvent("did-become-active");
+
+    fireAppEvent("did-resign-active");
+
+    expect(companionOpen).toBe(false);
+  });
+});
+
+/**
+ * Share, which takes the picker's pick the way Teach does and means the
+ * opposite thing by a press with none: the stop, since the surface can see
+ * a share is on. The frames themselves are the helper's; what this file
+ * holds is that main reaches it with the target it was given.
+ */
+describe("Share on the companion surface", () => {
+  beforeEach(() => {
+    mainWindowOpen = true;
+    dispatched.length = 0;
+    framesAsked.length = 0;
+    capturedFrame = { jpegBase64: "/9j/", width: 16, height: 9 };
+  });
+
+  test("a press with no pick is the stop", () => {
+    send("vellum:companion:setScreenShare");
+    expect(dispatched.at(-1)).toEqual({ kind: "setScreenShare" });
+    expect(picksResolved).toHaveLength(0);
+  });
+
+  test("a pick is resolved and rides the command as the share's target", async () => {
+    resolvedPick = { kind: "window", windowId: 4242 };
+    send("vellum:companion:setScreenShare", {
+      kind: "tab",
+      chromeWindowId: 3,
+      tabIndex: 2,
+    });
+    await Bun.sleep(0);
+    expect(picksResolved.at(-1)).toEqual({
+      kind: "tab",
+      chromeWindowId: 3,
+      tabIndex: 2,
+    });
+    expect(dispatched.at(-1)).toEqual({
+      kind: "setScreenShare",
+      target: { kind: "window", windowId: 4242 },
+    });
+  });
+
+  /**
+   * The two controls share one picker and one generation: a pick still
+   * resolving for Share when Teach is pressed belonged to a choice the user
+   * has left, and must not start a share beside the session.
+   */
+  test("a share pick superseded by a Teach press dispatches nothing", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const slow = resolvedPickAsync;
+    resolvedPickAsync = async () => {
+      await gate;
+      return { kind: "window", windowId: 1 };
+    };
+    send("vellum:companion:setScreenShare", {
+      kind: "tab",
+      chromeWindowId: 3,
+      tabIndex: 1,
+    });
+    resolvedPickAsync = slow;
+    send("vellum:companion:toggleWatch");
+    release();
+    await Bun.sleep(0);
+    expect(dispatched).toEqual([{ kind: "toggleWatch" }]);
+  });
+
+  test("a pick without the grant sends the user to it and starts nothing", async () => {
+    screenGranted = false;
+    settingsOpened.length = 0;
+    const resolvedBefore = picksResolved.length;
+    try {
+      send("vellum:companion:setScreenShare", {
+        kind: "display",
+        displayId: 2,
+      });
+      await Bun.sleep(0);
+      expect(settingsOpened).toEqual(["screen"]);
+      expect(picksResolved).toHaveLength(resolvedBefore);
+      expect(dispatched).toEqual([]);
+    } finally {
+      screenGranted = true;
+    }
+  });
+
+  test("a frame refused for want of the grant sends the user to it", async () => {
+    settingsOpened.length = 0;
+    frameError = SCREEN_REFUSAL;
+    capturedFrame = null;
+    try {
+      const capture = invocable.get("vellum:companion:captureScreen");
+      expect(await capture?.([{ kind: "display", displayId: 2 }])).toBeNull();
+      await Bun.sleep(0);
+      expect(settingsOpened).toEqual(["screen"]);
+    } finally {
+      frameError = null;
+    }
+  });
+
+  test("a frame missed for any other reason sends nobody anywhere", async () => {
+    settingsOpened.length = 0;
+    frameError = new Error("The window to capture is no longer on screen");
+    capturedFrame = null;
+    try {
+      const capture = invocable.get("vellum:companion:captureScreen");
+      expect(await capture?.([{ kind: "window", windowId: 7 }])).toBeNull();
+      await Bun.sleep(0);
+      expect(settingsOpened).toEqual([]);
+    } finally {
+      frameError = null;
+    }
+  });
+
+  test("takes a frame of the shared target from the helper", async () => {
+    const capture = invocable.get("vellum:companion:captureScreen");
+    expect(capture).toBeDefined();
+    expect(await capture?.([{ kind: "display", displayId: 2 }])).toEqual({
+      jpegBase64: "/9j/",
+      width: 16,
+      height: 9,
+    });
+    expect(framesAsked).toEqual([{ kind: "display", displayId: 2 }]);
+    capturedFrame = null;
+    expect(await capture?.([{ kind: "window", windowId: 7 }])).toBeNull();
+  });
+
+  test("takes a picker preview of one row from the helper", async () => {
+    const preview = invocable.get("vellum:companion:captureSourceThumbnail");
+    expect(preview).toBeDefined();
+    expect(await preview?.([{ kind: "window", windowId: 7 }])).toBe(
+      "data:image/jpeg;base64,/9j/",
+    );
+    expect(thumbnailsAsked).toEqual([{ kind: "window", windowId: 7 }]);
+    // A window that closed between the list and the grid is a tile with no
+    // picture, not a failed call.
+    capturedThumbnail = null;
+    expect(await preview?.([{ kind: "display", displayId: 2 }])).toBeNull();
+  });
+
+  test("carries the share and whether one may start to the surface", () => {
+    send(
+      "vellum:companion:setContext",
+      context({
+        screenShareEnabled: true,
+        screenShare: { kind: "window", windowId: 7 },
+      }),
+    );
+    expect(state().screenShare).toEqual({ kind: "window", windowId: 7 });
+    expect(state().screenShareEnabled).toBe(true);
+    send("vellum:companion:setContext", context());
+    expect(state().screenShare).toBeUndefined();
+    expect(state().screenShareEnabled).toBe(false);
+  });
+
+  /**
+   * The frame says what is being shown, the way it says what is being read:
+   * a share with no session reading the screen frames the shared display.
+   */
+  test("frames what is shared when nothing is reading the screen", () => {
+    send(
+      "vellum:companion:setContext",
+      context({ screenShare: { kind: "display", displayId: 2 } }),
+    );
+    expect(glow?.bounds).toEqual({ x: 1440, y: 0, width: 1920, height: 1080 });
+    send("vellum:companion:setContext", context());
+    expect(glow).toBeNull();
+  });
+
+  /**
+   * A whole display is framed to its full bounds, and the menu bar draws
+   * over the top of that window. What the frame draws at its top has to
+   * start below the bar, and only the shell knows how tall it is.
+   */
+  test("reports the menu bar's height over a framed display", () => {
+    displays[1] = {
+      ...displays[1],
+      workArea: { x: 1440, y: 25, width: 1920, height: 1055 },
+    };
+    send(
+      "vellum:companion:setContext",
+      context({ screenShare: { kind: "display", displayId: 2 } }),
+    );
+    expect(state().frameInsetTop).toBe(25);
+  });
+
+  /**
+   * The bar can change height under a running share, and the frame's
+   * renderer holds whatever it was last pushed. The events that move the
+   * bar are the ones that place the frame again, so the inset travels with
+   * that placement, whether or not the surface's own growth changed and
+   * whether or not the surface is on screen at all.
+   */
+  test("pushes the inset again when the menu bar changes height", () => {
+    send(
+      "vellum:companion:setContext",
+      context({ screenShare: { kind: "display", displayId: 2 } }),
+    );
+    expect(glowPushes.at(-1)?.frameInsetTop).toBe(0);
+    glowPushes.length = 0;
+    displays[1] = {
+      ...displays[1],
+      workArea: { x: 1440, y: 37, width: 1920, height: 1043 },
+    };
+    fireDisplayEvent("display-metrics-changed");
+    expect(glowPushes.at(-1)?.frameInsetTop).toBe(37);
+  });
+
+  test("pushes the inset again with the surface hidden", () => {
+    send(
+      "vellum:companion:setContext",
+      context({ screenShare: { kind: "display", displayId: 2 } }),
+    );
+    companionOpen = false;
+    glowPushes.length = 0;
+    displays[1] = {
+      ...displays[1],
+      workArea: { x: 1440, y: 37, width: 1920, height: 1043 },
+    };
+    fireDisplayEvent("display-metrics-changed");
+    expect(glowPushes.at(-1)?.frameInsetTop).toBe(37);
+  });
+
+  /** A display event that left the bar alone is not a reason to push. */
+  test("does not push for a display event that left the bar alone", () => {
+    send(
+      "vellum:companion:setContext",
+      context({ screenShare: { kind: "display", displayId: 2 } }),
+    );
+    glowPushes.length = 0;
+    fireDisplayEvent("display-metrics-changed");
+    expect(glowPushes).toHaveLength(0);
+  });
+
+  test("reports no inset over a framed window", () => {
+    send(
+      "vellum:companion:setContext",
+      context({ screenShare: { kind: "window", windowId: 7 } }),
+    );
+    expect(state().frameInsetTop).toBeUndefined();
+  });
+
+  test("reports no inset with nothing framed", () => {
+    send("vellum:companion:setContext", context());
+    expect(state().frameInsetTop).toBeUndefined();
+  });
+
+  test("the share ends with the window holding it", () => {
+    send(
+      "vellum:companion:setContext",
+      context({
+        screenShareEnabled: true,
+        screenShare: { kind: "display", displayId: 2 },
+      }),
+    );
+    mainWindowOpen = false;
+    fireVisibilityChange();
+    expect(state().screenShare).toBeUndefined();
+    expect(state().screenShareEnabled).toBe(false);
+    expect(glow).toBeNull();
+  });
+});
+
+/**
+ * Drawing on the shared surface.
+ *
+ * Main's half of it is the mode: whether the frame it opened takes the mouse.
+ * That is the part no renderer can hold and the part that, left on by
+ * mistake, is a transparent window eating every click on a display.
+ */
+describe("companion window: drawing on what is shared", () => {
+  /** The accent the frame's window drew the marks in, sent with them. */
+  const INK = "#a78bfa";
+
+  // The context and the mode are main's own, and outlive a case. Cleared
+  // rather than assumed, so each of these starts on a desktop with nothing
+  // shared and a frame that is click-through.
+  beforeEach(() => {
+    send("vellum:companion:setContext", context());
+  });
+
+  const shareDisplay = (): void => {
+    send(
+      "vellum:companion:setContext",
+      context({
+        screenShareEnabled: true,
+        screenShare: { kind: "display", displayId: 2 },
+      }),
+    );
+  };
+
+  test("the frame is click-through until drawing is turned on", () => {
+    shareDisplay();
+    expect(glow?.clickThrough).toBe(true);
+    expect(state().annotating).toBe(false);
+    send("vellum:companion:setAnnotating", true);
+    expect(glow?.clickThrough).toBe(false);
+    expect(state().annotating).toBe(true);
+  });
+
+  test("a second press gives the mouse back to the desktop", () => {
+    shareDisplay();
+    send("vellum:companion:setAnnotating", true);
+    send("vellum:companion:setAnnotating", false);
+    expect(glow?.clickThrough).toBe(true);
+    expect(state().annotating).toBe(false);
+  });
+
+  /**
+   * The keyboard's press, which has no view of the mode and so cannot ask
+   * for a direction. Main holds it, so main turns it over.
+   */
+  test("a toggle turns the mode over in both directions", () => {
+    shareDisplay();
+    send("vellum:companion:toggleAnnotating");
+    expect(state().annotating).toBe(true);
+    expect(glow?.clickThrough).toBe(false);
+
+    send("vellum:companion:toggleAnnotating");
+    expect(state().annotating).toBe(false);
+    expect(glow?.clickThrough).toBe(true);
+  });
+
+  /**
+   * What a press on the frame draws is main's for the reason the mode is:
+   * the pill chooses it and the frame draws with it, and both read it off
+   * the pushed state. Kept across the mode and the share, since it decides
+   * nothing about where a click goes and a user who reached for the box
+   * expects it under their hand next time.
+   */
+  test("the tool is the pencil until the pill says otherwise, and is kept", () => {
+    shareDisplay();
+    expect(state().annotationTool).toBe("freehand");
+    send("vellum:companion:setAnnotationTool", "box");
+    expect(state().annotationTool).toBe("box");
+
+    send("vellum:companion:setAnnotating", true);
+    send("vellum:companion:setAnnotating", false);
+    expect(state().annotationTool).toBe("box");
+
+    send("vellum:companion:setContext", context());
+    expect(state().annotationTool).toBe("box");
+  });
+
+  test("the wire refuses a tool it does not know", () => {
+    expect(companionAnnotationToolSchema.safeParse("star").success).toBe(false);
+    expect(companionAnnotationToolSchema.safeParse("circle").success).toBe(
+      true,
+    );
+  });
+
+  /**
+   * A frame taking presses takes the wheel with them, and it cannot forward
+   * a wheel event it has taken. So on the first one the renderer sees, the
+   * frame steps aside for the rest of the scroll, with mouse-move forwarded
+   * so the renderer can see the pointer move and ask for the mouse back. The
+   * mode stays on the whole time: the user did not press Draw again.
+   */
+  test("a scroll on the frame lets the rest of it through to the app", () => {
+    shareDisplay();
+    send("vellum:companion:setAnnotating", true);
+    send("vellum:companion:setFrameScrolling", true);
+    expect(glow?.clickThrough).toBe(true);
+    expect(glow?.forwarded).toBe(true);
+    expect(state().annotating).toBe(true);
+  });
+
+  test("the pointer moving after a scroll takes the mouse back", () => {
+    shareDisplay();
+    send("vellum:companion:setAnnotating", true);
+    send("vellum:companion:setFrameScrolling", true);
+    send("vellum:companion:setFrameScrolling", false);
+    expect(glow?.clickThrough).toBe(false);
+    expect(state().annotating).toBe(true);
+  });
+
+  /**
+   * A hand that scrolls and then presses without moving the pointer never
+   * sends the renderer a move to ask with, and the press would land on the
+   * app. The desktop knows when the scroll stopped, so main asks the helper
+   * to watch for that while the frame is stepped aside, and takes the mouse
+   * back the moment it hears it.
+   */
+  test("the scroll ending takes the mouse back without a move", () => {
+    const watches: boolean[] = [];
+    provideFrameScrollWatch((enable) => watches.push(enable));
+    shareDisplay();
+    send("vellum:companion:setAnnotating", true);
+    send("vellum:companion:setFrameScrolling", true);
+    expect(watches).toEqual([true]);
+    frameScrollEnded();
+    expect(glow?.clickThrough).toBe(false);
+    expect(glow?.forwarded).toBe(false);
+    expect(state().annotating).toBe(true);
+    expect(watches).toEqual([true, false]);
+  });
+
+  /** The watch is up only while the frame is stepped aside, whichever way that ends. */
+  test("every way out of a scroll takes the watch down with it", () => {
+    const watches: boolean[] = [];
+    provideFrameScrollWatch((enable) => watches.push(enable));
+    shareDisplay();
+    send("vellum:companion:setAnnotating", true);
+
+    send("vellum:companion:setFrameScrolling", true);
+    send("vellum:companion:setFrameScrolling", false);
+    expect(watches).toEqual([true, false]);
+
+    send("vellum:companion:setFrameScrolling", true);
+    send("vellum:companion:setAnnotating", false);
+    expect(watches).toEqual([true, false, true, false]);
+
+    send("vellum:companion:setAnnotating", true);
+    send("vellum:companion:setFrameScrolling", true);
+    send("vellum:companion:setContext", context());
+    expect(watches).toEqual([true, false, true, false, true, false]);
+
+    // A scroll that ended after the frame stopped waiting changes nothing.
+    frameScrollEnded();
+    expect(watches).toHaveLength(6);
+  });
+
+  /** Off the mode there is no watch to put up, and no scroll end to act on. */
+  test("a scroll ending with the mode off is nothing", () => {
+    const watches: boolean[] = [];
+    provideFrameScrollWatch((enable) => watches.push(enable));
+    shareDisplay();
+    send("vellum:companion:setFrameScrolling", true);
+    frameScrollEnded();
+    expect(watches).toEqual([]);
+    expect(glow?.clickThrough).toBe(true);
+  });
+
+  /**
+   * Off the mode the frame has no mouse to hand back, and a scroll remembered
+   * against the next press would open the mode click-through.
+   */
+  test("a scroll with the mode off changes nothing, now or later", () => {
+    shareDisplay();
+    send("vellum:companion:setFrameScrolling", true);
+    expect(glow?.clickThrough).toBe(true);
+    expect(glow?.forwarded).toBe(false);
+    send("vellum:companion:setAnnotating", true);
+    expect(glow?.clickThrough).toBe(false);
+  });
+
+  /** The mode going off leaves nothing for the scroll to have stepped aside from. */
+  test("the mode going off forgets the scroll it stepped aside for", () => {
+    shareDisplay();
+    send("vellum:companion:setAnnotating", true);
+    send("vellum:companion:setFrameScrolling", true);
+    send("vellum:companion:setAnnotating", false);
+    expect(glow?.clickThrough).toBe(true);
+    expect(glow?.forwarded).toBe(false);
+    send("vellum:companion:setAnnotating", true);
+    expect(glow?.clickThrough).toBe(false);
+  });
+
+  /**
+   * The mode outlives the frame's window, which is replaced when the share
+   * ends and starts again. The new window's renderer has seen no scroll, so
+   * one the old window stepped aside for would leave it click-through with
+   * nothing to ask for the mouse back.
+   */
+  test("a frame opened afresh takes the mouse whatever the last one did", () => {
+    shareDisplay();
+    send("vellum:companion:setAnnotating", true);
+    send("vellum:companion:setFrameScrolling", true);
+    send("vellum:companion:setContext", context());
+    expect(glow).toBeNull();
+    shareDisplay();
+    send("vellum:companion:setAnnotating", true);
+    expect(glow?.clickThrough).toBe(false);
+    expect(glow?.forwarded).toBe(false);
+  });
+
+  /**
+   * Chromium on macOS puts a page's cursor on the pointer only for the key
+   * window, and the frame opens unable to become one. So the mode lends it
+   * key status, or the pencil the layer hangs on the pointer never shows and
+   * nothing on screen says a press is now a mark.
+   */
+  test("drawing on lends the frame key status, so its pencil can show", () => {
+    shareDisplay();
+    expect(glow?.focusable).toBe(false);
+    expect(glow?.key).toBe(false);
+    send("vellum:companion:setAnnotating", true);
+    expect(glow?.focusable).toBe(true);
+    expect(glow?.key).toBe(true);
+  });
+
+  /**
+   * Off the mode the frame may not become key again: a click-through window
+   * that still could would take the keyboard on the next press that reached
+   * it. Resigning key is not something main can ask for on macOS, so what it
+   * can do is stop the frame taking it back.
+   */
+  test("drawing off makes the frame unfocusable again", () => {
+    shareDisplay();
+    send("vellum:companion:setAnnotating", true);
+    send("vellum:companion:setAnnotating", false);
+    expect(glow?.focusable).toBe(false);
+  });
+
+  /** The mode is still on across a scroll, and the mouse is coming back. */
+  test("a scroll the frame steps aside for leaves its key status alone", () => {
+    shareDisplay();
+    send("vellum:companion:setAnnotating", true);
+    send("vellum:companion:setFrameScrolling", true);
+    expect(glow?.focusable).toBe(true);
+    expect(glow?.key).toBe(true);
+  });
+
+  /** A window that replaces the frame mid-mode is lent key the same way. */
+  test("a frame opened afresh is lent key status with the mouse", () => {
+    shareDisplay();
+    send("vellum:companion:setAnnotating", true);
+    send("vellum:companion:setContext", context());
+    expect(glow).toBeNull();
+    shareDisplay();
+    send("vellum:companion:setAnnotating", true);
+    expect(glow?.focusable).toBe(true);
+    expect(glow?.key).toBe(true);
+  });
+
+  /**
+   * A gesture made in the gap between a share ending and the surface hearing
+   * about it asks for a mode there is nothing to draw in. Refused the same
+   * way the press on the pill is, so the toggle cannot arm the mode ahead of
+   * a share by being pressed twice.
+   */
+  test("a toggle with nothing shared leaves the mode off", () => {
+    send("vellum:companion:toggleAnnotating");
+    expect(state().annotating).toBe(false);
+    send("vellum:companion:toggleAnnotating");
+    expect(state().annotating).toBe(false);
+  });
+
+  /**
+   * The mode can never be armed ahead of a share, or it would take a
+   * display's clicks the moment one started.
+   */
+  test("refuses the mode with nothing shared", () => {
+    send("vellum:companion:setAnnotating", true);
+    expect(state().annotating).toBe(false);
+  });
+
+  /**
+   * The frame prefers a watch session's target when both are running, so the
+   * frame would be around the surface being read while the frames sent are of
+   * the surface being shared. A mark on one would arrive on the other.
+   */
+  test("refuses the mode while a watch session owns the frame", () => {
+    send(
+      "vellum:companion:setContext",
+      context({
+        watching: true,
+        screenShareEnabled: true,
+        screenShare: { kind: "display", displayId: 2 },
+      }),
+    );
+    send("vellum:companion:setAnnotating", true);
+    expect(state().annotating).toBe(false);
+  });
+
+  test("a share that ends takes the mode with it", () => {
+    shareDisplay();
+    send("vellum:companion:setAnnotating", true);
+    send("vellum:companion:setContext", context());
+    expect(state().annotating).toBe(false);
+  });
+
+  test("a watch session starting mid-drawing takes the mode with it", () => {
+    shareDisplay();
+    send("vellum:companion:setAnnotating", true);
+    send(
+      "vellum:companion:setContext",
+      context({
+        watching: true,
+        screenShareEnabled: true,
+        screenShare: { kind: "display", displayId: 2 },
+      }),
+    );
+    expect(state().annotating).toBe(false);
+  });
+
+  test("hands a finished mark to the window holding the session", () => {
+    shareDisplay();
+    send("vellum:companion:setAnnotating", true);
+    dispatched.length = 0;
+    const strokes = [{ points: [{ x: 0.25, y: 0.5 }] }];
+    send("vellum:companion:annotateShare", "released", strokes, INK);
+    expect(dispatched).toEqual([
+      { kind: "annotateShare", phase: "released", strokes, ink: INK },
+    ]);
+  });
+
+  /** The hand going down is what stops the frames, so it travels too. */
+  test("hands on the hand going down as well as coming off", () => {
+    shareDisplay();
+    send("vellum:companion:setAnnotating", true);
+    dispatched.length = 0;
+    send("vellum:companion:annotateShare", "drawing", [], INK);
+    expect(dispatched).toEqual([
+      { kind: "annotateShare", phase: "drawing", strokes: [], ink: INK },
+    ]);
+  });
+
+  /**
+   * Lowering the mode is what unmounts the layer, and the layer lets go of
+   * the hand on its way out, so that release always arrives after the mode is
+   * already off. Refusing it would refuse it exactly on the path it exists
+   * for, leaving the session suppressing every frame for a hand that came off
+   * with the mode.
+   */
+  test("lets a bare release through after the mode has gone", () => {
+    shareDisplay();
+    send("vellum:companion:setAnnotating", true);
+    send("vellum:companion:setAnnotating", false);
+    dispatched.length = 0;
+    send("vellum:companion:annotateShare", "released", [], INK);
+    expect(dispatched).toEqual([
+      { kind: "annotateShare", phase: "released", strokes: [], ink: INK },
+    ]);
+  });
+
+  /**
+   * The coordinates are fractions of the frame, and the frame is only around
+   * the shared surface while the mode holds. A mark arriving outside it
+   * describes nothing.
+   */
+  test("drops a mark sent while the mode is off", () => {
+    shareDisplay();
+    dispatched.length = 0;
+    send(
+      "vellum:companion:annotateShare",
+      "released",
+      [{ points: [{ x: 0.5, y: 0.5 }] }],
+      INK,
+    );
+    expect(dispatched).toHaveLength(0);
+  });
+
+  /**
+   * The coordinates are fractions of the shared surface, so a point outside
+   * `0`..`1` describes somewhere that surface does not reach. Checked against
+   * the schema rather than through a send, because the registrar drops what
+   * fails to parse and a dropped command is indistinguishable here from one
+   * this handler refused for its own reasons.
+   */
+  /** The colour is a canvas fill on the other side, so it is checked here. */
+  test("the wire refuses a colour that is not one", () => {
+    expect(companionAnnotationInkSchema.safeParse("red").success).toBe(false);
+    expect(companionAnnotationInkSchema.safeParse(INK).success).toBe(true);
+  });
+
+  test("the wire refuses a mark that falls outside the surface", () => {
+    expect(
+      companionAnnotationStrokeSchema.safeParse({
+        points: [{ x: 4, y: 0.5 }],
+      }).success,
+    ).toBe(false);
+    expect(
+      companionAnnotationStrokeSchema.safeParse({
+        points: [{ x: 0.25, y: 0.5 }],
+      }).success,
+    ).toBe(true);
+  });
+});
+
+/**
+ * What the assistant points at on the shared surface.
+ *
+ * Main's half is the same half it holds for the drawing: whether the marks
+ * describe anything at all. They are fractions of the surface its frame is
+ * around, so a mark that outlives the share is a ring around whatever has
+ * since moved under it.
+ */
+describe("companion window: pointing at what is shared", () => {
+  const MARK = { x: 0.1, y: 0.2, width: 0.3, height: 0.1, caption: "Press" };
+  /** The same rectangle as it travels once the surface has tagged it. */
+  const DRAWN_MARK = { kind: "region" as const, ...MARK };
+  /** The conversation the shared call belongs to. */
+  const CALL = "conv-abc";
+  /** Any other conversation the same user has running. */
+  const OTHER = "conv-xyz";
+  const DISPLAY = { kind: "display", displayId: 2 } as const;
+  const WINDOW = { kind: "window", windowId: 9 } as const;
+
+  beforeEach(() => {
+    locatesAsked.length = 0;
+    locateHeldBy = null;
+    located = {
+      found: true,
+      label: "Share",
+      role: "AXButton",
+      x: 120,
+      y: 80,
+      width: 60,
+      height: 20,
+    };
+    send("vellum:companion:setContext", context());
+  });
+
+  const shareOf = (
+    target: typeof DISPLAY | typeof WINDOW,
+    over: Record<string, unknown> = {},
+  ): void => {
+    send(
+      "vellum:companion:setContext",
+      context({
+        screenShareEnabled: true,
+        screenShare: target,
+        callConversationId: CALL,
+        ...over,
+      }),
+    );
+  };
+
+  const shareDisplay = (): void => shareOf(DISPLAY);
+
+  /**
+   * A frame of `target` served to the window holding the session, which is
+   * how main learns which surface the assistant is measuring against.
+   */
+  const capture = async (
+    target: typeof DISPLAY | typeof WINDOW = DISPLAY,
+  ): Promise<void> => {
+    const take = invocable.get("vellum:companion:captureScreen");
+    if (!take) {
+      throw new Error("No handler registered for captureScreen");
+    }
+    await take([target]);
+  };
+
+  /**
+   * The window holding the session saying a frame of `target` reached the
+   * call, which is the moment the assistant has actually been shown it.
+   */
+  const acknowledge = (
+    target: typeof DISPLAY | typeof WINDOW = DISPLAY,
+  ): void => {
+    send("vellum:companion:sharedFrame", target);
+  };
+
+  /** A share with a frame of it already sent, which is the resting case. */
+  const shareAndSee = async (
+    target: typeof DISPLAY | typeof WINDOW = DISPLAY,
+  ): Promise<void> => {
+    shareOf(target);
+    await capture(target);
+    acknowledge(target);
+  };
+
+  test("puts the marks on the state the frame reads", async () => {
+    await shareAndSee();
+    expect(await showCompanionCoachmarks([MARK], CALL)).toMatchObject({
+      kind: "placed",
+    });
+    expect(state().coachmarks).toEqual([{ kind: "region", ...MARK }]);
+  });
+
+  /** Nothing pointed at is absence, so a frame reads one shape for it. */
+  test("says nothing rather than nothing-in-a-list", async () => {
+    await shareAndSee();
+    expect(state().coachmarks).toBeUndefined();
+    await showCompanionCoachmarks([MARK], CALL);
+    await showCompanionCoachmarks([], CALL);
+    expect(state().coachmarks).toBeUndefined();
+  });
+
+  /**
+   * The user's own way to take the marks down, from the pill. The share is
+   * what the marks are about and it goes on; the frame stays around it. The
+   * count is read as a difference, since it is main's own and outlives a
+   * case.
+   */
+  describe("the pill's Clear", () => {
+    const clears = (): number => state().marksCleared ?? 0;
+
+    test("takes the marks down and leaves the share running", async () => {
+      await shareAndSee();
+      await showCompanionCoachmarks([MARK], CALL);
+      const before = clears();
+      send("vellum:companion:clearMarks");
+      expect(state().coachmarks).toBeUndefined();
+      expect(state().screenShare).toEqual(DISPLAY);
+      expect(clears()).toBe(before + 1);
+    });
+
+    /**
+     * The user's own ink is on the frame's window and main never sees it,
+     * so the press reaches it as a step in a count on the pushed state. The
+     * step has to happen whether or not the assistant had marks up, since
+     * the ink is the other thing the press is about.
+     */
+    test("steps the count the frame drops its ink on, marks up or not", () => {
+      shareDisplay();
+      send("vellum:companion:setAnnotating", true);
+      const before = clears();
+      send("vellum:companion:clearMarks");
+      send("vellum:companion:clearMarks");
+      expect(clears()).toBe(before + 2);
+      // The mode is the user's, and stays where they put it.
+      expect(state().annotating).toBe(true);
+    });
+
+    test("is nothing with nothing shared", () => {
+      const before = clears();
+      send("vellum:companion:clearMarks");
+      expect(clears()).toBe(before);
+    });
+
+    /** The race `screen_clear_marks` runs, with the same answer. */
+    test("outranks a lookup still out when it is pressed", async () => {
+      windowBounds = { x: 100, y: 50, width: 1000, height: 500 };
+      await shareAndSee(WINDOW);
+      let letGo!: () => void;
+      locateHeldBy = new Promise<void>((resolve) => {
+        letGo = resolve;
+      });
+      const drawing = showCompanionCoachmarks([{ target: "Share" }], CALL);
+      send("vellum:companion:clearMarks");
+      letGo();
+
+      expect(await drawing).toEqual({
+        kind: "refused",
+        refusal: "superseded",
+      });
+      expect(state().coachmarks).toBeUndefined();
+    });
+  });
+
+  /**
+   * The whole reason a mark may name a control rather than give a rectangle:
+   * the tree holds the control's frame exactly, so the fractions are derived
+   * rather than estimated. A window at (100,50) 1000x500 with the control at
+   * (120,80) 60x20 puts it 2% in and 6% down, 6% wide and 4% tall.
+   */
+  test("aims at the middle of a named control, not its bounds", async () => {
+    windowBounds = { x: 100, y: 50, width: 1000, height: 500 };
+    await shareAndSee(WINDOW);
+    const result = await showCompanionCoachmarks(
+      [{ target: "the share button", caption: "Press" }],
+      CALL,
+    );
+
+    expect(locatesAsked).toEqual([
+      { target: WINDOW, query: "the share button" },
+    ]);
+    // The control is at (120,80) 60x20, so its middle is (150,90): a twentieth
+    // of the way across the window and two twenty-fifths down it. No width or
+    // height travels, because the frame's extent is the part that misleads.
+    expect(result).toEqual({
+      kind: "placed",
+      marks: [
+        {
+          kind: "point",
+          x: 0.05,
+          y: 0.08,
+          caption: "Press",
+          matched: "Share",
+        },
+      ],
+    });
+    // What is drawn is the place alone: the name it resolved from is for the
+    // caller to say out loud, not for the frame to hold.
+    expect(state().coachmarks).toEqual([
+      { kind: "point", x: 0.05, y: 0.08, caption: "Press" },
+    ]);
+  });
+
+  /**
+   * The fractions are of the rectangle the marks are drawn on, which is the
+   * frame's, and it is not always the rectangle the share names: a frame
+   * asked for a display's whole bounds can be held to that display's work
+   * area, a menu bar lower and a menu bar shorter. Measured against the
+   * display and drawn into the frame, every mark lands low by exactly that
+   * much, which is what a whole-screen share does.
+   */
+  test("a named control is measured against the frame, not the share", async () => {
+    await shareAndSee(DISPLAY);
+    // The frame ends up somewhere other than the display it was asked for.
+    glow?.setBounds({ x: 100, y: 50, width: 1000, height: 500 });
+
+    const result = await showCompanionCoachmarks([{ target: "Share" }], CALL);
+
+    // The control's middle is (150,90): measured against this frame that is a
+    // twentieth across and two twenty-fifths down. Measured against display 2,
+    // which begins at x 1440, it would not be on the surface at all.
+    expect(result).toEqual({
+      kind: "placed",
+      marks: [{ kind: "point", x: 0.05, y: 0.08, matched: "Share" }],
+    });
+  });
+
+  /**
+   * A display is measured from its own origin, not the desktop's. Display 2
+   * begins at x 1440, so a control at x 1560 is 120 points into it and a
+   * sixteenth of the way across, not past its right edge.
+   */
+  test("resolves a named control against the shared display's bounds", async () => {
+    located = {
+      found: true,
+      label: "Share",
+      role: "AXButton",
+      x: 1560,
+      y: 108,
+      width: 96,
+      height: 54,
+    };
+    await shareAndSee(DISPLAY);
+    const result = await showCompanionCoachmarks([{ target: "Share" }], CALL);
+
+    expect(result).toEqual({
+      kind: "placed",
+      marks: [{ kind: "point", x: 0.0875, y: 0.125, matched: "Share" }],
+    });
+  });
+
+  /**
+   * A name the surface does not carry is not a mark drawn somewhere else: it
+   * comes back with what is there, so the next attempt can name one of those.
+   */
+  test("a name the surface does not carry draws nothing and says what is there", async () => {
+    located = {
+      found: false,
+      reason: "no-match",
+      available: ["color balance", "cropping"],
+    };
+    await shareAndSee(WINDOW);
+    const result = await showCompanionCoachmarks(
+      [{ target: "white balance" }],
+      CALL,
+    );
+
+    expect(result).toEqual({
+      kind: "unresolved",
+      unresolved: {
+        target: "white balance",
+        reason: "no-match",
+        candidates: ["color balance", "cropping"],
+      },
+    });
+    expect(state().coachmarks).toBeUndefined();
+  });
+
+  /**
+   * The host bounds the names it sends, so what arrives can be the short
+   * version of a surface that carried hundreds. The count travels with it,
+   * which is what lets the answer say how many it is not naming.
+   */
+  test("how many names there were survives the bounded list", async () => {
+    located = {
+      found: false,
+      reason: "no-match",
+      available: ["color balance", "cropping"],
+      candidateCount: 312,
+    };
+    await shareAndSee(WINDOW);
+
+    expect(
+      await showCompanionCoachmarks([{ target: "white balance" }], CALL),
+    ).toEqual({
+      kind: "unresolved",
+      unresolved: {
+        target: "white balance",
+        reason: "no-match",
+        candidates: ["color balance", "cropping"],
+        candidateCount: 312,
+      },
+    });
+  });
+
+  /** Two controls answering to one name is refused rather than guessed at. */
+  test("a name fitting more than one control draws nothing", async () => {
+    located = {
+      found: false,
+      reason: "ambiguous",
+      ambiguous: ["Close", "Close"],
+    };
+    await shareAndSee(WINDOW);
+
+    expect(
+      await showCompanionCoachmarks([{ target: "Close" }], CALL),
+    ).toMatchObject({
+      kind: "unresolved",
+      unresolved: { reason: "ambiguous" },
+    });
+    expect(state().coachmarks).toBeUndefined();
+  });
+
+  /**
+   * Resolving a name is a round trip, and the user is still working through
+   * it. A share that moved in that gap would take marks measured against the
+   * surface they were resolved on onto whatever replaced it.
+   */
+  test("a share that moves while a name resolves is refused", async () => {
+    windowBounds = { x: 100, y: 50, width: 1000, height: 500 };
+    await shareAndSee(WINDOW);
+    const drawing = showCompanionCoachmarks([{ target: "Share" }], CALL);
+    shareOf(DISPLAY);
+
+    expect(await drawing).toEqual({
+      kind: "refused",
+      refusal: "stale-surface",
+    });
+    expect(state().coachmarks).toBeUndefined();
+  });
+
+  /**
+   * The move that the current state alone cannot see. Once the new surface
+   * has served a frame of its own, everything main can ask about the present
+   * agrees: the share is framed, the call is the same one, and the picture
+   * the assistant holds is of what is shared. Only the surface these marks
+   * were measured against says otherwise, so it is what has to be kept.
+   */
+  test("a share that moves and is seen while a name resolves is refused", async () => {
+    windowBounds = { x: 100, y: 50, width: 1000, height: 500 };
+    await shareAndSee(WINDOW);
+    const drawing = showCompanionCoachmarks([{ target: "Share" }], CALL);
+    shareOf(DISPLAY);
+    acknowledge(DISPLAY);
+
+    expect(await drawing).toEqual({
+      kind: "refused",
+      refusal: "stale-surface",
+    });
+    expect(state().coachmarks).toBeUndefined();
+  });
+
+  /**
+   * Nothing queues behind a lookup, and a clear has nothing to look up, so it
+   * answers while the lookup is still out. The user has been told the screen
+   * is clear by then, and the lookup landing afterwards would put the mark
+   * back on it.
+   */
+  test("a lookup that lands after a clear does not put the mark back", async () => {
+    windowBounds = { x: 100, y: 50, width: 1000, height: 500 };
+    await shareAndSee(WINDOW);
+    let letGo!: () => void;
+    locateHeldBy = new Promise<void>((resolve) => {
+      letGo = resolve;
+    });
+    const drawing = showCompanionCoachmarks([{ target: "Share" }], CALL);
+    expect(await showCompanionCoachmarks([], CALL)).toEqual({
+      kind: "placed",
+      marks: [],
+    });
+    letGo();
+
+    expect(await drawing).toEqual({
+      kind: "refused",
+      refusal: "superseded",
+    });
+    expect(state().coachmarks).toBeUndefined();
+  });
+
+  /** The same for a later request that draws something of its own. */
+  test("a lookup that lands after another request does not overwrite it", async () => {
+    windowBounds = { x: 100, y: 50, width: 1000, height: 500 };
+    await shareAndSee(WINDOW);
+    let letGo!: () => void;
+    locateHeldBy = new Promise<void>((resolve) => {
+      letGo = resolve;
+    });
+    const drawing = showCompanionCoachmarks([{ target: "Share" }], CALL);
+    locateHeldBy = null;
+    expect(await showCompanionCoachmarks([MARK], CALL)).toMatchObject({
+      kind: "placed",
+    });
+    letGo();
+
+    expect(await drawing).toMatchObject({
+      kind: "refused",
+      refusal: "superseded",
+    });
+    expect(state().coachmarks).toEqual([DRAWN_MARK]);
+  });
+
+  /**
+   * A request replaces everything on screen, and this one has replaced it
+   * with nothing it can draw. The mark left over from the last step points at
+   * a control the assistant is in the same breath saying it could not find.
+   */
+  test("a name that does not resolve takes down what was up", async () => {
+    windowBounds = { x: 100, y: 50, width: 1000, height: 500 };
+    await shareAndSee(WINDOW);
+    await showCompanionCoachmarks([{ target: "Share" }], CALL);
+    expect(state().coachmarks).toHaveLength(1);
+
+    located = {
+      found: false,
+      reason: "no-match",
+      available: ["color balance", "cropping"],
+    };
+    expect(
+      await showCompanionCoachmarks([{ target: "white balance" }], CALL),
+    ).toMatchObject({ kind: "unresolved" });
+    expect(state().coachmarks).toBeUndefined();
+  });
+
+  /** Bounds still go up untouched, for what the tree cannot name. */
+  test("a mark given as bounds keeps its ring and never asks the tree", async () => {
+    await shareAndSee();
+    const result = await showCompanionCoachmarks([MARK], CALL);
+
+    expect(locatesAsked).toEqual([]);
+    // An extent someone gave outright is an extent they mean.
+    expect(result).toEqual({
+      kind: "placed",
+      marks: [{ kind: "region", ...MARK }],
+    });
+  });
+
+  /**
+   * A mark says go and press that, and the press is the step being done. The
+   * frame is click-through while marks stand, so the press is heard from the
+   * helper: main tells it where the control is, and is told which one was
+   * pressed.
+   */
+  describe("hearing the press", () => {
+    /** Every set of rectangles the helper was asked to watch, in order. */
+    const watches: unknown[][] = [];
+
+    beforeEach(() => {
+      watches.length = 0;
+      dispatched.length = 0;
+      // A window the control can be found on; without bounds there is no
+      // surface to measure against and nothing is drawn.
+      windowBounds = { x: 100, y: 50, width: 1000, height: 500 };
+      provideCoachmarkPressWatch((rects) => {
+        watches.push([...rects]);
+      });
+    });
+
+    test("a named control is watched at the frame the tree reported", async () => {
+      await shareAndSee(WINDOW);
+      await showCompanionCoachmarks([{ target: "Share" }], CALL);
+
+      // The tree's frame in screen points, not the fraction the arrow is
+      // aimed at: a press is tested against the control's hit area.
+      expect(watches).toEqual([[{ x: 120, y: 80, width: 60, height: 20 }]]);
+    });
+
+    test("a press takes the marks down and tells the call which control", async () => {
+      await shareAndSee(WINDOW);
+      await showCompanionCoachmarks([{ target: "Share" }], CALL);
+
+      coachmarkPressed(0);
+
+      expect(dispatched).toEqual([
+        { kind: "coachmarkPressed", label: "Share" },
+      ]);
+      expect(state().coachmarks).toBeUndefined();
+      // The watch went with the marks, so a second press on the same control
+      // reports nothing.
+      coachmarkPressed(0);
+      expect(dispatched).toHaveLength(1);
+    });
+
+    /**
+     * The control is on a window, and windows move. The frame follows the
+     * window, and the marks with it; a rectangle left where the control was
+     * would miss the press on it and take a press on empty desktop for it.
+     */
+    test("the watch follows the window the control is on", async () => {
+      await shareAndSee(WINDOW);
+      await showCompanionCoachmarks([{ target: "Share" }], CALL);
+      expect(watches).toEqual([[{ x: 120, y: 80, width: 60, height: 20 }]]);
+
+      windowBounds = { x: 300, y: 150, width: 1000, height: 500 };
+      await Bun.sleep(300);
+
+      expect(watches.at(-1)).toEqual([
+        { x: 320, y: 180, width: 60, height: 20 },
+      ]);
+      coachmarkPressed(0);
+      expect(dispatched).toEqual([
+        { kind: "coachmarkPressed", label: "Share" },
+      ]);
+    });
+
+    /**
+     * A ring drawn from bounds the model gave is an extent someone means, not
+     * a button: a press inside it says nothing about a step.
+     */
+    test("an extent given as bounds is not something to press", async () => {
+      await shareAndSee();
+      await showCompanionCoachmarks([MARK], CALL);
+
+      expect(watches).toEqual([]);
+      coachmarkPressed(0);
+      expect(dispatched).toEqual([]);
+    });
+
+    test("clearing the marks takes the watch down", async () => {
+      await shareAndSee(WINDOW);
+      await showCompanionCoachmarks([{ target: "Share" }], CALL);
+      await showCompanionCoachmarks([], CALL);
+
+      expect(watches.at(-1)).toEqual([]);
+      coachmarkPressed(0);
+      expect(dispatched).toEqual([]);
+    });
+
+    test("the share ending takes the watch down", async () => {
+      await shareAndSee(WINDOW);
+      await showCompanionCoachmarks([{ target: "Share" }], CALL);
+      send("vellum:companion:setContext", context());
+
+      expect(watches.at(-1)).toEqual([]);
+    });
+
+    /** Pointing at the same control for a second step arms a second press. */
+    test("pointing again arms the watch again", async () => {
+      await shareAndSee(WINDOW);
+      await showCompanionCoachmarks([{ target: "Share" }], CALL);
+      coachmarkPressed(0);
+      await showCompanionCoachmarks([{ target: "Share" }], CALL);
+
+      coachmarkPressed(0);
+      expect(dispatched).toEqual([
+        { kind: "coachmarkPressed", label: "Share" },
+        { kind: "coachmarkPressed", label: "Share" },
+      ]);
+    });
+  });
+
+  /**
+   * Marks can never be armed ahead of a share, or the first share to start
+   * would open with a ring around whatever happened to be at those
+   * coordinates.
+   */
+  test("refuses marks with nothing shared", async () => {
+    expect(await showCompanionCoachmarks([MARK], CALL)).toEqual({
+      kind: "refused",
+      refusal: "unshared",
+    });
+    expect(state().coachmarks).toBeUndefined();
+  });
+
+  /**
+   * The frame prefers a watch session's target when both run, so the marks
+   * would be drawn around the surface being read while they describe the one
+   * being shared.
+   */
+  test("refuses marks while a watch session owns the frame", async () => {
+    await capture();
+    send(
+      "vellum:companion:setContext",
+      context({
+        watching: true,
+        screenShareEnabled: true,
+        screenShare: DISPLAY,
+        callConversationId: CALL,
+      }),
+    );
+    expect(await showCompanionCoachmarks([MARK], CALL)).toEqual({
+      kind: "refused",
+      refusal: "unshared",
+    });
+    expect(state().coachmarks).toBeUndefined();
+  });
+
+  /**
+   * A mark names a rectangle and nothing else, so a turn from any other
+   * conversation the user has running would otherwise draw on this call's
+   * surface and be told it worked.
+   */
+  test("refuses marks from another conversation", async () => {
+    await shareAndSee();
+    expect(await showCompanionCoachmarks([MARK], OTHER)).toEqual({
+      kind: "refused",
+      refusal: "not-this-call",
+    });
+    expect(state().coachmarks).toBeUndefined();
+  });
+
+  /** What the call put up is not another conversation's to replace. */
+  test("a refused mark leaves the call's own marks standing", async () => {
+    await shareAndSee();
+    await showCompanionCoachmarks([MARK], CALL);
+    expect(
+      await showCompanionCoachmarks([{ ...MARK, caption: "Elsewhere" }], OTHER),
+    ).toEqual({
+      kind: "refused",
+      refusal: "not-this-call",
+    });
+    expect(state().coachmarks).toEqual([{ kind: "region", ...MARK }]);
+  });
+
+  /** A claim that cannot be checked is not a claim that passed. */
+  test("refuses marks when the surface names no conversation", async () => {
+    shareOf(DISPLAY, { callConversationId: undefined });
+    await capture();
+    expect(await showCompanionCoachmarks([MARK], CALL)).toEqual({
+      kind: "refused",
+      refusal: "not-this-call",
+    });
+    expect(state().coachmarks).toBeUndefined();
+  });
+
+  /**
+   * Taking marks down is the one direction that must always work: a ring
+   * nothing can reach is worse than one taken down by the wrong caller.
+   */
+  test("takes marks down for any conversation", async () => {
+    await shareAndSee();
+    await showCompanionCoachmarks([MARK], CALL);
+    expect(await showCompanionCoachmarks([], OTHER)).toMatchObject({
+      kind: "placed",
+    });
+    expect(state().coachmarks).toBeUndefined();
+  });
+
+  /**
+   * The assistant measures against the picture it was last shown. Before any
+   * frame of the shared surface has gone out there is no such picture, so
+   * whatever it is holding is of something else.
+   */
+  test("refuses marks before a frame of the share has been served", async () => {
+    shareDisplay();
+    expect(await showCompanionCoachmarks([MARK], CALL)).toEqual({
+      kind: "refused",
+      refusal: "stale-surface",
+    });
+    expect(state().coachmarks).toBeUndefined();
+  });
+
+  /**
+   * `syncCoachmarks` takes down marks already up when the target changes and
+   * cannot reach one that arrives after it, so the arrival is refused.
+   */
+  test("refuses marks measured against the surface before a move", async () => {
+    await shareAndSee(DISPLAY);
+    shareOf(WINDOW);
+    expect(await showCompanionCoachmarks([MARK], CALL)).toEqual({
+      kind: "refused",
+      refusal: "stale-surface",
+    });
+    expect(state().coachmarks).toBeUndefined();
+  });
+
+  /** Once the model has seen the surface it moved to, a mark is about that. */
+  test("takes marks once a frame of the new surface has been served", async () => {
+    await shareAndSee(DISPLAY);
+    await shareAndSee(WINDOW);
+    expect(await showCompanionCoachmarks([MARK], CALL)).toMatchObject({
+      kind: "placed",
+    });
+    expect(state().coachmarks).toEqual([{ kind: "region", ...MARK }]);
+  });
+
+  /** A capture that came back with nothing is never acknowledged. */
+  test("a frame that failed is not a frame the model saw", async () => {
+    shareDisplay();
+    const held = capturedFrame;
+    capturedFrame = null;
+    await capture();
+    capturedFrame = held;
+    expect(await showCompanionCoachmarks([MARK], CALL)).toEqual({
+      kind: "refused",
+      refusal: "stale-surface",
+    });
+  });
+
+  /**
+   * **Taking a frame is not showing one.** The renderer still has to prepare,
+   * upload and send it, and a share that moves in that window would otherwise
+   * open the gate to the new surface while the only picture the assistant
+   * holds is of the old one. That is the arrival this guard exists to refuse,
+   * so the capture alone must not admit it.
+   */
+  test("a capture that has not reached the call opens nothing", async () => {
+    shareOf(DISPLAY);
+    await capture(DISPLAY);
+    expect(await showCompanionCoachmarks([MARK], CALL)).toEqual({
+      kind: "refused",
+      refusal: "stale-surface",
+    });
+    acknowledge(DISPLAY);
+    expect(await showCompanionCoachmarks([MARK], CALL)).toMatchObject({
+      kind: "placed",
+    });
+  });
+
+  /**
+   * The move lands between the capture and its acknowledgement, which is the
+   * exact interval a capture-time record would have admitted.
+   */
+  test("a share that moved after the capture is still refused", async () => {
+    await shareAndSee(DISPLAY);
+    await capture(WINDOW);
+    shareOf(WINDOW);
+    expect(await showCompanionCoachmarks([MARK], CALL)).toEqual({
+      kind: "refused",
+      refusal: "stale-surface",
+    });
+  });
+
+  /**
+   * The surface was unshared for a stretch and the user kept working on it,
+   * so the picture from before the detour is as stale as one from before a
+   * stop. Coming back to it must not resurrect what was acknowledged then.
+   */
+  test("a share that leaves a surface and returns forgets its frame", async () => {
+    await shareAndSee(DISPLAY);
+    shareOf(WINDOW);
+    shareOf(DISPLAY);
+    expect(await showCompanionCoachmarks([MARK], CALL)).toEqual({
+      kind: "refused",
+      refusal: "stale-surface",
+    });
+    acknowledge(DISPLAY);
+    expect(await showCompanionCoachmarks([MARK], CALL)).toMatchObject({
+      kind: "placed",
+    });
+  });
+
+  test("a share that ends takes the marks with it", async () => {
+    await shareAndSee();
+    await showCompanionCoachmarks([MARK], CALL);
+    send("vellum:companion:setContext", context());
+    expect(state().coachmarks).toBeUndefined();
+  });
+
+  test("a watch session starting takes the marks with it", async () => {
+    await shareAndSee();
+    await showCompanionCoachmarks([MARK], CALL);
+    send(
+      "vellum:companion:setContext",
+      context({
+        watching: true,
+        screenShareEnabled: true,
+        screenShare: DISPLAY,
+        callConversationId: CALL,
+      }),
+    );
+    expect(state().coachmarks).toBeUndefined();
+  });
+
+  /**
+   * The fractions would survive a move to another display or window and
+   * describe that surface instead, so the marks come down with the surface
+   * they were measured against rather than with the share as a whole.
+   */
+  test("a share moving to another surface takes the marks with it", async () => {
+    await shareAndSee(DISPLAY);
+    await showCompanionCoachmarks([MARK], CALL);
+    shareOf(WINDOW);
+    expect(state().coachmarks).toBeUndefined();
+  });
+
+  test("marks placed on the surface it moved to stand", async () => {
+    await shareAndSee(DISPLAY);
+    await showCompanionCoachmarks([MARK], CALL);
+    await shareAndSee(WINDOW);
+    await showCompanionCoachmarks([MARK], CALL);
+    expect(state().coachmarks).toEqual([{ kind: "region", ...MARK }]);
+  });
+
+  /** A context republished unchanged is not a surface that moved. */
+  test("holds the marks while the share stays where it is", async () => {
+    await shareAndSee();
+    await showCompanionCoachmarks([MARK], CALL);
+    shareDisplay();
+    expect(state().coachmarks).toEqual([{ kind: "region", ...MARK }]);
+  });
+
+  /**
+   * The whole promise of a mark is that the user can press the thing inside
+   * it. Drawing is the one mode that makes this frame take the mouse, so a
+   * mark placed while it is on would ring a control and then swallow the
+   * click on it.
+   */
+  test("gives the mouse back to the desktop when marks go up", async () => {
+    await shareAndSee();
+    send("vellum:companion:setAnnotating", true);
+    expect(state().annotating).toBe(true);
+    await showCompanionCoachmarks([MARK], CALL);
+    expect(state().annotating).toBe(false);
+    expect(glow?.clickThrough).toBe(true);
+  });
+
+  /** Taking marks down is not a reason to touch a mode the user set. */
+  test("leaves the drawing mode alone when marks come down", async () => {
+    await shareAndSee();
+    send("vellum:companion:setAnnotating", true);
+    await showCompanionCoachmarks([], CALL);
+    expect(state().annotating).toBe(true);
+  });
+
+  /** A refusal is not a reason to touch it either. */
+  test("leaves the drawing mode alone when marks are refused", async () => {
+    await shareAndSee();
+    send("vellum:companion:setAnnotating", true);
+    expect(await showCompanionCoachmarks([MARK], OTHER)).toEqual({
+      kind: "refused",
+      refusal: "not-this-call",
+    });
+    expect(state().annotating).toBe(true);
+  });
+
+  /**
+   * Checked against the schema rather than through a send, for the reason the
+   * drawing's bounds are: what the registrar refuses never reaches the
+   * handler, and the two are indistinguishable from here.
+   */
+  test("the wire refuses a mark measured against another surface", () => {
+    expect(
+      companionCoachmarkSchema.safeParse({ ...DRAWN_MARK, x: 1.5 }).success,
+    ).toBe(false);
+    expect(companionCoachmarkSchema.safeParse(DRAWN_MARK).success).toBe(true);
+    expect(
+      companionCoachmarkSchema.safeParse({ kind: "point", x: 0.5, y: 1.5 })
+        .success,
+    ).toBe(false);
+    expect(
+      companionCoachmarkSchema.safeParse({ kind: "point", x: 0.5, y: 0.5 })
+        .success,
+    ).toBe(true);
+  });
+
+  /**
+   * What `x` and `y` mean is decided by the kind, so a mark that names no kind
+   * is a mark a reader would have to guess about. A place and a corner half a
+   * mark apart is exactly the guess JARVIS-1759 was.
+   */
+  test("the wire refuses a mark that does not say what it is", () => {
+    expect(companionCoachmarkSchema.safeParse(MARK).success).toBe(false);
+  });
+
+  test("the wire refuses a caption longer than a caption", () => {
+    expect(
+      companionCoachmarkSchema.safeParse({
+        ...DRAWN_MARK,
+        caption: "a".repeat(400),
+      }).success,
+    ).toBe(false);
+  });
+
+  /**
+   * Counted against the schema rather than through this entrance. The bound
+   * belongs to the executor that answers the assistant
+   * (`executors/host-cu-executor.ts`), and what it refuses never reaches main
+   * at all.
+   */
+  test("the wire refuses more marks than there are places to look", () => {
+    const many = Array.from(
+      { length: COMPANION_COACHMARK_MAX + 1 },
+      () => DRAWN_MARK,
+    );
+    expect(many.length).toBeGreaterThan(COMPANION_COACHMARK_MAX);
+    expect(
+      many.every((m) => companionCoachmarkSchema.safeParse(m).success),
+    ).toBe(true);
   });
 });

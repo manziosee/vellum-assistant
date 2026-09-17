@@ -1,6 +1,10 @@
 import { beforeEach, describe, expect, mock, test } from "bun:test";
 
+import { eq } from "drizzle-orm";
+
 import { getConfig } from "../config/loader.js";
+import { getDb } from "../persistence/db-connection.js";
+import { providerConnections } from "../persistence/schema/inference.js";
 import { credentialKey } from "../security/credential-key.js";
 
 let lastGeminiConstructorOpts: Record<string, unknown> | null = null;
@@ -8,6 +12,9 @@ let secureKeyStore: Record<string, string | undefined> = {};
 const metadataUpserts: Array<{ service: string; field: string }> = [];
 const metadataDeletes: Array<{ service: string; field: string }> = [];
 let providerRefreshCalls = 0;
+let identitySyncCalls = 0;
+let avatarSyncCalls = 0;
+let failSecureKeyWrites = false;
 
 const PLATFORM_BASE_URL = "https://platform.example.com";
 const ASSISTANT_API_KEY_PATH = credentialKey("vellum", "assistant_api_key");
@@ -21,6 +28,9 @@ const MANAGED_PROVIDERS = [
 ] as const;
 
 let platformBaseUrlOverride: string | undefined;
+let platformAssistantIdOverride: string | undefined;
+let platformOrganizationIdOverride: string | undefined;
+let platformUserIdOverride: string | undefined;
 
 mock.module("@google/genai", () => ({
   GoogleGenAI: class MockGoogleGenAI {
@@ -47,8 +57,18 @@ mock.module("@google/genai", () => ({
 
 mock.module("../config/env.js", () => ({
   getPlatformBaseUrl: () => PLATFORM_BASE_URL,
+  getPlatformAssistantId: () => platformAssistantIdOverride,
   setPlatformBaseUrl: (value: string | undefined) => {
     platformBaseUrlOverride = value;
+  },
+  setPlatformAssistantId: (value: string | undefined) => {
+    platformAssistantIdOverride = value;
+  },
+  setPlatformOrganizationId: (value: string | undefined) => {
+    platformOrganizationIdOverride = value;
+  },
+  setPlatformUserId: (value: string | undefined) => {
+    platformUserIdOverride = value;
   },
 }));
 
@@ -69,6 +89,9 @@ mock.module("../security/secure-keys.js", () => ({
     unreachable: false,
   }),
   setSecureKeyAsync: async (key: string, value: string) => {
+    if (failSecureKeyWrites) {
+      return false;
+    }
     secureKeyStore[key] = value;
     return true;
   },
@@ -93,6 +116,19 @@ mock.module("../tools/credentials/metadata-store.js", () => ({
 // to a no-op; its behavior is covered by boot-maintenance.test.ts.
 mock.module("../plugins/defaults/memory/substrate/boot-maintenance.js", () => ({
   maybeReseedCapabilitiesAfterManagedCredential: async () => {},
+}));
+
+// Live platform registration (`vellum login` against a running assistant)
+// must re-enqueue the name and avatar syncs that no-op'd at startup.
+mock.module("../platform/sync-identity.js", () => ({
+  syncWorkspaceIdentityToPlatform: () => {
+    identitySyncCalls++;
+  },
+}));
+mock.module("../platform/sync-avatar.js", () => ({
+  syncAvatarToPlatform: () => {
+    avatarSyncCalls++;
+  },
 }));
 
 // secret-routes evicts conversations after a credential change so the next turn
@@ -159,7 +195,17 @@ describe("secret routes managed proxy registry sync", () => {
     metadataDeletes.length = 0;
     lastGeminiConstructorOpts = null;
     platformBaseUrlOverride = undefined;
+    platformAssistantIdOverride = undefined;
+    platformOrganizationIdOverride = undefined;
+    platformUserIdOverride = undefined;
     providerRefreshCalls = 0;
+    identitySyncCalls = 0;
+    avatarSyncCalls = 0;
+    failSecureKeyWrites = false;
+    getDb()
+      .delete(providerConnections)
+      .where(eq(providerConnections.name, "openrouter-connection"))
+      .run();
     await initializeProviders(getConfig());
   });
 
@@ -224,32 +270,158 @@ describe("secret routes managed proxy registry sync", () => {
     expect(providerRefreshCalls).toBe(2);
   });
 
-  test("deleting vellum:assistant_api_key clears managed fallback providers immediately", async () => {
+  test("deleting a vellum credential is rejected without touching the vault", async () => {
     secureKeyStore[ASSISTANT_API_KEY_PATH] = "ast-managed-key";
+    secureKeyStore[PLATFORM_BASE_URL_PATH] = "https://managed.example.com";
+    platformBaseUrlOverride = "https://managed.example.com";
+    platformAssistantIdOverride = "asst-1";
     await initializeProviders(getConfig());
 
-    for (const provider of MANAGED_PROVIDERS) {
-      expect(listProviders()).toContain(provider);
-      expect(getProviderRoutingSource(provider)).toBe("managed-proxy");
+    for (const name of [
+      "vellum:assistant_api_key",
+      "vellum:platform_base_url",
+      "vellum:webhook_secret",
+      "vellum:platform_assistant_id",
+    ]) {
+      await expect(deleteCredential(name)).rejects.toThrow(
+        "Vellum credentials cannot be deleted",
+      );
     }
 
-    await deleteCredential("vellum:assistant_api_key");
-
-    expect(secureKeyStore[ASSISTANT_API_KEY_PATH]).toBeUndefined();
-    expect(metadataDeletes).toEqual([
-      { service: "vellum", field: "assistant_api_key" },
-    ]);
-    expect(listProviders()).toEqual([]);
+    expect(secureKeyStore[ASSISTANT_API_KEY_PATH]).toBe("ast-managed-key");
+    expect(secureKeyStore[PLATFORM_BASE_URL_PATH]).toBe(
+      "https://managed.example.com",
+    );
+    expect(platformBaseUrlOverride).toBe("https://managed.example.com");
+    expect(platformAssistantIdOverride).toBe("asst-1");
+    expect(metadataDeletes).toEqual([]);
+    expect(providerRefreshCalls).toBe(0);
   });
 
   test("managed proxy credential writes notify live-conversation refresh listeners", async () => {
     await addCredential("vellum:assistant_api_key", "ast-managed-key");
 
     expect(providerRefreshCalls).toBe(1);
+  });
 
-    await deleteCredential("vellum:assistant_api_key");
+  /**
+   * Verifies that rotating a credential refreshes providers for dependent connections.
+   */
+  test("non-managed credentials refresh providers when a connection uses them", async () => {
+    // GIVEN a non-managed credential.
+    // AND a provider connection references its canonical credential key.
+    const now = Date.now();
+    getDb()
+      .insert(providerConnections)
+      .values({
+        name: "openrouter-connection",
+        provider: "openai",
+        auth: JSON.stringify({
+          type: "api_key",
+          credential: credentialKey("openrouter", "api_key"),
+        }),
+        createdAt: now,
+        updatedAt: now,
+      })
+      .run();
 
-    expect(providerRefreshCalls).toBe(2);
+    // WHEN the credential is rotated.
+    await addCredential("openrouter:api_key", "openrouter-key");
+
+    // THEN the provider refresh runs once.
+    expect(providerRefreshCalls).toBe(1);
+  });
+
+  /**
+   * Verifies that rotating an unused credential does not refresh providers.
+   */
+  test("non-managed credentials do not refresh providers when no connection uses them", async () => {
+    // GIVEN a non-managed credential.
+    // AND no provider connection references its credential key.
+    // WHEN the credential is rotated.
+    await addCredential("openrouter:api_key", "openrouter-key");
+
+    // THEN the provider refresh does not run.
+    expect(providerRefreshCalls).toBe(0);
+  });
+
+  test("storing a platform registration credential enqueues name and avatar syncs", async () => {
+    for (const name of [
+      "vellum:assistant_api_key",
+      "vellum:platform_base_url",
+    ]) {
+      identitySyncCalls = 0;
+      avatarSyncCalls = 0;
+      await addCredential(name, "value");
+      expect(identitySyncCalls).toBe(1);
+      expect(avatarSyncCalls).toBe(1);
+    }
+  });
+
+  test("unrelated credentials do not enqueue platform syncs", async () => {
+    await addCredential("openrouter:api_key", "openrouter-key");
+
+    expect(identitySyncCalls).toBe(0);
+    expect(avatarSyncCalls).toBe(0);
+  });
+
+  test("a failed platform credential write does not enqueue platform syncs", async () => {
+    failSecureKeyWrites = true;
+
+    await expect(
+      addCredential("vellum:platform_base_url", "https://managed.example.com"),
+    ).rejects.toThrow("Failed to store credential");
+
+    expect(identitySyncCalls).toBe(0);
+    expect(avatarSyncCalls).toBe(0);
+  });
+
+  test("unknown vellum credentials are rejected without persisting or binding identity", async () => {
+    platformAssistantIdOverride = "existing-asst";
+    platformOrganizationIdOverride = "existing-org";
+    platformUserIdOverride = "existing-user";
+
+    await expect(
+      addCredential("vellum:platform_assistant_id", "asst-1"),
+    ).rejects.toThrow("Unknown vellum credential: platform_assistant_id");
+    await expect(
+      addCredential("vellum:platform_organization_id", "org-1"),
+    ).rejects.toThrow("Unknown vellum credential: platform_organization_id");
+    await expect(
+      addCredential("vellum:platform_user_id", "user-1"),
+    ).rejects.toThrow("Unknown vellum credential: platform_user_id");
+
+    expect(
+      secureKeyStore[credentialKey("vellum", "platform_assistant_id")],
+    ).toBeUndefined();
+    expect(
+      secureKeyStore[credentialKey("vellum", "platform_organization_id")],
+    ).toBeUndefined();
+    expect(
+      secureKeyStore[credentialKey("vellum", "platform_user_id")],
+    ).toBeUndefined();
+    expect(metadataUpserts).toEqual([]);
+    expect(platformAssistantIdOverride).toBe("existing-asst");
+    expect(platformOrganizationIdOverride).toBe("existing-org");
+    expect(platformUserIdOverride).toBe("existing-user");
+    expect(identitySyncCalls).toBe(0);
+    expect(avatarSyncCalls).toBe(0);
+  });
+
+  test("an unknown vellum credential does not delete leftover vault copies", async () => {
+    const key = credentialKey("vellum", "platform_assistant_id");
+    secureKeyStore[key] = "leftover-asst";
+    platformAssistantIdOverride = "asst-1";
+
+    await expect(
+      addCredential("vellum:platform_assistant_id", "   "),
+    ).rejects.toThrow("Unknown vellum credential: platform_assistant_id");
+
+    expect(secureKeyStore[key]).toBe("leftover-asst");
+    expect(platformAssistantIdOverride).toBe("asst-1");
+    expect(metadataDeletes).toEqual([]);
+    expect(identitySyncCalls).toBe(0);
+    expect(avatarSyncCalls).toBe(0);
   });
 
   test("storing vellum:platform_base_url sets override and triggers initializeProviders", async () => {
@@ -284,18 +456,5 @@ describe("secret routes managed proxy registry sync", () => {
       expect(providers).toContain(provider);
       expect(getProviderRoutingSource(provider)).toBe("managed-proxy");
     }
-  });
-
-  test("deleting vellum:platform_base_url clears override and re-initializes providers", async () => {
-    secureKeyStore[PLATFORM_BASE_URL_PATH] = "https://managed.example.com";
-    platformBaseUrlOverride = "https://managed.example.com";
-
-    await deleteCredential("vellum:platform_base_url");
-
-    expect(secureKeyStore[PLATFORM_BASE_URL_PATH]).toBeUndefined();
-    expect(platformBaseUrlOverride).toBeUndefined();
-    expect(metadataDeletes).toEqual([
-      { service: "vellum", field: "platform_base_url" },
-    ]);
   });
 });

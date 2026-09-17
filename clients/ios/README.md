@@ -9,7 +9,8 @@ This is _not_ a port of the web app — it's a thin `WKWebView` shell in
 (`options.deploymentTarget.iOS`) — both, because the xcconfig wins for
 targets that carry one and the `project.yml` value covers those that
 don't. Do not lower it: Live Activities need 16.1, interactive Live
-Activity content 17.0, and the Action Button 17.1. The Control Center
+Activity content 17.0, the Home Screen widgets' `Button(intent:)`
+targets 17.0, and the Action Button 17.1. The Control Center
 control needs 18.0 and is therefore `@available`-gated rather than
 holding the whole app back.
 
@@ -43,14 +44,16 @@ which URL is baked into the build.
   process. With `server.url`, only native shell changes (Swift code,
   entitlements, Capacitor plugin updates) require a store submission.
 - **Thin native surface** - the IPC bridge between the WKWebView and
-  native code is minimal (seven app-local plugins: `NativeAuthPlugin`,
+  native code is minimal (eleven app-local plugins: `NativeAuthPlugin`,
   `NativeBiometricPlugin`, `VoiceAudioSessionPlugin`,
   `VoiceLiveActivityPlugin`, `ApnsEnvironmentPlugin`,
-  `SelfHostedServersPlugin`, and `RecentChatsPlugin`, plus the
-  auto-discovered community camera preview dependency), so version skew risk between the web app and native
-  shell is low. Every plugin call from the web side must still have a
-  working missing-plugin fallback because a new web bundle always ships
-  ahead of the shell that hosts it. Contrast
+  `SelfHostedServersPlugin`, `RecentChatsPlugin`,
+  `WidgetSnapshotPlugin`, `AppIconPlugin`, `ShareInboxPlugin`, and
+  `SenderNotificationPlugin`, plus the auto-discovered
+  community camera preview dependency), so version skew risk between the
+  web app and native shell is low. Every plugin call from the web side
+  must still have a working missing-plugin fallback because a new web
+  bundle always ships ahead of the shell that hosts it. Contrast
   with the Electron app, where the
   `window.vellum.*` IPC surface is broad and tightly coupled.
 - **WKWebView security model** — unlike Electron's renderer, `WKWebView`
@@ -152,7 +155,7 @@ Apple's reference for the toolbar controls:
 
 The app has two layers: the **WKWebView contents** (the React app loaded
 from the configured server URL) and the **native Swift shell** (Capacitor
-bridge, `MyViewController`, the seven app-local plugins, and linked package
+bridge, `MyViewController`, the eleven app-local plugins, and linked package
 plugins such as `CameraPreview`). Each has its own
 debugger.
 
@@ -281,12 +284,15 @@ experience works. Do not enable it.
 The Xcode project has three _app_ targets — one per environment. Each has its own
 bundle ID, display name, and icon colour so they can be installed side by
 side on the same device. Each also embeds its own `VoiceActivity` widget
-extension target (`<app bundle id>.VoiceActivity`), so `xcodegen generate`
-produces six targets in total; only the three app schemes are worth
+extension (`<app bundle id>.VoiceActivity`), `Share` extension
+(`<app bundle id>.Share`), and `NotificationService` extension
+(`<app bundle id>.NotificationService`). With the host-less `AppTests`
+logic-test bundle, `xcodegen generate` produces thirteen targets and four
+schemes in total; of those, the three app schemes are the ones worth
 building, since the extensions build as embedded dependencies. See
-[`docs/NATIVE_VOICE.md`](docs/NATIVE_VOICE.md) for what the extension
-contains and [Signing: two profiles per environment](#signing-two-profiles-per-environment)
-for what it costs at release time.
+[`docs/NATIVE_VOICE.md`](docs/NATIVE_VOICE.md) for the widget extension
+and [Signing: four profiles per environment](#signing-four-profiles-per-environment)
+for what the extra App IDs cost at release time.
 
 | Target | Bundle ID | Display Name | Icon | Server |
 |--------|-----------|-------------|------|--------|
@@ -302,15 +308,114 @@ inline in `App/project.yml` under the `AppEnvironment` template.
 
 ### App icon + launch screen
 
-- `App/App/AppIcon.icon/` is an Icon Composer bundle (green background +
-  white "V"). It uses the same visual design as the macOS app icon
-  source SVG ([`vellum-assistant/clients/macos/build-resources/icons/production/Assets/white-V.svg`](https://github.com/vellum-ai/vellum-assistant/blob/main/clients/macos/build-resources/icons/production/Assets/white-V.svg)),
-  but is its own Icon Composer bundle living in this repo.
-- `AppIcon-Staging.icon` (yellow) and `AppIcon-Dev.icon` (pink) follow
-  the same structure — only the `fill.solid` colour differs.
-- `App/App/Base.lproj/LaunchScreen.storyboard` references the `Splash`
-  imageset in `Assets.xcassets/`. Those 2732×2732 PNGs are a solid green
-  background with a centered white V — same palette as the icon.
+- `App/App/AppIcon.icon/` is an Icon Composer bundle: a solid `#4C9B50`
+  background (the `green` entry in the avatar palette in
+  `packages/avatar-catalog`) with the `quirky` eye
+  pair from that same library centred on top, spanning half the icon
+  width. The six paths in `Assets/eyes.svg` are copied verbatim out of
+  `getCharacterComponents().eyeStyles`, keeping the icon and the in-app
+  avatars in sync.
+- `AppIcon-Staging.icon` (`#E9C91A`) and `AppIcon-Dev.icon` (`#FF88C9`)
+  carry the same eyes; only the `fill-specializations` colour differs.
+- A bundle's `fill-specializations` solid is a **Display P3** value, so an
+  sRGB hex has to be converted before it goes in. All three bundles carry a
+  true conversion of their hex. Pasting the raw sRGB components straight
+  through renders noticeably more saturated than the hex you started from.
+- `App/App/AvatarIcons.xcassets` holds the alternate icons, one
+  `.appiconset` per eye style and color, named `avatar-eyes-<eye>-<color>`.
+  Every combination ships: 9 eye styles × 6 colors, so 54 sets. Each set is a
+  single opaque 1024×1024 `icon.png` covering every idiom: a solid field in the
+  trait color with that eye pair centered on top, fitted by its longer edge to
+  that style's span. Most styles span half the icon width, the framing
+  `AppIcon.icon` uses; `dazed` spans 0.55 so it reads at the size of the rest,
+  and `bashful` spans 0.40 so it does not draw the same icon as `surprised`,
+  which is the same shape. The spans live in a table at the top of the
+  generator, mirrored by
+  `clients/web/src/components/avatar/app-icon-preview.tsx` so the picker's
+  on-screen preview frames a pair the way the shipped PNG does. Body shape is
+  deliberately not part of the artwork or the name, so an avatar's icon follows
+  its eyes and color alone. App icons may not be transparent, so the background
+  is baked into the pixels and the file is encoded as PNG color type 2 (RGB, no
+  alpha channel at all). App Store validation rejects an app icon that carries
+  an alpha channel (ITMS-90717), and that only surfaces at TestFlight upload,
+  so the generator asserts every pixel is opaque and drops the channel rather
+  than shipping a fully opaque RGBA image.
+- The catalog and `Config/AvatarIcons.xcconfig`
+  (`ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = YES`) are generated
+  output produced from the avatar catalog (`packages/avatar-catalog`)
+  by `clients/ios/scripts/generate-avatar-icons.ts`. Edit the script, not the
+  files. Regenerate with `bun clients/ios/scripts/generate-avatar-icons.ts`,
+  which reproduces the committed state in about five seconds (add `--pilot` to
+  rasterize a 12-set slice while iterating locally), and verify with
+  `cd clients/ios && bun test scripts/__tests__/generate-avatar-icons.test.ts`.
+  Both the generator and the test rasterize through the native
+  `@resvg/resvg-js` binding, so the assistant package's dependencies have to
+  be installed first: `bun install --filter=@vellumai/assistant`.
+  `pr-native-drift.yaml` and `ci-main-native-drift.yaml` run that same check,
+  and both watch `packages/avatar-catalog/**` as well as
+  `assistant/src/avatar/**`, so a catalog edit without a regeneration fails
+  CI. They are separate from `pr-ios.yaml` and `ci-main-ios.yaml` because the
+  sources they read are cross-cutting and none of it is worth a macOS Xcode
+  build; the unsigned build is what those iOS jobs' 45-minute budget is for.
+- All three app targets ship the catalog: it rides along in the
+  `AppEnvironment` source sweep the way `Assets.xcassets` does, and each
+  target's `Config/App*.xcconfig` includes `AvatarIcons.xcconfig`. Every
+  target keeps its own `ASSETCATALOG_COMPILER_APPICON_NAME`, so the primary
+  icon is unchanged and actool writes the avatar sets into `CFBundleIcons` ->
+  `CFBundleAlternateIcons` (and the `~ipad` variant), which
+  `AppIconPlugin.swift` reads back at runtime.
+- Which alternate is showing is a user's choice, made in the web app under
+  Settings -> General -> Preferences -> App icon
+  (`clients/web/src/domains/settings/components/app-icon-modal.tsx`), which
+  every capable iOS shell offers: a native iOS shell carrying the `AppIcon`
+  plugin is the whole gate. The picker cycles eyes and color over the same
+  component library the artwork is generated from, seeds its selection from
+  the assistant's avatar when that avatar is a character one, and resets back
+  to the target's primary icon. Applying is always a press: iOS puts up a
+  system alert of its own on every icon change, so nothing swaps on its own.
+  Version skew degrades in two layers, neither an error: a shell without the
+  `AppIcon` plugin reports unsupported, so the picker row does not render at
+  all, and on a shell that has the plugin a composed name is applied only when
+  the shell lists it in `available`, so a missing name reads as a disabled Set
+  button rather than a failed swap.
+- `App/App/Base.lproj/LaunchScreen.storyboard` uses a black background with the
+  white Vellum wordmark centered at its native 92×28 point size. The vector
+  image lives in the `VellumLogo` imageset in `Assets.xcassets/`.
+
+#### Alternate icon size cost
+
+Measured by compiling `AvatarIcons.xcassets` on its own through `actool`
+(Xcode 26.2). A standalone compile tracks the catalog's contribution to an
+unsigned `App Dev` build within 0.1 percent, so it is the cheap way to check
+the cost.
+
+| Catalog | Committed PNGs | `Assets.car` |
+| ------- | -------------- | ------------ |
+| 54 eyes-on-color alternates | 590,542 B (0.56 MiB) | 1,188,152 B (1.13 MiB) |
+
+That is **21.5 KiB per alternate icon** compiled. The whole catalog is one
+`Assets.car` slice, so the cost lands on every install whether or not the user
+ever switches icons.
+
+**Do not try to shrink this by capping the rendered detail.** Rendering at
+180 px (the largest size iOS ever draws an alternate icon at) and upscaling
+onto the 1024 canvas is a standard icon-shrinking trick, and it backfires
+badly on this artwork. The eyes are flat vector shapes, so a native 1024
+render is almost entirely uniform regions separated by hairline antialiased
+edges, which is the best case there is for compression. A bilinear upscale
+replaces every one of those edges with a six-pixel gradient ramp:
+
+| Full catalog, 54 icons | Committed PNGs | `Assets.car` |
+| ---------------------- | -------------- | ------------ |
+| Native 1024 render | 590,542 B (0.56 MiB) | 1,188,152 B (1.13 MiB) |
+| 180 px detail, bilinear upscale | 3,764,157 B (3.59 MiB) | 6,817,336 B (6.50 MiB) |
+
+Rendering at 360 px instead of 180 only halves the overshoot. Nearest-neighbour
+upscaling does shrink the compiled catalog by 38 percent, to 735,128 B
+(0.70 MiB), but the 5.69x non-integer scale leaves visible stair-stepping: max
+per-channel error against the shipped icons at display size is about 87 of 255,
+against about 64 for bilinear. That trades clean edges for under half a MiB on
+a catalog that already costs about one.
 
 ### Bundle ID vs capacitor.config appId
 
@@ -413,13 +518,32 @@ bunx cap update ios   # only if @capacitor/ios major changed; re-run ios:setup a
 `CapApp-SPM/Package.swift` (`exact:` version) — `cap sync` writes
 that for you when the npm package version changes.
 
+### Run the logic tests
+
+`AppTests` is a host-less XCTest bundle over the framework-free helpers under
+`App/`. It links no app target, so it finishes in seconds. `pr-ios.yaml` runs
+it on every PR; locally, against any installed simulator (`xcrun simctl list
+devices available` names them):
+
+```bash
+cd clients/ios/App
+xcodebuild test \
+  -project App.xcodeproj \
+  -scheme AppTests \
+  -destination 'platform=iOS Simulator,name=iPhone 17' \
+  CODE_SIGNING_ALLOWED=NO
+```
+
+The bundle compiles only the sources listed under the `AppTests` target in
+`App/project.yml`, so a newly covered file goes there first.
+
 ## Testing checklist
 
 On first build after pulling:
 
 - [ ] Home-screen icon is Vellum green with a white "V" (not the blue X
       Capacitor placeholder)
-- [ ] Launch screen briefly flashes green + V
+- [ ] Launch screen briefly displays the white Vellum wordmark on black
 - [ ] WebView loads the configured server URL and you can sign in
 - [ ] Chat streams token-by-token (verifies SSE is intact — if tokens
       arrive in one big blob, CapacitorHttp got turned on somewhere)
@@ -441,9 +565,8 @@ On first build after pulling:
   `Assets.xcassets/`. It's wired into `project.yml` as a per-target
   resource and shows up in the regenerated `project.pbxproj` as a
   `folder.iconcomposer.icon` reference.
-- **Splash looks stretched** — the storyboard uses `scaleAspectFill`
-  on a 2732×2732 square. On phones this crops horizontally; the
-  centered V stays visible.
+- **Launch logo is missing**: confirm the `VellumLogo` imageset contains the
+  SVG and `LaunchScreen.storyboard` references `VellumLogo`.
 - **`xcuserdata` and `App.xcodeproj/*` changes in `git status`** —
   expected, both are gitignored. `xcuserdata` is per-user IDE state
   (selected scheme, breakpoints); `App.xcodeproj/*` is regenerated by
@@ -547,20 +670,24 @@ workflow called from the release pipelines — it intentionally has no
 extracted into their own reusable workflow because it's the only iOS
 workflow.
 
-### Signing: two profiles per environment
+### Signing: four profiles per environment
 
-Each app target embeds a `VoiceActivity` widget extension whose bundle ID
-is prefixed by its host app's (`<app bundle id>.VoiceActivity`). Apple
-treats that appex as its own App ID with its own provisioning profile, so
-**every environment signs with two profiles, not one**: the app's and the
-extension's.
+Each app target embeds a `VoiceActivity` widget extension, a `Share`
+extension, and a `NotificationService` extension, each whose bundle ID is
+prefixed by its host app's (`<app bundle id>.VoiceActivity`,
+`<app bundle id>.Share`, `<app bundle id>.NotificationService`). Apple treats
+each appex as its own App ID with its own provisioning profile, so
+**every environment signs with four profiles, not one**: the app's and
+one per embedded extension.
 
 That has three consequences in the pipeline:
 
-- The **install step** writes both profiles into
+- The **install step** writes all four profiles into
   `~/Library/MobileDevice/Provisioning Profiles/` under distinct
-  filenames (`ios_distribution.mobileprovision` and
-  `ios_distribution_ext.mobileprovision`). Writing both to one name
+  filenames (`ios_distribution.mobileprovision`,
+  `ios_distribution_ext.mobileprovision`,
+  `ios_distribution_share.mobileprovision`, and
+  `ios_distribution_nse.mobileprovision`). Writing two to one name
   silently clobbers the first.
 - **`ExportOptions.plist`** carries a `provisioningProfiles` entry for
   each bundle ID. `xcodebuild -exportArchive` fails when an embedded
@@ -569,7 +696,8 @@ That has three consequences in the pipeline:
   override.** A CLI override applies to every target in the archive,
   which would push the app profile onto the appex it does not cover.
   Instead each target's specifier lives in its own xcconfig
-  (`App/App/Config/App*.xcconfig` and `Extension*.xcconfig`), next to the
+  (`App/App/Config/App*.xcconfig`, `Extension*.xcconfig`,
+  `Share*.xcconfig`, and `NotificationService*.xcconfig`), next to the
   `PRODUCT_BUNDLE_IDENTIFIER` it has to agree with. Those files set
   `PROVISIONING_PROFILE_SPECIFIER_Manual` and resolve
   `PROVISIONING_PROFILE_SPECIFIER =
@@ -580,9 +708,91 @@ That has three consequences in the pipeline:
   machines.
 
 Profile names are therefore written down in three places that must agree
-character for character: the Apple Developer portal, the xcconfig, and
-the `profile_name` / `ext_profile_name` outputs of the `config` step in
-`release-ios.yaml`. A mismatch fails the build with an unhelpful message.
+character for character: the Apple Developer portal, the xcconfig, and the
+`profile_name` / `ext_profile_name` / `share_profile_name` /
+`nse_profile_name` outputs of the `config` step in `release-ios.yaml`. A
+mismatch fails the build with an unhelpful message.
+
+#### The NotificationService extension also changes the app's own App ID
+
+The other two appexes need only their own App IDs. This one also makes the
+containing app claim a restricted entitlement,
+`com.apple.developer.usernotifications.communication`, which is what lets
+`UNNotificationContent.updating(from:)` rewrite a push into a Communication
+Notification. That capability has to be enabled on the three **main app**
+App IDs, and a capability added to an App ID does not reach profiles already
+issued against it, so the three main app distribution profiles must be
+reissued and their `IOS_PROVISIONING_PROFILE*` secrets replaced. Skipping
+that leaves the app signing against a profile that does not grant the
+entitlement, and the manual-signing archive fails on the app itself even
+once every extension row is complete.
+
+The appex's own entitlements file stays App Group-only, the same file the
+other two extensions use: the extension reads cached avatars out of the
+shared container and needs nothing more. The capability is an app-target one.
+Apple's [Implementing communication
+notifications](https://developer.apple.com/documentation/usernotifications/implementing-communication-notifications)
+says to "Enable the Communication Notifications capability in your app target",
+and [WWDC21 session 10091](https://developer.apple.com/videos/play/wwdc2021/10091/)
+splits the two halves the same way: "enable the communication capability via
+Xcode for your application" against "start donating incoming StartCall and
+SendMessage intents in your service extension". Do not add the entitlement to
+the appex speculatively: a target declaring an entitlement its profile does not grant
+fails to sign, so it would break every environment's release until the NSE App
+IDs carried the capability too.
+
+#### Local notification owner and remote extension
+
+The app has two native notification routes with different owners. APNs invokes
+the `NotificationService` extension, which may rewrite the remote push before
+its one-shot content handler returns. App-originated notifications do not pass
+through that extension. Under `local-notification-avatar`, the app-local
+`SenderNotificationPlugin` owns them after a versioned capability check. An
+exact prepared scope, assistant, and native sender identity match gates the
+sender rewrite, not native ownership. Missing or stale prepared identity makes
+the same native owner submit plain content.
+
+The local plugin keeps bounded prepared generations and completed full-key
+results in app-process RAM. Once `post` accepts a delivery key, native code
+alone races the Communication Notification rewrite against its deadline and
+submits rewritten or plain content once. A blocked, failed, unknown, or late
+bridge result does not authorize a second Capacitor notification. A process
+restart clears those results. Validated PNG bytes may remain in the existing
+App Group cache, but the cache does not establish identity or delivery
+ownership.
+
+`push-avatar-sender` independently controls whether the platform gives the APNs
+route sender metadata. `local-notification-avatar` controls the app-local route.
+Both default off. The signed-device cases and current rollout status are in the
+[notification avatar and local delivery QA ledger](../../docs/notification-avatar-local-qa.md).
+
+#### The push payload the extension reads
+
+APNs carries JSON, so the sender arrives as a nested object beside `aps`:
+
+```json
+{
+  "aps": {
+    "alert": { "title": "<conversation title>", "body": "<message>" },
+    "mutable-content": 1
+  },
+  "sender": {
+    "id": "<assistant id>",
+    "name": "<assistant name>",
+    "avatar_url": "https://.../avatar.png",
+    "avatar_hash": "<sha-256 hex of the bytes at avatar_url>"
+  }
+}
+```
+
+`mutable-content: 1` is what makes iOS run the extension at all. `id`, `name`,
+and `avatar_hash` must all be non-empty or the push is delivered untouched.
+`avatar_url` is optional: it is the first field the platform drops when a
+payload nears the APNs size limit, and the hash alone still hits a warm cache.
+The thread is the assistant id, so every conversation with one assistant
+threads together. Android reads the same four fields as flat `sender_*` entries
+in the FCM data map, which is a string map rather than JSON: the two consumers
+differ by transport, not by contract.
 
 ### Manual Apple Developer portal setup
 
@@ -609,55 +819,230 @@ build of the affected environment fails while signing or exporting.
 > help either; manual signing then fails with `"VoiceActivity …" requires a
 > provisioning profile` instead. The fix is the portal work below, not a
 > workflow change.
+>
+> **The app's own profiles are equally stale.** `App.entitlements` and
+> `App-Dev.entitlements` now declare
+> `com.apple.developer.usernotifications.communication`, and a profile issued
+> before Communication Notifications was ticked on its App ID does not grant
+> it, so the archive fails on the **app** target even once every extension row
+> is complete. Unlike the extension case this one is caught early:
+> "Install provisioning profiles" decodes the installed app profile with
+> `security cms -D` and hard-fails the run with an `::error::` when the
+> entitlement is absent, rather than letting the run reach Archive. Clearing
+> it means doing step 2 and step 4 below for the app App ID of the environment
+> being released and replacing its `IOS_PROVISIONING_PROFILE*` secret.
 
 | Environment | Extension bundle ID | Profile name (exact) | GitHub secret |
 |-------------|---------------------|----------------------|---------------|
 | production | `ai.vocify-inc.vellum-assistant-ios.VoiceActivity` | `Vellum Assistant iOS VoiceActivity Distribution` | `IOS_PROVISIONING_PROFILE_EXT` |
 | staging | `ai.vocify-inc.vellum-assistant-ios.staging.VoiceActivity` | `Vellum Assistant iOS Staging VoiceActivity Distribution` | `IOS_PROVISIONING_PROFILE_EXT_STAGING` |
 | dev | `ai.vocify-inc.vellum-assistant-ios.dev.VoiceActivity` | `Vellum Assistant iOS Dev VoiceActivity Distribution` | `IOS_PROVISIONING_PROFILE_EXT_DEV` |
+| production | `ai.vocify-inc.vellum-assistant-ios.Share` | `Vellum Assistant iOS Share Distribution` | `IOS_PROVISIONING_PROFILE_SHARE` |
+| staging | `ai.vocify-inc.vellum-assistant-ios.staging.Share` | `Vellum Assistant iOS Staging Share Distribution` | `IOS_PROVISIONING_PROFILE_SHARE_STAGING` |
+| dev | `ai.vocify-inc.vellum-assistant-ios.dev.Share` | `Vellum Assistant iOS Dev Share Distribution` | `IOS_PROVISIONING_PROFILE_SHARE_DEV` |
+| production | `ai.vocify-inc.vellum-assistant-ios.NotificationService` | `Vellum Assistant iOS NotificationService Distribution` | `IOS_PROVISIONING_PROFILE_NSE` |
+| staging | `ai.vocify-inc.vellum-assistant-ios.staging.NotificationService` | `Vellum Assistant iOS Staging NotificationService Distribution` | `IOS_PROVISIONING_PROFILE_NSE_STAGING` |
+| dev | `ai.vocify-inc.vellum-assistant-ios.dev.NotificationService` | `Vellum Assistant iOS Dev NotificationService Distribution` | `IOS_PROVISIONING_PROFILE_NSE_DEV` |
+
+The containing app App IDs already exist, and each one already carries
+the App Group from the VoiceActivity row. A new Share or
+NotificationService App ID still needs that same group assigned. A
+capability added to an App ID does not reach profiles already issued
+against it, so a first-time extension row also issues that extension's
+distribution profile:
+
+| Environment | App bundle ID | Profile name (exact) | GitHub secret |
+|-------------|--------------|----------------------|---------------|
+| production | `ai.vocify-inc.vellum-assistant-ios` | `Vellum Assistant iOS Distribution` | `IOS_PROVISIONING_PROFILE` |
+| staging | `ai.vocify-inc.vellum-assistant-ios.staging` | `Vellum Assistant iOS Staging Distribution` | `IOS_PROVISIONING_PROFILE_STAGING` |
+| dev | `ai.vocify-inc.vellum-assistant-ios.dev` | `Vellum Assistant iOS Dev Distribution` | `IOS_PROVISIONING_PROFILE_DEV` |
+
+For the NotificationService rows only, step 2 below also enables
+**Communication Notifications** on the containing app's App ID, and step 4
+is what carries that capability into the app's profile. Both are required:
+the app entitlements file now declares
+`com.apple.developer.usernotifications.communication`, and a build
+declaring an entitlement its profile does not grant fails to sign.
 
 Repeat these steps once per row (start with **dev** — it is the only
 track that releases hourly, so it is the fastest way to prove the setup):
 
-1. **Register the App ID.** [Certificates, Identifiers &
+1. **Register the extension App ID.** [Certificates, Identifiers &
    Profiles](https://developer.apple.com/account/resources/identifiers/list)
    → **Identifiers** → **+** → **App IDs** → **App**. Set
    **Bundle ID** to **Explicit** and paste the exact string from the
-   table. Description can be anything descriptive
-   (e.g. "Vellum Assistant iOS Dev VoiceActivity"). **Enable no
-   capabilities** — the extension deliberately ships no entitlements
-   file (no App Group, no push; see the comment at the top of
+   first table. Description can be anything descriptive
+   (e.g. "Vellum Assistant iOS Dev VoiceActivity"). Enable **App
+   Groups** and nothing else, then assign the group for this row's
+   environment (`group.ai.vocify-inc.vellum-assistant-ios`, plus the
+   `.staging` / `.dev` suffix; create it under **Identifiers → App
+   Groups** first if it does not exist). Push in particular
+   stays off: the extension's entitlements file carries the App Group
+   alone (see the comment at the top of
    `App/App/Config/Extension-Base.xcconfig`), and a capability enabled
-   here produces a profile the build cannot satisfy. **Register**.
-2. **Create the distribution profile.** **Profiles** → **+** →
-   **Distribution → App Store Connect** → pick the App ID from step 1 →
+   here that the build does not declare produces a profile the build
+   cannot satisfy. **Register**.
+2. **Add the App Group to the containing app's App ID.**
+   **Identifiers** → the app bundle ID from the second table →
+   **App Groups** → tick it, **Edit**, and assign the same group as
+   step 1 → **Save**. A container is shared only between bundles naming
+   the identical group, so both bundle IDs carry the same one. On a
+   NotificationService row, also tick **Communication Notifications** on
+   this same App ID (not on the extension's) before saving.
+3. **Create the extension's distribution profile.** **Profiles** → **+**
+   → **Distribution → App Store Connect** → pick the App ID from step 1 →
    pick the Apple Distribution certificate that matches the
    `DIST_CERTIFICATE_P12` secret → **Provisioning Profile Name**: type
-   the profile name from the table exactly, including capitalisation and
-   spacing → **Generate** → **Download**.
-3. **Base64-encode it**, matching how the existing profile secrets are
-   stored (the workflow pipes the secret through `base64 -D`):
+   the profile name from the first table exactly, including
+   capitalisation and spacing → **Generate** → **Download**.
+4. **Reissue the containing app's distribution profile.** **Profiles** →
+   the profile named in the second table → **Edit** → **Save** (which
+   regenerates it against the App ID's capabilities as they stand after
+   step 2) → **Download**. Keep the name exactly as it is: the app
+   xcconfig and `release-ios.yaml` both reference it. Skipping this
+   leaves the app target signing against a profile with no App Group
+   entitlement, and the manual-signing archive fails on the app itself
+   even once every extension row is complete.
+5. **Base64-encode both downloads**, matching how the existing profile
+   secrets are stored (the workflow pipes the secret through
+   `base64 -D`):
 
    ```bash
    base64 -i ~/Downloads/<downloaded>.mobileprovision | pbcopy
    ```
 
-4. **Add the GitHub secret.** Repo **Settings → Secrets and variables →
-   Actions → New repository secret**. Name it exactly as in the table,
-   paste the clipboard contents. Use the same scope as the existing
+6. **Add or replace the GitHub secrets.** Repo **Settings → Secrets and
+   variables → Actions**. This row's extension secret
+   (`IOS_PROVISIONING_PROFILE_EXT*`, `IOS_PROVISIONING_PROFILE_SHARE*`, or
+   `IOS_PROVISIONING_PROFILE_NSE*`, whichever the first table names) is a
+   **New repository secret** named exactly as in that table; its
+   `IOS_PROVISIONING_PROFILE*` already exists, so **Update** it with the
+   step 4 profile. Use the same scope as the existing
    `IOS_PROVISIONING_PROFILE*` secrets.
-5. **Nothing to do in App Store Connect.** The extension ships inside
+7. **Nothing to do in App Store Connect.** The extension ships inside
    its host app's record — it gets no app record and no
    `APPLE_APP_ID_*` of its own.
 
-Once all three rows are done, verify end to end by dispatching
-`dev-release.yaml`, downloading the `ios-ipa-dev` artifact, and checking
-that the appex is signed with the *extension* profile:
+Once all three extension types are done for dev, verify end to end by
+dispatching `dev-release.yaml`, downloading the `ios-ipa-dev` artifact, and
+checking that every appex embeds its expected extension profile and that the
+app and all three appexes carry the App Group. Decode
+`embedded.mobileprovision` directly to verify a profile. `codesign -dvvv` does
+not prove which profile was embedded.
 
 ```bash
-unzip -q ios-ipa-dev.zip && unzip -q *.ipa
-codesign -dvvv "Payload/App Dev.app/PlugIns/VoiceActivity Dev.appex" 2>&1 | grep -i profile
+(
+set -euo pipefail
+verification_dir=$(mktemp -d)
+trap 'rm -rf "$verification_dir"' EXIT
+unzip -q ios-ipa-dev.zip -d "$verification_dir"
+shopt -s nullglob
+ipa_paths=("$verification_dir"/*.ipa)
+test "${#ipa_paths[@]}" -eq 1
+mkdir -p "$verification_dir/ipa" "$verification_dir/profiles"
+unzip -q "${ipa_paths[0]}" -d "$verification_dir/ipa"
+app_path="$verification_dir/ipa/Payload/App Dev.app"
+profile_dir="$verification_dir/profiles"
+
+inspect_profile() {
+  appex_path=$1
+  profile_key=$2
+  expected_name=$3
+  expected_application_identifier=$4
+  profile_plist="$profile_dir/$profile_key.plist"
+
+  security cms -D -i "$appex_path/embedded.mobileprovision" > "$profile_plist"
+  actual_name=$(/usr/libexec/PlistBuddy -c 'Print :Name' "$profile_plist")
+  actual_application_identifier=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$profile_plist")
+  printf 'Name: %s\napplication-identifier: %s\n' "$actual_name" "$actual_application_identifier"
+  test "$actual_name" = "$expected_name"
+  test "$actual_application_identifier" = "$expected_application_identifier"
+}
+
+inspect_profile \
+  "$app_path/PlugIns/VoiceActivity Dev.appex" \
+  voice-activity \
+  "Vellum Assistant iOS Dev VoiceActivity Distribution" \
+  "7FZDXZR8P5.ai.vocify-inc.vellum-assistant-ios.dev.VoiceActivity"
+inspect_profile \
+  "$app_path/PlugIns/Share Dev.appex" \
+  share \
+  "Vellum Assistant iOS Dev Share Distribution" \
+  "7FZDXZR8P5.ai.vocify-inc.vellum-assistant-ios.dev.Share"
+inspect_profile \
+  "$app_path/PlugIns/NotificationService Dev.appex" \
+  notification-service \
+  "Vellum Assistant iOS Dev NotificationService Distribution" \
+  "7FZDXZR8P5.ai.vocify-inc.vellum-assistant-ios.dev.NotificationService"
+
+# Verify signature integrity separately from embedded profile contents.
+codesign --verify --strict --verbose=2 "$app_path"
+codesign --verify --strict --verbose=2 "$app_path/PlugIns/VoiceActivity Dev.appex"
+codesign --verify --strict --verbose=2 "$app_path/PlugIns/Share Dev.appex"
+codesign --verify --strict --verbose=2 "$app_path/PlugIns/NotificationService Dev.appex"
+
+codesign -d --entitlements - "$app_path" 2>&1 | grep -A2 application-groups
+codesign -d --entitlements - "$app_path/PlugIns/VoiceActivity Dev.appex" 2>&1 | grep -A2 application-groups
+codesign -d --entitlements - "$app_path/PlugIns/Share Dev.appex" 2>&1 | grep -A2 application-groups
+codesign -d --entitlements - "$app_path/PlugIns/NotificationService Dev.appex" 2>&1 | grep -A2 application-groups
+# Communication Notifications belongs to the app target only. An empty app
+# result means its profile predates the capability.
+codesign -d --entitlements - "$app_path" 2>&1 | grep usernotifications.communication
+if codesign -d --entitlements - "$app_path/PlugIns/NotificationService Dev.appex" 2>&1 | grep -q usernotifications.communication; then
+  echo "NotificationService must not carry the Communication Notifications entitlement"
+  exit 1
+fi
+)
 ```
+
+Then check the notification avatar itself on a device: send a push while the
+app is killed, backgrounded, and foregrounded; send a second push for the same
+avatar and confirm Console shows no network fetch; change the avatar on the
+assistant and confirm the next push picks it up; tap through to the
+conversation. Every path that gives up logs one `nse.` prefix
+(`nse.no_sender`, `nse.no_app_group`, `nse.avatar_unavailable`,
+`nse.intent_failed`, `nse.expired`), so filter Console on `nse.` before
+guessing.
+
+`nse.avatar_unavailable` carries a `reason=` token naming the cause, so one
+line is enough to tell a trimmed payload from a rejected download:
+
+| `reason=` | What it means |
+|-----------|---------------|
+| `no_url` | Cache miss and the payload carried no `avatar_url` (usually a payload trimmed for size). |
+| `invalid_url` | `avatar_url` was present but `URL(string:)` could not read it. |
+| `bad_hash` | `avatar_hash` is not 64 lowercase hex characters. |
+| `insecure_url` | `avatar_url` is not `https`. |
+| `request_failed` | The request never produced a response (offline, DNS, TLS). |
+| `bad_status` | The response was not an HTTP 200. |
+| `declared_too_large` | The response declared a `Content-Length` past 512 KB. |
+| `body_too_large` | The body crossed 512 KB while streaming, declared or not. |
+| `read_failed` | The body stopped mid-transfer, including on extension expiry. |
+| `timed_out` | The body kept arriving, too slowly to go idle, past the download's total budget. |
+| `digest_mismatch` | The bytes did not hash to `avatar_hash`. |
+
+`declared_too_large`, `body_too_large` and `timed_out` are the download's own
+bounds: 512 KB whether the response declares a length or streams one, and six
+seconds of wall clock on top of the request's idle timeout, which bounds only a
+stall. Android bounds the same download the same way, reading 8 KB chunks under
+the same 512 KB cap against a three-second budget that spans the response head
+and the body (`RESPONSE_BUDGET_MILLIS` in
+`clients/android/app/src/main/java/ai/vellum/assistant/push/AvatarCache.java`).
+iOS buffers 16 KB chunks out of a per-byte `URLSession.AsyncBytes` sequence and
+reads a monotonic clock once per byte, since any stride between checks is a
+window a host answering fewer bytes than that stride hides in.
+
+A banner with no avatar and no `nse.` line at all is the entitlement and
+profile case rather than a code one. `updating(from:)` may throw, which lands
+in `nse.intent_failed`, or return the content unchanged, which logs nothing at
+all, so check both: a plain banner without `nse.intent_failed` still points at
+Communication Notifications on the app's App ID and the profile that has to
+grant it. The extension's `Info.plist` carries no `IntentsSupported` (that key
+belongs to the Intents extension point, not to
+`com.apple.usernotifications.service`); the app's `Info.plist` carries
+`NSUserActivityTypes: [INSendMessageIntent]`, which is the declaration the
+rewrite needs. `clients/ios/scripts/__tests__/notification-service-bundle-ids.test.ts`
+pins both.
 
 > **Profiles expire after one year.** Renewal is the same loop:
 > regenerate in the portal under the identical name, re-encode, update
@@ -673,6 +1058,8 @@ All iOS signing secrets are stored as GitHub Actions secrets:
 - `IOS_PROVISIONING_PROFILE` — Production provisioning profile (App Store Distribution)
 - `IOS_PROVISIONING_PROFILE_STAGING` / `_DEV` — Per-environment profiles
 - `IOS_PROVISIONING_PROFILE_EXT` / `_EXT_STAGING` / `_EXT_DEV` — Per-environment profiles for the embedded `VoiceActivity` widget extension. See [Manual Apple Developer portal setup](#manual-apple-developer-portal-setup).
+- `IOS_PROVISIONING_PROFILE_SHARE` / `_SHARE_STAGING` / `_SHARE_DEV` — Per-environment profiles for the embedded Share Sheet extension. Same portal setup as VoiceActivity (App Group only; no push).
+- `IOS_PROVISIONING_PROFILE_NSE` / `_NSE_STAGING` / `_NSE_DEV`: per-environment profiles for the embedded Notification Service Extension. Same portal setup as Share (App Group only), plus Communication Notifications on the containing app's App ID and reissued `IOS_PROVISIONING_PROFILE*` secrets. See [Manual Apple Developer portal setup](#manual-apple-developer-portal-setup).
 - `APPLE_APP_ID_PROD` / `_STAGING` / `_DEV` — Numeric App Store Connect app IDs (e.g. `123456789`), passed as `--apple-id` to [`xcrun altool --upload-package`](https://keith.github.io/xcode-man-pages/altool.7.html). Each environment has its own ASC app record with its own ID.
 - `SLACK_WEBHOOK_URL` — Slack incoming webhook for `#build-alerts` notifications
 
@@ -695,15 +1082,18 @@ clients/
     │                                 # generated capacitor.config.json, etc.
     ├── docs/
     │   └── NATIVE_VOICE.md           # Live Activity, App Intents, deep links
+    ├── scripts/
+    │   └── generate-avatar-icons.ts  # Generates App/App/AvatarIcons.xcassets + Config/AvatarIcons.xcconfig
     ├── App/
     │   ├── App.xcodeproj/            # Open this in Xcode
-    │   │   └── xcshareddata/xcschemes/  # Shared schemes for all 3 targets
+    │   │   └── xcshareddata/xcschemes/  # Shared schemes: 3 apps + AppTests
     │   ├── App/
     │   │   ├── Config/               # xcconfig files (Base + per-target)
     │   │   ├── AppIcon.icon/         # Production icon (green)
     │   │   ├── AppIcon-Staging.icon/  # Staging icon (yellow)
     │   │   ├── AppIcon-Dev.icon/      # Dev icon (pink)
-    │   │   ├── Assets.xcassets/      # Splash imageset lives here
+    │   │   ├── AvatarIcons.xcassets/ # Generated avatar alternate icons (all 3 app targets)
+    │   │   ├── Assets.xcassets/      # Launch wordmark imageset lives here
     │   │   ├── Base.lproj/           # LaunchScreen.storyboard, Main.storyboard
     │   │   ├── AppDelegate.swift     # Universal Links + APNs token forwarding
     │   │   ├── MyViewController.swift  # CAPBridgeViewController subclass
@@ -714,12 +1104,25 @@ clients/
     │   │   ├── ApnsEnvironmentPlugin.swift # APNs entitlement environment
     │   │   ├── SelfHostedServer.swift      # Active + remembered self-hosted origins
     │   │   ├── SelfHostedServersPlugin.swift # Server list / origin switching bridge
-    │   │   ├── RecentChatsPlugin.swift # Conversation-list cache for the Shortcuts chat picker
+    │   │   ├── RecentChatsPlugin.swift # Conversation-list cache for Shortcuts + Share
+    │   │   ├── WidgetSnapshotPlugin.swift # App Group snapshot the Home Screen widgets render
+    │   │   ├── AppIconPlugin.swift   # Alternate app icon state + selection bridge
+    │   │   ├── ShareInboxPlugin.swift # Drain the App Group share inbox
+    │   │   ├── SenderNotificationPlugin.swift # Process-local notification owner
     │   │   ├── Intents/              # App Intents + AppShortcutsProvider
     │   │   ├── Shared/               # Compiled into app + widget extension
     │   │   └── Info.plist
+    │   ├── AppTests/                 # XCTest bundle for the framework-free
+    │   │                             # helpers under App/ (no host app)
+    │   ├── NotificationService/      # Notification Service Extension: rewrite
+    │   │                             # a push into a Communication Notification
+    │   │                             # so the assistant avatar is the icon
+    │   ├── ShareExtension/           # Share Sheet: write inbox + open host
     │   ├── VoiceActivity/            # WidgetKit extension: Live Activity
-    │   │                             # presentations + Control Center controls
+    │   │   │                         # presentations + Control Center controls
+    │   │   └── Widgets/              # Catch Up, Status, and Quick Actions
+    │   │                             # Home Screen widgets over the App Group
+    │   │                             # snapshot
     │   └── CapApp-SPM/               # SPM local package: pulls in @capacitor/ios
     │                                 # and any Capacitor plugin native deps
     └── debug.xcconfig                # Sets CAPACITOR_DEBUG for Debug builds

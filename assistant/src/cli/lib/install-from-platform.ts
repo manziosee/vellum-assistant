@@ -8,7 +8,9 @@
  * and extracts it into the plugin's install directory — it does NOT clone the
  * plugin from GitHub itself, and it does NOT emit `plugin_installed` telemetry
  * (hitting this endpoint *is* the recorded install; the server rejects that
- * event type on the usual ingest path).
+ * event type on the usual ingest path). A tarball that ships neither supported
+ * manifest gets the same synthesized manifest the GitHub clone path writes, so
+ * the loader still registers the plugin's skills.
  *
  *     GET {PLATFORM_BASE_URL}/v1/plugins/{name}/install/
  *
@@ -27,9 +29,14 @@ import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 import { gunzipSync } from "node:zlib";
 
+import {
+  MALFORMED_USTAR_SIZE,
+  parseUstarSizeField,
+} from "../../archive/ustar-size.js";
 import { getPlatformBaseUrl } from "../../config/env.js";
 import { getExistingDeviceId } from "../../util/device-id.js";
 import { getWorkspacePluginsDir } from "../../util/platform.js";
+import { getPluginManifestInstallAction } from "../../util/plugin-manifest.js";
 import { APP_VERSION } from "../../version.js";
 import type { FetchLike } from "./fetch-like.js";
 import {
@@ -42,6 +49,7 @@ import {
   PluginNotFoundError,
   PluginSourceUnavailableError,
   sanitizePluginName,
+  synthesizeMinimalPackageJson,
 } from "./install-from-github.js";
 
 /**
@@ -196,6 +204,18 @@ export async function installPluginFromPlatform(
   if (fileCount === 0) {
     rmSync(stagingDir, { recursive: true, force: true });
     throw new PluginNotFoundError(name, meta.ref ?? "", meta.repo ?? name);
+  }
+
+  // Same default as the GitHub clone path: a marketplace tarball without a
+  // recognized manifest still has to load. A claimed standard manifest is
+  // validated before the fingerprint and swap.
+  try {
+    if (getPluginManifestInstallAction(stagingDir) === "synthesize-legacy") {
+      synthesizeMinimalPackageJson(name, stagingDir);
+    }
+  } catch (err) {
+    rmSync(stagingDir, { recursive: true, force: true });
+    throw err;
   }
 
   await confirmStagedOrAbort(name, stagingDir, deps.confirmStaged);
@@ -582,18 +602,12 @@ function readHeaderName(header: Buffer): string {
   return prefix ? `${prefix}/${name}` : name;
 }
 
-/** Parse the octal `size` field (bytes 124–136). */
 function parseTarSize(pluginName: string, header: Buffer): number {
-  const raw = header
-    .subarray(124, 136)
-    .toString("utf-8")
-    .replace(/\0/g, "")
-    .trim();
-  const size = raw ? Number.parseInt(raw, 8) : 0;
-  if (!Number.isFinite(size) || size < 0) {
-    throw new PluginArchiveError(pluginName, "malformed tar size field");
+  try {
+    return parseUstarSizeField(header);
+  } catch {
+    throw new PluginArchiveError(pluginName, MALFORMED_USTAR_SIZE);
   }
-  return size;
 }
 
 /** Decode a NUL-terminated field to a UTF-8 string. */

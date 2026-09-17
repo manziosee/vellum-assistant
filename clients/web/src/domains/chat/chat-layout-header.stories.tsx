@@ -1,12 +1,11 @@
 /**
- * Full-header visual matrix, built to protect the conversation header's right
- * cluster now that `ConversationActivityPill` sits in it beside Assets.
+ * Full-header visual matrix, protecting the conversation header's right
+ * cluster.
  *
  * The header is assembled here the way `ChatLayout` + `routes.tsx` assemble it:
- * a long conversation title in the centre slot, and Assets / Activity /
- * Notifications in `topBarRightSlot`. The thing worth protecting is the
- * *composition*: whether the title still shrinks, and whether the cluster stays
- * readable once Activity joins it.
+ * a long conversation title in the centre slot, and Assets / Notifications in
+ * `topBarRightSlot`. The thing worth protecting is the *composition*: whether
+ * the title still shrinks, and whether the cluster stays readable beside it.
  *
  * Notifications is a stand-in, not the real `NotificationsBell`: that component
  * belongs to the home domain and `routes.tsx` injects it into the chat layout at
@@ -14,172 +13,41 @@
  * is the same ghost icon-only `Button` with the same glyph, which is all this
  * story needs it to be. It exists to occupy the cluster, not to be exercised.
  *
- * Six states are covered. The per-status card matrix for subagents and ACP
- * runs belongs to their component tests, not to a header story.
+ * The Assets pill's conversation is seeded by the shared Chat Info decorator,
+ * on ids of this file's own so a panel opened here can only be this header's.
+ *
+ * The states covered are the composition's, not a per-component matrix: the
+ * desktop and mobile baselines, a channel-bound header, the desktop header
+ * with the Chat Info panel open, where the Assets trigger reads as selected,
+ * and the header of a chat whose assets could not be loaded. The mobile
+ * trigger carries the same `active` fill open or closed, so there is no second
+ * open state to show.
  */
 
 import { useEffect, useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
 import { Bell } from "lucide-react";
-import type { Meta, StoryObj } from "@storybook/react-vite";
+import type { Decorator, Meta, StoryObj } from "@storybook/react-vite";
 
 import { Button } from "@vellumai/design-library";
 
-import {
-  appsGetQueryKey,
-  documentsGetQueryKey,
-} from "@/generated/daemon/@tanstack/react-query.gen";
 import { ChannelSourceLinkPill } from "@/domains/chat/components/channel-source-link-pill";
 import { ChatLayoutHeader } from "@/domains/chat/chat-layout-header";
-import { ConversationActivityPill } from "@/domains/chat/components/conversation-activity-pill";
+import { makePreviewableImages } from "@/domains/chat/components/chat-attachments/attachment-fixtures";
+import {
+  failChatInfoDocuments,
+  inChatInfoConversation,
+} from "@/domains/chat/components/chat-info-story-fixtures";
 import { ConversationAssetsPill } from "@/domains/chat/components/conversation-assets-pill";
-import { useAcpRunStore } from "@/domains/chat/acp-run-store";
-import { useSubagentStore } from "@/domains/chat/subagent-store";
 import { MOBILE_MEDIA_QUERY } from "@/hooks/use-is-mobile";
+import { useViewerStore } from "@/stores/viewer-store";
 
+/** This header's own conversation, distinct from the panel stories' fixture ids. */
 const ASSISTANT_ID = "asst-story";
 const CONVERSATION_ID = "conv-story";
-const T0 = 1_700_000_000_000;
 
 const LONG_TITLE =
   "Investigating why the nightly ingestion job silently drops Slack threads " +
   "after a gateway restart";
-
-// ---------------------------------------------------------------------------
-// Fixtures
-// ---------------------------------------------------------------------------
-
-/** One running ACP run and one finished subagent: the mixed case. */
-function seedMixedActivity() {
-  useAcpRunStore.getState().spawnRun({
-    acpSessionId: "acp-live",
-    agent: "claude",
-    parentConversationId: CONVERSATION_ID,
-    startedAt: T0,
-  });
-  useAcpRunStore.getState().receiveEvent({
-    acpSessionId: "acp-live",
-    event: {
-      seq: 1,
-      updateType: "tool_call",
-      toolCallId: "tc-1",
-      toolTitle: "Reading gateway restart logs",
-      toolStatus: "in_progress",
-    },
-  });
-
-  useSubagentStore.getState().spawnSubagent({
-    subagentId: "sa-done",
-    label: "slack-thread-audit",
-    objective: "Audit dropped Slack threads",
-    status: "completed",
-    conversationId: "sa-done-child",
-    parentConversationId: CONVERSATION_ID,
-    timestamp: T0 + 1_000,
-  });
-  // Load a timeline so the finished card settles into its terminal state
-  // instead of the detail-fetch placeholder.
-  useSubagentStore.getState().loadDetail({
-    subagentId: "sa-done",
-    events: [
-      {
-        id: "sa-done-e1",
-        type: "text",
-        content: "Found 12 dropped threads across 3 channels",
-        timestamp: T0 + 1_500,
-      },
-    ],
-  });
-}
-
-/** Finished work only. Nothing running, everything still reopenable. */
-function seedCompletedActivity() {
-  for (const [i, label] of [
-    "slack-thread-audit",
-    "gateway-log-sweep",
-    "retry-policy-review",
-  ].entries()) {
-    const id = `sa-done-${i}`;
-    useSubagentStore.getState().spawnSubagent({
-      subagentId: id,
-      label,
-      objective: label,
-      status: "completed",
-      conversationId: `${id}-child`,
-      parentConversationId: CONVERSATION_ID,
-      timestamp: T0 + i * 100,
-    });
-    useSubagentStore.getState().loadDetail({
-      subagentId: id,
-      events: [
-        { id: `${id}-e1`, type: "text", content: "Done", timestamp: T0 },
-      ],
-    });
-  }
-}
-
-/**
- * Several of each kind running and finished at once: the case that shows the
- * stacks overlapping, the `+N` remainder, and (the point) ACP brand marks and
- * subagent avatars mixed inside the *same* stack. The groups are status groups,
- * never per-kind ones.
- */
-function seedManyMixedActivity() {
-  // Running: one ACP run alongside four subagents.
-  useAcpRunStore.getState().spawnRun({
-    acpSessionId: "acp-live",
-    agent: "claude",
-    parentConversationId: CONVERSATION_ID,
-    startedAt: T0,
-  });
-  useAcpRunStore.getState().receiveEvent({
-    acpSessionId: "acp-live",
-    event: {
-      seq: 1,
-      updateType: "tool_call",
-      toolCallId: "tc-1",
-      toolTitle: "Reading gateway restart logs",
-      toolStatus: "in_progress",
-    },
-  });
-  for (let i = 0; i < 4; i++) {
-    const id = `sa-live-${i}`;
-    useSubagentStore.getState().spawnSubagent({
-      subagentId: id,
-      label: `researcher-${i}`,
-      objective: "",
-      status: "running",
-      conversationId: `${id}-child`,
-      parentConversationId: CONVERSATION_ID,
-      timestamp: T0 + 10 + i * 10,
-    });
-    useSubagentStore.getState().loadDetail({
-      subagentId: id,
-      events: [
-        { id: `${id}-e1`, type: "text", content: "Working", timestamp: T0 },
-      ],
-    });
-  }
-
-  // Finished: a settled ACP run alongside the finished subagents.
-  useAcpRunStore.getState().spawnRun({
-    acpSessionId: "acp-done",
-    agent: "claude",
-    parentConversationId: CONVERSATION_ID,
-    startedAt: T0 - 500,
-  });
-  useAcpRunStore.getState().setTerminal({
-    acpSessionId: "acp-done",
-    status: "completed",
-    completedAt: T0 - 100,
-  });
-  seedCompletedActivity();
-}
-
-function resetActivity() {
-  useAcpRunStore.getState().reset();
-  useSubagentStore.getState().reset();
-}
 
 /**
  * Placeholder for the injected `NotificationsBell`: the same ghost icon-only
@@ -201,64 +69,15 @@ function NotificationsStandIn() {
 // Harness
 // ---------------------------------------------------------------------------
 
-/**
- * Seeds the assets query cache (so the Assets pill has something to show
- * without a daemon) and, optionally, the activity stores. Stores are global
- * singletons, so the teardown matters: without it a story leaks its fixtures
- * into whichever story renders next.
- */
 function Harness({
-  activity,
   isMobile,
   channelBound = false,
 }: {
-  activity: "none" | "mixed" | "completed" | "many";
   isMobile: boolean;
   /** Renders the "Open in Slack" source-link pill leading the cluster, the
    *  way `useChatHeaderRegistration` composes it for channel-bound chats. */
   channelBound?: boolean;
 }) {
-  const queryClient = useQueryClient();
-  const [seeded] = useState(() => {
-    queryClient.setQueryData(
-      appsGetQueryKey({
-        path: { assistant_id: ASSISTANT_ID },
-        query: { conversationId: CONVERSATION_ID },
-      }),
-      {
-        apps: [
-          {
-            id: "app-1",
-            name: "Ingestion dashboard",
-            createdAt: T0,
-            updatedAt: T0,
-            version: "1",
-            contentId: "c1",
-            origin: "workspace",
-          },
-        ],
-      },
-    );
-    queryClient.setQueryData(
-      documentsGetQueryKey({
-        path: { assistant_id: ASSISTANT_ID },
-        query: { conversationId: CONVERSATION_ID },
-      }),
-      { documents: [] },
-    );
-    if (activity === "mixed") {
-      seedMixedActivity();
-    } else if (activity === "completed") {
-      seedCompletedActivity();
-    } else if (activity === "many") {
-      seedManyMixedActivity();
-    }
-    return true;
-  });
-  void seeded;
-
-  useEffect(() => resetActivity, []);
-
   return (
     <ChatLayoutHeader
       isMobile={isMobile}
@@ -282,7 +101,6 @@ function Harness({
             assistantId={ASSISTANT_ID}
             conversationId={CONVERSATION_ID}
           />
-          <ConversationActivityPill conversationId={CONVERSATION_ID} />
           <NotificationsStandIn />
         </>
       }
@@ -306,9 +124,9 @@ function setMatchMedia(impl: typeof window.matchMedia) {
  * shows the mobile composition regardless of the viewport the docs page happens
  * to render at.
  */
-function ForceMobile({ children }: { children: React.ReactNode }) {
+const forceMobile: Decorator = function ForceMobile(Story) {
   // Installed from a `useState` initializer, which runs exactly once and during
-  // this component's render, i.e. before any child samples the query. An
+  // this decorator's render, i.e. before the story samples the query. An
   // identity check against the saved original would not work here: `bind`
   // returns a new function object, so it never compares equal to the global.
   const [original] = useState(() => {
@@ -335,25 +153,46 @@ function ForceMobile({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     return () => setMatchMedia(original);
   }, [original]);
-  return <>{children}</>;
-}
+  return <Story />;
+};
 
-/** Click the Activity trigger so the story renders with its panel open. */
-const openActivityPanel = async ({
-  canvasElement,
-}: {
-  canvasElement: HTMLElement;
-}) => {
-  const trigger = canvasElement.querySelector<HTMLElement>(
-    '[data-testid="conversation-activity-pill"]',
-  );
-  trigger?.click();
+/**
+ * Opens the Chat Info panel for this header's conversation, so the Assets
+ * trigger renders the selected state it holds while the panel is on screen.
+ */
+const withChatInfoOpen: Decorator = function WithChatInfoOpen(Story) {
+  // A `useState` initializer runs during this decorator's own render, i.e.
+  // before the trigger below it first samples the store.
+  useState(() => {
+    useViewerStore.getState().openChatInfo({
+      assistantId: ASSISTANT_ID,
+      conversationId: CONVERSATION_ID,
+    });
+  });
+  useEffect(() => {
+    return () => useViewerStore.getState().closeChatInfo();
+  }, []);
+  return <Story />;
 };
 
 const meta: Meta<typeof Harness> = {
   title: "Chat/ChatLayoutHeader",
   component: Harness,
-  parameters: { layout: "fullscreen" },
+  // Opted out of the global `autodocs` tag. Every story seeds the same
+  // module-singleton chat-session store, so on a docs page that mounts them all
+  // the last transcript seeded would show up in every other story.
+  tags: ["!autodocs"],
+  parameters: {
+    layout: "fullscreen",
+    chatInfo: {
+      assistantId: ASSISTANT_ID,
+      conversationId: CONVERSATION_ID,
+      appCount: 1,
+      documentCount: 0,
+      attachments: [],
+    },
+  },
+  decorators: [inChatInfoConversation],
 };
 
 export default meta;
@@ -364,74 +203,53 @@ type Story = StoryObj<typeof Harness>;
 // ---------------------------------------------------------------------------
 
 /**
- * The header with no agent activity at all: a long title, Assets, Notifications
- * and no Activity control, because the conversation has nothing to reopen.
- * This is the baseline the control must not disturb.
+ * A long title beside Assets and Notifications: the case that decides whether
+ * the centre slot still truncates instead of shoving the cluster off the edge.
  */
 export const DesktopBaseline: Story = {
-  args: { activity: "none", isMobile: false },
+  args: { isMobile: false },
 };
 
 /**
- * One running ACP run and one finished subagent. Closed, the trigger shows the
- * live treatment and counts only the running work. The finished session is
- * reachable but doesn't inflate the count or make the header look busy.
+ * A channel-bound conversation: the "Open in Slack" source-link pill leads the
+ * cluster, taking width from the same row the title is competing for.
  */
-export const DesktopMixedClosed: Story = {
-  args: { activity: "mixed", isMobile: false },
+export const DesktopChannelBound: Story = {
+  args: { isMobile: false, channelBound: true },
 };
 
 /**
- * The same data with the popover open: the running run carries a Stop control,
- * the finished subagent doesn't, and either row opens the existing process
- * detail viewer.
+ * The narrow header, where the title has the least room to give.
  */
-export const DesktopMixedOpen: Story = {
-  args: { activity: "mixed", isMobile: false },
-  play: openActivityPanel,
+export const MobileBaseline: Story = {
+  args: { isMobile: true },
+  decorators: [forceMobile],
 };
 
 /**
- * Nothing running, three finished subagents. The trigger drops the pulsing dots
- * and the primary tint, keeping the green check and its stack. Finished work
- * stays reachable without the header claiming anything is in progress.
+ * The Chat Info panel is open on this conversation, so the Assets glyph carries
+ * the `active` fill that marks it as the selected view. Two transcript images
+ * join the app, so the trigger counts both of the sources it reads.
  */
-export const DesktopCompletedClosed: Story = {
-  args: { activity: "completed", isMobile: false },
+export const AssetsPanelOpen: Story = {
+  args: { isMobile: false },
+  parameters: { chatInfo: { attachments: makePreviewableImages(2) } },
+  decorators: [withChatInfoOpen],
 };
 
 /**
- * Five running and four finished, both mixing ACP runs with subagents. Shows the
- * chips overlapping inside each stack, the `+N` remainder past three, and the
- * point that the two groups are *status* groups: a Claude brand mark and a
- * subagent avatar sit in the same stack.
+ * A chat whose documents source is down with nothing cached. The trigger stays
+ * in the cluster with nothing counted, since the panel is where the user finds
+ * out why.
  */
-export const DesktopManyClosed: Story = {
-  args: { activity: "many", isMobile: false },
-};
-
-/**
- * The fullest right cluster a conversation can produce: a channel-bound chat
- * ("Open in Slack" source-link pill) with assets, heavy agent activity, and
- * Notifications, against the long title. Protects the squeeze behavior: the
- * cluster is `shrink-0`, so only the centre title may give.
- */
-export const DesktopChannelBoundManyClosed: Story = {
-  args: { activity: "many", isMobile: false, channelBound: true },
-};
-
-/**
- * The mobile composition: the cluster collapses to icon-only triggers and
- * Activity opens the bottom sheet rather than a popover.
- */
-export const MobileMixedOpen: Story = {
-  args: { activity: "mixed", isMobile: true },
-  decorators: [
-    (Story) => (
-      <ForceMobile>
-        <Story />
-      </ForceMobile>
-    ),
-  ],
-  play: openActivityPanel,
+export const TriggerUnavailable: Story = {
+  args: { isMobile: false },
+  parameters: {
+    chatInfo: {
+      appCount: 0,
+      documentCount: 0,
+      attachments: [],
+      afterSeed: failChatInfoDocuments,
+    },
+  },
 };

@@ -86,6 +86,7 @@ const BASELINE: Record<string, readonly string[]> = {
     "../../../../../messaging/providers/slack/message-metadata.js",
     "../../../../../persistence/auto-analysis-constants.js",
     "../../../../../persistence/checkpoints.js",
+    "../../../../../persistence/conversation-types.js",
     "../../../../../persistence/db-connection.js",
     "../../../../../persistence/embeddings/embed.js",
     "../../../../../persistence/embeddings/embedding-backend.js",
@@ -128,7 +129,10 @@ const BASELINE: Record<string, readonly string[]> = {
     "../../../../daemon/embedding-reconcile.js",
     "../../../../daemon/trust-context.js",
     "../../../../daemon/turn-latency-sub-spans.js",
-    "../../../../notifications/emit-signal.js",
+    // mcp-setup capability cards list configured server names from the
+    // workspace mcp.json document. No plugin-api equivalent.
+    "../../../../mcp/workspace-mcp-config.js",
+    "../../../../notifications/background-failure-signal.js",
     "../../../../persistence/checkpoints.js",
     "../../../../persistence/conversation-types.js",
     "../../../../persistence/db-connection.js",
@@ -159,6 +163,7 @@ const BASELINE: Record<string, readonly string[]> = {
     "../../../../skills/catalog-cache.js",
     "../../../../telemetry/watchdog-events-store.js",
     "../../../../tools/skills/delete-managed.js",
+    "../../../../util/json.js",
     "../../../../util/logger.js",
     "../../../../util/platform.js",
     "../../../channels/types.js",
@@ -173,6 +178,10 @@ const BASELINE: Record<string, readonly string[]> = {
     "../../../context/strip-injections.js",
     "../../../context/token-estimator.js",
     "../../../conversations/job-handlers/summarization.js",
+    // The standalone memory worker hosts real agent conversations, so its
+    // entry point starts the same eviction sweep the daemon starts at
+    // startup. No plugin-api equivalent.
+    "../../../daemon/conversation-evictor.js",
     "../../../daemon/date-context.js",
     "../../../daemon/disk-pressure-background-gate.js",
     "../../../daemon/embedding-reconcile.js",
@@ -204,6 +213,16 @@ const BASELINE: Record<string, readonly string[]> = {
     "../../../persistence/job-handlers/message-lexical.js",
     "../../../persistence/job-utils.js",
     "../../../persistence/jobs-store.js",
+    // The retrospective cursor is a `(createdAt, id)` bound that must keep
+    // working after its message row is deleted. The resolver lives beside
+    // the persistence after-reads it also drives, so the plugin's
+    // accounting imports it rather than re-deriving the bound. No
+    // plugin-api equivalent.
+    "../../../persistence/message-cursor.js",
+    // Named any-state `createdAt` lookup the cursor bookkeeping uses for
+    // forks and the timestamp backfill; the messages-read boundary guard
+    // requires the read to live in persistence. No plugin-api equivalent.
+    "../../../persistence/message-reads.js",
     "../../../persistence/raw-query.js",
     "../../../persistence/schema/index.js",
     "../../../prompts/persona-resolver.js",
@@ -436,7 +455,7 @@ const NAMESPACE_IMPORT = "*";
  *  namespace import yields the {@link NAMESPACE_IMPORT} sentinel — it reaches
  *  the whole surface, so it must not slip past the anti-backslide check. */
 function symbolsImportedFrom(source: string, hostPathSuffix: string): string[] {
-  const escaped = hostPathSuffix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const escaped = RegExp.escape(hostPathSuffix);
   const from = String.raw`\s*from\s*['"]([^'"]*` + escaped + String.raw`)['"]`;
   const namedRegex = new RegExp(
     String.raw`import\s+(?:type\s+)?\{([^}]*)\}` + from,

@@ -78,10 +78,10 @@ export function AcpChatTerminalBlock({
       <div
         data-testid="acp-chat-terminal-block"
         data-terminal-kind="failed"
-        className="flex items-start gap-2 rounded-lg bg-[var(--system-negative-weak)] px-3 py-2 text-body-small-default text-[var(--system-negative-strong)]"
+        className="flex items-start gap-2 rounded-md bg-[var(--system-negative-weak)] px-3 py-2 text-body-small-default text-[var(--system-negative-strong)]"
       >
         {/* Row wraps for multi-line errors; the icon box matches the 12px
-            text-body-small line-height so the triangle centers on the first
+            text-body-small-default line-height so the triangle centers on the first
             line rather than the wrapped block's middle. */}
         <span
           aria-hidden

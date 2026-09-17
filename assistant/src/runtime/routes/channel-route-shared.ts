@@ -3,7 +3,6 @@
  */
 import type { ChannelId } from "../../channels/types.js";
 import {
-  type ApprovalAction,
   type ApprovalDecisionResult,
   type ApprovalUIMetadata,
   isApprovalAction,
@@ -30,13 +29,6 @@ export function requiredDecisionKeywords(
 // Callback data parser — format: "apr:<requestId>:<action>"
 // ---------------------------------------------------------------------------
 
-/** Map legacy callback actions to canonical ones for in-flight buttons. */
-const LEGACY_CALLBACK_MAP: Record<string, string> = {
-  approve_10m: "approve_once",
-  approve_conversation: "approve_once",
-  approve_always: "approve_once",
-};
-
 export function parseCallbackData(
   data: string,
   sourceChannel?: string,
@@ -46,56 +38,15 @@ export function parseCallbackData(
     return null;
   }
   const requestId = parts[1];
-  const rawAction = parts.slice(2).join(":");
-  const action = LEGACY_CALLBACK_MAP[rawAction] ?? rawAction;
+  const action = parts.slice(2).join(":");
   if (!requestId || !isApprovalAction(action)) {
     return null;
   }
   const source =
-    sourceChannel === "whatsapp"
-      ? ("whatsapp_button" as const)
-      : sourceChannel === "slack"
-        ? ("slack_button" as const)
-        : sourceChannel === "vellum"
-          ? ("vellum_surface" as const)
-          : ("telegram_button" as const);
+    sourceChannel === "vellum"
+      ? ("vellum_surface" as const)
+      : ("button" as const);
   return { action, source, requestId };
-}
-
-// ---------------------------------------------------------------------------
-// Reaction callback data parser — format: "reaction:<emoji_name>"
-// ---------------------------------------------------------------------------
-
-/**
- * Map of Slack emoji names to approval actions. Multiple emoji names can
- * map to the same action to handle Slack's aliasing (e.g. `+1` and `thumbsup`
- * both represent the thumbs-up emoji).
- */
-const REACTION_EMOJI_MAP: ReadonlyMap<string, ApprovalAction> = new Map([
-  ["+1", "approve_once"],
-  ["thumbsup", "approve_once"],
-  ["white_check_mark", "approve_once"],
-  ["alarm_clock", "approve_once"],
-  ["-1", "reject"],
-  ["thumbsdown", "reject"],
-]);
-
-/**
- * Parse a `reaction:<emoji_name>` callback data string into an approval
- * decision. Returns null if the emoji is not mapped to any action.
- */
-export function parseReactionCallbackData(
-  data: string,
-): ApprovalDecisionResult | null {
-  if (!data.startsWith("reaction:")) {
-    return null;
-  }
-  const emoji = data.slice("reaction:".length);
-  const action = REACTION_EMOJI_MAP.get(emoji);
-  if (!action) {
-    return null;
-  }
-  return { action, source: "slack_reaction" };
 }
 
 // ---------------------------------------------------------------------------

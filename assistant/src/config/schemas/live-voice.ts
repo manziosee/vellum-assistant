@@ -1,7 +1,5 @@
 import { z } from "zod";
 
-export const VALID_LIVE_VOICE_MODES = ["ptt", "open-mic"] as const;
-
 export const LiveVoiceVadConfigSchema = z
   .object({
     speechEnergyThreshold: z
@@ -15,6 +13,13 @@ export const LiveVoiceVadConfigSchema = z
       .default(800)
       .describe(
         "Mean absolute amplitude (16-bit linear scale) above which a frame counts as speech — mirrors DEFAULT_SPEECH_ENERGY_THRESHOLD in stt/speech-energy.ts",
+      ),
+    noiseFloorMargin: z
+      .number({ error: "liveVoice.vad.noiseFloorMargin must be a number" })
+      .nonnegative("liveVoice.vad.noiseFloorMargin must be nonnegative")
+      .default(3)
+      .describe(
+        "Multiple of the room's measured background noise level that the speech gate is raised to, so a noisy room does not read as continuous speech. The gate never falls below speechEnergyThreshold and never exceeds 4x it. 0 disables the adaptation and pins the gate to speechEnergyThreshold.",
       ),
     silenceThresholdMs: z
       .number({ error: "liveVoice.vad.silenceThresholdMs must be a number" })
@@ -72,156 +77,20 @@ export const LiveVoiceVadConfigSchema = z
     "Voice-activity-detection tuning for live voice sessions (open-mic turn segmentation)",
   );
 
-export const LiveVoiceProgressConfigSchema = z
-  .object({
-    enabled: z
-      .boolean({
-        error: "liveVoice.frontModel.progress.enabled must be a boolean",
-      })
-      .default(true)
-      .describe(
-        "Speak short progress updates during long-running tool-heavy turns; the opt-out for progress narration",
-      ),
-    opsThreshold: z
-      .number({
-        error: "liveVoice.frontModel.progress.opsThreshold must be a number",
-      })
-      .int("liveVoice.frontModel.progress.opsThreshold must be an integer")
-      .positive(
-        "liveVoice.frontModel.progress.opsThreshold must be a positive integer",
-      )
-      .default(3)
-      .describe(
-        "Narrate after this many tool operations since the last narration",
-      ),
-    idleIntervalMs: z
-      .number({
-        error: "liveVoice.frontModel.progress.idleIntervalMs must be a number",
-      })
-      .int("liveVoice.frontModel.progress.idleIntervalMs must be an integer")
-      .positive(
-        "liveVoice.frontModel.progress.idleIntervalMs must be a positive integer",
-      )
-      .default(5_000)
-      .describe(
-        "How often (ms) a running turn's silence is checked, and so the soonest new tool activity is narrated",
-      ),
-    maxSilenceMs: z
-      .number({
-        error: "liveVoice.frontModel.progress.maxSilenceMs must be a number",
-      })
-      .int("liveVoice.frontModel.progress.maxSilenceMs must be an integer")
-      .positive(
-        "liveVoice.frontModel.progress.maxSilenceMs must be a positive integer",
-      )
-      .default(35_000)
-      .describe(
-        "Heartbeat ceiling (ms): narrate after this much unbroken silence even when nothing new has happened. Evaluated on the idle tick, so its resolution is idleIntervalMs and it must be at least that long",
-      ),
-    longOpMs: z
-      .number({
-        error: "liveVoice.frontModel.progress.longOpMs must be a number",
-      })
-      .int("liveVoice.frontModel.progress.longOpMs must be an integer")
-      .positive(
-        "liveVoice.frontModel.progress.longOpMs must be a positive integer",
-      )
-      .default(15_000)
-      .describe(
-        "A tool operation that ran at least this long (ms) narrates the moment it completes, without waiting for opsThreshold",
-      ),
-    minGapMs: z
-      .number({
-        error: "liveVoice.frontModel.progress.minGapMs must be a number",
-      })
-      .int("liveVoice.frontModel.progress.minGapMs must be an integer")
-      .positive(
-        "liveVoice.frontModel.progress.minGapMs must be a positive integer",
-      )
-      .default(6_000)
-      .describe(
-        "Minimum spacing (ms) from any spoken floor-holder — ack or narration",
-      ),
-    generationTimeoutMs: z
-      .number({
-        error:
-          "liveVoice.frontModel.progress.generationTimeoutMs must be a number",
-      })
-      .int(
-        "liveVoice.frontModel.progress.generationTimeoutMs must be an integer",
-      )
-      .positive(
-        "liveVoice.frontModel.progress.generationTimeoutMs must be a positive integer",
-      )
-      .default(1_500)
-      .describe(
-        "Budget (ms) for LLM-generated progress text — not latency-critical: it speaks into dead air",
-      ),
-  })
-  // The heartbeat is checked when the idle tick finds the turn silent, so a
-  // ceiling shorter than the tick interval would be missed by up to a full
-  // interval — a promise the cadence cannot keep. Rejecting the combination
-  // beats silently overshooting it.
-  .refine((progress) => progress.maxSilenceMs >= progress.idleIntervalMs, {
-    error:
-      "liveVoice.frontModel.progress.maxSilenceMs must be at least idleIntervalMs — the heartbeat is evaluated on the idle tick",
-  })
-  .describe(
-    "Progress-narration tuning for live voice sessions (spoken updates during long-running turns)",
-  );
-
-export const LiveVoiceFrontModelConfigSchema = z
-  .object({
-    endpointDecisionTimeoutMs: z
-      .number({
-        error:
-          "liveVoice.frontModel.endpointDecisionTimeoutMs must be a number",
-      })
-      .int("liveVoice.frontModel.endpointDecisionTimeoutMs must be an integer")
-      .positive(
-        "liveVoice.frontModel.endpointDecisionTimeoutMs must be a positive integer",
-      )
-      .default(1200)
-      .describe(
-        "Hard budget (ms) for the endpoint decision LLM call. This adds to end-of-turn latency when semantic endpointing is on, so keep it as tight as the decider model's real roundtrip allows — measured Haiku roundtrips through the managed proxy run ~670-1130ms (dev), so tighter budgets turn the feature into a fail-open no-op.",
-      ),
-    endpointExtensionMs: z
-      .number({
-        error: "liveVoice.frontModel.endpointExtensionMs must be a number",
-      })
-      .int("liveVoice.frontModel.endpointExtensionMs must be an integer")
-      .positive(
-        "liveVoice.frontModel.endpointExtensionMs must be a positive integer",
-      )
-      .default(1500)
-      .describe(
-        "How long (ms) a 'hold' decision keeps the turn open before turn-end replays",
-      ),
-    endpointMaxExtensions: z
-      .number({
-        error: "liveVoice.frontModel.endpointMaxExtensions must be a number",
-      })
-      .int("liveVoice.frontModel.endpointMaxExtensions must be an integer")
-      .nonnegative(
-        "liveVoice.frontModel.endpointMaxExtensions must be a nonnegative integer",
-      )
-      .default(2)
-      .describe("Cap on consecutive 'hold' extensions per utterance"),
-    progress: LiveVoiceProgressConfigSchema.default(
-      LiveVoiceProgressConfigSchema.parse({}),
-    ),
-  })
-  .describe(
-    "Voice front-door endpointing and long-turn progress narration tuning",
-  );
-
 const LiveVoiceFluxTurnEndConfigSchema = z
   .object({
     enabled: z
       .boolean({ error: "liveVoice.flux.turnEnd.enabled must be a boolean" })
-      .default(false)
+      // On by default because it is the only reason to select Flux, and
+      // because off is not a neutral setting on this provider: managed Flux
+      // exposes no `finalizeUtterance` (Flux commits turns itself), so the
+      // session's persistence check falls through and it opens a socket per
+      // utterance, putting a full Deepgram handshake on every turn. Ignored
+      // by any provider that does not own its turn boundary, so the default
+      // reaches only the sessions it is about.
+      .default(true)
       .describe(
-        "Commit the live-voice turn on Flux's EndOfTurn instead of the front-door [0] hold verdict. Requires services.stt.provider to be deepgram-flux; ignored otherwise.",
+        "Commit the live-voice turn on Flux's EndOfTurn instead of the front-door [0] hold verdict. Requires the active STT provider to be running the flux model family (services.stt.providers.<provider>.model); ignored otherwise.",
       ),
   })
   .describe(
@@ -235,8 +104,10 @@ export const LiveVoiceFluxConfigSchema = z
     ),
     model: z
       .string({ error: "liveVoice.flux.model must be a string" })
-      .default("flux-general-en")
-      .describe("Deepgram Flux model requested when opening the STT stream"),
+      .optional()
+      .describe(
+        "Deepgram Flux model to pin when opening the STT stream. Unset (the default) selects the model from services.stt.language: English and unset use the English model, everything else uses the multilingual one",
+      ),
     eotThreshold: z
       .number({ error: "liveVoice.flux.eotThreshold must be a number" })
       .min(0.5, "liveVoice.flux.eotThreshold must be >= 0.5")
@@ -269,31 +140,10 @@ export const LiveVoiceFluxConfigSchema = z
 
 export const LiveVoiceConfigSchema = z
   .object({
-    mode: z
-      .enum(VALID_LIVE_VOICE_MODES, {
-        error: `liveVoice.mode must be one of: ${VALID_LIVE_VOICE_MODES.join(", ")}`,
-      })
-      .default("open-mic")
-      .describe(
-        "Default microphone mode for live voice sessions — hands-free (open-mic) or push-to-talk (ptt)",
-      ),
     vad: LiveVoiceVadConfigSchema.default(LiveVoiceVadConfigSchema.parse({})),
-    frontModel: LiveVoiceFrontModelConfigSchema.default(
-      LiveVoiceFrontModelConfigSchema.parse({}),
-    ),
     flux: LiveVoiceFluxConfigSchema.default(
       LiveVoiceFluxConfigSchema.parse({}),
     ),
-    maxSessionDurationSeconds: z
-      .number({
-        error: "liveVoice.maxSessionDurationSeconds must be a number",
-      })
-      .int("liveVoice.maxSessionDurationSeconds must be an integer")
-      .positive(
-        "liveVoice.maxSessionDurationSeconds must be a positive integer",
-      )
-      .default(1800)
-      .describe("Maximum duration of a single live voice session in seconds"),
     archiveAudio: z
       .boolean({ error: "liveVoice.archiveAudio must be a boolean" })
       .default(false)
@@ -302,15 +152,9 @@ export const LiveVoiceConfigSchema = z
       ),
   })
   .describe(
-    "Live voice (in-app duplex audio) configuration — mic mode, VAD tuning, and session limits",
+    "Live voice (in-app duplex audio) configuration: VAD tuning, Flux turn detection, and audio archiving",
   );
 
 export type LiveVoiceConfig = z.infer<typeof LiveVoiceConfigSchema>;
 export type LiveVoiceVadConfig = z.infer<typeof LiveVoiceVadConfigSchema>;
-export type LiveVoiceFrontModelConfig = z.infer<
-  typeof LiveVoiceFrontModelConfigSchema
->;
-export type LiveVoiceProgressConfig = z.infer<
-  typeof LiveVoiceProgressConfigSchema
->;
 export type LiveVoiceFluxConfig = z.infer<typeof LiveVoiceFluxConfigSchema>;

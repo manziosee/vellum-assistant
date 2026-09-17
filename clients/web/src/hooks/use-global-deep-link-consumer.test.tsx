@@ -1,4 +1,5 @@
 import {
+  afterAll,
   afterEach,
   beforeEach,
   describe,
@@ -9,6 +10,7 @@ import {
 } from "bun:test";
 import { cleanup, renderHook, act } from "@testing-library/react";
 import type { ReactNode } from "react";
+import type { NavigateOptions, To } from "react-router";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
@@ -30,9 +32,20 @@ import {
 } from "@/stores/pending-deep-link-store";
 import { useResolvedAssistantsStore } from "@/stores/resolved-assistants-store";
 import { useViewerStore } from "@/stores/viewer-store";
+import {
+  appEntryStateFor,
+  showOpenAppRoute,
+  showPath,
+} from "@/stores/open-app.test-helper";
+import type { ShareInboxItem } from "@/runtime/share-inbox-parse";
 import { routes } from "@/utils/routes";
 import * as toastModule from "@vellumai/design-library/components/toast";
+import type * as SentryReact from "@sentry/react";
 import { stubViewportAxes } from "@/hooks/viewport-axes.test-helper";
+import {
+  restoreStubbedModules,
+  stubModule,
+} from "@/utils/module-mock.test-helper";
 
 /**
  * Location the app is "on", advanced by the consumer's own `navigate` calls.
@@ -41,50 +54,80 @@ import { stubViewportAxes } from "@/hooks/viewport-axes.test-helper";
  * route the deep link actually landed on* rather than at a hand-written path.
  */
 let mockPathname: string = routes.assistant;
-const navigateMock = mock((to: string) => {
-  mockPathname = to.split("?")[0] ?? to;
+let mockSearch = "";
+/** What the entry on screen records, which a same-entry replace carries. */
+let mockState: unknown = null;
+const navigateMock = mock((to: To | number, _options?: NavigateOptions) => {
+  // A history delta names no path, so the location stays where it is.
+  const path =
+    typeof to === "number"
+      ? mockPathname
+      : typeof to === "string"
+        ? to
+        : (to.pathname ?? mockPathname);
+  mockPathname = path.split("?")[0] ?? path;
   return undefined;
 });
-mock.module("react-router", () => ({
+stubModule("react-router", await import("react-router"), {
   useNavigate: () => navigateMock,
-  // Empty `search` is the main window — the room's pop-out gate
+  // Empty `search` is the main window: the room's pop-out gate
   // (`isPopoutWindow`) looks for `popout=1`.
-  useLocation: () => ({ pathname: mockPathname, search: "" }),
-}));
+  useLocation: () => ({
+    pathname: mockPathname,
+    search: mockSearch,
+    hash: "",
+    state: mockState,
+    key: "default",
+  }),
+});
 
 const ensureMainWindowVisibleMock = mock(async () => undefined);
-mock.module("@/runtime/main-window", () => ({
+stubModule("@/runtime/main-window", await import("@/runtime/main-window"), {
   ensureMainWindowVisible: ensureMainWindowVisibleMock,
-}));
+});
 
 // Stub the toaster: the top-up success branch toasts, and no <Toaster /> is
-// mounted here. Full toast surface: `mock.module` is process-global in bun,
-// so a partial shape would shadow the other methods for later test files.
-const toastSuccessMock = mock((..._args: unknown[]) => undefined);
-mock.module("@vellumai/design-library/components/toast", () => ({
-  ...toastModule,
-  toast: Object.assign((..._args: unknown[]) => {}, {
-    success: toastSuccessMock,
-    error: () => {},
-    info: () => {},
-    warning: () => {},
-  }),
-}));
+// mounted here.
+const toastSuccessMock = mock<typeof toastModule.toast.success>(
+  (_message, _options) => "",
+);
+// The real toast carries its other kinds and `dismiss`; only the success
+// branch this suite asserts on is replaced.
+stubModule("@vellumai/design-library/components/toast", toastModule, {
+  toast: Object.assign(
+    (..._args: Parameters<typeof toastModule.toast>): string | number => "",
+    toastModule.toast,
+    { success: toastSuccessMock },
+  ),
+});
 
-const sentryBreadcrumbMock = mock((_args: unknown) => undefined);
-// Full Sentry surface — `mock.module` is process-global in bun, so a
-// partial mock would shadow `captureException` (used by `runtime/event-sources/*`
-// and `sse-service`) for every later test file in the run.
-mock.module("@sentry/react", () => ({
+const sentryBreadcrumbMock = mock<typeof SentryReact.addBreadcrumb>(
+  (_breadcrumb) => undefined,
+);
+stubModule("@sentry/react", await import("@sentry/react"), {
   addBreadcrumb: sentryBreadcrumbMock,
-  captureException: () => {},
-}));
+  captureException: () => "",
+});
 
 // Voice entry runs a readiness preflight before a session opens; stub it ready
 // so these tests stay about link handling. See `voice-entry-guards`.
-mock.module("@/domains/chat/voice/live-voice/live-voice-preflight-api", () => ({
-  preflightLiveVoice: async () => ({ status: "ready" }),
-}));
+stubModule(
+  "@/domains/chat/voice/live-voice/live-voice-preflight-api",
+  await import("@/domains/chat/voice/live-voice/live-voice-preflight-api"),
+  { preflightLiveVoice: async () => ({ status: "ready" }) },
+);
+
+const consumeShareInboxMock = mock(
+  async (_id?: string | null): Promise<ShareInboxItem | null> => null,
+);
+const readShareInboxFilesMock = mock(async () => [] as File[]);
+stubModule("@/runtime/share-inbox", await import("@/runtime/share-inbox"), {
+  consumeShareInbox: consumeShareInboxMock,
+  readShareInboxFiles: readShareInboxFilesMock,
+  publishShareInboxSource: () => () => undefined,
+});
+
+afterAll(restoreStubbedModules);
 
 const { useGlobalDeepLinkConsumer } =
   await import("./use-global-deep-link-consumer");
@@ -100,6 +143,8 @@ const renderConsumer = () =>
   renderHook(() => useGlobalDeepLinkConsumer(), { wrapper: Wrapper });
 const { drainPendingVoiceStart } =
   await import("@/domains/chat/voice/live-voice/start-voice-request");
+const { voiceEntryGreetingSeed } =
+  await import("@/domains/chat/voice/live-voice/voice-entry-greeting");
 const { useIsVoiceRoomVisible } =
   await import("@/domains/chat/voice/voice-room/use-is-voice-room-visible");
 const { useVoicePrefsStore } = await import("@/stores/voice-prefs-store");
@@ -113,6 +158,7 @@ const asStarter = (start: (a: string, c: string | null) => void) => ({
   prewarm: () => {},
   cancelPrewarm: () => {},
   start,
+  sendText: () => false,
 });
 
 const resetStores = () => {
@@ -124,6 +170,7 @@ const resetStores = () => {
   useLiveVoiceStore.getState().setStarter(null);
   useAssistantIdentityStore.setState({ assistantId: null, version: null });
   useResolvedAssistantsStore.setState({ activeAssistantId: null });
+  showPath(routes.assistant);
 };
 
 /**
@@ -140,6 +187,8 @@ beforeEach(() => {
   __resetPendingDeepLinkForTesting();
   __resetConnectDialogForTesting();
   mockPathname = routes.assistant;
+  mockSearch = "";
+  mockState = null;
   queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
@@ -147,6 +196,10 @@ beforeEach(() => {
   ensureMainWindowVisibleMock.mockClear();
   sentryBreadcrumbMock.mockClear();
   toastSuccessMock.mockClear();
+  consumeShareInboxMock.mockClear();
+  consumeShareInboxMock.mockImplementation(async () => null);
+  readShareInboxFilesMock.mockClear();
+  readShareInboxFilesMock.mockImplementation(async () => []);
   // Module-level one-shot flag; drain so a prior test's focus request can't
   // satisfy this test's assertion.
   consumePendingComposerFocus();
@@ -200,11 +253,7 @@ describe("deeplink.openThread", () => {
       narrow: false,
       coarsePointer: false,
     });
-    useViewerStore.setState({
-      mainView: "app",
-      activeAppId: "app-1",
-      openedAppState: { appId: "app-1", name: "My App", html: "<h1>hi</h1>" },
-    });
+    showOpenAppRoute({ conversationId: "conv-with-app" });
     renderConsumer();
 
     try {
@@ -216,6 +265,51 @@ describe("deeplink.openThread", () => {
       expect(useConversationStore.getState().editingConversationId).toBe(
         "abc-123",
       );
+      expect(navigateMock).toHaveBeenCalledWith(
+        "/assistant/conversations/abc-123/app/app-1",
+      );
+    } finally {
+      restoreViewport();
+    }
+  });
+
+  test("a same-thread tap beside an open app keeps the app in the URL", () => {
+    const restoreViewport = stubViewportAxes({
+      narrow: false,
+      coarsePointer: false,
+    });
+    useConversationStore.setState({ activeConversationId: "abc-123" });
+    showOpenAppRoute({ conversationId: "conv-with-app" });
+    renderConsumer();
+
+    try {
+      act(() => {
+        publish("deeplink.openThread", { threadId: "abc-123" });
+      });
+
+      expect(useViewerStore.getState().mainView).toBe("app-editing");
+      expect(navigateMock).toHaveBeenCalledWith(
+        "/assistant/conversations/abc-123/app/app-1",
+      );
+    } finally {
+      restoreViewport();
+    }
+  });
+
+  test("drops the app from the URL on a narrow viewport, which has no split", () => {
+    const restoreViewport = stubViewportAxes({
+      narrow: true,
+      coarsePointer: true,
+    });
+    showOpenAppRoute({ conversationId: "conv-with-app" });
+    renderConsumer();
+
+    try {
+      act(() => {
+        publish("deeplink.openThread", { threadId: "abc-123" });
+      });
+
+      expect(useViewerStore.getState().mainView).toBe("chat");
       expect(navigateMock).toHaveBeenCalledWith(
         "/assistant/conversations/abc-123",
       );
@@ -497,8 +591,34 @@ describe("deeplink.startVoice", () => {
   const isVoiceRoomVisible = (): boolean =>
     renderHook(() => useIsVoiceRoomVisible()).result.current;
 
-  test("mode=new starts a session on the draft composer — no conversation, so the server assigns one", async () => {
+  /** An earlier thread the app is left sitting on when a link arrives. */
+  const PRIOR_CONVERSATION_ID = "conv-prior";
+
+  /**
+   * The session is started on a conversation minted for it, and the app lands
+   * on that conversation so its composer can own the session and show the
+   * room. Never the selection already in the store: that is wherever the user
+   * was last, while a link asking for voice means a new call. A minted id is a
+   * fresh uuid, hence the assertions against the store rather than a literal.
+   */
+  const expectStartedOnFreshDraft = (starterMock: unknown): void => {
+    const conversationId = useConversationStore.getState().activeConversationId;
+    expect(conversationId).not.toBeNull();
+    expect(conversationId).not.toBe(PRIOR_CONVERSATION_ID);
+    // A link is one of several ways in, and the daemon's telemetry is told
+    // which. The minted draft is empty, so the assistant speaks first on it.
+    expect(starterMock).toHaveBeenCalledWith("assistant-1", conversationId, {
+      entry: "deep_link",
+      seedText: voiceEntryGreetingSeed(true),
+    });
+    expect(mockPathname).toBe(routes.conversation(conversationId ?? ""));
+  };
+
+  test("mode=new starts a session on a conversation of its own, not the one the app was left on", async () => {
     seedEligibleAssistant();
+    useConversationStore
+      .getState()
+      .setActiveConversationId(PRIOR_CONVERSATION_ID);
     const starter = mock((_a: string, _c: string | null) => undefined);
     useLiveVoiceStore.getState().setStarter(asStarter(starter));
     renderConsumer();
@@ -513,7 +633,11 @@ describe("deeplink.startVoice", () => {
     await flush();
 
     expect(navigateMock).toHaveBeenCalledWith("/assistant");
-    expect(starter).toHaveBeenCalledWith("assistant-1", null);
+    expectStartedOnFreshDraft(starter);
+    expect(starter).not.toHaveBeenCalledWith(
+      "assistant-1",
+      PRIOR_CONVERSATION_ID,
+    );
     expect(ensureMainWindowVisibleMock).toHaveBeenCalledTimes(1);
   });
 
@@ -536,14 +660,15 @@ describe("deeplink.startVoice", () => {
     ).not.toBeNull();
     expect(navigateMock).toHaveBeenCalledWith("/assistant");
 
-    // What `useLiveVoiceSessionController` does when it mounts.
+    // What `useLiveVoiceSessionController` does when it mounts, navigation
+    // included: it lands on the conversation the drain mints.
     const starter = mock((_a: string, _c: string | null) => undefined);
     useLiveVoiceStore.getState().setStarter(asStarter(starter));
     await act(async () => {
-      await drainPendingVoiceStart();
+      await drainPendingVoiceStart(navigateMock);
     });
 
-    expect(starter).toHaveBeenCalledWith("assistant-1", null);
+    expectStartedOnFreshDraft(starter);
     expect(usePendingDeepLinkStore.getState().pendingVoiceStartAt).toBeNull();
   });
 
@@ -665,7 +790,7 @@ describe("deeplink.startVoice", () => {
     // `restoreVoiceRoom` no-ops with no active session, so the fresh session
     // the starter opens is not pre-emptively un-minimized by this path.
     expect(useLiveVoiceStore.getState().roomMinimized).toBe(false);
-    expect(starter).toHaveBeenCalledWith("assistant-1", null);
+    expectStartedOnFreshDraft(starter);
   });
 
   test("mode=new during a live call surfaces that call instead of navigating away and starting nothing", async () => {
@@ -714,7 +839,7 @@ describe("deeplink.startVoice", () => {
     await flush();
 
     expect(navigateMock).toHaveBeenCalledWith("/assistant");
-    expect(starter).toHaveBeenCalledWith("assistant-1", null);
+    expectStartedOnFreshDraft(starter);
   });
 
   // -------------------------------------------------------------------------
@@ -828,7 +953,7 @@ describe("deeplink.startVoice", () => {
     });
     await flush();
 
-    expect(starter).toHaveBeenCalledWith("assistant-1", null);
+    expectStartedOnFreshDraft(starter);
     // No session yet, so no room — the room appears once the starter's session
     // reaches an active phase, exactly as it does for a `mode=new` link.
     expect(isVoiceRoomVisible()).toBe(false);
@@ -970,7 +1095,7 @@ describe("deeplink.startVoice", () => {
     await flush();
 
     expect(navigateMock).toHaveBeenCalledWith("/assistant");
-    expect(starter).toHaveBeenCalledWith("assistant-1", null);
+    expectStartedOnFreshDraft(starter);
     // Nothing parked: a promptless link must not disturb the composer.
     expect(usePendingDeepLinkStore.getState().pendingComposerMessage).toBe(
       null,
@@ -1034,70 +1159,416 @@ describe("deeplink.startVoice", () => {
   });
 });
 
-describe("deeplink.connect", () => {
-  test("a bundle link opens the connect dialog prefilled and navigates to the chooser", () => {
+describe("deeplink.share", () => {
+  test("parks a new-draft send and lands on a registered draft", async () => {
+    consumeShareInboxMock.mockImplementation(async () => ({
+      id: "inbox-1",
+      destination: { type: "new" as const },
+      text: "look at this",
+      files: [],
+    }));
+    renderConsumer();
+
+    await act(async () => {
+      publish("deeplink.share", { inboxId: "inbox-1" });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(consumeShareInboxMock).toHaveBeenCalledWith("inbox-1");
+    expect(ensureMainWindowVisibleMock).toHaveBeenCalledTimes(1);
+    const parked = usePendingDeepLinkStore.getState().pendingShareSend;
+    expect(parked?.isNewDraft).toBe(true);
+    expect(parked?.text).toBe("look at this");
+    expect(parked?.threadId).toBe(
+      useConversationStore.getState().activeConversationId ?? undefined,
+    );
+  });
+
+  test("parks a thread send and navigates to that conversation", async () => {
+    consumeShareInboxMock.mockImplementation(async () => ({
+      id: "inbox-2",
+      destination: { type: "thread" as const, threadId: "conv-xyz" },
+      text: "from safari",
+      files: [],
+    }));
+    renderConsumer();
+
+    await act(async () => {
+      publish("deeplink.share", { inboxId: "inbox-2" });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(navigateMock).toHaveBeenCalledWith(routes.conversation("conv-xyz"));
+    const parked = usePendingDeepLinkStore.getState().pendingShareSend;
+    expect(parked?.isNewDraft).toBe(false);
+    expect(parked?.threadId).toBe("conv-xyz");
+    expect(parked?.text).toBe("from safari");
+  });
+
+  test("a missing inbox item is a no-op", async () => {
+    renderConsumer();
+
+    await act(async () => {
+      publish("deeplink.share", { inboxId: "gone" });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(usePendingDeepLinkStore.getState().pendingShareSend).toBeNull();
+    expect(navigateMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("deeplink.newChat", () => {
+  test("mints a registered draft and navigates to it, the same landing the in-app new-chat controls give", () => {
     renderConsumer();
 
     act(() => {
-      publish("deeplink.connect", { url: null, bundle: "eyJnYXRld2F5" });
+      publish("deeplink.newChat", { provenance: null });
     });
 
-    const dialog = useConnectDialogStore.getState();
-    expect(dialog.open).toBe(true);
-    expect(dialog.initialBundle).toBe("eyJnYXRld2F5");
-    expect(dialog.guidanceMessage).toBeNull();
-    expect(navigateMock).toHaveBeenCalledWith(routes.selectAssistant);
     expect(ensureMainWindowVisibleMock).toHaveBeenCalledTimes(1);
+    const [to] = navigateMock.mock.calls.at(-1) as [string];
+    expect(to).toMatch(/^\/assistant\/conversations\/[^/?]+$/);
+    const draftId = to.split("/").at(-1)!;
+    expect(
+      useConversationStore.getState().draftConversationIds.has(draftId),
+    ).toBe(true);
+    expect(useConversationStore.getState().activeConversationId).toBe(draftId);
+  });
+});
+
+describe("deeplink.openConversations", () => {
+  test("parks the request and lands on the chat from a route that mounts no list", () => {
+    mockPathname = routes.settings.general;
+    renderConsumer();
+
+    act(() => {
+      publish("deeplink.openConversations", { provenance: null });
+    });
+
+    expect(ensureMainWindowVisibleMock).toHaveBeenCalledTimes(1);
+    expect(navigateMock).toHaveBeenCalledWith(routes.assistant);
+    expect(
+      usePendingDeepLinkStore.getState().pendingConversationListAt,
+    ).toEqual(expect.any(Number));
   });
 
-  test("a url+code QR link opens the dialog with guidance naming the host", () => {
+  test("a settled conversation already mounts the list, so the tap only parks", () => {
+    mockPathname = routes.conversation("conv-1");
+    renderConsumer();
+
+    act(() => {
+      publish("deeplink.openConversations", { provenance: "intent" });
+    });
+
+    expect(navigateMock).not.toHaveBeenCalled();
+    expect(
+      usePendingDeepLinkStore.getState().pendingConversationListAt,
+    ).toEqual(expect.any(Number));
+  });
+});
+
+describe("deeplink.openCamera", () => {
+  test("parks the request and mints a draft to land on, never the bouncing /assistant index", () => {
+    renderConsumer();
+
+    act(() => {
+      publish("deeplink.openCamera", { provenance: null });
+    });
+
+    expect(ensureMainWindowVisibleMock).toHaveBeenCalledTimes(1);
+    // The index route replace-navigates off itself, remounting the composer
+    // that holds the open viewfinder in local state.
+    expect(navigateMock).not.toHaveBeenCalledWith(routes.assistant);
+    const [to] = navigateMock.mock.calls.at(-1) as [string];
+    expect(to).toMatch(/^\/assistant\/conversations\/[^/?]+$/);
+    const draftId = to.split("/").at(-1)!;
+    expect(
+      useConversationStore.getState().draftConversationIds.has(draftId),
+    ).toBe(true);
+    expect(useConversationStore.getState().activeConversationId).toBe(draftId);
+    // Addressed to the draft it navigated to, so a composer still mounted on
+    // the outgoing route cannot spend the one-shot park on its way out.
+    expect(
+      usePendingDeepLinkStore.getState().pendingCamera?.targetConversationId,
+    ).toBe(draftId);
+  });
+
+  test("a composer already on screen keeps its conversation: the tap re-lands on it", () => {
+    mockPathname = routes.conversation("conv-1");
+    renderConsumer();
+
+    act(() => {
+      publish("deeplink.openCamera", { provenance: "intent" });
+    });
+
+    expect(
+      usePendingDeepLinkStore.getState().pendingCamera?.targetConversationId,
+    ).toBe("conv-1");
+    // The replace re-navigation is a no-op at rest and cancels an in-flight
+    // transition away from the conversation the park is addressed to.
+    expect(navigateMock).toHaveBeenCalledWith(
+      { pathname: routes.conversation("conv-1"), search: "", hash: "" },
+      { replace: true, state: null },
+    );
+  });
+
+  test("reveals the chat behind a full-screen app viewer, which mounts no composer to drain the park", () => {
+    mockPathname = routes.conversation("conv-1");
+    useViewerStore.setState({ mainView: "app" });
+    renderConsumer();
+
+    act(() => {
+      publish("deeplink.openCamera", { provenance: "intent" });
+    });
+
+    expect(useViewerStore.getState().mainView).toBe("chat");
+    expect(
+      usePendingDeepLinkStore.getState().pendingCamera?.targetConversationId,
+    ).toBe("conv-1");
+    expect(navigateMock).toHaveBeenCalledWith(
+      { pathname: routes.conversation("conv-1"), search: "", hash: "" },
+      { replace: true, state: null },
+    );
+  });
+
+  test("keeps a loaded app in the side-by-side layout, where the composer is mounted beside it", () => {
+    const restoreViewport = stubViewportAxes({
+      narrow: false,
+      coarsePointer: false,
+    });
+    mockPathname = routes.conversation("conv-1");
+    mockSearch = "?prompt=hello";
+    showOpenAppRoute({ conversationId: "conv-with-app" });
+    renderConsumer();
+
+    try {
+      act(() => {
+        publish("deeplink.openCamera", { provenance: null });
+      });
+
+      expect(useViewerStore.getState().mainView).toBe("app-editing");
+      expect(useConversationStore.getState().editingConversationId).toBe(
+        "conv-1",
+      );
+      expect(
+        usePendingDeepLinkStore.getState().pendingCamera?.targetConversationId,
+      ).toBe("conv-1");
+      expect(navigateMock).toHaveBeenCalledWith(
+        {
+          pathname: routes.conversation("conv-1", "app-1"),
+          search: "?prompt=hello",
+          hash: "",
+        },
+        { replace: true, state: null },
+      );
+    } finally {
+      restoreViewport();
+    }
+  });
+
+  test("carries what the entry records, so closing the app still pops to it", () => {
+    const restoreViewport = stubViewportAxes({
+      narrow: false,
+      coarsePointer: false,
+    });
+    mockPathname = routes.conversation("conv-1");
+    mockState = appEntryStateFor("conv-1");
+    showOpenAppRoute({ conversationId: "conv-1" });
+    renderConsumer();
+
+    try {
+      act(() => {
+        publish("deeplink.openCamera", { provenance: null });
+      });
+
+      expect(navigateMock).toHaveBeenCalledWith(
+        {
+          pathname: routes.conversation("conv-1", "app-1"),
+          search: "",
+          hash: "",
+        },
+        { replace: true, state: appEntryStateFor("conv-1") },
+      );
+    } finally {
+      restoreViewport();
+    }
+  });
+
+  test("a conversation subroute has no composer, so the tap lands on one", () => {
+    const inspector = `${routes.conversation("conv-1")}/inspect`;
+    mockPathname = inspector;
+    renderConsumer();
+
+    act(() => {
+      publish("deeplink.openCamera", { provenance: "intent" });
+    });
+
+    const [to] = navigateMock.mock.calls.at(-1) as [string];
+    expect(to).toMatch(/^\/assistant\/conversations\/[^/?]+$/);
+    expect(to).not.toBe(inspector);
+  });
+
+  test("a second tap refreshes the park rather than queueing a second camera", () => {
+    mockPathname = routes.conversation("conv-1");
+    renderConsumer();
+
+    act(() => {
+      publish("deeplink.openCamera", { provenance: null });
+    });
+    const first = usePendingDeepLinkStore.getState().pendingCamera;
+    act(() => {
+      publish("deeplink.openCamera", { provenance: "intent" });
+    });
+    const second = usePendingDeepLinkStore.getState().pendingCamera;
+
+    expect(first).not.toBeNull();
+    expect(second).not.toBeNull();
+    expect(second!.targetConversationId).toBe("conv-1");
+    expect(second!.parkedAt).toBeGreaterThanOrEqual(first!.parkedAt);
+    for (const call of navigateMock.mock.calls) {
+      expect(call).toEqual([
+        { pathname: routes.conversation("conv-1"), search: "", hash: "" },
+        { replace: true, state: null },
+      ]);
+    }
+  });
+
+  test("the re-landing keeps the query string, so pending query effects survive", () => {
+    mockPathname = routes.conversation("conv-1");
+    mockSearch = "?prompt=hello";
+    renderConsumer();
+
+    act(() => {
+      publish("deeplink.openCamera", { provenance: "intent" });
+    });
+
+    expect(navigateMock).toHaveBeenCalledWith(
+      {
+        pathname: routes.conversation("conv-1"),
+        search: "?prompt=hello",
+        hash: "",
+      },
+      { replace: true, state: null },
+    );
+  });
+});
+
+describe("deeplink.connect", () => {
+  test("a url+code link prefills the pairing link so one click completes the pair", () => {
     renderConsumer();
 
     act(() => {
       publish("deeplink.connect", {
         url: "https://office-mac.example:8443/assistant-1",
-        bundle: null,
+        code: "DEVICE-CODE-1",
+        legacy: false,
       });
     });
 
     const dialog = useConnectDialogStore.getState();
     expect(dialog.open).toBe(true);
-    expect(dialog.initialBundle).toBeNull();
-    expect(dialog.guidanceMessage).toBe(
-      "This link came from a pairing QR code. To connect this Mac, run vellum pair on the assistant's machine at office-mac.example:8443 and paste the bundle here.",
+    // The two params recompose into the artifact the host hands out, which
+    // the dialog submits to the local-mode host verbatim. It carries the pair
+    // route, so copying it into another device's browser lands on the pair
+    // page rather than on the SPA root.
+    expect(dialog.initialAddress).toBe(
+      "https://office-mac.example:8443/assistant-1/assistant/pair#device_code=DEVICE-CODE-1",
     );
+    // Prefill only: a URL scheme carries no caller identity, so the pairing
+    // grant waits on the user's click.
+    expect(dialog.guidanceKind).toBeNull();
     expect(navigateMock).toHaveBeenCalledWith(routes.selectAssistant);
     expect(ensureMainWindowVisibleMock).toHaveBeenCalledTimes(1);
   });
 
-  test("a link with no usable fields still routes to the flow with hostless guidance", () => {
+  test("a codeless link prefills the bare address, which mints its own approval code", () => {
     renderConsumer();
 
     act(() => {
-      publish("deeplink.connect", { url: null, bundle: null });
+      publish("deeplink.connect", {
+        url: "https://office-mac.example:8443/assistant-1",
+        code: null,
+        legacy: false,
+      });
     });
 
     const dialog = useConnectDialogStore.getState();
     expect(dialog.open).toBe(true);
-    expect(dialog.guidanceMessage).toBe(
-      "This link came from a pairing QR code. To connect this Mac, run vellum pair on the assistant's machine and paste the bundle here.",
+    expect(dialog.initialAddress).toBe(
+      "https://office-mac.example:8443/assistant-1",
     );
+    expect(dialog.guidanceKind).toBeNull();
     expect(navigateMock).toHaveBeenCalledWith(routes.selectAssistant);
   });
 
-  test("a bundle wins over guidance when both fields arrive", () => {
+  test("a legacy bundle link opens the dialog with guidance, never prefilled", () => {
+    renderConsumer();
+
+    act(() => {
+      publish("deeplink.connect", { url: null, code: null, legacy: true });
+    });
+
+    const dialog = useConnectDialogStore.getState();
+    expect(dialog.open).toBe(true);
+    // The bundle payload never crosses the bridge, so there is nothing to
+    // submit: the dialog explains the link instead. The kind is parked, not
+    // the copy, so the dialog resolves it in the active language.
+    expect(dialog.initialAddress).toBeNull();
+    expect(dialog.guidanceKind).toBe("legacy");
+    expect(navigateMock).toHaveBeenCalledWith(routes.selectAssistant);
+    expect(ensureMainWindowVisibleMock).toHaveBeenCalledTimes(1);
+  });
+
+  test("a link with no usable fields still routes to the flow with guidance", () => {
+    renderConsumer();
+
+    act(() => {
+      publish("deeplink.connect", { url: null, code: null, legacy: false });
+    });
+
+    const dialog = useConnectDialogStore.getState();
+    expect(dialog.open).toBe(true);
+    expect(dialog.initialAddress).toBeNull();
+    expect(dialog.guidanceKind).toBe("generic");
+    expect(navigateMock).toHaveBeenCalledWith(routes.selectAssistant);
+  });
+
+  test("a legacy link that still carries a usable address prefills it", () => {
     renderConsumer();
 
     act(() => {
       publish("deeplink.connect", {
         url: "https://office-mac.example",
-        bundle: "eyJnYXRld2F5",
+        code: "DEVICE-CODE-1",
+        legacy: true,
       });
     });
 
     const dialog = useConnectDialogStore.getState();
-    expect(dialog.initialBundle).toBe("eyJnYXRld2F5");
-    expect(dialog.guidanceMessage).toBeNull();
+    expect(dialog.initialAddress).toBe(
+      "https://office-mac.example/assistant/pair#device_code=DEVICE-CODE-1",
+    );
+    expect(dialog.guidanceKind).toBeNull();
+  });
+
+  test("a trailing slash on the base does not double the pair route", () => {
+    renderConsumer();
+
+    act(() => {
+      publish("deeplink.connect", {
+        url: "https://office-mac.example/assistant-1/",
+        code: "DEVICE-CODE-1",
+        legacy: false,
+      });
+    });
+
+    expect(useConnectDialogStore.getState().initialAddress).toBe(
+      "https://office-mac.example/assistant-1/assistant/pair#device_code=DEVICE-CODE-1",
+    );
   });
 });
 
@@ -1133,7 +1604,7 @@ describe("subscription lifecycle", () => {
         prompt: null,
         provenance: null,
       });
-      publish("deeplink.connect", { url: null, bundle: "eyJnYXRld2F5" });
+      publish("deeplink.connect", { url: null, code: null, legacy: true });
       publish("deeplink.unknown", { url: "x" });
     });
 

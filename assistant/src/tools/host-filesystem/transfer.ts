@@ -6,6 +6,8 @@ import { supportsHostProxy } from "../../channels/types.js";
 import { HostTransferProxy } from "../../daemon/host-transfer-proxy.js";
 import { RiskLevel } from "../../permissions/types.js";
 import { assistantEventHub } from "../../runtime/assistant-event-hub.js";
+import { formatDesktopAppRequired } from "../capability-offer.js";
+import { declareDaemonActivityField } from "../schema-transforms.js";
 import { sandboxPolicy } from "../shared/filesystem/path-policy.js";
 import type {
   ToolContext,
@@ -25,7 +27,7 @@ export const hostFileTransferTool = {
 
   defaultRiskLevel: RiskLevel.Medium,
 
-  input_schema: {
+  input_schema: declareDaemonActivityField({
     type: "object",
     properties: {
       source_path: {
@@ -61,7 +63,7 @@ export const hostFileTransferTool = {
       },
     },
     required: ["source_path", "dest_path", "direction"],
-  },
+  }),
 
   async execute(
     input: Record<string, unknown>,
@@ -124,8 +126,7 @@ export const hostFileTransferTool = {
       !HostTransferProxy.instance.isAvailable()
     ) {
       return {
-        content:
-          "Error: no client with host_file capability is connected. Connect a macOS client to use host_file from a non-desktop interface.",
+        content: formatDesktopAppRequired("files"),
         isError: true,
       };
     }

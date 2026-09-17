@@ -9,6 +9,7 @@
 
 import { v4 as uuid } from "uuid";
 
+import { onActivationTurnComplete } from "../activation/turn-hooks.js";
 import { repairHistoryForRun } from "../agent/history-repair/history-repair.js";
 import type {
   AgentEvent,
@@ -36,6 +37,8 @@ import {
 } from "../config/llm-resolver.js";
 import { getConfig } from "../config/loader.js";
 import type { LLMCallSite } from "../config/schemas/llm.js";
+import { isSendUserMessageActiveForTurn } from "../config/send-user-message-gate.js";
+import { desktopAutomationLease } from "../desktop/desktop-automation-lease.js";
 import { writeRelationshipState } from "../home/relationship-state-writer.js";
 import type { UserPromptSubmitInputContext } from "../hooks/types.js";
 import {
@@ -51,8 +54,10 @@ import {
   resolveOverrideProfile,
   updateConversationContextWindow,
   updateConversationSlackContextWatermark,
+  updateMessageMetadata,
 } from "../persistence/conversation-crud.js";
 import { isReplaceableTitle } from "../persistence/conversation-title-service.js";
+import { NO_RESPONSE_MESSAGE_KIND } from "../persistence/conversation-types.js";
 import {
   backfillMessageIdOnLogs,
   recordSyntheticAgentErrorMessageLog,
@@ -73,6 +78,9 @@ import {
 import type { ContentBlock, Message } from "../providers/types.js";
 import type { Provider } from "../providers/types.js";
 import { resolveCapabilities } from "../runtime/capabilities.js";
+import { resolveTurnReplyMessageId } from "../runtime/channel-reply-delivery.js";
+import { isNoResponseOnlyText } from "../runtime/no-response.js";
+import { getByConversation as getPendingInteractionsByConversation } from "../runtime/pending-interactions.js";
 import { publishConversationMessagesChanged } from "../runtime/sync/resource-sync-events.js";
 import { stampTurnOutcome } from "../telemetry/turn-outcome.js";
 import {
@@ -80,11 +88,15 @@ import {
   startToolProfilingRequest,
 } from "../tools/tool-profiler.js";
 import type { UsageActor } from "../usage/actors.js";
+import { isPreemptedByNewMessage } from "../util/abort-reasons.js";
 import { getLogger } from "../util/logger.js";
 import { timeAgo } from "../util/time.js";
 import { getWorkspaceGitService } from "../workspace/git-service.js";
 import { commitTurnChanges } from "../workspace/turn-commit.js";
-import { ABORT_WATCHDOG_MS } from "./abort-watchdog.js";
+import {
+  ABORT_WATCHDOG_MS,
+  DEFAULT_TURN_COMMIT_MAX_WAIT_MS,
+} from "./abort-watchdog.js";
 import { cleanAssistantContent } from "./assistant-attachments.js";
 import { conversationSupportsDynamicUi } from "./channel-ui-capability.js";
 import type { Conversation } from "./conversation.js";
@@ -93,11 +105,13 @@ import {
   dispatchAgentEvent,
   type EventHandlerDeps,
   finalizePendingToolResultRow,
-  markHistoryStrippedBestEffort,
+  resetInjectionLedgersForStrip,
+  selectFinalComputerUseScreenshotCandidate,
   settlePendingPartialFlush,
 } from "./conversation-agent-loop-handlers.js";
 import {
   approveHostAttachmentRead,
+  type PersistedAttachmentFile,
   resolveAssistantAttachments,
 } from "./conversation-attachments.js";
 import {
@@ -113,13 +127,18 @@ import {
   drainConversationNotices,
 } from "./conversation-notices.js";
 import {
+  applySightFrameRetention,
   getSlackCompactionWatermarkForPrefix,
   loadSlackChronologicalContext,
   resolveTurnInboundActorContext,
   type SlackChronologicalContext,
 } from "./conversation-runtime-assembly.js";
 import type { CurrentTurnSurface } from "./conversation-surfaces.js";
-import { markSurfaceCompleted } from "./conversation-surfaces.js";
+import {
+  hasBlockingPendingSurface,
+  markSurfaceCompleted,
+  settleRunningTaskProgressSurfaces,
+} from "./conversation-surfaces.js";
 import {
   runDeferredTurnTail,
   settleTurnContent,
@@ -133,9 +152,14 @@ import {
   unregisterInflightTurn,
 } from "./inflight-turn-registry.js";
 import type { UsageStats } from "./message-protocol.js";
+import {
+  persistReactionRecords,
+  type QueuedReactionRecord,
+} from "./reaction-record.js";
 import type { TrustContext } from "./trust-context-types.js";
 import { turnOrRestingTrust } from "./trust-context-types.js";
 import { resolveTurnCallSite } from "./turn-call-site.js";
+import { beginTurnFinalization } from "./turn-finalization.js";
 import { runWithLatencySubSpans } from "./turn-latency-sub-spans.js";
 import {
   MEMORY_CONTEXT_PHASE_KEY,
@@ -237,6 +261,35 @@ const FALLBACK_TURN_TRUST: TrustContext = {
  * {@link Conversation}.
  */
 export type AssistantSurface = CurrentTurnSurface;
+
+/**
+ * Interaction kinds that are a prompt posed to the user. The `host_*` kinds
+ * are in-flight tool executions proxied to a client, which are the loop
+ * waiting on a machine rather than on a person.
+ */
+const USER_PROMPT_INTERACTION_KINDS = new Set([
+  "confirmation",
+  "acp_confirmation",
+  "question",
+  "secret",
+]);
+
+/**
+ * Whether this turn handed control back to the user instead of delivering.
+ *
+ * True when something the turn put on screen still needs an answer once the
+ * turn is over: a question or confirmation prompt that outlived it, or an
+ * interactive surface still awaiting an action. Both are structural, so a
+ * question the assistant asks in prose alone reads as a delivered turn.
+ */
+function turnEndedAwaitingUser(ctx: Conversation): boolean {
+  if (hasBlockingPendingSurface(ctx)) {
+    return true;
+  }
+  return getPendingInteractionsByConversation(ctx.conversationId).some(
+    (interaction) => USER_PROMPT_INTERACTION_KINDS.has(interaction.kind),
+  );
+}
 
 // ── abort watchdog ───────────────────────────────────────────────────
 
@@ -418,6 +471,28 @@ export async function runAgentLoopImpl(
   const isNonInteractive = !isInteractiveResolved;
   ctx.currentTurnIsNonInteractive = isNonInteractive;
 
+  // Default user-initiated turns to the `mainAgent` call site; other invocation
+  // contexts (heartbeat, filing, analyze, etc.) pass their own `callSite`. The
+  // provider layer resolves provider/model/maxTokens via `resolveCallSiteConfig`,
+  // picking up any user overrides under `llm.callSites.<id>` (falling back to
+  // the shipped call-site defaults when absent). `resolveTurnCallSite` keeps subagent
+  // conversations on `subagentSpawn` when no call site is supplied.
+  const turnCallSite = resolveTurnCallSite(options?.callSite, ctx);
+  // Expose the turn's call site on the live conversation so the runtime
+  // injection assembly self-resolves it for the turn's plugin contexts. Set
+  // before the prompt sync below: the tool-gated reply section and the tool
+  // surface both scope on the turn's call site.
+  ctx.currentCallSite = turnCallSite;
+
+  // Whether this turn routes its user-facing text through `send_user_message`:
+  // the flag is on and the turn is a main-agent turn. Resolved once and pinned
+  // on the conversation, because the loop's suppression is fixed for the whole
+  // run: the tool surface, the reserved row's visibility marker, and the
+  // prompt section all read this snapshot instead of the live flag, so a
+  // remote flag change mid-turn cannot contradict what the run is doing.
+  const sendUserMessageActive = isSendUserMessageActiveForTurn(ctx);
+  ctx.currentTurnSendUserMessageActive = sendUserMessageActive;
+
   // Re-resolve the system prompt under the snapshots just set and push it into
   // the loop when the persona changed. The loop reuses the prompt frozen at
   // construction otherwise, so a flow that binds trust after construction (a
@@ -458,17 +533,6 @@ export async function runAgentLoopImpl(
   let emitTerminalExit:
     | ((reason: AgentLoopExitReason) => Promise<void>)
     | null = null;
-
-  // Default user-initiated turns to the `mainAgent` call site; other invocation
-  // contexts (heartbeat, filing, analyze, etc.) pass their own `callSite`. The
-  // provider layer resolves provider/model/maxTokens via `resolveCallSiteConfig`,
-  // picking up any user overrides under `llm.callSites.<id>` (falling back to
-  // the shipped call-site defaults when absent). `resolveTurnCallSite` keeps subagent
-  // conversations on `subagentSpawn` when no call site is supplied.
-  const turnCallSite = resolveTurnCallSite(options?.callSite, ctx);
-  // Expose the turn's call site on the live conversation so the runtime
-  // injection assembly self-resolves it for the turn's plugin contexts.
-  ctx.currentCallSite = turnCallSite;
 
   // Expose the turn's request origin (e.g. "memory_consolidation") on the live
   // conversation so the tool context — and through it `buildPolicyContext` —
@@ -714,6 +778,16 @@ export async function runAgentLoopImpl(
   );
   ctx.diskPressureCleanupModeActive =
     diskPressureDecision.action === "allow-cleanup-mode";
+  if (ctx.diskPressureCleanupModeActive) {
+    // The prompt synced above was built before this turn's disk-pressure
+    // policy was known. Cleanup mode narrows the turn to
+    // `DISK_PRESSURE_CLEANUP_TOOL_NAMES`, so sections gated on the resolved
+    // tool surface (the parallel-delegation guidance, which needs the skill
+    // dispatcher cleanup mode withholds) must be re-derived against it.
+    // Skipped otherwise: the mode is cleared at the end of every turn, so an
+    // ordinary turn already synced under the same answer.
+    ctx.syncLoopSystemPrompt();
+  }
   const toolsDisabledForTurn = ctx.toolsDisabledDepth > 0;
 
   ctx.lastAssistantAttachments = [];
@@ -727,14 +801,48 @@ export async function runAgentLoopImpl(
   // the live seq counter, which runs ahead while the turn streams. Cleared in
   // the `finally`.
   registerInflightTurn(ctx.conversationId, state);
+  // Opened before anything can release the conversation, closed at the very end
+  // of the `finally` below. It is what tells a caller that starts a turn from
+  // outside this loop (the interrupt path) that the turn-boundary commit is
+  // done, since that commit runs after the release and would otherwise sweep
+  // the next turn's first file writes into the finished turn's commit. Nothing
+  // waits on it unless such a caller is present, so the ordinary send, drain
+  // and wake paths are unchanged. Declared here and opened as the first
+  // statement of the `try` below, so the `finally` that closes it always runs.
+  let closeTurnFinalization: () => void = () => {};
   let persistedErrorAssistantMessage = false;
   let deletedReservedAssistantMessage = false;
   // Abnormal turn outcome for telemetry, stamped onto the user-message row in
   // the `finally` (before processing clears, so the reporter's settled-turn
   // barrier guarantees the stamp ships with the turn event). Unset = the turn
   // replied normally and carries no stamp.
+  const failedOutcomeFromClassification = (classified: {
+    code: string;
+    userMessage: string;
+    errorCategory: string;
+    connectionName?: string;
+    profileName?: string;
+  }): NonNullable<typeof abnormalOutcome> => ({
+    outcome: "failed",
+    failureCode: classified.code,
+    failureMessage: classified.userMessage,
+    failureCategory: classified.errorCategory,
+    ...(classified.connectionName
+      ? { failureConnection: classified.connectionName }
+      : {}),
+    ...(classified.profileName
+      ? { failureProfile: classified.profileName }
+      : {}),
+  });
   let abnormalOutcome:
-    | { outcome: "failed" | "cancelled"; failureCode?: string }
+    | {
+        outcome: "failed" | "cancelled";
+        failureCode?: string;
+        failureMessage?: string;
+        failureCategory?: string;
+        failureConnection?: string;
+        failureProfile?: string;
+      }
     | undefined;
   // True once a replied terminal SSE (message_complete / generation_handoff)
   // has been emitted. Guards the catch block: an error thrown by the
@@ -746,10 +854,23 @@ export async function runAgentLoopImpl(
   // provider-error turn's only assistant row is the synthetic error text, so
   // the deferred tail must not treat either as a final reply.
   let turnCompleted = false;
+  // Files this turn attached that survived resolution and persistence, in
+  // the shape the activation hook records as artifacts. Rejected directives
+  // never reach it, so a checklist card can never point at a file the turn
+  // failed to attach.
+  let persistedAttachmentFiles: readonly PersistedAttachmentFile[] = [];
   // True once `releaseTurn` has run. The happy path releases as soon as the
   // turn's content is settled; the `finally` calls it again as the backstop for
   // the cancel/error paths that never reached the early release.
   let turnReleased = false;
+  // The turn's own queued reaction records, captured by `releaseTurn` while
+  // the conversation is still exclusive. The `finally` drains this array,
+  // never the live conversation field: after release a following turn may
+  // queue records of its own there, and draining the shared field would
+  // consume the new turn's record before its tool_result settles, the
+  // cross-turn variant of the pairing corruption the boundary drain
+  // prevents.
+  const ownedReactionRecords: QueuedReactionRecord[] = [];
 
   /**
    * Free the conversation for its next turn.
@@ -777,6 +898,10 @@ export async function runAgentLoopImpl(
       try {
         stampTurnOutcome(userMessageId, abnormalOutcome.outcome, {
           failureCode: abnormalOutcome.failureCode,
+          failureMessage: abnormalOutcome.failureMessage,
+          failureCategory: abnormalOutcome.failureCategory,
+          failureConnection: abnormalOutcome.failureConnection,
+          failureProfile: abnormalOutcome.failureProfile,
         });
       } catch (err) {
         rlog.warn(
@@ -785,6 +910,12 @@ export async function runAgentLoopImpl(
         );
       }
     }
+    // Ownership capture happens in the same synchronous step as the
+    // release, so records queued after this point belong to the next turn.
+    if (ctx.pendingReactionRecords?.length) {
+      ownedReactionRecords.push(...ctx.pendingReactionRecords.splice(0));
+    }
+    desktopAutomationLease.releaseForConversation(ctx.conversationId);
     ctx.abortController = null;
     ctx.setProcessing(false);
     unregisterInflightTurn(ctx.conversationId, state);
@@ -797,6 +928,7 @@ export async function runAgentLoopImpl(
     ctx.surfaceActionRequestIds.delete(ctx.currentRequestId ?? "");
     ctx.approvedViaPromptThisTurn = false;
     ctx.currentRequestId = undefined;
+    ctx.currentTurnClientMessageId = undefined;
     ctx.currentActiveSurfaceId = undefined;
     ctx.allowedToolNames = undefined;
     ctx.diskPressureCleanupModeActive = false;
@@ -850,6 +982,16 @@ export async function runAgentLoopImpl(
   };
 
   try {
+    closeTurnFinalization = beginTurnFinalization(ctx.conversationId);
+    // An interrupt hands the conversation straight from the turn it stopped to
+    // the message that stopped it, and that turn's `generation_cancelled` has
+    // idled every client. Emitting here rather than at the handover means a
+    // send that failed on the way to this turn left clients idle, which is what
+    // they are, instead of stranded on a cached `thinking` nothing clears.
+    if (ctx.pendingInterruptActivityBridge) {
+      ctx.pendingInterruptActivityBridge = false;
+      ctx.emitActivityState("thinking", "message_interrupted");
+    }
     if (diskPressureDecision.action === "block") {
       const message = formatDiskPressureBlockedMessage();
       // The user message is already persisted, so this turn will be reported
@@ -858,6 +1000,7 @@ export async function runAgentLoopImpl(
       abnormalOutcome = {
         outcome: "failed",
         failureCode: DISK_PRESSURE_ERROR_CODE,
+        failureMessage: message,
       };
       rlog.warn(
         { reason: diskPressureDecision.reason },
@@ -1030,6 +1173,7 @@ export async function runAgentLoopImpl(
     const applySuccessfulCompaction = async (
       result: Awaited<ReturnType<typeof ctx.contextWindowManager.maybeCompact>>,
       compactedBasis?: Message[],
+      historyStripMarkerDurable = false,
     ) => {
       const provenanceContext = compactedBasis
         ? getSlackProvenanceContextForCompactionBasis(
@@ -1044,6 +1188,7 @@ export async function runAgentLoopImpl(
       await applyCompactionResult(ctx, result, onEvent, reqId, {
         slackContextCompactionWatermarkTs: slackWatermarkTs,
         cronRunId: turnCronRunId,
+        historyStripMarkerDurable,
       });
       slackChronologicalContext = projectSlackProvenanceAfterCompaction(
         provenanceContext,
@@ -1098,11 +1243,15 @@ export async function runAgentLoopImpl(
 
     // Unified `<turn_context>` actor input for this turn (model-facing grounding
     // metadata; the conversation runtime context remains the source for policy
-    // gating). Resolved once at turn start and frozen onto the conversation so
-    // the post-compaction hook re-emits this same value during in-loop recovery
+    // gating). Derived from the turn's own actor, so the block describes who
+    // is speaking now rather than who last touched the conversation. Resolved
+    // once at turn start and frozen onto the conversation so the
+    // post-compaction hook re-emits this same value during in-loop recovery
     // instead of re-resolving against contact/member registry state that may
     // have drifted mid-turn.
-    const actorContext = resolveTurnInboundActorContext(ctx.trustContext);
+    const actorContext = resolveTurnInboundActorContext(
+      turnOrRestingTrust(ctx),
+    );
     ctx.currentTurnInboundActorContext = actorContext;
 
     // Surface long gaps between user messages so the model can acknowledge
@@ -1225,8 +1374,20 @@ export async function runAgentLoopImpl(
     // immediately before the call, after every hook (memory injection, title,
     // user plugins) has settled its shape. Runs unconditionally — a malformed
     // history is a hard provider rejection, never a per-conversation opt-in.
-    const runMessages = repairHistoryForRun(
+    const repairedMessages = repairHistoryForRun(
       finalUserPromptCtx.latestMessages,
+      ctx.conversationId,
+    );
+    // Camera-frame retention: keep only the newest few ambient frames as real
+    // images. Applied to the per-turn copy, after every hook and the repair, so
+    // every turn this loop drives inherits it and the stored transcript keeps
+    // its attachments. The loop re-runs the same pass on any history its
+    // in-place compaction rebuilds (see the `transformCompactedHistory` closure
+    // the conversation supplies), so the bound holds across a compaction rather
+    // than only from the next turn. The overflow ladder's media stubbing still
+    // governs everything the user deliberately attached.
+    const runMessages = applySightFrameRetention(
+      repairedMessages,
       ctx.conversationId,
     );
 
@@ -1320,6 +1481,7 @@ export async function runAgentLoopImpl(
           requestId: reqId,
           onCheckpoint,
           callSite: turnCallSite,
+          suppressAssistantText: sendUserMessageActive,
           supportsDynamicUi: conversationSupportsDynamicUi(ctx),
           trust: loopTrust,
           overrideProfile: turnOverrideProfile,
@@ -1330,6 +1492,7 @@ export async function runAgentLoopImpl(
           isNonInteractive,
           modelProfileKey,
           latencyTracker,
+          injectionLedgerResets: state.injectionLedgerResets,
           ...(ctx.modelOverride ? { model: ctx.modelOverride } : {}),
         }),
         abortController.signal,
@@ -1382,17 +1545,16 @@ export async function runAgentLoopImpl(
       );
       // Exhausted-overflow exit: the reduction ladder is spent and the turn
       // ends without a real reply, so label it failed for telemetry.
-      abnormalOutcome = { outcome: "failed", failureCode: classified.code };
+      abnormalOutcome = failedOutcomeFromClassification(classified);
       onEvent(buildConversationErrorMessage(ctx.conversationId, classified));
     } else if (
       overflowTerminalReason === "budget_yield_unrecovered" &&
       !abortController.signal.aborted
     ) {
       budgetYieldClassification = budgetYieldUnrecoveredClassification();
-      abnormalOutcome = {
-        outcome: "failed",
-        failureCode: budgetYieldClassification.code,
-      };
+      abnormalOutcome = failedOutcomeFromClassification(
+        budgetYieldClassification,
+      );
       onEvent(
         buildConversationErrorMessage(
           ctx.conversationId,
@@ -1534,6 +1696,32 @@ export async function runAgentLoopImpl(
     // of why the turn stopped.
     const hasAssistantResponse =
       newMessages[newMessages.length - 1]?.role === "assistant";
+    // A reply that is nothing but the `<no_response/>` sentinel is deliberate
+    // silence. Stamp the persisted row so clients render a quiet notice and
+    // resolve their pending-response state, instead of showing the raw
+    // sentinel or waiting forever; the content keeps the sentinel so the
+    // model reads its own convention back from history.
+    if (hasAssistantResponse && state.lastAssistantMessageId) {
+      const tail = newMessages[newMessages.length - 1]!;
+      const tailText = Array.isArray(tail.content)
+        ? tail.content
+            .filter((b) => b.type === "text")
+            .map((b) => (b.type === "text" ? b.text : ""))
+            .join("\n")
+        : "";
+      if (isNoResponseOnlyText(tailText)) {
+        try {
+          updateMessageMetadata(state.lastAssistantMessageId, {
+            messageKind: NO_RESPONSE_MESSAGE_KIND,
+          });
+        } catch (err) {
+          rlog.warn(
+            { err, messageId: state.lastAssistantMessageId },
+            "Failed to stamp deliberate-silence marker (non-fatal)",
+          );
+        }
+      }
+    }
     if (
       !hasAssistantResponse &&
       state.providerErrorUserMessage &&
@@ -1547,6 +1735,16 @@ export async function runAgentLoopImpl(
         outcome: "failed",
         ...(state.providerErrorCode
           ? { failureCode: state.providerErrorCode }
+          : {}),
+        failureMessage: state.providerErrorUserMessage,
+        ...(state.providerErrorCategory
+          ? { failureCategory: state.providerErrorCategory }
+          : {}),
+        ...(state.providerErrorConnection
+          ? { failureConnection: state.providerErrorConnection }
+          : {}),
+        ...(state.providerErrorProfile
+          ? { failureProfile: state.providerErrorProfile }
           : {}),
       };
       // Drop any reservation stranded by the failed LLM call. The B3
@@ -1572,6 +1770,13 @@ export async function runAgentLoopImpl(
           );
         }
       }
+      // The row this turn ends on is no longer the one the last successful
+      // call wrote: it is either nothing, or the synthetic error row built
+      // below, and neither carries an assistant-text visibility marker. Drop
+      // the marker along with the id, so the terminal event cannot label a
+      // visible provider error as private working notes and leave clients
+      // rendering it as activity that never produced a reply.
+      state.lastAssistantTextVisibility = undefined;
       if (!state.persistProviderErrorAsAssistantMessage) {
         state.assistantRowAwaitingFinalization = false;
         state.lastAssistantMessageId = undefined;
@@ -1684,12 +1889,37 @@ export async function runAgentLoopImpl(
         tokens: state.lastCallInputTokens,
         maxTokens: resolveCurrentMaxInputTokens(),
       },
+      // When the turn's last LLM call was rerouted to a backup profile, that
+      // profile is what served the tokens being recorded, so it outranks the
+      // conversation's own resolution, which knows nothing about the
+      // reroute. `provider` and `model` on this same row already follow the
+      // backup (via `state.exchangeProviderName` / `state.model`), so
+      // attributing the profile from the primary would write a row that
+      // contradicts itself. `forceOverrideProfile` floats it above the
+      // call-site profile exactly as the fallback dispatch did.
       {
         callSite: turnCallSite,
-        overrideProfile: resolveCurrentOverrideProfile() ?? null,
+        overrideProfile:
+          state.exchangeInferenceProfile ??
+          resolveCurrentOverrideProfile() ??
+          null,
+        ...(state.exchangeInferenceProfile !== undefined
+          ? { forceOverrideProfile: true }
+          : {}),
       },
       turnCronRunId,
     );
+
+    // Generation is over for every outcome below (reply, hand-off, or
+    // cancellation), so a progress card still spinning would be lying.
+    // Settle before the terminal SSE so the client sees the card at rest by
+    // the time it re-enables the composer. An interrupt is the exception:
+    // the replacement turn picks the work up or drops it, and it owns the
+    // card either way, so a card settled here would read as finished work
+    // the model then resumes without a visible restart.
+    if (!isPreemptedByNewMessage(abortController.signal.reason)) {
+      settleRunningTaskProgressSurfaces(ctx, rlog);
+    }
 
     // Fast-path: when the user cancelled, skip expensive post-loop work
     // (attachment resolution) and emit the cancellation event immediately
@@ -1707,7 +1937,24 @@ export async function runAgentLoopImpl(
       });
       publishLoopMessagesChanged();
     } else {
-      // Resolve attachments (only when not cancelled — this is expensive async I/O)
+      // An attachment belongs on the row whose text asked for it. On a turn
+      // that routed its reply through `send_user_message`, the link the model
+      // wrote is inside that tool's message, while the turn's last row is
+      // private wrap-up text: linking there would leave channel delivery
+      // sending the file from a row with no words on it. Resolve the row the
+      // reply actually lives on, the same one the push preview quotes.
+      const attachmentTargetMessageId =
+        state.lastAssistantTextVisibility === "private" &&
+        state.lastAssistantMessageId
+          ? resolveTurnReplyMessageId(
+              ctx.conversationId,
+              userMessageId,
+              state.lastAssistantMessageId,
+            )
+          : state.lastAssistantMessageId;
+      const computerUseScreenshotCandidate =
+        selectFinalComputerUseScreenshotCandidate(state);
+      // Resolve attachments (only when not cancelled, this is expensive async I/O)
       const attachmentResult = await resolveAssistantAttachments(
         state.accumulatedDirectives,
         state.accumulatedToolContentBlocks,
@@ -1721,10 +1968,18 @@ export async function runAgentLoopImpl(
             ctx.conversationId,
             ctx.hasNoClient,
           ),
-        state.lastAssistantMessageId,
+        attachmentTargetMessageId,
         state.toolContentBlockToolNames,
+        computerUseScreenshotCandidate,
       );
       const { assistantAttachments, emittedAttachments } = attachmentResult;
+      persistedAttachmentFiles = attachmentResult.persistedFiles;
+      if (
+        attachmentTargetMessageId &&
+        attachmentResult.linkedAttachmentIds.length > 0
+      ) {
+        state.assistantMessageIdsToSync.add(attachmentTargetMessageId);
+      }
 
       ctx.lastAssistantAttachments = assistantAttachments;
       ctx.lastAttachmentWarnings = attachmentResult.directiveWarnings;
@@ -1778,6 +2033,11 @@ export async function runAgentLoopImpl(
           ...(state.lastAssistantMessageId
             ? { messageId: state.lastAssistantMessageId }
             : {}),
+          // The marker the row was stamped with, so the live row gets the same
+          // per-row treatment the history projection will hand it.
+          ...(state.lastAssistantTextVisibility
+            ? { assistantTextVisibility: state.lastAssistantTextVisibility }
+            : {}),
         });
         if (shouldEmitQueuedConversationNotices) {
           for (const notice of drainConversationNotices(ctx.conversationId)) {
@@ -1828,6 +2088,10 @@ export async function runAgentLoopImpl(
     );
   } catch (err) {
     clearConversationNotices(ctx.conversationId);
+    // A turn that threw out of the loop is over too; see the happy path.
+    if (!isPreemptedByNewMessage(abortController.signal.reason)) {
+      settleRunningTaskProgressSurfaces(ctx, rlog);
+    }
     const errorCtx = {
       phase: "agent_loop" as const,
       aborted: abortController.signal.aborted,
@@ -1860,7 +2124,7 @@ export async function runAgentLoopImpl(
         ...turnErrorAttribution(),
       });
       if (!turnReplied) {
-        abnormalOutcome = { outcome: "failed", failureCode: classified.code };
+        abnormalOutcome = failedOutcomeFromClassification(classified);
       }
       onEvent({
         type: "error",
@@ -1887,12 +2151,44 @@ export async function runAgentLoopImpl(
     // turn that started while it was preparing would have its first file
     // writes swept into the wrong commit. The wait is deadline-bounded, and
     // direct sends are already unblocked by the release above.
+    // Set when the turn-boundary commit outran its wait budget and is still
+    // staging the working tree. The turn stops waiting on it, but the
+    // finalization barrier below must not: a replacement turn that started
+    // writing files now would still have them swept into this turn's commit.
+    let outstandingCommit: Promise<void> | undefined;
     try {
       if (turnStarted) {
         ctx.turnCount++;
+
+        // Activation checklist: a completed turn in a conversation an
+        // activation task was launched into finishes that task, unless the
+        // turn ended waiting on the user, in which case the answer's turn
+        // finishes it (see `markActivationTurnComplete`). Cancelled turns
+        // and handoffs deliberately fall through: the task is still
+        // running. No-op for every conversation no task points at.
+        //
+        // Ahead of the turn-boundary commit, and fire-and-forget: a commit
+        // that fails, times out, or is deferred to the next turn must not
+        // leave the task showing as still running while the client is
+        // already free to restart it.
+        if (turnCompleted) {
+          onActivationTurnComplete({
+            conversationId: ctx.conversationId,
+            toolCallCount: state.toolUseIdToName.size,
+            attachedFiles: persistedAttachmentFiles.map((file) => ({
+              path: file.sourcePath,
+              filename: file.displayName,
+              sourceType: file.sourceType,
+            })),
+            endedAwaitingUser: turnEndedAwaitingUser(ctx),
+          });
+        }
+
         const runTurnCommit = async (): Promise<void> => {
           const config = getConfig();
-          const maxWait = config.workspaceGit?.turnCommitMaxWaitMs ?? 4000;
+          const maxWait =
+            config.workspaceGit?.turnCommitMaxWaitMs ??
+            DEFAULT_TURN_COMMIT_MAX_WAIT_MS;
           const deadlineMs = Date.now() + maxWait;
 
           const commitTurnChangesFn =
@@ -1906,6 +2202,7 @@ export async function runAgentLoopImpl(
           );
           const outcome = await raceWithTimeout(commitPromise, maxWait);
           if (outcome === "timed_out") {
+            outstandingCommit = commitPromise;
             rlog.warn(
               {
                 turnNumber: ctx.turnCount,
@@ -1945,6 +2242,34 @@ export async function runAgentLoopImpl(
       // the API, enabling stable prefix caching across turns.  Compaction
       // consolidates when it summarizes old messages (cache miss is expected).
     } finally {
+      // Backstop for paths that threw before either release site: still
+      // exclusive here, so the release's ownership capture is race-free.
+      releaseTurn();
+      // Reactions the turn delivered get their durable rows on every
+      // terminal path, error exits included: the reaction already happened
+      // on the channel, and the record must not depend on the turn
+      // finishing cleanly. Only records this turn captured at release are
+      // drained; writing after the turn stops producing rows keeps them out
+      // of any tool_use/tool_result pair.
+      await drainQueuedReactionRecords(ctx, ownedReactionRecords);
+      // Everything the next turn must not overlap with is done, so a caller
+      // waiting to start one outside this loop may proceed. Closed before the
+      // drain kick rather than after it: the kick is fire-and-forget, and a
+      // drained turn takes the processing lock for itself, which is the same
+      // answer an interrupt gets from any other competing claim.
+      //
+      // A commit that outran its wait budget is still staging the working tree,
+      // so the barrier stays open until it settles even though the turn no
+      // longer waits on it. `waitForTurnFinalization` is deadline-bounded, so a
+      // genuinely wedged commit makes the interrupt queue its message rather
+      // than race the commit for the working tree.
+      if (outstandingCommit) {
+        void outstandingCommit
+          .then(closeTurnFinalization, closeTurnFinalization)
+          .catch(() => {});
+      } else {
+        closeTurnFinalization();
+      }
       // kickDrainQueue never rejects: a drain failure here would otherwise be
       // an unhandled rejection that strands the queue with nothing left to
       // re-trigger it.
@@ -1953,6 +2278,32 @@ export async function runAgentLoopImpl(
         "agent_loop_finally",
       );
     }
+  }
+}
+
+/**
+ * Persist and clear the turn's queued reaction records. Non-throwing: a
+ * failure here must never mask the turn's own outcome, and
+ * `persistReactionRecords` already logs per-record failures.
+ */
+export async function drainQueuedReactionRecords(
+  ctx: Pick<Conversation, "conversationId" | "markHistoryStale">,
+  ownedRecords: QueuedReactionRecord[] | undefined,
+): Promise<void> {
+  // Runs inside the loop's finally, where a throw would mask the turn's own
+  // outcome, so every access sits inside the guard. Drains only the records
+  // the finished turn captured at release, never the conversation's live
+  // queue, so one turn cannot consume a following turn's records.
+  try {
+    if (!ownedRecords?.length) {
+      return;
+    }
+    const queuedReactions = ownedRecords.splice(0);
+    await persistReactionRecords(ctx.conversationId, queuedReactions);
+    ctx.markHistoryStale();
+  } catch {
+    // persistReactionRecords is itself non-throwing per record; this guard
+    // covers only unexpected faults so the finally block stays safe.
   }
 }
 
@@ -1975,6 +2326,13 @@ function emitUsage(
   attribution?: {
     callSite: LLMCallSite | null;
     overrideProfile?: string | null;
+    /**
+     * Float `overrideProfile` above the call-site profile, matching how the
+     * dispatch path floated it. Set when the profile being attributed is the
+     * one a reroute actually served under rather than the caller's own
+     * resolution.
+     */
+    forceOverrideProfile?: boolean;
   },
   cronRunId: string | null = null,
 ): void {
@@ -2050,7 +2408,10 @@ export async function applyCompactionResult(
     summaryCacheReadInputTokens?: number;
     summaryRawResponses?: unknown[];
     summaryCallSite?: LLMCallSite;
+    summaryResolutionCallSite?: LLMCallSite;
     summaryOverrideProfile?: string | null;
+    summaryActualProvider?: string;
+    summaryActualInferenceProfile?: string;
   },
   onEvent: (msg: AssistantEvent) => void,
   reqId: string | null,
@@ -2058,6 +2419,12 @@ export async function applyCompactionResult(
     slackContextCompactionWatermarkTs?: string | null;
     /** Firing's `cron_runs.id` stamped onto the compaction usage row. */
     cronRunId?: string | null;
+    /**
+     * Whether a history-stripped marker write for this strip already
+     * succeeded (the loop's `history_stripped` dispatch), so the
+     * memory-injection ledger reset needs no second marker write.
+     */
+    historyStripMarkerDurable?: boolean;
   } = {},
 ): Promise<void> {
   ctx.messages = result.messages;
@@ -2077,13 +2444,11 @@ export async function applyCompactionResult(
   ctx.contextSummary = result.summaryText;
   const compactedAt = Date.now();
   ctx.contextCompactedAt = compactedAt;
-  await ctx.graphMemory.onCompacted(result.compactedPersistedMessages);
   updateConversationContextWindow(
     ctx.conversationId,
     result.summaryText,
     ctx.contextCompactedMessageCount,
   );
-  markHistoryStrippedBestEffort(ctx.conversationId);
   if (options.slackContextCompactionWatermarkTs) {
     updateConversationSlackContextWatermark(
       ctx.conversationId,
@@ -2093,6 +2458,15 @@ export async function applyCompactionResult(
     ctx.slackContextCompactionWatermarkTs =
       options.slackContextCompactionWatermarkTs;
   }
+  // The ledgers reset only once the compaction commit above has landed: a
+  // commit that throws aborts the turn with the ledgers untouched, so a reload
+  // of the un-compacted history finds its frozen blocks still claimed. The
+  // compacted history is the summary plus the compactor's stripped tail, so
+  // the reset then runs even when the marker cannot be made durable.
+  await resetInjectionLedgersForStrip(ctx, result.compactedPersistedMessages, {
+    historyStripMarkerDurable: options.historyStripMarkerDurable,
+    historyAlreadyStripped: true,
+  });
   enqueueMemoryRetrospectiveOnCompaction(
     ctx.conversationId,
     ctx.trustContext?.trustClass,
@@ -2125,12 +2499,29 @@ export async function applyCompactionResult(
     result.summaryCacheCreationInputTokens ?? 0,
     result.summaryCacheReadInputTokens ?? 0,
     collapseRawResponses(result.summaryRawResponses),
-    undefined /* providerName */,
+    // The provider that actually served the summary, which follows a fallback
+    // reroute the way `summaryModel` already did. Undefined only where no call
+    // was made, and `emitUsage` then falls back to `ctx.provider.name` exactly
+    // as before.
+    result.summaryActualProvider /* providerName */,
     1 /* llmCallCount */,
     undefined /* contextWindow */,
+    // Same rule as the main-agent row above, applied to the compaction row:
+    // a rerouted summary is attributed to the profile that answered, not to
+    // the one the compactor resolved before the call. The two call sites set
+    // this parameter independently off their own state and never share it.
     {
       callSite: result.summaryCallSite ?? null,
-      overrideProfile: result.summaryOverrideProfile ?? null,
+      ...(result.summaryResolutionCallSite != null
+        ? { profileResolutionCallSite: result.summaryResolutionCallSite }
+        : {}),
+      overrideProfile:
+        result.summaryActualInferenceProfile ??
+        result.summaryOverrideProfile ??
+        null,
+      ...(result.summaryActualInferenceProfile !== undefined
+        ? { forceOverrideProfile: true }
+        : {}),
     },
     options.cronRunId ?? null,
   );

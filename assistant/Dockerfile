@@ -30,18 +30,9 @@ COPY assistant/package.json ./assistant/
 COPY assistant/src/api/package.json ./assistant/src/api/
 COPY --parents packages/*/package.json ./
 
-RUN bun install --frozen-lockfile --ignore-scripts \
+RUN --mount=type=cache,id=bun-install-cache,target=/root/.bun/install/cache \
+    bun install --frozen-lockfile --ignore-scripts \
     --filter='./assistant' --filter='./assistant/src/api'
-
-# The repo-root .dockerignore decides which skills (and files) ship.
-COPY skills ./skills
-RUN set -eu; for pkg in /app/skills/*/package.json; do \
-      [ -e "$pkg" ] || continue; \
-      dir="$(dirname "$pkg")"; \
-      echo "Installing dependencies for $dir"; \
-      (cd "$dir" && (bun install --frozen-lockfile 2>/dev/null || bun install)); \
-    done
-
 
 # Final stage
 FROM debian:trixie-slim@sha256:4ffb3a1511099754cddc70eb1b12e50ffdb67619aa0ab6c13fcd800a78ef7c7a AS runner
@@ -114,9 +105,12 @@ RUN apt-get update && apt-get install -y \
 COPY --from=builder /root/.bun/bin/bun /usr/local/bin/bun
 RUN ln -sf /usr/local/bin/bun /usr/local/bin/bunx
 
-COPY --from=builder /app /app
+COPY --link --from=builder /app /app
 
 # Copy source after installing dependencies for better layer caching.
+COPY packages/app-icons /app/packages/app-icons
+COPY packages/avatar-catalog /app/packages/avatar-catalog
+COPY packages/avatar-manifest /app/packages/avatar-manifest
 COPY packages/ces-client /app/packages/ces-client
 COPY packages/service-contracts /app/packages/service-contracts
 COPY packages/credential-storage /app/packages/credential-storage
@@ -129,17 +123,32 @@ COPY packages/twilio-client /app/packages/twilio-client
 
 COPY assistant /app/assistant
 
-# Materialize the git-ignored offline plugin manifest from its canonical source.
-# `assistant/src/cli/lib/plugin-catalog-local.ts` statically imports this JSON
-# (loaded even when platform features are enabled), so it must exist in the image
-# — the build installs with --ignore-scripts, so the postinstall sync that
-# regenerates it in dev never runs here. Mirrors how CI materializes the
-# feature-flag registry before building.
-COPY plugins/marketplace.json /app/assistant/src/cli/lib/bundled-marketplace.json
+# Resolve production workspace dependencies from the filesystem layout shipped
+# in the image.
+RUN bun run scripts/smoke-container-workspace-dependencies.ts
+
+# The repo-root .dockerignore decides which skills (and files) ship.
+COPY skills /app/skills
+
+# Materialize the git-ignored offline marketplace and reviewed local packages.
+# The build installs with --ignore-scripts, so the postinstall sync that creates
+# these static imports in development never runs here.
+COPY plugins /app/plugins
+COPY meta/sync-bundled-copies.ts /app/meta/
+RUN cd /app && bun run meta/sync-bundled-copies.ts --plugins-only && \
+    bun run assistant/scripts/generate-bundled-plugin-packages.ts
 
 # Install assistant CLI launcher backed by the bundled assistant package
 RUN printf '#!/usr/bin/env sh\nexec bun run /app/assistant/src/index.ts "$@"\n' > /usr/local/bin/assistant && \
     chmod +x /usr/local/bin/assistant
+
+# The image ships no Node, so `bunx <pkg>` follows a bin's `#!/usr/bin/env node`
+# shebang into this launcher. It hands off to a real Node when one is installed
+# later and otherwise runs the bin under Bun with the auto-serve shim preloaded,
+# so a CLI whose bundle default-exports an object with `fetch` exits instead of
+# being turned into an HTTP server by `bun:main`. Installing it here also stops
+# Bun synthesizing its own `node` shim in /tmp/bun-node-<hash> at daemon launch.
+RUN ln -s /app/assistant/docker-node-launcher.sh /usr/local/bin/node
 
 # Create non-root user that also has sudo access so it can like install stuff
 RUN groupadd --system --gid 1001 assistant && \
@@ -184,53 +193,11 @@ RUN printf '%s\n' \
     >> /home/assistant/.bashrc && \
     chown assistant:assistant /home/assistant/.bashrc
 
-RUN printf '%s\n' \
-    '#!/usr/bin/env sh' \
-    'set -eu' \
-    '. /app/assistant/docker-kata-runtime-family.sh' \
-    'if ! vellum_is_kata_family_runtime; then' \
-    '  exec /usr/bin/apt-get "$@"' \
-    'fi' \
-    'export DEBIAN_FRONTEND=noninteractive' \
-    'DATA_ROOT="${VELLUM_APT_DATA_ROOT:-/data/system}"' \
-    '/app/assistant/docker-init-apt-root.sh' \
-    'if [ -x "${DATA_ROOT}/bin/sh" ] && [ -x "${DATA_ROOT}/usr/bin/apt-get" ] && [ -f "${DATA_ROOT}/.rootfs-initialized" ] && ! grep -qs " ${DATA_ROOT} .*noexec" /proc/mounts; then' \
-    '  exec chroot "${DATA_ROOT}" /usr/bin/apt-get "$@"' \
-    'fi' \
-    'exec /usr/bin/apt-get "$@"' \
-    > /usr/local/bin/apt-get && \
-    chmod +x /usr/local/bin/apt-get && \
-    printf '%s\n' \
-    '#!/usr/bin/env sh' \
-    'set -eu' \
-    '. /app/assistant/docker-kata-runtime-family.sh' \
-    'if ! vellum_is_kata_family_runtime; then' \
-    '  exec /usr/bin/apt "$@"' \
-    'fi' \
-    'export DEBIAN_FRONTEND=noninteractive' \
-    'DATA_ROOT="${VELLUM_APT_DATA_ROOT:-/data/system}"' \
-    '/app/assistant/docker-init-apt-root.sh' \
-    'if [ -x "${DATA_ROOT}/bin/sh" ] && [ -x "${DATA_ROOT}/usr/bin/apt" ] && [ -f "${DATA_ROOT}/.rootfs-initialized" ] && ! grep -qs " ${DATA_ROOT} .*noexec" /proc/mounts; then' \
-    '  exec chroot "${DATA_ROOT}" /usr/bin/apt "$@"' \
-    'fi' \
-    'exec /usr/bin/apt "$@"' \
-    > /usr/local/bin/apt && \
-    chmod +x /usr/local/bin/apt && \
-    printf '%s\n' \
-    '#!/usr/bin/env sh' \
-    'set -eu' \
-    '. /app/assistant/docker-kata-runtime-family.sh' \
-    'if ! vellum_is_kata_family_runtime; then' \
-    '  exec /usr/bin/dpkg "$@"' \
-    'fi' \
-    'DATA_ROOT="${VELLUM_APT_DATA_ROOT:-/data/system}"' \
-    '/app/assistant/docker-init-apt-root.sh' \
-    'if [ -x "${DATA_ROOT}/bin/sh" ] && [ -x "${DATA_ROOT}/usr/bin/dpkg" ] && [ -f "${DATA_ROOT}/.rootfs-initialized" ] && ! grep -qs " ${DATA_ROOT} .*noexec" /proc/mounts; then' \
-    '  exec chroot "${DATA_ROOT}" /usr/bin/dpkg "$@"' \
-    'fi' \
-    'exec /usr/bin/dpkg "$@"' \
-    > /usr/local/bin/dpkg && \
-    chmod +x /usr/local/bin/dpkg
+# apt/apt-get/dpkg must persist like pip: on Kata-family runtimes the wrapper
+# routes package operations into the persistent apt chroot.
+RUN ln -s /app/assistant/docker-kata-apt-wrapper.sh /usr/local/bin/apt-get && \
+    ln -s /app/assistant/docker-kata-apt-wrapper.sh /usr/local/bin/apt && \
+    ln -s /app/assistant/docker-kata-apt-wrapper.sh /usr/local/bin/dpkg
 
 # pip must persist like apt: on Kata-family runtimes the wrapper routes root
 # installs into the persistent apt chroot.
@@ -272,9 +239,12 @@ RUN chmod +x \
     /app/assistant/docker-entrypoint.sh \
     /app/assistant/docker-init-apt-root.sh \
     /app/assistant/docker-kata-apt-env.sh \
+    /app/assistant/docker-kata-apt-shims.sh \
+    /app/assistant/docker-kata-apt-wrapper.sh \
+    /app/assistant/docker-kata-chroot-exec.sh \
     /app/assistant/docker-kata-pip.sh \
-    /app/assistant/docker-kata-pip-chroot.sh \
     /app/assistant/docker-kata-runtime-family.sh \
+    /app/assistant/docker-node-launcher.sh \
     /usr/local/bin/vellum-block-volume-common.sh \
     /usr/local/bin/vellum-block-volume-init.sh \
     /usr/local/bin/vellum-block-volume-mount.sh \

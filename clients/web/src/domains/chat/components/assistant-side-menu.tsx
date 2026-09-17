@@ -1,3 +1,7 @@
+import {
+  acceleratorToAriaKeyShortcuts,
+  formatAcceleratorHint,
+} from "@vellumai/design-library";
 import { Search, X } from "lucide-react";
 import {
   useCallback,
@@ -21,6 +25,7 @@ import {
 } from "@/domains/chat/components/conversation-list-context";
 import { SidebarListContextMenu } from "@/domains/chat/components/sidebar-list-context-menu";
 import type { GroupMenuItemsProps } from "@/domains/chat/components/group-actions-menu";
+import { AssistantSectionToggle } from "@/domains/chat/components/assistant-section-toggle";
 import { SidebarSectionItem } from "@/domains/chat/components/sidebar-section-item";
 import { SideMenuBuiltInNav } from "@/domains/chat/components/side-menu-built-in-nav";
 import { SideMenuOverlayBottomColumn } from "@/domains/chat/components/side-menu-overlay-bottom-column";
@@ -35,6 +40,8 @@ import {
   type UseSidebarStateParams,
 } from "@/domains/chat/use-sidebar-state";
 import { copyIdToClipboard } from "@/domains/chat/utils/copy-id-to-clipboard";
+import { ASSISTANT_SECTION_KEY } from "@/domains/chat/utils/sidebar-section-order";
+import { useCommandShortcut } from "@/hooks/use-command-shortcut";
 import { useTranslation } from "@/i18n";
 import { captureError } from "@/lib/sentry/capture-error";
 import { NATIVE_MOBILE_BARE_ICON_BUTTON } from "@/domains/chat/utils/native-mobile-button-constants";
@@ -74,24 +81,22 @@ export interface AssistantSideMenuProps extends UseSidebarStateParams {
   activeAppId?: string;
   onStartNewConversation?: () => void;
   footerAction?: ReactNode;
+  /** First control in the overlay's action cluster, before search. */
+  leadingAction?: ReactNode;
   /**
-   * Trailing control in the overlay's glyph row, opposite dismiss and search.
-   * A slot rather than a direct render: the control belongs to another
-   * domain, so the page composes it and this menu stays free of the
+   * Trailing control in the overlay's glyph row, beside search and opposite
+   * dismiss. A slot rather than a direct render: the control belongs to
+   * another domain, so the page composes it and this menu stays free of the
    * dependency (and of the router context it needs).
    */
   notificationsAction?: ReactNode;
-  /**
-   * Rendered above `footerAction` in the rail footer (hidden when collapsed)
-   * and above the floating action pills on the overlay.
-   */
-  tipCard?: ReactNode;
   onClose?: () => void;
 
   onPinConversation?: (conversation: Conversation) => void;
   onRenameConversation?: (conversation: Conversation) => void;
   onArchiveConversation?: (conversation: Conversation) => void;
   onUnarchiveConversation?: (conversation: Conversation) => void;
+  onDeleteConversation?: (conversation: Conversation) => void;
   onMarkConversationUnread?: (conversation: Conversation) => void;
   onMarkConversationRead?: (conversation: Conversation) => void;
   /**
@@ -139,6 +144,22 @@ export interface AssistantSideMenuProps extends UseSidebarStateParams {
 const NATIVE_MOBILE_LIST_TOP_FADE =
   "native-mobile:[mask-image:linear-gradient(to_bottom,transparent,black_2.75rem)] native-mobile:[-webkit-mask-image:linear-gradient(to_bottom,transparent,black_2.75rem)]";
 
+/**
+ * Rounds the overlay scrollport's bottom edge onto the section card's own
+ * corners. The scrollport ends above the floating column (see the body's
+ * margin reserve), so a list taller than the drawer is cut at that edge, and
+ * the cut carries the card's radius so the card reads as a card at any scroll
+ * position rather than as two square corners.
+ *
+ * The inset is the scrollport's own horizontal padding, which is exactly
+ * where the card's edges sit, so the clip lands on the card and nothing else.
+ * `clip-path` rather than a `border-radius`: the scrollport's box is wider
+ * than the card (it cancels the sheet's padding with `-mx-3` so the scrollbar
+ * rides the sheet edge), so its corners curve 12px clear of the card.
+ */
+const OVERLAY_LIST_ROUNDED_CLIP =
+  "[clip-path:inset(0_var(--side-menu-inset)_0_var(--side-menu-inset)_round_0_0_var(--radius-xl)_var(--radius-xl))]";
+
 function SearchButton() {
   const { t } = useTranslation("chat");
   const toggle = useCommandPaletteStore.use.toggle();
@@ -147,12 +168,26 @@ function SearchButton() {
   const handleClick = useCallback(() => {
     toggle();
   }, [toggle]);
+  const accelerator = useCommandShortcut("commandPalette");
+  // The glyphs belong in the tooltip a sighted user reads, not in the
+  // accessible name, where they are announced as their character names. A
+  // screen reader gets the plain label and the binding through
+  // `aria-keyshortcuts`.
+  const label = t("assistantSideMenu.search");
+  const tooltip = accelerator
+    ? t("assistantSideMenu.searchShortcut", {
+        shortcut: formatAcceleratorHint(accelerator),
+      })
+    : label;
   return (
     <Button
       variant="ghost"
       iconOnly={<Search />}
-      aria-label={t("assistantSideMenu.searchShortcut")}
-      title={t("assistantSideMenu.searchShortcut")}
+      aria-label={label}
+      aria-keyshortcuts={
+        accelerator ? acceleratorToAriaKeyShortcuts(accelerator) : undefined
+      }
+      title={tooltip}
       className={`pointer-events-auto ${NATIVE_MOBILE_BARE_ICON_BUTTON}`}
       onClick={handleClick}
     />
@@ -177,7 +212,6 @@ function SearchButton() {
  *       in Chats instead, so which section a conversation appears in changes
  *       but whether it appears does not
  *   Footer
- *     • caller-provided tip card (SidebarTipCard), hidden on the collapsed rail
  *     • caller-provided action (PreferencesMenu)
  *
  * This component does **not** know that order. `useSidebarState` hands it one
@@ -216,11 +250,12 @@ export function AssistantSideMenu({
   onStartNewConversation,
   footerAction,
   notificationsAction,
-  tipCard,
+  leadingAction,
   onPinConversation,
   onRenameConversation,
   onArchiveConversation,
   onUnarchiveConversation,
+  onDeleteConversation,
   onMarkConversationUnread,
   onMarkConversationRead,
   conversationGroups,
@@ -263,10 +298,9 @@ export function AssistantSideMenu({
     conversationsFailed === true && hasNoConversations;
 
   // --- Overlay bottom reserve ---
-  // The overlay's floating bottom column (tip card + action pills) covers the
-  // scrollable body, so the body reserves matching bottom padding to keep the
-  // last conversation rows scrollable clear of it. Measured (not static)
-  // because the tip card appears/disappears and its copy length varies.
+  // The overlay's floating action pills cover the sheet's bottom, so the
+  // body's own box stops above them and the last conversation rows scroll
+  // clear. The measured reserve follows the rendered action column.
   // The scrollport the flat "All" list virtualizes against. State, not a ref,
   // because the list only mounts once the node exists and has to re-render
   // when it does.
@@ -384,6 +418,8 @@ export function AssistantSideMenu({
 
   const listContext: ConversationListContextValue = {
     overlayCards: variant === "overlay",
+    scrollParent:
+      variant === "overlay" ? (bodyElement ?? undefined) : undefined,
     activeConversationId,
     activeConversationProcessing,
     processingConversationIds,
@@ -393,6 +429,7 @@ export function AssistantSideMenu({
     onRename: onRenameConversation,
     onArchive: onArchiveConversation,
     onUnarchive: onUnarchiveConversation,
+    onDelete: onDeleteConversation,
     onMarkRead: onMarkConversationRead,
     onMarkUnread: onMarkConversationUnread,
     onOpenInNewWindow,
@@ -453,6 +490,33 @@ export function AssistantSideMenu({
     });
   };
 
+  /* The assistant's own section is lifted out of the list: it opens beneath
+     the assistant pill from a round toggle beside it, rather than standing
+     as a card pinned to the foot of the list, so the threads the assistant
+     started read as hers, hanging off her row. The collapsed rail draws no
+     pill and no toggle, so there the section keeps its tile in the list. */
+  const assistantSection = sidebar.sections.find((s) => s.type === "assistant");
+  const listSections = sidebar.sections.filter((s) => s.type !== "assistant");
+
+  /* The section's open state is the same persisted bucket every other
+     section's is, so it survives a reload and the card's own header chevron
+     and the toggle beside the pill agree without a second source. */
+  const assistantSectionOpen =
+    assistantSection !== undefined &&
+    sidebar.effectiveOpenSections.includes(ASSISTANT_SECTION_KEY);
+  const setAssistantSectionOpen = (open: boolean) => {
+    const rest = sidebar.effectiveOpenSections.filter(
+      (key) => key !== ASSISTANT_SECTION_KEY,
+    );
+    sidebar.onOpenSectionsChange(
+      open ? [...rest, ASSISTANT_SECTION_KEY] : rest,
+    );
+  };
+
+  /* Index of the last listed section, the one that may claim the rail's
+     leftover space. -1 when the list is empty, so nothing fills. */
+  const lastFillIndex = listSections.length - 1;
+
   const renderSection = (section: SidebarSection, index: number) => (
     <SidebarSectionItem
       key={section.key}
@@ -463,14 +527,54 @@ export function AssistantSideMenu({
       }
       drag={sectionDragFor(section)}
       collapsedIndicator={collapsedActivityDot}
-      // Only the bottom-most section ever claims the sidebar's leftover
-      // space (see `unbounded` on `ConversationRowList`): flex-grow doesn't
-      // know which open section "needs" the room, so giving every open
-      // section a share stretched a small one (e.g. a two-row group) into a
-      // near-empty box the same size as a busy one beside it.
-      isLast={index === sidebar.sections.length - 1}
+      // The rail's bottom-most section claims leftover space (see
+      // `unbounded` on `ConversationRowList`): flex-grow doesn't know
+      // which open section "needs" the room, so giving every open section
+      // a share stretched a small one (e.g. a two-row group) into a
+      // near-empty box the same size as a busy one beside it. The overlay
+      // skips that fill: its lists scroll with the drawer body so rows
+      // can travel clear of the floating action pills.
+      //
+      isLast={variant === "rail" && index === lastFillIndex}
     />
   );
+
+  const assistantSectionToggle =
+    assistantSection && !isCollapsedRail ? (
+      <AssistantSectionToggle
+        assistantId={assistantId ?? null}
+        section={assistantSection}
+        assistantName={assistantName || t("sideMenuBuiltInNav.yourAssistant")}
+        open={assistantSectionOpen}
+        onToggle={() => setAssistantSectionOpen(!assistantSectionOpen)}
+      />
+    ) : undefined;
+
+  /* Mounted only while open: closed, the toggle is the section's whole
+     presence, so nothing of the card (not even a collapsed header) is drawn
+     beneath the pill. Its own accordion root, because the card is not in the
+     list's; the header chevron still closes it through the same state. Not
+     draggable and never the fill section: it hangs off the pill, not the
+     list. */
+  const assistantSectionCard =
+    assistantSection && !isCollapsedRail && assistantSectionOpen ? (
+      <CollapsibleNavSection.Root
+        type="multiple"
+        value={[ASSISTANT_SECTION_KEY]}
+        onValueChange={(next) =>
+          setAssistantSectionOpen(next.includes(ASSISTANT_SECTION_KEY))
+        }
+      >
+        <SidebarSectionItem
+          section={assistantSection}
+          assistantId={assistantId ?? null}
+          groupMenu={(conversations, getAllRows) =>
+            sectionMenu(assistantSection, conversations, getAllRows)
+          }
+          collapsedIndicator={collapsedActivityDot}
+        />
+      </CollapsibleNavSection.Root>
+    ) : undefined;
 
   // Rendered in the rail's non-scrolling header, or at the top of the
   // overlay's body so the whole menu scrolls as one surface; the block's
@@ -487,6 +591,8 @@ export function AssistantSideMenu({
       activeAppId={activeAppId}
       onOpenApp={onOpenApp}
       onClose={onClose}
+      assistantAside={assistantSectionToggle}
+      assistantBeneath={assistantSectionCard}
     />
   );
 
@@ -519,29 +625,37 @@ export function AssistantSideMenu({
       >
         <SideMenu.Header>
           {variant === "overlay" ? (
-            /* Dismiss and search lead together on the left, notifications
-               sits alone on the right (Figma 7842-83305). In Capacitor
-               mobile shells the row floats over the scrollport so list
-               content travels beneath the bare glyphs;
-               `pointer-events-none` keeps the gap between the clusters
-               scrollable. */
+            /* Dismiss leads alone on the left; search sits with
+               notifications on the right, mirroring the chat header's
+               right cluster so the glyphs hold one position whether the
+               drawer is open or closed. In Capacitor mobile shells the row
+               floats over the scrollport so list content travels beneath
+               the bare glyphs; `pointer-events-none` keeps the gap between
+               the clusters scrollable. */
             <div
               data-slot="side-menu-glyph-row"
               className="flex items-center justify-between gap-2 native-mobile:pointer-events-none native-mobile:absolute native-mobile:inset-x-3 native-mobile:top-4 native-mobile:z-10"
             >
-              <div className="flex items-center gap-1">
-                <Button
-                  variant="ghost"
-                  iconOnly={<X />}
-                  aria-label={t("assistantSideMenu.closeNavAria")}
-                  className="pointer-events-auto"
-                  onClick={() => onClose?.()}
-                />
+              <Button
+                variant="ghost"
+                iconOnly={<X />}
+                aria-label={t("assistantSideMenu.closeNavAria")}
+                className="pointer-events-auto"
+                onClick={() => onClose?.()}
+              />
+              <div className="flex items-center gap-2">
+                {leadingAction ? (
+                  <div className="pointer-events-auto empty:hidden">
+                    {leadingAction}
+                  </div>
+                ) : null}
                 <SearchButton />
+                {notificationsAction ? (
+                  <div className="pointer-events-auto">
+                    {notificationsAction}
+                  </div>
+                ) : null}
               </div>
-              {notificationsAction ? (
-                <div className="pointer-events-auto">{notificationsAction}</div>
-              ) : null}
             </div>
           ) : (
             builtInNav
@@ -552,15 +666,15 @@ export function AssistantSideMenu({
           ref={setBodyElement}
           className={
             variant === "overlay"
-              ? /* pb-24 is a coarse floating-column reserve until the measured
-                 inline padding below is applied. The native-mobile reserve is
+              ? /* mb-24 is a coarse floating-column reserve until the measured
+                 inline margin below is applied. The native-mobile reserve is
                  the glyph row's own extent: it floats 1rem below the sheet's
                  top and stands 2.5rem tall. An icon-only Button carries a
                  40px touch target on a coarse pointer, not the 32px box the
                  mock draws. This scrollport starts one overlay inset down, so
                  2.75rem reaches the row's bottom edge, and the assistant
                  cluster's own top padding supplies the 1rem gap beneath it. */
-                `-mx-3 ${SIDEBAR_STACK_GAP} px-3 pb-24 native-mobile:pt-11 ${NATIVE_MOBILE_LIST_TOP_FADE}`
+                `-mx-3 ${SIDEBAR_STACK_GAP} mb-24 px-3 ${OVERLAY_LIST_ROUNDED_CLIP} native-mobile:pt-11 ${NATIVE_MOBILE_LIST_TOP_FADE}`
               : /* The top inset is the same stack gap: the header closes
                    with no rule, so without it the first card (or the
                    collapsed rail's first group icon) butts against the
@@ -574,9 +688,15 @@ export function AssistantSideMenu({
                      body's own box stops one overlay inset short of that same
                      edge. Reserving the column's height plus both 1rem steps,
                      less the inset the body already has, leaves exactly the
-                     second step as clearance under the last row. */
+                     second step as clearance under the last row.
+
+                     A margin, so the reserve ends the scrollport rather than
+                     sitting inside it: padding belongs to the scrollable box,
+                     and a card taller than the drawer paints through it. The
+                     scrollport's own edge is what keeps rows off the column,
+                     and the last row still scrolls into view above it. */
                   "--overlay-bottom-column-h": `${overlayBottomColumnHeight}px`,
-                  paddingBottom:
+                  marginBottom:
                     "calc(var(--overlay-bottom-column-h) + 2rem - var(--side-menu-inset) + var(--safe-area-inset-bottom, env(safe-area-inset-bottom, 0px)))",
                 } as CSSProperties)
               : undefined
@@ -624,13 +744,18 @@ export function AssistantSideMenu({
                   action. */}
                 <CollapsibleNavSection.Root
                   type="multiple"
-                  /* min-h-0 flex-1: the root must claim the body's height so
+                  /* On the rail, min-h-0 flex-1 claims the body's height so
                      the bottom-most open card's flex-fill has leftover space
                      to take. Without it every layer below sizes to content,
                      and a windowed row list (which renders only what fits a
                      bounded viewport) resolves to zero height and draws no
-                     rows at all. */
-                  className={cn(SIDEBAR_STACK_GAP, "min-h-0 flex-1")}
+                     rows at all. The overlay sizes to content instead: a
+                     flex-1 root would pin the body to the viewport and trap
+                     Chats under the floating pills. */
+                  className={cn(
+                    SIDEBAR_STACK_GAP,
+                    variant === "rail" && "min-h-0 flex-1",
+                  )}
                   value={sidebar.effectiveOpenSections}
                   onValueChange={sidebar.onOpenSectionsChange}
                 >
@@ -640,7 +765,7 @@ export function AssistantSideMenu({
                     no wrapping header. Each section's menu carries the
                     Group by toggle, which is why removing the persistent
                     "Conversations" header loses nothing. */}
-                  {sidebar.sections.map(renderSection)}
+                  {listSections.map(renderSection)}
                 </CollapsibleNavSection.Root>
               </SidebarListContextMenu>
               <SidebarBackToTop
@@ -655,13 +780,12 @@ export function AssistantSideMenu({
 
         {variant === "overlay" ? (
           <SideMenuOverlayBottomColumn
-            tipCard={tipCard}
             footerAction={footerAction}
             onStartNewConversation={onStartNewConversation}
             onClose={onClose}
             onHeightChange={setOverlayBottomColumnHeight}
           />
-        ) : footerAction || tipCard ? (
+        ) : footerAction ? (
           /* Every entry in this sidebar is a pill on the page background, and
              a shape like that is already delimited: a line above the last one
              would divide a column that reads as grouped without it. The
@@ -669,8 +793,6 @@ export function AssistantSideMenu({
              on `SideMenu.Footer` is what holds it at the bottom while the
              list scrolls in `SideMenu.Body` above it. */
           <SideMenu.Footer>
-            {/* The collapsed rail drops the tip card (per design). */}
-            {isCollapsedRail ? null : tipCard}
             {footerAction}
           </SideMenu.Footer>
         ) : null}

@@ -3,33 +3,15 @@ import { describe, expect, test } from "bun:test";
 import {
   LiveVoiceConfigSchema,
   LiveVoiceFluxConfigSchema,
-  LiveVoiceFrontModelConfigSchema,
   LiveVoiceVadConfigSchema,
-  VALID_LIVE_VOICE_MODES,
 } from "../live-voice.js";
 
-const PROGRESS_DEFAULTS = {
-  enabled: true,
-  opsThreshold: 3,
-  idleIntervalMs: 5_000,
-  maxSilenceMs: 35_000,
-  longOpMs: 15_000,
-  minGapMs: 6_000,
-  generationTimeoutMs: 1_500,
-};
-
-const FRONT_MODEL_DEFAULTS = {
-  endpointDecisionTimeoutMs: 1200,
-  endpointExtensionMs: 1500,
-  endpointMaxExtensions: 2,
-  progress: PROGRESS_DEFAULTS,
-};
-
 // `eagerEotThreshold` is deliberately absent: it has no default, and leaving it
-// unset is what keeps Deepgram from emitting speculative turn events.
+// unset is what keeps Deepgram from emitting speculative turn events. `model`
+// is absent for a related reason: unset means the spoken language selects the
+// model, and pinning one overrides that.
 const FLUX_DEFAULTS = {
-  turnEnd: { enabled: false },
-  model: "flux-general-en",
+  turnEnd: { enabled: true },
   eotThreshold: 0.7,
   eotTimeoutMs: 5_000,
 };
@@ -39,6 +21,7 @@ describe("LiveVoiceVadConfigSchema", () => {
     const parsed = LiveVoiceVadConfigSchema.parse({});
     expect(parsed).toEqual({
       speechEnergyThreshold: 800,
+      noiseFloorMargin: 3,
       silenceThresholdMs: 1200,
       maxTurnDurationMs: 30_000,
       bargeInMinSpeechMs: 250,
@@ -59,6 +42,17 @@ describe("LiveVoiceVadConfigSchema", () => {
     expect(parsed.silenceThresholdMs).toBe(500);
     expect(parsed.maxTurnDurationMs).toBe(60_000);
     expect(parsed.bargeInMinSpeechMs).toBe(120);
+  });
+
+  test("accepts a noiseFloorMargin of 0 (adaptation disabled)", () => {
+    const parsed = LiveVoiceVadConfigSchema.parse({ noiseFloorMargin: 0 });
+    expect(parsed.noiseFloorMargin).toBe(0);
+  });
+
+  test("rejects a negative noiseFloorMargin", () => {
+    expect(() =>
+      LiveVoiceVadConfigSchema.parse({ noiseFloorMargin: -1 }),
+    ).toThrow();
   });
 
   test("accepts a bargeInMinSpeechMs of 0 (guard disabled)", () => {
@@ -117,119 +111,8 @@ describe("LiveVoiceVadConfigSchema", () => {
   });
 });
 
-describe("LiveVoiceFrontModelConfigSchema", () => {
-  test("empty object parses to defaults", () => {
-    const parsed = LiveVoiceFrontModelConfigSchema.parse({});
-    expect(parsed).toEqual(FRONT_MODEL_DEFAULTS);
-  });
-
-  test("accepts overrides", () => {
-    const parsed = LiveVoiceFrontModelConfigSchema.parse({
-      endpointDecisionTimeoutMs: 400,
-      endpointMaxExtensions: 0,
-    });
-    expect(parsed.endpointDecisionTimeoutMs).toBe(400);
-    expect(parsed.endpointMaxExtensions).toBe(0);
-    // Unspecified fields still get defaults
-    expect(parsed.endpointExtensionMs).toBe(1500);
-  });
-
-  test("strips retired generated-ack settings", () => {
-    const parsed = LiveVoiceFrontModelConfigSchema.parse({
-      ackFirstDeltaTimeoutMs: 2500,
-      ackGenerationTimeoutMs: 600,
-    });
-    expect(parsed).not.toHaveProperty("ackFirstDeltaTimeoutMs");
-    expect(parsed).not.toHaveProperty("ackGenerationTimeoutMs");
-  });
-
-  test("rejects non-positive endpointDecisionTimeoutMs", () => {
-    const result = LiveVoiceFrontModelConfigSchema.safeParse({
-      endpointDecisionTimeoutMs: 0,
-    });
-    expect(result.success).toBe(false);
-  });
-
-  test("rejects negative endpointMaxExtensions", () => {
-    const result = LiveVoiceFrontModelConfigSchema.safeParse({
-      endpointMaxExtensions: -1,
-    });
-    expect(result.success).toBe(false);
-  });
-
-  test("absent progress namespace parses to full progress defaults", () => {
-    const parsed = LiveVoiceFrontModelConfigSchema.parse({});
-    expect(parsed.progress).toEqual(PROGRESS_DEFAULTS);
-  });
-
-  test("partial progress overrides merge with defaults", () => {
-    const parsed = LiveVoiceFrontModelConfigSchema.parse({
-      progress: { enabled: false, opsThreshold: 5 },
-    });
-    expect(parsed.progress.enabled).toBe(false);
-    expect(parsed.progress.opsThreshold).toBe(5);
-    // Unspecified progress fields still get defaults
-    expect(parsed.progress.idleIntervalMs).toBe(5_000);
-    expect(parsed.progress.maxSilenceMs).toBe(35_000);
-    expect(parsed.progress.longOpMs).toBe(15_000);
-    expect(parsed.progress.minGapMs).toBe(6_000);
-    expect(parsed.progress.generationTimeoutMs).toBe(1_500);
-  });
-
-  test("a stale maxPerTurn key is stripped, not rejected", () => {
-    // The cap was removed; configs written while it existed must still parse.
-    const parsed = LiveVoiceFrontModelConfigSchema.parse({
-      progress: { maxPerTurn: 3 },
-    });
-    expect("maxPerTurn" in parsed.progress).toBe(false);
-  });
-
-  test("rejects non-positive progress.opsThreshold", () => {
-    const result = LiveVoiceFrontModelConfigSchema.safeParse({
-      progress: { opsThreshold: 0 },
-    });
-    expect(result.success).toBe(false);
-  });
-
-  test("rejects a heartbeat ceiling shorter than the idle tick interval", () => {
-    // The heartbeat is only checked on the idle tick, so a shorter ceiling
-    // could be overshot by a full interval.
-    const result = LiveVoiceFrontModelConfigSchema.safeParse({
-      progress: { idleIntervalMs: 60_000, maxSilenceMs: 10_000 },
-    });
-    expect(result.success).toBe(false);
-    if (!result.success) {
-      const msgs = result.error.issues.map((issue) => issue.message);
-      expect(
-        msgs.some((msg) =>
-          msg.includes("liveVoice.frontModel.progress.maxSilenceMs"),
-        ),
-      ).toBe(true);
-    }
-    // The floor itself is allowed: the tick is exactly on the ceiling.
-    expect(
-      LiveVoiceFrontModelConfigSchema.safeParse({
-        progress: { idleIntervalMs: 60_000, maxSilenceMs: 60_000 },
-      }).success,
-    ).toBe(true);
-  });
-
-  test("rejects a non-boolean progress.enabled", () => {
-    const result = LiveVoiceFrontModelConfigSchema.safeParse({
-      progress: { enabled: "yes" },
-    });
-    expect(result.success).toBe(false);
-    if (!result.success) {
-      const msgs = result.error.issues.map((i) => i.message);
-      expect(
-        msgs.some((m) => m.includes("liveVoice.frontModel.progress.enabled")),
-      ).toBe(true);
-    }
-  });
-});
-
 describe("LiveVoiceFluxConfigSchema", () => {
-  test("empty object parses to defaults, with turn-end off", () => {
+  test("empty object parses to defaults, with turn-end on", () => {
     expect(LiveVoiceFluxConfigSchema.parse({})).toEqual(FLUX_DEFAULTS);
   });
 
@@ -257,8 +140,8 @@ describe("LiveVoiceFluxConfigSchema", () => {
   test("partial overrides merge with defaults", () => {
     const parsed = LiveVoiceFluxConfigSchema.parse({ eotThreshold: 0.6 });
     expect(parsed.eotThreshold).toBe(0.6);
-    expect(parsed.turnEnd.enabled).toBe(false);
-    expect(parsed.model).toBe("flux-general-en");
+    expect(parsed.turnEnd.enabled).toBe(true);
+    expect(parsed.model).toBeUndefined();
     expect(parsed.eotTimeoutMs).toBe(5_000);
   });
 
@@ -313,9 +196,9 @@ describe("LiveVoiceConfigSchema", () => {
   test("empty object parses to defaults", () => {
     const parsed = LiveVoiceConfigSchema.parse({});
     expect(parsed).toEqual({
-      mode: "open-mic",
       vad: {
         speechEnergyThreshold: 800,
+        noiseFloorMargin: 3,
         silenceThresholdMs: 1200,
         maxTurnDurationMs: 30_000,
         bargeInMinSpeechMs: 250,
@@ -323,11 +206,9 @@ describe("LiveVoiceConfigSchema", () => {
         echoEmaHalfLifeMs: 400,
         echoDrainSlackMs: 300,
       },
-      frontModel: FRONT_MODEL_DEFAULTS,
       // Off by default: Flux turn detection is opt-in, so the front-door hold
       // verdict keeps committing turns until it is enabled.
       flux: FLUX_DEFAULTS,
-      maxSessionDurationSeconds: 1800,
       // Off by default: voice turns carry only their transcript, no audio
       // artifacts on the conversation messages (JARVIS-1283).
       archiveAudio: false,
@@ -351,43 +232,26 @@ describe("LiveVoiceConfigSchema", () => {
 
   test("accepts overrides", () => {
     const parsed = LiveVoiceConfigSchema.parse({
-      mode: "ptt",
       vad: { silenceThresholdMs: 900 },
-      frontModel: { endpointDecisionTimeoutMs: 300 },
       flux: { turnEnd: { enabled: true } },
-      maxSessionDurationSeconds: 600,
     });
-    expect(parsed.mode).toBe("ptt");
     expect(parsed.vad.silenceThresholdMs).toBe(900);
     // Unspecified vad fields still get defaults
     expect(parsed.vad.speechEnergyThreshold).toBe(800);
     expect(parsed.vad.maxTurnDurationMs).toBe(30_000);
-    // Partial frontModel overrides merge with defaults
-    expect(parsed.frontModel.endpointDecisionTimeoutMs).toBe(300);
-    expect(parsed.frontModel.endpointExtensionMs).toBe(1500);
     // Partial flux overrides merge with defaults
     expect(parsed.flux.turnEnd.enabled).toBe(true);
     expect(parsed.flux.eotThreshold).toBe(0.7);
-    expect(parsed.maxSessionDurationSeconds).toBe(600);
   });
 
-  test("rejects invalid mode", () => {
-    const result = LiveVoiceConfigSchema.safeParse({ mode: "always-on" });
-    expect(result.success).toBe(false);
-    if (!result.success) {
-      const msgs = result.error.issues.map((i) => i.message);
-      expect(msgs.some((m) => m.includes("liveVoice.mode"))).toBe(true);
-    }
-  });
-
-  test("rejects non-positive maxSessionDurationSeconds", () => {
-    const result = LiveVoiceConfigSchema.safeParse({
-      maxSessionDurationSeconds: -1,
+  test("persisted configs carrying retired keys keep parsing", () => {
+    // Zod strips unrecognized keys, so a persisted config that still carries
+    // `mode` or `maxSessionDurationSeconds` parses.
+    const parsed = LiveVoiceConfigSchema.parse({
+      mode: "ptt",
+      maxSessionDurationSeconds: 600,
     });
-    expect(result.success).toBe(false);
-  });
-
-  test("VALID_LIVE_VOICE_MODES lists ptt and open-mic", () => {
-    expect(VALID_LIVE_VOICE_MODES).toEqual(["ptt", "open-mic"]);
+    expect(parsed).not.toHaveProperty("mode");
+    expect(parsed).not.toHaveProperty("maxSessionDurationSeconds");
   });
 });

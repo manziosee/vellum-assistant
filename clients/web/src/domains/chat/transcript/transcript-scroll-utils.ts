@@ -5,6 +5,9 @@
  *  into scroll events and React state; these functions own the math. */
 
 import type { TranscriptItem } from "@/domains/chat/transcript/types";
+import type { DisplayMessage } from "@/domains/chat/types/types";
+
+import { isCameraFrameRow } from "./camera-frame-rows";
 
 // ---------------------------------------------------------------------------
 // Thresholds (load-bearing — keep exact).
@@ -73,8 +76,82 @@ export function classifyScrollPosition(
   return { distanceFromBottom, isPinned, showScrollToLatest, shouldLoadOlder };
 }
 
-/** Find the new index of a previously saved anchor key inside a refreshed
- *  items list. Returns -1 if the key is no longer present. */
+/**
+ * Whether two item lists hold the same visible row identities, including
+ * frames folded into a message item.
+ *
+ * Guards the underfilled-viewport auto-fetch against no-progress updates.
+ * Reprojected arrays, streaming text, and attachment hydration preserve
+ * identity, while a page adding frames changes it even under the same host.
+ */
+export function haveSameItemKeys(
+  a: readonly TranscriptItem[],
+  b: readonly TranscriptItem[],
+): boolean {
+  return (
+    a.length === b.length &&
+    a.every((item, i) => {
+      const next = b[i];
+      if (item.key !== next?.key) {
+        return false;
+      }
+      const frames = item.kind === "message" ? (item.cameraFrames ?? []) : [];
+      const nextFrames =
+        next.kind === "message" ? (next.cameraFrames ?? []) : [];
+      return (
+        frames.length === nextFrames.length &&
+        frames.every((frame, index) => {
+          const nextFrame = nextFrames[index];
+          return nextFrame !== undefined && sameFrameIdentity(nextFrame, frame);
+        })
+      );
+    })
+  );
+}
+
+/**
+ * Whether a history-seeking user gesture should page in older history.
+ *
+ * An underfilled scroll element is pinned at scrollTop 0 and never fires
+ * `scroll`, so the scroll-handler load-older path is unreachable there and
+ * the no-progress guard (see {@link haveSameItemKeys}) has stopped the
+ * automatic chain. Gestures are the only remaining signal of intent, and
+ * each one pages in at most one fetch.
+ */
+export function shouldGestureLoadOlder(
+  metrics: ScrollMetrics,
+  flags: {
+    hasMore: boolean;
+    isLoadingOlder: boolean;
+    hasConversation: boolean;
+  },
+): boolean {
+  const underfilled = metrics.scrollHeight <= metrics.clientHeight;
+  return (
+    underfilled &&
+    flags.hasConversation &&
+    flags.hasMore &&
+    !flags.isLoadingOlder
+  );
+}
+
+function frameMatchesAnchor(frame: DisplayMessage, key: string): boolean {
+  return frame.id === key || frame.clientMessageId === key;
+}
+
+function sameFrameIdentity(
+  frame: DisplayMessage,
+  previous: DisplayMessage,
+): boolean {
+  return (
+    frameMatchesAnchor(frame, previous.id) ||
+    (previous.clientMessageId !== undefined &&
+      frameMatchesAnchor(frame, previous.clientMessageId))
+  );
+}
+
+/** Exact row keys take precedence over grouped-frame aliases. Both persisted
+ *  frame ids and optimistic client ids survive a group changing its host. */
 export function findAnchorIndex(
   items: readonly TranscriptItem[],
   anchorKey: string,
@@ -85,7 +162,48 @@ export function findAnchorIndex(
       return i;
     }
   }
+  for (let i = 0; i < items.length; i += 1) {
+    const item = items[i];
+    if (
+      item?.kind === "message" &&
+      item.cameraFrames?.some((frame) => frameMatchesAnchor(frame, anchorKey))
+    ) {
+      return i;
+    }
+  }
   return -1;
+}
+
+/** A standalone group's existing frames remain contiguous when pagination
+ *  adds earlier frames, even if ambient capture also appends to the run.
+ *  Speech rehosting and distinct user turns remain new-anchor events. */
+export function isStandaloneCameraFramePrepend(
+  previous: TranscriptItem | undefined,
+  next: TranscriptItem | undefined,
+): boolean {
+  if (
+    previous?.kind !== "message" ||
+    next?.kind !== "message" ||
+    !isCameraFrameRow(previous.message) ||
+    !isCameraFrameRow(next.message) ||
+    !previous.cameraFrames?.length ||
+    !next.cameraFrames?.length
+  ) {
+    return false;
+  }
+  const nextFrames = next.cameraFrames;
+  const first = previous.cameraFrames[0]!;
+  const offset = nextFrames.findIndex((frame) =>
+    sameFrameIdentity(frame, first),
+  );
+  return (
+    offset > 0 &&
+    nextFrames.some((frame) => frameMatchesAnchor(frame, previous.key)) &&
+    previous.cameraFrames.every((frame, index) => {
+      const candidate = nextFrames[offset + index];
+      return candidate !== undefined && sameFrameIdentity(candidate, frame);
+    })
+  );
 }
 
 /** Walk the items list backward and return the key of the most recent
@@ -137,6 +255,36 @@ export interface ItemsChangeContext {
   savedAnchor: AnchorSnapshot | null;
 }
 
+function hasPrependedItems(
+  previousItems: readonly TranscriptItem[],
+  items: readonly TranscriptItem[],
+): boolean {
+  const first = previousItems[0];
+  if (!first) {
+    return false;
+  }
+  const index = findAnchorIndex(items, first.key);
+  if (index > 0) {
+    return true;
+  }
+  const next = items[index];
+  if (
+    first.kind !== "message" ||
+    next?.kind !== "message" ||
+    !next.cameraFrames?.length
+  ) {
+    return false;
+  }
+  const firstMessage = first.cameraFrames?.[0] ?? first.message;
+  const frameIndex = next.cameraFrames.findIndex((frame) =>
+    sameFrameIdentity(frame, firstMessage),
+  );
+  return (
+    frameIndex > 0 ||
+    (frameIndex < 0 && sameFrameIdentity(next.message, firstMessage))
+  );
+}
+
 /** Decide what the scroll coordinator should do in response to an
  *  `items` change. The caller is responsible for executing the action
  *  (calling into the TranscriptHandle) and for updating the
@@ -155,7 +303,7 @@ export function decideItemsChangeAction(
     return { kind: "none" };
   }
 
-  if (ctx.savedAnchor && ctx.items.length > 0) {
+  if (ctx.savedAnchor && hasPrependedItems(ctx.previousItems, ctx.items)) {
     const newIndex = findAnchorIndex(ctx.items, ctx.savedAnchor.key);
     if (newIndex >= 0) {
       return {

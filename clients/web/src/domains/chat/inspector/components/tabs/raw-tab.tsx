@@ -1,7 +1,7 @@
 import { AlertCircle, Download, RefreshCw } from "lucide-react";
 import { useState, type ReactNode } from "react";
 
-import { CopyButton } from "@/domains/chat/inspector/components/copy-button";
+import { CopyButton } from "@/components/copy-button";
 import { useLlmLogPayload } from "@/domains/chat/inspector/inspector-payload-api";
 import { t, useTranslation } from "@/i18n";
 import { captureError } from "@/lib/sentry/capture-error";
@@ -66,9 +66,7 @@ export function RawTab({ entry, assistantId }: RawTabProps): ReactNode {
               border: "1px solid var(--border-base)",
             }}
           >
-            {p === "request"
-              ? t("rawTab.request")
-              : t("rawTab.response")}
+            {p === "request" ? t("rawTab.request") : t("rawTab.response")}
           </button>
         ))}
       </div>
@@ -181,7 +179,7 @@ function LoadingState(): ReactNode {
   return (
     <div className="flex h-48 w-full flex-col items-center justify-center gap-2">
       <p
-        className="text-label-default"
+        className="text-label-medium-default"
         style={{ color: "var(--content-secondary)" }}
       >
         {t("rawTab.loading")}
@@ -212,7 +210,7 @@ function ErrorState({ message, onRetry }: ErrorStateProps): ReactNode {
         {t("rawTab.loadErrorTitle")}
       </p>
       <p
-        className="max-w-xs text-label-default"
+        className="max-w-xs text-label-medium-default"
         style={{ color: "var(--content-secondary)" }}
       >
         {message}

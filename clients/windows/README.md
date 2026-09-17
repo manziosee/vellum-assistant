@@ -3,13 +3,15 @@
 The Windows desktop client. Like `clients/macos`, this is an Electron shell
 around the `clients/web` renderer: in dev it loads the Vite dev server (or
 vel's edge proxy when `vel up` is running), and in packaged builds it serves a
-bundled `resources/web-dist` over a privileged `app://` protocol.
+bundled `resources/cli-runtime/web-dist` over a privileged `app://` protocol.
 
 ## Layout
 
 - `src/main/index.ts` boots the hardened shell (single-instance lock,
   per-environment `userData`, `app://` serving with path-traversal protection,
-  platform API forwarding) and then composes `src/main/features/*`.
+  local, paired, and platform request forwarding, paired-request frame-origin
+  enforcement, CSP, a permission allowlist, and sandboxed `vellumapp://`
+  serving) and then composes `src/main/features/*`.
 - `src/main/features/*` and `src/preload/features/*` are capability modules
   installed through the registries in `@vellumai/electron-desktop`. Every
   `.ts` file in those directories is picked up automatically; a new capability
@@ -22,6 +24,11 @@ bundled `resources/web-dist` over a privileged `app://` protocol.
   text insertion (security model in `native/README.md`).
   `native/Vellum.PreviewHandler` is the Explorer preview and thumbnail handler
   for `.vellum` bundles.
+- `src/main/features/voice-mode-chord.ts` registers the voice mode shortcut's
+  bare-modifier binding with the helper's low-level keyboard hook, because an
+  Electron `globalShortcut` cannot express one. A clean tap (chord down, chord
+  key up, nothing else in between) toggles voice mode system-wide; a shortcut
+  passing through the chord's keys (Alt+Tab over Alt) disarms instead.
 - [`docs/parity-matrix.md`](docs/parity-matrix.md) maps every bridge key and
   main-process capability to its Windows module, its macOS counterpart, and the
   test or packaged smoke that covers it, and lists the macOS concepts with no
@@ -63,6 +70,18 @@ Packaged Windows startup installs the bundled CLI runtime for the current user:
 background archive uses PowerShell and the built-in `tar.exe`; other platforms
 use the existing POSIX archive process.
 
+## Automated backups
+
+The packaged Windows client does not expose automated backup configuration yet.
+The installed `vellum backup <name>` command creates an on-demand local export,
+but the internal `assistant backup` command is not installed on the user PATH.
+
+Windows has no implicit offsite destination. A future automated backup surface
+must ask the user to select a OneDrive folder, external drive, or network
+location explicitly. OneDrive environment variables are insufficient because
+a machine can expose personal and organization-managed accounts at the same
+time.
+
 ## Updates and troubleshooting
 
 Packaged builds poll the channel-, platform-, and architecture-isolated feed
@@ -97,43 +116,83 @@ This builds the local `clients/web` source, serves it from Electron's
 ## Packaging
 
 ```bash
-bun run build:web   # builds clients/web into resources/web-dist
-bun run pack        # electron-vite build + electron-builder --win (NSIS)
+bun run pack                     # dev installer for testing on another machine
+bun run pack --environment local # local-platform installer
+bun run pack:debug               # dev installer with Chrome DevTools enabled
 ```
 
-Local and CI packs are unsigned. `bun run pack` skips the Explorer preview
-handler, which `.github/workflows/windows-package-smoke.yaml` builds before
-packaging and then install-, launch-, and uninstall-tests.
+`pack` builds every bundled resource (`build:runtime`, `build:native-helper`,
+`build:preview-handler`) before `electron-builder`, so the Explorer preview
+handler DLL that `electron-builder.config.cjs` requires is always present.
+The builder rebuilds the Electron main and preload entrypoints immediately
+before collecting app files, including when it is invoked directly.
+
+The default `dev` environment keeps an installed test build connected to the
+deployed dev platform, including its login endpoint. Pass `--environment local`
+only when a platform server is available at `localhost:8000`.
+
+`build:runtime` bundles the Bun pinned in `.tool-versions`: the host `bun.exe`
+is used when its sha256 matches `scripts/bun-release.ts`, otherwise the
+matching GitHub release is downloaded and verified. Bump the pins there when
+the Bun version changes.
+
+`build:preview-handler` installs its manifest dependencies before invoking
+MSBuild. It installs the manifest's pinned vcpkg baseline in the ignored
+`clients/windows/.build-tools` directory and reuses it for future builds. This
+keeps packaging independent of vcpkg copies exposed by Visual Studio,
+environment variables, or `PATH`.
+
+Local and CI packs are unsigned. `.github/workflows/windows-package-smoke.yaml`
+runs the same steps per architecture, then install-, launch-, and
+uninstall-tests the installer.
 
 ## Release
 
-`.github/workflows/release-windows.yaml` is the reusable release: both
+`.github/workflows/release-windows.yaml` builds signed release artifacts: both
 `dev-release.yaml` and `release.yml` call it with `{ environment, version }`
-behind the `WINDOWS_{DEV,STAGING,PRODUCTION}_RELEASE_ENABLED` variables, so
-each channel stays off until its variable is set. Per
-architecture (x64 on `windows-2025`, arm64 on the `windows-11-vs2026-arm`
-preview runner) it stamps the version, builds the helper, preview handler,
-CLI runtime, and renderer, packages and signs through `electron-builder`,
-verifies every manifest binary and the installer with
-`Get-AuthenticodeSignature`, and publishes to the
+as soon as version resolution succeeds. Windows installers build for dev,
+staging, and production in parallel with the other release jobs.
+
+The separate `.github/workflows/publish-windows.yaml` publishes artifacts from
+that same workflow run after the Windows build and release gates succeed.
+Staging and production require the release images and channel metadata to
+publish first. Dev requires release registration and the Chrome extension build.
+The workflow stamps the version and builds the helper, preview handler, CLI
+runtime, and renderer on native runners (x64 on `windows-2025`, arm64 on
+`windows-11-vs2026-arm`). Each native payload and its stamped app manifest
+transfer to an x64 `windows-2025` runner
+for packaging and signing through `electron-builder`, because
+[Azure Artifact Signing does not support Windows ARM runners](https://github.com/Azure/artifact-signing-action#runner-requirements).
+The workflow verifies every manifest binary and the installer with
+`Get-AuthenticodeSignature`, requiring valid signatures from the configured
+publisher while allowing Azure certificate rotation. Three bundled Microsoft
+runtime DLL paths also accept valid Microsoft Windows catalog signatures,
+which PowerShell prefers over embedded signatures. The publish workflow writes to the
 `vellum-ai-<env>-releases/win-electron/<arch>/` feed: installer and blockmap
-first, then the `<env>.yml` channel manifest.
+first, then the `<env>.yml` channel manifest. Dev also publishes the installer
+as `vellum-assistant-dev-<arch>.exe` for stable download-page links.
+
+The builder always writes `latest.yml`, including for prerelease versions;
+CD uploads it under the environment's `<env>.yml` channel name.
 
 The executable, installer, and uninstaller use the environment-specific icon
 from `build-resources/icons/<environment>/icon.ico`, matching the local, dev,
 staging, and production desktop identities.
 
-Signing is provider-neutral and an explicit gate on each GitHub environment
-(`electron-builder.config.cjs`, `WINDOWS_SIGNING_PROVIDER`):
+CD uses Azure Artifact Signing (`azure-trusted-signing`) with the shared account,
+certificate profile, regional endpoint, and publisher name defined directly in
+`.github/workflows/release-windows.yaml`. These settings apply to dev, staging,
+and production without GitHub signing variables.
 
-- `pfx`: `WINDOWS_SIGNING_PFX_BASE64` + `WINDOWS_SIGNING_PFX_PASSWORD` secrets.
-- `azure-trusted-signing`: `AZURE_TENANT_ID` / `AZURE_CLIENT_ID` /
-  `AZURE_CLIENT_SECRET` secrets plus `AZURE_TRUSTED_SIGNING_ENDPOINT`,
-  `AZURE_TRUSTED_SIGNING_ACCOUNT`, `AZURE_TRUSTED_SIGNING_PROFILE`, and
-  `WINDOWS_SIGNING_PUBLISHER_NAME` variables.
-- `command`: a `WINDOWS_SIGN_COMMAND` secret holding any signing CLI
-  invocation with a `{file}` placeholder, plus `WINDOWS_SIGNING_PUBLISHER_NAME`
-  so the updater can verify downloaded installers.
+Set `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, and `AZURE_CLIENT_SECRET` once as
+repository secrets under **Settings > Secrets and variables > Actions**.
+Both callers inherit these secrets. Environment secrets with the same names
+override the repository values. The app registration must have the
+Artifact Signing Certificate Profile Signer role on the signing account or
+certificate profile.
+
+Local packaging also supports `pfx` and `command` through the
+`WINDOWS_SIGNING_PROVIDER` environment variable in `electron-builder.config.cjs`.
 
 Production also requires `SENTRY_DSN_WINDOWS` and `SENTRY_AUTH_TOKEN` secrets
 plus the `SENTRY_PROJECT_WINDOWS` variable. The DSN serves both the main

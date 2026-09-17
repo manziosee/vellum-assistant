@@ -4,6 +4,15 @@ import {
   isChannelId,
 } from "@vellumai/service-contracts/channels";
 
+import {
+  HOST_PROXY_CAPABILITIES,
+  HOST_PROXY_SUPPORT,
+  hostProxyCapabilities,
+  type HostProxyCapability,
+  type HostProxyInterfaceId,
+  isHostProxyInterfaceId,
+} from "../types/host-capabilities.js";
+
 // The assistant understands the full canonical channel set, so it adopts the
 // shared vocabulary wholesale. `parseChannelId` stays local — it is only used
 // daemon-side and is a thin convenience over the shared guard.
@@ -111,6 +120,26 @@ export const CHANNEL_METADATA: Partial<Record<ChannelId, ChannelInfo>> = {
         "I'd like to verify a contact's Telegram identity. Can you walk me through it?",
     },
   },
+  discord: {
+    id: "discord",
+    label: "Discord",
+    subtitle: "Message your assistant from Discord",
+    // A Lucide name, per this field's contract, and the same one Slack
+    // carries: both name their text channels with a hash. A client with room
+    // for a brand mark uses one, which is how Slack's header already works.
+    icon: "hash",
+    // Verification needs nothing channel-specific here. The inbound intercept
+    // that matches a code takes the source channel as data, Discord inbound
+    // reaches it through the same `handleInbound` every channel uses, and a
+    // Discord user id canonicalizes as opaque, which is what it is.
+    supportsVerification: true,
+    setupMessages: {
+      guardian:
+        "I'd like to verify my identity as your guardian on Discord. Can you help me set that up?",
+      contact:
+        "I'd like to verify a contact's Discord identity. Can you walk me through it?",
+    },
+  },
   phone: {
     id: "phone",
     label: "Phone Calling",
@@ -167,6 +196,7 @@ export const CHANNEL_METADATA: Partial<Record<ChannelId, ChannelInfo>> = {
 export const INTERFACE_IDS = [
   "macos",
   "windows",
+  "linux",
   "ios",
   "cli",
   "telegram",
@@ -243,6 +273,7 @@ export const CLIENT_OS_VALUES = [
   "ios",
   "macos",
   "windows",
+  "linux",
   "android",
 ] as const;
 
@@ -266,6 +297,7 @@ export function parseClientOs(value: unknown): ClientOs | null {
 export const INTERACTIVE_INTERFACES: ReadonlySet<InterfaceId> = new Set([
   "macos",
   "windows",
+  "linux",
   "ios",
   "cli",
   "web",
@@ -276,31 +308,32 @@ export function isInteractiveInterface(id: InterfaceId): boolean {
 }
 
 /**
- * Host proxy capabilities that an interface can support. macOS supports all
- * of them, Windows withholds app control, and chrome-extension supports only
- * host_browser through the Chrome DevTools Protocol proxy.
+ * The host capability matrix lives in the shared leaf zone so the CLI can
+ * render it in `assistant clients` help without hoisting this daemon module.
+ * Re-exported here because this is where interface vocabulary is consumed.
  */
-export const HOST_PROXY_CAPABILITIES = [
-  "host_bash",
-  "host_file",
-  "host_cu",
-  "host_browser",
-  "host_app_control",
-  "host_ui_snapshot",
-] as const;
+export {
+  HOST_PROXY_CAPABILITIES,
+  HOST_PROXY_SUPPORT,
+  hostProxyCapabilities,
+  type HostProxyCapability,
+  type HostProxyInterfaceId,
+  isHostProxyInterfaceId,
+};
 
-export type HostProxyCapability = (typeof HOST_PROXY_CAPABILITIES)[number];
-
-/**
- * Interfaces that support desktop host-proxy tools. This identity is used by
- * the discriminated transport metadata union and by the
- * `supportsHostProxy(id)` type predicate.
- *
- * Extend this literal type AND the `supportsHostProxy` implementation
- * below in lock-step when adding a new host-capable client such as native
- * Linux.
- */
-export type HostProxyInterfaceId = "macos" | "windows";
+// Every key of the capability table must be a real interface id. The table
+// itself cannot state this: it lives in a leaf module that must not import
+// the daemon's interface vocabulary.
+const _hostProxySupportKeysAreInterfaceIds: Record<
+  keyof typeof HOST_PROXY_SUPPORT,
+  InterfaceId
+> = {
+  macos: "macos",
+  windows: "windows",
+  linux: "linux",
+  "chrome-extension": "chrome-extension",
+};
+void _hostProxySupportKeysAreInterfaceIds;
 
 /**
  * Whether the interface supports a host proxy capability.
@@ -325,20 +358,10 @@ export function supportsHostProxy(
   id: InterfaceId,
   capability?: HostProxyCapability,
 ): boolean {
-  // macOS supports every host proxy capability including host_browser
-  // and host_app_control. The host_browser proxy is provisioned via the
-  // assistant event hub. When no extension is connected, browser tools fall
-  // through to cdp-inspect/local via the CDP factory's candidate chain.
-  if (id === "macos") {
-    return true;
+  if (!isHostProxyInterfaceId(id)) {
+    return capability != null && hostProxyCapabilities(id).includes(capability);
   }
-  if (id === "windows") {
-    return capability == null || capability !== "host_app_control";
-  }
-  if (id === "chrome-extension" && capability === "host_browser") {
-    return true;
-  }
-  return false;
+  return capability == null || hostProxyCapabilities(id).includes(capability);
 }
 
 export interface TurnInterfaceContext {

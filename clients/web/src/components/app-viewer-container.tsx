@@ -8,6 +8,7 @@ import {
   useAppDeployment,
 } from "@/hooks/use-app-deployment";
 import { useSandboxFetchProxy } from "@/hooks/use-sandbox-fetch-proxy";
+import { useTranslation } from "@/i18n";
 import { useAppIframeSandboxDisabled } from "@/lib/app-sandbox-debug-flag";
 import { cn } from "@/utils/misc";
 import { injectBridge } from "@/utils/sandbox-bridge";
@@ -27,6 +28,8 @@ export interface AppViewerContainerProps {
   html: string;
   assistantId: string;
   onClose: () => void;
+  /** Routes a validated root-relative Vellum URL in the host client. */
+  onNavigateAppRoute: (href: string) => void;
   onEdit?: () => void;
   /** When true, the nav bar Edit button becomes the expand-app affordance. */
   isEditing?: boolean;
@@ -53,6 +56,7 @@ export function AppViewerContainer({
   html,
   assistantId,
   onClose,
+  onNavigateAppRoute,
   onEdit,
   isEditing,
   onShare,
@@ -63,6 +67,7 @@ export function AppViewerContainer({
   enableFullscreen = false,
   onAction,
 }: AppViewerContainerProps) {
+  const { t } = useTranslation();
   const iframeRef = useRef<HTMLIFrameElement>(null);
 
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -89,7 +94,12 @@ export function AppViewerContainer({
   }, [isFullscreen]);
 
   const srcdoc = useMemo(
-    () => injectBridge(html, appId, { fetch: true, route }),
+    () =>
+      injectBridge(html, appId, {
+        fetch: true,
+        route,
+        relayAppRoutes: true,
+      }),
     [html, appId, route],
   );
 
@@ -112,6 +122,7 @@ export function AppViewerContainer({
     assistantId,
     appId,
     onAction,
+    onNavigateAppRoute,
   });
 
   // Only asked for when the viewer actually offers a deploy: read-only
@@ -163,7 +174,7 @@ export function AppViewerContainer({
               variant="primary"
               iconOnly={<Minimize2 />}
               onClick={toggleFullscreen}
-              tooltip="Exit fullscreen"
+              tooltip={t("appViewerContainer.exitFullscreen")}
             />
           </div>
         )}

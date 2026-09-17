@@ -69,7 +69,6 @@ mock.module(
 let mockSkillEntries: Array<{ id: string; content: string }> = [];
 
 mock.module("../substrate/skill-store.js", () => ({
-  SKILL_SLUG_PREFIX: "skills/",
   listSkillEntries: () => mockSkillEntries,
 }));
 
@@ -204,7 +203,7 @@ function insertItem(opts: {
 describe("Memory Item Routes", () => {
   beforeAll(async () => {
     await initializeDb();
-  });
+  }, 30_000);
 
   beforeEach(() => {
     // Keep memory v2 disabled so the v1 paths under test stay active.

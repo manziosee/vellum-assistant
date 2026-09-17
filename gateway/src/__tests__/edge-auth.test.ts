@@ -16,6 +16,11 @@
  */
 
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { eq } from "drizzle-orm";
 
 import "./test-preload.js";
 
@@ -24,12 +29,22 @@ import "./test-preload.js";
 let mockReadCredential = mock(
   async (_key: string): Promise<string | undefined> => undefined,
 );
+let mockPlatformUserIdUnreachable = false;
 // Spread the actual module so untouched exports (getWorkspaceDir, …) stay
 // importable by transitive dependencies of the modules under test.
 const actualCredentialReader = await import("../credential-reader.js");
 mock.module("../credential-reader.js", () => ({
   ...actualCredentialReader,
   readCredential: (key: string) => mockReadCredential(key),
+}));
+mock.module("../platform-user-id.js", () => ({
+  readStoredPlatformUserId: async () => {
+    if (mockPlatformUserIdUnreachable) {
+      return { userId: undefined, unreachable: true };
+    }
+    const userId = await mockReadCredential("vellum:platform_user_id");
+    return { userId, unreachable: false };
+  },
 }));
 
 let mockValidateEdgeToken = mock(
@@ -51,6 +66,11 @@ mock.module("../auth/token-exchange.js", () => ({
 const { AuthRateLimiter } = await import("../auth-rate-limiter.js");
 const { createAuthMiddleware, loopbackFallbackCountTracker } =
   await import("../http/middleware/auth.js");
+const { initGatewayDb, resetGatewayDb, getGatewayDb } =
+  await import("../db/connection.js");
+const { actorTokenRecords } = await import("../db/schema.js");
+const { actorTokenRecordHash, __resetLastUsedDebounceForTests } =
+  await import("../auth/actor-token-revocation.js");
 
 const PLATFORM_USER_ID = "user-abc-123";
 
@@ -74,6 +94,7 @@ function makeLoopbackServer(address = "127.0.0.1") {
 
 beforeEach(() => {
   mockReadCredential = mock(async () => undefined);
+  mockPlatformUserIdUnreachable = false;
   mockValidateEdgeToken = mock(() => ({ ok: false, reason: "noop" }));
   loopbackFallbackCountTracker.reset();
 });
@@ -115,6 +136,15 @@ describe("requireEdgeAuth — DISABLE_HTTP_AUTH + IS_PLATFORM", () => {
       makeReq({ "x-vellum-user-id": "different-user" }),
     );
     expect(res?.status).toBe(403);
+  });
+
+  test("503 when platform_user_id vault is unreachable", async () => {
+    mockPlatformUserIdUnreachable = true;
+    const { requireEdgeAuth } = makeMiddleware();
+    const res = await requireEdgeAuth(
+      makeReq({ "x-vellum-user-id": PLATFORM_USER_ID }),
+    );
+    expect(res?.status).toBe(503);
   });
 
   test("503 when readCredential throws", async () => {
@@ -442,6 +472,142 @@ describe("requireEdgeAuthWithScope — JWT mode", () => {
 });
 
 // =========================================================================
+// The OAuth passthrough grant a third-party CLI holds is a single-route grant.
+//
+// The grant is a valid edge token: signature, audience, expiry and policy
+// epoch all check out. Every gateway edge route would otherwise accept it,
+// including mutating ones (Telegram config, contacts control plane). Its own
+// route is the runtime-proxy catch-all, which validates the token itself and
+// never reaches this middleware.
+// =========================================================================
+
+const PROXY_GRANT_CLAIMS = {
+  sub: "local:asst:oauth-proxy.stripe_link",
+  scope_profile: "oauth_proxy_v1",
+};
+
+describe("edge auth refuses a single-route grant", () => {
+  test("requireEdgeAuth 401s an oauth_proxy_v1 grant", async () => {
+    mockValidateEdgeToken = mock(() => ({
+      ok: true,
+      claims: PROXY_GRANT_CLAIMS,
+    }));
+    const { requireEdgeAuth } = makeMiddleware();
+    const res = await requireEdgeAuth(
+      makeReq({ authorization: "Bearer proxy.grant" }),
+    );
+    expect(res?.status).toBe(401);
+  });
+
+  test("the refusal is not softened by the loopback fallback", async () => {
+    // A third-party CLI holding the grant runs on the loopback host itself,
+    // so a fallback here would return exactly what the refusal withholds.
+    mockValidateEdgeToken = mock(() => ({
+      ok: true,
+      claims: PROXY_GRANT_CLAIMS,
+    }));
+    const { requireEdgeAuth } = makeMiddleware();
+    const res = await requireEdgeAuth(
+      makeReq({ authorization: "Bearer proxy.grant" }),
+      makeLoopbackServer(),
+    );
+    expect(res?.status).toBe(401);
+    expect(loopbackFallbackCountTracker.snapshot()).toEqual([]);
+  });
+
+  test("requireEdgeAuthWithScope 401s the grant before the scope check", async () => {
+    mockValidateEdgeToken = mock(() => ({
+      ok: true,
+      claims: PROXY_GRANT_CLAIMS,
+    }));
+    const { requireEdgeAuthWithScope } = makeMiddleware();
+    const res = await requireEdgeAuthWithScope(
+      makeReq({ authorization: "Bearer proxy.grant" }),
+      "settings.write",
+    );
+    // 401 (not the under-scoped 403): the credential is refused outright.
+    expect(res?.status).toBe(401);
+  });
+
+  test("requireEdgeGuardianAuth 401s the grant", async () => {
+    mockValidateEdgeToken = mock(() => ({
+      ok: true,
+      claims: PROXY_GRANT_CLAIMS,
+    }));
+    const { requireEdgeGuardianAuth } = makeMiddleware();
+    const res = await requireEdgeGuardianAuth(
+      makeReq({ authorization: "Bearer proxy.grant" }),
+      makeLoopbackServer(),
+    );
+    expect(res?.status).toBe(401);
+  });
+
+  test("a proxy subject is refused even under a broad profile", async () => {
+    mockValidateEdgeToken = mock(() => ({
+      ok: true,
+      claims: {
+        sub: "local:asst:oauth-proxy.stripe_link",
+        scope_profile: "local_v1",
+      },
+    }));
+    const { requireEdgeAuth } = makeMiddleware();
+    const res = await requireEdgeAuth(
+      makeReq({ authorization: "Bearer proxy.grant" }),
+    );
+    expect(res?.status).toBe(401);
+  });
+
+  test("an unrecognized profile is refused", async () => {
+    mockValidateEdgeToken = mock(() => ({
+      ok: true,
+      claims: {
+        sub: "actor:asst:123",
+        scope_profile: "minted_by_a_newer_peer",
+      },
+    }));
+    const { requireEdgeAuth } = makeMiddleware();
+    const res = await requireEdgeAuth(
+      makeReq({ authorization: "Bearer future.jwt" }),
+    );
+    expect(res?.status).toBe(401);
+  });
+
+  test("an actor client token still satisfies both guards", async () => {
+    mockValidateEdgeToken = mock(() => ({
+      ok: true,
+      claims: { sub: "actor:asst:123", scope_profile: "actor_client_v1" },
+    }));
+    const { requireEdgeAuth, requireEdgeAuthWithScope } = makeMiddleware();
+    expect(
+      await requireEdgeAuth(makeReq({ authorization: "Bearer good.jwt" })),
+    ).toBeNull();
+    expect(
+      await requireEdgeAuthWithScope(
+        makeReq({ authorization: "Bearer good.jwt" }),
+        "settings.write",
+      ),
+    ).toBeNull();
+  });
+
+  test("a local CLI token still satisfies both guards", async () => {
+    mockValidateEdgeToken = mock(() => ({
+      ok: true,
+      claims: { sub: "local:asst:conv-123", scope_profile: "local_v1" },
+    }));
+    const { requireEdgeAuth, requireEdgeAuthWithScope } = makeMiddleware();
+    expect(
+      await requireEdgeAuth(makeReq({ authorization: "Bearer local.jwt" })),
+    ).toBeNull();
+    expect(
+      await requireEdgeAuthWithScope(
+        makeReq({ authorization: "Bearer local.jwt" }),
+        "local.all",
+      ),
+    ).toBeNull();
+  });
+});
+
+// =========================================================================
 // Loopback fallback + trustProxy — proxied-remote vs direct-local
 //
 // A same-host reverse proxy / tunnel always connects over 127.0.0.1, so the
@@ -505,5 +671,256 @@ describe("requireEdgeAuth — trustProxy loopback fallback", () => {
     // platform 401 (missing user header), NOT a loopback free pass.
     const res = await requireEdgeAuth(makeReq(), makeLoopbackServer());
     expect(res?.status).toBe(401);
+  });
+});
+
+// =========================================================================
+// Device last-used stamping: the edge allow path records activity for the
+// presenting device so the "Paired devices" list can show it.
+// =========================================================================
+
+describe("requireEdgeAuth: device last-used stamping", () => {
+  // Every seeded row belongs to the same device, so a stamp routed through the
+  // device lands on whichever row is active.
+  function seedTokenRow(rawToken: string, status: "active" | "revoked") {
+    const now = Date.now();
+    getGatewayDb()
+      .insert(actorTokenRecords)
+      .values({
+        id: `row-${rawToken}`,
+        tokenHash: actorTokenRecordHash(rawToken),
+        guardianPrincipalId: "guardian-001",
+        hashedDeviceId: "hashed-device-web",
+        platform: "web",
+        status,
+        issuedAt: now,
+        expiresAt: now + 86_400_000,
+        createdAt: now,
+        updatedAt: now,
+      })
+      .run();
+  }
+
+  function readLastUsedAt(rawToken: string) {
+    return getGatewayDb()
+      .select({ lastUsedAt: actorTokenRecords.lastUsedAt })
+      .from(actorTokenRecords)
+      .where(eq(actorTokenRecords.tokenHash, actorTokenRecordHash(rawToken)))
+      .get()?.lastUsedAt;
+  }
+
+  // Own the security dir: the shared preload's env vars are already restored by
+  // the time this file runs as part of the full suite.
+  let savedSecurityDir: string | undefined;
+  let dbRoot: string;
+
+  beforeEach(async () => {
+    savedSecurityDir = process.env.GATEWAY_SECURITY_DIR;
+    dbRoot = mkdtempSync(join(tmpdir(), "edge-auth-last-used-"));
+    const securityDir = join(dbRoot, "protected");
+    mkdirSync(securityDir, { recursive: true });
+    process.env.GATEWAY_SECURITY_DIR = securityDir;
+    await initGatewayDb();
+    __resetLastUsedDebounceForTests();
+    mockValidateEdgeToken = mock(() => ({
+      ok: true,
+      claims: { sub: "actor:asst:123", scope_profile: "actor_client_v1" },
+    }));
+  });
+
+  afterEach(() => {
+    resetGatewayDb();
+    if (savedSecurityDir === undefined) {
+      delete process.env.GATEWAY_SECURITY_DIR;
+    } else {
+      process.env.GATEWAY_SECURITY_DIR = savedSecurityDir;
+    }
+    try {
+      rmSync(dbRoot, { recursive: true, force: true });
+    } catch {
+      /* best effort */
+    }
+  });
+
+  test("stamps last_used_at on the device's active row", async () => {
+    seedTokenRow("live-token", "active");
+    expect(readLastUsedAt("live-token")).toBeNull();
+
+    const { requireEdgeAuth } = makeMiddleware();
+    const res = await requireEdgeAuth(
+      makeReq({ authorization: "Bearer live-token" }),
+    );
+
+    expect(res).toBeNull();
+    expect(readLastUsedAt("live-token")).toBeGreaterThan(0);
+  });
+
+  test("a revoked token 401s and stamps nothing", async () => {
+    seedTokenRow("dead-token", "revoked");
+    seedTokenRow("live-token", "active");
+
+    const { requireEdgeAuth } = makeMiddleware();
+    const res = await requireEdgeAuth(
+      makeReq({ authorization: "Bearer dead-token" }),
+    );
+
+    expect(res?.status).toBe(401);
+    expect(readLastUsedAt("live-token")).toBeNull();
+    expect(readLastUsedAt("dead-token")).toBeNull();
+  });
+});
+
+// =========================================================================
+// handleCreateToken: derived actor-token rows carry device identity forward
+// =========================================================================
+
+const { handleCreateToken } = await import("../http/routes/auth-token.js");
+const { initSigningKey, mintToken } = await import("../auth/token-service.js");
+const { CURRENT_POLICY_EPOCH } = await import("../auth/policy.js");
+const { contacts } = await import("../db/schema.js");
+const { bustGuardianIntegrityCache } =
+  await import("../auth/guardian-integrity.js");
+
+initSigningKey(Buffer.from("test-signing-key-at-least-32-bytes-long-xx"));
+
+describe("handleCreateToken: derived actor-token identity carry-forward", () => {
+  const GUARDIAN_PRINCIPAL = "guardian-derived-001";
+  const DERIVED_ORIGIN = "http://localhost:5173";
+
+  let dbRoot: string;
+  let savedSecurityDir: string | undefined;
+
+  function makeTokenReq(bearerToken: string): Request {
+    return new Request("http://gateway.local/auth/token", {
+      method: "POST",
+      headers: {
+        origin: DERIVED_ORIGIN,
+        authorization: `Bearer ${bearerToken}`,
+      },
+    });
+  }
+
+  function mintSourceToken(): string {
+    return mintToken({
+      aud: "vellum-gateway",
+      sub: `actor:self:${GUARDIAN_PRINCIPAL}`,
+      scope_profile: "actor_client_v1",
+      policy_epoch: CURRENT_POLICY_EPOCH,
+      ttlSeconds: 3600,
+    });
+  }
+
+  function seedSourceActorToken(
+    rawToken: string,
+    identity: {
+      pairingUserAgent: string | null;
+      clientReportedName: string | null;
+    },
+  ) {
+    const now = Date.now();
+    getGatewayDb()
+      .insert(actorTokenRecords)
+      .values({
+        id: `row-${rawToken}`,
+        tokenHash: actorTokenRecordHash(rawToken),
+        guardianPrincipalId: GUARDIAN_PRINCIPAL,
+        hashedDeviceId: "hashed-device-derived",
+        platform: "macos",
+        pairingUserAgent: identity.pairingUserAgent,
+        clientReportedName: identity.clientReportedName,
+        status: "active",
+        issuedAt: now,
+        expiresAt: now + 86_400_000,
+        createdAt: now,
+        updatedAt: now,
+      })
+      .run();
+  }
+
+  function findDerivedRow() {
+    return getGatewayDb()
+      .select()
+      .from(actorTokenRecords)
+      .where(eq(actorTokenRecords.status, "derived"))
+      .get();
+  }
+
+  beforeEach(async () => {
+    savedSecurityDir = process.env.GATEWAY_SECURITY_DIR;
+    dbRoot = mkdtempSync(join(tmpdir(), "auth-token-derived-"));
+    const securityDir = join(dbRoot, "protected");
+    mkdirSync(securityDir, { recursive: true });
+    process.env.GATEWAY_SECURITY_DIR = securityDir;
+    await initGatewayDb();
+
+    // Seed a guardian contact so guardianIntegrityState() reads "ok"; a
+    // missing guardian row would 401 before the mint is ever reached.
+    const now = Date.now();
+    getGatewayDb()
+      .insert(contacts)
+      .values({
+        id: "contact-guardian",
+        displayName: "guardian",
+        role: "guardian",
+        principalId: GUARDIAN_PRINCIPAL,
+        createdAt: now,
+        updatedAt: now,
+      })
+      .run();
+    bustGuardianIntegrityCache();
+  });
+
+  afterEach(() => {
+    resetGatewayDb();
+    bustGuardianIntegrityCache();
+    if (savedSecurityDir === undefined) {
+      delete process.env.GATEWAY_SECURITY_DIR;
+    } else {
+      process.env.GATEWAY_SECURITY_DIR = savedSecurityDir;
+    }
+    try {
+      rmSync(dbRoot, { recursive: true, force: true });
+    } catch {
+      /* best effort */
+    }
+  });
+
+  test("copies both identity fields from a source row onto the derived row", async () => {
+    const sourceToken = mintSourceToken();
+    seedSourceActorToken(sourceToken, {
+      pairingUserAgent: "Vellum/1.2 (Macintosh; Intel Mac OS X 10_15_7)",
+      clientReportedName: "Alice's MacBook Pro",
+    });
+
+    const res = await handleCreateToken(
+      makeTokenReq(sourceToken),
+      makeLoopbackServer(),
+    );
+
+    expect(res.status).toBe(200);
+    const derived = findDerivedRow();
+    expect(derived?.platform).toBe("macos");
+    expect(derived?.pairingUserAgent).toBe(
+      "Vellum/1.2 (Macintosh; Intel Mac OS X 10_15_7)",
+    );
+    expect(derived?.clientReportedName).toBe("Alice's MacBook Pro");
+  });
+
+  test("a null-identity source row produces a derived row with nulls and does not throw", async () => {
+    const sourceToken = mintSourceToken();
+    seedSourceActorToken(sourceToken, {
+      pairingUserAgent: null,
+      clientReportedName: null,
+    });
+
+    const res = await handleCreateToken(
+      makeTokenReq(sourceToken),
+      makeLoopbackServer(),
+    );
+
+    expect(res.status).toBe(200);
+    const derived = findDerivedRow();
+    expect(derived?.pairingUserAgent).toBeNull();
+    expect(derived?.clientReportedName).toBeNull();
   });
 });

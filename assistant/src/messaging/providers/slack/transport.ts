@@ -1,11 +1,16 @@
 import type { KnownBlock } from "@slack/types";
 import { ChannelDeliveryError } from "@vellumai/gateway-client/http-delivery";
 
+import { extractThreadTsFromCallbackUrl } from "../../../channels/slack-callback-url.js";
 import { getLogger } from "../../../util/logger.js";
+import { directDeliveryContext } from "../callback-routing.js";
 import type { ChannelTransport } from "../channel-transport.js";
+import { SLACK_STREAM_MARKDOWN_LIMIT } from "./api.js";
 import {
+  describeSlackReactionEmoji,
   sendSlackAgentSessionStatus,
   sendSlackAttachments,
+  sendSlackReaction,
   sendSlackReply,
   sendSlackStreamOp,
   updateSlackMessage,
@@ -20,6 +25,32 @@ function mutedBlocks(text: string): KnownBlock[] {
 
 export const slackTransport: ChannelTransport = {
   channel: "slack",
+
+  /**
+   * A chat is a channel or DM id, with `threadTs` naming the thread to post
+   * under. Reaching a person who has not been named as a chat would mean
+   * opening the DM first (`conversations.open`), a platform call this
+   * resolution does not make.
+   */
+  addressFor(target) {
+    const threadTs = target.threadId?.trim();
+    return {
+      ctx: directDeliveryContext("slack", threadTs ? { threadTs } : {}),
+      chatId: target.chatId,
+      ...(threadTs ? { threadId: threadTs } : {}),
+    };
+  },
+
+  describeReactionEmoji: describeSlackReactionEmoji,
+
+  async react(target) {
+    return sendSlackReaction(
+      target.chatId,
+      target.emoji,
+      target.messageId,
+      target.action,
+    );
+  },
 
   async deliver(ctx, payload) {
     const { chatId, text, attachments } = payload;
@@ -54,7 +85,13 @@ export const slackTransport: ChannelTransport = {
     }
 
     log.info({ chatId, hasText: !!text }, "Slack reply delivered (direct)");
-    return { ok: true, ts: sentTs };
+    // Slack posts the text as one message, so the acknowledged ids are that
+    // one `ts`; file posts are not acknowledged here.
+    return {
+      ok: true,
+      ts: sentTs,
+      messageIds: sentTs !== undefined ? [sentTs] : [],
+    };
   },
 
   async edit(_ctx, target) {
@@ -84,7 +121,31 @@ export const slackTransport: ChannelTransport = {
     return { ok };
   },
 
-  async streamReply(_ctx, chatId, op) {
-    return sendSlackStreamOp(chatId, op);
+  // `chat.startStream` and `chat.appendStream` both cap `markdown_text`, so
+  // the caller splits a wider delta and advances its delivered mark once per
+  // operation this transport confirms.
+  maxStreamTextChars: SLACK_STREAM_MARKDOWN_LIMIT,
+
+  // `chat.stopStream` finalizes the streamed message in place, so what the
+  // stream leaves behind IS the reply and durable delivery must not resend it.
+  streamPersists: true,
+
+  /**
+   * `chat.startStream` streams into a thread, so a turn with no thread to
+   * open under cannot stream. Resolving that here, from this channel's own
+   * callback, is what keeps Slack's addressing out of the shared session:
+   * a start with no thread reports not-ok and the caller sends the finished
+   * reply instead.
+   */
+  async streamReply(ctx, chatId, op) {
+    if (op.action !== "start") {
+      return sendSlackStreamOp(chatId, op);
+    }
+    const threadTs =
+      op.anchorMessageId ?? extractThreadTsFromCallbackUrl(ctx.callbackUrl);
+    if (!threadTs) {
+      return { ok: false };
+    }
+    return sendSlackStreamOp(chatId, { ...op, anchorMessageId: threadTs });
   },
 };

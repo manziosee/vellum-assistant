@@ -13,12 +13,19 @@ import { SurfaceRouter } from "@/domains/chat/components/surfaces/surface-router
 import type { TranscriptItem } from "@/domains/chat/transcript/types";
 
 import { PendingConfirmationRow } from "@/domains/chat/transcript/pending-confirmation-row";
+import { PendingContactRecordRequestRow } from "@/domains/chat/transcript/pending-contact-record-request-row";
 import { PendingContactRequestRow } from "@/domains/chat/transcript/pending-contact-request-row";
+import { PendingDesktopHelpRow } from "@/domains/chat/transcript/pending-desktop-help-row";
 import { PendingSecretRow } from "@/domains/chat/transcript/pending-secret-row";
+import { DeletedMessageRow } from "@/domains/chat/transcript/deleted-message-row";
+import { NoResponseRow } from "@/domains/chat/transcript/no-response-row";
+import { ReactionLineRow } from "@/domains/chat/transcript/reaction-line-row";
 import { SystemCardRow } from "@/domains/chat/transcript/system-card-row";
 import { TranscriptMessageBody } from "@/domains/chat/transcript/transcript-message-body";
 import { isInteractiveClickTarget } from "@/domains/chat/transcript/transcript-message-body-shared";
+import { useHideThinkingUi } from "@/domains/chat/hooks/use-hide-thinking-ui";
 import { useCoarsePointerReveal } from "@/domains/chat/transcript/use-coarse-pointer-reveal";
+import { getMessageRenderKind } from "@/domains/chat/transcript/message-render-kind";
 import { isPointerCoarse } from "@/utils/pointer";
 import type { ConfirmationDecision } from "@/types/event-types";
 import type { ChatMessageToolCall } from "@/domains/chat/api/event-types";
@@ -37,6 +44,9 @@ export interface TranscriptRowProps {
   item: TranscriptItem;
   /** Conversation id, forwarded to message bodies for the bookmark toggle. */
   conversationId?: string | null;
+  /** Tool call the Connect card renders under, resolved once by
+   *  `Transcript` so rows do not each subscribe to the transcript. */
+  acpConnectInlineToolUseId?: string | null;
   assistantDisplayName?: string | null;
   onSurfaceAction: (
     surfaceId: string,
@@ -59,7 +69,6 @@ export interface TranscriptRowProps {
     input?: Record<string, unknown>;
     allowlistOptions: import("@/types/interaction-ui-types").AllowlistOption[];
     scopeOptions: import("@/types/interaction-ui-types").ScopeOption[];
-    directoryScopeOptions: import("@/types/interaction-ui-types").DirectoryScopeOption[];
   }) => void;
   unknownNudgeToolCallIds?: Set<string>;
   onDismissUnknownNudge?: (toolCallId: string) => void;
@@ -97,8 +106,7 @@ export interface TranscriptRowProps {
    *  defaults open. History rows leave it `false`. */
   isStreaming?: boolean;
   /** True for the final item of the latest turn. Forwarded to
-   *  `TranscriptMessageBody` so the message directly above the parked avatar
-   *  collapses its hover-actions row and animates it open on hover. */
+   *  `TranscriptMessageBody` so Retry attaches only to that assistant row. */
   isLatestMessage?: boolean;
 }
 
@@ -110,18 +118,25 @@ export interface TranscriptRowProps {
  * resolve via `getElementById`, and exposes the same Inspect affordance as
  * ordinary rows: the daemon backfills the failed request's LLM logs onto
  * this row's message id, and inspection is their only entry point while the
- * bubble is substituted. The actions reveal on hover/focus-visible, and on
- * coarse pointers via tap (dismissed by tapping outside), mirroring
- * `TranscriptMessageBody`'s reveal behavior.
+ * bubble is substituted. Copy and Read aloud stay visible when the message
+ * has text; Inspect still reveals on hover or tap.
  */
-function CreditsUpsellMessageRow({
+/**
+ * Shell for a row that substitutes custom content for the ordinary message
+ * body while keeping the backing message's identity and affordances: the
+ * `msg-<id>` anchor deep links and programmatic scrolling locate, the
+ * `data-message-id` attribute, and Copy, Read aloud, and Inspect actions.
+ */
+function SubstitutedMessageShell({
   message,
   conversationId,
   onInspectMessage,
+  children,
 }: {
   message: DisplayMessage;
   conversationId?: string | null;
   onInspectMessage?: (messageId: string) => void;
+  children: ReactNode;
 }) {
   const { wrapperRef, revealed, toggleRevealed } = useCoarsePointerReveal();
   const handleClick = (e: ReactMouseEvent<HTMLDivElement>) => {
@@ -148,23 +163,42 @@ function CreditsUpsellMessageRow({
       onClick={handleClick}
       className="group/msg flex flex-col gap-2"
     >
-      <CreditsUpsellCard />
-      {inspectHandler && (
-        <div className="h-6 overflow-hidden opacity-0 transition-opacity duration-200 ease-out group-hover/msg:opacity-100 has-[:focus-visible]:opacity-100 group-data-[revealed=true]/msg:opacity-100 motion-reduce:transition-none">
-          <MessageHoverActions
-            message={message}
-            conversationId={conversationId}
-            onInspect={inspectHandler}
-          />
-        </div>
-      )}
+      {children}
+      <div className="h-6">
+        <MessageHoverActions
+          message={message}
+          conversationId={conversationId}
+          onInspect={inspectHandler}
+        />
+      </div>
     </div>
+  );
+}
+
+function CreditsUpsellMessageRow({
+  message,
+  conversationId,
+  onInspectMessage,
+}: {
+  message: DisplayMessage;
+  conversationId?: string | null;
+  onInspectMessage?: (messageId: string) => void;
+}) {
+  return (
+    <SubstitutedMessageShell
+      message={message}
+      conversationId={conversationId}
+      onInspectMessage={onInspectMessage}
+    >
+      <CreditsUpsellCard />
+    </SubstitutedMessageShell>
   );
 }
 
 export const TranscriptRow = memo(function TranscriptRow({
   item,
   conversationId,
+  acpConnectInlineToolUseId,
   assistantDisplayName,
   onSurfaceAction,
   onForkConversation,
@@ -189,19 +223,65 @@ export const TranscriptRow = memo(function TranscriptRow({
   isLatestMessage,
 }: TranscriptRowProps) {
   const { t } = useTranslation("chat");
+  const hideThinkingUi = useHideThinkingUi();
   switch (item.kind) {
     case "message": {
+      const renderKind = getMessageRenderKind(item.message);
+      // A row deleted on its channel renders as a tombstone whatever else it
+      // is: the channel no longer shows it, so neither does the transcript.
+      // The shell keeps the row addressable and its content behind Inspect.
+      if (renderKind === "deleted") {
+        return (
+          <SubstitutedMessageShell
+            message={item.message}
+            conversationId={conversationId}
+            onInspectMessage={onInspectMessage}
+          >
+            <DeletedMessageRow />
+          </SubstitutedMessageShell>
+        );
+      }
       // Daemon-authored status cards render as standalone system notices,
       // outside the persona bubble/avatar/hover-action machinery.
-      if (item.message.isSystemCard) {
+      if (renderKind === "systemCard") {
         return (
           <SystemCardRow message={item.message} assistantId={assistantId} />
+        );
+      }
+      // A deliberate-silence turn renders as a quiet marker with fixed copy
+      // inside the standard message shell, so deep links, scrolling, and
+      // Inspect still address the row; its stored content never shows.
+      // A reaction row renders as a quiet line from its projected fact,
+      // never the stored sentinel text. Slack-shaped rows keep their richer
+      // Slack transcript line inside the ordinary body path.
+      if (renderKind === "reaction") {
+        return (
+          <SubstitutedMessageShell
+            message={item.message}
+            conversationId={conversationId}
+            onInspectMessage={onInspectMessage}
+          >
+            <ReactionLineRow message={item.message} />
+          </SubstitutedMessageShell>
+        );
+      }
+      if (renderKind === "noResponse") {
+        return (
+          <SubstitutedMessageShell
+            message={item.message}
+            conversationId={conversationId}
+            onInspectMessage={onInspectMessage}
+          >
+            <NoResponseRow />
+          </SubstitutedMessageShell>
         );
       }
       return (
         <TranscriptMessageBody
           message={item.message}
+          cameraFrames={item.cameraFrames}
           conversationId={conversationId}
+          acpConnectInlineToolUseId={acpConnectInlineToolUseId}
           assistantDisplayName={assistantDisplayName}
           onSurfaceAction={onSurfaceAction}
           onForkConversation={onForkConversation}
@@ -255,16 +335,31 @@ export const TranscriptRow = memo(function TranscriptRow({
         <div
           data-testid="transcript-thinking-row"
           data-active={item.active ? "true" : "false"}
+          data-copy-exclude
           aria-hidden={!item.active}
           className={`flex items-center overflow-hidden text-[13px] font-medium text-[var(--content-secondary)] transition-[height,opacity] duration-300 ease-out motion-reduce:transition-none ${
             item.active ? "h-7 opacity-100" : "h-0 opacity-0"
           }`}
         >
+          {/*
+            The daemon's own status line ("Processing command results") shows
+            only where it is the transcript's one live label. Under
+            `send-user-message` the step stack above already names the work in
+            the user's terms, and a second label under it reads as the
+            assistant reporting on itself twice. "Working" still covers the gap
+            before the first tool starts, which is the only stretch of a turn
+            the step stack cannot narrate.
+          */}
           <StreamingShimmerText>
-            {item.label ?? t("transcriptRow.thinking")}
+            {hideThinkingUi
+              ? t("transcriptRow.working")
+              : (item.label ?? t("transcriptRow.thinking"))}
           </StreamingShimmerText>
         </div>
       );
+
+    case "pendingDesktopHelp":
+      return <PendingDesktopHelpRow requestId={item.requestId} />;
 
     case "pendingSecret":
       return <PendingSecretRow />;
@@ -274,6 +369,9 @@ export const TranscriptRow = memo(function TranscriptRow({
 
     case "pendingContactRequest":
       return <PendingContactRequestRow />;
+
+    case "pendingContactRecordRequest":
+      return <PendingContactRecordRequestRow />;
 
     case "ephemeralMeta":
       return (

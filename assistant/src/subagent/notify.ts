@@ -9,7 +9,9 @@
  * pulling in the conversation/agent-loop core.
  *
  * Delivery targets the parent's in-process `Conversation` via the conversation
- * registry: a notification is injected only when the parent is live here.
+ * registry: a notification is injected only when the parent is live here. A
+ * stale idle parent is rebuilt through `getOrCreateConversation` first so the
+ * injected turn uses the current provider, prompt, and credentials.
  */
 
 import {
@@ -35,15 +37,67 @@ export function injectMessageIntoParent(
   parentConversationId: string,
   message: string,
   metadata?: Record<string, unknown>,
+  opts?: { cronRunId?: string | null },
 ): void {
-  const parentConversation = findConversation(parentConversationId);
-  if (!parentConversation) {
+  const existing = findConversation(parentConversationId);
+  if (!existing) {
     log.warn(
       { parentConversationId },
       "Subagent notification target parent conversation not found",
     );
     return;
   }
+  // A reload can mark the parent stale while children still run. Terminal
+  // injection is the first parent turn after the last child settles, so
+  // rebuild first when the instance is idle. Otherwise the completion turn
+  // would run on the construction-time provider, prompt, and credentials.
+  if (existing.isStale() && !existing.hasInFlightWork()) {
+    void import("../daemon/conversation-store.js")
+      .then(({ getOrCreateConversation }) =>
+        getOrCreateConversation(parentConversationId),
+      )
+      .then((parent) =>
+        deliverToParent(parent, parentConversationId, message, metadata, opts),
+      )
+      .catch((err) => {
+        log.error(
+          { parentConversationId, err },
+          "Failed to rebuild stale parent before subagent notification",
+        );
+      });
+    return;
+  }
+  deliverToParent(existing, parentConversationId, message, metadata, opts);
+}
+
+function deliverToParent(
+  parentConversation: {
+    enqueueMessage: (options: {
+      content: string;
+      metadata?: Record<string, unknown>;
+      isInteractive: boolean;
+      cronRunId?: string | null;
+    }) => { queued: boolean; rejected?: boolean };
+    persistUserMessage: (options: {
+      content: string;
+      metadata?: Record<string, unknown>;
+    }) => Promise<{ id: string }>;
+    runAgentLoop: (
+      message: string,
+      messageId: string,
+      options: { isInteractive: boolean; cronRunId?: string | null },
+    ) => Promise<unknown>;
+  },
+  parentConversationId: string,
+  message: string,
+  metadata?: Record<string, unknown>,
+  opts?: { cronRunId?: string | null },
+): void {
+  // The continuation this notification starts is still the scheduled firing's
+  // work, so it carries the same run id as the child whose result triggered it.
+  // Both delivery paths need it: the queued one drains after the enqueuing turn
+  // has ended, so the id has to travel on the message.
+  const cronRunId = opts?.cronRunId ?? null;
   // Machine-injected with no human asserted present, so the notification
   // turn runs non-interactive; it still streams to whoever is watching
   // through the parent's sink.
@@ -51,6 +105,7 @@ export function injectMessageIntoParent(
     content: message,
     metadata,
     isInteractive: false,
+    ...(cronRunId ? { cronRunId } : {}),
   });
   if (!enqueueResult.queued && !enqueueResult.rejected) {
     parentConversation
@@ -58,6 +113,7 @@ export function injectMessageIntoParent(
       .then(({ id: messageId }) =>
         parentConversation.runAgentLoop(message, messageId, {
           isInteractive: false,
+          ...(cronRunId ? { cronRunId } : {}),
         }),
       )
       .catch((err) => {

@@ -7,7 +7,7 @@ import type {
 } from "@/domains/chat/transcript/types";
 
 import { TranscriptRow } from "@/domains/chat/transcript/transcript-row";
-import { useTurnStore } from "@/domains/chat/turn-store";
+import { isActivityLive, useTurnStore } from "@/domains/chat/turn-store";
 import type { ConfirmationDecision } from "@/types/event-types";
 import type { ChatMessageToolCall } from "@/domains/chat/api/event-types";
 
@@ -26,6 +26,10 @@ export interface LatestTurnRowProps {
   responseItems: TranscriptItem[];
   /** Conversation id, forwarded to message bodies for the bookmark toggle. */
   conversationId?: string | null;
+  /** Tool call the inline Connect card renders under, resolved once by
+   *  `Transcript`. The latest turn is where a fresh spawn failure lands, so
+   *  dropping it here is what would leave that card unrendered. */
+  acpConnectInlineToolUseId?: string | null;
   assistantDisplayName?: string | null;
   onSurfaceAction: (
     surfaceId: string,
@@ -44,7 +48,6 @@ export interface LatestTurnRowProps {
     input?: Record<string, unknown>;
     allowlistOptions: import("@/types/interaction-ui-types").AllowlistOption[];
     scopeOptions: import("@/types/interaction-ui-types").ScopeOption[];
-    directoryScopeOptions: import("@/types/interaction-ui-types").DirectoryScopeOption[];
   }) => void;
   unknownNudgeToolCallIds?: Set<string>;
   onDismissUnknownNudge?: (toolCallId: string) => void;
@@ -80,6 +83,7 @@ export const LatestTurnRow = memo(function LatestTurnRow({
   anchorMessage,
   responseItems,
   conversationId,
+  acpConnectInlineToolUseId,
   assistantDisplayName,
   onSurfaceAction,
   onForkConversation,
@@ -101,17 +105,16 @@ export const LatestTurnRow = memo(function LatestTurnRow({
   onStopWorkflow,
   responseArtifactsByKey,
 }: LatestTurnRowProps) {
-  // The response cluster is "streaming" whenever the turn is in flight. This
-  // keeps each response message's last tool-call group expanded for the whole
-  // turn, rather than only during the instants a tool reports `running`.
+  // The response cluster is "streaming" while response output can still
+  // append. This keeps each response message's last tool-call group expanded
+  // between tool updates and settles it while awaiting user input.
   const phase = useTurnStore.use.phase();
-  const isStreaming =
-    phase === "queued" || phase === "thinking" || phase === "streaming";
-  // The last message-kind item of the cluster collapses its hover-actions row
+  const isStreaming = isActivityLive(phase);
+  // The last message-kind item of the cluster is the latest message
   // (see `TranscriptRowProps.isLatestMessage`). Trailing non-message rows —
   // the thinking slot, pending prompts — carry no trailer of their own, so
-  // the flag skips past them; this keeps the space collapsed while the turn
-  // is still streaming, not just after it settles.
+  // Retry stays on the last assistant message while the turn is still
+  // streaming, not just after it settles.
   const lastMessageItem = responseItems.findLast(
     (item) => item.kind === "message",
   );
@@ -120,6 +123,7 @@ export const LatestTurnRow = memo(function LatestTurnRow({
       <TranscriptRow
         item={anchorMessage}
         conversationId={conversationId}
+        acpConnectInlineToolUseId={acpConnectInlineToolUseId}
         assistantDisplayName={assistantDisplayName}
         onSurfaceAction={onSurfaceAction}
         onForkConversation={onForkConversation}
@@ -146,6 +150,7 @@ export const LatestTurnRow = memo(function LatestTurnRow({
           <TranscriptRow
             item={response}
             conversationId={conversationId}
+            acpConnectInlineToolUseId={acpConnectInlineToolUseId}
             assistantDisplayName={assistantDisplayName}
             onSurfaceAction={onSurfaceAction}
             onForkConversation={onForkConversation}

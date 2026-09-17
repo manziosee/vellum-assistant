@@ -12,8 +12,8 @@ import { useCallback, useEffect, useState } from "react";
 import { motion, useReducedMotion } from "motion/react";
 
 import { AvatarRenderer } from "@/components/avatar-renderer";
-import { DetailShell } from "@/components/detail-shell";
-import { DetailPanelStopButton } from "@/domains/chat/components/detail-panel-stop-button";
+import { DetailShell, DetailShellNotice } from "@/components/detail-shell";
+import { DetailPanelStopButton } from "@/components/detail-panel-stop-button";
 import {
   AnimatedMetricCard,
   formatNumber,
@@ -251,12 +251,9 @@ export function WorkflowDetailPanel({
                   {t("workflowDetailPanel.subagents")}
                 </Typography>
                 {sortedLeaves.length === 0 ? (
-                  <Typography
-                    variant="body-small-default"
-                    className="py-4 text-center text-[var(--content-tertiary)]"
-                  >
+                  <DetailShellNotice>
                     {t("workflowDetailPanel.noSubagentsYet")}
-                  </Typography>
+                  </DetailShellNotice>
                 ) : (
                   <div className="flex flex-col gap-1">
                     {sortedLeaves.map((leaf) => (

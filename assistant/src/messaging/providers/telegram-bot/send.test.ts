@@ -30,8 +30,13 @@ mock.module("./api.js", () => ({
 }));
 
 const { TelegramNonRetryableError } = await import("./api.js");
-const { editTelegramMessage, sendTelegramReply, sendTelegramRichReply } =
-  await import("./send.js");
+const {
+  editTelegramMessage,
+  sendTelegramReaction,
+  sendTelegramReply,
+  sendTelegramRichReply,
+  TELEGRAM_DRAFT_TEXT_LIMIT,
+} = await import("./send.js");
 const { telegramTransport } = await import("./transport.js");
 
 const approval: ApprovalUIMetadata = {
@@ -170,12 +175,56 @@ describe("sendTelegramReply message id capture", () => {
 
     expect(callsTo("sendMessage")).toHaveLength(2);
     expect(result.lastMessageId).toBe("2");
+    // Every chunk is acknowledged, in send order, not only the last.
+    expect(result.messageIds).toEqual(["1", "2"]);
   });
 
   test("omits the message id when the API response lacks one", async () => {
     const result = await sendTelegramReply("123", "Hello");
 
     expect(result.lastMessageId).toBeUndefined();
+    expect(result.messageIds).toEqual([]);
+  });
+
+  test("a final chunk without an id leaves lastMessageId absent rather than naming an earlier chunk", async () => {
+    // The final chunk carries the approval keyboard, so it is the one a later
+    // edit or withdrawal addresses; an earlier chunk's id must never stand in
+    // for it. Every acknowledged id is still reported for recording.
+    let call = 0;
+    callTelegramBotApiMock.mockImplementation(
+      async () => (call++ === 0 ? { message_id: 1 } : {}) as never,
+    );
+
+    const result = await sendTelegramReply("123", "x".repeat(4500), approval);
+
+    expect(callsTo("sendMessage")).toHaveLength(2);
+    expect(result).toEqual({ messageIds: ["1"] });
+  });
+
+  test("a rich send acknowledges the message Telegram returned", async () => {
+    callTelegramBotApiMock.mockImplementation(
+      async () => ({ message_id: 7 }) as never,
+    );
+
+    const result = await sendTelegramRichReply("123", "**hello**");
+
+    expect(callsTo("sendRichMessage")).toHaveLength(1);
+    expect(result).toEqual({ lastMessageId: "7", messageIds: ["7"] });
+  });
+
+  test("a rich send that falls back acknowledges the plain chunks instead", async () => {
+    let nextId = 10;
+    callTelegramBotApiMock.mockImplementation(async (method: string) => {
+      if (method === "sendRichMessage") {
+        throw new TelegramNonRetryableError("rejected", "rejected");
+      }
+      return { message_id: nextId++ } as never;
+    });
+
+    const result = await sendTelegramRichReply("123", "**hello**");
+
+    expect(callsTo("sendMessage")).toHaveLength(1);
+    expect(result).toEqual({ lastMessageId: "10", messageIds: ["10"] });
   });
 });
 
@@ -204,6 +253,29 @@ describe("telegramTransport.deliver routing", () => {
 
     expect(callsTo("sendRichMessage")).toHaveLength(0);
     expect(callsTo("sendMessage")).toHaveLength(1);
+  });
+
+  test("deliver acknowledges every chunk the text became", async () => {
+    let nextId = 1;
+    callTelegramBotApiMock.mockImplementation(
+      async () => ({ message_id: nextId++ }) as never,
+    );
+
+    const result = await telegramTransport.deliver(
+      ctx,
+      payload({ text: "x".repeat(4500), renderRichly: false }),
+    );
+
+    expect(result).toEqual({ ok: true, messageIds: ["1", "2"] });
+  });
+
+  test("deliver acknowledges nothing when Telegram returned no message id", async () => {
+    const result = await telegramTransport.deliver(
+      ctx,
+      payload({ renderRichly: false }),
+    );
+
+    expect(result).toEqual({ ok: true, messageIds: [] });
   });
 
   test("forwards approval metadata through the rich path", async () => {
@@ -323,6 +395,49 @@ describe("telegramTransport topic targeting", () => {
   });
 });
 
+describe("sendTelegramReaction", () => {
+  test("add sends setMessageReaction with a single emoji entry", async () => {
+    const result = await sendTelegramReaction("12345", "👍", "678", "add");
+    expect(result).toEqual({ ok: true });
+    const calls = callsTo("setMessageReaction");
+    expect(calls).toHaveLength(1);
+    expect(calls[0][1]).toEqual({
+      chat_id: "12345",
+      message_id: 678,
+      reaction: [{ type: "emoji", emoji: "👍" }],
+    });
+  });
+
+  test("remove clears the bot's reaction with the empty list", async () => {
+    await sendTelegramReaction("12345", "👍", "678", "remove");
+    const calls = callsTo("setMessageReaction");
+    expect(calls[0][1]).toEqual({
+      chat_id: "12345",
+      message_id: 678,
+      reaction: [],
+    });
+  });
+
+  test("a non-numeric message id reports ok false without calling the API", async () => {
+    const result = await sendTelegramReaction(
+      "12345",
+      "👍",
+      "not-an-id",
+      "add",
+    );
+    expect(result).toEqual({ ok: false });
+    expect(callsTo("setMessageReaction")).toHaveLength(0);
+  });
+
+  test("an API rejection reports ok false without throwing", async () => {
+    callTelegramBotApiMock.mockImplementationOnce(async () => {
+      throw new TelegramNonRetryableError("400", "REACTION_INVALID");
+    });
+    const result = await sendTelegramReaction("12345", "👍", "678", "add");
+    expect(result).toEqual({ ok: false });
+  });
+});
+
 describe("editTelegramMessage", () => {
   const ctx = { callbackUrl: "http://gw/deliver/telegram", params: {} };
 
@@ -343,7 +458,28 @@ describe("editTelegramMessage", () => {
     expect(method).toBe("editMessageText");
     // Telegram wants a numeric message id, where the capability carries the
     // channel's id as a string.
-    expect(body).toEqual({ chat_id: "123", message_id: 456, text: "revised" });
+    expect(body).toEqual({
+      chat_id: "123",
+      message_id: 456,
+      text: "revised",
+      reply_markup: { inline_keyboard: [] },
+    });
+  });
+
+  test("clears the inline keyboard, so a settled message keeps no buttons", async () => {
+    await telegramTransport.edit!(ctx as CallbackContext, {
+      chatId: "123",
+      messageId: "456",
+      text: "\u2713 Approved",
+    });
+
+    const [, body] = callTelegramBotApiMock.mock.calls[0]!;
+    // Omitting reply_markup leaves an existing keyboard in place, which would
+    // leave live Approve and Reject buttons under text saying the request is
+    // already decided. The field has to be sent, and sent empty.
+    expect((body as Record<string, unknown>).reply_markup).toEqual({
+      inline_keyboard: [],
+    });
   });
 
   test("treats an unchanged message as already done", async () => {
@@ -374,5 +510,163 @@ describe("editTelegramMessage", () => {
     // failure has to reach the caller.
     await expect(editTelegramMessage("123", "456", "gone")).rejects.toThrow();
     expect(sendMessageCalls()).toHaveLength(0);
+  });
+});
+
+describe("telegramTransport.streamReply", () => {
+  const ctx: CallbackContext = {
+    callbackUrl: "https://example.test/deliver/telegram?chatId=123",
+    params: {},
+  };
+
+  test("opens a draft carrying the whole partial reply", async () => {
+    const result = await telegramTransport.streamReply?.(ctx, "123", {
+      action: "start",
+      text: "Looking that up",
+      appended: "Looking that up",
+    });
+
+    const calls = callsTo("sendMessageDraft");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]![1]).toMatchObject({
+      chat_id: 123,
+      text: "Looking that up",
+    });
+    // The id is minted here, not handed back by Telegram, and must be usable
+    // as the stream id the later append addresses.
+    expect(Number(result?.ts)).toBeGreaterThan(0);
+    expect(result?.ok).toBe(true);
+  });
+
+  test("advances one draft by resending the whole text under the same id", async () => {
+    await telegramTransport.streamReply?.(ctx, "123", {
+      action: "append",
+      streamId: "4242",
+      text: "Looking that up. Found it.",
+      appended: ". Found it.",
+    });
+
+    const calls = callsTo("sendMessageDraft");
+    expect(calls).toHaveLength(1);
+    // Telegram animates between drafts sharing an id, so the call carries the
+    // whole reply so far rather than the delta.
+    expect(calls[0]![1]).toMatchObject({
+      chat_id: 123,
+      draft_id: 4242,
+      text: "Looking that up. Found it.",
+    });
+  });
+
+  test("draws a plan into the draft, since Telegram has no task primitive", async () => {
+    await telegramTransport.streamReply?.(ctx, "123", {
+      action: "append",
+      streamId: "4242",
+      text: "Working.",
+      plan: {
+        title: "Answering",
+        steps: [
+          { label: "Search docs", status: "completed" },
+          { label: "Summarize", status: "in_progress" },
+          { label: "Reply", status: "pending" },
+        ],
+      },
+    });
+
+    const body = callsTo("sendMessageDraft")[0]![1] as { text: string };
+    expect(body.text).toBe(
+      "Working.\n\nAnswering\n✓ Search docs\n▸ Summarize\n· Reply",
+    );
+  });
+
+  test("stopping does nothing, because sending the reply clears the draft", async () => {
+    const result = await telegramTransport.streamReply?.(ctx, "123", {
+      action: "stop",
+      streamId: "4242",
+      text: "All done.",
+    });
+
+    expect(callsTo("sendMessageDraft")).toHaveLength(0);
+    expect(result).toEqual({ ok: true, ts: "4242" });
+  });
+
+  test("sends the chat id as the integer the draft method requires", async () => {
+    // `sendMessageDraft` takes an Integer chat_id, not the "Integer or String"
+    // most methods accept, so the string the transport carries has to become a
+    // number on the wire.
+    await telegramTransport.streamReply?.(ctx, "123", {
+      action: "start",
+      text: "Hi",
+      appended: "Hi",
+    });
+
+    const body = callsTo("sendMessageDraft")[0]![1] as { chat_id: unknown };
+    expect(body.chat_id).toBe(123);
+  });
+
+  test("refuses a chat id that cannot be an integer, without calling out", async () => {
+    const result = await telegramTransport.streamReply?.(ctx, "@somechannel", {
+      action: "start",
+      text: "Hi",
+      appended: "Hi",
+    });
+
+    expect(callsTo("sendMessageDraft")).toHaveLength(0);
+    expect(result).toEqual({ ok: false });
+  });
+
+  test("a draft past the cap keeps its live tail, not a frozen prefix", async () => {
+    // Telegram caps a draft at 4096. Keeping the head would freeze the preview
+    // the moment the reply passed the cap, and would cut off anything drawn
+    // beneath it; the tail is the part still moving.
+    const body = "HEADMARK" + "a".repeat(5_000);
+    await telegramTransport.streamReply?.(ctx, "123", {
+      action: "append",
+      streamId: "4242",
+      text: body + "TAILMARK",
+      appended: "TAILMARK",
+      plan: { steps: [{ label: "Summarize", status: "in_progress" }] },
+    });
+
+    const sent = (callsTo("sendMessageDraft")[0]![1] as { text: string }).text;
+    expect(sent.length).toBe(TELEGRAM_DRAFT_TEXT_LIMIT);
+    // The newest text and the plan beneath it survive; the stale head is what
+    // gets dropped, which is the opposite of a frozen prefix.
+    expect(sent).toContain("TAILMARK");
+    expect(sent).toContain("Summarize");
+    expect(sent).not.toContain("HEADMARK");
+  });
+
+  test("a trimmed draft never begins with half of a character", async () => {
+    // The cap counts UTF-16 code units, so a tail cut can land between the
+    // halves of an emoji and send a lone surrogate.
+    const emoji = "\u{1F600}";
+    const body = emoji.repeat(3_000);
+    await telegramTransport.streamReply?.(ctx, "123", {
+      action: "append",
+      streamId: "4242",
+      text: body,
+      appended: emoji,
+    });
+
+    const sent = (callsTo("sendMessageDraft")[0]![1] as { text: string }).text;
+    const first = sent.charCodeAt(0);
+    expect(first >= 0xdc00 && first <= 0xdfff).toBe(false);
+    expect(sent.length).toBeLessThanOrEqual(TELEGRAM_DRAFT_TEXT_LIMIT);
+  });
+
+  test("a refused draft reports not-ok so the caller falls back", async () => {
+    // Telegram offers drafts in private chats only; anywhere else the call is
+    // rejected, and that rejection is the whole of the per-conversation rule.
+    callTelegramBotApiMock.mockImplementation(async () => {
+      throw new Error("Bad Request: chat type is not supported");
+    });
+
+    const result = await telegramTransport.streamReply?.(ctx, "123", {
+      action: "start",
+      text: "Looking that up",
+      appended: "Looking that up",
+    });
+
+    expect(result).toEqual({ ok: false });
   });
 });

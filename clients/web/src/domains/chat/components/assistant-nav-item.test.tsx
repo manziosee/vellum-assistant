@@ -14,6 +14,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import type { CharacterComponents, CharacterTraits } from "@/types/avatar";
 import { AssistantNavItem } from "@/domains/chat/components/assistant-nav-item";
 import { BUNDLED_COMPONENTS } from "@/utils/avatar-bundled-components";
+import { resolveAvatarAccentHex } from "@/utils/avatar-accent";
 
 /* The hook reads through React Query, which static rendering has no client
    for. Mocked through a mutable value rather than a fixed one: a module mock
@@ -33,6 +34,10 @@ let avatar: AvatarState = {
 mock.module("@/hooks/use-assistant-avatar", () => ({
   useAssistantAvatar: () => ({
     ...avatar,
+    // The real hook's own derivation, so the row can only wear what the app
+    // resolves for the same avatar.
+    accentHex: resolveAvatarAccentHex({ ...avatar, state: null }),
+    accent: null,
     isLoading: false,
     invalidate: () => {},
   }),
@@ -143,6 +148,43 @@ describe("AssistantNavItem switcher slots", () => {
   test("without a trailing action the pill keeps its default gap", () => {
     const html = renderWithSlots();
     expect(html).not.toContain("gap-[12px]");
+  });
+
+  const ASIDE = createElement(
+    "button",
+    { "data-testid": "section-toggle" },
+    "t",
+  );
+  const BENEATH = createElement(
+    "div",
+    { "data-testid": "section-card" },
+    "card",
+  );
+
+  test("an aside stands on the pill's row and a beneath slot under it", () => {
+    const html = renderWithSlots({ aside: ASIDE, beneath: BENEATH });
+    expect(html).toContain('data-testid="section-toggle"');
+    expect(html).toContain('data-testid="section-card"');
+    // The aside sits after the pill inside one row, not inside the pill.
+    const pillEnd = html.indexOf('data-tour-id="assistant-page"');
+    const asideAt = html.indexOf('data-testid="section-toggle"');
+    expect(asideAt).toBeGreaterThan(pillEnd);
+  });
+
+  test("the collapsed tile drops the aside and the beneath slot", () => {
+    const html = renderWithSlots({
+      aside: ASIDE,
+      beneath: BENEATH,
+      collapsed: true,
+    });
+    expect(html).not.toContain('data-testid="section-toggle"');
+    expect(html).not.toContain('data-testid="section-card"');
+  });
+
+  test("an expansion takes the row from the aside", () => {
+    const html = renderWithSlots({ aside: ASIDE, expansion: EXPANSION });
+    expect(html).toContain('data-testid="switcher-card"');
+    expect(html).not.toContain('data-testid="section-toggle"');
   });
 
   test("the collapsed tile has no slot for the trailing action", () => {

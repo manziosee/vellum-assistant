@@ -6,6 +6,9 @@
  * around empty/whitespace input.
  */
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { cleanup, renderHook } from "@testing-library/react";
+
+import type { DisplayAttachment } from "@/domains/chat/types/types";
 
 // Mock local-settings so we can observe localStorage reads/writes without
 // touching the real localStorage (happy-dom doesn't persist across tests).
@@ -57,6 +60,10 @@ mock.module(
 );
 
 const { useComposerStore } = await import("@/domains/chat/composer-store");
+const { useChatSessionStore } =
+  await import("@/domains/chat/chat-session-store");
+const { useComposerSubmit } =
+  await import("@/domains/chat/hooks/use-composer-submit");
 
 function getStore() {
   return useComposerStore.getState();
@@ -64,12 +71,18 @@ function getStore() {
 
 beforeEach(() => {
   getStore().fullReset();
+  useChatSessionStore.setState({
+    previousConversationId: null,
+    previousAssistantId: null,
+    draftConversationIdResolution: false,
+  });
   localSettingsStore.clear();
   uploadChatAttachmentMock.mockClear();
   fetchAttachmentContentBlobMock.mockClear();
 });
 
 afterEach(() => {
+  cleanup();
   getStore().fullReset();
   localSettingsStore.clear();
 });
@@ -466,6 +479,104 @@ describe("addPathReferences", () => {
 });
 
 describe("addFiles upload metadata", () => {
+  test("same-session re-entry lets an in-flight upload finish once", async () => {
+    let finishUpload!: (result: UploadAttachmentResult) => void;
+    uploadChatAttachmentMock.mockImplementationOnce(
+      () =>
+        new Promise<UploadAttachmentResult>((resolve) => {
+          finishUpload = resolve;
+        }),
+    );
+    useChatSessionStore.getState().switchToConversation({
+      assistantId: "assistant-1",
+      activeConversationId: "conversation-1",
+    });
+
+    getStore().addFiles(
+      [new File(["notes"], "notes.txt", { type: "text/plain" })],
+      "assistant-1",
+    );
+    for (let i = 0; i < 100 && !finishUpload; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    expect(finishUpload).toBeFunction();
+    expect(getStore().attachments).toMatchObject([
+      { kind: "uploading", filename: "notes.txt" },
+    ]);
+    const localId = getStore().attachments[0]?.localId;
+
+    useChatSessionStore.getState().switchToConversation({
+      assistantId: "assistant-1",
+      activeConversationId: "conversation-1",
+    });
+    expect(getStore().attachments).toMatchObject([
+      { kind: "uploading", localId },
+    ]);
+    finishUpload({ ok: true, id: "attachment-1" });
+    await waitForUploadsSettled(1);
+
+    expect(uploadChatAttachmentMock).toHaveBeenCalledTimes(1);
+    expect(getStore().attachments).toMatchObject([
+      {
+        kind: "uploaded",
+        localId,
+        id: "attachment-1",
+        filename: "notes.txt",
+      },
+    ]);
+
+    getStore().setInput("Send these notes");
+    const sendMessage = mock(
+      async (_content: string, _attachments?: DisplayAttachment[]) => {},
+    );
+    const { result } = renderHook(() =>
+      useComposerSubmit({
+        sendMessage,
+        inputRef: { current: null },
+        scrollToLatest: () => {},
+        isEditing: false,
+        editingMessageId: null,
+        cancelEditing: () => {},
+        canUndoEdit: false,
+        sendDisabled: false,
+        typingDisabled: false,
+        assistantId: "assistant-1",
+        activeConversationId: "conversation-1",
+      }),
+    );
+    await result.current.submitMessage();
+
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage.mock.calls[0]?.[1]?.map(({ id }) => id)).toEqual([
+      "attachment-1",
+    ]);
+    expect(getStore().input).toBe("");
+    expect(getStore().attachments).toEqual([]);
+  });
+
+  test("logout reset prevents an in-flight upload from entering a later session", async () => {
+    let finishUpload!: (result: UploadAttachmentResult) => void;
+    uploadChatAttachmentMock.mockImplementationOnce(
+      () =>
+        new Promise<UploadAttachmentResult>((resolve) => {
+          finishUpload = resolve;
+        }),
+    );
+    getStore().addFiles(
+      [new File(["notes"], "notes.txt", { type: "text/plain" })],
+      "assistant-1",
+    );
+    for (let i = 0; i < 100 && !finishUpload; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+
+    getStore().resetForLogout();
+    finishUpload({ ok: true, id: "attachment-1" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(getStore().attachments).toEqual([]);
+  });
+
   test("adopts stored metadata and previews the stored bytes when the assistant transcodes", async () => {
     uploadChatAttachmentMock.mockResolvedValueOnce({
       ok: true,
@@ -627,5 +738,113 @@ describe("addFiles image byte validation", () => {
     // THEN it uploads: the image rule applies only to images
     expect(getStore().attachments[0].kind).toBe("uploaded");
     expect(uploadChatAttachmentMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// restoreFailedDraft: parking a failed send's text for its own thread
+// ---------------------------------------------------------------------------
+
+describe("restoreFailedDraft", () => {
+  /** What the composer would show on opening `key` under the loaded assistant. */
+  function draftFor(key: string): string {
+    getStore().setInput("");
+    getStore().restoreDraftIfEmpty(key);
+    return getStore().input;
+  }
+
+  test("parks the text where the conversation will look for it", () => {
+    getStore().loadAssistantDrafts("assistant-1");
+
+    getStore().restoreFailedDraft(
+      "assistant-1",
+      "conv-A",
+      "the lost message",
+      getStore().sessionGeneration,
+    );
+
+    expect(draftFor("conv-A")).toBe("the lost message");
+  });
+
+  test("ignores a failed send that completes after logout", () => {
+    getStore().loadAssistantDrafts("assistant-1");
+    const sessionGeneration = getStore().sessionGeneration;
+
+    getStore().resetForLogout();
+    getStore().restoreFailedDraft(
+      "assistant-1",
+      "conv-A",
+      "private failed send",
+      sessionGeneration,
+    );
+    getStore().loadAssistantDrafts("assistant-1");
+
+    expect(draftFor("conv-A")).toBe("");
+  });
+
+  test("leaves an occupied slot alone", () => {
+    getStore().loadAssistantDrafts("assistant-1");
+    getStore().saveDraft("conv-A", "typed later");
+
+    getStore().restoreFailedDraft(
+      "assistant-1",
+      "conv-A",
+      "the lost message",
+      getStore().sessionGeneration,
+    );
+
+    expect(draftFor("conv-A")).toBe("typed later");
+  });
+
+  test("ignores blank text", () => {
+    getStore().loadAssistantDrafts("assistant-1");
+
+    getStore().restoreFailedDraft(
+      "assistant-1",
+      "conv-A",
+      "   ",
+      getStore().sessionGeneration,
+    );
+
+    expect(draftFor("conv-A")).toBe("");
+  });
+
+  test("files into the sending assistant's own storage, not the loaded one", () => {
+    // GIVEN the user switched assistants while a send for assistant-1 was in
+    // flight, so the in-memory map now belongs to assistant-2
+    getStore().loadAssistantDrafts("assistant-1");
+    getStore().loadAssistantDrafts("assistant-2");
+
+    getStore().restoreFailedDraft(
+      "assistant-1",
+      "conv-A",
+      "the lost message",
+      getStore().sessionGeneration,
+    );
+
+    // THEN assistant-2, whose map is live, never sees it
+    expect(draftFor("conv-A")).toBe("");
+
+    // AND assistant-1 has it waiting when it is loaded again
+    getStore().loadAssistantDrafts("assistant-2");
+    getStore().loadAssistantDrafts("assistant-1");
+    expect(draftFor("conv-A")).toBe("the lost message");
+  });
+
+  test("respects an occupied slot in another assistant's storage too", () => {
+    getStore().loadAssistantDrafts("assistant-1");
+    getStore().saveDraft("conv-A", "typed later");
+    getStore().loadAssistantDrafts("assistant-2");
+
+    getStore().restoreFailedDraft(
+      "assistant-1",
+      "conv-A",
+      "the lost message",
+      getStore().sessionGeneration,
+    );
+
+    getStore().loadAssistantDrafts("assistant-2");
+    getStore().loadAssistantDrafts("assistant-1");
+    expect(draftFor("conv-A")).toBe("typed later");
   });
 });

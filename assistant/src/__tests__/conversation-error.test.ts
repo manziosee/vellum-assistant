@@ -582,6 +582,23 @@ describe("classifyConversationError", () => {
       expect(result.retryable).toBe(true);
       expect(result.errorCategory).toBe("tool_ordering");
     });
+
+    it("classifies user-terminal history rejections separately", () => {
+      /** User-terminal provider rejections receive a dedicated category. */
+
+      // GIVEN a provider error whose history ends with a model turn
+      const error = new Error(
+        "Requests ending with a model turn are not supported.",
+      );
+
+      // WHEN the conversation error is classified
+      const result = classifyConversationError(error, baseCtx);
+
+      // THEN it is a retryable ordering error in the user-terminal category
+      expect(result.code).toBe("PROVIDER_ORDERING");
+      expect(result.retryable).toBe(true);
+      expect(result.errorCategory).toBe("history_user_terminal");
+    });
   });
 
   describe("web search ordering errors", () => {
@@ -797,6 +814,44 @@ describe("classifyConversationError", () => {
       expect(result.userMessage).toBe(
         "Your personal Anthropic API key was rejected by Anthropic. Update that key in Settings → Models & Services.",
       );
+    });
+
+    it("classifies an OpenCode 401 ModelError as model-not-found, not an invalid key", () => {
+      providerRoutingSources.opencode = "user-key";
+      const err = new ProviderError(
+        "OpenCode API error (401): Model muse-spark-1.3-contributor is not supported [type=ModelError]",
+        "opencode",
+        401,
+        { reason: "model_not_found" },
+      );
+
+      const result = classifyConversationError(err, {
+        ...baseCtx,
+        profileName: "custom-profile",
+        connectionName: "opencode-personal",
+      });
+
+      expect(result.code).toBe("PROVIDER_API");
+      expect(result.errorCategory).toBe("provider_model_not_found");
+      expect(result.retryable).toBe(false);
+      expect(result.userMessage).toContain("wasn't found by the provider");
+      expect(result.userMessage).not.toContain("API key");
+    });
+
+    it("classifies a reason-less OpenCode 401 ModelError via the message, not credentials", () => {
+      providerRoutingSources.opencode = "user-key";
+      const err = new ProviderError(
+        "OpenCode API error (401): Model muse-spark-1.3-contributor is not supported [type=ModelError]",
+        "opencode",
+        401,
+      );
+
+      const result = classifyConversationError(err, baseCtx);
+
+      expect(result.code).toBe("PROVIDER_API");
+      expect(result.errorCategory).toBe("provider_model_not_found");
+      expect(result.retryable).toBe(false);
+      expect(result.userMessage).not.toContain("API key");
     });
 
     it("classifies managed-proxy auth failures as managed credential refresh failures", () => {
@@ -1119,6 +1174,50 @@ describe("classifyConversationError", () => {
   });
 
   describe("reason-driven classification (ProviderError.reason)", () => {
+    it("classifies reason=request_shape_unsupported as a friendly capability-mismatch message", () => {
+      // GIVEN a chat-template 400 that the provider stamped with the
+      // semantic reason (Together serving MiniMax M3)
+      const err = new ProviderError(
+        "Together AI API error (400): Failed to apply chat template: invalid operation: object is not callable (in chat:22)",
+        "together",
+        400,
+        { reason: "request_shape_unsupported" },
+      );
+
+      // WHEN it is classified
+      const result = classifyConversationError(err, baseCtx);
+
+      // THEN the user sees the capability-mismatch copy, not the raw
+      // template error
+      expect(result.code).toBe("PROVIDER_API");
+      expect(result.errorCategory).toBe("request_shape_unsupported");
+      expect(result.retryable).toBe(false);
+      expect(result.userMessage).toContain(
+        "couldn't process the request format",
+      );
+      expect(result.userMessage).not.toContain("chat template");
+    });
+
+    it("classifies a reason-less chat-template 400 via the message ladder", () => {
+      // GIVEN a chat-template 400 whose ProviderError carries no semantic
+      // reason (e.g. thrown by a non-OpenAI-compatible wrapper)
+      const err = new ProviderError(
+        "Together AI API error (400): Failed to apply chat template: invalid operation: object is not callable (in chat:22)",
+        "together",
+        400,
+      );
+
+      // WHEN it is classified
+      const result = classifyConversationError(err, baseCtx);
+
+      // THEN the regex ladder still lands on the capability-mismatch copy
+      expect(result.code).toBe("PROVIDER_API");
+      expect(result.errorCategory).toBe("request_shape_unsupported");
+      expect(result.userMessage).toContain(
+        "couldn't process the request format",
+      );
+    });
+
     it("classifies reason=model_restricted on the skew-safe PROVIDER_API code with a specific errorCategory", () => {
       const err = new ProviderError(
         "Vercel AI Gateway API error (403): Model claude-opus-4 is restricted on your plan [type=no_providers_available]",
@@ -1391,6 +1490,7 @@ describe("classifyConversationError", () => {
       "subagent_aborted",
       "signal_cancel",
       "voice_session_aborted",
+      "voice_progress_narration_timeout",
     ];
 
     for (const kind of taggedKinds) {
@@ -1614,6 +1714,23 @@ describe("ConnectionResolutionError classification", () => {
     expect(err.cause).toBe(cause);
     const result = classifyConversationError(err, errCtx);
     expect(result.userMessage).toContain("Restart the assistant");
+  });
+
+  it("classifies adapter_unavailable for a Vellum-hosted GPU model", () => {
+    const err = new ConnectionResolutionError(
+      "vellum",
+      "adapter_unavailable",
+      "no adapter",
+      { model: "qwen/qwen3-8b", profileName: "steer" },
+    );
+    const result = classifyConversationError(err, errCtx);
+    expect(result.code).toBe("PROVIDER_NOT_CONFIGURED");
+    expect(result.userMessage).toContain("qwen/qwen3-8b");
+    expect(result.userMessage).toContain("Vellum GPU route");
+    expect(result.userMessage).toContain('profile "steer"');
+    expect(result.userMessage).toContain(
+      "was not sent through another provider",
+    );
   });
 
   it("classifies missing_credential naming the connection and fix", () => {

@@ -27,15 +27,14 @@ import {
   quarantineRefusedExchanges,
 } from "../context/refusal-quarantine.js";
 import {
+  LEGACY_MEMORY_SPOTLIGHT_MATCHER,
+  MEMORY_POINTER_MATCHER,
   NOW_SCRATCHPAD_STRIP_PREFIXES,
-  stripSpotlightInjections,
+  stripTailUserTextBlocksByPrefix,
   stripUserTextBlocksByPrefix,
 } from "../context/strip-injections.js";
 import { getDocumentsForConversation } from "../documents/document-store.js";
-import {
-  readSlackMetadata,
-  readSlackMetadataFromMessageMetadata,
-} from "../messaging/providers/slack/message-metadata.js";
+import { readSlackMetadataFromMessageMetadata } from "../messaging/providers/slack/message-metadata.js";
 import {
   compareSlackTs,
   extractTagLineTexts,
@@ -48,6 +47,7 @@ import { isGuardianCardRow } from "../notifications/approval-card-data.js";
 import {
   getMessages as defaultGetMessages,
   type MessageRow,
+  selectSightFrameCaptureTimes,
 } from "../persistence/conversation-crud.js";
 import { isBackgroundConversationType } from "../persistence/conversation-types.js";
 import { createContextSummaryMessage } from "../plugins/defaults/compaction/window-manager.js";
@@ -60,9 +60,17 @@ import {
   unwrapMemoryBlock,
   wrapMemoryBlock,
 } from "../plugins/defaults/memory/memory-marker.js";
+import { getPrunedSections } from "../plugins/defaults/memory/v3/ever-injected-store.js";
 import {
+  mergeIntoAnchorBlock,
+  stripPrunedSectionsFromMessages,
+} from "../plugins/defaults/memory/v3/prune.js";
+import {
+  isV3LiveBlock,
+  markV3LiveBlock,
   MEMORY_V3_BLOCK_ID,
   MEMORY_V3_COMMIT_META_KEY,
+  MEMORY_V3_POINTER_BLOCK_ID,
 } from "../plugins/defaults/memory/v3/types.js";
 import { getRegisteredInjectors } from "../plugins/injector-registry.js";
 import type {
@@ -73,11 +81,20 @@ import type {
 import type { ContentBlock, Message } from "../providers/types.js";
 import type { TrustClass } from "../runtime/actor-trust-resolver.js";
 import { resolveCapabilities } from "../runtime/capabilities.js";
+import { trustClassSchema } from "../runtime/trust-class.js";
 import type { SubagentState } from "../subagent/types.js";
 import { TERMINAL_STATUSES } from "../subagent/types.js";
 import { canonicalizeInboundIdentity } from "../util/canonicalize-identity.js";
+import { safeParseRecord } from "../util/json.js";
+import { getLogger } from "../util/logger.js";
+import { safeStringSlice } from "../util/unicode.js";
 import { channelSupportsInlineOptions } from "./channel-ui-capability.js";
 import { findConversationOrSubagent } from "./conversation-registry.js";
+import {
+  hasAttributableImages,
+  resolveSightKeepLatestFrames,
+  stripAgedSightFrames,
+} from "./conversation-sight-frames.js";
 import type { SurfaceShowPair } from "./conversation-surfaces.js";
 import { canonicalizeTimeZone, formatTurnTimestamp } from "./date-context.js";
 import type {} from "./message-protocol.js";
@@ -88,6 +105,8 @@ import { timeLatencySubSpan } from "./turn-latency-sub-spans.js";
 // The compaction strip lives in the compaction layer (`context/`) so the agent
 // loop can own it; re-exported here for this module's existing consumers.
 export { stripInjectionsForCompaction } from "../context/strip-injections.js";
+
+const log = getLogger("conversation-runtime-assembly");
 
 /**
  * Describes the capabilities of the channel through which the user is
@@ -557,7 +576,7 @@ function injectActiveSurfaceContext(
     if (schema && schema !== '"{}"' && schema !== "{}") {
       const truncatedSchema =
         schema.length > MAX_SCHEMA_LENGTH
-          ? schema.slice(0, MAX_SCHEMA_LENGTH) + "… (truncated)"
+          ? safeStringSlice(schema, 0, MAX_SCHEMA_LENGTH) + "… (truncated)"
           : schema;
       lines.push("", `Data schema: ${truncatedSchema}`);
     }
@@ -737,14 +756,78 @@ export function stripNowScratchpad(messages: Message[]): Message[] {
   return stripUserTextBlocksByPrefix(messages, NOW_SCRATCHPAD_STRIP_PREFIXES);
 }
 
+// ---------------------------------------------------------------------------
+// Camera-frame retention
+// ---------------------------------------------------------------------------
+
+/**
+ * Trim the conversation's ambient camera frames down to the newest
+ * `sight.keepLatestFrames`, replacing the rest with text stubs.
+ *
+ * A camera call samples a frame every few seconds, and history resends
+ * every inline image on every later request, so an hour-long call otherwise
+ * grows its own context until the provider rejects it. Trimming here, on the
+ * assembled copy the turn is about to send, keeps the stored transcript and its
+ * attachments intact.
+ *
+ * The tag that names the frames is per-row metadata, and the assembled
+ * `Message[]` omits row metadata, so the ids are read back from the rows and
+ * matched against the attachment id each image block carries: `workspace_ref`
+ * on a reloaded block, `_attachmentId` on the live copy a turn pushed. One
+ * uninterrupted call and a reloaded conversation therefore trim from the same
+ * pool. A conversation with no tagged rows returns the input array unchanged.
+ *
+ * Called twice over a turn that compacts: once before the run, and again on the
+ * rebuilt history the agent loop installs, since compaction reads the stored
+ * rows and can retain frames this pass had already stubbed.
+ *
+ * Best-effort: this trims cost, it does not decide what the turn means, so a
+ * failed read degrades to the untrimmed history rather than failing the turn.
+ */
+export function applySightFrameRetention(
+  messages: Message[],
+  conversationId: string,
+): Message[] {
+  // A frame always traces back to an attachment row, so a history holding no
+  // attributable image can be answered without reading any rows. That is the
+  // overwhelming majority of turns, and this pass sits on the per-turn critical
+  // path.
+  if (!hasAttributableImages(messages)) {
+    return messages;
+  }
+  try {
+    const captureTimes = selectSightFrameCaptureTimes(conversationId);
+    if (captureTimes.size === 0) {
+      return messages;
+    }
+    return stripAgedSightFrames(
+      messages,
+      captureTimes,
+      resolveSightKeepLatestFrames(),
+    ).messages;
+  } catch (err) {
+    log.warn(
+      { conversationId, err },
+      "Camera-frame retention failed (non-fatal)",
+    );
+    return messages;
+  }
+}
+
 /**
  * Build the `<channel_capabilities>` block text for the given capabilities, or
  * `null` on the happy path (desktop, full capabilities, no special context)
  * where no block is injected. Split from {@link injectChannelCapabilityContext}
  * so callers can capture the exact injected text for metadata persistence.
+ *
+ * Live vs clientless guidance belongs here, not in tool schemas. Tool
+ * definitions stay identical so the tools cache prefix can reuse; this block
+ * sits later in the system prompt and can describe the current turn.
  */
 export function buildChannelCapabilityBlock(
   caps: ChannelCapabilities,
+  clientOs: string | undefined = caps.clientOS,
+  isNonInteractive = false,
 ): string | null {
   // Happy path: desktop with full capabilities and no special context — skip injection.
   if (
@@ -752,7 +835,9 @@ export function buildChannelCapabilityBlock(
     caps.supportsDynamicUi &&
     caps.supportsVoiceInput &&
     !isGroupChatType(caps.chatType) &&
-    caps.clientOS !== "macos"
+    clientOs !== "macos" &&
+    clientOs !== "windows" &&
+    clientOs !== "linux"
   ) {
     return null;
   }
@@ -762,14 +847,28 @@ export function buildChannelCapabilityBlock(
   lines.push(`dashboard_capable: ${caps.dashboardCapable}`);
   lines.push(`supports_dynamic_ui: ${caps.supportsDynamicUi}`);
   lines.push(`supports_voice_input: ${caps.supportsVoiceInput}`);
-  if (caps.clientOS) {
-    lines.push(`client_os: ${caps.clientOS}`);
+  if (clientOs) {
+    lines.push(`client_os: ${clientOs}`);
   }
 
-  if (caps.clientOS === "macos") {
+  if (clientOs === "macos") {
     lines.push("");
     lines.push(
-      "On macOS, prefer osascript/CLI via `host_bash` over computer use tools, which take over the user's cursor. Use foreground computer use only when no scripting alternative exists or the user explicitly asks.",
+      "On macOS, drive apps with the computer-use skill; `host_bash` is for shell commands.",
+    );
+  }
+
+  if (clientOs === "windows") {
+    lines.push("");
+    lines.push(
+      "On Windows, `host_bash` runs PowerShell. Use PowerShell syntax and Windows paths. Prefer PowerShell or CLI automation over foreground computer use when either can complete the task reliably.",
+    );
+  }
+
+  if (clientOs === "linux") {
+    lines.push("");
+    lines.push(
+      "On Linux, prefer CLI via `host_bash` over computer use tools, which take over the user's cursor. Use foreground computer use only when no scripting alternative exists or the user explicitly asks.",
     );
   }
 
@@ -780,18 +879,24 @@ export function buildChannelCapabilityBlock(
       "- Do NOT reference the dashboard UI, settings panels, or visual preference pickers.",
     );
     if (!caps.supportsDynamicUi) {
-      if (caps.channel === "slack") {
+      if (isNonInteractive) {
         lines.push(
-          '- Do NOT use app_create. Only use ui_show/ui_update for card surfaces with template: "task_progress"; present all other information as text.',
+          "- ui_show, ui_update, and ui_dismiss persist conversation content for the next capable client that opens this conversation. Do not claim a surface is visible now or wait for an action.",
         );
       } else {
+        if (caps.channel === "slack") {
+          lines.push(
+            '- Do NOT use app_create. Only use ui_show/ui_update for card surfaces with template: "task_progress"; present all other information as text.',
+          );
+        } else {
+          lines.push(
+            "- Do NOT use ui_show, ui_update, or app_create. This channel cannot render them.",
+          );
+        }
         lines.push(
-          "- Do NOT use ui_show, ui_update, or app_create — this channel cannot render them.",
+          "- Present information as well-formatted text instead of dynamic UI.",
         );
       }
-      lines.push(
-        "- Present information as well-formatted text instead of dynamic UI.",
-      );
     }
     if (caps.channel === "whatsapp") {
       lines.push(
@@ -834,8 +939,9 @@ export function buildChannelCapabilityBlock(
 export function injectChannelCapabilityContext(
   message: Message,
   caps: ChannelCapabilities,
+  clientOs?: string,
 ): Message {
-  const block = buildChannelCapabilityBlock(caps);
+  const block = buildChannelCapabilityBlock(caps, clientOs);
   if (block === null) {
     return message;
   }
@@ -915,12 +1021,12 @@ function injectTransportHints(message: Message, hints: string[]): Message {
  * `<active_thread>` focus block. DMs are excluded because they have no
  * threads.
  *
- * The gateway normalizer sets `chatType: "channel"` for every non-DM Slack
- * conversation (public, private, and mpim alike — see
- * `gateway/src/slack/normalize.ts`) and omits the field entirely for DMs.
- * We therefore accept only `chatType === "channel"` — when the gateway
- * omits `chatType` (as it does for DMs), the check correctly returns
- * `false`.
+ * The gateway normalizer (`gateway/src/slack/message-normalizer.ts`)
+ * forwards `chatType: "channel"` for channel messages, `"im"` for a 1:1
+ * DM, and `"mpim"` for a group DM, and omits it for an app mention, which
+ * Slack sends without naming the room kind. Accepting only
+ * `chatType === "channel"` therefore returns `false` for both DM shapes
+ * and for an app mention.
  *
  * The chronological-transcript override applies to ALL Slack
  * conversations (channels and DMs) — gate that on
@@ -1075,29 +1181,12 @@ function placeholderForBlockType(type: ContentBlock["type"]): string | null {
  *   renderer drops the redundant `@user` placeholder.
  */
 function rowToRenderable(row: SlackTranscriptInputRow): RenderableSlackMessage {
-  let slackMeta: ReturnType<typeof readSlackMetadata> = null;
-  let provenanceTrustClass: TrustClass | undefined;
-  if (row.metadata) {
-    try {
-      const outer = JSON.parse(row.metadata) as {
-        slackMeta?: unknown;
-        provenanceTrustClass?: unknown;
-      };
-      if (typeof outer.slackMeta === "string") {
-        slackMeta = readSlackMetadata(outer.slackMeta);
-      }
-      if (
-        outer.provenanceTrustClass === "guardian" ||
-        outer.provenanceTrustClass === "trusted_contact" ||
-        outer.provenanceTrustClass === "unverified_contact" ||
-        outer.provenanceTrustClass === "unknown"
-      ) {
-        provenanceTrustClass = outer.provenanceTrustClass;
-      }
-    } catch {
-      // Malformed metadata — fall through to legacy/null treatment.
-    }
-  }
+  const slackMeta = readSlackMetadataFromMessageMetadata(row.metadata);
+  const provenanceTrustClass = row.metadata
+    ? trustClassSchema.safeParse(
+        safeParseRecord(row.metadata).provenanceTrustClass,
+      ).data
+    : undefined;
 
   const isReaction = slackMeta?.eventKind === "reaction";
   let senderLabel: string | null;
@@ -1791,14 +1880,24 @@ export interface RuntimeInjectionBlocks {
    */
   nonInteractiveContextBlock?: string;
   /**
-   * UNWRAPPED inner text of the memory-v3 frozen net-new card block the v3
+   * UNWRAPPED inner text of the memory-v3 frozen net-new section block the v3
    * injector attached this turn, mirroring v2's unwrapped `memoryInjectedBlock`
    * contract (rehydration re-wraps on use). Undefined when v3 attached no new
-   * cards (all-repeat turn, v3 off, or v3 failure). Persisted by the
-   * user-prompt-submit hook under `metadata.memoryV3InjectedBlock`
+   * sections (all-repeat turn, v3 off, or v3 failure) and when the block
+   * attached in memory only, carrying no residency commit (a replaced
+   * history, a re-entry): what is captured here is persisted, and only a
+   * block the store claims may be. Persisted by the user-prompt-submit hook
+   * under `metadata.memoryV3InjectedBlock`
    * (`MEMORY_V3_INJECTED_BLOCK_METADATA_KEY`).
    */
   memoryV3InjectedBlock?: string;
+  /**
+   * Rendered `<memory_pointer>` block spliced onto this turn's user message.
+   * Persisted by the user-prompt-submit hook under
+   * `metadata.memoryV3PointerBlock`. Historical turns keep the block they
+   * were sent with; a new pointer is added only on the new tail.
+   */
+  memoryV3PointerBlock?: string;
   /**
    * True when memory-v3 superseded v2 as this turn's `<memory>` source —
    * `memory.v3.live` is on AND the v3 injector produced a block (possibly
@@ -1835,10 +1934,22 @@ export interface RuntimeInjectionResult {
  * non-overlapping so the inspector's "Other" remainder is honest. The
  * names are pinned by `injector-registry-order-guard.test.ts`.
  */
-const SELF_INSTRUMENTED_INJECTORS = new Set([
-  "memory-v3-shadow",
-  "memory-v3-spotlight",
-]);
+const SELF_INSTRUMENTED_INJECTORS = new Set(["memory-v3-shadow"]);
+
+/**
+ * Whether `block` replaces the turn's run messages: a
+ * `"replace-run-messages"` placement carrying the override that
+ * {@link applyInjectionBlock} swaps in (a replace block without one is a
+ * no-op there).
+ */
+function replacesRunMessages(
+  block: InjectionBlock,
+): block is InjectionBlock & { messagesOverride: Message[] } {
+  return (
+    block.placement === "replace-run-messages" &&
+    block.messagesOverride !== undefined
+  );
+}
 
 /**
  * Run every {@link Injector} in the chain ({@link getRegisteredInjectors},
@@ -1852,6 +1963,15 @@ const SELF_INSTRUMENTED_INJECTORS = new Set([
  * callers ({@link composeInjectorChain}) that drive the chain without a
  * message array.
  *
+ * `ctx` is handed to each injector as given, except that once an injector
+ * has produced the run-messages replacement ({@link replacesRunMessages}),
+ * every injector after it in the chain is told so on its context
+ * (`TurnContext.replacesRunMessages`, read by the memory-v3 sections
+ * injector). The flag follows the block Step 1 of
+ * {@link applyRuntimeInjections} swaps in, so it is set exactly when the
+ * replacement fires: never for a replacing injector that is unregistered,
+ * disabled with its plugin, or gated off for the turn.
+ *
  * Injectors returning `null` are omitted from the result. The returned array
  * preserves ascending-`order` sort so downstream callers (notably
  * {@link applyRuntimeInjections}) can group blocks by `placement` and apply
@@ -1862,16 +1982,21 @@ async function collectInjectorBlocks(
   runMessages?: Message[],
 ): Promise<InjectionBlock[]> {
   const out: InjectionBlock[] = [];
+  let injectorCtx = ctx;
   for (const injector of getRegisteredInjectors()) {
     const block = SELF_INSTRUMENTED_INJECTORS.has(injector.name)
-      ? await injector.produce(ctx, runMessages)
+      ? await injector.produce(injectorCtx, runMessages)
       : await timeLatencySubSpan(
           `injector:${injector.name}`,
           `Injector: ${injector.name}`,
-          () => injector.produce(ctx, runMessages),
+          () => injector.produce(injectorCtx, runMessages),
         );
-    if (block) {
-      out.push(block);
+    if (!block) {
+      continue;
+    }
+    out.push(block);
+    if (replacesRunMessages(block)) {
+      injectorCtx = { ...injectorCtx, replacesRunMessages: true };
     }
   }
   return out;
@@ -1959,6 +2084,10 @@ function applyInjectionBlock(
   }
 
   const textBlock = { type: "text" as const, text: block.text };
+  if (block.id === MEMORY_V3_BLOCK_ID) {
+    // The prune valve's live strip owns v3 blocks by object identity.
+    markV3LiveBlock(textBlock);
+  }
 
   switch (placement) {
     case "prepend-user-tail":
@@ -1988,6 +2117,7 @@ function applyInjectionBlock(
       ];
     }
   }
+  return runMessages;
 }
 
 /**
@@ -2160,6 +2290,19 @@ export interface RuntimeInjectionOptions {
    * site when omitted.
    */
   callSite?: LLMCallSite;
+  /**
+   * True when this assembly re-applies injections onto a continuation
+   * history mid-turn (the post-compaction hook, which also serves overflow
+   * re-entry). Such an assembly's blocks live in memory only: no caller
+   * persists them, and every message they attach to predates the
+   * compaction, whose `historyStrippedAt` marker keeps `loadFromDb` from
+   * rehydrating metadata on it. The memory-v3 sections injector's residency
+   * commit (`MEMORY_V3_COMMIT_META_KEY`) is therefore not invoked: a section
+   * the store claimed here would have no persisted body after a restart, so
+   * the injector would emit only a pointer for it. The injector attaches the
+   * commit to the turn's first produce alone, so the two sites agree.
+   */
+  reinjection?: boolean;
 }
 
 /**
@@ -2198,7 +2341,14 @@ function fallbackTurnTrust(
  *     tail. When replacement fires, re-prepend any memory-prefix blocks
  *     that `graphMemory.prepareMemory` had attached to the original tail —
  *     the Slack transcript is rendered fresh from persisted rows and
- *     carries no memory prefix of its own.
+ *     carries no memory prefix of its own. Every injector after the
+ *     replacing one was told that the replacement will fire
+ *     (`replacesRunMessages` on its turn context, set by the chain walker
+ *     in step 2 as the replacing block is produced), and the memory-v3
+ *     block then attaches to the replaced tail in memory only (step 4); a
+ *     memory-v3 block the original tail already carried (a retry's anchor)
+ *     is left off the transcript in that case, so the fresh render is the
+ *     prompt's single copy of each selected section.
  *  4. Apply the chain's `"after-memory-prefix"` blocks in ascending
  *     `order`. This runs BEFORE step 5's hardcoded prepends so the
  *     memory-prefix counter sees only the memory blocks on the tail —
@@ -2220,7 +2370,7 @@ function fallbackTurnTrust(
  *     the user tail content.
  *
  * Returns the final message array plus a `blocks` object holding the exact
- * injected text for each captured block — callers persist those bytes to
+ * injected text for each captured block. Callers persist those bytes to
  * message metadata for later byte-exact rehydration.
  */
 export async function applyRuntimeInjections(
@@ -2352,7 +2502,6 @@ export async function applyRuntimeInjections(
           liveConversation?.slackContextCompactionWatermarkTs,
       })
     : null;
-
   // Assemble the per-turn TurnContext handed to the injector chain. The
   // turn-identity fields come from `options` when supplied; `requestId` is the
   // only one the caller must provide, since the other three are recovered from
@@ -2434,6 +2583,7 @@ export async function applyRuntimeInjections(
   let pkbSystemReminderCaptured: string | undefined;
   let memoryV2StaticCaptured: string | undefined;
   let memoryV3Captured: string | undefined;
+  let memoryV3PointerCaptured: string | undefined;
   let backgroundTurnCaptured: string | undefined;
   let channelCapabilitiesCaptured: string | undefined;
   let nonInteractiveContextCaptured: string | undefined;
@@ -2463,26 +2613,16 @@ export async function applyRuntimeInjections(
         case "background-turn":
           backgroundTurnCaptured = block.text;
           break;
-        case MEMORY_V3_BLOCK_ID: {
-          // The v3 frozen card block is persisted UNWRAPPED (the v2
-          // `memoryInjectedBlock` contract — rehydration re-wraps on use).
-          // An empty-text block (all-repeat turn) attaches no content, so
-          // nothing is captured for persistence either.
+        case MEMORY_V3_BLOCK_ID:
+          // Captured and committed at its Step 2 splice, where the block's
+          // place on the tail (merged into a retried anchor's frozen block
+          // or spliced as its own) is decided.
+          break;
+        case MEMORY_V3_POINTER_BLOCK_ID:
           if (block.text.length > 0) {
-            memoryV3Captured = unwrapMemoryBlock(block.text);
-          }
-          // Attachment is guaranteed from here (user tail — the gate this
-          // capture loop runs under), so commit the injector's deferred
-          // everInjected-store write. On a non-user tail the block silently
-          // no-ops in `applyInjectionBlock`, and skipping the commit keeps
-          // the store from claiming cards that never attached (which would
-          // suppress them until compaction).
-          const commit = block.meta?.[MEMORY_V3_COMMIT_META_KEY];
-          if (typeof commit === "function") {
-            (commit as () => void)();
+            memoryV3PointerCaptured = block.text;
           }
           break;
-        }
       }
     }
   }
@@ -2501,16 +2641,42 @@ export async function applyRuntimeInjections(
       ? injectorChainPieces.join("\n\n")
       : undefined;
 
-  // ── Step 0: memory-v3 ephemeral-spotlight strip + v2 tail suppression ──
+  // ── Step 0: tail pointer strip + tombstone strip + v2 tail suppression ──
   //
-  // Spotlight strip (unconditional): the `<memory_spotlight>` block is
-  // ephemeral by contract — re-rendered at the current tail each turn — so any
-  // spotlight riding history from a previous turn is stale and is removed
-  // here. This is a SCOPED strip of only that block id: the frozen `<memory>`
-  // card blocks on historical messages are untouched (the cache contract).
-  // With the v3 flag off no spotlight blocks exist and this is a content
-  // no-op, keeping the v2 path bit-for-bit identical.
-  let runMessagesForAssembly = stripSpotlightInjections(runMessages);
+  // Pointer strip (tail only): mid-turn re-entry and post-compact can hand
+  // back a tail that already carries this turn's `<memory_pointer>`. Strip
+  // that leftover from the tail so Step 2 splices a single fresh copy.
+  // Historical user messages keep the pointer they were sent with, so the
+  // provider prefix through those messages stays byte-identical. Frozen
+  // `<memory>` section blocks are untouched. A legacy `<memory_spotlight>`
+  // that a row persisted by an earlier build rehydrated onto the tail is
+  // stripped the same way (that build tail-stripped it too). With the v3
+  // flag off no pointer blocks exist and this is a content no-op.
+  let runMessagesForAssembly = stripTailUserTextBlocksByPrefix(runMessages, [
+    MEMORY_POINTER_MATCHER,
+    LEGACY_MEMORY_SPOTLIGHT_MATCHER,
+  ]);
+
+  // Tombstone strip (v3-owned blocks, every turn): the prune valve strips
+  // the sections it tombstones from the live history it is handed, but it
+  // runs on a timer while the turn that scheduled it may still be in
+  // flight, against a history that turn's block has not folded back into.
+  // A section pruned on the turn that injected it therefore rides back in
+  // untouched, and the valve does not run again while the footprint stays
+  // under the cap. Applying the store's full tombstone set (with the
+  // newest-copy rule) to the owned blocks here, the filter rehydration
+  // applies on load, converges the live history to the store by the next
+  // assembly whenever the valve ran. In place on the shared message
+  // objects, so the fold-back keeps it; idempotent and a no-op below the
+  // cap. Ownership is by identity (`isV3LiveBlock`), so v2 blocks and
+  // pre-cutover blocks are never touched.
+  const memoryV3Live = isMemoryV3Live(getConfig());
+  if (memoryV3Live) {
+    stripPrunedSectionsFromMessages(
+      runMessagesForAssembly,
+      getPrunedSections(conversationId),
+    );
+  }
 
   // v2 suppression: when `memory.v3.live` is on AND the v3 injector
   // produced a block this turn (possibly empty-text on an all-repeat turn), v3
@@ -2518,22 +2684,20 @@ export async function applyRuntimeInjections(
   // fresh `<memory>` block to the tail user message — strip the TAIL's v2
   // dynamic prefix only, so the v3 `after-memory-prefix` block (Step 2) lands
   // at the top of the tail with no v2 prefix ahead of it. Historical user
-  // messages keep their memory blocks byte-identical: frozen v3 card blocks
-  // from prior turns AND pre-cutover v2 blocks both ride the cached prefix
-  // (the old whole-layer `stripAllMemoryInjections` replace is gone). The
-  // strip discriminates v2's dynamic block by IDENTITY ({@link
+  // messages keep their memory blocks byte-identical: frozen v3 section
+  // blocks from prior turns AND pre-cutover v2 blocks both ride the cached
+  // prefix. The strip discriminates v2's dynamic block by IDENTITY ({@link
   // stripTailV2DynamicMemoryPrefix}): the live graph handle holds the exact
   // text the wiring layer prepended this turn, so a re-entry tail's
-  // just-frozen v3 card block (and the `<info>` static block) survive even
+  // just-frozen v3 section block (and the `<info>` static block) survive even
   // though v2 and v3 blocks share identical wrapper + header bytes — the v2
   // prefix this strip exists to remove was already stripped on first entry.
   // Keyed off the v3 block being present (not the flag alone) so a v3 failure
   // (`produce()` → null) leaves v2's block intact — fallback rather than a
   // memory-less turn. Idempotent: re-injection sites that already stripped
   // see no change. Flag off → bit-for-bit identical to the v2 path.
-  const suppressV2MemoryForV3 = isMemoryV3Live(getConfig());
   const v3ProducedBlock = afterMemory.some((b) => b.id === MEMORY_V3_BLOCK_ID);
-  const memoryV3Active = suppressV2MemoryForV3 && v3ProducedBlock;
+  const memoryV3Active = memoryV3Live && v3ProducedBlock;
   if (memoryV3Active) {
     const v2DynamicText =
       getLiveGraphMemory(conversationId)?.lastInjectedBlockText ?? null;
@@ -2546,15 +2710,25 @@ export async function applyRuntimeInjections(
   let result = runMessagesForAssembly;
 
   // ── Step 1: Slack chronological replacement (chain "replace" block) ──
-  if (replaceBlock && replaceBlock.messagesOverride) {
+  let historyReplaced = false;
+  if (replaceBlock && replacesRunMessages(replaceBlock)) {
+    historyReplaced = true;
     // `graphMemory.prepareMemory` prepends a `<memory __injected>` block
     // (and any memory-image groups) to the last user message before
     // runtime assembly runs. The Slack transcript is freshly rendered
     // from persisted rows and has no such prefix, so swap it in and then
-    // re-prepend the captured prefix onto the new tail user message.
+    // re-prepend the captured prefix onto the new tail user message. A
+    // v3-owned block on that tail (the first run's frozen block, rehydrated
+    // onto the anchor a retry re-runs) is left behind whenever v3 produced
+    // a block for this assembly: the sections injector rendered every
+    // selection afresh for the replacement, resident ones included, so
+    // carrying the anchor's block as well would put each re-selected
+    // section in the prompt twice. With no v3 block this turn the anchor's
+    // block is carried as the turn's only memory, the fallback the v2 tail
+    // strip above also keeps.
     const carriedMemoryBlocks = extractMemoryPrefixBlocks(
       runMessagesForAssembly,
-    );
+    ).filter((block) => !(memoryV3Active && isV3LiveBlock(block)));
     result = replaceBlock.messagesOverride;
     if (carriedMemoryBlocks.length > 0) {
       const slackTail = result[result.length - 1];
@@ -2581,8 +2755,53 @@ export async function applyRuntimeInjections(
   // Ascending `order`: each splice lands at the memory-prefix boundary,
   // pushing any previously-spliced block one slot further from memory.
   // So higher-`order` blocks end up closer to the memory prefix.
+  //
+  // The v3 frozen section block is captured here, UNWRAPPED (the v2
+  // `memoryInjectedBlock` contract; rehydration re-wraps on use), and its
+  // deferred section-store commit runs here, once attachment is certain: a
+  // user tail (on any other tail `applyInjectionBlock` no-ops the block, and
+  // a commit would claim sections that never attached), a block carrying a
+  // commit, and not a re-injection assembly (`options.reinjection`, whose
+  // block is never persisted). Capture and commit go together: a block
+  // without a commit (a re-entry, or a turn whose history Step 1 replaced)
+  // rides the tail in memory only and is never persisted or claimed. A tail
+  // that already carries a v3 block (a turn re-run onto its original anchor
+  // row, `/conversations/:id/retry`) takes the new entries by merge, or, for
+  // a legacy-format anchor block, carries the new block in memory only
+  // (`AnchorBlockMerge` in `v3/prune.ts`). An empty-text block (all-repeat
+  // turn) attaches nothing and captures nothing. The partition and commit
+  // rules live in `plugins/defaults/memory/v3/injector.ts`.
   for (const block of afterMemory) {
-    result = applyInjectionBlock(result, block);
+    if (block.id !== MEMORY_V3_BLOCK_ID) {
+      result = applyInjectionBlock(result, block);
+      continue;
+    }
+    const tail = result[result.length - 1];
+    if (!tail || tail.role !== "user") {
+      continue;
+    }
+    const commit = block.meta?.[MEMORY_V3_COMMIT_META_KEY];
+    if (historyReplaced || typeof commit !== "function") {
+      result = applyInjectionBlock(result, block);
+      continue;
+    }
+    if (block.text.length > 0) {
+      const merge = mergeIntoAnchorBlock(result, unwrapMemoryBlock(block.text));
+      if (merge.kind === "legacy") {
+        result = applyInjectionBlock(result, block);
+        continue;
+      }
+      if (merge.kind === "merged") {
+        result = merge.messages;
+        memoryV3Captured = merge.inner;
+      } else {
+        result = applyInjectionBlock(result, block);
+        memoryV3Captured = unwrapMemoryBlock(block.text);
+      }
+    }
+    if (!options.reinjection) {
+      (commit as () => void)();
+    }
   }
 
   // ── Step 3: hardcoded branches that stayed outside the injector chain ──
@@ -2642,8 +2861,11 @@ export async function applyRuntimeInjections(
   if (channelCapabilities) {
     const userTail = result[result.length - 1];
     if (userTail && userTail.role === "user") {
-      const channelCapabilityBlock =
-        buildChannelCapabilityBlock(channelCapabilities);
+      const channelCapabilityBlock = buildChannelCapabilityBlock(
+        channelCapabilities,
+        clientOs,
+        options.isNonInteractive === true,
+      );
       if (channelCapabilityBlock !== null) {
         channelCapabilitiesCaptured = channelCapabilityBlock;
         result = [
@@ -2715,6 +2937,7 @@ export async function applyRuntimeInjections(
       pkbContextBlock: pkbContextCaptured,
       memoryV2StaticBlock: memoryV2StaticCaptured,
       memoryV3InjectedBlock: memoryV3Captured,
+      memoryV3PointerBlock: memoryV3PointerCaptured,
       backgroundTurnBlock: backgroundTurnCaptured,
       channelCapabilitiesBlock: channelCapabilitiesCaptured,
       nonInteractiveContextBlock: nonInteractiveContextCaptured,

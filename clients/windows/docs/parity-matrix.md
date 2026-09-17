@@ -12,24 +12,42 @@ Evidence columns name the focused test (under `src/`) or the packaged smoke
 (`scripts/package-smoke.ts`, run by `.github/workflows/windows-package-smoke.yaml`)
 that exercises the Windows behavior.
 
+## Notification sender parity
+
+Under `push-avatar-sender`, Windows consumes the same optional exact sender
+payload as macOS through the shared Electron notification module. The native
+helper stages the verified avatar for the toast app-logo slot, promotes the
+assistant name to the title, and uses the conversation title as the subtitle.
+Actions, tap identifiers, and delivery acknowledgments keep their existing
+owners. If the sender is absent or malformed, the plain route receives no
+sender decoration. `local-notification-avatar` does not select the Windows
+helper route, and the macOS grant-time sender confirmation has no Windows
+counterpart.
+
+The packaged Windows result remains `NOT RUN`. Its required cases and rollout
+status are recorded in the canonical
+[notification avatar and local delivery QA ledger](../../../docs/notification-avatar-local-qa.md).
+
 ## Renderer bridge
 
-| Bridge key                                                            | Windows module                                                                                        | macOS counterpart                        | Evidence                                                                        |
-| --------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------- | ---------------------------------------- | ------------------------------------------------------------------------------- |
-| `platform`, `hostOS`, `app`, `commands`, `mainWindow`                 | `preload/core-capabilities.ts`                                                                        | `preload/index.ts`                       | `preload/bridge-parity.test.ts`, `main/main-window.test.ts`                     |
-| `auth`                                                                | `preload/features/auth.ts`, `main/features/auth.ts`                                                   | `main/native-auth`                       | `main/auth-callback.test.ts`                                                    |
-| `hotkeys`, `menu`                                                     | `preload/features/commands.ts`, `main/features/commands.ts`, `main/menu.ts`                           | `main/menu.ts`, `main/commands.ts`       | `main/menu.test.ts`                                                             |
-| `launchAtLogin`, `deepLinks`                                          | `preload/features/deep-links.ts`, `main/features/deep-links.ts`                                       | `main/deep-links.ts`                     | `preload/deep-links-feature.test.ts`                                            |
-| `featureFlags`, `diagnostics`, `feedback`                             | `preload/features/diagnostics.ts`, `main/features/diagnostics.ts`                                     | `main/diagnostics.ts`                    | `preload/presence-feature.test.ts`                                              |
-| `helper` (ping, state, restart, dictation partials and transcription) | `preload/features/dictation.ts`, `main/features/dictation.ts`, `main/windows-helper.ts`               | `native/mac-helper`                      | `main/dictation.test.ts`, `native/Vellum.WindowsHelper.Tests`                   |
-| `permissions`, `text`                                                 | `preload/features/permissions.ts`, `main/features/permissions.ts`                                     | `main/permissions.ts`                    | `main/permissions-feature.test.ts`                                              |
-| `status`, `identity`, `icon`, `dock`, `power`, `connectivity`         | `preload/features/presence.ts`, `main/features/presence.ts`, `main/tray.ts`, `main/taskbar.ts`        | `main/dock.ts`, `main/tray.ts`           | `preload/presence-feature.test.ts`, `main/tray.test.ts`, `main/taskbar.test.ts` |
-| `share`, `notifications`                                              | `preload/features/notifications-share.ts`, `main/features/share.ts`, `main/features/notifications.ts` | `main/share.ts`, `main/notifications.ts` | `main/notifications-share-feature.test.ts`                                      |
-| `localMode`                                                           | `preload/features/local-mode.ts`, `main/features/local-mode.ts`, `main/local-mode-providers.ts`       | `main/local-mode.client.ts`              | `main/local-mode-feature.test.ts`, `main/cli-provisioning.test.ts`              |
-| `fileOpen`, `paths`                                                   | `preload/features/paths.ts`, `main/features/file-open.ts`                                             | `main/file-open.ts`                      | `preload/paths.test.ts`, `main/file-open.test.ts`                               |
-| `bundleConfirm`                                                       | `preload/features/bundles.ts`, `main/features/bundles.ts`                                             | `main/bundles.ts`                        | `main/bundles-feature.test.ts`, package smoke (`.vellum` association)           |
-| `quickInput`, `commandPalette`, `dictationOverlay`, `popout`          | `preload/features/auxiliary-windows.ts`, `main/features/auxiliary-windows.ts`                         | `main/*-window.ts`                       | `main/auxiliary-windows.test.ts`                                                |
-| `update`                                                              | `preload/features/auto-update.ts`, `main/features/auto-update.ts`, `main/auto-update.ts`              | `main/auto-update.ts`                    | `main/auto-update.test.ts`                                                      |
+| Bridge key                                                            | Windows module                                                                                         | macOS counterpart                           | Evidence                                                                        |
+| --------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------ | ------------------------------------------- | ------------------------------------------------------------------------------- |
+| `platform`, `hostOS`, `app`, `commands`, `mainWindow`                 | `preload/core-capabilities.ts`                                                                         | `preload/index.ts`                          | `preload/bridge-parity.test.ts`, `main/main-window.test.ts`                     |
+| `auth`                                                                | `preload/features/auth.ts`, `main/features/auth.ts`                                                    | `main/native-auth`                          | `main/auth-callback.test.ts`                                                    |
+| `hotkeys`, `menu`                                                     | `preload/features/commands.ts`, `main/features/commands.ts`, `main/menu.ts`                            | `main/menu.ts`, `main/commands.ts`          | `main/menu.test.ts`                                                             |
+| `launchAtLogin`, `deepLinks`                                          | `preload/features/deep-links.ts`, `main/features/deep-links.ts`                                        | `main/deep-links.ts`                        | `preload/deep-links-feature.test.ts`                                            |
+| `featureFlags`, `diagnostics`, `feedback`                             | `preload/features/diagnostics.ts`, `main/features/diagnostics.ts`                                      | `main/diagnostics.ts`                       | `preload/presence-feature.test.ts`                                              |
+| `helper` (ping, state, restart, dictation partials and transcription) | `preload/features/dictation.ts`, `main/features/dictation.ts`, `main/windows-helper.ts`                | `native/mac-helper`                         | `main/dictation.test.ts`, `native/Vellum.WindowsHelper.Tests`                   |
+| `helper.hotkey` (voice mode chord, registration state)                | `preload/features/dictation.ts`, `main/features/voice-mode-chord.ts`, `native/.../VoiceModeChordService.cs`    | `native/mac-helper` (voice key hold)        | `main/voice-mode-chord.test.ts`, `native/Vellum.WindowsHelper.Tests`                |
+| `permissions`, `text`                                                 | `preload/features/permissions.ts`, `main/features/permissions.ts`                                      | `main/permissions.ts`                       | `main/permissions-feature.test.ts`                                              |
+| `status`, `identity`, `icon`, `dock`, `power`, `connectivity`         | `preload/features/presence.ts`, `main/features/presence.ts`, `main/tray.ts`, `main/taskbar.ts`         | `main/dock.ts`, `main/tray.ts`              | `preload/presence-feature.test.ts`, `main/tray.test.ts`, `main/taskbar.test.ts` |
+| `share`, `notifications`                                              | `preload/features/notifications-share.ts`, `main/features/share.ts`, `main/features/notifications.ts`, `native/.../NotificationService.cs` (a toast from a sender takes the assistant avatar as its app-logo image, the assistant's name as its title, and the conversation title as its subtitle) | `main/share.ts`, `main/notifications.ts`    | `main/notifications-share-feature.test.ts`, `native/Vellum.WindowsHelper.Tests` |
+| `downloads`                                                           | `preload/features/downloads.ts`, `main/features/downloads.ts`                                          | `@vellumai/electron-desktop` `downloads.ts` | `@vellumai/electron-desktop` `downloads.test.ts`                                |
+| `localMode`                                                           | `preload/features/local-mode.ts`, `main/features/local-mode.ts`, `main/local-mode-providers.ts`        | `main/local-mode.client.ts`                 | `main/local-mode-feature.test.ts`, `main/cli-provisioning.test.ts`              |
+| `fileOpen`, `paths`                                                   | `preload/features/paths.ts`, `main/features/file-open.ts`                                              | `main/file-open.ts`                         | `preload/paths.test.ts`, `main/file-open.test.ts`                               |
+| `bundleConfirm`                                                       | `preload/features/bundles.ts`, `main/features/bundles.ts`                                              | `main/bundles.ts`                           | `main/bundles-feature.test.ts`, package smoke (`.vellum` association)           |
+| `quickInput`, `commandPalette`, `dictationOverlay`, `popout`          | `preload/features/auxiliary-windows.ts`, `main/features/auxiliary-windows.ts`                          | `main/*-window.ts`                          | `main/auxiliary-windows.test.ts`                                                |
+| `update`                                                              | `preload/features/auto-update.ts`, `main/features/auto-update.ts`, `main/auto-update.ts`               | `main/auto-update.ts`                       | `main/auto-update.test.ts`                                                      |
 
 ## Main-process capabilities without a bridge key
 
@@ -43,19 +61,20 @@ that exercises the Windows behavior.
 
 ## Windows-only surface
 
-| Surface                         | Why                                                                                    |
-| ------------------------------- | -------------------------------------------------------------------------------------- |
-| `menu.titles`, `menu.popup`     | The shell hides the native frame, so the renderer draws the menu bar in its title bar. |
-| `mainWindow.setTitleBarOverlay` | Native caption buttons are themed with the renderer's palette.                         |
+| Surface                                                             | Why                                                                                                                                                                             |
+| ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `menu.titles`, `menu.popup`                                         | The shell hides the native frame, so the renderer draws the menu bar in its title bar.                                                                                          |
+| `mainWindow.setTitleBarOverlay`                                     | Native caption buttons are themed with the renderer's palette.                                                                                                                  |
+| `helper.hotkey.setVoiceModeChord`, `helper.hotkey.onRegistrationChange` | The keyboard hook takes the voice mode shortcut's bare-modifier chord and reports whether the registration is live, so the renderer only quiets its focused-window tap listener while native capture is. |
 
 ## Not applicable on Windows
 
-| macOS concept                                           | Windows equivalent                                                                          |
-| ------------------------------------------------------- | ------------------------------------------------------------------------------------------- |
-| `companion`, `voiceActivity` (companion surface)        | None. The shell opens no floating companion window; the renderer feature-detects both keys. |
-| `helper.hotkey` (Fn push-to-talk)                       | A configurable global chord registered through `hotkeys`.                                   |
-| Dock badge and bounce                                   | Taskbar overlay icon and attention flash (`main/taskbar.ts`).                               |
-| Share sheet                                             | Native Save As dialog (`main/features/share.ts`).                                           |
-| Quick Look extension                                    | Explorer preview and thumbnail handler.                                                     |
-| Accessibility, Input Monitoring, Automation permissions | No Windows permission concept; the rows are hidden on a Windows host.                       |
-| Notarization and stapling                               | Authenticode signatures, verified at release time.                                          |
+| macOS concept                                           | Windows equivalent                                                                                                                 |
+| ------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| `companion`, `voiceActivity` (companion surface)        | None. The shell opens no floating companion window; the renderer feature-detects both keys.                                        |
+| `helper.hotkey.setModifierHold` (the voice key: Fn held to dictate, double-tapped for a call) | `helper.hotkey.setVoiceModeChord`: the voice mode shortcut's bare-modifier chord, registered with the helper's keyboard hook (`main/features/voice-mode-chord.ts`). |
+| Dock badge and bounce                                   | Taskbar overlay icon and attention flash (`main/taskbar.ts`).                                                                      |
+| Share sheet                                             | Native Save As dialog (`main/features/share.ts`).                                                                                  |
+| Quick Look extension                                    | Explorer preview and thumbnail handler.                                                                                            |
+| Accessibility, Input Monitoring, Automation permissions | No Windows permission concept; the rows are hidden on a Windows host.                                                              |
+| Notarization and stapling                               | Authenticode signatures, verified at release time.                                                                                 |

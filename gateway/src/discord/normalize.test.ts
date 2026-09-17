@@ -1,8 +1,19 @@
 import { describe, expect, test } from "bun:test";
 
 import { admitDiscordMessage } from "./admit.js";
-import { DiscordMessageCreateSchema } from "./message-schemas.js";
-import { normalizeDiscordMessage, toAdmissionCandidate } from "./normalize.js";
+import {
+  DiscordInteractionSchema,
+  DiscordMessageCreateSchema,
+  DiscordMessageDeleteSchema,
+  DiscordMessageReactionSchema,
+} from "./message-schemas.js";
+import {
+  normalizeDiscordInteraction,
+  normalizeDiscordMessage,
+  normalizeDiscordMessageDelete,
+  normalizeDiscordMessageReaction,
+  toAdmissionCandidate,
+} from "./normalize.js";
 import "../__tests__/test-preload.js";
 
 /** A well-formed guild MESSAGE_CREATE payload, as Discord sends it. */
@@ -77,10 +88,10 @@ describe("DiscordMessageCreateSchema", () => {
   });
 
   test("a malformed guild id fails closed, not to absent", () => {
-    // Absence marks a DM, and a DM is admitted with no allow-list entry and
-    // no mention. Collapsing a parse failure to undefined would hand a guild
-    // message both exemptions, so it collapses to a truthy sentinel instead
-    // and stays on the guild path. Same reasoning as the bot indicators.
+    // Absence marks a DM, and a DM is admitted without a mention. Collapsing
+    // a parse failure to undefined would hand a guild message that exemption,
+    // so it collapses to a truthy sentinel instead and stays on the guild
+    // path. Same reasoning as the bot indicators.
     const message = parse(messagePayload({ guild_id: 42 }));
     expect(message.guild_id).toBeDefined();
     expect(message.guild_id).not.toBeUndefined();
@@ -121,15 +132,6 @@ describe("toAdmissionCandidate", () => {
     });
   });
 
-  test("threads carry their resolved parent", () => {
-    const candidate = toAdmissionCandidate(
-      parse(messagePayload({ channel_id: "thread-1" })),
-      "channel-1",
-    );
-    expect(candidate?.channelId).toBe("thread-1");
-    expect(candidate?.parentChannelId).toBe("channel-1");
-  });
-
   test("webhook messages read as bot-authored", () => {
     const candidate = toAdmissionCandidate(
       parse(messagePayload({ webhook_id: "wh-1" })),
@@ -152,7 +154,6 @@ describe("toAdmissionCandidate", () => {
       expect(candidate?.authorIsBot).toBe(true);
       const verdict = admitDiscordMessage(candidate!, {
         botUserId: "bot-1",
-        allowedChannelIds: new Set(["channel-1"]),
       });
       expect(verdict).toEqual({ admitted: false, reason: "bot_authored" });
     }
@@ -310,9 +311,44 @@ describe("normalizeDiscordMessage", () => {
     });
     const event = normalizeDiscordMessage(parse(raw), { raw });
     expect(event?.source.chatType).toBe("dm");
+    expect(event?.source.isDirectMessage).toBe(true);
+    expect(event?.message.eventKind).toBe("message");
     expect(event?.message.conversationExternalId).toBe("dm-channel-1");
     expect(event?.source.threadId).toBeUndefined();
     expect(event?.actor.actorExternalId).toBe("user-1");
+  });
+
+  test("states whether the bot was mentioned when it knows its own id", () => {
+    // The fact rides the event so the runtime can expect a reply before any
+    // text exists. Read from the same `mentions` array the admission gate
+    // keys on, so the two can never disagree about one message.
+    const mentioned = messagePayload();
+    expect(
+      normalizeDiscordMessage(parse(mentioned), {
+        raw: mentioned,
+        botUserId: "bot-1",
+      })?.source.botMentioned,
+    ).toBe(true);
+
+    const unmentioned = messagePayload({
+      guild_id: undefined,
+      channel_id: "dm-channel-1",
+      mentions: [],
+    });
+    expect(
+      normalizeDiscordMessage(parse(unmentioned), {
+        raw: unmentioned,
+        botUserId: "bot-1",
+      })?.source.botMentioned,
+    ).toBe(false);
+  });
+
+  test("leaves the mention fact unstated without its own id", () => {
+    // Absent means "not established", never "not mentioned".
+    const raw = messagePayload();
+    expect(
+      normalizeDiscordMessage(parse(raw), { raw })?.source.botMentioned,
+    ).toBeUndefined();
   });
 
   test("keeps a file-only DM routable with empty content", () => {
@@ -350,29 +386,28 @@ describe("normalizeDiscordMessage", () => {
     expect(
       admitDiscordMessage(candidate!, {
         botUserId: "bot-1",
-        allowedChannelIds: new Set(),
       }),
-    ).toEqual({ admitted: true });
+    ).toEqual({ admitted: true, botMentioned: false });
   });
 
   test("a malformed guild id stays a guild message, not a DM", () => {
-    // The DM lane reads an absent guild as private and skips both the
-    // allow-list and the mention check, so a parse failure must not land
-    // there. The schema collapses a bad `guild_id` to a sentinel rather than
-    // to undefined, which keeps it on the guild path.
+    // The DM lane reads an absent guild as private and skips the mention
+    // check, so a parse failure must not land there. The schema collapses a
+    // bad `guild_id` to a sentinel rather than to undefined, which keeps it
+    // on the guild path.
     const raw = messagePayload({ guild_id: 12345, mentions: [] });
     const parsed = parse(raw);
     expect(parsed.guild_id).toBeDefined();
 
     const event = normalizeDiscordMessage(parsed, { raw });
     expect(event?.source.chatType).toBe("channel");
+    expect(event?.source.isDirectMessage).toBe(false);
 
     // And the gate keeps applying the guild controls to it.
     const candidate = toAdmissionCandidate(parsed, undefined);
     expect(candidate).not.toBeNull();
     const verdict = admitDiscordMessage(candidate!, {
       botUserId: "bot-1",
-      allowedChannelIds: new Set(["channel-1"]),
     });
     expect(verdict).toEqual({ admitted: false, reason: "bot_not_mentioned" });
   });
@@ -388,7 +423,6 @@ describe("normalizeDiscordMessage", () => {
     // guild rather than on the absence of a parent channel.
     const raw = messagePayload({ channel_id: "thread-1" });
     const event = normalizeDiscordMessage(parse(raw), {
-      parentChannelId: "channel-1",
       raw,
     });
     expect(event?.source.chatType).toBe("channel");
@@ -416,5 +450,344 @@ describe("normalizeDiscordMessage", () => {
     expect(normalizeDiscordMessage(noChannel, { raw: {} })).toBeNull();
     const noAuthor = parse(messagePayload({ author: undefined }));
     expect(normalizeDiscordMessage(noAuthor, { raw: {} })).toBeNull();
+  });
+});
+
+describe("normalizeDiscordMessage: edits", () => {
+  test("an edit names its family and revision without carrying media", () => {
+    const message = parse(
+      messagePayload({
+        edited_timestamp: "2026-08-27T10:00:00.000000+00:00",
+        attachments: [{ id: "att-1", filename: "photo.png" }],
+      }),
+    );
+    const event = normalizeDiscordMessage(message, {
+      raw: {},
+      edit: { revision: message.edited_timestamp! },
+    });
+
+    expect(event).not.toBeNull();
+    expect(event!.message.eventKind).toBe("edit");
+    // The dedup id is unique per revision so successive edits of one message
+    // never swallow each other; the source id keeps naming the message the
+    // edit rewrites.
+    expect(event!.message.externalMessageId).toBe(
+      "msg-1:edit:2026-08-27T10:00:00.000000+00:00",
+    );
+    expect(event!.source.messageId).toBe("msg-1");
+    // An edit refers to another message and ingests no media of its own.
+    expect(event!.message.attachments).toBeUndefined();
+  });
+});
+
+describe("normalizeDiscordMessageDelete", () => {
+  test("a delete states its family and its unattributed actor", () => {
+    const parsed = DiscordMessageDeleteSchema.safeParse({
+      id: "msg-9",
+      channel_id: "channel-1",
+      guild_id: "guild-1",
+    });
+    expect(parsed.success).toBe(true);
+    const event = normalizeDiscordMessageDelete(
+      parsed.success ? parsed.data : (undefined as never),
+      { raw: {} },
+    );
+
+    expect(event).not.toBeNull();
+    expect(event!.message.eventKind).toBe("delete");
+    expect(event!.message.externalMessageId).toBe("msg-9:delete");
+    expect(event!.source.messageId).toBe("msg-9");
+    // The wire names no actor: the synthetic id is not an identity claim,
+    // and the flag is what lets the daemon treat it that way.
+    expect(event!.actor.actorExternalId).toBe("discord-system");
+    expect(event!.source.actorUnattributed).toBe(true);
+    expect(event!.source.isDirectMessage).toBe(false);
+  });
+
+  test("a DM delete proves its lane by guild absence", () => {
+    const parsed = DiscordMessageDeleteSchema.safeParse({
+      id: "msg-10",
+      channel_id: "dm-channel-1",
+    });
+    expect(parsed.success).toBe(true);
+    const event = normalizeDiscordMessageDelete(
+      parsed.success ? parsed.data : (undefined as never),
+      { raw: {} },
+    );
+
+    expect(event!.source.isDirectMessage).toBe(true);
+    expect(event!.source.conversationType).toBe("dm");
+  });
+});
+describe("normalizeDiscordMessageReaction", () => {
+  // Stand-in for the id `gateway-socket.ts` mints per received dispatch. It
+  // is a parameter precisely so the normalizer stays deterministic here.
+  const INGEST_ID = "ingest-1";
+
+  function parseReaction(payload: Record<string, unknown>) {
+    const parsed = DiscordMessageReactionSchema.safeParse(payload);
+    if (!parsed.success) {
+      throw new Error("schema unexpectedly rejected payload");
+    }
+    return parsed.data;
+  }
+
+  const thumbsUp = (overrides: Record<string, unknown> = {}) =>
+    parseReaction({
+      user_id: "user-1",
+      channel_id: "channel-1",
+      message_id: "msg-1",
+      guild_id: "guild-1",
+      emoji: { id: null, name: "\u{1F44D}" },
+      ...overrides,
+    });
+
+  test("a unicode reaction carries the structured payload", () => {
+    const event = normalizeDiscordMessageReaction(thumbsUp(), {
+      op: "added",
+      ingestId: INGEST_ID,
+      raw: {},
+    });
+
+    expect(event).not.toBeNull();
+    expect(event!.message.eventKind).toBe("reaction");
+    expect(event!.message.content).toBe("");
+    expect(event!.message.reaction).toEqual({
+      op: "added",
+      emoji: "\u{1F44D}",
+      emojiKind: "unicode",
+      emojiName: "\u{1F44D}",
+      targetMessageId: "msg-1",
+    });
+    expect(event!.message.externalMessageId).toBe(
+      `msg-1:reaction:\u{1F44D}:user-1:${INGEST_ID}`,
+    );
+    expect(event!.source.messageId).toBe("msg-1");
+    expect(event!.actor.actorExternalId).toBe("user-1");
+    expect(event!.source.isDirectMessage).toBe(false);
+  });
+
+  test("a removal appends the op suffix so it never dedups against the add", () => {
+    const event = normalizeDiscordMessageReaction(thumbsUp(), {
+      op: "removed",
+      ingestId: INGEST_ID,
+      raw: {},
+    });
+
+    expect(event!.message.reaction!.op).toBe("removed");
+    expect(event!.message.externalMessageId).toBe(
+      `msg-1:reaction:\u{1F44D}:user-1:removed:${INGEST_ID}`,
+    );
+  });
+
+  test("a custom emoji carries its structure beside the spelling", () => {
+    const event = normalizeDiscordMessageReaction(
+      thumbsUp({ emoji: { id: "111222333", name: "party_blob" } }),
+      { op: "added", ingestId: INGEST_ID, raw: {} },
+    );
+
+    expect(event!.message.reaction).toMatchObject({
+      emojiKind: "custom",
+      emojiName: "party_blob",
+      emojiId: "111222333",
+      emojiAnimated: false,
+    });
+    // The spelling is unchanged: the outbound route parses it back to
+    // `name:id`, and the dedup id embeds it byte for byte.
+    expect(event!.message.reaction!.emoji).toBe("<:party_blob:111222333>");
+    expect(event!.message.externalMessageId).toBe(
+      `msg-1:reaction:<:party_blob:111222333>:user-1:${INGEST_ID}`,
+    );
+  });
+
+  test("an animated custom emoji says so without changing its spelling", () => {
+    const event = normalizeDiscordMessageReaction(
+      thumbsUp({
+        emoji: { id: "444555666", name: "party_blob", animated: true },
+      }),
+      { op: "added", ingestId: INGEST_ID, raw: {} },
+    );
+
+    expect(event!.message.reaction!.emojiAnimated).toBe(true);
+    // The dedup id embeds the spelling, so it stays the plain form and
+    // animation is reported in the typed field.
+    expect(event!.message.reaction!.emoji).toBe("<:party_blob:444555666>");
+  });
+
+  test("a guild emoji named like a standard one is told apart by kind", () => {
+    // A guild can name a custom emoji anything, `white_check_mark` included.
+    // A reader tells the two apart by asking the kind, never by matching the
+    // shape of the spelling.
+    const squatter = normalizeDiscordMessageReaction(
+      thumbsUp({ emoji: { id: "999888777", name: "white_check_mark" } }),
+      { op: "added", ingestId: INGEST_ID, raw: {} },
+    );
+    const standard = normalizeDiscordMessageReaction(
+      thumbsUp({ emoji: { id: null, name: "\u2705" } }),
+      { op: "added", ingestId: INGEST_ID, raw: {} },
+    );
+
+    expect(squatter!.message.reaction!.emojiKind).toBe("custom");
+    expect(squatter!.message.reaction!.emojiName).toBe("white_check_mark");
+    expect(standard!.message.reaction!.emojiKind).toBe("unicode");
+    expect(standard!.message.reaction!.emojiName).toBe("\u2705");
+  });
+
+  test("an emoji with no name cannot be expressed and drops", () => {
+    const event = normalizeDiscordMessageReaction(
+      thumbsUp({ emoji: { id: "111222333", name: null } }),
+      { op: "removed", ingestId: INGEST_ID, raw: {} },
+    );
+
+    expect(event).toBeNull();
+  });
+
+  test("a DM reaction proves its lane by guild absence", () => {
+    const event = normalizeDiscordMessageReaction(
+      parseReaction({
+        user_id: "user-1",
+        channel_id: "dm-channel-1",
+        message_id: "msg-2",
+        emoji: { id: null, name: "\u2705" },
+      }),
+      { op: "added", ingestId: INGEST_ID, raw: {} },
+    );
+
+    expect(event!.source.isDirectMessage).toBe(true);
+    expect(event!.source.conversationType).toBe("dm");
+  });
+
+  test("a thread reaction addresses the parent conversation and names the thread", () => {
+    const event = normalizeDiscordMessageReaction(
+      thumbsUp({ channel_id: "thread-1", message_id: "msg-3" }),
+      {
+        op: "added",
+        ingestId: INGEST_ID,
+        parentChannelId: "channel-1",
+        raw: {},
+      },
+    );
+
+    expect(event!.message.conversationExternalId).toBe("channel-1");
+    expect(event!.source.threadId).toBe("thread-1");
+  });
+
+  test("add, remove and re-add are three events, not two", () => {
+    // Three acts, three ids. The dispatch payload is byte-identical across
+    // all three, so `ingestId` is the only thing separating them.
+    const ids = (["added", "removed", "added"] as const).map(
+      (op, index) =>
+        normalizeDiscordMessageReaction(thumbsUp(), {
+          op,
+          ingestId: `dispatch-${index}`,
+          raw: {},
+        })!.message.externalMessageId,
+    );
+
+    expect(new Set(ids).size).toBe(3);
+  });
+
+  test("one dispatch forwarded twice keeps its id, so redelivery still dedups", () => {
+    // The other half of the contract: the id is stamped once per received
+    // dispatch and rides in the forwarded payload, so a retried forward
+    // presents the same id.
+    const first = normalizeDiscordMessageReaction(thumbsUp(), {
+      op: "added",
+      ingestId: "dispatch-0",
+      raw: {},
+    });
+    const redelivered = normalizeDiscordMessageReaction(thumbsUp(), {
+      op: "added",
+      ingestId: "dispatch-0",
+      raw: {},
+    });
+
+    expect(redelivered!.message.externalMessageId).toBe(
+      first!.message.externalMessageId,
+    );
+  });
+});
+describe("normalizeDiscordInteraction", () => {
+  function parseInteraction(payload: Record<string, unknown>) {
+    const parsed = DiscordInteractionSchema.safeParse(payload);
+    if (!parsed.success) {
+      throw new Error("schema unexpectedly rejected payload");
+    }
+    return parsed.data;
+  }
+
+  const base = (overrides: Record<string, unknown> = {}) => ({
+    id: "inter-1",
+    token: "inter-token-1",
+    type: 3,
+    channel_id: "dm-channel-1",
+    data: { custom_id: "apr:req-1:approve_once", component_type: 2 },
+    message: { id: "card-msg-1" },
+    user: { id: "user-1", username: "alice", global_name: "Alice" },
+    ...overrides,
+  });
+
+  test("a DM button press takes the button family with the card's id", () => {
+    const event = normalizeDiscordInteraction(parseInteraction(base()), {
+      raw: {},
+    });
+
+    expect(event).not.toBeNull();
+    expect(event!.message.eventKind).toBe("button");
+    expect(event!.message.callbackData).toBe("apr:req-1:approve_once");
+    expect(event!.message.content).toBe("apr:req-1:approve_once");
+    expect(event!.message.externalMessageId).toBe("inter-1");
+    expect(event!.source.messageId).toBe("card-msg-1");
+    expect(event!.actor.actorExternalId).toBe("user-1");
+    expect(event!.actor.displayName).toBe("Alice");
+    expect(event!.source.isDirectMessage).toBe(true);
+    expect(event!.source.conversationType).toBe("dm");
+  });
+
+  test("a guild press names its actor from member.user and proves no DM", () => {
+    const event = normalizeDiscordInteraction(
+      parseInteraction(
+        base({
+          guild_id: "guild-1",
+          user: undefined,
+          member: { user: { id: "user-2", username: "bob" } },
+        }),
+      ),
+      { raw: {} },
+    );
+
+    expect(event!.actor.actorExternalId).toBe("user-2");
+    expect(event!.source.isDirectMessage).toBe(false);
+    expect(event!.source.conversationType).toBeUndefined();
+  });
+
+  test("a bot actor cannot press a real button and drops", () => {
+    const event = normalizeDiscordInteraction(
+      parseInteraction(
+        base({ user: { id: "bot-x", username: "x", bot: true } }),
+      ),
+      { raw: {} },
+    );
+
+    expect(event).toBeNull();
+  });
+
+  test("an interaction naming no actor drops", () => {
+    const event = normalizeDiscordInteraction(
+      parseInteraction(base({ user: undefined })),
+      { raw: {} },
+    );
+
+    expect(event).toBeNull();
+  });
+
+  test("a thread press addresses the parent conversation", () => {
+    const event = normalizeDiscordInteraction(
+      parseInteraction(base({ channel_id: "thread-1", guild_id: "guild-1" })),
+      { parentChannelId: "channel-1", raw: {} },
+    );
+
+    expect(event!.message.conversationExternalId).toBe("channel-1");
+    expect(event!.source.threadId).toBe("thread-1");
   });
 });

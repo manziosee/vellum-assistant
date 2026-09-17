@@ -7,6 +7,7 @@
  * **State managed:**
  * - `mainView` — which top-level panel is displayed
  * - `activeAppId` / `openedAppState` — app viewer
+ * - `appLoad`: the app request in flight, owning which settlement may write
  * - `activeDocumentTarget` / `openedDocumentState` — document viewer, holding
  *   a document surface or a read-only preview of a workspace file
  * - `isAppMinimized` — mobile-only: app viewer minimized
@@ -20,6 +21,8 @@
  * - `activeAcpRunId` — ACP run detail panel
  * - `activeBackgroundTaskId` — background-task detail panel
  * - `activeSkillDetailId` — skill detail panel
+ * - `activeChannelTranscript`: read-only external-channel transcript drawer
+ *   (identity only; the panel re-derives its rows from the live transcript)
  *
  * App share/deploy lifecycle lives in `domains/chat/deploy-store.ts`.
  *
@@ -29,15 +32,19 @@
 import { captureError } from "@/lib/sentry/capture-error";
 import { create } from "zustand";
 
-import type { SetupChannelId } from "@/types/channel-types";
+import {
+  CHANNEL_META,
+  type ChannelCredentialForm,
+} from "@/domains/channels/channel-meta";
+import { SETUP_CHANNEL_IDS, type SetupChannelId } from "@/types/channel-types";
 import type { ProcessKind } from "@/domains/chat/process-registry/types";
 import type { ChatMessageToolCall } from "@/domains/chat/api/event-types";
 import type { ToolCallCardItem } from "@/domains/chat/utils/tool-call-card-utils";
 import type { DisplayAttachment } from "@/types/attachment-types";
 
-import { appsByIdOpenPost, documentsByIdGet } from "@/generated/daemon/sdk.gen";
+import { appsByIdOpenPost } from "@/generated/daemon/sdk.gen";
 import { primeAppHtmlCache } from "@/utils/app-html-cache";
-import { workspaceBasenameOf } from "@/domains/chat/utils/workspace-path-links";
+import { workspaceBasenameOf } from "@/utils/workspace-path-links";
 import { useUnseenDocumentChangesStore } from "@/domains/chat/unseen-document-changes-store";
 
 import type { WebSearchResultItem } from "@/assistant/web-activity-types";
@@ -55,7 +62,10 @@ type OverlayView =
   | "acp-run-detail"
   | "background-task-detail"
   | "skill-detail"
-  | "channel-setup";
+  | "wake-detail"
+  | "channel-setup"
+  | "channel-transcript"
+  | "chat-info";
 
 /**
  * Resolve the "view before" value for overlay navigation.
@@ -115,19 +125,33 @@ export function isAppNotFoundError(err: unknown): boolean {
   return typeof message === "string" && message.startsWith("App not found");
 }
 
+/** Whether `token` still names the request the store is waiting on. */
+function isCurrentAppLoad(state: ViewerState, token: number): boolean {
+  return state.appLoad?.token === token;
+}
+
+/** Every overlay's restore target: the view it was opened over. */
+const VIEW_BEFORE_FIELDS = [
+  "viewBeforeDocument",
+  "viewBeforeSubagentDetail",
+  "viewBeforeToolDetail",
+  "viewBeforeActivitySteps",
+  "viewBeforeMessageFiles",
+  "viewBeforeWorkflowDetail",
+  "viewBeforeAcpRunDetail",
+  "viewBeforeBackgroundTaskDetail",
+  "viewBeforeSkillDetail",
+  "viewBeforeWakeDetail",
+  "viewBeforeChannelSetup",
+  "viewBeforeChannelTranscript",
+  "viewBeforeChatInfo",
+] as const;
+
+type ViewBeforeField = (typeof VIEW_BEFORE_FIELDS)[number];
+
 function resolveViewBefore(
   state: ViewerState,
-  field:
-    | "viewBeforeDocument"
-    | "viewBeforeSubagentDetail"
-    | "viewBeforeToolDetail"
-    | "viewBeforeActivitySteps"
-    | "viewBeforeMessageFiles"
-    | "viewBeforeWorkflowDetail"
-    | "viewBeforeAcpRunDetail"
-    | "viewBeforeBackgroundTaskDetail"
-    | "viewBeforeSkillDetail"
-    | "viewBeforeChannelSetup",
+  field: ViewBeforeField,
 ): Exclude<MainView, OverlayView> {
   const mv = state.mainView;
   if (
@@ -140,7 +164,10 @@ function resolveViewBefore(
     mv === "acp-run-detail" ||
     mv === "background-task-detail" ||
     mv === "skill-detail" ||
-    mv === "channel-setup"
+    mv === "wake-detail" ||
+    mv === "channel-setup" ||
+    mv === "channel-transcript" ||
+    mv === "chat-info"
   ) {
     return state[field];
   }
@@ -164,15 +191,28 @@ export type MainView =
   | "acp-run-detail"
   | "background-task-detail"
   | "skill-detail"
-  | "channel-setup";
+  | "wake-detail"
+  | "channel-setup"
+  | "channel-transcript"
+  | "chat-info";
 
 export type IntelligenceTab = "identity" | "skills" | "workspace" | "contacts";
 
 export interface OpenedAppState {
+  /** The assistant the app was loaded from: an app id is assistant-scoped. */
+  assistantId: string;
   appId: string;
   dirName?: string;
   name: string;
   html: string;
+}
+
+/** One app request in flight. See {@link ViewerState.appLoad} for the rules. */
+export interface AppLoadRequest {
+  assistantId: string;
+  appId: string;
+  token: number;
+  promise: Promise<boolean>;
 }
 
 /**
@@ -182,6 +222,7 @@ export interface OpenedAppState {
  */
 export interface OpenedDbDocumentState {
   source: "document";
+  assistantId?: string;
   surfaceId: string;
   conversationId: string;
   documentName: string;
@@ -253,7 +294,46 @@ export function sameDocumentTarget(
   );
 }
 
-export type ChannelSetupType = SetupChannelId;
+/**
+ * Channels the setup drawer can actually render.
+ *
+ * Narrower than the setup-channel list on purpose: this panel *is* a
+ * credential form, and a channel without one has nothing for it to show.
+ *
+ * Derived rather than listed. The drawer and the Channels tab render the same
+ * wizards and differ only in where they are mounted, so "has a credential
+ * form" is one fact about the channel, and two hand-kept lists would be free
+ * to disagree about it.
+ */
+export const CHANNEL_SETUP_TYPES = SETUP_CHANNEL_IDS.filter(
+  (id): id is ChannelSetupType => CHANNEL_META[id].credentialForm !== undefined,
+);
+
+/**
+ * Derived at the type level from the same declarations the filter above reads
+ * at runtime: the channels whose `CHANNEL_META` entry declares a form. A bare
+ * `.filter` keeps the unnarrowed union, which would let a formless channel
+ * satisfy this type while the drawer has nothing to show it.
+ */
+export type ChannelSetupType = {
+  [K in SetupChannelId]: (typeof CHANNEL_META)[K] extends {
+    credentialForm: ChannelCredentialForm;
+  }
+    ? K
+    : never;
+}[SetupChannelId];
+
+/** Whether the setup drawer has a credential form for this channel. */
+export function isChannelSetupType(value: string): value is ChannelSetupType {
+  return CHANNEL_SETUP_TYPES.some((id) => id === value);
+}
+
+/**
+ * What the user did to end a channel-setup session, when they did something
+ * more specific than dismissing the drawer. Read at close time to pick which
+ * marker the auto-notify sends, so one close is one message.
+ */
+export type ChannelSetupOutcome = "verify_requested";
 
 export interface ChannelSetupPayload {
   channel: ChannelSetupType;
@@ -266,6 +346,36 @@ export interface ChannelSetupPayload {
    * the panel was opened outside an assistant conversation.
    */
   conversationId?: string;
+  /**
+   * Set by the wizard just before it closes itself. Absent for a plain
+   * dismissal, and never carried between sessions: opening the wizard
+   * replaces this payload wholesale.
+   */
+  outcome?: ChannelSetupOutcome;
+}
+
+/**
+ * Identity of the thread the channel-transcript drawer is showing.
+ *
+ * Held as an identity rather than a payload of rows: entries stream, and a
+ * store that owned them would keep a previous conversation's rows alive after
+ * a switch. The panel re-derives entries from the live transcript and matches
+ * them against this, so a stale thread has nothing to render.
+ */
+export interface ChannelSidecarRef {
+  conversationId: string;
+  channelId: string;
+}
+
+/** Whether a stored drawer reference still addresses the conversation on screen. */
+export function isSameChannelSidecarRef(
+  a: ChannelSidecarRef | null | undefined,
+  b: ChannelSidecarRef | null | undefined,
+): boolean {
+  if (!a || !b) {
+    return false;
+  }
+  return a.conversationId === b.conversationId && a.channelId === b.channelId;
 }
 
 export interface ToolDetailPayload {
@@ -324,36 +434,67 @@ export interface ToolDetailPayload {
 }
 
 /**
- * Payload for the activity-steps side panel — the full steps timeline of one
+ * Payload for the wake-detail side panel: everything the transcript card
+ * folds away behind "View details".
+ *
+ * A snapshot rather than a surface id, because a wake card is written once and
+ * never revised: there is no later version of it for the panel to miss, and a
+ * lookup would strand the panel empty whenever the message it came from has
+ * been paged out of the loaded transcript window.
+ */
+export interface WakeDetailPayload {
+  title: string;
+  body: string;
+  metadata: Array<{ label: string; value: string }>;
+}
+
+/**
+ * Payload for the activity-steps side panel: the full steps timeline of one
  * contiguous thinking + tool run (a `MultiActivityGroup`).
  *
- * `messageId` + `groupIndex` are the stable identity of the activity group in
- * the transcript: the open panel re-derives live items from the chat-session
- * store (via `useLiveActivityGroup`) so it streams as new steps land. The
- * embedded `items` / `toolCalls` are the open-time snapshot, used only when
- * the live source can't be resolved (message paged out, or identity-less
- * callers like stories).
+ * `messageId` plus the raw group tool-call ids identify the activity group as
+ * pagination shifts its numeric index or older history extends the group.
+ * Thinking-only groups retain exact-index identity. The embedded `items` /
+ * `toolCalls` are the open-time snapshot, used only when the live source can't
+ * be resolved (message paged out, or identity-less callers like stories).
  */
 export interface ActivityStepsPayload {
   messageId?: string;
   groupIndex?: number;
+  /** Tool-call occurrence ids from the group before display suppression. */
+  groupToolCallIds?: string[];
   items: ToolCallCardItem[];
   toolCalls: ChatMessageToolCall[];
+  /** Open-time evidence that this was the active trailing transcript group. */
+  active?: boolean;
 }
 
 /**
  * Whether two activity-steps payloads address the same transcript group.
- * Keys on the stable (message, group) identity when present, falling back to
- * the first tool-call id for identity-less callers.
+ * Within one message, overlapping raw tool-call ids keep the same group
+ * selected when pagination prepends older groups. Exact indexes identify
+ * groups that have no raw tool-call evidence.
  */
 export function sameActivityStepsTarget(
   a: ActivityStepsPayload,
   b: ActivityStepsPayload,
 ): boolean {
   if (a.messageId != null || b.messageId != null) {
-    return a.messageId === b.messageId && a.groupIndex === b.groupIndex;
+    if (a.messageId !== b.messageId) {
+      return false;
+    }
+    if (a.groupToolCallIds?.length && b.groupToolCallIds?.length) {
+      const bIds = new Set(b.groupToolCallIds);
+      return a.groupToolCallIds.some((id) => bIds.has(id));
+    }
+    return a.groupIndex === b.groupIndex;
   }
-  return a.toolCalls[0]?.id === b.toolCalls[0]?.id;
+  const aAnchor = a.toolCalls[0]?.id;
+  const bAnchor = b.toolCalls[0]?.id;
+  if (aAnchor != null && bAnchor != null) {
+    return aAnchor === bAnchor;
+  }
+  return a.groupIndex != null && a.groupIndex === b.groupIndex;
 }
 
 /**
@@ -375,6 +516,47 @@ export function sameMessageFilesTarget(
   b: MessageFilesPayload,
 ): boolean {
   return a.messageId === b.messageId;
+}
+
+/** The asset categories the chat-info panel groups a conversation into. */
+export type ChatInfoCategory = "apps" | "files" | "frames";
+
+/** What the chat-info panel is showing: one conversation, at one level. */
+export interface ChatInfoPayload {
+  assistantId: string;
+  conversationId: string;
+  /**
+   * The category drilled into through See All. `null` is the top level, where
+   * every category shows one truncated row.
+   */
+  category: ChatInfoCategory | null;
+}
+
+/**
+ * The identity of a chat-info target. Conversation ids are assistant-scoped,
+ * so both halves name it; hosts key the panel on this so a retarget remounts
+ * it rather than carrying preview and pending-delete state across.
+ */
+export function chatInfoTargetKey(
+  target: Pick<ChatInfoPayload, "assistantId" | "conversationId">,
+): string {
+  return `${target.assistantId}:${target.conversationId}`;
+}
+
+/**
+ * Whether the chat-info panel is on screen showing `target`. Single source of
+ * truth for the header trigger's selected state, the trigger's own teardown,
+ * and the store's toggle.
+ */
+export function sameChatInfoTarget(
+  state: Pick<ViewerState, "mainView" | "activeChatInfo">,
+  target: Pick<ChatInfoPayload, "assistantId" | "conversationId">,
+): boolean {
+  return (
+    state.mainView === "chat-info" &&
+    state.activeChatInfo !== null &&
+    chatInfoTargetKey(state.activeChatInfo) === chatInfoTargetKey(target)
+  );
 }
 
 /** The identity fields a thinking drawer target is matched on. */
@@ -414,6 +596,17 @@ export interface ViewerState {
   mainView: MainView;
   activeAppId: string | null;
   openedAppState: OpenedAppState | null;
+  /**
+   * The app load in flight, shared by every caller asking for the same
+   * assistant and app so a surface that mounts mid-load observes the request
+   * already running instead of starting a second one. `token` is what a
+   * settlement checks: a load whose token is not the current one has been
+   * abandoned and must not touch the viewer. A pending request always names
+   * the app the viewer holds.
+   */
+  appLoad: AppLoadRequest | null;
+  /** Monotonic source of {@link AppLoadRequest.token}. */
+  appLoadSeq: number;
   activeDocumentTarget: DocumentTarget | null;
   openedDocumentState: OpenedDocumentState | null;
   isAppMinimized: boolean;
@@ -427,6 +620,8 @@ export interface ViewerState {
   viewBeforeActivitySteps: Exclude<MainView, OverlayView>;
   activeMessageFiles: MessageFilesPayload | null;
   viewBeforeMessageFiles: Exclude<MainView, OverlayView>;
+  activeChatInfo: ChatInfoPayload | null;
+  viewBeforeChatInfo: Exclude<MainView, OverlayView>;
   activeWorkflowRunId: string | null;
   viewBeforeWorkflowDetail: Exclude<MainView, OverlayView>;
   activeAcpRunId: string | null;
@@ -435,8 +630,16 @@ export interface ViewerState {
   viewBeforeBackgroundTaskDetail: Exclude<MainView, OverlayView>;
   activeSkillDetailId: string | null;
   viewBeforeSkillDetail: Exclude<MainView, OverlayView>;
+  activeWakeDetail: WakeDetailPayload | null;
+  viewBeforeWakeDetail: Exclude<MainView, OverlayView>;
   activeChannelSetup: ChannelSetupPayload | null;
   viewBeforeChannelSetup: Exclude<MainView, OverlayView>;
+  /**
+   * Which external-channel thread the read-only channel drawer is showing.
+   * See {@link ChannelSidecarRef} for why this is an identity, not rows.
+   */
+  activeChannelTranscript: ChannelSidecarRef | null;
+  viewBeforeChannelTranscript: Exclude<MainView, OverlayView>;
   /**
    * Monotonic counter bumped when a viewer (a tool-detail drawer or the
    * activity-steps drill-in, which may live in a separate portal subtree)
@@ -456,9 +659,18 @@ export interface ViewerActions {
 
   // --- App viewer ---
   openApp: (appId: string) => void;
-  loadApp: (assistantId: string, appId: string) => Promise<void>;
+  /**
+   * Resolves to whether this app ended up on screen: false when the load
+   * failed, or when the viewer left the app view while the request was in
+   * flight. Callers asking for the same assistant and app share one request.
+   */
+  loadApp: (assistantId: string, appId: string) => Promise<boolean>;
   setLoadedApp: (app: OpenedAppState) => void;
-  handleAppLoadFailed: () => void;
+  /**
+   * Let go of the app without touching `mainView`, so a view that opened over
+   * it (a document, a subagent detail) stays in front.
+   */
+  releaseApp: () => void;
   closeApp: () => void;
   toggleAppMinimized: () => void;
   minimizeApp: () => void;
@@ -485,6 +697,10 @@ export interface ViewerActions {
   // --- Skill detail ---
   openSkillDetail: (skillId: string) => void;
   closeSkillDetail: () => void;
+
+  // --- Wake detail ---
+  openWakeDetail: (payload: WakeDetailPayload) => void;
+  closeWakeDetail: () => void;
 
   // --- Process-detail routing facade ---
   /**
@@ -536,19 +752,73 @@ export interface ViewerActions {
   toggleMessageFiles: (payload: MessageFilesPayload) => void;
   closeMessageFiles: () => void;
 
+  // --- Chat info panel ---
+  /** Open the chat-info panel for `target`, at the top level. */
+  openChatInfo: (target: {
+    assistantId: string;
+    conversationId: string;
+  }) => void;
+  /**
+   * Open the chat-info panel for `target`, or close it when it is already
+   * showing the SAME conversation. Powers the header trigger, where clicking
+   * the already-active control dismisses the panel.
+   */
+  toggleChatInfo: (target: {
+    assistantId: string;
+    conversationId: string;
+  }) => void;
+  closeChatInfo: () => void;
+  /** Drill into a category (See All) or back out (`null`). No-op unless the panel is open. */
+  setChatInfoCategory: (category: ChatInfoCategory | null) => void;
+
   /**
    * Drop the payloads of the panels whose content is scoped to one
    * conversation's transcript. Called on conversation switch: overlay
    * panels are dismissed when the viewer returns to chat, and holding
    * their payloads keeps the previous conversation's data alive -
    * `activeMessageFiles` in particular retains decoded attachment blob/data
-   * URLs. Leaves `mainView` alone; this is a memory concern, not navigation.
+   * URLs.
+   *
+   * Leaves `mainView` alone except for `"chat-info"`, which it restores to
+   * the view the panel was opened from: that panel is the conversation's own,
+   * so a switch that takes its payload has to take the view with it rather
+   * than leave an empty panel on screen.
    */
   clearTranscriptPanelPayloads: () => void;
 
   // --- Channel setup ---
   openChannelSetup: (payload: ChannelSetupPayload) => void;
+  /**
+   * Record how the open session is ending, for the close auto-notify to read.
+   * Call immediately before `closeChannelSetup`.
+   */
+  markChannelSetupOutcome: (outcome: ChannelSetupOutcome) => void;
   closeChannelSetup: () => void;
+
+  // --- Channel transcript (external-channel sidecar) ---
+  openChannelTranscript: (ref: ChannelSidecarRef) => void;
+  /**
+   * Open the channel drawer for `ref`, or close it when the drawer is already
+   * showing that thread. Powers the header's channel-thread control, which is
+   * a toggle rather than a link.
+   */
+  toggleChannelTranscript: (ref: ChannelSidecarRef) => void;
+  /**
+   * Drop the drawer's thread identity. `mainView` is restored to the
+   * pre-drawer view only when the drawer itself is the active view; an
+   * overlay opened on top of the drawer (tool detail, activity steps, skill
+   * detail, ...) keeps exclusive ownership of `mainView`.
+   */
+  closeChannelTranscript: () => void;
+  /**
+   * Close the drawer unless it is still showing `ref`. Called as the sidecar
+   * re-resolves, so a conversation switch, a lost binding, or the flag going
+   * off settles the drawer instead of stranding `mainView` on a thread with
+   * nothing behind it. Passing `null` closes any open channel drawer. A stale
+   * identity is cleared even while another overlay owns `mainView`; that
+   * overlay stays put.
+   */
+  reconcileChannelTranscript: (ref: ChannelSidecarRef | null) => void;
 
   // --- Document viewer ---
   openDocument: () => void;
@@ -571,6 +841,13 @@ export interface ViewerActions {
     content: string,
     mode: string,
   ) => void;
+  /**
+   * Retitle the open document. The viewer writes the new title through the
+   * documents API and calls this so the drawer, the autosave target, and the
+   * mobile overlay all read the name the user just gave it, rather than
+   * waiting for the next load.
+   */
+  renameOpenedDocument: (surfaceId: string, documentName: string) => void;
   handleDocumentLoadFailed: () => void;
   closeDocument: () => void;
 
@@ -588,6 +865,8 @@ const INITIAL_STATE: ViewerState = {
   mainView: "chat",
   activeAppId: null,
   openedAppState: null,
+  appLoad: null,
+  appLoadSeq: 0,
   activeDocumentTarget: null,
   openedDocumentState: null,
   isAppMinimized: false,
@@ -601,6 +880,8 @@ const INITIAL_STATE: ViewerState = {
   viewBeforeActivitySteps: "chat",
   activeMessageFiles: null,
   viewBeforeMessageFiles: "chat",
+  activeChatInfo: null,
+  viewBeforeChatInfo: "chat",
   activeWorkflowRunId: null,
   viewBeforeWorkflowDetail: "chat",
   activeAcpRunId: null,
@@ -609,8 +890,12 @@ const INITIAL_STATE: ViewerState = {
   viewBeforeBackgroundTaskDetail: "chat",
   activeSkillDetailId: null,
   viewBeforeSkillDetail: "chat",
+  activeWakeDetail: null,
+  viewBeforeWakeDetail: "chat",
   activeChannelSetup: null,
   viewBeforeChannelSetup: "chat",
+  activeChannelTranscript: null,
+  viewBeforeChannelTranscript: "chat",
   ruleEditorRequestSeq: 0,
   ruleEditorRequestToolCallId: null,
 };
@@ -646,67 +931,102 @@ const useViewerStoreBase = create<ViewerStore>()((set, get) => ({
       activeAppId: appId,
       openedAppState: null,
       isAppMinimized: false,
+      appLoad: null,
     });
   },
 
-  loadApp: async (assistantId, appId) => {
+  loadApp: (assistantId, appId) => {
+    const pending = get().appLoad;
+    if (
+      pending &&
+      pending.assistantId === assistantId &&
+      pending.appId === appId
+    ) {
+      // One request per app: a mount that lands mid-load (Back onto the app
+      // URL) waits on the result the first caller is already waiting on.
+      return pending.promise;
+    }
+    const token = get().appLoadSeq + 1;
     set({
+      appLoadSeq: token,
       mainView: "app",
       activeAppId: appId,
       openedAppState: null,
       isAppMinimized: false,
     });
-    try {
-      const { data: result } = await appsByIdOpenPost({
-        path: { assistant_id: assistantId, id: appId },
-        throwOnError: true,
-      });
-      if (get().activeAppId !== appId) {
-        return;
+    const promise = (async (): Promise<boolean> => {
+      // The request waits one microtask for the registration below, so every
+      // settlement has a token to compare against.
+      await Promise.resolve();
+      try {
+        const { data: result } = await appsByIdOpenPost({
+          path: { assistant_id: assistantId, id: appId },
+          throwOnError: true,
+        });
+        if (!isCurrentAppLoad(get(), token)) {
+          return false;
+        }
+        set({
+          appLoad: null,
+          openedAppState: {
+            assistantId,
+            appId: result.appId,
+            dirName: result.dirName,
+            name: result.name,
+            html: result.html,
+          },
+        });
+        primeAppHtmlCache(assistantId, result.appId, result.html);
+        // The viewer can leave the app view without dropping activeAppId, so the
+        // id match alone does not mean the app is what the reader sees.
+        return isAppMainView(get().mainView);
+      } catch (err) {
+        if (!isCurrentAppLoad(get(), token)) {
+          return false;
+        }
+        set({ appLoad: null });
+        // 404s here are an expected condition (app was deleted on the
+        // server but the client still has a reference). Skip the Sentry
+        // capture for those, since the daemon already returns a structured
+        // `{ code: "NOT_FOUND", message }` body, and let the UI fall back to
+        // chat as below. Unexpected failures still report.
+        if (!isAppNotFoundError(err)) {
+          captureError(err, { context: "openApp" });
+        }
+        get().closeApp();
+        return false;
       }
-      const app = {
-        appId: result.appId,
-        dirName: result.dirName,
-        name: result.name,
-        html: result.html,
-      };
-      set({ openedAppState: app });
-      primeAppHtmlCache(assistantId, result.appId, result.html);
-    } catch (err) {
-      if (get().activeAppId !== appId) {
-        return;
-      }
-      // 404s here are an expected condition (app was deleted on the
-      // server but the client still has a reference). Skip the Sentry
-      // capture for those — the daemon already returns a structured
-      // `{ code: "NOT_FOUND", message }` body — and let the UI fall
-      // back to chat as below. Unexpected failures still report.
-      if (!isAppNotFoundError(err)) {
-        captureError(err, { context: "openApp" });
-      }
-      set({ mainView: "chat", activeAppId: null, openedAppState: null });
-    }
+    })();
+    set({ appLoad: { assistantId, appId, token, promise } });
+    return promise;
   },
 
   setLoadedApp: (app) => {
     set({ openedAppState: app });
   },
 
-  handleAppLoadFailed: () => {
+  releaseApp: () => {
+    // An overlay opened over the app restores to it on close. With the app
+    // gone there is nothing to restore to, so those targets settle on chat.
+    const state = get();
+    const settled: Partial<Record<ViewBeforeField, "chat">> = {};
+    for (const field of VIEW_BEFORE_FIELDS) {
+      if (isAppMainView(state[field])) {
+        settled[field] = "chat";
+      }
+    }
     set({
-      mainView: "chat",
       activeAppId: null,
       openedAppState: null,
+      isAppMinimized: false,
+      appLoad: null,
+      ...settled,
     });
   },
 
   closeApp: () => {
-    set({
-      mainView: "chat",
-      activeAppId: null,
-      openedAppState: null,
-      isAppMinimized: false,
-    });
+    get().releaseApp();
+    set({ mainView: "chat" });
   },
 
   toggleAppMinimized: () => {
@@ -831,6 +1151,23 @@ const useViewerStoreBase = create<ViewerStore>()((set, get) => ({
     });
   },
 
+  // --- Wake detail ---
+
+  openWakeDetail: (payload) => {
+    set({
+      mainView: "wake-detail",
+      activeWakeDetail: payload,
+      viewBeforeWakeDetail: resolveViewBefore(get(), "viewBeforeWakeDetail"),
+    });
+  },
+
+  closeWakeDetail: () => {
+    set({
+      mainView: get().viewBeforeWakeDetail,
+      activeWakeDetail: null,
+    });
+  },
+
   // --- Process-detail routing facade ---
 
   openProcessDetail: ({ kind, id }) => {
@@ -883,8 +1220,23 @@ const useViewerStoreBase = create<ViewerStore>()((set, get) => ({
       case "skill-detail":
         get().closeSkillDetail();
         return true;
+      case "wake-detail":
+        get().closeWakeDetail();
+        return true;
       case "channel-setup":
         get().closeChannelSetup();
+        return true;
+      case "channel-transcript":
+        get().closeChannelTranscript();
+        return true;
+      case "chat-info":
+        // Alone among the overlays, this one's second level lives in the
+        // store, so Escape and Android Back pop the drill-in before the panel.
+        if (get().activeChatInfo?.category != null) {
+          get().setChatInfoCategory(null);
+        } else {
+          get().closeChatInfo();
+        }
         return true;
       default:
         return false;
@@ -904,11 +1256,71 @@ const useViewerStoreBase = create<ViewerStore>()((set, get) => ({
     });
   },
 
+  markChannelSetupOutcome: (outcome) => {
+    const active = get().activeChannelSetup;
+    if (!active) {
+      return;
+    }
+    set({ activeChannelSetup: { ...active, outcome } });
+  },
+
   closeChannelSetup: () => {
     set({
       mainView: get().viewBeforeChannelSetup,
       activeChannelSetup: null,
     });
+  },
+
+  // --- Channel transcript (external-channel sidecar) ---
+
+  openChannelTranscript: (ref) => {
+    set({
+      mainView: "channel-transcript",
+      activeChannelTranscript: ref,
+      viewBeforeChannelTranscript: resolveViewBefore(
+        get(),
+        "viewBeforeChannelTranscript",
+      ),
+    });
+  },
+
+  toggleChannelTranscript: (ref) => {
+    const state = get();
+    const isOpenOnSameThread =
+      state.mainView === "channel-transcript" &&
+      isSameChannelSidecarRef(state.activeChannelTranscript, ref);
+    if (isOpenOnSameThread) {
+      get().closeChannelTranscript();
+    } else {
+      get().openChannelTranscript(ref);
+    }
+  },
+
+  closeChannelTranscript: () => {
+    const state = get();
+    // Restore `mainView` only when the drawer is what is on screen: a caller
+    // reaching here while another overlay sits on top (reconciliation after a
+    // conversation switch) must not replace that overlay with the drawer's
+    // remembered pre-open view.
+    set(
+      state.mainView === "channel-transcript"
+        ? {
+            mainView: state.viewBeforeChannelTranscript,
+            activeChannelTranscript: null,
+          }
+        : { activeChannelTranscript: null },
+    );
+  },
+
+  reconcileChannelTranscript: (ref) => {
+    const state = get();
+    if (state.activeChannelTranscript === null) {
+      return;
+    }
+    if (isSameChannelSidecarRef(state.activeChannelTranscript, ref)) {
+      return;
+    }
+    get().closeChannelTranscript();
   },
 
   // --- Tool detail ---
@@ -1023,11 +1435,59 @@ const useViewerStoreBase = create<ViewerStore>()((set, get) => ({
     });
   },
 
+  // --- Chat info panel ---
+
+  openChatInfo: (target) => {
+    set({
+      mainView: "chat-info",
+      activeChatInfo: {
+        assistantId: target.assistantId,
+        conversationId: target.conversationId,
+        category: null,
+      },
+      viewBeforeChatInfo: resolveViewBefore(get(), "viewBeforeChatInfo"),
+    });
+  },
+
+  toggleChatInfo: (target) => {
+    if (sameChatInfoTarget(get(), target)) {
+      get().closeChatInfo();
+    } else {
+      get().openChatInfo(target);
+    }
+  },
+
+  closeChatInfo: () => {
+    set({
+      mainView: get().viewBeforeChatInfo,
+      activeChatInfo: null,
+    });
+  },
+
+  setChatInfoCategory: (category) => {
+    const state = get();
+    const active = state.activeChatInfo;
+    if (
+      state.mainView !== "chat-info" ||
+      active == null ||
+      active.category === category
+    ) {
+      return;
+    }
+    set({ activeChatInfo: { ...active, category } });
+  },
+
   clearTranscriptPanelPayloads: () => {
+    const { mainView, viewBeforeChatInfo } = get();
     set({
       activeMessageFiles: null,
       activeActivitySteps: null,
       activeToolDetail: null,
+      activeChatInfo: null,
+      // The chat-info panel is about the conversation itself, so the switch
+      // that drops its payload has to settle its view too. The other three
+      // are reached from a transcript row and are already off screen.
+      mainView: mainView === "chat-info" ? viewBeforeChatInfo : mainView,
     });
   },
 
@@ -1042,11 +1502,24 @@ const useViewerStoreBase = create<ViewerStore>()((set, get) => ({
   },
 
   loadDocument: async (assistantId, documentSurfaceId) => {
+    const current = get();
+    const opened = current.openedDocumentState;
+    if (
+      current.mainView === "document" &&
+      current.activeDocumentTarget?.source === "document" &&
+      current.activeDocumentTarget.surfaceId === documentSurfaceId &&
+      opened?.source === "document" &&
+      opened.assistantId === assistantId &&
+      opened.surfaceId === documentSurfaceId
+    ) {
+      return;
+    }
     const viewBeforeDocument = resolveViewBefore(get(), "viewBeforeDocument");
     const target: DocumentTarget = {
       source: "document",
       surfaceId: documentSurfaceId,
     };
+    const isCurrent = () => get().activeDocumentTarget === target;
     set({
       mainView: "document",
       activeDocumentTarget: target,
@@ -1054,11 +1527,14 @@ const useViewerStoreBase = create<ViewerStore>()((set, get) => ({
       viewBeforeDocument,
     });
     try {
-      const { data: result } = await documentsByIdGet({
-        path: { assistant_id: assistantId, id: documentSurfaceId },
-        throwOnError: true,
+      const { loadDocumentContent } =
+        await import("@/domains/chat/api/document-load");
+      const result = await loadDocumentContent({
+        assistantId,
+        surfaceId: documentSurfaceId,
+        isCurrent,
       });
-      if (!sameDocumentTarget(get().activeDocumentTarget, target)) {
+      if (!isCurrent()) {
         return;
       }
       if (!result) {
@@ -1072,6 +1548,7 @@ const useViewerStoreBase = create<ViewerStore>()((set, get) => ({
       set({
         openedDocumentState: {
           source: "document",
+          assistantId,
           surfaceId: result.surfaceId,
           conversationId: result.conversationId,
           documentName: result.title ?? "Untitled",
@@ -1082,7 +1559,7 @@ const useViewerStoreBase = create<ViewerStore>()((set, get) => ({
         .getState()
         .clearDocumentEverywhere(result.surfaceId);
     } catch {
-      if (!sameDocumentTarget(get().activeDocumentTarget, target)) {
+      if (!isCurrent()) {
         return;
       }
       set({
@@ -1120,6 +1597,16 @@ const useViewerStoreBase = create<ViewerStore>()((set, get) => ({
     }
     const newContent = mode === "append" ? prev.content + content : content;
     set({ openedDocumentState: { ...prev, content: newContent } });
+  },
+
+  renameOpenedDocument: (surfaceId, documentName) => {
+    const prev = get().openedDocumentState;
+    // A workspace-file preview is named by its path, which nothing renames
+    // from here, so only a document surface answers to this.
+    if (!prev || prev.source !== "document" || prev.surfaceId !== surfaceId) {
+      return;
+    }
+    set({ openedDocumentState: { ...prev, documentName } });
   },
 
   handleDocumentLoadFailed: () => {

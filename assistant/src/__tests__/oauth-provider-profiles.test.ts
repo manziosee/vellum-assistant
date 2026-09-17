@@ -7,6 +7,7 @@ mock.module("../security/secure-keys.js", () => ({
 }));
 
 import { getProvider } from "../oauth/oauth-store.js";
+import { expectedScopesForStoredToken } from "../oauth/scope-utils.js";
 import { seedOAuthProviders } from "../oauth/seed-providers.js";
 import { initializeDb } from "../persistence/db-init.js";
 
@@ -14,16 +15,32 @@ await initializeDb();
 seedOAuthProviders();
 
 describe("oauth provider profiles (DB-seeded)", () => {
-  test("google provider row includes Drive in default scopes", () => {
+  test("google provider row includes Drive, Sheets, and Slides in default scopes", () => {
     const provider = getProvider("google");
 
     expect(provider).toBeDefined();
-    expect(JSON.parse(provider!.defaultScopes)).toContain(
-      "https://www.googleapis.com/auth/drive",
-    );
+    const scopes = JSON.parse(provider!.defaultScopes) as string[];
+    expect(scopes).toContain("https://www.googleapis.com/auth/drive");
   });
 
-  test("google provider row contains bearer injection templates for 6 Google API hosts", () => {
+  test("slack provider row requests files:read for the token it stores", () => {
+    // The flow persists the authed_user token, and credential health measures
+    // its grant through the same function used here, so this is the scope set
+    // an integration connection must carry to fetch a file from files.slack.com.
+    const provider = getProvider("slack");
+
+    expect(provider).toBeDefined();
+    const expected = expectedScopesForStoredToken(
+      JSON.parse(provider!.defaultScopes) as string[],
+      provider!.authorizeParams
+        ? (JSON.parse(provider!.authorizeParams) as Record<string, string>)
+        : undefined,
+      provider!.scopeSeparator ?? undefined,
+    );
+    expect(expected).toContain("files:read");
+  });
+
+  test("google provider row contains bearer injection templates for 8 Google API hosts", () => {
     const provider = getProvider("google");
 
     expect(provider).toBeDefined();
@@ -36,7 +53,7 @@ describe("oauth provider profiles (DB-seeded)", () => {
       valuePrefix: string;
     }>;
 
-    expect(templates).toHaveLength(6);
+    expect(templates).toHaveLength(8);
 
     const byHost = new Map(templates.map((t) => [t.hostPattern, t]));
 
@@ -45,6 +62,8 @@ describe("oauth provider profiles (DB-seeded)", () => {
       "www.googleapis.com",
       "people.googleapis.com",
       "docs.googleapis.com",
+      "sheets.googleapis.com",
+      "slides.googleapis.com",
       "tasks.googleapis.com",
       "calendar.googleapis.com",
     ]) {

@@ -45,8 +45,12 @@ Examples:
         },
       ],
       helpText: `
-Lists all credentials in the vault. Each entry includes the same fields as
-"inspect" â€” scrubbed value, timestamps, policy, and metadata.
+Lists credentials from the live credential vault. Each entry includes the same
+fields as inspect: scrubbed value, timestamps, policy, and metadata.
+
+Fails immediately with an error if the credential vault is unreachable. An
+empty list means the vault answered and has no matching credentials, not that
+the store is down.
 
 The --search flag filters results by case-insensitive substring match against
 the credential's service name, field name, label, or description. For example, --search
@@ -70,9 +74,9 @@ path or connection details. Run this to diagnose credential lookup mismatches â€
 for example, when the CLI and the daemon are reading from different stores.
 
 Backend types:
-  encrypted-store   Direct file read from keys.enc (standalone CLI, no daemon)
-  ces-rpc           Delegates to the running CES process via stdio RPC (daemon)
-  ces-http          Delegates to CES sidecar over HTTP (containerized/Docker mode)
+  encrypted-store   Direct file read from keys.enc (standalone CLI, no assistant)
+  ces-rpc           Delegates to the running CES process via socket RPC
+  ces-http          Managed failover when the CES socket is unavailable
 
 Also shows the CREDENTIAL_SECURITY_DIR, GATEWAY_SECURITY_DIR, and
 VELLUM_WORKSPACE_DIR env vars so you can confirm which instance directory this
@@ -178,7 +182,7 @@ Arguments:
   id   (optional) Credential UUID for lookup by ID
 
 Shows everything known about a credential without revealing the secret value.
-The secret is masked to show only the last 4 characters (e.g. ****c123).
+The secret is masked to show only the first 4 characters (e.g. cfat****).
 
 Displayed fields include: label, creation/update timestamps, allowed tools,
 allowed domains, OAuth2 scopes, account info, and injection template count.

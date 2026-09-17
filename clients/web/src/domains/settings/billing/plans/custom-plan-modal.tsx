@@ -36,7 +36,6 @@ import {
   type CustomPlanSeed,
   type MachineChoice,
   computeCustomPlanDiff,
-  NO_CREDITS_LABEL,
   NO_EXTRA_CREDITS,
 } from "./custom-plan-diff";
 import {
@@ -63,7 +62,7 @@ export interface CustomPlanModalProps {
   pending: boolean;
   /**
    * The Pro subscriber's current storage size, when reconfiguring an existing
-   * Pro plan. Storage is upgrade-only for Pro (the change-storage-tier endpoint
+   * Pro plan. Storage is upgrade-only for Pro (change-package
    * rejects downgrades), so tiers below this size render disabled. Leave
    * null/undefined for the base checkout path, where every tier is selectable.
    */
@@ -147,6 +146,10 @@ export function CustomPlanModal({
   onContinue,
 }: CustomPlanModalProps) {
   const { t } = useTranslation("settings");
+  // The bundle picker's chrome (label, placeholder, sentinel row) never names
+  // credits. The options themselves need no swap: the catalog labels are
+  // already the usage bundles' Stripe product names.
+  const noBundleLabel = t("customPlanModal.noExtraUsage");
 
   // A Pro reconfigure seeds the current tiers so the default is a no-op; base
   // checkout passes none and leaves every dimension empty. A baseline machine
@@ -247,7 +250,7 @@ export function CustomPlanModal({
   const creditOptions: SelectOption<CreditChoice>[] = [
     {
       value: NO_EXTRA_CREDITS,
-      label: NO_CREDITS_LABEL,
+      label: noBundleLabel,
       icon: <Coins className="h-4 w-4" aria-hidden />,
     },
     ...selectableCreditTiers.map((t) => ({
@@ -315,9 +318,12 @@ export function CustomPlanModal({
   // one dimension differs from the seed. Base checkout has no seed, so a
   // complete selection is always submittable. Compared against the raw seed
   // values (not the priced diff) so a seed tier the catalog dropped still reads
-  // as changed once the user picks a live replacement.
+  // as changed once the user picks a live replacement. A fee-less (Mighty) seed
+  // never matches: a custom plan always carries the platform fee, so keeping
+  // the tiers still adds (and bills) the fee.
   const matchesSeed =
     initialSelection != null &&
+    initialSelection.hasPlatformFee !== false &&
     machineTier === (initialSelection.machineTier ?? BASELINE_MACHINE) &&
     storageTier === initialSelection.storageTier &&
     creditChoice === (initialSelection.creditTier ?? NO_EXTRA_CREDITS);
@@ -330,8 +336,16 @@ export function CustomPlanModal({
         machineTier,
         storageTier,
         creditChoice,
+        noBundleLabel,
       }),
-    [proPlan, initialSelection, machineTier, storageTier, creditChoice],
+    [
+      proPlan,
+      initialSelection,
+      machineTier,
+      storageTier,
+      creditChoice,
+      noBundleLabel,
+    ],
   );
 
   const handleContinue = () => {
@@ -419,14 +433,14 @@ export function CustomPlanModal({
 
               <div className="flex flex-col gap-1">
                 <PickerLabel
-                  label={t("customPlanModal.creditsLabel")}
+                  label={t("customPlanModal.usageBundleLabel")}
                   docsUrl={CREDIT_DOCS_URL}
-                  docsLabel={t("customPlanModal.creditsDocsAriaLabel")}
+                  docsLabel={t("customPlanModal.usageBundleDocsAriaLabel")}
                   learnMore={t("customPlanModal.learnMore")}
                 />
                 <Select<CreditChoice>
-                  aria-label={t("customPlanModal.creditBundleAriaLabel")}
-                  placeholder={t("customPlanModal.creditBundlePlaceholder")}
+                  aria-label={t("customPlanModal.usageBundleAriaLabel")}
+                  placeholder={t("customPlanModal.usageBundlePlaceholder")}
                   value={creditChoice}
                   onChange={setCreditChoice}
                   options={creditOptions}

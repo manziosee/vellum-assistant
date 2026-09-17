@@ -11,9 +11,19 @@ import {
 import { CardSurfaceDataSchema } from "@vellumai/assistant-api";
 import type { Surface } from "@/domains/chat/types/types";
 
+import { Button } from "@vellumai/design-library";
+import { MidlineDot } from "@/components/midline-dot";
 import { LazyBoundary } from "@/components/lazy-boundary";
 import { ChatMarkdownMessage } from "@/domains/chat/components/chat-markdown-message";
 import { SurfaceContainer } from "@/domains/chat/components/surfaces/surface-container";
+import {
+  isWakeCardSurface,
+  wakeCardRecap,
+  wakeCardSource,
+  wakeCardTitleKey,
+} from "@/domains/chat/components/surfaces/wake-card-presentation";
+import { useViewerStore } from "@/stores/viewer-store";
+import { WatchRetroSurface } from "@/domains/chat/components/surfaces/watch-retro-surface";
 import { cn } from "@/utils/misc";
 import { useTranslation } from "@/i18n";
 
@@ -30,7 +40,7 @@ const WeatherForecastDisplay = lazy(() =>
 // Types
 // ---------------------------------------------------------------------------
 
-interface TaskStepItem {
+export interface TaskStepItem {
   id?: string;
   label: string;
   status?: string;
@@ -145,6 +155,8 @@ function StepIcon({ status }: { status: string | undefined }) {
       icon = <CircleCheck aria-hidden className={iconClass} />;
       break;
     case "in_progress":
+      // The same spinner the plan's own title carries, so a step in flight and
+      // a plan in flight read as one state rather than two vocabularies.
       icon = <Loader2 aria-hidden className={cn(iconClass, "animate-spin")} />;
       break;
     case "waiting":
@@ -199,9 +211,7 @@ function TaskProgressBar({
   return (
     <div className="mt-3">
       <div className="mb-1 flex items-center justify-between text-body-small-default text-[var(--content-quiet)]">
-        <span>
-          {t("cardSurface.tasksProgress", { completed, total })}
-        </span>
+        <span>{t("cardSurface.tasksProgress", { completed, total })}</span>
         <span>{percent}%</span>
       </div>
       <div className="h-2 w-full overflow-hidden rounded-full bg-[var(--border-subtle)]">
@@ -225,7 +235,10 @@ function TaskStepList({
     <div className="mt-5 divide-y divide-[var(--border-base)]">
       {steps.map((step, index) => {
         const status = effectiveStepStatus(step.status, taskCompleted);
-        const showDetailOnRight = status === "in_progress" && !!step.detail;
+        // Figma 8136-149041 puts a step's result on the right at every status
+        // ("Confirmed target + constraints" beside a completed check), not only
+        // while it runs.
+        const showDetailOnRight = !!step.detail;
         return (
           // The number badge and status icon center against the *title
           // line*, not the label+detail block — the detail lives outside the
@@ -268,6 +281,98 @@ function TaskStepList({
   );
 }
 
+/**
+ * A task-progress card's contents, already narrowed off the opaque wire `data`.
+ * `null` when the surface is not a plan card (wrong template, missing or empty
+ * `steps`).
+ *
+ * Exported so the progress control can parse a plan surface without
+ * duplicating the narrowing.
+ */
+export interface TaskProgress {
+  title: string;
+  /** Overall card status: `completed`, `in_progress`, `failed`, ... */
+  status: string | undefined;
+  steps: TaskStepItem[];
+}
+
+export function parseTaskProgress(surface: Surface): TaskProgress | null {
+  const parsed = CardSurfaceDataSchema.safeParse(surface.data);
+  const data = parsed.success ? parsed.data : {};
+  if (data.template !== "task_progress") {
+    return null;
+  }
+  const templateData = data.templateData;
+  const steps = templateData?.steps;
+  if (!templateData || !Array.isArray(steps) || steps.length === 0) {
+    return null;
+  }
+  return {
+    title:
+      normalizedTitle(templateData.title) ||
+      normalizedTitle(data.title) ||
+      normalizedTitle(surface.title) ||
+      "Task",
+    status:
+      typeof templateData.status === "string" ? templateData.status : undefined,
+    steps: steps as TaskStepItem[],
+  };
+}
+
+/**
+ * The "3 of 4" counter beside the plan title.
+ *
+ * `current` is the step the plan is ON, not the number finished: the mock reads
+ * "3 of 4" while step 3 runs and steps 1-2 are done. So it is the first
+ * unfinished step's position, or the total once nothing is unfinished.
+ */
+export function taskProgressCounter(steps: TaskStepItem[]): {
+  current: number;
+  total: number;
+} {
+  const firstUnfinished = steps.findIndex((s) => s.status !== "completed");
+  return {
+    current: firstUnfinished === -1 ? steps.length : firstUnfinished + 1,
+    total: steps.length,
+  };
+}
+
+/**
+ * The plan itself, per Figma `8136-149041`: a status-led title with its
+ * "3 of 4" counter, then the numbered step list.
+ *
+ * Title and counter render at the SAME size, separated by a midline dot, and
+ * differ only in weight and tone. The mock's close X is deliberately absent:
+ * the only host is the progress card, whose own header row already collapses
+ * it, so a second dismiss control here would be a second way to do one thing.
+ */
+export function TaskProgressBody({ progress }: { progress: TaskProgress }) {
+  const { t } = useTranslation("chat");
+  const { current, total } = taskProgressCounter(progress.steps);
+  return (
+    <div>
+      <div className="flex items-center gap-2">
+        <TitleStatusIcon status={progress.status} />
+        {/* `leading-snug` + a little vertical padding: `title-small` ships a
+            tight line-height, and with `truncate` (which is `overflow:hidden`)
+            that clips descenders: the "g" in a title like "Long Task" loses
+            its tail. Same fix `DetailShell` applies to its own header. */}
+        <span className="min-w-0 truncate py-0.5 text-title-small leading-snug text-[var(--content-strong)]">
+          {progress.title}
+        </span>
+        <MidlineDot />
+        <span className="shrink-0 whitespace-nowrap py-0.5 text-title-small font-normal! leading-snug text-[var(--content-tertiary)]">
+          {t("progressRail.stepCounter", { current, total })}
+        </span>
+      </div>
+      <TaskStepList
+        steps={progress.steps}
+        taskCompleted={progress.status === "completed"}
+      />
+    </div>
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Main component
 // ---------------------------------------------------------------------------
@@ -282,6 +387,21 @@ export function CardSurface({
   // unchecked cast or a re-declared local interface.
   const parsed = CardSurfaceDataSchema.safeParse(surface.data);
   const data = parsed.success ? parsed.data : {};
+
+  // Routed before every other template so a retro always reaches its own
+  // renderer. A client that predates the template falls through to the plain
+  // card below and shows the title, subtitle and body the retro also sets,
+  // which is the whole point of shipping it as a template rather than as a
+  // surface type of its own.
+  if (data.template === "watch_retro" && data.templateData) {
+    return (
+      <WatchRetroSurface
+        surface={surface}
+        templateData={data.templateData}
+        onAction={onAction}
+      />
+    );
+  }
 
   const isWeather = data.template === "weather_forecast" && data.templateData;
   const isTaskProgress =
@@ -334,6 +454,17 @@ export function CardSurface({
     />
   );
 
+  if (isWakeCardSurface(surface)) {
+    return (
+      <WakeCard
+        surface={surface}
+        onAction={onAction}
+        body={data.body ?? ""}
+        metadata={data.metadata ?? []}
+      />
+    );
+  }
+
   return (
     <SurfaceContainer surface={surface} onAction={onAction} hideTitle>
       <div>
@@ -379,6 +510,70 @@ export function CardSurface({
               <TaskProgressBar templateData={data.templateData!} />
             )}
           </>
+        )}
+      </div>
+    </SurfaceContainer>
+  );
+}
+
+/**
+ * A wake announcement: the conversation woke, and this is what woke it.
+ *
+ * The daemon's wake hint is a machine-written report (run ids, token counts, a
+ * JSON result tail), so the card keeps the recap and hands the rest to the
+ * side panel behind "View details". The source metadata goes with it: which
+ * wake fired is a detail to look up, not a line to read on every card.
+ *
+ * Borderless, unlike its sibling surfaces. A wake card is the conversation
+ * telling you why it started talking, so it reads as part of the transcript
+ * rather than as a thing handed to it.
+ */
+function WakeCard({
+  surface,
+  onAction,
+  body,
+  metadata,
+}: {
+  surface: Surface;
+  onAction: CardSurfaceProps["onAction"];
+  body: string;
+  metadata: Array<{ label: string; value: string }>;
+}) {
+  const { t } = useTranslation("chat");
+  const openWakeDetail = useViewerStore.use.openWakeDetail();
+  const recap = wakeCardRecap(body);
+  // The payload's own title is the daemon's "Conversation Woke" for every
+  // wake there is, so the trigger names the card instead.
+  const title = t(wakeCardTitleKey(wakeCardSource(metadata)));
+
+  return (
+    <SurfaceContainer
+      surface={surface}
+      onAction={onAction}
+      hideTitle
+      className="border-transparent"
+    >
+      <div className="flex flex-col items-start gap-2">
+        <h3 className="text-title-small text-[var(--content-strong)]">
+          {title}
+        </h3>
+
+        {recap && (
+          <p className="text-body-medium-lighter text-[var(--content-tertiary)]">
+            {recap}
+          </p>
+        )}
+
+        {body && (
+          <Button
+            variant="outlined"
+            size="compact"
+            onClick={() =>
+              openWakeDetail({ title, body, metadata })
+            }
+          >
+            {t("cardSurface.viewDetails")}
+          </Button>
         )}
       </div>
     </SurfaceContainer>

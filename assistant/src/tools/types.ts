@@ -6,8 +6,13 @@ import type {
 import { z } from "zod";
 
 import type { AnsweredQuestion } from "../api/events/question-answered.js";
-import type { InterfaceId } from "../channels/types.js";
+import {
+  CLIENT_OS_VALUES,
+  type ClientOs,
+  type InterfaceId,
+} from "../channels/types.js";
 import type { LLMCallSite } from "../config/schemas/llm.js";
+import { SEND_USER_MESSAGE_TOOL_NAME } from "../config/send-user-message-constants.js";
 import type { ToolActivityMetadata } from "../daemon/message-types/web-activity.js";
 import type { SecretPromptResult } from "../permissions/secret-prompt-types.js";
 import type { ContentBlock } from "../providers/types.js";
@@ -33,6 +38,36 @@ export const DISK_PRESSURE_CLEANUP_TOOL_NAMES: ReadonlySet<string> = new Set([
 
 export function isDiskPressureCleanupToolName(name: string): boolean {
   return DISK_PRESSURE_CLEANUP_TOOL_NAMES.has(name);
+}
+
+/**
+ * Whether a tool survives disk-pressure cleanup mode on this turn.
+ *
+ * The cleanup set holds tools that can free space without consuming it.
+ * `send_user_message` consumes nothing either: its executor is a no-op, and
+ * the text it carries is text the turn would otherwise have streamed. On a
+ * gated turn it is also the only channel that reaches the user, so withholding
+ * it would leave the model under a prompt naming a tool it does not have,
+ * spend the empty-response nudge asking for it, and fall through to raw text.
+ * Off a gated turn `sendUserMessageActive` is false and the name resolves the
+ * same as any other, so the tool never appears on a cleanup turn that was not
+ * gated to begin with.
+ *
+ * Lives here, beside the set it extends, because three layers have to agree on
+ * it: the wire filter and its mirror in `conversation-tool-setup.ts`, and the
+ * approval handler that gates the call at execution. A tool offered by the
+ * first two and refused by the third is worse than one never offered.
+ */
+export function survivesDiskPressureCleanup(
+  name: string,
+  opts: { sendUserMessageActive?: boolean },
+): boolean {
+  if (isDiskPressureCleanupToolName(name)) {
+    return true;
+  }
+  return (
+    name === SEND_USER_MESSAGE_TOOL_NAME && opts.sendUserMessageActive === true
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -251,6 +286,12 @@ export interface ToolContext {
    */
   diskPressureCleanupModeActive?: boolean;
   /**
+   * Whether this turn routes its user-facing text through `send_user_message`.
+   * Read by the cleanup-mode gate, which keeps that tool callable on a gated
+   * turn: the wire offers it, so the executor must not refuse it.
+   */
+  sendUserMessageActive?: boolean;
+  /**
    * Prompt the user for a secret value via native SecureField UI.
    * @legacy
    */
@@ -368,6 +409,12 @@ export interface ToolContext {
    */
   requesterIdentifier?: string;
   /**
+   * Contact ID of the requester's member record. Approval resolution looks
+   * up this contact's auto-approve ceiling from the gateway at use time.
+   * @legacy
+   */
+  requesterContactId?: string;
+  /**
    * Preferred display name for the requester.
    * @legacy
    */
@@ -406,6 +453,8 @@ export interface ToolContext {
    * @legacy
    */
   transportInterface?: InterfaceId;
+  /** Operating system reported by the client for the current turn. */
+  clientOs?: ClientOs;
   /**
    * The per-turn inference-profile override the agent loop is currently
    * running under, propagated through tool context so subagent-spawn tools
@@ -504,6 +553,8 @@ export const ToolDefinitionSchema = z.object({
   category: z.string().min(1).optional(),
   /** Where the tool runs — sandbox (assistant container) or host (guardian device via proxy). Resolved by `resolveExecutionTarget` if omitted. */
   executionTarget: z.enum(["sandbox", "host"]).optional(),
+  /** Client operating systems that may expose this tool. Unset means all. */
+  supportedClientOs: z.array(z.enum(CLIENT_OS_VALUES)).optional(),
   /**
    * Implementation invoked when the model calls the tool. Optional
    * because some `ToolDefinition` instances are schema-only (e.g.
@@ -551,8 +602,10 @@ export type ToolDefinition = z.infer<typeof ToolDefinitionSchema>;
  * it, and the agent loop reads it as `?.exclusive === true`, so forcing every
  * hand-built `Tool` (MCP/meet/test fixtures) to carry it would be noise.
  */
-export type Tool = Required<Omit<ToolDefinition, "exclusive">> &
-  Pick<ToolDefinition, "exclusive">;
+export type Tool = Required<
+  Omit<ToolDefinition, "exclusive" | "supportedClientOs">
+> &
+  Pick<ToolDefinition, "exclusive" | "supportedClientOs">;
 
 /**
  * The kind of entity that owns a tool. `"default"` is the built-in tool set

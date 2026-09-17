@@ -17,7 +17,7 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Brain, Loader2, MoreHorizontal, Trash2 } from "lucide-react";
 import { useState } from "react";
-import { useNavigate } from "react-router";
+import { useLocation, useNavigate } from "react-router";
 
 import { Button, Menu, Typography } from "@vellumai/design-library";
 
@@ -25,7 +25,7 @@ import { useTranslation } from "@/i18n";
 import { FileMarkdown } from "@/components/file-markdown";
 import { SkillLineageLink } from "@/components/skill-lineage-link";
 import { SkillRemovalDialog } from "@/components/skill-removal-dialog";
-import { DetailShell } from "@/components/detail-shell";
+import { DetailShell, DetailShellNotice } from "@/components/detail-shell";
 import {
   skillsByIdGetOptions,
   useSkillsByIdDeleteMutation,
@@ -34,7 +34,11 @@ import { useSkillDetailFiles } from "@/hooks/use-skill-detail-files";
 import { captureError } from "@/lib/sentry/capture-error";
 import { useResolvedAssistantsStore } from "@/stores/resolved-assistants-store";
 import { routes } from "@/utils/routes";
-import { invalidateSkillsList, isRemovableSkill } from "@/utils/skills";
+import {
+  invalidateSkillsList,
+  isRemovableSkill,
+  skillDetailBackState,
+} from "@/utils/skills";
 
 interface SkillDetailPanelProps {
   skillId: string;
@@ -44,6 +48,7 @@ interface SkillDetailPanelProps {
 export function SkillDetailPanel({ skillId, onClose }: SkillDetailPanelProps) {
   const { t } = useTranslation("chat");
   const navigate = useNavigate();
+  const location = useLocation();
   const queryClient = useQueryClient();
   const assistantId = useResolvedAssistantsStore.use.activeAssistantId();
   const [confirmingRemoval, setConfirmingRemoval] = useState(false);
@@ -139,7 +144,16 @@ export function SkillDetailPanel({ skillId, onClose }: SkillDetailPanelProps) {
         }
         footer={
           <div className="flex justify-end">
-            <Button onClick={() => navigate(routes.skills.detail(skillId))}>
+            <Button
+              onClick={() => {
+                // Close the in-place panel before handing off to the
+                // dedicated page, which supersedes it.
+                onClose();
+                navigate(routes.skills.detail(skillId), {
+                  state: skillDetailBackState(location),
+                });
+              }}
+            >
               {t("skillDetailPanel.goToSkill")}
             </Button>
           </div>
@@ -149,15 +163,11 @@ export function SkillDetailPanel({ skillId, onClose }: SkillDetailPanelProps) {
             while KEEPING the cached skill. Gate the error state on the
             RESOLVED skill being absent, not on `isError` alone: cached data
             degrades to the cached render, while an error with nothing to
-            show surfaces the failure (matching `skill-detail-page`). */}
+            show surfaces the failure. */}
         {skillQuery.isError && !skill ? (
-          <Typography
-            variant="body-medium-lighter"
-            as="p"
-            className="py-8 text-center text-[var(--content-tertiary)]"
-          >
+          <DetailShellNotice>
             {t("skillDetailPanel.loadError")}
-          </Typography>
+          </DetailShellNotice>
         ) : isLoading ? (
           <div className="flex items-center justify-center py-8">
             <Loader2 className="h-5 w-5 animate-spin text-[var(--content-tertiary)]" />

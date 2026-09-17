@@ -22,7 +22,6 @@ import {
   SIZE_LABEL,
 } from "@/lib/billing/machine-sizes";
 import { Trans, useTranslation } from "@/i18n";
-import { useIsNativeAndroid } from "@/runtime/platform-detection";
 import { routes } from "@/utils/routes";
 import { Button } from "@vellumai/design-library/components/button";
 import { Select } from "@vellumai/design-library/components/select";
@@ -35,6 +34,8 @@ export interface ResizeCardProps {
   assistant: Assistant;
   healthz: HealthzGetResponse | null;
   healthzLoading: boolean;
+  /** True while a request is in flight, including a refresh over existing values. */
+  healthzFetching: boolean;
   /** True while a post-resize poll is waiting for the new allocation to appear. */
   healthzPolling: boolean;
   refetch: () => Promise<void> | void;
@@ -48,13 +49,13 @@ export function ResizeCard({
   assistant,
   healthz,
   healthzLoading,
+  healthzFetching,
   healthzPolling,
   refetch,
   refetchUntilResized,
 }: ResizeCardProps) {
   const { t } = useTranslation("settings");
   const navigate = useNavigate();
-  const isNativeAndroid = useIsNativeAndroid();
   const subscriptionQuery = useQuery(
     organizationsBillingSubscriptionRetrieveOptions(),
   );
@@ -206,7 +207,7 @@ export function ResizeCard({
       }
     : null;
 
-  const basePlanResizeAction = isNativeAndroid ? null : (
+  const basePlanResizeAction = (
     <Button
       variant="ghost"
       size="compact"
@@ -278,7 +279,7 @@ export function ResizeCard({
             variant="ghost"
             size="compact"
             iconOnly={
-              healthzLoading || healthzPolling ? (
+              healthzFetching || healthzPolling ? (
                 <Loader2 className="animate-spin" />
               ) : (
                 <RefreshCw />
@@ -290,7 +291,7 @@ export function ResizeCard({
                 : t("resizeCard.refreshMetrics")
             }
             aria-label={t("resizeCard.refreshMetrics")}
-            disabled={healthzLoading || healthzPolling}
+            disabled={healthzFetching || healthzPolling}
             onClick={() => void refetch()}
           />
         }
@@ -486,28 +487,22 @@ export function ResizeCard({
               {resizeError && <Notice tone="error">{resizeError}</Notice>}
             </div>
           </Modal.Body>
-          <Modal.Footer
-            className={
-              isNativeAndroid ? "justify-end" : "items-center justify-between"
-            }
-          >
-            {!isNativeAndroid ? (
-              <span className="text-label-small-default text-[var(--content-tertiary)]">
-                <Trans
-                  ns="settings"
-                  i18nKey="resizeCard.needMore"
-                  components={{
-                    upgradeLink: (
-                      <Link
-                        to={routes.plans}
-                        className="text-[var(--content-secondary)] underline decoration-[var(--border-element)] underline-offset-2 transition-colors hover:text-[var(--content-default)]"
-                        onClick={() => setResizeModalOpen(false)}
-                      />
-                    ),
-                  }}
-                />
-              </span>
-            ) : null}
+          <Modal.Footer className="items-center justify-between">
+            <span className="text-label-small-default text-[var(--content-tertiary)]">
+              <Trans
+                ns="settings"
+                i18nKey="resizeCard.needMore"
+                components={{
+                  upgradeLink: (
+                    <Link
+                      to={routes.plans}
+                      className="text-[var(--content-secondary)] underline decoration-[var(--border-element)] underline-offset-2 transition-colors hover:text-[var(--content-default)]"
+                      onClick={() => setResizeModalOpen(false)}
+                    />
+                  ),
+                }}
+              />
+            </span>
             <div className="flex gap-2">
               <Button
                 variant="ghost"

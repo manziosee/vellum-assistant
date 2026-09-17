@@ -123,8 +123,11 @@ export const CALL_SITE_DEFAULTS: Record<LLMCallSite, CallSiteDefaultConfig> = {
     effort: "low",
     thinking: { enabled: false },
   },
+  // The dictation cleanup pass, and nothing else runs on this site. The
+  // caller has already stopped speaking and has nothing on screen until this
+  // answers, so it is priced as a latency call.
   interactionClassifier: {
-    profile: "cost-optimized",
+    profile: "latency-optimized",
     effort: "low",
     thinking: { enabled: false },
   },
@@ -133,7 +136,7 @@ export const CALL_SITE_DEFAULTS: Record<LLMCallSite, CallSiteDefaultConfig> = {
   // default-profile-catalog.ts): managed installs get the pinned latency model,
   // BYOK installs resolve their own provider's latency model through the intent
   // table rather than a model id they may hold no credential for. The profile
-  // is user-facing ("Speed"), so a user edit to it moves this call site too.
+  // is user-facing ("Fast"), so a user edit to it moves this call site too.
   voiceProgressNarration: {
     profile: "latency-optimized",
     effort: "low",
@@ -149,6 +152,16 @@ export const CALL_SITE_DEFAULTS: Record<LLMCallSite, CallSiteDefaultConfig> = {
     profile: "latency-optimized",
     effort: "low",
     thinking: { enabled: false },
+  },
+  // Names the background continuation a barge-in spawns, from the interrupted
+  // transcript. The label is fixed at spawn, so the call runs under a short
+  // timeout and the deterministic label stands in when it misses; that makes
+  // the latency-class profile wasted spend here.
+  voiceContinuationLabel: {
+    profile: "cost-optimized",
+    effort: "low",
+    thinking: { enabled: false },
+    disableCache: true,
   },
   inviteInstructionGenerator: {
     profile: "cost-optimized",

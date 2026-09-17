@@ -476,6 +476,18 @@ import { migrateAddConversationForkStrategy } from "./migrations/365-add-convers
 import { migrateChatgptSubscriptionRowIdentity } from "./migrations/366-chatgpt-subscription-row-identity.js";
 import { migrateCreateWatchTimelineEntries } from "./migrations/367-create-watch-timeline-entries.js";
 import { migrateWatchTimelineScreenshotBlob } from "./migrations/368-watch-timeline-screenshot-blob.js";
+import { migrateCreateAppPins } from "./migrations/369-create-app-pins.js";
+import { migrateAcpSessionHistoryAuthErrorCode } from "./migrations/370-acp-session-history-auth-error-code.js";
+import { migrateAcpSessionHistoryAuthErrorCredential } from "./migrations/371-acp-session-history-auth-error-credential.js";
+import { migrateCreateAcpRefusedCredentials } from "./migrations/372-create-acp-refused-credentials.js";
+import { migrateAcpAuthMarkerIndex } from "./migrations/373-acp-auth-marker-index.js";
+import { migrateChannelInboundMessageIdIndex } from "./migrations/374-channel-inbound-message-id-index.js";
+import { migrateCreateChannelOutboundPosts } from "./migrations/375-create-channel-outbound-posts.js";
+import { migrateNotificationDeliveriesCanonicalMessageId } from "./migrations/376-notification-deliveries-canonical-message-id.js";
+import { migrateAddSubagentBudgetStopReason } from "./migrations/377-add-subagent-budget-stop-reason.js";
+import { migrateCreateConversationToolSurfaces } from "./migrations/378-create-conversation-tool-surfaces.js";
+import { migrateOAuthProvidersResponseOkField } from "./migrations/379-oauth-providers-response-ok-field.js";
+import { migrateConversationToolSurfacesDelegateIndependentTasks } from "./migrations/380-conversation-tool-surfaces-delegate-independent-tasks.js";
 import type { MigrationStep } from "./migrations/run-migrations.js";
 
 export const migrationSteps: MigrationStep[] = [
@@ -1586,4 +1598,38 @@ export const migrationSteps: MigrationStep[] = [
   },
   migrateCreateWatchTimelineEntries,
   migrateWatchTimelineScreenshotBlob,
+  migrateCreateAppPins,
+  migrateAcpSessionHistoryAuthErrorCode,
+  migrateAcpSessionHistoryAuthErrorCredential,
+  migrateCreateAcpRefusedCredentials,
+  migrateAcpAuthMarkerIndex,
+  migrateChannelInboundMessageIdIndex,
+  migrateCreateChannelOutboundPosts,
+  migrateNotificationDeliveriesCanonicalMessageId,
+  {
+    name: "migrateAddSubagentBudgetStopReason",
+    run: migrateAddSubagentBudgetStopReason,
+    // The column guard reads the table's columns and the ALTER throws on a
+    // missing table, so the table must be checkpointed first or a repair flow
+    // that failed to create it would fail this step needlessly.
+    dependsOn: ["migrateCreateSubagentsTable"],
+  },
+  migrateCreateConversationToolSurfaces,
+  {
+    name: "migrateOAuthProvidersResponseOkField",
+    run: migrateOAuthProvidersResponseOkField,
+    // The column guard reads the table's columns, and an `ALTER` on a missing
+    // table throws, so the table must be checkpointed first or a repair flow
+    // that failed to create it would either fail this step needlessly or, if
+    // the error were swallowed, checkpoint it as done against no table.
+    dependsOn: ["createOAuthTables"],
+  },
+  {
+    name: "migrateConversationToolSurfacesDelegateIndependentTasks",
+    run: migrateConversationToolSurfacesDelegateIndependentTasks,
+    // Same column-guard shape as the step above: the guard reads the table's
+    // columns and the `ALTER` throws on a missing table, so the table's own
+    // step must be checkpointed first.
+    dependsOn: ["migrateCreateConversationToolSurfaces"],
+  },
 ];

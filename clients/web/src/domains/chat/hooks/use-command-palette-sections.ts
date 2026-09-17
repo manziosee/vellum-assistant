@@ -9,10 +9,13 @@ import {
   useCommandPalette,
   type UseCommandPaletteReturn,
 } from "@/components/command-palette/use-command-palette";
+import { useCommandShortcut } from "@/hooks/use-command-shortcut";
+import { useTranslation, type TFunction } from "@/i18n";
 import {
   buildActionsSection,
   buildServerResultSections,
 } from "@/domains/chat/hooks/command-palette-utils";
+import { displayConversationTitle } from "@/utils/conversation-title";
 import { haptic } from "@/utils/haptics";
 import { routes } from "@/utils/routes";
 
@@ -26,6 +29,7 @@ import type { Conversation } from "@/types/conversation-types";
 /** Build the "Recent" section from the first 5 conversations. */
 function buildRecentsSection(
   conversations: Conversation[],
+  translate: TFunction,
 ): CommandPaletteSection {
   const recent = conversations.slice(0, 5);
   return {
@@ -34,7 +38,7 @@ function buildRecentsSection(
     items: recent.map((conv) => ({
       id: `conv-${conv.conversationId}`,
       icon: MessageSquare,
-      title: conv.title ?? "Untitled",
+      title: displayConversationTitle(conv.title, translate),
       subtitle: conv.lastMessageAt
         ? formatRelativeTime(conv.lastMessageAt)
         : undefined,
@@ -135,12 +139,30 @@ export function useCommandPaletteSections({
   onClose,
   onItemSelect,
 }: UseCommandPaletteSectionsParams): UseCommandPaletteSectionsReturn {
+  // Read from the host's catalog, so these follow a rebind and fill in when
+  // the desktop catalog arrives after first paint.
+  const newConversationShortcut = useCommandShortcut("newConversation");
+  const currentConversationShortcut = useCommandShortcut("currentConversation");
+  const openSettingsShortcut = useCommandShortcut("openSettings");
+  const { t } = useTranslation();
+
   // Static sections: actions + recent conversations.
   const localSections = useMemo((): CommandPaletteSection[] => {
-    const actions = buildActionsSection(assistantName ?? "Assistant");
-    const recents = buildRecentsSection(conversations);
+    const actions = buildActionsSection(assistantName ?? "Assistant", {
+      newConversation: newConversationShortcut,
+      currentConversation: currentConversationShortcut,
+      openSettings: openSettingsShortcut,
+    });
+    const recents = buildRecentsSection(conversations, t);
     return [actions, ...(recents.items.length > 0 ? [recents] : [])];
-  }, [conversations, assistantName]);
+  }, [
+    conversations,
+    assistantName,
+    newConversationShortcut,
+    currentConversationShortcut,
+    openSettingsShortcut,
+    t,
+  ]);
 
   // Deduplicate server results against local recents.
   const recentConversationIds = useMemo(
@@ -229,6 +251,7 @@ export function useCommandPaletteSections({
       ? buildServerResultSections(
           commandPalette.searchResults,
           recentConversationIds,
+          t,
         )
       : [];
     return [...filteredLocalSections, ...serverSections];
@@ -236,6 +259,7 @@ export function useCommandPaletteSections({
     filteredLocalSections,
     commandPalette.searchResults,
     recentConversationIds,
+    t,
   ]);
 
   // Keep the ref in sync so keyboard nav and onSelect always use the latest sections.

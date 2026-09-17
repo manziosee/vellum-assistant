@@ -2,7 +2,7 @@
 
 Make a route reachable from the public internet. A plugin is a channel because it declares ingress: `channels/ingress.json` is the list of routes the outside world may reach it on.
 
-The gateway owns the public surface: it validates the declaration, signature-checks every request, and holds `plugin`-signed routes behind a guardian's approval. Plugins that declare a channel ingress are considered themselves a channel in all contexts where channels are viewed.
+The gateway owns the public surface: it validates the declaration, verifies every request, and holds plugin-owned ingress behind a guardian's approval. Plugins that declare a channel ingress are considered themselves a channel in all contexts where channels are viewed.
 
 ## When to declare ingress
 
@@ -34,12 +34,12 @@ That route is served at `/webhooks/plugins/<plugin-name>/events` and handled by 
 | `kind`         | yes      |                    | `"http"` or `"websocket"`. The gateway bridges the two differently, so the kind has to be known before a connection arrives.                                                                                                                  |
 | `description`  | yes      |                    | Human-readable purpose, surfaced in gateway logs and the approval UI.                                                                                                                                                                         |
 | `handshake`    | no       | `"signed-headers"` | Where the caller carries its signature. `"signed-headers"` (default) puts it in request headers. `"signed-query"` puts the same HMAC in the URL, WebSocket only, for a caller that is handed a URL and nothing else.                          |
-| `verification` | no       | vendor HMAC        | How a third-party caller's signature is checked. HTTP only.                                                                                                                                                                                   |
+| `verification` | no       | vendor HMAC        | How an outside caller is verified. HTTP only. `hmac` (parts as data), `standard-webhooks` (the complete spec), or `bearer` (a static `Authorization` token).                                                                                  |
 | `inbound`      | no       | webhook only       | That this route's replies carry inbound messages, and how to read them. HTTP only.                                                                                                                                                            |
 
 Duplicate paths in one file fail the whole declaration. A malformed file disables ingress for that plugin only; sibling plugins keep theirs.
 
-## Approval and signatures
+## Approval and verification
 
 Every public plugin route is signature-checked. An unsigned plugin route does not exist. A route whose signing secret is missing is refused rather than served unsigned, and an unauthenticated probe sees `404` whether the route is undeclared, pending, or missing a secret.
 
@@ -47,9 +47,9 @@ A guardian has to approve the declaration before the gateway serves it. The appr
 
 Ask the user to approve pending ingress from the channels settings once the plugin is installed. A plugin must not approve its own ingress.
 
-## Third-party verification
+## Ingress verification
 
-A vendor that signs `X-Example-Signature` has its own scheme. Declare `verification` so the gateway runs one HMAC engine and reads the vendor's specifics as data:
+A vendor that signs `X-Example-Signature` has its own scheme. Declare `verification` so the gateway checks it. Most vendors fit `kind: "hmac"`: one engine, vendor specifics as data:
 
 ```json
 {
@@ -75,12 +75,44 @@ A vendor that signs `X-Example-Signature` has its own scheme. Declare `verificat
 }
 ```
 
+A vendor that adopted [Standard Webhooks](https://www.standardwebhooks.com/) (`webhook-id`, `webhook-timestamp`, `webhook-signature: v1,<base64>`, `whsec_` secret) declares that complete scheme instead. The signed content, key encoding, and five-minute replay window are fixed by the spec, so they are not listed as HMAC parts:
+
+```json
+{
+  "path": "events",
+  "kind": "http",
+  "description": "Inbound deliveries from Example Courier",
+  "verification": {
+    "kind": "standard-webhooks",
+    "secret": { "field": "courier_webhook_secret" }
+  }
+}
+```
+
+An automation client that cannot calculate an HMAC, such as an iOS Shortcut, can use a static bearer token. The gateway verifies the `Authorization` header before it forwards the request:
+
+```json
+{
+  "path": "shortcuts/health",
+  "kind": "http",
+  "description": "Health data submitted by an automation shortcut",
+  "verification": {
+    "kind": "bearer",
+    "secret": { "field": "shortcut_ingress_token" }
+  }
+}
+```
+
+Store `shortcut_ingress_token` through `assistant credentials prompt` or `storeCredential`, then configure the client to send exactly one token in `Authorization: Bearer <shortcut_ingress_token>`. The scheme name is case-insensitive, but the token is not. Do not put the token in a URL or query string. URLs can be retained in browser history, logs, and referrer data, and the gateway accepts bearer credentials only in `Authorization`.
+
+A static bearer token does not provide replay protection. Prefer `hmac` with `freshness` when a vendor supports signed timestamps, and rotate the token after any suspected disclosure.
+
 Rules that stay gateway-side:
 
 - The credential **service** is the plugin's directory name. The descriptor names only a **field** (`courier_webhook_secret` above). A manifest cannot point a route at another plugin's secret or at the platform's.
 - Store the secret via `assistant credentials prompt` (or `storeCredential` from a hook/tool/route). Never put it in the file.
-- `payload` is the exact bytes the vendor signs, in order: `"body"`, `{ "header": "..." }`, or `{ "literal": "..." }`. A header named in `payload` but absent from the request fails verification rather than contributing an empty string.
-- `freshness` is a replay window. Declare it when the vendor binds a timestamp. A signature over the body alone stays valid for as long as the secret does.
+- For `hmac`, `payload` is the exact bytes the vendor signs, in order: `"body"`, `{ "header": "..." }`, or `{ "literal": "..." }`. A header named in `payload` but absent from the request fails verification rather than contributing an empty string.
+- For `hmac`, `freshness` is a replay window. Declare it when the vendor binds a timestamp. A signature over the body alone stays valid for as long as the secret does.
 - Unrecognized fields fail the declaration rather than guessing a scheme.
 
 ## Delivering inbound messages
@@ -146,6 +178,24 @@ What the plugin does not get to decide:
 
 - **Channel.** The gateway stamps `plugin`. A reply that claims `slack` is ignored, so a plugin cannot inherit Slack's admission floor or contact records.
 - **External ids.** Every id is prefixed with the plugin's directory name (`courier:+12025550142`). Two plugins whose vendors both address by phone number do not share conversations or contacts.
+
+### When a sender is refused
+
+A delivery that verifies but fails the ranked admission floor never reaches the route, because that path is free to run a turn. The sender still has to hear that they were not admitted, and only the plugin can send on its vendor, so the gateway posts a notice to `routes/notices/admission-denied.ts` instead. The plugin sends `replyText` to `conversationExternalId` and answers `200`; there is no turn. The notice is JSON:
+
+| Field                    | Value                                                                                     |
+| ------------------------ | ----------------------------------------------------------------------------------------- |
+| `reason`                 | `"admission_floor"`                                                                       |
+| `plugin`                 | The plugin's directory name.                                                              |
+| `ingressRoute`           | The declared `path` the delivery arrived on.                                              |
+| `admissionPolicy`        | The floor that refused the sender.                                                        |
+| `trustClass`             | The sender's trust class as the gateway read it.                                          |
+| `conversationExternalId` | The vendor's chat id, without the plugin prefix.                                          |
+| `actorExternalId`        | The vendor's sender id, without the plugin prefix.                                        |
+| `externalMessageId`      | The vendor's message id, without the plugin prefix. Use it as the send's idempotency key. |
+| `replyText`              | The exact line to send. Do not reword it: built-in channels send the same one.            |
+
+A plugin without that handler leaves the sender unanswered; the gateway logs the failed notice and still acknowledges the vendor. The `notices/` prefix is [reserved for the gateway](routes.md#reserved-for-the-gateway-notices), so an authenticated client cannot post a notice of its own.
 
 ## Presentation
 

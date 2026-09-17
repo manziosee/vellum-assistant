@@ -1,7 +1,9 @@
+import type { ReactNode } from "react";
+
 import { SIDEBAR_STACK_GAP } from "@/components/sidebar-nav-geometry";
 import { AssistantSwitcher } from "@/domains/chat/components/assistant-switcher";
 import { PinnedAppNavItem } from "@/domains/chat/components/pinned-app-nav-item";
-import { usePinnedAppsStore } from "@/stores/pinned-apps-store";
+import { usePinnedApps } from "@/hooks/use-pinned-apps";
 import { cn } from "@vellumai/design-library";
 import { useTranslation } from "@/i18n";
 
@@ -17,6 +19,10 @@ export interface SideMenuBuiltInNavProps {
   activeAppId?: string;
   onOpenApp?: (appId: string) => void;
   onClose?: () => void;
+  /** The assistant section's toggle, beside the assistant pill. */
+  assistantAside?: ReactNode;
+  /** The assistant's own section, opened beneath the assistant row. */
+  assistantBeneath?: ReactNode;
 }
 
 /**
@@ -41,9 +47,11 @@ export function SideMenuBuiltInNav({
   activeAppId,
   onOpenApp,
   onClose,
+  assistantAside,
+  assistantBeneath,
 }: SideMenuBuiltInNavProps) {
   const { t } = useTranslation("chat");
-  const pinnedApps = usePinnedAppsStore.use.pinnedApps();
+  const { pinnedApps, unpin, setColor } = usePinnedApps(assistantId);
 
   /* One column at a single gap, rather than each cluster spacing itself.
      `SideMenu.Header` puts its own gap between its children, so a margin
@@ -85,16 +93,20 @@ export function SideMenuBuiltInNav({
               : undefined
           }
           onSwitched={onClose}
+          aside={assistantAside}
+          beneath={assistantBeneath}
         />
       </div>
       {pinnedApps.length > 0 ? (
         <div className={cn("flex flex-col", SIDEBAR_STACK_GAP)}>
           {pinnedApps.map((app) => (
             <PinnedAppNavItem
-              key={app.appId}
+              key={app.id}
               app={app}
               collapsed={collapsed}
-              active={activeAppId === app.appId}
+              active={activeAppId === app.id}
+              onUnpin={unpin}
+              onSetColor={setColor}
               onOpen={
                 onOpenApp
                   ? (appId) => {

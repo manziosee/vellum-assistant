@@ -1,12 +1,6 @@
 import { useMutation } from "@tanstack/react-query";
 import { Check, Copy, Loader2 } from "lucide-react";
-import {
-  useCallback,
-  useEffect,
-  useLayoutEffect,
-  useRef,
-  useState,
-} from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef } from "react";
 
 import { Button } from "@vellumai/design-library/components/button";
 import { Input } from "@vellumai/design-library/components/input";
@@ -15,7 +9,8 @@ import { Typography } from "@vellumai/design-library/components/typography";
 
 import { buildA2AInviteLink } from "@/domains/contacts/a2a-invite";
 import { integrationsA2aInvitePostMutation } from "@/generated/daemon/@tanstack/react-query.gen";
-import { copyToClipboard } from "@/lib/copy-to-clipboard";
+import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
+import { useTranslation } from "@/i18n";
 
 export interface GenerateInviteLinkDialogProps {
   open: boolean;
@@ -41,8 +36,12 @@ export function GenerateInviteLinkDialog({
   assistantId,
   onClose,
 }: GenerateInviteLinkDialogProps) {
-  const [copied, setCopied] = useState(false);
-  const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const { t } = useTranslation();
+  const {
+    copy,
+    copied,
+    reset: resetCopied,
+  } = useCopyToClipboard({ errorMessage: "Couldn't copy the invite link." });
   const prevOpenRef = useRef(false);
 
   const mutation = useMutation({
@@ -67,36 +66,11 @@ export function GenerateInviteLinkDialog({
     prevOpenRef.current = open;
   }, [open, assistantId]);
 
-  useEffect(() => {
-    return () => {
-      if (copiedTimerRef.current) {
-        clearTimeout(copiedTimerRef.current);
-      }
-    };
-  }, []);
-
   const handleClose = useCallback(() => {
     resetRef.current();
-    setCopied(false);
-    if (copiedTimerRef.current) {
-      clearTimeout(copiedTimerRef.current);
-      copiedTimerRef.current = null;
-    }
+    resetCopied();
     onClose();
-  }, [onClose]);
-
-  const handleCopy = useCallback((url: string) => {
-    copyToClipboard(url, {
-      errorMessage: "Couldn't copy the invite link.",
-      onCopied: () => {
-        setCopied(true);
-        if (copiedTimerRef.current) {
-          clearTimeout(copiedTimerRef.current);
-        }
-        copiedTimerRef.current = setTimeout(() => setCopied(false), 2000);
-      },
-    });
-  }, []);
+  }, [onClose, resetCopied]);
 
   const inviteUrl =
     mutation.isSuccess && mutation.data.token
@@ -117,7 +91,7 @@ export function GenerateInviteLinkDialog({
     >
       <Modal.Content size="sm">
         <Modal.Header>
-          <Modal.Title>Share Connection Link</Modal.Title>
+          <Modal.Title>{t("generateInviteLinkDialog.title")}</Modal.Title>
         </Modal.Header>
         <Modal.Body>
           {mutation.isPending ? (
@@ -126,7 +100,7 @@ export function GenerateInviteLinkDialog({
               style={{ color: "var(--content-tertiary)" }}
             >
               <Loader2 className="h-4 w-4 animate-spin" />
-              Creating invite link…
+              {t("generateInviteLinkDialog.creating")}
             </div>
           ) : mutation.isError ? (
             <div className="space-y-3">
@@ -135,8 +109,7 @@ export function GenerateInviteLinkDialog({
                 className="!m-0 text-body-medium-lighter"
                 style={{ color: "var(--system-negative-strong)" }}
               >
-                Failed to create invite link. Make sure A2A is enabled for your
-                assistant.
+                {t("generateInviteLinkDialog.createFailed")}
               </p>
               <Button
                 variant="outlined"
@@ -144,7 +117,7 @@ export function GenerateInviteLinkDialog({
                   mutation.mutate({ path: { assistant_id: assistantId } })
                 }
               >
-                Try Again
+                {t("generateInviteLinkDialog.tryAgain")}
               </Button>
             </div>
           ) : mutation.isSuccess ? (
@@ -153,8 +126,7 @@ export function GenerateInviteLinkDialog({
                 variant="body-medium-lighter"
                 style={{ color: "var(--content-secondary)" }}
               >
-                Share this link with another assistant owner to establish a
-                connection.
+                {t("generateInviteLinkDialog.shareHint")}
               </Typography>
               <div className="flex items-center gap-2">
                 <Input
@@ -168,8 +140,8 @@ export function GenerateInviteLinkDialog({
                 />
                 <button
                   type="button"
-                  onClick={() => handleCopy(inviteUrl)}
-                  aria-label="Copy invite link"
+                  onClick={() => copy(inviteUrl)}
+                  aria-label={t("generateInviteLinkDialog.copyAriaLabel")}
                   className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-[var(--border-base)] hover:bg-[var(--surface-hover)]"
                 >
                   {copied ? (
@@ -192,7 +164,7 @@ export function GenerateInviteLinkDialog({
         </Modal.Body>
         <Modal.Footer>
           <Button variant="outlined" onClick={handleClose}>
-            Done
+            {t("generateInviteLinkDialog.done")}
           </Button>
         </Modal.Footer>
       </Modal.Content>

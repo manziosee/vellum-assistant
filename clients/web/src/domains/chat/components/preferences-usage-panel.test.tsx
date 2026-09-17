@@ -1,52 +1,41 @@
 /**
  * Tests for the preferences menu's usage panel.
  *
- * The panel composes the subscription, the plan catalog, and the usage totals
- * behind the `obscure-credits` flag, so the reads are driven from the SDK
- * boundary the way the billing hook tests drive them. The wallet status is
- * mocked: the real hook needs the platform gate and the org store, neither of
- * which these tests stand up.
+ * The panel composes the subscription and the billing summary's usage-grant
+ * figures; the subscription is driven from the SDK boundary the way the
+ * billing hook tests drive it. The wallet status is mocked: the real hook
+ * needs the platform gate and the org store, neither of which these tests
+ * stand up.
  */
 
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import {
-  act,
-  cleanup,
-  fireEvent,
-  render,
-  waitFor,
-} from "@testing-library/react";
+import { act, cleanup, fireEvent, render } from "@testing-library/react";
 
 import * as sdkGen from "@/generated/api/sdk.gen";
-import type {
-  PlanListResponse,
-  SubscriptionResponse,
-} from "@/generated/api/types.gen";
+import type { SubscriptionResponse } from "@/generated/api/types.gen";
 
-let usageTotalUsd = "10";
 let subscription: SubscriptionResponse | null = proSubscription();
-let plans: PlanListResponse = proPlans();
 
 mock.module("@/generated/api/sdk.gen", () => ({
   ...sdkGen,
   organizationsBillingSubscriptionRetrieve: () =>
     Promise.resolve({ data: subscription, response: { ok: true } }),
-  organizationsBillingPlansRetrieve: () =>
-    Promise.resolve({ data: plans, response: { ok: true } }),
-  organizationsBillingUsageTotalsRetrieve: () =>
-    Promise.resolve({
-      data: { total_usd: usageTotalUsd, event_count: 2 },
-      response: { ok: true },
-    }),
 }));
 
 let billingEnabled = true;
 let creditsExhausted = false;
+/** The raw wallet balance, which BYOK suppression never touches. */
+let effectiveBalance: string | null = null;
 let availableUsageBalance: string | null = null;
 let totalUsageBalance: string | null = null;
 /** What the panel asked the wallet status to classify against. */
 let balanceStatusOpts: unknown;
+// Whether the route classification behind the panel's colours has landed.
+// Kept separately drivable because those colours are exactly what must not be
+// painted before it has: a double that always answers instantly cannot see
+// the flash.
+let classificationSettled = true;
 mock.module("@/hooks/use-billing-balance-status", () => ({
   useBillingBalanceStatus: (opts?: unknown) => {
     balanceStatusOpts = opts;
@@ -57,26 +46,35 @@ mock.module("@/hooks/use-billing-balance-status", () => ({
       dailyLimitSnoozed: false,
       dailyLimit: null,
       dailySpend: null,
-      balance: null,
+      balance: effectiveBalance,
       availableUsageBalance,
       totalUsageBalance,
       enabled: billingEnabled,
+      settled: classificationSettled,
     };
   },
 }));
 
-const { PreferencesUsagePanel } = await import("./preferences-usage-panel");
-const { useClientFeatureFlagStore } =
-  await import("@/stores/client-feature-flag-store");
+// The real BYOK gate classifies through five daemon queries and the
+// resolved-assistants store, none of which these tests stand up; what the
+// hook owns is only how the verdict gates the extra-credits claim.
+/**
+ * Which route the classifier lands on. One knob rather than two: the gate
+ * derives `suppress` and `routeBurnsManaged` from the same classification, so
+ * separate switches could stage a BYOK route that also burns managed credits,
+ * which it never reports.
+ */
+let route: "managed" | "byok" | "unknown" = "managed";
+mock.module("@/hooks/use-byok-credit-banner-gate", () => ({
+  useByokCreditRouteVerdict: (candidate: boolean) => ({
+    // Only a proven BYOK route with no recent burn holds the banners down.
+    suppress: candidate && route === "byok",
+    settled: classificationSettled,
+    routeBurnsManaged: route === "managed",
+  }),
+}));
 
-/** Drives the `obscure-credits` client flag the way the app's LD sync does. */
-function setObscureCredits(value: boolean): void {
-  act(() => {
-    useClientFeatureFlagStore
-      .getState()
-      .setFlags({ obscureCredits: value }, null);
-  });
-}
+const { PreferencesUsagePanel } = await import("./preferences-usage-panel");
 
 function proSubscription(): SubscriptionResponse {
   return {
@@ -90,27 +88,6 @@ function proSubscription(): SubscriptionResponse {
     package: { key: "mighty", name: "Mighty", version: 1, customized: false },
     entitlements: { managed_email: false, phone_number: false },
   };
-}
-
-/** A catalog whose Mighty package includes a $25 monthly bundle. */
-function proPlans(): PlanListResponse {
-  return {
-    plans: [
-      {
-        id: "pro",
-        packages: [
-          {
-            key: "mighty",
-            name: "Mighty",
-            version: 1,
-            machine_size: null,
-            credits_usd: 25,
-            storage_gib: 10,
-          },
-        ],
-      },
-    ],
-  } as unknown as PlanListResponse;
 }
 
 function renderPanel(
@@ -140,49 +117,58 @@ function renderPanel(
   );
 }
 
-/** Lets both catalog reads settle inside `act`, so nothing lands mid-assert. */
+/** Lets the subscription read settle inside `act`, so nothing lands mid-assert. */
 async function settle(): Promise<void> {
   await act(async () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
   });
 }
 
-/** The panel's reset date, formatted the way the panel formats it. */
-function resetLabel(iso: string): string {
-  return new Intl.DateTimeFormat("en", {
-    month: "short",
-    day: "numeric",
-  }).format(new Date(iso));
-}
-
 beforeEach(() => {
-  usageTotalUsd = "10";
   subscription = proSubscription();
-  plans = proPlans();
   billingEnabled = true;
+  classificationSettled = true;
   creditsExhausted = false;
+  effectiveBalance = null;
   availableUsageBalance = null;
   totalUsageBalance = null;
+  route = "managed";
   balanceStatusOpts = undefined;
-  setObscureCredits(true);
 });
 
 afterEach(() => {
-  setObscureCredits(false);
   cleanup();
 });
 
 describe("PreferencesUsagePanel", () => {
-  test("reads the share of the bundle spent this cycle", async () => {
+  test("reads the used share of the granted usage", async () => {
+    // $10 of the $25 the cycle granted is gone.
+    totalUsageBalance = "25.00";
+    availableUsageBalance = "15.00";
     const { findByTestId } = renderPanel();
 
-    // $10 of Mighty's $25 bundle.
     const panel = await findByTestId("preferences-usage");
     expect(panel.textContent).toContain("Usage");
     expect(panel.textContent).toContain("40% used");
-    expect(panel.textContent).toContain(
-      `Resets ${resetLabel("2026-08-10T00:00:00Z")}`,
-    );
+  });
+
+  test("a Pro sub with no live grants reads as fully spent", async () => {
+    // Every grant this sub ever held is used or expired: a full bar with
+    // nothing scheduled to refill it, not a missing one.
+    totalUsageBalance = "0.00";
+    availableUsageBalance = "0.00";
+    const { findByTestId } = renderPanel();
+
+    const panel = await findByTestId("preferences-usage");
+    expect(panel.textContent).toContain("100% used");
+  });
+
+  test("renders nothing without grant figures on the summary", async () => {
+    // An older platform reports neither figure, so no honest reading exists.
+    const { queryByTestId } = renderPanel();
+
+    await settle();
+    expect(queryByTestId("preferences-usage")).toBeNull();
   });
 
   test("classifies the wallet against the conversation it renders for", async () => {
@@ -201,14 +187,6 @@ describe("PreferencesUsagePanel", () => {
     expect(balanceStatusOpts).toEqual({ conversationId: null });
   });
 
-  test("renders nothing while the flag is off", async () => {
-    setObscureCredits(false);
-    const { queryByTestId } = renderPanel();
-
-    await settle();
-    expect(queryByTestId("preferences-usage")).toBeNull();
-  });
-
   test("renders nothing without managed billing to read", async () => {
     billingEnabled = false;
     const { queryByTestId } = renderPanel();
@@ -217,7 +195,7 @@ describe("PreferencesUsagePanel", () => {
     expect(queryByTestId("preferences-usage")).toBeNull();
   });
 
-  test("renders nothing for a sub with no included bundle", async () => {
+  test("renders nothing for a free plan that was never granted credit", async () => {
     subscription = { ...proSubscription(), plan_id: "base", package: null };
     const { queryByTestId } = renderPanel();
 
@@ -225,7 +203,7 @@ describe("PreferencesUsagePanel", () => {
     expect(queryByTestId("preferences-usage")).toBeNull();
   });
 
-  test("a free plan reads its usage grant with nothing to reset", async () => {
+  test("a free plan reads its usage grant", async () => {
     // $3.40 of the $5.00 this account was granted.
     subscription = { ...proSubscription(), plan_id: "base", package: null };
     totalUsageBalance = "5.00";
@@ -234,37 +212,41 @@ describe("PreferencesUsagePanel", () => {
 
     const panel = await findByTestId("preferences-usage");
     expect(panel.textContent).toContain("68% used");
-    expect(panel.textContent).not.toContain("Resets");
   });
 
   test("a free plan with an empty wallet raises the strip", async () => {
     subscription = { ...proSubscription(), plan_id: "base", package: null };
     totalUsageBalance = "5.00";
     availableUsageBalance = "0.00";
+    effectiveBalance = "0.00";
     creditsExhausted = true;
     const { findByTestId, getByText } = renderPanel();
 
     const panel = await findByTestId("preferences-usage");
     expect(panel.textContent).toContain("100% used");
-    expect(panel.textContent).not.toContain("Resets");
     expect(getByText("Add credits to continue.")).toBeTruthy();
   });
 
-  test("a used-up grant with purchased credits stays red without a strip", async () => {
+  test("a used-up grant with purchased credits names the extra credits", async () => {
     // The grant is gone, but bought credits still cover the next turn, so the
-    // reading is negative and nothing is being offered.
+    // panel says what it is drawing on and offers nothing.
     subscription = { ...proSubscription(), plan_id: "base", package: null };
     totalUsageBalance = "5.00";
     availableUsageBalance = "0.00";
-    const { findByTestId, queryByText, queryByTestId } = renderPanel();
+    effectiveBalance = "12.00";
+    const { findByTestId, getByText, queryByText, queryByTestId } =
+      renderPanel();
 
     const panel = await findByTestId("preferences-usage");
+    expect(getByText("Now using extra usage credits")).toBeTruthy();
     expect(panel.textContent).toContain("100% used");
     expect(queryByText("Add credits to continue.")).toBeNull();
     expect(queryByTestId("preferences-usage-add-credits")).toBeNull();
   });
 
   test("the gear hands the billing page to its caller", async () => {
+    totalUsageBalance = "25.00";
+    availableUsageBalance = "15.00";
     const onOpenBilling = mock(() => {});
     const { findByTestId } = renderPanel({ onOpenBilling });
 
@@ -273,13 +255,19 @@ describe("PreferencesUsagePanel", () => {
   });
 
   test("a spent bundle with an empty wallet raises the strip", async () => {
-    usageTotalUsd = "25";
+    totalUsageBalance = "25.00";
+    availableUsageBalance = "0.00";
+    effectiveBalance = "0.00";
     creditsExhausted = true;
     const onAddCredits = mock(() => {});
-    const { findByTestId, getByText } = renderPanel({ onAddCredits });
+    const { findByTestId, getByText, queryByText } = renderPanel({
+      onAddCredits,
+    });
 
     const panel = await findByTestId("preferences-usage");
+    // Exhausted keeps the red reading: there are no extra credits to name.
     expect(panel.textContent).toContain("100% used");
+    expect(queryByText("Now using extra usage credits")).toBeNull();
     expect(getByText("Add credits to continue.")).toBeTruthy();
     expect(
       panel
@@ -292,7 +280,9 @@ describe("PreferencesUsagePanel", () => {
   });
 
   test("without a handler the strip states its case and offers nothing", async () => {
-    usageTotalUsd = "25";
+    totalUsageBalance = "25.00";
+    availableUsageBalance = "0.00";
+    effectiveBalance = "0.00";
     creditsExhausted = true;
     const { findByTestId, getByText, queryByTestId } = renderPanel({
       withoutAddCredits: true,
@@ -304,30 +294,141 @@ describe("PreferencesUsagePanel", () => {
     expect(queryByTestId("preferences-usage-add-credits")).toBeNull();
   });
 
-  test("a spent bundle turns negative with credits still in hand", async () => {
-    usageTotalUsd = "25";
+  test("a spent bundle swaps the bar for the extra-credits line", async () => {
+    totalUsageBalance = "25.00";
+    availableUsageBalance = "0.00";
+    effectiveBalance = "18.00";
     const { findByTestId, getByText, queryByTestId, queryByText } =
       renderPanel();
 
     const panel = await findByTestId("preferences-usage");
-    await waitFor(() => {
-      expect(panel.textContent).toContain("100% used");
-    });
-    // Red bar and red percentage, but nothing has gone wrong yet: the wallet
-    // behind the bundle still has something to draw on, so no strip.
+    // Amber, not red: nothing has gone wrong yet, the wallet behind the
+    // grants still has something to draw on, so the line names it while the
+    // bar and the strip stay away and the percentage keeps its neutral color.
+    expect(getByText("Now using extra usage credits").className).toContain(
+      "--system-mid-strong",
+    );
+    expect(getByText("100% used").className).toContain("--content-secondary");
+    expect(panel.querySelector('[data-slot="progress-bar-fill"]')).toBeNull();
+    expect(queryByText("Add credits to continue.")).toBeNull();
+    expect(queryByTestId("preferences-usage-add-credits")).toBeNull();
+  });
+
+  test("a BYOK route with an empty wallet keeps the red reading", async () => {
+    // The BYOK gate holds `isExhausted` down so the credit wall stays away,
+    // but the wallet is empty: the next turn runs on the user's own key, so
+    // nothing may claim extra credits are being spent.
+    totalUsageBalance = "25.00";
+    availableUsageBalance = "0.00";
+    effectiveBalance = "0.00";
+    const { findByTestId, queryByText, queryByTestId } = renderPanel();
+
+    const panel = await findByTestId("preferences-usage");
+    expect(panel.textContent).toContain("100% used");
+    expect(queryByText("Now using extra usage credits")).toBeNull();
     expect(
       panel
         .querySelector('[data-slot="progress-bar-fill"]')
         ?.getAttribute("style"),
     ).toContain("--system-negative-strong");
-    expect(getByText("100% used").className).toContain(
-      "--system-negative-strong",
-    );
     expect(queryByText("Add credits to continue.")).toBeNull();
     expect(queryByTestId("preferences-usage-add-credits")).toBeNull();
   });
 
+  test("a BYOK route with a positive wallet keeps the red reading", async () => {
+    // The classifier proves the next turn dispatches on the user's own key,
+    // so whatever the wallet holds is not what gets spent.
+    totalUsageBalance = "25.00";
+    availableUsageBalance = "0.00";
+    effectiveBalance = "18.00";
+    route = "byok";
+    const { findByTestId, queryByText } = renderPanel();
+
+    const panel = await findByTestId("preferences-usage");
+    expect(panel.textContent).toContain("100% used");
+    expect(queryByText("Now using extra usage credits")).toBeNull();
+    expect(queryByText("Add credits to continue.")).toBeNull();
+  });
+
+  test("an unknown wallet withholds the extra-credits claim", async () => {
+    // Belt-and-braces: the balance and the grant figures ride the same
+    // summary now, so a reading without a balance is synthetic, but an
+    // unknown wallet must still never be described as holding credit.
+    totalUsageBalance = "25.00";
+    availableUsageBalance = "0.00";
+    effectiveBalance = null;
+    const { findByTestId, queryByText } = renderPanel();
+
+    const panel = await findByTestId("preferences-usage");
+    expect(panel.textContent).toContain("100% used");
+    expect(queryByText("Now using extra usage credits")).toBeNull();
+    expect(queryByText("Add credits to continue.")).toBeNull();
+  });
+
+  test("holds the neutral reading while the classification is in flight", async () => {
+    // Spent grants with credit behind them on a route that will turn out to
+    // be managed: the settled answer is the amber extra-credits line. The red
+    // reading must not appear on the way there, however long the classifier's
+    // daemon queries take.
+    totalUsageBalance = "25.00";
+    availableUsageBalance = "0.00";
+    effectiveBalance = "12.00";
+    classificationSettled = false;
+    const { findByTestId, getByText, queryByText } = renderPanel();
+
+    const panel = await findByTestId("preferences-usage");
+    const fill = () =>
+      panel
+        .querySelector('[data-slot="progress-bar-fill"]')
+        ?.getAttribute("style");
+    // The length comes off the summary alone, so it is already honest.
+    expect(panel.textContent).toContain("100% used");
+    expect(fill()).toContain("width: 100%");
+    // Neither reading is claimed yet.
+    expect(queryByText("Now using extra usage credits")).toBeNull();
+    expect(fill()).not.toContain("--system-negative-strong");
+    expect(getByText("100% used").className).not.toContain(
+      "--system-negative-strong",
+    );
+  });
+
+  test("no managed route means no extra-credits claim", async () => {
+    // Settled and wallet funded, with suppression down for a reason that is
+    // not a managed route: a read that failed, or a BYOK route with spend on
+    // another surface. `suppress` alone cannot tell either from managed.
+    totalUsageBalance = "25.00";
+    availableUsageBalance = "0.00";
+    effectiveBalance = "12.00";
+    route = "unknown";
+    const { findByTestId, queryByText } = renderPanel();
+
+    const panel = await findByTestId("preferences-usage");
+    expect(panel.textContent).toContain("100% used");
+    expect(queryByText("Now using extra usage credits")).toBeNull();
+  });
+
+  test("an unsettled classification withholds the exhausted strip too", async () => {
+    totalUsageBalance = "25.00";
+    availableUsageBalance = "0.00";
+    effectiveBalance = "0.00";
+    creditsExhausted = true;
+    classificationSettled = false;
+    const { findByTestId, queryByText } = renderPanel();
+
+    const panel = await findByTestId("preferences-usage");
+    // The strip and the bar's colour are the same verdict, so they land on one
+    // render rather than the strip growing the popover a beat later.
+    expect(queryByText("Add credits to continue.")).toBeNull();
+    expect(
+      panel
+        .querySelector('[data-slot="progress-bar-fill"]')
+        ?.getAttribute("style"),
+    ).not.toContain("--system-negative-strong");
+  });
+
   test("a reading below 100% stays neutral", async () => {
+    totalUsageBalance = "25.00";
+    availableUsageBalance = "15.00";
     const { findByTestId, getByText } = renderPanel();
 
     const panel = await findByTestId("preferences-usage");

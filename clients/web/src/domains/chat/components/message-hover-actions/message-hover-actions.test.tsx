@@ -6,6 +6,25 @@ import type { DisplayMessage } from "@/domains/chat/types/types";
 import { textBody } from "@/domains/chat/utils/message-test-helpers";
 
 describe("MessageHoverActions", () => {
+  test("hides text actions without changing the backing message or other actions", () => {
+    const message: DisplayMessage = {
+      id: "frame-123",
+      role: "user",
+      ...textBody("(camera frame)"),
+    };
+    const html = renderToStaticMarkup(
+      <MessageHoverActions
+        message={message}
+        showTextActions={false}
+        onInspect={() => {}}
+        onFork={() => {}}
+      />,
+    );
+    expect(html).not.toContain('title="Copy"');
+    expect(html).not.toContain('title="Read aloud"');
+    expect(html).toContain('title="Inspect"');
+    expect(html).toContain('title="Fork from here"');
+  });
   test("renders the timestamp even when no actions are available", () => {
     const message: DisplayMessage = {
       id: "m1",
@@ -19,6 +38,23 @@ describe("MessageHoverActions", () => {
 
     expect(html).toContain("title=");
     expect(html).toContain("select-none");
+  });
+
+  test("omits the copy action for a row deleted on its channel", () => {
+    const message: DisplayMessage = {
+      id: "m-deleted",
+      role: "user",
+      timestamp: Date.UTC(2026, 0, 2, 12, 34),
+      ...textBody("text the channel no longer shows"),
+      deletedAt: 1725100001000,
+    };
+    const html = renderToStaticMarkup(
+      <MessageHoverActions message={message} onInspect={() => {}} />,
+    );
+
+    expect(html).not.toContain('title="Copy"');
+    expect(html).not.toContain('title="Read aloud"');
+    expect(html).toContain('title="Inspect"');
   });
 
   test("renders inspect action for user messages when provided", () => {
@@ -89,5 +125,35 @@ describe("MessageHoverActions", () => {
     );
 
     expect(html).not.toContain('title="Retry"');
+  });
+
+  test("renders copy and read aloud for a copyable message", () => {
+    const message: DisplayMessage = {
+      id: "m7",
+      role: "assistant",
+      timestamp: Date.UTC(2026, 0, 2, 12, 34),
+      ...textBody("hello"),
+    };
+    const html = renderToStaticMarkup(
+      <MessageHoverActions message={message} />,
+    );
+
+    expect(html).toContain('title="Copy"');
+    expect(html).toContain('title="Read aloud"');
+  });
+
+  test("omits copy and read aloud when the message has no text", () => {
+    const message: DisplayMessage = {
+      id: "m8",
+      role: "assistant",
+      timestamp: Date.UTC(2026, 0, 2, 12, 34),
+      ...textBody(""),
+    };
+    const html = renderToStaticMarkup(
+      <MessageHoverActions message={message} />,
+    );
+
+    expect(html).not.toContain('title="Copy"');
+    expect(html).not.toContain('title="Read aloud"');
   });
 });

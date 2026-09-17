@@ -67,7 +67,8 @@ mock.module("../../../util/logger.js", () => ({
 // Import module under test (after mocks)
 // ---------------------------------------------------------------------------
 
-const { registerBrowserCommand } = await import("../browser.js");
+const { formatBrowserStatusLines, registerBrowserCommand } =
+  await import("../browser.js");
 
 // ---------------------------------------------------------------------------
 // Test helper
@@ -533,6 +534,68 @@ describe("--json output", () => {
   });
 });
 
+describe("formatBrowserStatusLines", () => {
+  test("prints userActions for a disconnected extension", () => {
+    const lines = formatBrowserStatusLines(
+      JSON.stringify({
+        requestedMode: "auto",
+        recommendedMode: "cdp-inspect",
+        stickyConversationMode: null,
+        modes: [
+          {
+            mode: "extension",
+            available: false,
+            autoCandidate: true,
+            summary:
+              "Extension mode is unavailable: no Chrome Extension is connected.",
+            userActions: [
+              "Install the Vellum Assistant Chrome extension from the Chrome Web Store: https://chromewebstore.google.com/detail/vellum-assistant-browser/hphbdmpffeigpcdjkckleobjmhhokpne",
+              "Tell the user to make sure a browser is open with the Vellum Chrome extension on.",
+            ],
+          },
+        ],
+      }),
+    );
+
+    expect(lines).not.toBeNull();
+    const rendered = lines!.join("\n");
+    expect(rendered).toContain("Requested mode: auto");
+    expect(rendered).toContain("✗ extension (auto-candidate)");
+    expect(rendered).toContain(
+      "Install the Vellum Assistant Chrome extension from the Chrome Web Store:",
+    );
+    expect(rendered).toContain(
+      "Tell the user to make sure a browser is open with the Vellum Chrome extension on.",
+    );
+  });
+
+  test("omits userActions when the mode is ready", () => {
+    const lines = formatBrowserStatusLines(
+      JSON.stringify({
+        requestedMode: "extension",
+        recommendedMode: "extension",
+        stickyConversationMode: null,
+        modes: [
+          {
+            mode: "extension",
+            available: true,
+            autoCandidate: true,
+            summary: "Extension mode is ready.",
+            userActions: [],
+          },
+        ],
+      }),
+    );
+
+    expect(lines).not.toBeNull();
+    expect(lines!.some((line) => line.trim().startsWith("- "))).toBe(false);
+  });
+
+  test("returns null for non-JSON status content", () => {
+    expect(formatBrowserStatusLines("not json")).toBeNull();
+  });
+});
+
 describe("error exit codes", () => {
   test("exits with non-zero code when IPC fails", async () => {
     mockIpcResult = {
@@ -577,3 +640,85 @@ describe("error exit codes", () => {
     expect(exitCode).toBe(0);
   });
 });
+
+for (const desktopFlag of ["--virtual-desktop", "--desktop"]) {
+  describe(`virtual desktop routing via ${desktopFlag}`, () => {
+    test("routes semantic actions through IPC with conversation and element identity", async () => {
+      process.env.__CONVERSATION_ID = "conv-desktop";
+      const result = await runCommand([
+        "browser",
+        desktopFlag,
+        "--json",
+        "click",
+        "--element-id",
+        "e7",
+      ]);
+      expect(result.exitCode).toBe(0);
+      expect(lastIpcCall?.method).toBe("browser_execute");
+      expect(lastBody()).toMatchObject({
+        desktop: true,
+        conversationId: "conv-desktop",
+        operation: "click",
+        input: { element_id: "e7" },
+      });
+      expect(
+        (lastBody().input as Record<string, unknown>).desktop,
+      ).toBeUndefined();
+    });
+
+    test.each([
+      { args: ["list"] },
+      { args: ["select", "--tab-id", "7"] },
+      { args: ["new"] },
+      { args: ["close", "--tab-id", "7"] },
+    ])("routes desktop tabs $args through IPC", async ({ args }) => {
+      mockIpcResult = { ok: true, result: { ok: true, tabs: [] } };
+      const result = await runCommand([
+        "browser",
+        desktopFlag,
+        "--json",
+        "tabs",
+        ...args,
+      ]);
+      expect(result.exitCode).toBe(0);
+      expect(lastIpcCall?.method).toBe("browser_tabs");
+      expect(lastBody()).toMatchObject({ desktop: true, command: args[0] });
+    });
+
+    test.each([
+      { flags: ["--browser-mode", "extension"] },
+      { flags: ["--target-client-id", "client-123"] },
+    ])("rejects conflicting desktop targets before IPC", async ({ flags }) => {
+      const result = await runCommand([
+        "browser",
+        desktopFlag,
+        ...flags,
+        "tabs",
+        "list",
+      ]);
+      expect(result.exitCode).not.toBe(0);
+      expect(lastIpcCall).toBeNull();
+    });
+  });
+}
+
+test.each([
+  { args: ["list"] },
+  { args: ["select", "--tab-id", "1"] },
+  { args: ["new", "--url", "https://example.com"] },
+  { args: ["close", "--tab-id", "1"] },
+])(
+  "tab command $args forwards an explicit backend override",
+  async ({ args }) => {
+    mockIpcResult = { ok: true, result: { ok: true, tabs: [] } };
+    await runCommand([
+      "browser",
+      "--browser-mode",
+      "extension",
+      "tabs",
+      ...args,
+    ]);
+    expect(lastIpcCall?.method).toBe("browser_tabs");
+    expect(lastBody().browserMode).toBe("extension");
+  },
+);

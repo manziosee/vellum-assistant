@@ -1,4 +1,4 @@
-import { execSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import {
   closeSync,
   existsSync,
@@ -23,6 +23,8 @@ import {
   getPidPath,
   getWorkspaceConfigPath,
 } from "../util/platform.js";
+import { readRawProcessCommand } from "../util/process-table.js";
+import { isDaemonCommand } from "../util/worker-ownership.js";
 
 const log = getLogger("lifecycle");
 
@@ -41,7 +43,7 @@ function isPositiveInteger(v: unknown): v is number {
 
 /**
  * Read daemon timeout values directly from the config JSON file, bypassing
- * loadConfig() and its ensureMigratedDataDir()/ensureDataDir() side effects.
+ * loadConfig() and its ensureDataDir() side effects.
  * Falls back to hardcoded defaults on any error (missing file, malformed JSON,
  * unexpected shape) so daemon stop/start never fails due to config issues.
  */
@@ -116,24 +118,11 @@ function isProcessRunning(pid: number): boolean {
 }
 
 /**
- * Check whether a PID belongs to a vellum daemon process (a bun process
- * running the daemon's main.ts). Prevents signaling an unrelated process
- * that reused a stale PID.
+ * Check whether a PID belongs to a vellum daemon process. Prevents signalling
+ * an unrelated process that reused a stale PID.
  */
 function isVellumDaemonProcess(pid: number): boolean {
-  try {
-    const cmd = execSync(`ps -ww -p ${pid} -o command=`, {
-      encoding: "utf-8",
-      timeout: 3000,
-      stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
-    // The daemon is spawned as `bun run <path>/main.ts` — look for bun
-    // running our daemon entry point.
-    return cmd.includes("bun") && cmd.includes("daemon/main.ts");
-  } catch {
-    // Process exited or ps failed — treat as not ours.
-    return false;
-  }
+  return isDaemonCommand(readRawProcessCommand(pid));
 }
 
 /** Normalize a bind address to a connectable host for health checks.
@@ -269,15 +258,11 @@ async function getDaemonStatus(): Promise<{
   return { running: true, pid };
 }
 
-function getStartupLockPath(): string {
-  return getDaemonStartupLockPath();
-}
-
 /** Attempt to acquire a startup lock. Returns true on success. Stale locks
  *  (older than STARTUP_LOCK_STALE_MS) are forcibly removed to prevent
  *  permanent deadlocks from a crashed caller. */
 function acquireStartupLock(): boolean {
-  const lockPath = getStartupLockPath();
+  const lockPath = getDaemonStartupLockPath();
   try {
     // Ensure the root directory exists before attempting the lock file write.
     // On a first-time run, getRootDir() may not exist yet, and writeFileSync
@@ -304,7 +289,7 @@ function acquireStartupLock(): boolean {
 
 function releaseStartupLock(): void {
   try {
-    unlinkSync(getStartupLockPath());
+    unlinkSync(getDaemonStartupLockPath());
   } catch {
     /* already removed */
   }

@@ -5,7 +5,6 @@
  */
 
 import {
-  creditRowLabel,
   formatMonthly,
   storageRowLabel,
 } from "@/domains/settings/components/tier-pricing";
@@ -29,9 +28,6 @@ import {
  */
 export const NO_EXTRA_CREDITS = "__none__";
 export type CreditChoice = CreditTierEnum | typeof NO_EXTRA_CREDITS;
-
-/** Shared by the credit dropdown's sentinel option and its recap row. */
-export const NO_CREDITS_LABEL = "No extra credits";
 
 /**
  * Sentinel for the baseline machine. `MachineTierEnum` names only the paid
@@ -58,6 +54,13 @@ export interface CustomPlanSeed {
   machineTier: MachineTierEnum | null;
   storageTier: StorageTierEnum;
   creditTier: CreditTierEnum | null;
+  /**
+   * Whether the seeded sub already bills the platform fee. A custom plan
+   * always carries it, so a fee-less (Mighty) seed reads the fee row as an
+   * addition and prices the previous total without it. Absent means the fee
+   * is already billed.
+   */
+  hasPlatformFee?: boolean;
 }
 
 export interface CustomPlanDiffRow {
@@ -82,8 +85,15 @@ export function computeCustomPlanDiff(input: {
   machineTier: MachineChoice | "";
   storageTier: StorageTierEnum | "";
   creditChoice: CreditChoice | "";
+  /**
+   * Wording for the no-bundle sentinel's recap row (and its struck-through
+   * previous value): the localized `customPlanModal.noExtraUsage` copy,
+   * supplied by the caller because this pure module has no `t()`.
+   */
+  noBundleLabel: string;
 }): CustomPlanDiff {
-  const { proPlan, seed, machineTier, storageTier, creditChoice } = input;
+  const { proPlan, seed, machineTier, storageTier, creditChoice, noBundleLabel } =
+    input;
 
   // Resolve against the full catalog, legacy tiers included: a tier a
   // subscriber still holds has to price and label even where the modal no
@@ -137,11 +147,14 @@ export function computeCustomPlanDiff(input: {
     seed != null && seed.machineTier != null && seedMachine == null;
   const seedStorageUnresolved = seed != null && seedStorage == null;
 
+  // A fee-less seed is gaining the fee, so the row reads as a change (there is
+  // no previous value to strike through: the fee was simply not billed).
+  const seedLacksFee = seed != null && seed.hasPlatformFee === false;
   const rows: CustomPlanDiffRow[] = [
     {
       key: "base",
       label: `Platform fee: ${formatMonthly(proPlan.base_price_cents)}`,
-      changed: false,
+      changed: seedLacksFee,
     },
   ];
 
@@ -178,9 +191,11 @@ export function computeCustomPlanDiff(input: {
   // "No extra credits" would be affirmatively false for a sub paying for one.
   const selectedCreditLabel =
     creditChoice === NO_EXTRA_CREDITS
-      ? NO_CREDITS_LABEL
+      ? noBundleLabel
       : selectedCredit != null
-        ? creditRowLabel(selectedCredit.credits_usd)
+        ? // The catalog label ("Mighty Usage") is the bundle's Stripe product
+          // name, so the row matches the invoice line.
+          selectedCredit.label
         : null;
 
   if (selectedCreditLabel != null) {
@@ -190,9 +205,9 @@ export function computeCustomPlanDiff(input: {
       seed != null && (seed.creditTier ?? NO_EXTRA_CREDITS) !== creditChoice;
     const previousCreditLabel =
       seed?.creditTier == null
-        ? NO_CREDITS_LABEL
+        ? noBundleLabel
         : seedCredit != null
-          ? creditRowLabel(seedCredit.credits_usd)
+          ? seedCredit.label
           : undefined;
     rows.push({
       key: "credit",
@@ -225,7 +240,7 @@ export function computeCustomPlanDiff(input: {
   }
 
   const previousTotalCents =
-    proPlan.base_price_cents +
+    (seedLacksFee ? 0 : proPlan.base_price_cents) +
     (seedMachine?.price_cents ?? 0) +
     (seedStorage?.price_cents ?? 0) +
     (seedCredit?.price_cents ?? 0);

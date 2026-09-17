@@ -16,6 +16,14 @@
 // zero-new-messages early-out) and the job's new-message slice — without
 // touching the generic persistence helpers' semantics for other callers.
 //
+// Ambient camera frames are excluded on the same three paths and for the same
+// reason, one step further out: a live-voice call with the camera up persists
+// a frame every few seconds whether or not anyone speaks, so counting them
+// would let a phone lying face up on a desk keep declaring its conversation
+// worth reviewing, and reviewing them would hand the model a wall to remember.
+// The user-activity probe excludes them too, so a tail of nothing but frames
+// never satisfies the `requireUserActivity` gate.
+//
 // The cursor is never blindly advanced over a card: the job still takes its
 // cutoff from the last NON-card row of the filtered slice, so a real message
 // that lands between the cutoff snapshot and the card insert can never be
@@ -23,16 +31,42 @@
 // accounting; once newer real messages arrive it is copied into the next
 // run's fork as inert prefix context.
 
-import { and, eq, gt, like, or } from "drizzle-orm";
+import { and, eq, like, or } from "drizzle-orm";
 
 import {
   countMessagesAfter,
   getMessagesAfter,
   type MessageRow,
 } from "../../../persistence/conversation-crud.js";
+import {
+  messageMetadataIsAmbientSightKeep,
+  SIGHT_FRAME_ATTACHMENT_IDS_KEY,
+} from "../../../persistence/conversation-types.js";
 import { getDb } from "../../../persistence/db-connection.js";
+import {
+  messagesAfterBoundFilter,
+  type MessagesAfterRef,
+  resolveMessagesAfterBound,
+} from "../../../persistence/message-cursor.js";
 import { messages } from "../../../persistence/schema/index.js";
 import { SKILL_CARD_MESSAGE_KIND } from "./memory-retrospective-constants.js";
+
+/**
+ * Rows the retrospective must not account for: a prior run's own skill card,
+ * and ambient camera frames.
+ *
+ * A frame is machine-sampled, one every few seconds for as long as the camera
+ * is up, so counting them would let an idle camera pointed at a wall keep
+ * declaring a conversation worth reviewing. They are also the wrong thing to
+ * review: nobody said anything.
+ */
+function isExcludedFromRetrospectiveAccounting(row: {
+  metadata: string | null;
+}): boolean {
+  return (
+    isSkillCardMessage(row) || messageMetadataIsAmbientSightKeep(row.metadata)
+  );
+}
 
 /** True when a message row's metadata carries the skill-card kind. */
 export function isSkillCardMessage(row: { metadata: string | null }): boolean {
@@ -69,13 +103,13 @@ export function isSkillCardMessage(row: { metadata: string | null }): boolean {
  */
 export function getRetrospectiveMessagesAfter(
   conversationId: string,
-  afterMessageId: string | null,
+  after: MessagesAfterRef,
 ): MessageRow[] {
-  const rows = getMessagesAfter(conversationId, afterMessageId);
+  const rows = getMessagesAfter(conversationId, after);
   const firstUnfinalized = rows.findIndex((row) => row.finalized !== 1);
   const bounded =
     firstUnfinalized === -1 ? rows : rows.slice(0, firstUnfinalized);
-  return bounded.filter((row) => !isSkillCardMessage(row));
+  return bounded.filter((row) => !isExcludedFromRetrospectiveAccounting(row));
 }
 
 /**
@@ -87,14 +121,14 @@ export function getRetrospectiveMessagesAfter(
  */
 export function countRetrospectiveMessagesAfter(
   conversationId: string,
-  afterMessageId: string | null,
+  after: MessagesAfterRef,
 ): number {
-  const total = countMessagesAfter(conversationId, afterMessageId);
+  const total = countMessagesAfter(conversationId, after);
   if (total === 0) {
     return 0;
   }
-  const cardCount = countSkillCardMessagesAfter(conversationId, afterMessageId);
-  return Math.max(0, total - cardCount);
+  const excluded = countExcludedMessagesAfter(conversationId, after);
+  return Math.max(0, total - excluded);
 }
 
 /**
@@ -117,6 +151,12 @@ function blocksCarryNonToolResult(
  * user-role row whose resolved content carries a non-tool_result block. Tool
  * results ride on user-role rows, so a bare role check would count any
  * tool-using assistant stretch as user activity.
+ *
+ * Takes rows rather than reading any itself, and its one caller passes the
+ * slice {@link getRetrospectiveMessagesAfter} already filtered, so ambient
+ * camera frames never reach it. A future caller assembling its own rows has to
+ * filter them first: a frame is a user-role row carrying an image block, which
+ * is indistinguishable from real activity by role and content alone.
  */
 export function messagesHaveUserActivity(
   rows: ReadonlyArray<Pick<MessageRow, "role" | "content">>,
@@ -132,46 +172,27 @@ export function messagesHaveUserActivity(
  * a non-tool_result block. Powers the `memory.retrospective.requireUserActivity`
  * enqueue gate, so only user rows are loaded. Cursor semantics mirror
  * `countMessagesAfter`: a null/`""` reference scans the whole conversation,
- * and a vanished reference means no new work.
+ * a cursor whose row is gone falls back to the timestamp it carries, and a
+ * bare id whose row is gone means no new work.
  *
  * Operates on the raw `content` column: rows that do not parse to a block
  * array (file-backed `{ ref }` rows, legacy plain strings) count as
- * user-authored, so the gate fails toward running the retrospective.
+ * user-authored, so the gate fails toward running the retrospective. Ambient
+ * camera frames are the one user-role row that does NOT count: the camera
+ * sampled them, so they must not be what wakes a review.
  */
 export function hasQualifyingUserMessageAfter(
   conversationId: string,
-  afterMessageId: string | null,
+  after: MessagesAfterRef,
 ): boolean {
-  const cursorId =
-    afterMessageId === null || afterMessageId === "" ? null : afterMessageId;
-  const db = getDb();
-
-  let ref: { createdAt: number } | undefined;
-  if (cursorId !== null) {
-    ref = db
-      .select({ createdAt: messages.createdAt })
-      .from(messages)
-      .where(eq(messages.id, cursorId))
-      .get();
-    if (!ref) {
-      return false;
-    }
+  const start = resolveMessagesAfterBound(after);
+  if (start.kind === "vanished") {
+    return false;
   }
-
   const afterCursor =
-    cursorId !== null && ref
-      ? [
-          or(
-            gt(messages.createdAt, ref.createdAt),
-            and(
-              eq(messages.createdAt, ref.createdAt),
-              gt(messages.id, cursorId),
-            ),
-          ),
-        ]
-      : [];
-  const rows = db
-    .select({ content: messages.content })
+    start.kind === "after" ? [messagesAfterBoundFilter(start.bound)] : [];
+  const rows = getDb()
+    .select({ content: messages.content, metadata: messages.metadata })
     .from(messages)
     .where(
       and(
@@ -182,7 +203,11 @@ export function hasQualifyingUserMessageAfter(
     )
     .all();
 
-  return rows.some((row) => rawUserContentCarriesActivity(row.content));
+  return rows.some(
+    (row) =>
+      !messageMetadataIsAmbientSightKeep(row.metadata) &&
+      rawUserContentCarriesActivity(row.content),
+  );
 }
 
 /** Raw-column twin of the block check used by {@link messagesHaveUserActivity}. */
@@ -207,18 +232,14 @@ function rawUserContentCarriesActivity(raw: string | null): boolean {
  * — at most one per successful retrospective run); each candidate is then
  * JSON-verified by {@link isSkillCardMessage} so an incidental substring
  * match in unrelated metadata can never exclude a real message from
- * accounting. The cursor comparison mirrors `countMessagesAfter`'s
- * tie-breaker semantics, including the null/`""` "count everything" cases
- * and the vanished-reference "no new work" case.
+ * accounting. The cursor resolves exactly as `countMessagesAfter`'s does,
+ * including the null/`""` "count everything" cases and the vanished-reference
+ * "no new work" case.
  */
-function countSkillCardMessagesAfter(
+function countExcludedMessagesAfter(
   conversationId: string,
-  afterMessageId: string | null,
+  after: MessagesAfterRef,
 ): number {
-  // The `""` sentinel (failure-only state rows) counts everything, matching
-  // `countMessagesAfter`.
-  const cursorId =
-    afterMessageId === null || afterMessageId === "" ? null : afterMessageId;
   const db = getDb();
   const candidates = db
     .select({
@@ -230,7 +251,10 @@ function countSkillCardMessagesAfter(
     .where(
       and(
         eq(messages.conversationId, conversationId),
-        like(messages.metadata, `%"kind":"${SKILL_CARD_MESSAGE_KIND}"%`),
+        or(
+          like(messages.metadata, `%"kind":"${SKILL_CARD_MESSAGE_KIND}"%`),
+          like(messages.metadata, `%"${SIGHT_FRAME_ATTACHMENT_IDS_KEY}"%`),
+        ),
       ),
     )
     .all();
@@ -238,30 +262,24 @@ function countSkillCardMessagesAfter(
     return 0;
   }
 
-  let ref: { createdAt: number } | undefined;
-  if (cursorId !== null) {
-    ref = db
-      .select({ createdAt: messages.createdAt })
-      .from(messages)
-      .where(eq(messages.id, cursorId))
-      .get();
-    // Vanished reference: `countMessagesAfter` reported 0, so there is
-    // nothing to subtract from.
-    if (!ref) {
-      return 0;
-    }
+  const start = resolveMessagesAfterBound(after);
+  // Vanished reference: `countMessagesAfter` reported 0, so there is nothing
+  // to subtract from.
+  if (start.kind === "vanished") {
+    return 0;
   }
 
   let count = 0;
   for (const row of candidates) {
-    if (!isSkillCardMessage(row)) {
+    if (!isExcludedFromRetrospectiveAccounting(row)) {
       continue;
     }
-    if (cursorId !== null && ref) {
-      const after =
-        row.createdAt > ref.createdAt ||
-        (row.createdAt === ref.createdAt && row.id > cursorId);
-      if (!after) {
+    if (start.kind === "after") {
+      const { createdAt, id } = start.bound;
+      const isAfter =
+        row.createdAt > createdAt ||
+        (row.createdAt === createdAt && row.id > id);
+      if (!isAfter) {
         continue;
       }
     }

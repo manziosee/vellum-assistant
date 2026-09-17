@@ -12,9 +12,11 @@ import {
   getOnboardingFunnelSessionId,
   ONBOARDING_FUNNEL_STEPS,
 } from "@/domains/onboarding/funnel-events";
-import { hasOnboardedAssistant } from "@/domains/onboarding/onboarded-assistant";
+import { isSelectedAssistantOnboarded } from "@/domains/onboarding/onboarded-assistant";
+import { readSelectedAssistantId } from "@/assistant/selected-assistant-storage";
 import {
   canSkipOnboardingResearch,
+  isNewAssistantFunnel,
   onboardingDestinationAfterConsent,
   withSkipResearch,
 } from "@/domains/onboarding/onboarding-destination";
@@ -127,13 +129,15 @@ export function PrivacyScreen() {
     // to chat.
     const isLocalHatch =
       isLocalClient() && hostingParam !== null && hostingParam !== "vellum-cloud";
-    const alreadyOnboarded = hasOnboardedAssistant(
+    const selectedAssistantOnboarded = isSelectedAssistantOnboarded(
       useResolvedAssistantsStore.getState().assistants,
+      readSelectedAssistantId(),
     );
     const destination = onboardingDestinationAfterConsent({
       isLocalHatch,
       skipResearch,
-      alreadyOnboarded,
+      selectedAssistantOnboarded,
+      newAssistant: isNewAssistantFunnel(searchParams),
     });
     const onboardingNext = skipResearch
       ? withSkipResearch(`${destination}${qs ? `?${qs}` : ""}`)
@@ -249,7 +253,7 @@ export function PrivacyScreen() {
             onClick={() => onAdvance(false)}
             className={electron ? undefined : "h-11 text-base"}
           >
-            {t("actions.start")}
+            {t("privacyScreen.start")}
           </Button>
           {showSkipToChat && (
             <Button
@@ -278,7 +282,7 @@ export function PrivacyScreen() {
            * running environment intact on web and native alike.
            */}
           <Button
-            variant="outlined"
+            variant="ghost"
             size="regular"
             fullWidth
             onClick={() =>

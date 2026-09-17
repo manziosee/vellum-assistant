@@ -20,29 +20,46 @@ import type {
   AppVersionInfo,
   AssistantStatus,
   BundleScanData,
+  CompanionAnnotationPhase,
+  CompanionAnnotationStroke,
+  CompanionAnnotationTool,
+  CompanionCapturePick,
+  CompanionCaptureSources,
   CompanionCharacter,
   CompanionGrowth,
   CompanionContext,
   CompanionIntroAction,
   CompanionSurfaceState,
   ConnectivityState,
+  ScreenCaptureFrame,
   DeepLink,
   DictationOverlayHitRegion,
   DictationOverlayMessage,
   DictationOverlayState,
   DictationPartialEvent,
+  DictationOfferAnswer,
+  CompanionPopoverAnswer,
+  CompanionPopoverView,
+  CompanionPicker,
+  ChordBinding,
+  ChordRegistrationResult,
   DictationPartialsResult,
   DictationTranscribeResult,
+  DownloadDoneEvent,
   ElectronHostOS,
-  FnPushToTalkResult,
+  ModifierHold,
+  ModifierHoldRegistrationResult,
   HelperRestartResult,
   HelperState,
   HotkeyEvent,
   HotkeyEventState,
   HotkeyScope,
+  HotkeySelection,
   LocalAssistantStatusResult,
-  LocalConnectImportResult,
   LocalListDevicesResult,
+  LocalPairingPollResult,
+  LocalPairingStartResult,
+  LocalReadAssistantAvatarResult,
   LocalRevokeDeviceResult,
   LocalUpgradeOptions,
   LocalWakeOptions,
@@ -50,6 +67,8 @@ import type {
   NotificationCategory,
   PowerEvent,
   PowerEventKind,
+  VoiceModeChord,
+  VoiceModeChordRegistrationResult,
   ResolvedHotkey,
   ShowNotificationPayload,
   SystemPermissionKind,
@@ -61,12 +80,15 @@ import type {
   UpdateState,
   UpdateStatus,
   VellumCommand,
+  VellumBridge,
   VoiceActivityContent,
   VoiceActivityControl,
   VoiceActivityControlAction,
   VoiceActivityPhase,
   VoiceActivityStart,
   VoiceActivityState,
+  WatchCaptureTarget,
+  WindowAttentionPayload,
 } from "@vellumai/ipc-contract";
 
 export type {
@@ -84,12 +106,13 @@ export type {
   DictationOverlayState,
   DictationPartialEvent,
   DictationPartialsResult,
-  FnPushToTalkResult,
+  DownloadDoneEvent,
   HelperRestartResult,
   HelperState,
   HotkeyEvent,
   HotkeyEventState,
   HotkeyScope,
+  HotkeySelection,
   NotificationCategory,
   PowerEvent,
   PowerEventKind,
@@ -128,6 +151,7 @@ declare global {
       };
       text?: {
         insertIntoFrontApp(text: string): Promise<TextInsertionResult>;
+        undoInFrontApp?(): Promise<TextInsertionResult>;
         openAutomationSettings(): Promise<void>;
       };
       hotkeys?: {
@@ -150,8 +174,27 @@ declare global {
         getState?(): Promise<HelperState>;
         restart?(): Promise<HelperRestartResult>;
         onState?(callback: (state: HelperState) => void): () => void;
+        apps?: {
+          running(bundleIds: readonly string[]): Promise<string[]>;
+          quit(bundleId: string): Promise<boolean>;
+          frontmost(): Promise<string | null>;
+        };
+        input?: {
+          setActivityWatch(enable: boolean): Promise<boolean>;
+          onActivity(callback: () => void): () => void;
+        };
         hotkey?: {
-          fnPushToTalk(enable: boolean): Promise<FnPushToTalkResult>;
+          setVoiceModeChord?(
+            activator: VoiceModeChord | null,
+          ): Promise<VoiceModeChordRegistrationResult>;
+          setModifierHold?(
+            hold: ModifierHold,
+          ): Promise<ModifierHoldRegistrationResult>;
+          setChords?(binding: ChordBinding): Promise<ChordRegistrationResult>;
+          readFrontSelection?(): Promise<HotkeySelection | null>;
+          onRegistrationChange?(
+            callback: (active: boolean) => void,
+          ): () => void;
           onEvent(callback: (event: HotkeyEvent) => void): () => void;
         };
         dictation?: {
@@ -167,23 +210,13 @@ declare global {
           onFinalized?(
             callback: (event: DictationPartialEvent) => void,
           ): () => void;
-          transcribe?(
-            audio: ArrayBuffer,
-          ): Promise<DictationTranscribeResult>;
+          transcribe?(audio: ArrayBuffer): Promise<DictationTranscribeResult>;
           onTranscribed?(
             callback: (event: DictationPartialEvent) => void,
           ): () => void;
         };
       };
-      permissions?: {
-        getState(): Promise<SystemPermissionsState>;
-        request(kind: SystemPermissionKind): Promise<SystemPermissionStateItem>;
-        openSettings(
-          kind: SystemPermissionKind,
-        ): Promise<SystemPermissionStateItem>;
-        quitAndReopen(): Promise<void>;
-        onState(callback: (state: SystemPermissionsState) => void): () => void;
-      };
+      permissions?: VellumBridge["permissions"];
       commands: {
         on(callback: (command: VellumCommand) => void): () => void;
       };
@@ -195,13 +228,20 @@ declare global {
       };
       icon?: {
         setAvatar(png: Uint8Array | null): void;
-        setCharacter?(character: CompanionCharacter | null): void;
+        setCharacter?(
+          character: CompanionCharacter | null,
+          accentHex?: string | null,
+        ): void;
       };
       dock: {
         setBadge(count: number): void;
       };
       share?: {
         shareFile(bytes: Uint8Array, filename: string): Promise<void>;
+      };
+      downloads?: {
+        onDone(callback: (event: DownloadDoneEvent) => void): () => void;
+        reveal(id: string): Promise<void>;
       };
       menu: {
         setPlatformSession(has: boolean): Promise<void>;
@@ -227,6 +267,10 @@ declare global {
           assistantId: string,
           name: string,
         ): Promise<LockfileWriteResult>;
+        stampLockfileAssistantOnboarded?(
+          assistantId: string,
+          onboardedAt: string,
+        ): Promise<LockfileWriteResult>;
         replacePlatformAssistants(
           platformAssistants: Array<Record<string, unknown>>,
           organizationId?: string,
@@ -237,10 +281,12 @@ declare global {
           hashedDeviceId: string,
         ): Promise<LocalRevokeDeviceResult>;
         unpair?(assistantId: string): Promise<LockfileWriteResult>;
-        connectImport?(
-          bundle: string,
+        pairingStart?(address: string): Promise<LocalPairingStartResult>;
+        pairingPoll?(
+          handle: string,
           name?: string,
-        ): Promise<LocalConnectImportResult>;
+        ): Promise<LocalPairingPollResult>;
+        pairingCancel?(handle: string): Promise<{ ok: boolean }>;
         sleep?(assistantId: string): Promise<{ ok: boolean; error?: string }>;
         wake?(
           assistantId: string,
@@ -251,6 +297,9 @@ declare global {
           options?: LocalUpgradeOptions,
         ): Promise<{ ok: boolean; version?: string; error?: string }>;
         status?(assistantId: string): Promise<LocalAssistantStatusResult>;
+        readAssistantAvatar?(
+          assistantId: string,
+        ): Promise<LocalReadAssistantAvatarResult>;
         guardianToken(
           assistantId: string,
         ): Promise<
@@ -321,6 +370,9 @@ declare global {
         onAction(
           callback: (event: NotificationActionEvent) => void,
         ): () => void;
+        onWindowAttention?(
+          callback: (payload: WindowAttentionPayload) => void,
+        ): () => void;
       };
       popout?: {
         open(conversationId: string): Promise<void>;
@@ -349,16 +401,44 @@ declare global {
         onState(callback: (state: CompanionSurfaceState) => void): () => void;
         setInteractive?(interactive: boolean): void;
         moveBy?(dx: number, dy: number): void;
+        release?(): void;
         startVoice?(): void;
-        toggleWatch?(): void;
+        toggleWatch?(pick?: CompanionCapturePick): void;
+        listCaptureSources?(): Promise<CompanionCaptureSources>;
+        setScreenShare?(pick?: CompanionCapturePick): void;
+        setAnnotating?(annotating: boolean): void;
+        toggleAnnotating?(): void;
+        clearMarks?(): void;
+        setAnnotationTool?(tool: CompanionAnnotationTool): void;
+        annotateShare?(
+          phase: CompanionAnnotationPhase,
+          strokes: readonly CompanionAnnotationStroke[],
+          ink: string,
+        ): void;
+        setFrameScrolling?(scrolling: boolean): void;
+        sharedFrame?(target: WatchCaptureTarget): void;
+        captureScreen?(
+          target: WatchCaptureTarget,
+        ): Promise<ScreenCaptureFrame | null>;
+        captureSourceThumbnail?(
+          target: WatchCaptureTarget,
+        ): Promise<string | null>;
         answerWatchRetro?(open: boolean): void;
+        answerDictationOffer?(
+          answer: DictationOfferAnswer,
+          offerId: string,
+        ): void;
+        answerPopover?(answer: CompanionPopoverAnswer, popoverId: string): void;
+        setPopoverSize?(popoverId: string, width: number, height: number): void;
+        setPopoverView?(popoverId: string, view: CompanionPopoverView): void;
+        setAttachedPopoverHeight?(popoverId: string, height: number): void;
+        togglePicker?(picker: CompanionPicker): void;
+        openLink?(url: string): void;
+        takesPrompts?(): Promise<boolean>;
         activate?(): void;
-        setComposing?(composing: boolean): void;
-        submit?(message: string, startsConversation: boolean): void;
         setContext?(context: CompanionContext): void;
         advanceIntro?(action: CompanionIntroAction): void;
         showContextMenu?(): void;
-        openLink?(url: string): void;
       };
     };
   }

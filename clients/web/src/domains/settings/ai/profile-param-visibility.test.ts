@@ -202,6 +202,14 @@ describe("resolveProfileParamVisibility", () => {
     expect(vis.thinkingLevel).toBe(false);
   });
 
+  test("openai gpt-6-astra enables effort and verbosity", () => {
+    const vis = resolveProfileParamVisibility("openai", "gpt-6-astra");
+    expect(vis.effort).toBe(true);
+    expect(vis.verbosity).toBe(true);
+    expect(vis.thinking).toBe(false);
+    expect(vis.thinkingLevel).toBe(false);
+  });
+
   test("gemini enables thinkingLevel for thinking-capable models", () => {
     const vis = resolveProfileParamVisibility("gemini", "gemini-2.5-flash");
     expect(vis.thinkingLevel).toBe(true);
@@ -245,14 +253,43 @@ describe("modelSupportsThinking", () => {
 });
 
 describe("geminiThinkingLevels", () => {
-  test("pro models exclude 'minimal'", () => {
+  test("uncatalogued Pro models exclude 'minimal' via the regex fallback", () => {
     const levels = geminiThinkingLevels("gemini-3.0-pro");
     expect(levels).toEqual(["low", "medium", "high"]);
     expect(levels).not.toContain("minimal");
   });
 
-  test("non-pro models include 'minimal'", () => {
+  test("cataloged Pro models exclude 'minimal' via thinkingFloor", () => {
+    expect(geminiThinkingLevels("gemini-3.1-pro-preview")).toEqual([
+      "low",
+      "medium",
+      "high",
+    ]);
+    expect(
+      geminiThinkingLevels("gemini-3.1-pro-preview-customtools"),
+    ).toEqual(["low", "medium", "high"]);
+  });
+
+  test("gemini-3.8-flash excludes 'minimal'", () => {
+    const levels = geminiThinkingLevels("gemini-3.8-flash");
+    expect(levels).toEqual(["low", "medium", "high"]);
+    expect(levels).not.toContain("minimal");
+  });
+
+  test("gemini-3.7-flash excludes 'minimal'", () => {
+    const levels = geminiThinkingLevels("gemini-3.7-flash");
+    expect(levels).toEqual(["low", "medium", "high"]);
+    expect(levels).not.toContain("minimal");
+  });
+
+  test("other flash models include 'minimal'", () => {
     const levels = geminiThinkingLevels("gemini-2.5-flash");
     expect(levels).toEqual(["minimal", "low", "medium", "high"]);
+    expect(geminiThinkingLevels("gemini-3.6-flash")).toEqual([
+      "minimal",
+      "low",
+      "medium",
+      "high",
+    ]);
   });
 });

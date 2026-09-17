@@ -94,7 +94,11 @@ export async function graphRequest<T = unknown>(
 
     let proc: ReturnType<typeof Bun.spawn>;
     try {
-      proc = Bun.spawn(args, { stdout: "pipe", stderr: "pipe" });
+      proc = Bun.spawn(args, {
+        windowsHide: true,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
     } catch (err) {
       throw new Error(
         `Failed to spawn assistant oauth request: ${err instanceof Error ? err.message : String(err)}`,
@@ -239,7 +243,12 @@ export interface OutlookCalendarEvent {
   isAllDay?: boolean;
   isCancelled?: boolean;
   showAs?:
-    "free" | "tentative" | "busy" | "oof" | "workingElsewhere" | "unknown";
+    | "free"
+    | "tentative"
+    | "busy"
+    | "oof"
+    | "workingElsewhere"
+    | "unknown";
   importance?: "low" | "normal" | "high";
   sensitivity?: "normal" | "personal" | "private" | "confidential";
   webLink?: string;
@@ -263,7 +272,12 @@ export interface OutlookCalendarEventListResponse {
 /** A single schedule item (free/busy block). */
 export interface OutlookScheduleItem {
   status:
-    "free" | "tentative" | "busy" | "oof" | "workingElsewhere" | "unknown";
+    | "free"
+    | "tentative"
+    | "busy"
+    | "oof"
+    | "workingElsewhere"
+    | "unknown";
   start: OutlookDateTimeZone;
   end: OutlookDateTimeZone;
   subject?: string;

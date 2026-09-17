@@ -4,7 +4,7 @@ import { useState, type ReactNode } from "react";
 import { CacheBreakpointMapCard } from "@/domains/chat/inspector/components/cache-breakpoint-map-card";
 import { CacheDiffCard } from "@/domains/chat/inspector/components/cache-diff-card";
 import { CacheHealthCard } from "@/domains/chat/inspector/components/cache-health-card";
-import { CopyButton } from "@/domains/chat/inspector/components/copy-button";
+import { CopyButton } from "@/components/copy-button";
 import { ToolDefinitionsContent } from "@/domains/chat/inspector/components/tool-definitions-content";
 import { parseToolDefinitions } from "@/domains/chat/inspector/tool-definitions";
 import { useTranslation } from "@/i18n";
@@ -205,14 +205,14 @@ function PromptSectionItem({
           </span>
           <span className="mt-0.5 flex items-center gap-2">
             <span
-              className="text-label-default"
+              className="text-label-medium-default"
               style={{ color: "var(--content-tertiary)" }}
             >
               {kind}
             </span>
             {formatLabel && (
               <span
-                className="text-label-default"
+                className="text-label-medium-default"
                 style={{ color: "var(--content-secondary)" }}
               >
                 {formatLabel}

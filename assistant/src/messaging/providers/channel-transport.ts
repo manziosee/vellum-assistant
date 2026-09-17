@@ -1,8 +1,9 @@
 import type {
   ChannelDeliveryResult,
   ChannelReplyPayload,
-  SlackStreamOp,
+  StreamOp,
 } from "@vellumai/gateway-client";
+import type { ReactionEmojiIdentity } from "@vellumai/service-contracts/reactions";
 
 import type { AssistantActivityPhase } from "../../api/index.js";
 import type { ChannelId } from "../../channels/types.js";
@@ -72,6 +73,60 @@ export interface EditTarget {
 }
 
 /**
+ * The message an emoji reaction lands on, and what to do there.
+ *
+ * `emoji` is spelled in the channel's own vocabulary (a Slack emoji name, a
+ * unicode emoji elsewhere): Vellum names the operation and the channel
+ * decides what its argument means, the same way `EditTarget.text` renders
+ * per channel.
+ */
+export interface ReactionTarget {
+  readonly chatId: string;
+  /** The target message, in the channel's own id space. */
+  readonly messageId: string;
+  /**
+   * Provider id of the thread the target message sits in, absent when it is
+   * not in one. Discord needs it: `chatId` is the delivery address (a thread
+   * message's parent channel), but a thread is its own channel and the
+   * reaction route must name the channel the message actually lives in.
+   * Slack and Telegram address reactions by `chatId` + `messageId` alone
+   * and ignore it.
+   */
+  readonly threadId?: string;
+  readonly emoji: string;
+  readonly action: "add" | "remove";
+}
+
+/**
+ * Where a proactive send goes, in the caller's vocabulary rather than any
+ * channel's: a chat the caller already knows, optionally a thread within it.
+ * How a thread is spelled is each channel's own business.
+ *
+ * Tagged with its kind so a second way of naming a destination is additive
+ * rather than a reinterpretation of `chatId`. Reaching a person who has not
+ * been named as a chat is deliberately not a kind here: on Slack and Discord
+ * it costs a platform call whose result must be resolved at send time rather
+ * than stored, and nothing asks for it yet.
+ */
+export type ProactiveTarget = {
+  readonly kind: "chat";
+  readonly chatId: string;
+  readonly threadId?: string;
+};
+
+/**
+ * A proactive target resolved into what this channel's operations read: the
+ * callback context carrying the channel's routing state, the chat id
+ * `deliver` posts to, and the thread the post lands in, absent when it is
+ * not in one.
+ */
+export interface ProactiveAddress {
+  readonly ctx: CallbackContext;
+  readonly chatId: string;
+  readonly threadId?: string;
+}
+
+/**
  * Direct outbound delivery for one channel, wrapping the channel's provider-API
  * send functions behind a uniform surface. Transports are registered statically
  * (delivery runs in non-daemon contexts) and dispatched by channel, resolved
@@ -84,6 +139,33 @@ export interface EditTarget {
 export interface ChannelTransport {
   /** Canonical source channel id, e.g. `"slack"`. */
   readonly channel: ChannelId;
+
+  /**
+   * Resolve a target the caller names into this channel's own routing state,
+   * for a send that no inbound message brought a callback for.
+   *
+   * Implementing it is the whole of declaring that the channel can be
+   * addressed from a named chat. A transport that can only answer on the
+   * callback an inbound message carried omits it, and a caller reads the
+   * omission as "not addressable" rather than switching on the channel's
+   * name. Returning `undefined` for a target this channel cannot address is
+   * the same answer for that target alone.
+   *
+   * Resolution is local: it reads the target and the channel's own
+   * vocabulary, and makes no platform call. A destination that has to be
+   * resolved over the network belongs behind its own capability, so this one
+   * stays cheap enough to call on every send.
+   */
+  addressFor?(target: ProactiveTarget): ProactiveAddress | undefined;
+
+  /**
+   * Whether a proactive send to a chat must also bind that chat's inbound
+   * conversation, so the next message from the chat resolves to the same
+   * conversation the post lives in. Declared by a channel whose inbound
+   * conversations are keyed per chat and can be reset between sends; omitted
+   * by one whose inbound binding is made at ingress and keyed by thread.
+   */
+  readonly bindsChatOnProactiveSend?: boolean;
 
   /** Deliver a rendered reply (text / approval / attachments). */
   deliver(
@@ -106,6 +188,28 @@ export interface ChannelTransport {
     ctx: CallbackContext,
     target: EditTarget,
   ): Promise<ChannelDeliveryResult>;
+
+  /**
+   * Add or remove one of the assistant's own emoji reactions on a message.
+   *
+   * Takes no callback context: a reaction addresses its message absolutely
+   * (`chatId` + `messageId`) and carries no per-callback thread state, which
+   * is also what lets a producer with no callback URL, a tool running inside
+   * a turn, reach it. A channel whose platform has no reaction affordance
+   * omits the method, and the tool surface reads that omission as the
+   * capability's absence.
+   */
+  react?(target: ReactionTarget): Promise<ChannelDeliveryResult>;
+
+  /**
+   * What an emoji spelling the assistant reacts with means on this channel:
+   * the character for a standard emoji, or the channel's own name for one
+   * only it can render. The record of the assistant's reaction carries
+   * this, so a reader never resolves the channel's naming itself. A channel
+   * without this method has its spelling classified by the contract's
+   * grammar.
+   */
+  describeReactionEmoji?(emoji: string): ReactionEmojiIdentity;
 
   /**
    * Show how busy the assistant is, in whatever form the channel has.
@@ -132,14 +236,52 @@ export interface ChannelTransport {
   readonly activityRefreshMs?: number;
 
   /**
-   * Advance a streamed reply: open it, add to it, or close it.
+   * Advance a reply that grows while the turn runs: open it, add to it, or end
+   * it.
    *
-   * A channel that can only post a finished message omits this, and the
-   * caller falls back to delivering the reply whole.
+   * A channel with no primitive for this omits the method, and the caller
+   * sends the finished reply instead. Omitting it is the correct answer for a
+   * platform that offers nothing here rather than a gap to paper over: a
+   * channel is not made to simulate streaming by rewriting a sent message,
+   * which is both a worse experience and, on Telegram, discouraged by the
+   * platform that does offer one.
+   *
+   * What the channel leaves behind when the stream ends is its own business.
+   * Slack finalizes the streamed message in place; Telegram's live draft
+   * expires and the reply is persisted by an ordinary send. `stop` carries the
+   * complete reply so either can be true.
    */
   streamReply?(
     ctx: CallbackContext,
     chatId: string,
-    op: SlackStreamOp,
+    op: StreamOp,
   ): Promise<ChannelDeliveryResult>;
+
+  /**
+   * The most text one stream operation may carry, for a channel that caps it.
+   *
+   * Declared rather than applied here because the caller is what knows how
+   * much of the reply a channel has actually accepted: it must advance that
+   * mark once per operation the channel confirms. A transport that split a
+   * wide delta into several calls of its own would leave the caller unable to
+   * tell a partial delivery from a whole one, and a retry would then re-send
+   * the part that already landed. Omitted by a channel with no cap.
+   */
+  readonly maxStreamTextChars?: number;
+
+  /**
+   * Whether what `streamReply` leaves behind is the reply itself.
+   *
+   * True for a channel that finalizes the streamed message in place, so the
+   * reply is already delivered once the stream ends and durable delivery must
+   * not send it again. Omitted by a channel whose stream is only a preview:
+   * the draft evaporates and the reply is still owed, so durable delivery
+   * sends it as it would for a channel that never streamed.
+   *
+   * Omission is the safe default on purpose. A channel that forgets to
+   * declare it posts the reply through the ordinary path, which at worst
+   * repeats what a persisting stream already showed; the opposite mistake
+   * loses the reply entirely.
+   */
+  readonly streamPersists?: boolean;
 }

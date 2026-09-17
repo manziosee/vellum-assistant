@@ -25,6 +25,8 @@ import { mock } from "bun:test";
 import type {
   LiveVoiceClientEventMap,
   LiveVoiceClientEventName,
+  LiveVoiceConnectArgs,
+  LiveVoiceSightFrameTiming,
 } from "@/domains/chat/voice/live-voice/live-voice-client";
 import type {
   LiveVoiceAudioCaptureOptions,
@@ -42,14 +44,19 @@ import {
 } from "@/domains/chat/voice/live-voice/live-voice-store";
 
 export class FakeClient {
-  connectArgs: {
-    assistantId: string;
-    conversationId?: string;
-    turnDetection?: "manual" | "server_vad";
-    silenceThresholdMs?: number;
-    bargeInMinSpeechMs?: number;
-  } | null = null;
+  // The real client's own args type, not a restated copy, so a field added to
+  // the connect frame reaches every assertion made against this fake.
+  connectArgs: LiveVoiceConnectArgs | null = null;
   sentAudio: ArrayBuffer[] = [];
+  sentText: string[] = [];
+  /** Per-send options, index-aligned with {@link sentText}. */
+  sentTextOptions: ({ hidden?: boolean } | undefined)[] = [];
+  /**
+   * Mirrors the real client's `ready.textInput` echo. False by default, as the
+   * real one is until a `ready` frame says otherwise, so a test that wants a
+   * typed turn to go out has to say so.
+   */
+  textInputSupported = false;
   pttReleaseCount = 0;
   interruptCount = 0;
   updateConfigCalls: {
@@ -77,18 +84,23 @@ export class FakeClient {
     return () => set?.delete(handler as (payload: never) => void);
   }
 
-  async connect(args: {
-    assistantId: string;
-    conversationId?: string;
-    turnDetection?: "manual" | "server_vad";
-    silenceThresholdMs?: number;
-    bargeInMinSpeechMs?: number;
-  }): Promise<void> {
+  async connect(args: LiveVoiceConnectArgs): Promise<void> {
     this.connectArgs = args;
   }
 
   sendAudio(pcm: ArrayBuffer): void {
     this.sentAudio.push(pcm);
+  }
+  sendText(text: string, options?: { hidden?: boolean }): boolean {
+    if (!this.textInputSupported) {
+      return false;
+    }
+    this.sentText.push(text);
+    this.sentTextOptions.push(options);
+    return true;
+  }
+  get supportsTextInput(): boolean {
+    return this.textInputSupported;
   }
   pttRelease(): void {
     this.pttReleaseCount++;
@@ -199,6 +211,18 @@ export class FakePlayer {
   /** Route the fake reports, and how many times it was asked to re-render it. */
   outputRoute: TtsOutputRoute = "unsupported";
   restartOutputRouteCount = 0;
+  /**
+   * Chunks a `holdPlayback()` flush retained, or null when nothing is held.
+   * The real player keeps the audio scheduled but not yet sounded; the fake
+   * stands in for it with whatever had been enqueued, which is enough for the
+   * controller specs (they assert what is held, resumed, and dropped, not how
+   * the audio is re-scheduled). Buffer-level behavior is covered against the
+   * real player in `tts-playback.test.ts`.
+   */
+  heldAudio: unknown[] | null = null;
+  holdCount = 0;
+  resumeHeldCount = 0;
+  discardHeldCount = 0;
   private drainResolvers: Array<() => void> = [];
 
   prewarm(): void {
@@ -236,13 +260,45 @@ export class FakePlayer {
     this.outputMuted = muted;
   }
   enqueue(chunk: unknown): void {
+    // New audio supersedes a hold, exactly as it does on the real player.
+    this.heldAudio = null;
     this.enqueued.push(chunk);
     this.isPlaying = true;
   }
   stop(): void {
+    this.heldAudio = null;
     this.stopCount++;
     this.isPlaying = false;
     this.resolveDrain();
+  }
+  /**
+   * Flush while retaining the unplayed audio. A flush that finds nothing
+   * playing captures nothing, mirroring the real player on both counts: a
+   * drained reply has nothing left to keep, and the second flush of a barge-in
+   * pair must not clear what the first kept.
+   */
+  holdPlayback(): void {
+    this.holdCount++;
+    const held = this.isPlaying ? [...this.enqueued] : this.heldAudio;
+    this.stop();
+    this.heldAudio = held;
+  }
+  hasHeldPlayback(): boolean {
+    return this.heldAudio !== null;
+  }
+  discardHeldPlayback(): void {
+    this.discardHeldCount++;
+    this.heldAudio = null;
+  }
+  resumeHeldPlayback(): boolean {
+    const held = this.heldAudio;
+    this.heldAudio = null;
+    if (!held) {
+      return false;
+    }
+    this.resumeHeldCount++;
+    this.isPlaying = true;
+    return true;
   }
   async dispose(): Promise<void> {
     this.disposeCount++;
@@ -292,6 +348,9 @@ export function makeControlsSpies() {
     // Defaults to delivered. The reconnect-gap case (false) is asserted by the
     // tests that care, so the common path stays uncluttered.
     attachImage: mock((_attachmentId: string) => true),
+    sightFrame: mock(
+      (_attachmentId: string, _timing?: LiveVoiceSightFrameTiming) => true,
+    ),
   } satisfies LiveVoiceSessionControls;
 }
 

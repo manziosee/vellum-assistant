@@ -10,7 +10,9 @@ import {
   ChannelIcon,
   getOpenInChannelLabel,
 } from "@/utils/channel-presentation";
+import { useConversationMenuShortcuts } from "@/domains/chat/hooks/use-conversation-menu-shortcuts";
 import type { Conversation } from "@/types/conversation-types";
+import { useDisplayConversationTitle } from "@/utils/conversation-title";
 
 interface ChatConversationHeaderProps {
   assistantId: string | null;
@@ -22,6 +24,7 @@ interface ChatConversationHeaderProps {
   showInternalActions: boolean;
   onArchive: (c: Conversation) => void;
   onUnarchive: (c: Conversation) => void;
+  onDelete: (c: Conversation) => void;
   onMarkUnread: (c: Conversation) => void;
   onMarkRead: (c: Conversation) => void;
   onPinToggle: (c: Conversation) => void;
@@ -35,12 +38,17 @@ export function ChatConversationHeader({
   showInternalActions,
   onArchive,
   onUnarchive,
+  onDelete,
   onMarkUnread,
   onMarkRead,
   onPinToggle,
   onRename,
 }: ChatConversationHeaderProps) {
+  // This menu acts on `activeConversation`, which is what the bound commands
+  // act on too, so its rows may advertise them.
+  const shortcuts = useConversationMenuShortcuts(true);
   const { t } = useTranslation("chat");
+  const displayTitle = useDisplayConversationTitle();
   if (!activeConversation) {
     if (!assistantId) {
       return null;
@@ -83,6 +91,7 @@ export function ChatConversationHeader({
   return (
     <ConversationActionsMenu
       variant="header"
+      shortcuts={shortcuts}
       channelSourceLink={channelSourceLink}
       isPinned={isPinned}
       isArchived={isArchived}
@@ -91,6 +100,11 @@ export function ChatConversationHeader({
       onRename={() => onRename(activeConversation)}
       onArchive={() => onArchive(activeConversation)}
       onUnarchive={() => onUnarchive(activeConversation)}
+      onDelete={
+        activeConversation.conversationId && !activeConversation.draft
+          ? () => onDelete(activeConversation)
+          : undefined
+      }
       onForkConversation={
         !isReadonly &&
         headerSupplements?.hasPersistedMessage &&
@@ -176,7 +190,7 @@ export function ChatConversationHeader({
                   {t("chatConversationHeader.archived")}
                 </span>
               )}
-              {activeConversation.title ?? t("chatConversationHeader.untitled")}
+              {displayTitle(activeConversation.title)}
             </span>
             {channelHeaderLabel ? (
               <span className="hidden max-w-[160px] shrink truncate leading-6 text-[var(--content-tertiary)] sm:inline">

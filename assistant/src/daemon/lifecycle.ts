@@ -1,10 +1,10 @@
 import { config as dotenvConfig } from "dotenv";
 
+import { reconcileAppPins } from "../apps/app-pin-reconciler.js";
 import { reconcileCallsOnStartup } from "../calls/call-recovery.js";
 import { TwilioVoiceProvider } from "../calls/twilio-provider.js";
 import { expireInteractionBoundGuardianRequests } from "../channels/gateway-guardian-requests.js";
 import { initFeatureFlagOverrides } from "../config/assistant-feature-flags.js";
-import { getBalancedModelExperimentArm } from "../config/balanced-model-experiment.js";
 import { setIngressPublicBaseUrl, validateEnv } from "../config/env.js";
 import {
   hasPendingDefaultWorkspaceConfig,
@@ -31,6 +31,7 @@ import { maybeEnqueueLexicalBackfillOnUpgrade } from "../persistence/job-handler
 import { clearLifecycleQuiesce } from "../persistence/lifecycle-quiesce.js";
 import { isPlatformClientConfigured } from "../platform/client.js";
 import { startConsentRefresh } from "../platform/consent-cache.js";
+import { syncAvatarToPlatform } from "../platform/sync-avatar.js";
 import { syncWorkspaceIdentityToPlatform } from "../platform/sync-identity.js";
 import { ensurePromptFiles } from "../prompts/system-prompt.js";
 import { runProviderConnectionsBackfill } from "../providers/inference/backfill.js";
@@ -68,10 +69,8 @@ import { repairAdaptiveThinkingOnManagedProfiles } from "../workspace/adaptive-t
 import { ensureByokDefaultProfiles } from "../workspace/byok-default-profile-ensure.js";
 import { ensureCompleteCustomProfiles } from "../workspace/custom-profile-ensure.js";
 import { ensureDefaultProvider } from "../workspace/default-provider-ensure.js";
-import { startWorkspaceHeartbeatService } from "../workspace/heartbeat-service.js";
 import { WORKSPACE_MIGRATIONS } from "../workspace/migrations/registry.js";
 import { runWorkspaceMigrations } from "../workspace/migrations/runner.js";
-import { startAppSourceWatcher } from "./app-source-watcher.js";
 import { startConfigWatcher } from "./config-watcher.js";
 import { startConversationEvictor } from "./conversation-evictor.js";
 import { writePid } from "./daemon-control.js";
@@ -229,21 +228,12 @@ export async function runDaemon(): Promise<void> {
   // a failed fetch leaves the cache unset and resolves `os-beta` to its
   // registry default `false`, which would remove the user's profile and reset
   // their selection.
-  // A balanced-model experiment arm arriving in this same load gets the same
-  // invalidation. HTTP binds before this resolves, so a client that fetched
-  // profiles in that window holds the shipped model; the arm moves nothing on
-  // disk, so the reconcile above would not report a change and the listener's
-  // own comparison sees the arm on both sides of its refresh.
-  const balancedArmBeforeInit = getBalancedModelExperimentArm();
   void initFeatureFlagOverrides()
     .then((loaded) => {
       if (!loaded) {
         return;
       }
-      const profilesChanged = reconcileFlagGatedProfiles();
-      const balancedArmChanged =
-        getBalancedModelExperimentArm() !== balancedArmBeforeInit;
-      if (profilesChanged || balancedArmChanged) {
+      if (reconcileFlagGatedProfiles()) {
         publishConfigChanged();
       }
     })
@@ -275,7 +265,8 @@ export async function runDaemon(): Promise<void> {
   // records the failed migration state so /readyz returns 503.
   let dbReady = false;
   try {
-    const { migrationsOk } = await initializeDb();
+    const initResult = await initializeDb();
+    const { migrationsOk } = initResult;
     dbReady = true;
     // A quiesce lease can survive a stop that happened mid-drain; clear it so
     // a fresh boot never starts with background work paused. Placed
@@ -303,8 +294,17 @@ export async function runDaemon(): Promise<void> {
       setDbReady(true);
       log.info("Daemon startup: DB initialized");
     } else {
-      setDbMigrationFailed();
+      setDbMigrationFailed(undefined, {
+        failedMigrations: initResult.failedMigrations,
+        deferredMigrations: initResult.deferredMigrations,
+        validationError: initResult.validationError,
+      });
       log.error(
+        {
+          failedMigrations: initResult.failedMigrations,
+          deferredMigrations: initResult.deferredMigrations,
+          validationError: initResult.validationError,
+        },
         "Daemon startup: DB opened but one or more migrations failed or were deferred — /readyz will remain unready",
       );
     }
@@ -459,19 +459,16 @@ export async function runDaemon(): Promise<void> {
       );
     }
 
-    // Expire stale pending guardian requests left over from before this
-    // process started. Daemon-keyed by design: interaction-bound kinds die
-    // with THIS process's in-memory pendingInteractions map, so the daemon
-    // triggers the gateway op at its own boot — the gateway never runs it
-    // on its own restart. Two categories are cleaned up:
-    //
-    // 1. Interaction-bound kinds (tool_approval, pending_question) — their
-    //    in-memory pending-interaction session references are gone, so they
-    //    can never be completed.
-    // 2. Any pending request whose expiresAt has already passed — persistent
-    //    kinds (access_request, tool_grant_request) that expired while the
-    //    daemon was stopped are transitioned so dedup logic doesn't return
-    //    stale rows.
+    // Expire interaction-bound guardian requests (tool_approval,
+    // pending_question) left over from before this process started: their
+    // in-memory pending-interaction session references are gone, so they
+    // can never be completed. Daemon-keyed by design: the daemon triggers
+    // the gateway op at its own boot, and the gateway never runs it on its
+    // own restart. Persistent kinds (access_request, tool_grant_request) are
+    // never touched here, whatever their deadline: their expiry belongs to
+    // the periodic sweep, which owns the card-withdrawal and
+    // requester-notice fan-out, and the dedupe reads are deadline-aware so
+    // a past-deadline row waiting for the sweep suppresses nothing.
     //
     // Startup must not block on the gateway (daemon startup philosophy):
     // on failure the periodic sweep still reaps time-expired rows, and
@@ -676,11 +673,11 @@ export async function runDaemon(): Promise<void> {
   // blocked.
   startConsentRefresh();
 
-  // Bring up the daemon's CES connection (process + handshake + reconnect
+  // Bring up the assistant's CES connection (process + handshake + reconnect
   // wiring). Blocks up to a 20s timeout so credential reads route through CES
-  // before provider init; non-fatal — falls back to the direct credential store
-  // on failure. The sidecar accepts exactly one bootstrap connection, so this
-  // happens at the process level.
+  // before provider init; non-fatal, falls back to the direct credential store
+  // on failure. CES serves a multi-connection bootstrap socket, so this
+  // happens at the process level and child processes can connect independently.
   await startCes(config);
 
   // Bring up the plugin layer: install the runtime bridge, register the
@@ -694,9 +691,10 @@ export async function runDaemon(): Promise<void> {
 
   // Initialize providers before Qdrant so HTTP routes can begin accepting
   // requests while Qdrant initializes, then best-effort sync the workspace
-  // identity name to the platform record.
+  // identity name and avatar to the platform record.
   await initializeProviders(config);
   syncWorkspaceIdentityToPlatform();
+  syncAvatarToPlatform();
 
   // Start the idle/LRU/memory-pressure sweep over the in-memory conversation
   // pool.
@@ -706,10 +704,6 @@ export async function runDaemon(): Promise<void> {
   // to changes: evict conversations so the next turn rebuilds against the new
   // config, and broadcast the relevant resource-changed events to clients.
   startConfigWatcher();
-
-  // Watch app source directories so edits recompile + refresh surfaces across
-  // all conversations.
-  startAppSourceWatcher();
 
   // Start the CLI IPC server. Throws on EADDRINUSE to abort startup when another
   // daemon already holds the socket, so this process never runs background jobs
@@ -746,6 +740,7 @@ export async function runDaemon(): Promise<void> {
   // the same shape as schedule recovery above.
   try {
     await reconcilePluginSchedules();
+    reconcileAppPins();
   } catch (err) {
     log.error({ err }, "Plugin schedule reconcile failed, continuing startup");
   }
@@ -832,8 +827,6 @@ export async function runDaemon(): Promise<void> {
   installAssistantCommand();
 
   void startEmbeddingRuntimeManager();
-
-  startWorkspaceHeartbeatService();
 
   startHeartbeatService();
 

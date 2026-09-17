@@ -1020,6 +1020,52 @@ paths:
           description: No response body
       x-vellum-api-clients:
       - platform
+  /v1/assistants/{assistant_id}/domains/{id}/provision/:
+    post:
+      operationId: assistants_domains_provision_create
+      description: Provision an existing managed domain with the email provider and
+        DNS.
+      parameters:
+      - in: path
+        name: assistant_id
+        schema:
+          type: string
+          format: uuid
+        required: true
+      - in: path
+        name: id
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - assistants
+      security:
+      - VellumAPIKey: []
+      - SDKCompatibleAssistantKey: []
+      - cookieAuth: []
+      - XSessionTokenAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DomainVerificationStatus'
+          description: ''
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DetailResponse'
+          description: ''
+        '502':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DetailResponse'
+          description: ''
+      x-vellum-api-clients:
+      - platform
   /v1/assistants/{assistant_id}/domains/{id}/verification-status/:
     get:
       operationId: assistants_domains_verification_status_retrieve
@@ -1824,15 +1870,22 @@ paths:
           enum:
           - airtable
           - asana
+          - calendly
           - discord
           - dropbox
+          - eventbrite
+          - figma
           - github
           - google
           - hubspot
           - linear
+          - monday
           - notion
           - outlook
+          - quickbooks
           - salesforce
+          - shopify
+          - stripe_link
           - todoist
           - twitter
         description: Filter connections by OAuth provider.
@@ -2632,6 +2685,12 @@ paths:
           description: No response body
         '409':
           description: No response body
+        '429':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DetailResponse'
+          description: ''
       x-vellum-api-clients:
       - platform
   /v1/assistants/{id}/access-consent/:
@@ -4853,17 +4912,72 @@ paths:
           description: ''
       x-vellum-api-clients:
       - platform
+  /v1/organizations/billing/subscription/cancel/:
+    post:
+      operationId: organizations_billing_subscription_cancel_create
+      description: 'Cancel the org''s Pro subscription at the end of the current billing
+        period — the server-side equivalent of cancelling through the Stripe Customer
+        Portal. The subscription (and its entitlements) stays active until the period
+        ends, when Stripe terminates it and the org returns to the Base plan; no refund
+        or proration is issued. Idempotent: a subscription already pending cancellation
+        returns no_op. Requires an active Pro subscription with a provisioned Stripe
+        subscription. The optional body carries the cancel survey (``feedback`` from
+        Stripe''s fixed vocabulary, free-text ``comment``), forwarded to Stripe as
+        ``cancellation_details`` so the admin Revenue page''s Pending Cancellations
+        reason column is populated for in-app cancels the same way it is for Customer
+        Portal cancels.'
+      parameters:
+      - in: header
+        name: Vellum-Organization-Id
+        schema:
+          type: string
+          format: uuid
+        description: Required if using Cookie-based or X-Session-Token authentication
+          methods.
+      tags:
+      - organizations
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubscriptionCancelRequestRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/SubscriptionCancelRequestRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/SubscriptionCancelRequestRequest'
+      security:
+      - cookieAuth: []
+      - XSessionTokenAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubscriptionCancelResponse'
+          description: ''
+      x-vellum-api-clients:
+      - platform
   /v1/organizations/billing/subscription/change-credit-tier/:
     post:
       operationId: organizations_billing_subscription_change_credit_tier_create
-      description: Add, swap, or remove the included-credit bundle on the org's active
+      description: 'DEPRECATED: use change-package with explicit tiers, which applies
+        every dimension — and the platform fee every non-Mighty plan carries — in
+        one call. Add, swap, or remove the included-credit bundle on the org''s active
         Pro subscription without re-checkout. A null ``credit_tier`` removes the bundle
         (back to the $0 default); a set value adds (when none today) or swaps the
-        existing bundle. All transitions use proration_behavior=none, so the change
-        — and the matching monthly credit grant — take effect at the next cycle boundary
-        (no immediate partial charge). Rejected with HTTP 409 while a cancellation
-        is pending. Requires an active Pro subscription with a provisioned Stripe
-        subscription.
+        existing bundle. UPGRADES (the credit value strictly increases; adding a bundle
+        counts) charge the full price difference between the two tiers immediately
+        — a flat difference, not a time-based Stripe proration — and grant the credit
+        difference immediately; the renewal then bills the full new price. A declined
+        difference charge returns HTTP 402 and reverts the change. Subscriptions carrying
+        an active discount defer upgrades to the next cycle instead (the flat difference
+        would ignore the coupon). DOWNGRADES and removals still use proration_behavior=none:
+        the change — and the smaller monthly grant — take effect at the next cycle
+        boundary, with no immediate charge or refund. Rejected with HTTP 409 while
+        a cancellation is pending. Requires an active Pro subscription with a provisioned
+        Stripe subscription.'
       parameters:
       - in: header
         name: Vellum-Organization-Id
@@ -4889,6 +5003,7 @@ paths:
       security:
       - cookieAuth: []
       - XSessionTokenAuth: []
+      deprecated: true
       responses:
         '200':
           content:
@@ -4901,16 +5016,19 @@ paths:
   /v1/organizations/billing/subscription/change-machine-tier/:
     post:
       operationId: organizations_billing_subscription_change_machine_tier_create
-      description: Add, switch, or remove the compute (machine) tier on the org's
+      description: 'DEPRECATED: use change-package with explicit tiers, which applies
+        every dimension — and the platform fee every non-Mighty plan carries — in
+        one call. Add, switch, or remove the compute (machine) tier on the org''s
         active Pro subscription. A set value swaps the Stripe subscription item in
         place (or adds one when the subscription has no machine item); a null ``machine_tier``
         removes the item entirely (back to the small baseline). Upgrades — including
-        adding a tier — invoice immediately (always_invoice) and only raise the ceiling;
-        pods are left untouched (grow later via the per-assistant resize). Downgrades
-        and removals net onto the next invoice (create_prorations, no refund) and
-        cap any pods above the new ceiling via vembda. Rejected with HTTP 409 while
-        a cancellation is pending. Requires an active Pro subscription with the multi-item
-        structure; legacy single-price subscriptions get HTTP 409 until they are migrated.
+        adding a tier — invoice immediately (always_invoice) and grow the org''s assistants
+        up to the new ceiling asynchronously, the same way a Base→Pro subscribe does;
+        the response does not wait on that rollout. Downgrades and removals net onto
+        the next invoice (create_prorations, no refund) and cap any pods above the
+        new ceiling via vembda. Rejected with HTTP 409 while a cancellation is pending.
+        Requires an active Pro subscription with the multi-item structure; legacy
+        single-price subscriptions get HTTP 409 until they are migrated.'
       parameters:
       - in: header
         name: Vellum-Organization-Id
@@ -4936,6 +5054,7 @@ paths:
       security:
       - cookieAuth: []
       - XSessionTokenAuth: []
+      deprecated: true
       responses:
         '200':
           content:
@@ -4948,19 +5067,35 @@ paths:
   /v1/organizations/billing/subscription/change-package/:
     post:
       operationId: organizations_billing_subscription_change_package_create
-      description: 'Switch the org''s active Pro subscription to a named package (e.g.
-        mighty/super/ultra). Diffs the package''s machine, storage, credit, and base-platform-fee
-        line items against the current subscription and applies them as one or two
-        atomic Stripe updates: the machine/storage/fee items (adding, swapping, or
-        removing — including the ``vellum_pro_base`` fee) settle in a first ``Subscription.modify``
-        that bills immediately, while any included-credit bundle change settles in
-        a separate ``proration_behavior=none`` modify at the next cycle. A net price
-        increase on the primary items invoices immediately and gates on payment success
-        (HTTP 402 on a declined card, leaving the plan unchanged); a net decrease
-        nets onto the next invoice. Machines above the new package''s ceiling are
-        capped via vembda and lower ceilings grow asynchronously; PVCs are never shrunk.
-        Rejected with HTTP 409 while a cancellation is pending, and gated on the ``pro-packages``
-        flag (an unknown or gated package returns the same HTTP 400).'
+      description: 'Change the org''s active Pro subscription to another Pro plan:
+        a named package (e.g. mighty/super/ultra) or a custom plan given as explicit
+        machine/storage/credit tiers. This is the one endpoint for every Pro → Pro
+        change (named ↔ named, named ↔ custom, custom ↔ custom). Diffs the target''s
+        machine, storage, credit, and base-platform-fee line items against the current
+        subscription and applies them as one or two atomic Stripe updates: the machine/storage/fee
+        items (adding, swapping, or removing — including the ``vellum_pro_base`` fee)
+        settle in a first ``Subscription.modify`` that bills immediately, while any
+        included-credit bundle change settles in a separate ``proration_behavior=none``
+        modify. A credit-tier INCREASE additionally charges the flat price difference
+        between the two bundles immediately and grants the credit difference immediately
+        (mirroring change-credit-tier); when that difference cannot be charged (active
+        discount, no chargeable payment method, or a declined charge) the credits
+        simply apply at the next cycle and the package switch stands. Credit decreases
+        settle at the next cycle. A net price increase on the primary items invoices
+        immediately and gates on payment success (HTTP 402 on a declined card, leaving
+        the plan unchanged); a net decrease nets onto the next invoice. Machines above
+        the new package''s ceiling are capped via vembda and lower ceilings grow asynchronously;
+        PVCs are never shrunk. Rejected with HTTP 409 while a cancellation is pending.
+        A named package is gated on the ``pro-packages`` flag (an unknown or gated
+        package returns the same HTTP 400); a custom target is not gated, like the
+        per-dimension tier endpoints it replaces. A custom plan ALWAYS carries the
+        base platform fee and clears the package pin (``package`` is null in the response);
+        only the Mighty package is sold without the fee, so leaving Mighty for any
+        other plan adds the fee (invoiced immediately with the rest of the net increase)
+        and grants the fee-backed managed-email / phone-number entitlements, while
+        moving to Mighty removes it. Custom targets follow the per-dimension rules:
+        storage is upgrade-or-keep, and retired credit bundles / legacy storage tiers
+        are rejected unless unchanged.'
       parameters:
       - in: header
         name: Vellum-Organization-Id
@@ -4998,15 +5133,18 @@ paths:
   /v1/organizations/billing/subscription/change-storage-tier/:
     post:
       operationId: organizations_billing_subscription_change_storage_tier_create
-      description: Upgrade the storage tier on the org's active Pro subscription.
+      description: 'DEPRECATED: use change-package with explicit tiers, which applies
+        every dimension — and the platform fee every non-Mighty plan carries — in
+        one call. Upgrade the storage tier on the org''s active Pro subscription.
         Modifies the Stripe subscription item in place and invoices immediately (always_invoice).
         Storage is upgrade-only — equal-tier requests are a no-op and smaller-tier
         requests are rejected with HTTP 400 before any Stripe call. Legacy (no-longer-offered)
         tiers are rejected with HTTP 400 unless they equal the current tier (which
-        no-ops). PVCs are never grown here; the per-assistant resize card applies
-        the new ceiling. Rejected with HTTP 409 while a cancellation is pending. Requires
-        an active Pro subscription with storage_tier metadata; legacy subscriptions
-        get HTTP 409 until they are migrated.
+        no-ops). On a successful change the org''s assistants grow up to the new ceiling
+        asynchronously, the same way a Base→Pro subscribe does; the response does
+        not wait on that rollout. PVCs are never shrunk. Rejected with HTTP 409 while
+        a cancellation is pending. Requires an active Pro subscription with storage_tier
+        metadata; legacy subscriptions get HTTP 409 until they are migrated.'
       parameters:
       - in: header
         name: Vellum-Organization-Id
@@ -5032,6 +5170,7 @@ paths:
       security:
       - cookieAuth: []
       - XSessionTokenAuth: []
+      deprecated: true
       responses:
         '200':
           content:
@@ -5191,6 +5330,39 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/EnsureProvisionedUnavailable'
+          description: ''
+      x-vellum-api-clients:
+      - platform
+  /v1/organizations/billing/subscription/reactivate/:
+    post:
+      operationId: organizations_billing_subscription_reactivate_create
+      description: 'Reactivate the org''s Pro subscription by removing a pending cancellation
+        before the current billing period ends — the server-side equivalent of clicking
+        "Do not cancel" in the Stripe Customer Portal. The subscription resumes renewing
+        at the period end; nothing is charged now. Idempotent: a subscription with
+        no pending cancellation returns no_op. Requires an active Pro subscription
+        with a provisioned Stripe subscription — once the period has ended and the
+        subscription is fully canceled it can no longer be reactivated (returns HTTP
+        403; subscribe again via upgrade instead).'
+      parameters:
+      - in: header
+        name: Vellum-Organization-Id
+        schema:
+          type: string
+          format: uuid
+        description: Required if using Cookie-based or X-Session-Token authentication
+          methods.
+      tags:
+      - organizations
+      security:
+      - cookieAuth: []
+      - XSessionTokenAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubscriptionReactivateResponse'
           description: ''
       x-vellum-api-clients:
       - platform
@@ -6061,14 +6233,25 @@ components:
   schemas:
     AccessConsent:
       type: object
-      description: Serializer for the user-controlled admin log access consent toggle.
+      description: Serializer for the user-controlled staff access consent toggle.
       properties:
         access_consented:
           type: boolean
-          description: When True, Vellum admins may view the daemon log files (/workspace/data/logs/assistant-*.log)
-            from this assistant pod for debugging. Defaults to False; the owner can
-            revoke at any time.
+          description: 'When True, Vellum staff may access this assistant and its
+            data for debugging: daemon log files, an admin terminal on the running
+            assistant, and a disposable clone of its disk. Defaults to False; the
+            owner can revoke at any time, which blocks new access and further commands
+            in open admin terminal sessions. A grant lapses on its own at access_consent_expires_at;
+            reads report False once it has.'
+        access_consent_expires_at:
+          type: string
+          format: date-time
+          readOnly: true
+          nullable: true
+          description: When the current grant lapses. Set on every enable, 24 hours
+            out by default. Null when access is off or the grant predates expiry.
       required:
+      - access_consent_expires_at
       - access_consented
     AcknowledgeRequest:
       type: object
@@ -6113,6 +6296,18 @@ components:
           type: string
           minLength: 1
           maxLength: 128
+        capabilities:
+          type: array
+          items:
+            type: string
+            minLength: 1
+            maxLength: 64
+          description: 'What the shell registering this token can render. Known values:
+            native-notification-render. An unknown value is dropped and the rest of
+            the registration succeeds, so a client can advertise a capability this
+            server does not know yet. Omitting the field resets the stored list to
+            [].'
+          maxItems: 16
       required:
       - bundle_id
       - platform
@@ -6160,6 +6355,10 @@ components:
           type: string
           nullable: true
           readOnly: true
+        avatar_url:
+          type: string
+          nullable: true
+          readOnly: true
         machine_id:
           type: string
           nullable: true
@@ -6200,8 +6399,15 @@ components:
         access_consented:
           type: boolean
           readOnly: true
+        access_consent_expires_at:
+          type: string
+          format: date-time
+          readOnly: true
+          nullable: true
       required:
+      - access_consent_expires_at
       - access_consented
+      - avatar_url
       - created
       - current_release_version
       - handle
@@ -6482,6 +6688,16 @@ components:
         payment_method_last4:
           type: string
           nullable: true
+        payment_method_exp_month:
+          type: integer
+          nullable: true
+        payment_method_exp_year:
+          type: integer
+          nullable: true
+        billing_address:
+          allOf:
+          - $ref: '#/components/schemas/BillingAddress'
+          nullable: true
         stripe_payment_method_updated_at:
           type: string
           format: date-time
@@ -6514,6 +6730,7 @@ components:
           type: boolean
       required:
       - amount_usd
+      - billing_address
       - current_month_charged_usd
       - current_month_credits_purchased_usd
       - disabled_due_to_repeated_failures
@@ -6526,6 +6743,8 @@ components:
       - next_trigger_amount_usd
       - paused_until
       - payment_method_brand
+      - payment_method_exp_month
+      - payment_method_exp_year
       - payment_method_last4
       - stripe_payment_method_updated_at
       - stubbed
@@ -6638,6 +6857,35 @@ components:
       - base
       type: string
       description: '* `base` - base'
+    BillingAddress:
+      type: object
+      description: Billing address saved on the Stripe PaymentMethod.
+      properties:
+        line1:
+          type: string
+          nullable: true
+        line2:
+          type: string
+          nullable: true
+        city:
+          type: string
+          nullable: true
+        state:
+          type: string
+          nullable: true
+        postal_code:
+          type: string
+          nullable: true
+        country:
+          type: string
+          nullable: true
+      required:
+      - city
+      - country
+      - line1
+      - line2
+      - postal_code
+      - state
     BillingIntervalEnum:
       enum:
       - month
@@ -6713,13 +6961,17 @@ components:
             when no daily limit is set.
         daily_spend_usd:
           type: string
-          description: Today's (UTC) credit spend as a decimal string. Reported as
-            "0.00" when the stored counter is from a prior UTC day.
+          description: Today's (UTC) credit spend counted against the daily limit,
+            as a decimal string. Spend covered by plan-included credits (initial credit,
+            Pro credit bundle) is excluded. Reported as "0.00" when the stored counter
+            is from a prior UTC day.
         daily_limit_reached:
           type: boolean
           description: True when a daily limit is set, today's spend has reached it,
             and the limit is being enforced. False while the limit is skipped for
-            the day (see daily_limit_snoozed). Drives the in-app daily-limit banner.
+            the day (see daily_limit_snoozed) or while plan-included credits (initial
+            credit, Pro credit bundle) still hold unexpired balance. Drives the in-app
+            daily-limit banner.
         daily_limit_snoozed:
           type: boolean
           description: True when the daily limit has been skipped for the current
@@ -6781,6 +7033,26 @@ components:
     BlankEnum:
       enum:
       - ''
+    CancellationFeedbackEnum:
+      enum:
+      - customer_service
+      - low_quality
+      - missing_features
+      - other
+      - switched_service
+      - too_complex
+      - too_expensive
+      - unused
+      type: string
+      description: |-
+        * `customer_service` - customer_service
+        * `low_quality` - low_quality
+        * `missing_features` - missing_features
+        * `other` - other
+        * `switched_service` - switched_service
+        * `too_complex` - too_complex
+        * `too_expensive` - too_expensive
+        * `unused` - unused
     CheckoutBonusClaimResponse:
       type: object
       description: POST /…/checkout-bonus/ response shape.
@@ -7065,6 +7337,12 @@ components:
         credit_tier:
           type: string
           nullable: true
+        charged_usd:
+          type: string
+          nullable: true
+        granted_credits_usd:
+          type: string
+          nullable: true
       required:
       - credit_tier
       - status
@@ -7086,6 +7364,34 @@ components:
         * `credits_100` - credits_100
         * `credits_115` - credits_115
         * `credits_200` - credits_200
+    CustomPlanChangeRequestRequest:
+      type: object
+      description: |-
+        The custom-plan arm of the ``change-package`` request: explicit tiers.
+
+        ``machine_tier`` / ``credit_tier`` ``None`` mean no line item for that
+        dimension (the small baseline machine; no credit bundle). The
+        ChoiceFields keep the FULL tier dicts (OpenAPI enum stability); the view
+        rejects retired/legacy targets that differ from the current tier,
+        mirroring the per-dimension tier endpoints. A custom plan always carries
+        the base platform fee; the fee-less configuration is only sold as the
+        Mighty package.
+      properties:
+        machine_tier:
+          nullable: true
+          oneOf:
+          - $ref: '#/components/schemas/MachineTierEnum'
+          - $ref: '#/components/schemas/NullEnum'
+        storage_tier:
+          $ref: '#/components/schemas/StorageTierEnum'
+        credit_tier:
+          nullable: true
+          oneOf:
+          - $ref: '#/components/schemas/CreditTierEnum'
+          - $ref: '#/components/schemas/NullEnum'
+      required:
+      - storage_tier
+      additionalProperties: false
     DailyCreditLimitRequestRequest:
       type: object
       description: PUT /…/daily-credit-limit/ request body. ``null`` clears the limit.
@@ -7142,9 +7448,21 @@ components:
           oneOf:
           - $ref: '#/components/schemas/ApnsEnvironmentEnum'
           - $ref: '#/components/schemas/NullEnum'
+        capabilities:
+          type: array
+          items:
+            type: string
+            maxLength: 64
+          description: 'What the shell registering this token can render. Known values:
+            native-notification-render. An unknown value is dropped and the rest of
+            the registration succeeds, so a client can advertise a capability this
+            server does not know yet. Omitting the field resets the stored list to
+            [].'
+          maxItems: 16
       required:
       - apns_environment
       - bundle_id
+      - capabilities
       - platform
       - token
     DevicePushTokenUpsertPlatformEnum:
@@ -8307,6 +8625,17 @@ components:
       - referrer_credit_amount
       - total_earned
       - total_earned_usd
+    NamedPackageChangeRequestRequest:
+      type: object
+      description: The named-package arm of the ``change-package`` request.
+      properties:
+        package:
+          type: string
+          minLength: 1
+          pattern: ^[-a-zA-Z0-9_]+$
+      required:
+      - package
+      additionalProperties: false
     NotificationList:
       type: object
       description: Read serializer for listing notifications.
@@ -8426,6 +8755,10 @@ components:
           type: string
           format: date-time
           nullable: true
+        provider_params:
+          type: object
+          additionalProperties:
+            type: string
       required:
       - account_label
       - connected
@@ -8469,6 +8802,13 @@ components:
       - airtable
       - hubspot
       - salesforce
+      - eventbrite
+      - calendly
+      - monday
+      - figma
+      - stripe_link
+      - shopify
+      - quickbooks
       type: string
       description: |-
         * `twitter` - twitter
@@ -8484,6 +8824,13 @@ components:
         * `airtable` - airtable
         * `hubspot` - hubspot
         * `salesforce` - salesforce
+        * `eventbrite` - eventbrite
+        * `calendly` - calendly
+        * `monday` - monday
+        * `figma` - figma
+        * `stripe_link` - stripe_link
+        * `shopify` - shopify
+        * `quickbooks` - quickbooks
     OAuthStartRequestRequest:
       type: object
       properties:
@@ -8496,6 +8843,10 @@ components:
           type: string
           minLength: 1
           default: /
+        tenant_host:
+          type: string
+          default: ''
+          maxLength: 253
     OAuthStartResponse:
       type: object
       properties:
@@ -8837,21 +9188,24 @@ components:
       - share_diagnostics_accepted_version
       - share_diagnostics_chosen
     PackageChangeRequestRequest:
-      type: object
-      properties:
-        package:
-          type: string
-          minLength: 1
-          pattern: ^[-a-zA-Z0-9_]+$
-      required:
-      - package
+      oneOf:
+      - $ref: '#/components/schemas/NamedPackageChangeRequestRequest'
+      - $ref: '#/components/schemas/CustomPlanChangeRequestRequest'
     PackageChangeResponse:
       type: object
       properties:
         status:
           $ref: '#/components/schemas/TierChangeStatusEnum'
         package:
-          $ref: '#/components/schemas/SubscriptionPackage'
+          allOf:
+          - $ref: '#/components/schemas/SubscriptionPackage'
+          nullable: true
+        credit_charged_usd:
+          type: string
+          nullable: true
+        credit_granted_usd:
+          type: string
+          nullable: true
       required:
       - package
       - status
@@ -9041,24 +9395,40 @@ components:
             $ref: '#/components/schemas/OrganizationRead'
     PatchedAccessConsentRequest:
       type: object
-      description: Serializer for the user-controlled admin log access consent toggle.
+      description: Serializer for the user-controlled staff access consent toggle.
       properties:
         access_consented:
           type: boolean
-          description: When True, Vellum admins may view the daemon log files (/workspace/data/logs/assistant-*.log)
-            from this assistant pod for debugging. Defaults to False; the owner can
-            revoke at any time.
+          description: 'When True, Vellum staff may access this assistant and its
+            data for debugging: daemon log files, an admin terminal on the running
+            assistant, and a disposable clone of its disk. Defaults to False; the
+            owner can revoke at any time, which blocks new access and further commands
+            in open admin terminal sessions. A grant lapses on its own at access_consent_expires_at;
+            reads report False once it has.'
+        expires_in_hours:
+          type: integer
+          maximum: 168
+          minimum: 1
+          writeOnly: true
+          description: 'Only with access_consented=true: how long the grant lasts,
+            1 to 168 hours. Defaults to 24. Enabling again resets the clock.'
     PatchedAssistantPartialUpdateRequest:
       type: object
       description: |-
         Write surface for ``PATCH /v1/assistants/{id}/``.
 
-        Accepts a narrow allowlist (``name``, ``description``, ``handle``) and
-        delegates handle format validation to
-        :func:`app.assistant.handle_validation.validate_handle`. Uniqueness is
-        enforced at the database layer via the case-insensitive functional
-        unique index on ``LOWER(handle)``; the view converts the resulting
-        ``IntegrityError`` to a 409 (see :meth:`AssistantViewSet.partial_update`).
+        Accepts a narrow allowlist (``name``, ``description``, ``handle``,
+        ``avatar_base64``, ``notification_avatar_base64``) and delegates handle
+        format validation to :func:`app.assistant.handle_validation.validate_handle`.
+        Uniqueness is enforced at the database layer via the case-insensitive
+        functional unique index on ``LOWER(handle)``; the view converts the
+        resulting ``IntegrityError`` to a 409 (see
+        :meth:`AssistantViewSet.partial_update`).
+
+        ``avatar_base64`` and ``notification_avatar_base64`` are write-only,
+        non-model fields: the daemon sends the raw images inline, and
+        :meth:`AssistantViewSet.partial_update` pops the decoded payloads out of
+        ``validated_data`` before the model save.
       properties:
         name:
           type: string
@@ -9071,6 +9441,21 @@ components:
           type: string
           minLength: 1
           maxLength: 150
+        avatar_base64:
+          type: string
+          writeOnly: true
+          nullable: true
+          description: Base64-encoded avatar image (PNG, JPEG, GIF, or WebP), at most
+            524288 bytes (512 KiB) decoded. Send null or an empty string to remove
+            the current avatar; omit the field to leave it alone.
+        notification_avatar_base64:
+          type: string
+          writeOnly: true
+          nullable: true
+          description: Base64-encoded notification avatar image (PNG only), square
+            and at most 512 pixels per side, at most 131072 bytes (128 KiB) decoded.
+            Send null or an empty string to remove the current notification avatar;
+            omit the field to leave it alone.
     PatchedSleepPolicyRequest:
       type: object
       description: Serializer for the assistant sleep/wake policy.
@@ -9313,6 +9698,14 @@ components:
           type: integer
           minimum: 0
           nullable: true
+        usage_label:
+          type: string
+          nullable: true
+          description: 'Customer-facing name for the included-usage line item, e.g.
+            "Mighty Usage". Render verbatim rather than composing a string from credits_usd:
+            this is the same wording the Stripe product carries, so the plan card
+            and the invoice line agree. Null exactly when credits_usd is — a package
+            with no credit bundle has no usage line item to name.'
         include_platform_fee:
           type: boolean
         base_price_cents:
@@ -9346,6 +9739,7 @@ components:
       - storage_price_cents
       - storage_tier
       - total_price_cents
+      - usage_label
       - version
     ProPlan:
       type: object
@@ -9619,6 +10013,39 @@ components:
         * `l` - l
         * `xl` - xl
         * `xxl` - xxl
+    SubscriptionCancelRequestRequest:
+      type: object
+      description: |-
+        Optional cancel survey forwarded to Stripe as ``cancellation_details``.
+
+        Both fields are optional and additive: the endpoint historically took no
+        body, and older native clients still post an empty one. ``feedback`` is
+        Stripe's fixed vocabulary (the same set the Customer Portal's cancel
+        survey offers; send ``null`` or omit it for "no answer"); ``comment`` is
+        free text, and a blank/whitespace-only comment is treated as not
+        provided so a client that submits an empty form sends nothing to Stripe.
+      properties:
+        feedback:
+          nullable: true
+          oneOf:
+          - $ref: '#/components/schemas/CancellationFeedbackEnum'
+          - $ref: '#/components/schemas/NullEnum'
+        comment:
+          type: string
+          nullable: true
+          maxLength: 1000
+    SubscriptionCancelResponse:
+      type: object
+      properties:
+        status:
+          $ref: '#/components/schemas/TierChangeStatusEnum'
+        cancel_at:
+          type: string
+          format: date-time
+          nullable: true
+      required:
+      - cancel_at
+      - status
     SubscriptionEntitlements:
       type: object
       description: |-
@@ -9653,6 +10080,18 @@ components:
       - key
       - name
       - version
+    SubscriptionReactivateResponse:
+      type: object
+      properties:
+        status:
+          $ref: '#/components/schemas/TierChangeStatusEnum'
+        current_period_end:
+          type: string
+          format: date-time
+          nullable: true
+      required:
+      - current_period_end
+      - status
     SubscriptionResponse:
       type: object
       properties:
@@ -9688,6 +10127,8 @@ components:
           allOf:
           - $ref: '#/components/schemas/SubscriptionPackage'
           nullable: true
+        has_platform_fee:
+          type: boolean
         entitlements:
           $ref: '#/components/schemas/SubscriptionEntitlements'
       required:

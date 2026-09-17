@@ -20,11 +20,12 @@ export const BROWSER_STATUS_INPUT_FIELD = {
   CHECK_LOCAL_LAUNCH: "check_local_launch",
 } as const;
 
-export const EXTENSION_STATUS_ERROR_MARKER = {
-  UNAUTHORIZED_ORIGIN: "unauthorized_origin",
-  NATIVE_MESSAGING_HOST: "native messaging host",
-  HTTP_401: "401",
-} as const;
+export {
+  CHROME_EXTENSION_INSTALL_HINT,
+  CHROME_WEB_STORE_INSTALL_URL,
+  DESKTOP_APP_DOWNLOAD_URL,
+  DESKTOP_APP_INSTALL_HINT,
+} from "../capability-offer.js";
 
 export const CDP_INSPECT_STATUS_DISCOVERY_CODE = {
   NO_TARGETS: DEVTOOLS_DISCOVERY_CODE.NO_TARGETS,

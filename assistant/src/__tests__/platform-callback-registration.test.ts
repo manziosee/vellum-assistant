@@ -1,11 +1,34 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 
+import type { RegisterWebhookRouteIpcParams } from "@vellumai/gateway-client";
+
+import { setIngressPublicBaseUrl } from "../config/env.js";
+import type { IpcRegisterWebhookRouteResult } from "../ipc/gateway-client.js";
 import { credentialKey } from "../security/credential-key.js";
 
 let mockIsPlatform = true;
+let mockVelayWebhooksEnabled = false;
 let mockPlatformBaseUrl = "";
 let mockPlatformAssistantId = "";
 let mockSecureKeys: Record<string, string> = {};
+let mockConfig: { ingress?: { publicBaseUrl?: string; enabled?: boolean } } =
+  {};
+
+const REGISTERED_ROUTE = {
+  path: "/webhooks/twilio/voice",
+  type: "twilio_voice",
+  source: null,
+  match: "exact" as const,
+  createdAt: 1,
+  lastRegisteredAt: 1,
+};
+
+let mockRegisterWebhookRouteResult: IpcRegisterWebhookRouteResult = {
+  ok: true,
+  disabled: false,
+  route: REGISTERED_ROUTE,
+};
+let ipcRegisterCalls: RegisterWebhookRouteIpcParams[] = [];
 
 // Bun shares mocked modules across test files in a combined run, so each mock
 // spreads the real module and overrides only what this file drives. Replacing
@@ -17,6 +40,12 @@ mock.module("../config/env-registry.js", () => ({
   getIsPlatform: () => mockIsPlatform,
 }));
 
+const actualVelayGate = await import("../inbound/velay-webhooks-gate.js");
+mock.module("../inbound/velay-webhooks-gate.js", () => ({
+  ...actualVelayGate,
+  isVelayWebhooksEnabled: () => mockVelayWebhooksEnabled,
+}));
+
 const actualEnv = await import("../config/env.js");
 mock.module("../config/env.js", () => ({
   ...actualEnv,
@@ -24,10 +53,25 @@ mock.module("../config/env.js", () => ({
   getPlatformAssistantId: () => mockPlatformAssistantId,
 }));
 
+const actualGatewayClient = await import("../ipc/gateway-client.js");
+mock.module("../ipc/gateway-client.js", () => ({
+  ...actualGatewayClient,
+  ipcRegisterWebhookRoute: async (input: RegisterWebhookRouteIpcParams) => {
+    ipcRegisterCalls.push(input);
+    return mockRegisterWebhookRouteResult;
+  },
+}));
+
 const actualSecureKeys = await import("../security/secure-keys.js");
 mock.module("../security/secure-keys.js", () => ({
   ...actualSecureKeys,
   getSecureKeyAsync: async (key: string) => mockSecureKeys[key] ?? undefined,
+}));
+
+const actualLoader = await import("../config/loader.js");
+mock.module("../config/loader.js", () => ({
+  ...actualLoader,
+  getConfig: () => mockConfig,
 }));
 
 const originalFetch = globalThis.fetch;
@@ -48,6 +92,8 @@ describe("platform callback registration", () => {
     mockPlatformBaseUrl = "";
     mockPlatformAssistantId = "";
     mockSecureKeys = {};
+    mockConfig = {};
+    setIngressPublicBaseUrl(undefined);
     delete process.env.ASSISTANT_API_KEY;
     globalThis.fetch = originalFetch;
   });
@@ -64,8 +110,7 @@ describe("platform callback registration", () => {
   test("resolves managed callback context from stored credentials", async () => {
     mockSecureKeys[credentialKey("vellum", "platform_base_url")] =
       "https://platform.example.com";
-    mockSecureKeys[credentialKey("vellum", "platform_assistant_id")] =
-      "11111111-2222-4333-8444-555555555555";
+    mockPlatformAssistantId = "11111111-2222-4333-8444-555555555555";
     mockSecureKeys[credentialKey("vellum", "assistant_api_key")] =
       "ast-managed-key";
 
@@ -83,8 +128,7 @@ describe("platform callback registration", () => {
     mockIsPlatform = false;
     mockSecureKeys[credentialKey("vellum", "platform_base_url")] =
       "https://platform.example.com";
-    mockSecureKeys[credentialKey("vellum", "platform_assistant_id")] =
-      "22222222-3333-4444-8555-666666666666";
+    mockPlatformAssistantId = "22222222-3333-4444-8555-666666666666";
     mockSecureKeys[credentialKey("vellum", "assistant_api_key")] =
       "ast-self-hosted-key";
 
@@ -115,8 +159,7 @@ describe("platform callback registration", () => {
   test("registerCallbackRoute falls back to assistant API key auth", async () => {
     mockSecureKeys[credentialKey("vellum", "platform_base_url")] =
       "https://platform.example.com";
-    mockSecureKeys[credentialKey("vellum", "platform_assistant_id")] =
-      "11111111-2222-4333-8444-555555555555";
+    mockPlatformAssistantId = "11111111-2222-4333-8444-555555555555";
     mockSecureKeys[credentialKey("vellum", "assistant_api_key")] =
       "ast-managed-key";
 
@@ -129,6 +172,171 @@ describe("platform callback registration", () => {
         expect(headers.get("Authorization")).toBe("Api-Key ast-managed-key");
         expect(headers.get("Content-Type")).toBe("application/json");
         expect(JSON.parse(String(init?.body))).toEqual({
+          assistant_id: "11111111-2222-4333-8444-555555555555",
+          callback_path: "webhooks/telegram",
+          type: "telegram",
+        });
+
+        return new Response(
+          JSON.stringify({
+            callback_url:
+              "https://platform.example.com/v1/gateway/callbacks/x/",
+            callback_path:
+              "11111111-2222-4333-8444-555555555555/webhooks/telegram",
+            type: "telegram",
+            assistant_id: "11111111-2222-4333-8444-555555555555",
+          }),
+          {
+            status: 201,
+            headers: { "content-type": "application/json" },
+          },
+        );
+      },
+    ) as unknown as typeof fetch;
+
+    await expect(
+      registerCallbackRoute("webhooks/telegram", "telegram"),
+    ).resolves.toBe("https://platform.example.com/v1/gateway/callbacks/x/");
+  });
+
+  test("self-hosted registerCallbackRoute sends configured callback_base_url", async () => {
+    mockIsPlatform = false;
+    mockConfig = {
+      ingress: { publicBaseUrl: "https://my-assistant.example.com" },
+    };
+    mockSecureKeys[credentialKey("vellum", "platform_base_url")] =
+      "https://platform.example.com";
+    mockPlatformAssistantId = "22222222-3333-4444-8555-666666666666";
+    mockSecureKeys[credentialKey("vellum", "assistant_api_key")] =
+      "ast-self-hosted-key";
+
+    globalThis.fetch = mock(
+      async (_input: RequestInfo | URL, init?: RequestInit) => {
+        expect(JSON.parse(String(init?.body))).toEqual({
+          assistant_id: "22222222-3333-4444-8555-666666666666",
+          callback_path: "webhooks/telegram",
+          type: "telegram",
+          callback_base_url: "https://my-assistant.example.com",
+        });
+
+        return new Response(
+          JSON.stringify({
+            callback_url:
+              "https://my-assistant.example.com/v1/gateway/callbacks/x/",
+            callback_path:
+              "22222222-3333-4444-8555-666666666666/webhooks/telegram",
+            type: "telegram",
+            assistant_id: "22222222-3333-4444-8555-666666666666",
+          }),
+          {
+            status: 201,
+            headers: { "content-type": "application/json" },
+          },
+        );
+      },
+    ) as unknown as typeof fetch;
+
+    await expect(
+      registerCallbackRoute("webhooks/telegram", "telegram"),
+    ).resolves.toBe("https://my-assistant.example.com/v1/gateway/callbacks/x/");
+  });
+
+  test("self-hosted registerCallbackRoute sends detected module-level callback_base_url", async () => {
+    mockIsPlatform = false;
+    mockConfig = {};
+    setIngressPublicBaseUrl("https://detected.example.com/");
+    mockSecureKeys[credentialKey("vellum", "platform_base_url")] =
+      "https://platform.example.com";
+    mockPlatformAssistantId = "22222222-3333-4444-8555-666666666666";
+    mockSecureKeys[credentialKey("vellum", "assistant_api_key")] =
+      "ast-self-hosted-key";
+
+    globalThis.fetch = mock(
+      async (_input: RequestInfo | URL, init?: RequestInit) => {
+        expect(JSON.parse(String(init?.body))).toEqual({
+          assistant_id: "22222222-3333-4444-8555-666666666666",
+          callback_path: "webhooks/telegram",
+          type: "telegram",
+          callback_base_url: "https://detected.example.com",
+        });
+
+        return new Response(
+          JSON.stringify({
+            callback_url:
+              "https://detected.example.com/v1/gateway/callbacks/x/",
+            callback_path:
+              "22222222-3333-4444-8555-666666666666/webhooks/telegram",
+            type: "telegram",
+            assistant_id: "22222222-3333-4444-8555-666666666666",
+          }),
+          {
+            status: 201,
+            headers: { "content-type": "application/json" },
+          },
+        );
+      },
+    ) as unknown as typeof fetch;
+
+    await expect(
+      registerCallbackRoute("webhooks/telegram", "telegram"),
+    ).resolves.toBe("https://detected.example.com/v1/gateway/callbacks/x/");
+  });
+
+  test("self-hosted registerCallbackRoute omits callback_base_url when no ingress is available", async () => {
+    mockIsPlatform = false;
+    mockConfig = {};
+    mockSecureKeys[credentialKey("vellum", "platform_base_url")] =
+      "https://platform.example.com";
+    mockPlatformAssistantId = "22222222-3333-4444-8555-666666666666";
+    mockSecureKeys[credentialKey("vellum", "assistant_api_key")] =
+      "ast-self-hosted-key";
+
+    globalThis.fetch = mock(
+      async (_input: RequestInfo | URL, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body)) as Record<string, string>;
+        expect(body).toEqual({
+          assistant_id: "22222222-3333-4444-8555-666666666666",
+          callback_path: "webhooks/telegram",
+          type: "telegram",
+        });
+        expect(body).not.toHaveProperty("callback_base_url");
+
+        return new Response(
+          JSON.stringify({
+            callback_url:
+              "https://platform.example.com/v1/gateway/callbacks/x/",
+            callback_path:
+              "22222222-3333-4444-8555-666666666666/webhooks/telegram",
+            type: "telegram",
+            assistant_id: "22222222-3333-4444-8555-666666666666",
+          }),
+          {
+            status: 201,
+            headers: { "content-type": "application/json" },
+          },
+        );
+      },
+    ) as unknown as typeof fetch;
+
+    await expect(
+      registerCallbackRoute("webhooks/telegram", "telegram"),
+    ).resolves.toBe("https://platform.example.com/v1/gateway/callbacks/x/");
+  });
+
+  test("platform-managed registerCallbackRoute omits callback_base_url even when ingress exists", async () => {
+    mockIsPlatform = true;
+    mockConfig = { ingress: { publicBaseUrl: "https://velay.example.com" } };
+    mockSecureKeys[credentialKey("vellum", "platform_base_url")] =
+      "https://platform.example.com";
+    mockPlatformAssistantId = "11111111-2222-4333-8444-555555555555";
+    mockSecureKeys[credentialKey("vellum", "assistant_api_key")] =
+      "ast-managed-key";
+
+    globalThis.fetch = mock(
+      async (_input: RequestInfo | URL, init?: RequestInit) => {
+        const body = JSON.parse(String(init?.body)) as Record<string, string>;
+        expect(body).not.toHaveProperty("callback_base_url");
+        expect(body).toEqual({
           assistant_id: "11111111-2222-4333-8444-555555555555",
           callback_path: "webhooks/telegram",
           type: "telegram",
@@ -181,8 +389,7 @@ describe("resolveCallbackUrl resolution order", () => {
   function seedPlatformCredentials(): void {
     mockSecureKeys[credentialKey("vellum", "platform_base_url")] =
       "https://platform.example.com";
-    mockSecureKeys[credentialKey("vellum", "platform_assistant_id")] =
-      "11111111-2222-4333-8444-555555555555";
+    mockPlatformAssistantId = "11111111-2222-4333-8444-555555555555";
     mockSecureKeys[credentialKey("vellum", "assistant_api_key")] =
       "ast-managed-key";
   }
@@ -191,11 +398,20 @@ describe("resolveCallbackUrl resolution order", () => {
 
   beforeEach(() => {
     mockIsPlatform = false;
+    mockVelayWebhooksEnabled = false;
     mockPlatformBaseUrl = "";
     mockPlatformAssistantId = "";
     mockSecureKeys = {};
+    mockConfig = {};
+    setIngressPublicBaseUrl(undefined);
     delete process.env.ASSISTANT_API_KEY;
     registerCalls = 0;
+    ipcRegisterCalls = [];
+    mockRegisterWebhookRouteResult = {
+      ok: true,
+      disabled: false,
+      route: REGISTERED_ROUTE,
+    };
     globalThis.fetch = mock(async () => {
       registerCalls++;
       return new Response(
@@ -224,6 +440,124 @@ describe("resolveCallbackUrl resolution order", () => {
       resolveCallbackUrl(noIngress, "webhooks/twilio/voice", "twilio_voice"),
     ).resolves.toBe(PLATFORM_URL);
     expect(registerCalls).toBe(1);
+    expect(ipcRegisterCalls).toEqual([]);
+  });
+
+  test("velay-webhooks on: a pod claims the subpath and uses the published URL", async () => {
+    mockIsPlatform = true;
+    mockVelayWebhooksEnabled = true;
+    seedPlatformCredentials();
+
+    await expect(
+      resolveCallbackUrl(
+        () => "https://velay.example.com/assistant-1/webhooks/twilio/voice",
+        "webhooks/twilio/voice",
+        "twilio_voice",
+        { callSessionId: "conv-xyz" },
+        "+15555550142",
+      ),
+    ).resolves.toBe(
+      "https://velay.example.com/assistant-1/webhooks/twilio/voice",
+    );
+    expect(registerCalls).toBe(0);
+    expect(ipcRegisterCalls).toEqual([
+      {
+        path: "/webhooks/twilio/voice",
+        type: "twilio_voice",
+        source: "+15555550142",
+      },
+    ]);
+  });
+
+  test("velay-webhooks on: a refused claim falls back to the platform", async () => {
+    mockIsPlatform = true;
+    mockVelayWebhooksEnabled = true;
+    mockRegisterWebhookRouteResult = { ok: true, disabled: true };
+    seedPlatformCredentials();
+
+    await expect(
+      resolveCallbackUrl(
+        () => "https://velay.example.com/assistant-1/webhooks/twilio/voice",
+        "webhooks/twilio/voice",
+        "twilio_voice",
+      ),
+    ).resolves.toBe(PLATFORM_URL);
+    expect(registerCalls).toBe(1);
+    expect(ipcRegisterCalls).toHaveLength(1);
+  });
+
+  test("velay-webhooks on: an unreachable gateway falls back to the platform", async () => {
+    mockIsPlatform = true;
+    mockVelayWebhooksEnabled = true;
+    mockRegisterWebhookRouteResult = { ok: false, reason: "no_response" };
+    seedPlatformCredentials();
+
+    await expect(
+      resolveCallbackUrl(
+        () => "https://velay.example.com/assistant-1/webhooks/twilio/voice",
+        "webhooks/twilio/voice",
+        "twilio_voice",
+      ),
+    ).resolves.toBe(PLATFORM_URL);
+    expect(registerCalls).toBe(1);
+    expect(ipcRegisterCalls).toHaveLength(1);
+  });
+
+  test("velay-webhooks on: a pod with no published URL still registers with the platform", async () => {
+    mockIsPlatform = true;
+    mockVelayWebhooksEnabled = true;
+    seedPlatformCredentials();
+
+    await expect(
+      resolveCallbackUrl(noIngress, "webhooks/twilio/voice", "twilio_voice"),
+    ).resolves.toBe(PLATFORM_URL);
+    expect(registerCalls).toBe(1);
+    expect(ipcRegisterCalls).toEqual([]);
+  });
+
+  test("velay-webhooks on: a pod with ingress disabled falls back instead of throwing", async () => {
+    mockIsPlatform = true;
+    mockVelayWebhooksEnabled = true;
+    seedPlatformCredentials();
+
+    await expect(
+      resolveCallbackUrl(
+        ingressDisabled,
+        "webhooks/twilio/voice",
+        "twilio_voice",
+      ),
+    ).resolves.toBe(PLATFORM_URL);
+    expect(registerCalls).toBe(1);
+    expect(ipcRegisterCalls).toEqual([]);
+  });
+
+  test("velay-webhooks on: self-hosted opt-out still surfaces", async () => {
+    mockVelayWebhooksEnabled = true;
+    seedPlatformCredentials();
+
+    await expect(
+      resolveCallbackUrl(
+        ingressDisabled,
+        "webhooks/twilio/voice",
+        "twilio_voice",
+      ),
+    ).rejects.toThrow("Public ingress is disabled");
+    expect(registerCalls).toBe(0);
+    expect(ipcRegisterCalls).toEqual([]);
+  });
+
+  test("velay-webhooks on: a self-hosted ingress URL is not claimed on the gateway", async () => {
+    mockVelayWebhooksEnabled = true;
+    seedPlatformCredentials();
+
+    await expect(
+      resolveCallbackUrl(
+        () => "https://tunnel.example.com/webhooks/twilio/voice",
+        "webhooks/twilio/voice",
+        "twilio_voice",
+      ),
+    ).resolves.toBe("https://tunnel.example.com/webhooks/twilio/voice");
+    expect(ipcRegisterCalls).toEqual([]);
   });
 
   test("a configured ingress wins over platform connectivity", async () => {
@@ -237,6 +571,7 @@ describe("resolveCallbackUrl resolution order", () => {
       ),
     ).resolves.toBe("https://tunnel.example.com/webhooks/twilio/voice");
     expect(registerCalls).toBe(0);
+    expect(ipcRegisterCalls).toEqual([]);
   });
 
   test("a platform-connected assistant with no ingress registers with the platform", async () => {

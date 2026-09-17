@@ -5,6 +5,7 @@
 import { beforeEach, describe, expect, mock, test } from "bun:test";
 
 import { setOverridesForTesting } from "../../__tests__/feature-flag-test-helpers.js";
+import { MESSAGE_KEYS } from "../../i18n/index.js";
 import type { AttentionState } from "../../persistence/conversation-attention-store.js";
 import type {
   ConversationRow,
@@ -386,16 +387,6 @@ describe("emitAssistantReplyNotification", () => {
       expect(emitCalls[0].attentionHints.visibleInSourceNow).toBe(false);
     });
 
-    test("leaves the signal live when the presence flag is off", async () => {
-      setOverridesForTesting({ "desktop-presence-suppression": false });
-
-      await run();
-
-      expect(emitCalls).toHaveLength(1);
-      expect(emitCalls[0].attentionHints.visibleInSourceNow).toBe(false);
-      expect(desktopPresenceArgs).toEqual([]);
-    });
-
     test("leaves the signal live when the presence read throws", async () => {
       desktopPresenceShouldThrow = true;
 
@@ -455,6 +446,9 @@ describe("emitAssistantReplyNotification", () => {
 
         expect(emitCalls).toHaveLength(1);
         expect(emitCalls[0].attentionHints.visibleInSourceNow).toBe(false);
+        // The origin check runs first, so a turn no desktop opened never
+        // reaches the presence read.
+        expect(desktopPresenceArgs).toEqual([]);
       });
     }
 
@@ -596,6 +590,60 @@ describe("emitAssistantReplyNotification", () => {
     });
   });
 
+  // A conversation whose title is still being written stores the message key
+  // itself, which is a non-empty string the sanitizer has no reason to reject.
+  // Sending it would put a raw key on the lock screen, so it counts as absent.
+  test("omits requestedTitle while the title is still generating", async () => {
+    conversationRow = makeConversation({
+      title: MESSAGE_KEYS.CONVERSATION_TITLE_GENERATING,
+    });
+
+    await run();
+
+    expect(emitCalls).toHaveLength(1);
+    expect(emitCalls[0].contextPayload).toEqual({
+      requestedMessage: "Sure, here is the plan.",
+    });
+  });
+
+  test("omits requestedTitle for the legacy generating placeholder", async () => {
+    conversationRow = makeConversation({ title: "Generating title..." });
+
+    await run();
+
+    expect(emitCalls).toHaveLength(1);
+    expect(emitCalls[0].contextPayload).toEqual({
+      requestedMessage: "Sure, here is the plan.",
+    });
+  });
+
+  test("omits requestedTitle for the untitled placeholder key", async () => {
+    conversationRow = makeConversation({
+      title: MESSAGE_KEYS.CONVERSATION_TITLE_UNTITLED,
+    });
+
+    await run();
+
+    expect(emitCalls).toHaveLength(1);
+    expect(emitCalls[0].contextPayload).toEqual({
+      requestedMessage: "Sure, here is the plan.",
+    });
+  });
+
+  // Only an exact key is a system constant. A title the user or the model
+  // wrote that happens to contain one is their copy and travels as written.
+  test("keeps a title that merely contains a message key", async () => {
+    conversationRow = makeConversation({
+      title: `notes on ${MESSAGE_KEYS.CONVERSATION_TITLE_GENERATING}`,
+    });
+
+    await run();
+
+    expect(emitCalls[0].contextPayload.requestedTitle).toBe(
+      "notes on conversation.title.generating",
+    );
+  });
+
   test("caps the preview at 200 chars", async () => {
     assistantRow = makeAssistantRow([
       { type: "text", text: "a".repeat(300) },
@@ -609,20 +657,22 @@ describe("emitAssistantReplyNotification", () => {
   });
 
   // Control characters would otherwise ride into the APNs payload verbatim.
-  test("strips control characters and newlines out of the preview", async () => {
+  // Newlines stay: iOS (and other lock screens) render them as line breaks.
+  test("strips control characters and keeps line breaks in the preview", async () => {
     assistantRow = makeAssistantRow([
       { type: "text", text: "Hello\n\tthere" },
     ] as ContentBlock[]);
 
     await run();
 
-    expect(emitCalls[0].contextPayload.requestedMessage).toBe("Hello there");
+    expect(emitCalls[0].contextPayload.requestedMessage).toBe("Hello\nthere");
   });
 
-  // Blank lines and list indentation would otherwise spend the preview's
-  // length budget on whitespace. The bullets go with them: a lock screen
-  // renders the marker as literal punctuation, not as a list.
-  test("collapses whitespace runs in the preview", async () => {
+  // List indentation and extra blank lines would otherwise spend the preview's
+  // length budget on whitespace. Markdown list markers are already gone after
+  // flattening; the remaining line breaks are the structure a lock screen can
+  // render.
+  test("keeps paragraph breaks after collapsing horizontal whitespace", async () => {
     assistantRow = makeAssistantRow([
       { type: "text", text: "  Here:\n\n  - item\n  - other  " },
     ] as ContentBlock[]);
@@ -630,7 +680,7 @@ describe("emitAssistantReplyNotification", () => {
     await run();
 
     expect(emitCalls[0].contextPayload.requestedMessage).toBe(
-      "Here: item other",
+      "Here:\n\nitem\nother",
     );
   });
 
@@ -684,7 +734,7 @@ describe("emitAssistantReplyNotification", () => {
       await run();
 
       expect(emitCalls[0].contextPayload.requestedMessage).toBe(
-        "Fixed it: const a = 1;",
+        "Fixed it:\n\nconst a = 1;",
       );
     });
 
@@ -699,7 +749,7 @@ describe("emitAssistantReplyNotification", () => {
       await run();
 
       expect(emitCalls[0].contextPayload.requestedMessage).toBe(
-        "Keys Env Key dev 4Y4L",
+        "Keys\n\nEnv Key\ndev 4Y4L",
       );
     });
 

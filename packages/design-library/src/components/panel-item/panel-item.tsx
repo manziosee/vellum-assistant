@@ -103,7 +103,8 @@ interface PanelItemFrameProps {
 
 /** PanelItem renders the row's contents from these props. */
 interface PanelItemContentProps
-  extends PanelItemFrameProps,
+  extends
+    PanelItemFrameProps,
     Omit<ComponentProps<"div">, "children" | "className" | "aria-label"> {
   asChild?: false;
   /** Ignored: this variant builds its own children from the props below. */
@@ -149,6 +150,15 @@ interface PanelItemContentProps
    */
   trailingAction?: ReactNode;
   /**
+   * Keep `trailingAction` painted regardless of hover, the way an `active`
+   * row keeps its own. For a row whose trailing action is the point of the
+   * row rather than a secondary command tucked behind it: a dismiss on an
+   * entry that exists to be declined, a control the user was told to look
+   * for. Without it the action is still there on hover, focus, and on every
+   * device that cannot hover.
+   */
+  revealHold?: boolean;
+  /**
    * Disabled state for the `onSelect` variant. Blocks click and Enter/Space
    * activation, removes the row from the tab order, and sets `aria-disabled`.
    * No effect on the `asChild` / non-interactive variants.
@@ -186,7 +196,8 @@ interface PanelItemContentProps
  * silently dropped at runtime.
  */
 interface PanelItemSlotProps
-  extends PanelItemFrameProps,
+  extends
+    PanelItemFrameProps,
     Omit<HTMLAttributes<HTMLElement>, "children" | "className" | "aria-label"> {
   asChild: true;
   /**
@@ -203,6 +214,7 @@ interface PanelItemSlotProps
   badge?: never;
   badgeBare?: never;
   trailingAction?: never;
+  revealHold?: never;
   marqueeOnHover?: never;
   disabled?: never;
   onSelect?: never;
@@ -262,6 +274,13 @@ const PILL_HOVER_CLASS =
  * row width in every ordinary layout. `width: fit-content` shrink-wraps while
  * leaving `display: flex` alone, which the row's internal layout depends on.
  *
+ * `max-w-full` beside it is not redundant. A label is `white-space: nowrap`,
+ * so its min-content contribution is the whole string and `fit-content`
+ * resolves to the full text however narrow the panel is; the label's
+ * `min-w-0` cannot pull that back, `min-width` being a floor and not a cap.
+ * The cap makes the used width definite, which is the condition flex
+ * shrinking needs, so a label too long for the panel truncates.
+ *
  * A pill is taller than a row, and how much taller is the panel's decision
  * rather than each caller's: `SideMenu` publishes `--side-menu-tile-size`, the
  * height its collapsed tiles are drawn at, and a pill mounted in one takes it,
@@ -290,7 +309,7 @@ const PILL_HOVER_CLASS =
  * whole treatment collapses to the default when nothing declares them.
  */
 const PILL_SHAPE_CLASSES = [
-  "w-fit rounded-full",
+  "w-fit max-w-full rounded-full",
   "h-[var(--side-menu-tile-size,36px)]",
   "max-md:min-h-[var(--side-menu-tile-size,36px)]",
   "bg-[var(--panel-item-bg,var(--surface-lift))]",
@@ -464,6 +483,7 @@ function PanelItemContentRow({
   badge,
   badgeBare = false,
   trailingAction,
+  revealHold = false,
   shape = "row",
   active = false,
   activeVariant = "default",
@@ -622,7 +642,7 @@ function PanelItemContentRow({
         aria-disabled={disabled || undefined}
         className={classes}
         data-reveal-row=""
-        data-reveal-hold={active ? "" : undefined}
+        data-reveal-hold={active || revealHold ? "" : undefined}
         aria-current={ariaCurrent}
         aria-label={resolvedAriaLabel}
         onClick={composedOnClick}
@@ -639,7 +659,7 @@ function PanelItemContentRow({
       ref={ref}
       className={classes}
       data-reveal-row=""
-      data-reveal-hold={active ? "" : undefined}
+      data-reveal-hold={active || revealHold ? "" : undefined}
       aria-current={ariaCurrent}
       aria-label={resolvedAriaLabel}
       onClick={onClick}

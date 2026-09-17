@@ -7,6 +7,8 @@
 
 import { readFileSync } from "node:fs";
 
+import { channelForBotProvider } from "@vellumai/service-contracts/channels";
+
 import {
   getConfig,
   loadRawConfig,
@@ -18,12 +20,20 @@ import {
   type Services,
   ServicesSchema,
 } from "../../config/schemas/services.js";
-import type { OAuthConnectionRequest } from "../../oauth/connection.js";
+import type {
+  OAuthConnectionRequest,
+  OAuthConnectionResponse,
+} from "../../oauth/connection.js";
+import {
+  isBinaryOAuthBody,
+  jsonSafeOAuthBody,
+} from "../../oauth/connection.js";
 import {
   resolveOAuthConnection,
   type ResolveOAuthConnectionOptions,
   resolveOAuthConnectionWithMeta,
 } from "../../oauth/connection-resolver.js";
+import { providerReportsFailure } from "../../oauth/identity-verifier.js";
 import { syncManualTokenConnection } from "../../oauth/manual-token-connection.js";
 import {
   disconnectOAuthProvider,
@@ -35,12 +45,20 @@ import {
   listConnections,
   type OAuthProviderRow,
 } from "../../oauth/oauth-store.js";
+import { missingScopesForStoredToken } from "../../oauth/scope-utils.js";
 import { VellumPlatformClient } from "../../platform/client.js";
 import { withValidToken } from "../../security/token-manager.js";
 import { matchHostPattern } from "../../tools/credentials/host-pattern-match.js";
+import { parseJsonSafe } from "../../util/json.js";
 import { getLogger } from "../../util/logger.js";
+import {
+  findContentTypeHeader,
+  parseRequestBodyBytes,
+  parseRequestBodyData,
+} from "../../util/oauth-request-body.js";
 import { LOCAL_PRINCIPALS } from "../auth/route-policy.js";
 import { BadRequestError, InternalError, NotFoundError } from "./errors.js";
+import { composeRequestHint } from "./oauth-request-hints.js";
 import type { RouteDefinition, RouteHandlerArgs } from "./types.js";
 
 const log = getLogger("oauth-commands-routes");
@@ -53,6 +71,7 @@ interface PlatformConnectionEntry {
   id: string;
   account_label?: string;
   scopes_granted?: string[];
+  provider_params?: Record<string, string> | null;
   status?: string;
 }
 
@@ -217,6 +236,52 @@ function assertOAuthRequestUrlAllowed(
       `OAuth request URL host "${parsedUrl.hostname}" is not allowed for "${providerRow.provider}". Allowed hosts: ${allowedHostPatterns.join(", ")}.`,
     );
   }
+}
+
+/**
+ * The verdict on a provider exchange: whether the status said success, and
+ * whether the provider's declared ok field (`responseOkField`) then took it
+ * back. The field is read only under a 2xx, so a 429 or 5xx whose body
+ * happens to carry it stays a transport failure rather than a refusal.
+ * `reportedFailure` is the one-line account of a refusal, absent otherwise.
+ */
+function judgeProviderResponse(
+  providerRow: OAuthProviderRow,
+  response: OAuthConnectionResponse,
+): { ok: boolean; reportedFailure?: string } {
+  const httpOk = response.status >= 200 && response.status < 300;
+  if (httpOk && providerReportsFailure(providerRow, response.body)) {
+    return {
+      ok: false,
+      reportedFailure: `${providerRow.provider} answered HTTP ${response.status} but reported ${providerRow.responseOkField}: false`,
+    };
+  }
+  return { ok: httpOk };
+}
+
+/**
+ * Required scopes the resolved connection's stored grant lacks. Credential
+ * health measures the same thing on the heartbeat; measuring it on the
+ * request names the gap at the moment a call may depend on it, since a
+ * connection made before a scope was required keeps working for every call
+ * that does not need it. A managed connection has no local row and reports
+ * nothing.
+ */
+function missingScopesForConnection(
+  providerRow: OAuthProviderRow,
+  connectionId: string,
+): string[] {
+  const row = getConnection(connectionId);
+  if (!row) {
+    return [];
+  }
+  return missingScopesForStoredToken(
+    parseJsonSafe<string[]>(providerRow.defaultScopes ?? "[]") ?? [],
+    parseJsonSafe<Record<string, string>>(providerRow.authorizeParams ?? "") ??
+      undefined,
+    providerRow.scopeSeparator,
+    parseJsonSafe<string[]>(row.grantedScopes ?? "[]") ?? [],
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -536,6 +601,9 @@ async function handleStatus({ queryParams = {} }: RouteHandlerArgs) {
       account: c.account_label ?? null,
       grantedScopes: c.scopes_granted ?? [],
       status: c.status ?? "ACTIVE",
+      // Values the provider scopes the connection by (QuickBooks' realm id),
+      // so a caller can address resources the proxy's base URL does not.
+      providerParams: c.provider_params ?? {},
     }));
 
     return {
@@ -647,7 +715,8 @@ async function handlePing({ body = {} }: RouteHandlerArgs) {
     ...(pingBody !== undefined ? { body: pingBody } : {}),
   });
 
-  if (response.status >= 200 && response.status < 300) {
+  const verdict = judgeProviderResponse(providerRow, response);
+  if (verdict.ok) {
     return { ok: true, provider: b.provider, status: response.status };
   }
 
@@ -655,10 +724,21 @@ async function handlePing({ body = {} }: RouteHandlerArgs) {
     ok: false,
     provider: b.provider,
     status: response.status,
-    error: `Ping failed with HTTP ${response.status}`,
+    error: verdict.reportedFailure
+      ? `Ping failed: ${verdict.reportedFailure}`
+      : `Ping failed with HTTP ${response.status}`,
   };
+  if (verdict.reportedFailure) {
+    payload.body = response.body;
+  }
 
-  if (response.status === 401 || response.status === 403) {
+  // A provider that refuses the ping inside a 2xx is refusing the credential
+  // the same way a 401 does.
+  if (
+    response.status === 401 ||
+    response.status === 403 ||
+    verdict.reportedFailure
+  ) {
     payload.hint =
       `Run 'assistant oauth status ${b.provider}' to check connection health. ` +
       `To reconnect, run 'assistant oauth connect --help'.`;
@@ -721,15 +801,13 @@ async function handleToken({ body = {} }: RouteHandlerArgs) {
 // Request handler
 // ---------------------------------------------------------------------------
 
-function tryJsonParse(raw: string): unknown {
-  try {
-    return JSON.parse(raw);
-  } catch {
-    return raw;
-  }
-}
-
-function readBodyData(data: string): unknown {
+/**
+ * Resolve a raw `data` string into a request body. A non-JSON Content-Type
+ * keeps the payload as the caller's exact string so multipart and other
+ * byte-sensitive payloads survive. Files are read as raw bytes: valid UTF-8
+ * stays text, and anything else stays a Buffer.
+ */
+function readBodyData(data: string, contentType: string | undefined): unknown {
   if (data === "@-") {
     // This handler runs inside the daemon, whose stdin is a supervisor pipe
     // or /dev/null — never the caller's terminal. Stdin-based body input is
@@ -742,11 +820,10 @@ function readBodyData(data: string): unknown {
 
   if (data.startsWith("@")) {
     const filePath = data.slice(1);
-    const raw = readFileSync(filePath, "utf-8");
-    return tryJsonParse(raw);
+    return parseRequestBodyBytes(readFileSync(filePath), contentType);
   }
 
-  return tryJsonParse(data);
+  return parseRequestBodyData(data, contentType);
 }
 
 export async function handleRequest({ body = {} }: RouteHandlerArgs) {
@@ -759,6 +836,8 @@ export async function handleRequest({ body = {} }: RouteHandlerArgs) {
     parsed_data?: unknown;
     /** Raw data string (for direct API callers, not the CLI). */
     data?: string;
+    /** When set to base64, `parsed_data` / `data` is a base64 string of raw bytes. */
+    body_encoding?: "base64";
     force_get?: boolean;
     head?: boolean;
     account?: string;
@@ -852,16 +931,26 @@ export async function handleRequest({ body = {} }: RouteHandlerArgs) {
   let reqBody: unknown = undefined;
   const query: Record<string, string | string[]> = { ...queryFromUrl };
 
-  // Use pre-parsed data from CLI, or fall back to raw data string for direct API callers
+  // Use pre-parsed data from CLI, or fall back to raw data string for direct
+  // API callers. A string here (a multipart or form-encoded payload) stays a
+  // string all the way to the provider; only objects are serialized as JSON.
   const resolvedData =
     b.parsed_data !== undefined
       ? b.parsed_data
       : b.data !== undefined
-        ? readBodyData(b.data)
+        ? readBodyData(b.data, findContentTypeHeader(b.headers))
         : undefined;
 
   if (resolvedData !== undefined) {
-    const rawBody = resolvedData;
+    let rawBody = resolvedData;
+    if (b.body_encoding === "base64") {
+      if (typeof rawBody !== "string") {
+        throw new BadRequestError(
+          "body_encoding=base64 requires a string body",
+        );
+      }
+      rawBody = Buffer.from(rawBody, "base64");
+    }
 
     if (b.force_get) {
       if (typeof rawBody === "string") {
@@ -879,7 +968,8 @@ export async function handleRequest({ body = {} }: RouteHandlerArgs) {
       } else if (
         rawBody !== null &&
         typeof rawBody === "object" &&
-        !Array.isArray(rawBody)
+        !Array.isArray(rawBody) &&
+        !isBinaryOAuthBody(rawBody)
       ) {
         for (const [key, value] of Object.entries(
           rawBody as Record<string, unknown>,
@@ -924,16 +1014,22 @@ export async function handleRequest({ body = {} }: RouteHandlerArgs) {
   };
 
   const response = await connection.request(req);
+  const encodedBody = jsonSafeOAuthBody(response.body);
+
+  const verdict = judgeProviderResponse(providerRow, response);
 
   const result: Record<string, unknown> = {
-    ok: response.status >= 200 && response.status < 300,
+    ok: verdict.ok,
     status: response.status,
     headers: response.headers,
-    body: response.body,
+    body: encodedBody.body,
     // Which connected account actually served the request, so the caller can
     // tell whether the intended account was used.
     account: connection.accountInfo,
   };
+  if (encodedBody.bodyEncoding) {
+    result.bodyEncoding = encodedBody.bodyEncoding;
+  }
 
   // Surface a caller-visible warning when the provider had several active
   // connections and no account was pinned — the model must see that a
@@ -945,41 +1041,21 @@ export async function handleRequest({ body = {} }: RouteHandlerArgs) {
       `used "${selected}". Pass --account to select a specific one.`;
   }
 
-  if (response.status === 401 || response.status === 403) {
-    result.hint = managed
-      ? `Request returned HTTP ${response.status}. The OAuth token may be expired or revoked.\n\n` +
-        `Run 'assistant oauth status ${b.provider}' to check connection health.\n` +
-        `To reconnect, run 'assistant oauth connect --help'.`
-      : `Request returned HTTP ${response.status}. The OAuth token may be expired or revoked.\n\n` +
-        `Run 'assistant oauth status ${b.provider}' to check connection status.\n` +
-        `To reconnect, run 'assistant oauth connect --help'.`;
-  } else if (response.status === 404 && isHtmlResponse(response.headers)) {
-    // An HTML 404 (rather than a JSON API error) is the signature of a request
-    // reaching a valid host but a path that host does not serve — e.g. a
-    // relative path resolved against a base URL that points at the wrong
-    // product. Surface the resolved base so the caller can tell where the path
-    // landed, and steer them to an absolute URL for non-default services.
-    const resolvedBaseUrl =
-      baseUrl ?? providerRow.baseUrl ?? "(none configured)";
-    result.hint =
-      `Request returned HTTP ${response.status} with an HTML body, which usually means ` +
-      `the path does not exist on the base URL it resolved against.\n\n` +
-      `This request used base URL "${resolvedBaseUrl}" (relative paths are joined onto it). ` +
-      `If you meant a different service on this provider, pass an absolute URL ` +
-      `(e.g. https://host/full/path) so the host and full path are set explicitly.`;
+  const hint = composeRequestHint({
+    provider: b.provider,
+    status: response.status,
+    headers: response.headers,
+    reportedFailure: verdict.reportedFailure,
+    botChannel: channelForBotProvider(b.provider),
+    managed,
+    resolvedBaseUrl: baseUrl ?? providerRow.baseUrl ?? undefined,
+    missingScopes: missingScopesForConnection(providerRow, connection.id),
+  });
+  if (hint) {
+    result.hint = hint;
   }
 
   return result;
-}
-
-/** True when the response's Content-Type header indicates an HTML body. */
-function isHtmlResponse(headers: Record<string, string>): boolean {
-  for (const [key, value] of Object.entries(headers)) {
-    if (key.toLowerCase() === "content-type") {
-      return value.toLowerCase().includes("text/html");
-    }
-  }
-  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -991,6 +1067,8 @@ async function handleManagedConnect({ body = {} }: RouteHandlerArgs) {
     provider: string;
     scopes?: string[];
     redirect_after_connect?: string;
+    /** Per-tenant providers (Shopify): the customer's own host. */
+    tenant_host?: string;
   };
 
   if (!b.provider) {
@@ -1007,6 +1085,13 @@ async function handleManagedConnect({ body = {} }: RouteHandlerArgs) {
   }
   reqBody.redirect_after_connect =
     b.redirect_after_connect ?? "/account/oauth/complete";
+  // Only forwarded when present: the platform validates it against the
+  // provider's pattern and rejects per-tenant providers that omit it.
+  const tenantHost =
+    typeof b.tenant_host === "string" ? b.tenant_host.trim() : "";
+  if (tenantHost) {
+    reqBody.tenant_host = tenantHost;
+  }
 
   const response = await client.fetch(startPath, {
     method: "POST",
@@ -1053,6 +1138,7 @@ async function handleManagedConnectPoll({
       id: e.id,
       account_label: e.account_label ?? null,
       scopes_granted: e.scopes_granted ?? [],
+      provider_params: e.provider_params ?? {},
     })),
   };
 }

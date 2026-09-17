@@ -148,6 +148,36 @@ describe("mergeAdjacentAssistantMessages · standalone rows", () => {
   });
 });
 
+describe("mergeAdjacentAssistantMessages · channel-deleted rows", () => {
+  test("a row deleted on its channel never folds, in either direction", () => {
+    // Mirrors the daemon's `isStandaloneAssistantMessage`: the fold keeps
+    // only the survivor's fields, so it would drop the donor's deletion or
+    // spread the survivor's tombstone over text the channel still shows.
+    const messages = [
+      makeAssistant({
+        id: "a-1",
+        ...textBody("still visible "),
+        timestamp: 1000,
+      }),
+      makeAssistant({
+        id: "gone-1",
+        ...textBody("removed from the channel"),
+        timestamp: 1010,
+        deletedAt: 1725100001000,
+      }),
+      makeAssistant({
+        id: "a-2",
+        ...textBody("also visible"),
+        timestamp: 1020,
+      }),
+    ];
+    const result = mergeAdjacentAssistantMessages(messages);
+    expect(result.map((m) => m.id)).toEqual(["a-1", "gone-1", "a-2"]);
+    expect(result[1]!.deletedAt).toBe(1725100001000);
+    expect(messageText(result[0]!)).toBe("still visible ");
+  });
+});
+
 describe("mergeAdjacentAssistantMessages · referential stability", () => {
   test("returns the input array (by reference) when no adjacent pair exists", () => {
     const messages = [
@@ -244,6 +274,82 @@ describe("mergeAdjacentAssistantMessages · contentOrder remap", () => {
       { type: "attachment", id: "0" },
       { type: "attachment", id: "2" },
     ]);
+  });
+
+  test("preserves donor automatic screenshot provenance without mutating inputs", () => {
+    const survivor = makeAssistant({
+      id: "anchor",
+      slackMessage: {
+        channelId: "channel-1",
+        channelTs: "100.1",
+      },
+      attachments: [
+        {
+          id: "explicit-file",
+          filename: "report.pdf",
+          mimeType: "application/pdf",
+          sizeBytes: 20,
+          previewUrl: null,
+        },
+      ],
+      contentBlocks: [
+        {
+          type: "attachment",
+          attachment: {
+            id: "explicit-file",
+            filename: "report.pdf",
+            mimeType: "application/pdf",
+            sizeBytes: 20,
+            kind: "document",
+          },
+        },
+      ],
+    });
+    const donor = makeAssistant({
+      id: "reply-donor",
+      attachments: [
+        {
+          id: "cloned-image",
+          filename: "computer-use-click.png",
+          mimeType: "image/png",
+          sizeBytes: 10,
+          previewUrl: null,
+          computerUseScreenshot: true,
+        },
+      ],
+      contentBlocks: [
+        {
+          type: "attachment",
+          attachment: {
+            id: "cloned-image",
+            filename: "computer-use-click.png",
+            mimeType: "image/png",
+            sizeBytes: 10,
+            kind: "image",
+            computerUseScreenshot: true,
+          },
+        },
+      ],
+    });
+    const original = structuredClone([survivor, donor]);
+
+    const result = mergeAdjacentAssistantMessages([survivor, donor]);
+
+    expect(
+      result[0]?.attachments?.map((attachment) => ({
+        id: attachment.id,
+        computerUseScreenshot: attachment.computerUseScreenshot,
+      })),
+    ).toEqual([
+      { id: "explicit-file", computerUseScreenshot: undefined },
+      { id: "cloned-image", computerUseScreenshot: true },
+    ]);
+    expect(result[0]?.contentBlocks).toEqual([
+      survivor.contentBlocks![0],
+      donor.contentBlocks![0],
+    ]);
+    expect(result[0]?.slackMessage).toEqual(survivor.slackMessage);
+    expect([survivor, donor]).toEqual(original);
   });
 
   // Server history payloads reference toolCalls / surfaces *positionally*

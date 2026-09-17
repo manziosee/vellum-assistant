@@ -217,8 +217,7 @@ function activeOrgSelection(perOrgPrefix: string): string | null {
 /**
  * Run all pending storage key migrations. Called from
  * `run-storage-migrations.ts` (side-effect import at the top of
- * `main.tsx`), after `migrateDeviceSettings()` — device keys must
- * already be in the `device:` namespace before we migrate user keys.
+ * `main.tsx`).
  *
  * Each migration is a one-time rename: read old → write new → remove old.
  * The order within each group doesn't matter since there are no
@@ -347,4 +346,10 @@ export function runStorageMigrations(): void {
   removeKey("app.discordNudge.bannerDismissed");
   removeKey("app.discordNudge.firstSeenAt");
   removeKey("app.nudgeLegacy.cleaned");
+
+  // Proactive tips state has no active reader.
+  removeKey("device:tips:records");
+  removeKey("device:tips:enabled");
+  removeKey("device:tips:first_seen_at");
+  removeKey("vellum:ff-str:proactiveTips");
 }

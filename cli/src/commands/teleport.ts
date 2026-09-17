@@ -1,3 +1,4 @@
+import { resolveAssistantApiKeyForInjection } from "../lib/assistant-api-key-resolution";
 import {
   findAssistantByName,
   loadAllAssistants,
@@ -23,8 +24,6 @@ import {
   platformRequestSignedUrl,
   VersionMismatchError,
   ensureSelfHostedLocalRegistration,
-  readGatewayCredential,
-  reprovisionAssistantApiKey,
   injectCredentialsIntoAssistant,
   fetchCurrentUser,
   fetchOrganizationId,
@@ -39,6 +38,15 @@ import {
 } from "../lib/local-runtime-client.js";
 import { pollJobUntilDone } from "../lib/job-polling.js";
 import {
+  createBackup,
+  listAssistantBackupTimes,
+  pruneOldBackups,
+} from "../lib/backup-ops.js";
+import {
+  createPlatformBackup,
+  listPlatformBackups,
+} from "../lib/teleport-backup.js";
+import {
   hatchDocker,
   retireDocker,
   sleepContainers,
@@ -47,13 +55,20 @@ import {
 import { hatchLocal } from "../lib/hatch-local.js";
 import { retireLocal } from "../lib/retire-local.js";
 import { validateAssistantName } from "../lib/retire-archive.js";
-import { stopProcessByPidFile } from "../lib/process.js";
+import {
+  DAEMON_STOP_TIMEOUT_MS,
+  stopProcessByPidFile,
+} from "../lib/process.js";
 import {
   fetchAssistantIngressUrl,
   fetchCurrentVersion,
 } from "../lib/upgrade-lifecycle.js";
 import { compareVersions } from "../lib/version-compat.js";
 import { join } from "node:path";
+import {
+  hasRecentBackup,
+  RECENT_BACKUP_MAX_AGE_MS,
+} from "@vellumai/local-mode/teleport-backup-policy";
 
 function printHelp(): void {
   console.log(
@@ -85,6 +100,20 @@ function printHelp(): void {
     "The source and target must be different environments. Same-environment",
   );
   console.log("transfers (e.g. local to local) are not supported.");
+  console.log("");
+  console.log(
+    "Before exporting, the source assistant is backed up. Platform sources",
+  );
+  console.log(
+    "get a PVC snapshot (waited on until restorable); local and docker",
+  );
+  console.log(
+    "sources get a .vbundle written to ~/.local/share/vellum/backups/ on this",
+  );
+  console.log(
+    `machine. A backup of the source taken within the last ${RECENT_BACKUP_MAX_AGE_MS / 60_000} minutes is`,
+  );
+  console.log("reused. If the backup fails, the teleport is aborted.");
   console.log("");
   console.log(
     "For local-to-docker and docker-to-local transfers, the source assistant",
@@ -359,6 +388,70 @@ interface ImportResponse {
     failedAccounts: string[];
     skippedPlatform?: number;
   };
+}
+
+// ---------------------------------------------------------------------------
+// Pre-export safety backup of the source
+//
+// Runs before any data leaves the source. Reuses a backup of this assistant
+// younger than RECENT_BACKUP_MAX_AGE_MS; otherwise takes one and blocks until
+// it is usable. Any failure aborts the teleport: the source is retired at the
+// end of a successful teleport, and that is only safe with a restore point
+// behind it.
+//
+// Local and docker sources are exported to the host's CLI backup directory
+// rather than snapshotted by their own gateway: docker retirement removes
+// every source volume (including the gateway's backup pool), and bare-metal
+// gateways share one unlabelled pool across assistants, so neither would
+// give this assistant a restore point that outlives the teleport.
+// ---------------------------------------------------------------------------
+
+/** Export timeout for the host-side pre-teleport backup of a local/docker source. */
+const LOCAL_SOURCE_BACKUP_TIMEOUT_MS = 30 * 60 * 1000;
+
+async function backupSourceBeforeTeleport(
+  entry: AssistantEntry,
+  cloud: string,
+  displayName: string,
+): Promise<void> {
+  console.log(`Backing up ${displayName} (${cloud})...`);
+  try {
+    if (cloud === "vellum") {
+      const platformToken = readPlatformToken();
+      if (!platformToken) {
+        console.error("Not logged in. Run 'vellum login' first.");
+        process.exit(1);
+      }
+      const createdAts = await listPlatformBackups(entry, platformToken);
+      if (hasRecentBackup(createdAts)) {
+        console.log("Recent backup found, reusing it.");
+        return;
+      }
+      await createPlatformBackup(entry, platformToken);
+      console.log("Backup complete.");
+      return;
+    }
+
+    if (hasRecentBackup(listAssistantBackupTimes(entry.assistantId))) {
+      console.log("Recent backup found, reusing it.");
+      return;
+    }
+    const backupPath = await createBackup(entry.runtimeUrl, entry.assistantId, {
+      prefix: `${entry.assistantId}-pre-teleport`,
+      description: `Pre-teleport snapshot of ${displayName} (${cloud})`,
+      timeoutMs: LOCAL_SOURCE_BACKUP_TIMEOUT_MS,
+    });
+    if (!backupPath) {
+      throw new Error("backup export failed (see warning above)");
+    }
+    pruneOldBackups(entry.assistantId, 3, "pre-teleport");
+    console.log(`Backup saved: ${backupPath}`);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`Error: Could not back up '${displayName}': ${msg}`);
+    console.error("Teleport aborted; the source assistant was not modified.");
+    process.exit(1);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1151,30 +1244,19 @@ async function tryInjectPlatformCredentials(
       platformOrganizationId: orgId,
     });
 
-    // Resolve the API key: 1) fresh from registration, 2) existing from
-    // daemon credential store, 3) reprovision as last resort (revokes old key).
-    // Only reprovision when the gateway confirms no key exists — not when
-    // the gateway is merely unreachable (would revoke without injecting).
-    let assistantApiKey = registration.assistant_api_key;
-    if (!assistantApiKey) {
-      const cached = await readGatewayCredential(
-        entry.runtimeUrl,
-        "vellum:assistant_api_key",
-        entry.bearerToken,
-      );
-      if (cached.value) {
-        assistantApiKey = cached.value;
-      } else if (!cached.unreachable) {
-        const reprovision = await reprovisionAssistantApiKey(
-          token,
-          orgId,
-          clientInstallationId,
-          entry.assistantId,
-          "cli",
-        );
-        assistantApiKey = reprovision.provisioning.assistant_api_key;
-      }
-    }
+    // Which key to hand the assistant, and why. Shared with login so the two
+    // injection paths cannot drift.
+    const resolvedKey = await resolveAssistantApiKeyForInjection({
+      registrationApiKey: registration.assistant_api_key,
+      runtimeUrl: entry.runtimeUrl,
+      bearerToken: entry.bearerToken,
+      token,
+      organizationId: orgId,
+      clientInstallationId,
+      runtimeAssistantId: entry.assistantId,
+      clientPlatform: "cli",
+    });
+    const assistantApiKey = resolvedKey.apiKey;
 
     const allInjected = await injectCredentialsIntoAssistant({
       gatewayUrl: entry.runtimeUrl,
@@ -1408,6 +1490,8 @@ export async function teleport(): Promise<void> {
     // where the import will run. For existing targets that's the lockfile's
     // runtimeUrl; for fresh hatches it's getPlatformUrl() (which is what
     // resolveOrHatchTarget writes to the new entry).
+    await backupSourceBeforeTeleport(fromEntry, fromCloud, from);
+
     console.log(`Exporting from ${from} (${fromCloud})...`);
     const bundlePlatformUrl = targetPlatformUrl ?? getPlatformUrl();
     const { bundleKey } = await exportFromAssistant(
@@ -1478,6 +1562,8 @@ export async function teleport(): Promise<void> {
   const bundlePlatformUrl =
     fromCloud === "vellum" ? fromEntry.runtimeUrl : getPlatformUrl();
 
+  await backupSourceBeforeTeleport(fromEntry, fromCloud, from);
+
   // Export from source (bundle lives in GCS after this returns).
   console.log(`Exporting from ${from} (${fromCloud})...`);
   const { bundleKey } = await exportFromAssistant(
@@ -1497,6 +1583,8 @@ export async function teleport(): Promise<void> {
       await stopProcessByPidFile(
         getDaemonPidPath(fromEntry.resources),
         "assistant",
+        undefined,
+        DAEMON_STOP_TIMEOUT_MS,
       );
       await stopProcessByPidFile(gatewayPidFile, "gateway", undefined, 7000);
     }

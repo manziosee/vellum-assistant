@@ -56,9 +56,11 @@ export interface PlanCardContentProps {
   machineChanged: boolean;
   storageChanged: boolean;
   creditChanged: boolean;
+  /** The fee-less sub gains the platform fee: a pending change on its own. */
+  feeAdded: boolean;
   tierChangeError: string | null;
   upgradePending: boolean;
-  portalPending: boolean;
+  billingActionPending: boolean;
   onUpgrade: () => void;
   onApplyTierChange: () => void;
   onDowngradeClick: () => void;
@@ -97,9 +99,10 @@ export function PlanCardContent({
   machineChanged,
   storageChanged,
   creditChanged,
+  feeAdded,
   tierChangeError,
   upgradePending,
-  portalPending,
+  billingActionPending,
   onUpgrade,
   onApplyTierChange,
   onDowngradeClick,
@@ -352,7 +355,10 @@ export function PlanCardContent({
                   onClick={onApplyTierChange}
                   disabled={
                     tierChangePending ||
-                    (!machineChanged && !storageChanged && !creditChanged)
+                    (!machineChanged &&
+                      !storageChanged &&
+                      !creditChanged &&
+                      !feeAdded)
                   }
                   data-testid="modal-change-tier-button"
                 >
@@ -367,7 +373,7 @@ export function PlanCardContent({
                 variant="outlined"
                 className="w-full"
                 onClick={onDowngradeClick}
-                disabled={portalPending}
+                disabled={billingActionPending}
                 data-testid="modal-downgrade-to-base-button"
               >
                 {t("planCardContent.downgradeToBase")}
@@ -381,7 +387,7 @@ export function PlanCardContent({
                 variant="outlined"
                 className="w-full"
                 onClick={onKeepPlan}
-                disabled={portalPending}
+                disabled={billingActionPending}
                 data-testid="modal-keep-plan-button"
               >
                 {t("planCardContent.keepPlan")}

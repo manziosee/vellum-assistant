@@ -21,7 +21,7 @@ import { AgentLoop } from "../agent/loop.js";
 import type { AssistantActivityStateEvent } from "../api/events/assistant-activity-state.js";
 import type { ConfirmationStateChangedEvent } from "../api/events/confirmation-state-changed.js";
 import type { AssistantEvent } from "../api/index.js";
-import { decideGuardianRequest } from "../channels/gateway-guardian-requests.js";
+import { syncTerminalGuardianRequestStatus } from "../approvals/guardian-request-status-sync.js";
 import type {
   ChannelId,
   InterfaceId,
@@ -30,6 +30,7 @@ import type {
 } from "../channels/types.js";
 import { parseChannelId, parseInterfaceId } from "../channels/types.js";
 import { isAssistantFeatureFlagEnabled } from "../config/assistant-feature-flags.js";
+import { isInterruptOnSendEnabled } from "../config/interrupt-on-send-gate.js";
 import {
   contextWindowConfigFromEffective,
   resolveEffectiveContextWindow,
@@ -37,10 +38,12 @@ import {
 import { resolveCallSiteConfig } from "../config/llm-resolver.js";
 import { getConfig } from "../config/loader.js";
 import type { LLMCallSite, Speed } from "../config/schemas/llm.js";
+import { resolveSendUserMessageActive } from "../config/send-user-message-gate.js";
 import {
   derefToolResultReReads,
   postTurnTruncateToolResults,
 } from "../context/post-turn-tool-result-truncation.js";
+import { readProviderMetadata } from "../messaging/read-provider-metadata.js";
 import { isGuardianCardRow } from "../notifications/approval-card-data.js";
 import { PermissionPrompter } from "../permissions/prompter.js";
 import { SecretPrompter } from "../permissions/secret-prompter.js";
@@ -56,6 +59,7 @@ import {
 } from "../persistence/conversation-crud.js";
 import { getResolvedConversationDirPath } from "../persistence/conversation-directories.js";
 import { reportSlowSync } from "../persistence/slow-sync-log.js";
+import { userFacingTextOfRow } from "../persistence/user-facing-content.js";
 import { defaultCompact } from "../plugins/defaults/compaction/compact.js";
 import {
   createContextWindowManager,
@@ -72,10 +76,23 @@ import {
   wrapMemoryBlock,
 } from "../plugins/defaults/memory/memory-marker.js";
 import {
-  getPrunedSlugs,
+  getPrunedSections,
   MEMORY_V3_INJECTED_BLOCK_METADATA_KEY,
+  type SectionRefSet,
+  v3BlockFormatOf,
 } from "../plugins/defaults/memory/v3/ever-injected-store.js";
-import { filterPrunedCardSections } from "../plugins/defaults/memory/v3/prune.js";
+import {
+  filterResidentPointerEntries,
+  filterResidentSections,
+  newestCopyIndexes,
+  persistedV3Block,
+} from "../plugins/defaults/memory/v3/prune.js";
+import {
+  LEGACY_MEMORY_V3_SPOTLIGHT_BLOCK_METADATA_KEY,
+  markV3LiveBlock,
+  MEMORY_V3_POINTER_BLOCK_METADATA_KEY,
+} from "../plugins/defaults/memory/v3/types.js";
+import { resolveDelegateIndependentTasks } from "../prompts/delegation-gate.js";
 import {
   applyBootstrapTemplate,
   buildSystemPrompt,
@@ -112,6 +129,7 @@ import {
   abortConversation,
   disposeConversation,
   reinjectAttachmentPathAnnotations,
+  reinjectInterruptTurnNote,
 } from "./conversation-lifecycle.js";
 import type {
   EnqueueMessageOptions,
@@ -137,6 +155,7 @@ import type {
 } from "./conversation-queue-manager.js";
 import { MessageQueue } from "./conversation-queue-manager.js";
 import {
+  applySightFrameRetention,
   type ChannelCapabilities,
   getSlackCompactionWatermarkForPrefix,
   getSlackWatermarkAdvanceForRowPrefix,
@@ -160,8 +179,10 @@ import type {
   WakeToolContextPin,
 } from "./conversation-tool-setup.js";
 import {
+  canSpawnSubagentsForTurn,
   createResolveToolsCallback,
   createToolExecutor,
+  createWireToolSurfaceRecorder,
 } from "./conversation-tool-setup.js";
 import { canonicalizeTimeZone } from "./date-context.js";
 import { HostAppControlProxy } from "./host-app-control-proxy.js";
@@ -172,6 +193,8 @@ import { filterMessagesForUntrustedActor } from "./message-provenance.js";
 import type { ConversationTransportMetadata } from "./message-types/conversations.js";
 import { isHostProxyTransport } from "./message-types/conversations.js";
 import { conversationMetadataSyncTag } from "./message-types/sync.js";
+import { renderReactionHistoryText } from "./reaction-history-render.js";
+import type { QueuedReactionRecord } from "./reaction-record.js";
 import {
   resolveSummarizeBoundary,
   startsNewTurn,
@@ -267,6 +290,7 @@ import {
   isPersonalMemoryAllowed,
 } from "./trust-context.js";
 import type { TrustContext } from "./trust-context-types.js";
+import { turnActorPrincipalId } from "./turn-actor.js";
 
 export interface ConversationConstructorOptions {
   maxTokens?: number;
@@ -301,12 +325,37 @@ function abortReasonOf(signal?: AbortSignal): unknown {
   );
 }
 
+/**
+ * Thrown by the processing fence when the claim it was asked about is no
+ * longer the live one, which is the conversation having moved on to another
+ * holder rather than anything failing.
+ */
+export class ProcessingClaimLostError extends Error {
+  constructor(conversationId: string) {
+    super(`Processing claim lost for conversation ${conversationId}`);
+    this.name = "ProcessingClaimLostError";
+  }
+}
+
 export class Conversation {
   public readonly conversationId: string;
   /** @internal */ provider: Provider;
   /** @internal */ messages: Message[] = [];
   /** @internal */ agentLoop: AgentLoop;
   private _processing = false;
+  /**
+   * Which claim on the processing flag is the live one, as a value that changes
+   * every time the flag is taken. Zero while it is free.
+   *
+   * The flag itself is a boolean and cannot say who holds it, so a release has
+   * no way to tell its own hold from one taken since. This is what lets
+   * {@link releaseProcessing} refuse to release someone else's.
+   */
+  private processingOwner = 0;
+  private nextProcessingOwner = 0;
+  /** The live claim's marker write, awaited through the fence below. */
+  private processingMarker: { owner: number; landed: Promise<void> } | null =
+    null;
   /**
    * Pending {@link waitForIdle} resolvers, notified from the committed
    * `processing → false` transition inside {@link setProcessing}. Every
@@ -405,6 +454,41 @@ export class Conversation {
    * @internal
    */
   toolContextPin?: WakeToolContextPin;
+  /**
+   * Tool definitions sent verbatim in place of the resolved wire array, for
+   * a wake replaying its source conversation's recorded surface
+   * (`recordConversationToolSurface`). Set and restored alongside the
+   * allowlist by `scopeWakeAllowedTools`; read only where the resolver returns
+   * the wire array, so it never widens what may execute.
+   * @internal
+   */
+  wireToolReplay?: readonly ToolDefinition[];
+  /**
+   * The delegation section's rendered state a wake replaying its source's
+   * recorded surface carries into its system prompt, in place of the answer
+   * derived from the wake's own scope (`canSpawnSubagentsForTurn`). Set and
+   * restored alongside {@link wireToolReplay} by `scopeWakeAllowedTools`;
+   * read only by {@link buildCurrentSystemPrompt}, so it never widens what
+   * may execute.
+   * @internal
+   */
+  delegateIndependentTasksReplay?: boolean;
+  /**
+   * The delegation-section state the system prompt most recently built by
+   * {@link buildCurrentSystemPrompt} rendered: the value the loop's prompt
+   * carries until the next build. `null` when that prompt is a verbatim
+   * override, unset before the first build. Read by the wire-surface recorder
+   * so the recorded state is the one the provider received, not a
+   * re-derivation that a config change mid-turn could flip.
+   * @internal
+   */
+  renderedDelegateIndependentTasks?: boolean | null;
+  /**
+   * Hash of the wire surface last recorded for this conversation in this
+   * process, so an unchanged surface is not rewritten on every provider call.
+   * @internal
+   */
+  recordedToolSurfaceHash?: string;
   /** @internal */ readonly skillProjectionState = new Map<string, string>();
   /** @internal */ readonly skillProjectionCache: SkillProjectionCache = {};
   /** @internal */ usageStats: UsageStats = {
@@ -441,6 +525,35 @@ export class Conversation {
    */
   enabledPlugins: string[] | null = null;
   /** @internal */ currentRequestId?: string;
+  /**
+   * The `clientMessageId` the running turn was started by, recorded in the same
+   * synchronous step that takes the processing lock.
+   *
+   * A retransmitted send is normally recognised by finding the row its original
+   * already wrote, but a turn takes the lock and arms its abort controller
+   * before it inserts that row. In that window a retry finds a busy
+   * conversation and no row, and would abort the very turn its own original
+   * request just started, then deduplicate against the row that lands a moment
+   * later and start nothing. This is what lets such a retry recognise the turn
+   * as its own.
+   * @internal
+   */
+  currentTurnClientMessageId?: string;
+  /**
+   * `clientMessageId` to `requestId` for sends this conversation has accepted
+   * but not yet persisted.
+   *
+   * {@link currentTurnClientMessageId} covers a retry that races a turn already
+   * starting. This covers the window the interrupt opens ahead of that: a send
+   * is answered `202` and its abort, waits, repair and persist all run
+   * afterwards, so a retransmission arriving in between finds no running turn
+   * of its own to recognise and no row yet either, and both copies would race
+   * the unique `clientMessageId` insert with one losing. Reserved
+   * synchronously before the handover is detached, so the second copy is
+   * recognised and answered with the first's id.
+   * @internal
+   */
+  readonly inFlightSendRequestIds = new Map<string, string>();
   /**
    * The {@link LLMCallSite} of the in-flight turn, set at turn start from
    * `options?.callSite ?? "mainAgent"`. Lets the per-turn plugin context tell
@@ -533,11 +646,63 @@ export class Conversation {
   /** @internal */ currentTurnIsNonInteractive?: boolean;
   /** @internal */ currentTurnModelProfileNoticeKey?: string;
   /** @internal */ currentTurnRequestOrigin?: string;
+  /**
+   * Whether this turn routes its user-facing text through `send_user_message`,
+   * resolved once at turn start. The agent loop's suppression is pinned to
+   * this value for the whole turn, so the tool surface, the reserved row's
+   * visibility marker, and the prompt section read the same snapshot rather
+   * than the live flag: a remote flag change mid-turn must not mark an
+   * ordinarily streamed row private, nor take the only delivery tool away from
+   * a run that is still suppressing its text.
+   * @internal
+   */
+  currentTurnSendUserMessageActive?: boolean;
   /** @internal */ authContext?: AuthContext;
   /** @internal */ currentTurnAuthContext?: AuthContext;
-  /** @internal */ currentTurnSourceActorPrincipalId?: string;
+  /**
+   * Whether this turn resolved its own actor and found none, which is not the
+   * same as a turn that never looked. See {@link turnActorPrincipalId}.
+   *
+   * @internal
+   */
+  currentTurnActorFallbackSuppressed = false;
+  /** @internal */ private _currentTurnSourceActorPrincipalId?: string;
+  /**
+   * How many times the actor stamp has been written on this conversation.
+   *
+   * A turn that stamped the actor and later needs to know whether its own
+   * stamp is still the one standing cannot ask the value: two turns for the
+   * same guardian write the identical string, so the field cannot say who
+   * wrote it. Every write moves this counter, whoever makes it, so a reader
+   * that remembers the count at its own write can tell "still mine" from
+   * "someone stamped after me" without every writer having to cooperate.
+   *
+   * Behind the accessor below rather than bumped at the call sites, because
+   * the writers are spread across the routes and the turn pipeline and a
+   * counter they had to remember to move is one they would eventually not.
+   *
+   * @internal
+   */
+  currentTurnActorStampGeneration = 0;
+  /** @internal */
+  get currentTurnSourceActorPrincipalId(): string | undefined {
+    return this._currentTurnSourceActorPrincipalId;
+  }
+  /** @internal */
+  set currentTurnSourceActorPrincipalId(value: string | undefined) {
+    this._currentTurnSourceActorPrincipalId = value;
+    this.currentTurnActorStampGeneration += 1;
+  }
   /** @internal */ loadedHistoryTrustClass?: TrustClass;
   /** @internal */ loadedHistoryPersonalMemoryAllowed?: boolean;
+  /** @internal */ loadedHistoryStale = false;
+  /**
+   * @internal Reactions the current turn delivered, awaiting their durable
+   * rows. Written mid-turn by the react tool, drained by the agent loop at
+   * the turn boundary so the rows never land between a tool_use and its
+   * tool_result.
+   */
+  pendingReactionRecords: QueuedReactionRecord[] = [];
   /** @internal */ voiceCallControlPrompt?: string;
   /** @internal */ transportHints?: string[];
   /**
@@ -599,6 +764,39 @@ export class Conversation {
    * @internal
    */
   pendingInterruptRepair = false;
+  /**
+   * Set by `interruptRunningTurn` once it has handed the conversation over, and
+   * consumed by the agent loop at the head of the very next turn, which emits
+   * the `thinking` / `message_interrupted` transition.
+   *
+   * The transition bridges a gap the interrupt opens: the stopped turn's
+   * `generation_cancelled` idles every client's turn state, and the ordinary
+   * send path emits no `thinking` of its own, so without it the composer sits
+   * idle until the replacement turn's first delta. It is deferred to the loop
+   * rather than emitted by the interrupt because the send can still fail
+   * between the two (slash resolution, a `/compact` claim, the user-row
+   * persist), and an activity state is cached and replayed to reconnecting
+   * clients: emitted early, a failed send leaves every client showing a busy
+   * conversation that is not running anything. A flag nobody consumes emits
+   * nothing.
+   * @internal
+   */
+  pendingInterruptActivityBridge = false;
+  /**
+   * Set by `interruptRunningTurn` when the abort it ran landed with no tool
+   * call in flight, and consumed exactly once by the persist of the
+   * interrupting user message, which appends
+   * {@link INTERRUPTED_TURN_NOTE_TEXT} to that message's LLM-facing content
+   * and stamps `interruptedPriorTurn` on the row.
+   *
+   * An interrupt caught mid-tool needs nothing here: the synthetic
+   * `tool_result` the loop or the repair writes already tells the model a
+   * message preempted it. Caught mid-provider-call there is no `tool_use` to
+   * answer, so the note is the only signal, and it rides on the message that
+   * did the interrupting.
+   * @internal
+   */
+  pendingInterruptNote = false;
   /**
    * When true, side-effect tools must prompt even if a trust/allow rule
    * would auto-allow. Set by non-interactive callers (e.g. non-guardian
@@ -877,6 +1075,7 @@ export class Conversation {
       tools: toolDefs.length > 0 ? toolDefs : undefined,
       toolExecutor: toolDefs.length > 0 ? toolExecutor : undefined,
       resolveTools,
+      onToolsSent: createWireToolSurfaceRecorder(this),
       resolveConversationDir: () => {
         const conv = getConversation(this.conversationId);
         if (!conv) {
@@ -887,6 +1086,16 @@ export class Conversation {
           conv.createdAt,
         );
       },
+      // Compaction rebuilds history from the stored rows, so it can retain
+      // camera frames the turn's pre-run pass had already stubbed, and the
+      // rebuilt array is sent on the next request of that same turn. Re-running
+      // the retention pass here is what holds the frame bound across a
+      // compaction instead of only from the next turn onward. The row read
+      // repeats rather than sharing the pre-run pass's map: compactions are
+      // rare, and a map captured before the turn's awaits would describe a
+      // conversation that has since gained rows.
+      transformCompactedHistory: (messages) =>
+        applySightFrameRetention(messages, this.conversationId),
     });
     createContextWindowManager({
       provider,
@@ -961,16 +1170,40 @@ export class Conversation {
    * the provider's prefix cache).
    */
   buildCurrentSystemPrompt(): string {
-    return this.hasSystemPromptOverride
-      ? this.systemPrompt
-      : buildSystemPrompt({
-          hasNoClient: this.hasNoClient,
-          trustContext: this.currentTurnTrustContext,
-          channelCapabilities: this.currentTurnChannelCapabilities,
-          personaOverride: this.wakePersonaOverride,
-          onboardingContext: this.getOnboardingContext(),
-          conversationId: this.conversationId,
-        });
+    if (this.hasSystemPromptOverride) {
+      this.renderedDelegateIndependentTasks = null;
+      return this.systemPrompt;
+    }
+    // Resolved once here, handed to the builder, and kept for the
+    // wire-surface recorder, so the prompt the provider receives and the state
+    // a fork replays are the same value by construction. A wake replaying its
+    // source's recorded surface renders the section the source's live turn
+    // rendered; otherwise the answer is read off this turn's resolved tool
+    // surface: a workspace `tools.exclude` entry, a background run's
+    // `allowedTools` scope, a read-only subagent pass, or tools disabled all
+    // answer no, and the section renders off rather than pointing at a tool
+    // the turn cannot call.
+    const delegateIndependentTasks =
+      this.delegateIndependentTasksReplay ??
+      resolveDelegateIndependentTasks({
+        canSpawnSubagents: canSpawnSubagentsForTurn(this),
+        channelCapabilities: this.currentTurnChannelCapabilities,
+      });
+    const prompt = buildSystemPrompt({
+      hasNoClient: this.hasNoClient,
+      trustContext: this.currentTurnTrustContext,
+      channelCapabilities: this.currentTurnChannelCapabilities,
+      personaOverride: this.wakePersonaOverride,
+      onboardingContext: this.getOnboardingContext(),
+      conversationId: this.conversationId,
+      sendUserMessageTool: resolveSendUserMessageActive(this),
+      delegateIndependentTasks,
+    });
+    // Recorded only once the build succeeds: a wake's prompt sync swallows a
+    // failed rebuild and runs on the previous prompt, whose state must stay
+    // the recorded one.
+    this.renderedDelegateIndependentTasks = delegateIndependentTasks;
+    return prompt;
   }
 
   /**
@@ -1052,6 +1285,9 @@ export class Conversation {
 
   async loadFromDb(): Promise<LoadFromDbResult> {
     const loadStartedAt = performance.now();
+    // Cleared before the rows are read: a channel event persisted mid-load
+    // re-marks the flag, so the next turn reloads rather than missing it.
+    this.loadedHistoryStale = false;
     const trustClass = this.trustContext?.trustClass;
     const canAccessMemory = resolveCapabilities(trustClass).canAccessMemory;
     const allDbMessages = getMessages(this.conversationId);
@@ -1124,23 +1360,87 @@ export class Conversation {
     // in the HTTP-auth-disabled dev bypass, so a turn with no bound actor
     // resolves the same way on both paths.
     const personalMemoryAllowed = isPersonalMemoryAllowed(this.trustContext);
-    // Pruned v3 card slugs, read lazily on the first row that carries a v3
+    // Pruned v3 sections, read lazily on the first row that carries a v3
     // block (most conversations carry none, so most loads never query). The
-    // prune valve marks cards pruned in the everInjected store instead of
+    // prune valve marks sections pruned in the section store instead of
     // rewriting the persisted metadata, so the v3 rehydration splice below
     // re-applies the filter on every load — that is what makes a prune
     // survive daemon restarts. Defensive catch: a store failure degrades to
     // an unfiltered (pre-prune) rehydration rather than a failed load.
-    let v3PrunedSlugsMemo: Set<string> | null = null;
-    const v3PrunedSlugs = (): Set<string> => {
-      if (v3PrunedSlugsMemo === null) {
+    let v3PrunedSectionsMemo: SectionRefSet | null = null;
+    const v3PrunedSections = (): SectionRefSet => {
+      if (v3PrunedSectionsMemo === null) {
         try {
-          v3PrunedSlugsMemo = getPrunedSlugs(this.conversationId);
+          v3PrunedSectionsMemo = getPrunedSections(this.conversationId);
         } catch {
-          v3PrunedSlugsMemo = new Set();
+          v3PrunedSectionsMemo = new Map();
         }
       }
-      return v3PrunedSlugsMemo;
+      return v3PrunedSectionsMemo;
+    };
+    // Provider-id → row-text index for reaction target resolution, built
+    // lazily on the first reaction row: most conversations carry none, so
+    // most loads never walk the rows a second time. Keyed over the full
+    // (unsliced) history so a reaction whose target was compacted out of
+    // context still resolves its quote.
+    let reactionTargetIndexMemo: Map<string, string> | null = null;
+    const resolveReactionTarget = (
+      targetMessageId: string,
+    ): string | undefined => {
+      if (reactionTargetIndexMemo === null) {
+        reactionTargetIndexMemo = new Map();
+        for (const row of dbMessages) {
+          const rowMeta = readProviderMetadata(row.metadata);
+          // A deleted target is a logical erasure (same rule as the Slack
+          // transcript renderer), so its text is never quoted back.
+          if (
+            rowMeta?.eventKind === "message" &&
+            rowMeta.deletedAt === undefined &&
+            rowMeta.messageId
+          ) {
+            // Quote what the channel actually carried: on a row a
+            // `send_user_message` turn wrote, that is the message the tool
+            // delivered, not the private working notes beside it.
+            const text = userFacingTextOfRow(row.content, row.metadata);
+            if (text) {
+              // A split reply posts several provider messages from one row;
+              // a reaction may name any of them. A post deleted on its own
+              // (partial deletion of a split reply) stops being quotable
+              // while its siblings remain.
+              for (const id of [
+                rowMeta.messageId,
+                ...(rowMeta.additionalMessageIds ?? []),
+              ]) {
+                if (
+                  !reactionTargetIndexMemo.has(id) &&
+                  !rowMeta.deletedMessageIds?.includes(id)
+                ) {
+                  reactionTargetIndexMemo.set(id, text);
+                }
+              }
+            }
+          }
+        }
+      }
+      return reactionTargetIndexMemo.get(targetMessageId);
+    };
+    // The message index carrying each v3 section's newest persisted copy,
+    // read lazily like the pruned set: a section re-injected after a prune
+    // has an older copy on an earlier message, and only the newest copy is
+    // rehydrated (the older one left the live history when the section was
+    // pruned). Indexed over the same rows the map below walks.
+    let v3NewestCopyMemo: ReadonlyMap<string, number> | null = null;
+    const v3NewestCopy = (): ReadonlyMap<string, number> => {
+      if (v3NewestCopyMemo === null) {
+        v3NewestCopyMemo = newestCopyIndexes(
+          slicedDbMessages.map((row, rowIndex) =>
+            row.role === "user" && rowIndex >= preStrippedCount
+              ? persistedV3Block(row.metadata)
+              : null,
+          ),
+        );
+      }
+      return v3NewestCopyMemo;
     };
     const parsedMessages: Message[] = slicedDbMessages.map((m, index, arr) => {
       const isPreStripped = index < preStrippedCount;
@@ -1148,6 +1448,56 @@ export class Conversation {
       let content: ContentBlock[] = m.content;
 
       content = reinjectAttachmentPathAnnotations(content, role, m.metadata);
+      content = reinjectInterruptTurnNote(content, role, m.metadata);
+
+      // Channel facts stamped in metadata render at load time rather than
+      // at persist time, so every stored row reads correctly whenever it
+      // was written: a reaction row's "[reaction]" sentinel renders as who
+      // reacted with what to which message, and a deleted row's original
+      // text gives way to a deletion marker (the delete intercepts stamp
+      // metadata and deliberately leave the content column untouched). The
+      // substring guard keeps the per-row metadata parse off rows that can
+      // carry neither fact: both envelopes spell these keys literally, in
+      // providerMeta and in nested slackMeta alike.
+      if (
+        m.metadata &&
+        (m.metadata.includes("reaction") || m.metadata.includes("deletedAt"))
+      ) {
+        const providerMeta = readProviderMetadata(m.metadata);
+        if (providerMeta?.eventKind === "reaction") {
+          const rendered = renderReactionHistoryText(
+            providerMeta,
+            resolveReactionTarget,
+            // An assistant-role reaction row is the assistant's own act,
+            // persisted by the react tool.
+            { selfAuthored: role === "assistant" },
+          );
+          if (rendered) {
+            content = [{ type: "text", text: rendered }];
+          }
+        } else if (role === "user" && providerMeta?.deletedAt !== undefined) {
+          // Neutral marker, no actor: Discord deletes can be authorless
+          // (`actorUnattributed`), so the marker never claims who deleted.
+          content = [{ type: "text", text: "[This message was deleted]" }];
+        } else if (
+          role === "assistant" &&
+          providerMeta?.deletedAt !== undefined
+        ) {
+          // The assistant's own deleted post keeps its content: erasure is
+          // how a retracted USER message is honored, but rewriting what the
+          // assistant said would falsify its memory of its own output. The
+          // rendered fact is visibility: the message no longer exists on the
+          // channel, so the assistant should not refer to it as something
+          // participants can see.
+          content = [
+            ...content,
+            {
+              type: "text",
+              text: "[This message was deleted from the channel and is no longer visible to participants]",
+            },
+          ];
+        }
+      }
 
       // Re-inject persisted injection blocks from metadata so it survives
       // conversation reloads (eviction, restart, fork).
@@ -1174,18 +1524,19 @@ export class Conversation {
           // (pkb-context 30, pkb-reminder 35, memory-v2-static 38,
           // now-md 40, memory-v3-shadow 1000 — the v2 static block lands
           // inside the memory prefix, so now-md splices *after* it; the
-          // v3 card block is `<memory>`-wrapped and splices LAST, landing
+          // v3 section block is `<memory>`-wrapped and splices LAST, landing
           // at the memory boundary after the `<info>` block but before
           // now-md's earlier splice):
           //   [<workspace>, <turn_context>, <memory>dynamic</memory>,
-          //    <info>v2static</info>, <memory>v3cards</memory>, <NOW.md>,
+          //    <info>v2static</info>, <memory>v3sections</memory>,
+          //    <memory_pointer>, <NOW.md>,
           //    <system_reminder>, <knowledge_base>, ...original]
           // The v2 static block is replayed verbatim from stored metadata,
           // so rows may carry either `<info>…</info>` or `<memory>…</memory>`
           // depending on when they were persisted.
           // Required so Anthropic's prefix cache keeps matching msg[0]
           // across daemon restart and conversation eviction. The tail
-          // row only rehydrates `memoryInjectedBlock` and the v3 card
+          // row only rehydrates `memoryInjectedBlock` and the v3 section
           // block — the next turn re-injects the rest fresh.
           if (!isTail && typeof meta.pkbContextBlock === "string") {
             content = [
@@ -1208,10 +1559,61 @@ export class Conversation {
             ];
           }
 
-          // The memory-v3 frozen card block (net-new compact cards) persists
+          // The memory-v3 per-turn `<memory_pointer>` persists under its own
+          // key as the wrapped block that was sent. Rehydrated on ALL rows
+          // (tail included), matching frozen sections: after a reload the
+          // last completed turn is the tail, and the next user message is
+          // appended without re-running loadFromDb. Prepended here, after
+          // now-md and before the v3 section block, so the inverted prepends
+          // land as [sections, pointer, now-md, ...]. Trust-gated on
+          // `personalMemoryAllowed` like the sections: the pointer names
+          // personal-memory pages and headings. A pruned section's line, and
+          // a line naming a section whose newest copy sits on a later message
+          // (the pointer predates its re-injection), are filtered out here
+          // the way the section is filtered out of its frozen block below; a
+          // pointer left with no entries is skipped entirely (matching the
+          // live strip in `memory/v3/prune.ts`).
+          if (
+            personalMemoryAllowed &&
+            typeof meta[MEMORY_V3_POINTER_BLOCK_METADATA_KEY] === "string"
+          ) {
+            const pointer = filterResidentPointerEntries(
+              meta[MEMORY_V3_POINTER_BLOCK_METADATA_KEY] as string,
+              index,
+              v3PrunedSections(),
+              v3NewestCopy(),
+            );
+            if (pointer.length > 0) {
+              content = [{ type: "text" as const, text: pointer }, ...content];
+            }
+          }
+
+          // Rows persisted by builds that shipped the per-turn
+          // `<memory_spotlight>` layer carry that turn's wrapped block under
+          // the legacy key. No producer writes it; it is rehydrated verbatim,
+          // in the slot those builds spliced it (the pointer's), so the
+          // prompts those turns were sent with stay byte-identical across
+          // the upgrade. Trust-gated like the pointer.
+          if (
+            personalMemoryAllowed &&
+            typeof meta[LEGACY_MEMORY_V3_SPOTLIGHT_BLOCK_METADATA_KEY] ===
+              "string"
+          ) {
+            content = [
+              {
+                type: "text" as const,
+                text: meta[
+                  LEGACY_MEMORY_V3_SPOTLIGHT_BLOCK_METADATA_KEY
+                ] as string,
+              },
+              ...content,
+            ];
+          }
+
+          // The memory-v3 frozen section block (net-new sections) persists
           // under its own key, stored UNWRAPPED like v2's dynamic block below.
           // Rehydrated on ALL rows (tail included): the next turn injects only
-          // net-new cards — deduped via the v3 everInjected store — so this
+          // net-new sections, deduped via the v3 section store, so this
           // row's block must be back in history byte-identical for the dedup
           // (and the provider prefix cache) to hold. A row carries at most one
           // of the v3 and v2-dynamic keys (the user-prompt-submit hook
@@ -1220,16 +1622,17 @@ export class Conversation {
           // first leaves it BELOW both in the final content, matching the
           // live after-memory-prefix splice (order 1000 lands at the memory
           // boundary, after `<info>` / `<memory>` prefix blocks).
-          // Pruned slugs' card sections are filtered out here (the metadata
-          // itself is never rewritten — auditable and reversible); an
-          // all-pruned block is skipped entirely, matching the live strip in
-          // `memory/v3/prune.ts`.
+          // Pruned sections, and copies superseded by a re-injection on a
+          // later message, are filtered out here by their header span (the
+          // metadata itself is never rewritten, auditable and reversible);
+          // a block left with nothing is skipped entirely, matching the live
+          // strip in `memory/v3/prune.ts`.
           // Trust-gated on `personalMemoryAllowed`, mirroring the v2 static
-          // block below and the live v3 injector: v3 cards carry personal user
-          // memory (memory pages, PKB, matched sections), so an untrusted-actor
-          // view must not read them back through persisted metadata. The tail
-          // is still rehydrated for trusted views (unlike v2) — the gate is the
-          // only constraint added here.
+          // block below and the live v3 injector: v3 sections carry personal
+          // user memory (memory pages, PKB, matched sections), so an
+          // untrusted-actor view must not read them back through persisted
+          // metadata. The tail is still rehydrated for trusted views (unlike
+          // v2), the gate is the only constraint added here.
           if (
             personalMemoryAllowed &&
             typeof meta[MEMORY_V3_INJECTED_BLOCK_METADATA_KEY] === "string"
@@ -1237,13 +1640,27 @@ export class Conversation {
             const v3Block = meta[
               MEMORY_V3_INJECTED_BLOCK_METADATA_KEY
             ] as string;
-            const v3Resident = filterPrunedCardSections(
+            // The block's rendering format is the row's own provenance (the
+            // persisting build's stamp, absent on pre-stamp rows), never
+            // read off the block's content: a current block is filtered by
+            // section, a legacy block by card under each card's lead ref.
+            const v3Format = v3BlockFormatOf(meta);
+            const v3Resident = filterResidentSections(
               unwrapMemoryBlock(v3Block),
-              v3PrunedSlugs(),
+              v3Format,
+              index,
+              v3PrunedSections(),
+              v3NewestCopy(),
             );
             if (v3Resident.length > 0) {
               content = [
-                { type: "text" as const, text: wrapMemoryBlock(v3Resident) },
+                markV3LiveBlock(
+                  {
+                    type: "text" as const,
+                    text: wrapMemoryBlock(v3Resident),
+                  },
+                  v3Format,
+                ),
                 ...content,
               ];
             }
@@ -1510,24 +1927,70 @@ export class Conversation {
     }
   }
 
-  async ensureActorScopedHistory(): Promise<void> {
-    const currentTrustClass = this.trustContext?.trustClass;
-    // Tracked alongside the trust class because `loadFromDb` gates
-    // personal-memory rehydration on `isPersonalMemoryAllowed`, which folds in
-    // the disabled-auth elevation of an unbound actor: two contexts can share a
-    // trust class and still differ here. A reuse that changes the answer has to
-    // reload, or stale personal-memory blocks persist into a turn that must not
-    // see them, or stay stripped from one that should.
-    const currentPersonalMemoryAllowed = isPersonalMemoryAllowed(
-      this.trustContext,
+  /**
+   * Whether the resident history is the one an actor carrying `trustContext`
+   * would be given.
+   *
+   * Personal memory is asked alongside the trust class because `loadFromDb`
+   * gates personal-memory rehydration on `isPersonalMemoryAllowed`, which folds
+   * in the disabled-auth elevation of an unbound actor: two contexts can share
+   * a trust class and still differ here. A reuse that changes the answer has to
+   * reload, or stale personal-memory blocks persist into a turn that must not
+   * see them, or stay stripped from one that should.
+   */
+  private historyMatchesScope(trustContext: TrustContext | undefined): boolean {
+    return (
+      !this.loadedHistoryStale &&
+      this.loadedHistoryTrustClass === trustContext?.trustClass &&
+      this.loadedHistoryPersonalMemoryAllowed ===
+        isPersonalMemoryAllowed(trustContext)
     );
-    if (
-      this.loadedHistoryTrustClass === currentTrustClass &&
-      this.loadedHistoryPersonalMemoryAllowed === currentPersonalMemoryAllowed
-    ) {
+  }
+
+  async ensureActorScopedHistory(): Promise<void> {
+    if (this.historyMatchesScope(this.trustContext)) {
       return;
     }
     await this.loadFromDb();
+  }
+
+  /**
+   * Mark stale when a row has been appended to the resident history under an
+   * actor this history is not scoped for.
+   *
+   * A persist that runs outside any turn has nothing ensuring the history for
+   * its sender first, so its row joins `this.messages` as it is. Left alone,
+   * the next turn under the resident scope reuses that array rather than
+   * reloading, and sends the model a row a reload would have filtered out.
+   *
+   * `trustContext` is the actor the row was attributed to, which for a caller
+   * that resolved none is the conversation's own, matching what the persist
+   * stamps. A scope that already matches is left alone: rows can arrive on a
+   * camera's cadence, and a reload apiece is a cost worth the comparison.
+   */
+  markHistoryStaleForForeignScope(
+    trustContext: TrustContext | undefined,
+  ): void {
+    if (this.historyMatchesScope(trustContext ?? this.trustContext)) {
+      return;
+    }
+    this.markHistoryStale();
+  }
+
+  /**
+   * Mark the resident history stale: a channel event (a reaction, edit, or
+   * delete) was persisted straight to the store while this conversation was
+   * loaded, so `this.messages` no longer reflects the rows. The next
+   * {@link ensureActorScopedHistory} reloads instead of reusing the resident
+   * history.
+   */
+  markHistoryStale(): void {
+    this.loadedHistoryStale = true;
+  }
+
+  /** Queue a delivered reaction for its durable row at the turn boundary. */
+  queueReactionRecord(record: QueuedReactionRecord): void {
+    this.pendingReactionRecords.push(record);
   }
 
   /**
@@ -1686,7 +2149,12 @@ export class Conversation {
    */
   setProcessing(value: boolean): void {
     const wasProcessing = this._processing;
+    const wasOwner = this.processingOwner;
     this._processing = value;
+    // Every set is a claim, including one over a flag another holder already
+    // has: a caller setting it unconditionally is asserting the hold is now
+    // theirs, and the previous holder's release must not undo that.
+    this.processingOwner = value ? ++this.nextProcessingOwner : 0;
     // Persist the cross-process source of truth so out-of-process callers
     // (retrospective CLI, future detached workers) can detect mid-turn state
     // by reading the conversations row directly.
@@ -1695,6 +2163,7 @@ export class Conversation {
         setConversationProcessingStartedAt(this.conversationId, Date.now());
       } catch (err) {
         this._processing = wasProcessing;
+        this.processingOwner = wasOwner;
         throw err;
       }
     } else {
@@ -1715,6 +2184,171 @@ export class Conversation {
         conversationMetadataSyncTag(this.conversationId),
       ]);
     }
+  }
+
+  /**
+   * Take the processing flag if it is free, reporting the claim a later release
+   * has to name. Null means someone already holds it.
+   *
+   * The read and the take are one synchronous step, so no second acquirer can
+   * land between them, and the flag stays held while the marker write below
+   * retries: reverting it because that write lost a race would publish an idle
+   * conversation for as long as the retry sleeps, and anything polling for idle
+   * takes the flag in that window while this caller believes its turn is
+   * starting.
+   *
+   * The marker is a fence, not a hope. `processing_started_at` is what a
+   * reconnecting client and the out-of-process retrospective worker read to
+   * decide whether a turn is live, so a turn that proceeds while the column is
+   * null lets a client stop waiting mid-turn and lets the worker fork partial
+   * history. Every caller therefore awaits {@link ensureProcessingMarker}
+   * before doing anything with the hold, and gives the hold back when it does
+   * not land.
+   */
+  acquireProcessing(): number | null {
+    if (this._processing) {
+      return null;
+    }
+    this._processing = true;
+    const owner = ++this.nextProcessingOwner;
+    this.processingOwner = owner;
+    this.processingMarker = {
+      owner,
+      landed: this.mirrorProcessingStarted(owner, Date.now()),
+    };
+    return owner;
+  }
+
+  /**
+   * Resolve once this claim's processing marker is durable. Reject when the
+   * retry budget runs out without it landing, and reject when the claim is not
+   * the live one.
+   *
+   * Lost ownership is a failure here, not a pass. The caller does its work
+   * between this fence and its release, so answering "fine" for a hold that
+   * Stop or a teardown has already cleared would let that work run under a
+   * dead claim while a new turn acquires and writes alongside it.
+   *
+   * Asked again after the await because both can happen in one window: the
+   * write lands, and the hold is claimed away before this resumes. The fence
+   * has to describe the present, not the moment it started waiting.
+   */
+  async ensureProcessingMarker(owner: number): Promise<void> {
+    const marker = this.processingMarker;
+    if (!marker || marker.owner !== owner || this.processingOwner !== owner) {
+      throw new ProcessingClaimLostError(this.conversationId);
+    }
+    await marker.landed;
+    if (this.processingOwner !== owner) {
+      throw new ProcessingClaimLostError(this.conversationId);
+    }
+  }
+
+  /**
+   * Take the flag and wait out its marker, giving the claim back rather than
+   * ever leaving a live one unreleased.
+   *
+   * Null is "this conversation is someone else's", by either route: the flag
+   * was already held, or the hold was claimed away while the marker was still
+   * landing. Callers answer both with the busy behaviour they already owe.
+   *
+   * A throw is the marker itself refusing to persist, which is a real failure
+   * rather than a busy conversation, and the claim is already released before
+   * it is raised. Every acquire goes through here, so no call site can get the
+   * ordering wrong: there is no window where a claim exists and its release is
+   * not yet guaranteed.
+   */
+  async acquireProcessingFenced(): Promise<number | null> {
+    const owner = this.acquireProcessing();
+    if (owner === null) {
+      return null;
+    }
+    try {
+      await this.ensureProcessingMarker(owner);
+    } catch (err) {
+      // A no-op when the claim is already gone, which is exactly the case
+      // this is here to make harmless.
+      this.releaseProcessing(owner);
+      if (err instanceof ProcessingClaimLostError) {
+        return null;
+      }
+      throw err;
+    }
+    return owner;
+  }
+
+  /**
+   * Whether this claim is still the live hold on the conversation.
+   *
+   * For work that runs across awaits under a claim it took earlier. A Stop on
+   * a hold with no live turn behind it force-clears the flag, and the next
+   * request acquires, so a claim can go stale while its holder is mid-write.
+   * Asking here is a plain field read, which is what lets a write fence ask it
+   * in the same tick as the statement it guards.
+   */
+  holdsProcessingClaim(owner: number): boolean {
+    return this.processingOwner === owner;
+  }
+
+  /**
+   * Release a hold taken by {@link acquireProcessing}, and only that hold.
+   * Reports whether it released.
+   *
+   * A hold can be claimed away by any unconditional `setProcessing(true)`,
+   * which is how a turn starts. The earlier holder's release then has to do
+   * nothing: clearing there would release a turn that is still running and let
+   * the next one interleave into the rows it is still writing.
+   */
+  releaseProcessing(owner: number): boolean {
+    if (this.processingOwner !== owner) {
+      log.debug(
+        {
+          conversationId: this.conversationId,
+          owner,
+          holder: this.processingOwner,
+        },
+        "Not releasing the processing flag: another holder claimed it",
+      );
+      return false;
+    }
+    this.setProcessing(false);
+    return true;
+  }
+
+  /**
+   * Write a taken processing lock into the `processing_started_at` column,
+   * reporting through the promise {@link ensureProcessingMarker} hands back.
+   *
+   * The retry runs while the flag stays held, so the lock has no gap for
+   * another acquirer, and it re-checks ownership rather than the flag: a hold
+   * claimed since has written its own timestamp, and a late write from this one
+   * would describe the wrong turn.
+   */
+  private mirrorProcessingStarted(
+    owner: number,
+    startedAt: number,
+  ): Promise<void> {
+    const landed = withSqliteRetry(
+      () => {
+        if (this.processingOwner !== owner) {
+          return;
+        }
+        setConversationProcessingStartedAt(this.conversationId, startedAt);
+      },
+      {
+        op: "conversation:acquireProcessing",
+        context: { conversationId: this.conversationId },
+      },
+    );
+    // The caller awaits this, but only on its own next tick, so subscribe now
+    // rather than let a rejection land with nothing attached to it.
+    landed.catch((err: unknown) => {
+      log.error(
+        { err, conversationId: this.conversationId },
+        "Failed to persist the processing marker; the claim holding this conversation is given back",
+      );
+    });
+    return landed;
   }
 
   /**
@@ -1787,9 +2421,6 @@ export class Conversation {
 
   markStale(): void {
     this.stale = true;
-    // Invalidate the cached skill catalog so the next projection picks up
-    // filesystem changes (e.g. a skill created during this run).
-    this.skillProjectionCache.catalog = undefined;
   }
 
   isStale(): boolean {
@@ -1878,6 +2509,18 @@ export class Conversation {
     return !this.queue.isEmpty;
   }
 
+  /**
+   * True when dropping this instance would lose work that is still in flight:
+   * a live turn, a queued successor, or a child subagent.
+   */
+  hasInFlightWork(): boolean {
+    return (
+      this.isProcessing() ||
+      this.hasQueuedMessages() ||
+      getSubagentManager().hasActiveChildren(this.conversationId)
+    );
+  }
+
   /** FIFO snapshot of the messages currently waiting in the in-memory queue.
    * Read-only — used to surface queued user messages in history responses. */
   snapshotQueuedMessages(): QueuedMessage[] {
@@ -1893,7 +2536,21 @@ export class Conversation {
     return this.queue.removeByRequestId(requestId);
   }
 
+  /**
+   * Whether the agent loop may yield at a turn-boundary checkpoint to let a
+   * queued message take over.
+   *
+   * Under `interrupt-on-send` a message sent while this conversation is busy
+   * never queues, so the handoff has nothing to hand off to. Answering `false`
+   * outright keeps the loop from taking the branch on a queue that only holds
+   * entries the interrupt path deliberately left there (another actor's send
+   * falling back to the queue, a daemon-internal enqueue): those run on the
+   * ordinary end-of-turn drain rather than by cutting a turn short.
+   */
   canHandoffAtCheckpoint(): boolean {
+    if (isInterruptOnSendEnabled()) {
+      return false;
+    }
     return this._processing && this.hasQueuedMessages();
   }
 
@@ -1917,8 +2574,6 @@ export class Conversation {
     requestId: string,
     decision: UserDecision,
     options?: {
-      selectedPattern?: string;
-      selectedScope?: string;
       decisionContext?: string;
       emissionContext?: {
         source?: ConfirmationStateChangedEvent["source"];
@@ -1937,8 +2592,6 @@ export class Conversation {
     const toolUseId = this.prompter.getToolUseId(requestId);
 
     this.prompter.resolveConfirmation(requestId, decision, {
-      selectedPattern: options?.selectedPattern,
-      selectedScope: options?.selectedScope,
       decisionContext: options?.decisionContext,
     });
 
@@ -1967,20 +2620,16 @@ export class Conversation {
     });
 
     // Sync the gateway request status so stale "pending" records don't get
-    // matched by later guardian reply routing. Fire-and-forget: this method
-    // is sync with many callers (HTTP handlers, /v1/confirm, channel
-    // bridges), the in-memory resolution above is authoritative, and a CAS
-    // miss (the decision primitive already resolved it, e.g. the channel
-    // approval path) is expected and harmless.
-    void decideGuardianRequest({
-      id: requestId,
-      expectedStatus: "pending",
+    // matched by later guardian reply routing, and withdraw the request's
+    // approval cards when this sync is the write that landed. Fire-and-forget:
+    // this method is sync with many callers (HTTP handlers, /v1/confirm,
+    // channel bridges), the in-memory resolution above is authoritative, and
+    // a CAS miss (the decision primitive already resolved it and withdrew the
+    // cards itself, e.g. the channel approval path) is expected and harmless.
+    void syncTerminalGuardianRequestStatus({
+      requestId,
       status: resolvedState,
-    }).catch((err) => {
-      log.warn(
-        { err, requestId },
-        "Post-confirmation guardian request status sync failed",
-      );
+      syncContext: "post-confirmation",
     });
   }
 
@@ -2309,6 +2958,20 @@ export class Conversation {
   }
 
   /**
+   * Trim this conversation's aged camera frames out of a history about to be
+   * sent to a provider, keeping only the newest few as real images.
+   *
+   * Thin binding of {@link applySightFrameRetention} to the conversation's own
+   * id, for the send paths that hold the instance rather than a turn context:
+   * the compaction pipeline's summarizer input, and the wake, which sends its
+   * run input itself. Best-effort inside, so a failed row read degrades to the
+   * untrimmed history.
+   */
+  trimAgedSightFrames(messages: Message[]): Message[] {
+    return applySightFrameRetention(messages, this.conversationId);
+  }
+
+  /**
    * Auto-threshold compaction gate. Runs the same durable compaction
    * pipeline as {@link forceCompact} (summary call, circuit-breaker
    * accounting, Slack provenance, in-memory + DB commit) but honors the
@@ -2407,8 +3070,16 @@ export class Conversation {
             },
           )
         : null;
-    const messagesToCompact =
-      slackChronologicalContext?.messages ?? this.messages;
+    // Trim aged camera frames out of the summarizer's own input. Compaction
+    // sends this array to a provider like any other request, so a long camera
+    // session would otherwise put every frame it ever captured into the summary
+    // call, which is the payload-size and many-image rejection retention exists
+    // to prevent. Safe against the caller-fixed boundary below: the pass
+    // replaces blocks inside messages and never adds, drops, or reorders one,
+    // so `fixedTailStartIndex` still names the same message.
+    const messagesToCompact = this.trimAgedSightFrames(
+      slackChronologicalContext?.messages ?? this.messages,
+    );
     const compactedRowCountAtCall = this.contextCompactedMessageCount;
     let result = await defaultCompact({
       conversationId: this.conversationId,
@@ -2503,9 +3174,13 @@ export class Conversation {
       this.messages,
     );
     const stripped = stripInjectionsForCompaction(this.messages);
+    // The marker is what keeps `loadFromDb` from rehydrating the stripped
+    // blocks, so it lands before the ledgers reset (a reset without it would
+    // let a restart rehydrate blocks the ledgers no longer claim); a failed
+    // write surfaces as the command's error with nothing changed.
+    setConversationHistoryStrippedAt(this.conversationId, Date.now());
     this.messages = stripped;
     await this.graphMemory.onCompacted(0);
-    setConversationHistoryStrippedAt(this.conversationId, Date.now());
     const estimatedInputTokens = await this.calculateTokens(this.messages);
     return {
       previousEstimatedInputTokens,
@@ -2595,11 +3270,7 @@ export class Conversation {
    * correctly. Returns `undefined` when no actor identity is known.
    */
   getTurnActorPrincipalId(): string | undefined {
-    return (
-      this.currentTurnSourceActorPrincipalId ??
-      this.currentTurnAuthContext?.actorPrincipalId ??
-      this.authContext?.actorPrincipalId
-    );
+    return turnActorPrincipalId(this);
   }
 
   setVoiceCallControlPrompt(prompt: string | null): void {

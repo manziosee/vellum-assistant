@@ -11,8 +11,12 @@
 import type {
   ChannelDeliveryResult,
   ChannelReplyPayload,
-  SlackStreamOp,
+  StreamOp,
 } from "@vellumai/gateway-client";
+import {
+  classifyReactionEmojiSpelling,
+  type ReactionEmojiIdentity,
+} from "@vellumai/service-contracts/reactions";
 
 import { a2aTransport } from "./a2a/transport.js";
 import type { DirectDeliveryChannel } from "./callback-routing.js";
@@ -22,6 +26,7 @@ import type {
   CallbackContext,
   ChannelTransport,
   EditTarget,
+  ReactionTarget,
 } from "./channel-transport.js";
 import { discordTransport } from "./discord/transport.js";
 import { slackTransport } from "./slack/transport.js";
@@ -49,6 +54,60 @@ export function getTransportForCallback(
 ): ChannelTransport | undefined {
   const channel = channelForCallback(callbackUrl);
   return channel ? TRANSPORTS[channel] : undefined;
+}
+
+/**
+ * Resolve a channel's transport by its id, or `undefined` for a channel with
+ * no direct transport. A plugin channel resolves to `undefined` until plugin
+ * outbound exists, so capability probes over this read as "not yet" rather
+ * than throwing on an unknown id.
+ */
+export function getTransportForChannel(
+  channel: string | undefined,
+): ChannelTransport | undefined {
+  return channel && channel in TRANSPORTS
+    ? TRANSPORTS[channel as DirectDeliveryChannel]
+    : undefined;
+}
+
+/**
+ * Whether this channel can add or remove the assistant's own emoji
+ * reactions. Asks the transport rather than the channel id, so a channel
+ * that gains the method starts being offered without a caller being told.
+ */
+export function supportsChannelReaction(channel: string | undefined): boolean {
+  return getTransportForChannel(channel)?.react !== undefined;
+}
+
+/**
+ * What an emoji spelling the assistant reacts with means on a channel, as
+ * the channel's adapter states it; a channel without an adapter opinion has
+ * the spelling classified by the contract's grammar.
+ */
+export function describeChannelReactionEmoji(
+  channel: string,
+  emoji: string,
+): ReactionEmojiIdentity {
+  const describe = getTransportForChannel(channel)?.describeReactionEmoji;
+  return describe ? describe(emoji) : classifyReactionEmojiSpelling(emoji);
+}
+
+/**
+ * Add or remove one of the assistant's own emoji reactions on a message.
+ *
+ * Resolves to nothing when the channel cannot react; the tool surface gates
+ * on `supportsChannelReaction`, so reaching this without the capability is a
+ * caller that skipped the gate, not a user-visible failure.
+ */
+export async function sendChannelReaction(
+  channel: string,
+  target: ReactionTarget,
+): Promise<ChannelDeliveryResult> {
+  const transport = getTransportForChannel(channel);
+  if (!transport?.react) {
+    return { ok: true };
+  }
+  return transport.react(target);
 }
 
 /**
@@ -117,7 +176,7 @@ export async function editChannelMessage(
 export async function sendChannelStreamOp(
   callbackUrl: string,
   chatId: string,
-  op: SlackStreamOp,
+  op: StreamOp,
 ): Promise<ChannelDeliveryResult> {
   const transport = getTransportForCallback(callbackUrl);
   if (!transport?.streamReply) {

@@ -1,3 +1,4 @@
+import { eventRefersToAnotherMessage } from "../../channels/inbound-event.js";
 import { buildTelegramTransportMetadata } from "../../channels/transport-hints.js";
 import type { ConfigFileCache } from "../../config-file-cache.js";
 import type { GatewayConfig } from "../../config.js";
@@ -9,7 +10,6 @@ import { DedupCache } from "../../dedup-cache.js";
 import { ContentMismatchError } from "../../download-validation.js";
 import {
   appendFailedAttachmentNotice,
-  AttachmentTooLargeError,
   ingestAttachments,
 } from "../../attachments/ingest.js";
 import { handleInbound } from "../../handlers/handle-inbound.js";
@@ -26,8 +26,13 @@ import {
   uploadAttachment,
 } from "../../runtime/client.js";
 import { callTelegramApi } from "../../telegram/api.js";
+import { createTelegramBotIdentityResolver } from "../../telegram/bot-identity.js";
 import { downloadTelegramFile } from "../../telegram/download.js";
-import { normalizeTelegramUpdate } from "../../telegram/normalize.js";
+import { createTelegramDropLog } from "../../telegram/drop-log.js";
+import {
+  normalizeTelegramUpdate,
+  telegramUpdateChatType,
+} from "../../telegram/normalize.js";
 import { sendTelegramReply } from "../../telegram/send.js";
 import { verifyWebhookSecret } from "../../telegram/verify.js";
 import {
@@ -61,6 +66,8 @@ export function createTelegramWebhookHandler(
   caches?: { credentials?: CredentialCache; configFile?: ConfigFileCache },
 ) {
   const dedupCache = new DedupCache();
+  const dropLog = createTelegramDropLog();
+  const resolveBotIdentity = createTelegramBotIdentityResolver(caches);
 
   const handler = async (req: Request): Promise<Response> => {
     const traceId = req.headers.get("x-trace-id") ?? undefined;
@@ -119,8 +126,13 @@ export function createTelegramWebhookHandler(
     // are blocked even while the first request is still processing.
     const updateId =
       typeof payload.update_id === "number" ? payload.update_id : undefined;
+    let reservedGeneration = dedupCache.currentGeneration;
     if (updateId !== undefined) {
       const status = dedupCache.reserve(updateId);
+      // Captured with the reservation so finalizing can tell whether the bot
+      // changed while this update was in flight. Read off the entry it would
+      // be lost, since a reset clears the map.
+      reservedGeneration = dedupCache.currentGeneration;
       if (status !== "reserved") {
         if (status === "already_processed") {
           // High-water mark rejection — this update_id was fully processed
@@ -163,7 +175,7 @@ export function createTelegramWebhookHandler(
     const respond = (body: Record<string, unknown>, status = 200): Response => {
       const json = JSON.stringify(body);
       if (updateId !== undefined) {
-        dedupCache.set(updateId, json, status);
+        dedupCache.set(updateId, json, status, reservedGeneration);
       }
       return new Response(json, {
         status,
@@ -277,9 +289,41 @@ export function createTelegramWebhookHandler(
       return callbackData.startsWith("apr:");
     };
 
-    // Normalize the update
-    const normalized = normalizeTelegramUpdate(payload);
-    if (!normalized) {
+    // Normalize the update. The bot's own identity is what lets the
+    // admission gate recognise a room message that addresses it, so it is
+    // resolved only for the chat kinds the gate admits on a mention; a
+    // private chat, a channel post, or a malformed update never needs it.
+    // Cached per token, it costs a call only on the first room update after
+    // start or a token rotation.
+    const chatType = telegramUpdateChatType(payload);
+    const bot =
+      chatType === "group" || chatType === "supergroup"
+        ? await resolveBotIdentity()
+        : undefined;
+    const normalization = normalizeTelegramUpdate(payload, { bot });
+    if (normalization.dropped) {
+      // Telegram sees a 200 either way, so this line is the only place the
+      // drop exists. Severity splits by reason and volume is capped at the
+      // first drop per reason and chat; see `telegram/drop-log.ts`.
+      const fields = {
+        updateId,
+        reason: normalization.reason,
+        chatType: normalization.chatType,
+        chatId: normalization.chatId,
+      };
+      const level = dropLog.levelFor(
+        normalization.reason,
+        normalization.chatId,
+      );
+      if (level === "info") {
+        tlog.info(
+          fields,
+          "Telegram update dropped before forwarding. Further drops for " +
+            "this reason and chat log at debug.",
+        );
+      } else {
+        tlog.debug(fields, "Telegram update dropped before forwarding");
+      }
       // If the dropped update was a callback query, acknowledge it so the
       // Telegram button spinner clears (e.g. non-DM callback queries).
       const cbqId =
@@ -291,6 +335,7 @@ export function createTelegramWebhookHandler(
       acknowledgeCallbackQuery(cbqId, "dropped_update");
       return respond({ ok: true });
     }
+    const normalized = normalization.event;
 
     tlog.info(
       {
@@ -303,11 +348,12 @@ export function createTelegramWebhookHandler(
       "Webhook received",
     );
 
-    // Private-chat topic scoping: when the inbound message belongs to a topic,
-    // the reply callback URL carries the thread id (the Telegram analog of
-    // Slack's `?threadTs=`) so the runtime's transport echoes it on outbound
-    // sends, and the gateway's own direct replies target the same topic.
-    // Messages outside a topic keep the bare URL and thread-less sends.
+    // Topic scoping: when the inbound message belongs to a topic (a private
+    // chat's or a forum supergroup's), the reply callback URL carries the
+    // thread id (the Telegram analog of Slack's `?threadTs=`) so the
+    // runtime's transport echoes it on outbound sends, and the gateway's own
+    // direct replies target the same topic. Messages outside a topic keep the
+    // bare URL and thread-less sends.
     const topicThreadId = normalized.source.threadId;
     const threadOpts = topicThreadId
       ? { messageThreadId: topicThreadId }
@@ -475,7 +521,8 @@ export function createTelegramWebhookHandler(
             normalized.message.callbackQueryId,
             "start_command_circuit_open",
           );
-          if (updateId !== undefined) dedupCache.unreserve(updateId);
+          if (updateId !== undefined)
+            dedupCache.unreserve(updateId, reservedGeneration);
           return Response.json(
             { error: SERVICE_UNAVAILABLE_ERROR },
             {
@@ -566,7 +613,6 @@ export function createTelegramWebhookHandler(
       return respond({ ok: true });
     }
 
-    const isEdit = !!normalized.message.isEdit;
     const isCallback = !!normalized.message.callbackQueryId;
 
     // Check routing early so we can gate attachments
@@ -578,16 +624,15 @@ export function createTelegramWebhookHandler(
     );
     const routable = !isRejection(routing);
 
-    // Download and upload attachments if present (skip for edits and callback
-    // queries — edits only update text, callbacks have no media to process)
+    // Download and upload attachments if present. An event that refers to
+    // another message (edit, button press) carries no media of its own.
     let attachmentIds: string[] | undefined;
     const eventAttachments = normalized.message.attachments;
     if (
       eventAttachments &&
       eventAttachments.length > 0 &&
       routable &&
-      !isEdit &&
-      !isCallback
+      !eventRefersToAnotherMessage(normalized.message)
     ) {
       try {
         const result = await ingestAttachments(
@@ -614,15 +659,14 @@ export function createTelegramWebhookHandler(
               mode: "rethrow-unless-skippable",
               isSkippableError: (error) =>
                 error instanceof AttachmentValidationError ||
-                error instanceof ContentMismatchError ||
-                error instanceof AttachmentTooLargeError,
+                error instanceof ContentMismatchError,
             },
           },
         );
         attachmentIds = result.attachmentIds;
         normalized.message.content = appendFailedAttachmentNotice(
           normalized.message.content,
-          result.failedAttachmentNames,
+          result,
         );
       } catch (err) {
         // Transient attachment failure — return 500 so Telegram retries.
@@ -632,7 +676,8 @@ export function createTelegramWebhookHandler(
           { err },
           "Attachment processing failed with transient error",
         );
-        if (updateId !== undefined) dedupCache.unreserve(updateId);
+        if (updateId !== undefined)
+          dedupCache.unreserve(updateId, reservedGeneration);
         return Response.json(
           { error: "Attachment processing failed" },
           { status: 500 },
@@ -692,7 +737,8 @@ export function createTelegramWebhookHandler(
             normalized.message.callbackQueryId,
             "forward_not_forwarded",
           );
-        if (updateId !== undefined) dedupCache.unreserve(updateId);
+        if (updateId !== undefined)
+          dedupCache.unreserve(updateId, reservedGeneration);
         return Response.json({ error: "Internal error" }, { status: 500 });
       }
 
@@ -762,7 +808,8 @@ export function createTelegramWebhookHandler(
             normalized.message.callbackQueryId,
             "circuit_open",
           );
-        if (updateId !== undefined) dedupCache.unreserve(updateId);
+        if (updateId !== undefined)
+          dedupCache.unreserve(updateId, reservedGeneration);
         return Response.json(
           { error: SERVICE_UNAVAILABLE_ERROR },
           {
@@ -780,7 +827,8 @@ export function createTelegramWebhookHandler(
           normalized.message.callbackQueryId,
           "forward_exception",
         );
-      if (updateId !== undefined) dedupCache.unreserve(updateId);
+      if (updateId !== undefined)
+        dedupCache.unreserve(updateId, reservedGeneration);
       return Response.json({ error: "Internal error" }, { status: 500 });
     }
 

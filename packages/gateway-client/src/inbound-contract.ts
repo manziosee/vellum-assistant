@@ -10,7 +10,10 @@
  * it in `handleChannelInbound()`.
  */
 
+import { INBOUND_EVENT_KINDS } from "./inbound-event-kind.js";
 import { z } from "zod";
+
+import { ReactionEmojiFieldsSchema } from "@vellumai/service-contracts/reactions";
 
 import { ChannelConversationTypeSchema } from "./channel-permission-contract.js";
 
@@ -80,8 +83,20 @@ export const SourceMetadataSchema = z
     clientTimezone: z.string().optional(),
     /** Channel command intent (e.g. Telegram /start). */
     commandIntent: CommandIntentSchema.optional(),
-    /** Slack-specific: whether the bot was @-mentioned. */
-    slackBotMentioned: z.boolean().optional(),
+    /**
+     * Whether the message addresses the assistant by name, an @-mention on
+     * the platforms that have one. Stated by the channel's normalizer only
+     * where it proved the answer; absent means "not established". Read to
+     * decide whether a reply is expected before any text exists, never to
+     * admit or deny: admission is the gate's job, upstream of this.
+     */
+    botMentioned: z.boolean().optional(),
+    /**
+     * Slack-specific: the `edited.ts` float-string from a `message_changed`
+     * event. Used by the daemon to reject out-of-order edit deliveries whose
+     * edit timestamp is older than the one already stored.
+     */
+    slackEditedTs: z.string().optional(),
     /** Slack workspace/team ID. */
     account: z.string().optional(),
     /**
@@ -138,6 +153,11 @@ export const SourceMetadataSchema = z
      * "not provided", never as a decision.
      */
     trustVerdict: TrustVerdictSchema.optional(),
+    /**
+     * The platform named no actor for this event; the actor id is the
+     * channel's synthetic system identity, never an identity claim.
+     */
+    actorUnattributed: z.boolean().optional(),
 
     // Email-specific fields
     /**
@@ -168,6 +188,19 @@ export const RuntimeInboundPayloadSchema = z.object({
   conversationExternalId: z.string(),
   externalMessageId: z.string(),
   content: z.string(),
+  /** The named event family; absent only on replayed retry payloads,
+   *  where resolveInboundEventKind derives it from the legacy fields. */
+  eventKind: z.enum(INBOUND_EVENT_KINDS).optional(),
+  /** Structured reaction payload; replayed retry payloads carry the
+   *  callbackData string form resolveInboundReactionPayload reads. */
+  reaction: z
+    .object({
+      op: z.enum(["added", "removed"]),
+      emoji: z.string(),
+      ...ReactionEmojiFieldsSchema.shape,
+      targetMessageId: z.string(),
+    })
+    .optional(),
   isEdit: z.boolean().optional(),
   callbackQueryId: z.string().optional(),
   callbackData: z.string().optional(),

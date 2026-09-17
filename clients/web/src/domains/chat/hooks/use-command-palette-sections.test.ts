@@ -65,6 +65,21 @@ describe("buildActionsSection", () => {
     ]);
     expect(section.items[4]!.title).toBe("Assistants");
   });
+
+  test("places each hint on its own action and omits the rest", () => {
+    const section = buildActionsSection("Assistants", {
+      newConversation: "CmdOrCtrl+N",
+      openSettings: "CmdOrCtrl+,",
+    });
+    const hints = Object.fromEntries(
+      section.items.map((item) => [item.id, item.shortcut]),
+    );
+    expect(hints["action-new-conversation"]).toBe("CmdOrCtrl+N");
+    expect(hints["action-settings"]).toBe("CmdOrCtrl+,");
+    // Absent on this host, so the row shows none rather than a stale default.
+    expect(hints["action-current-conversation"]).toBeUndefined();
+    expect(hints["action-library"]).toBeUndefined();
+  });
 });
 
 describe("buildServerResultSections", () => {
@@ -139,6 +154,25 @@ describe("buildServerResultSections", () => {
       (i) => i.id === "search-conv-c3",
     );
     expect(nullTitleItem!.title).toBe("Untitled");
+  });
+
+  test("does not sniff a generating title string without titleState", () => {
+    const generatingResults: GlobalSearchResponse = {
+      conversations: [
+        {
+          id: "c-generating",
+          title: "Generating title...",
+          updatedAt: 1,
+          excerpt: "",
+          matchCount: 0,
+        },
+      ],
+      memories: [],
+      schedules: [],
+      contacts: [],
+    };
+    const sections = buildServerResultSections(generatingResults, new Set());
+    expect(sections[0]!.items[0]!.title).toBe("Generating title...");
   });
 
   test("uses contact display name as title and notes as subtitle", () => {

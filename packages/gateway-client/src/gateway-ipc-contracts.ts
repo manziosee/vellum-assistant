@@ -5,6 +5,8 @@
 import { CHANNEL_IDS } from "@vellumai/service-contracts/channels";
 import { z } from "zod";
 
+import { RiskThresholdSchema } from "./channel-permission-contract.js";
+
 export const GATEWAY_LOG_LEVEL_NAMES = [
   "trace",
   "debug",
@@ -275,6 +277,11 @@ export const ContactReadSchema = z.object({
   contactType: z.string().nullable().optional(),
   lastInteraction: z.number().nullable().optional(),
   interactionCount: z.number().nullable(),
+  /**
+   * Per-contact auto-approve ceiling. Null when unset (inherit cascade).
+   * Optional on the wire for version skew; gateway reads always emit it.
+   */
+  autoApproveThreshold: RiskThresholdSchema.nullable().optional(),
   createdAt: z.number(),
   updatedAt: z.number(),
   channels: z.array(ContactReadChannelSchema),
@@ -348,6 +355,124 @@ export type GetGuardianContactIpcResponse = z.infer<
   typeof GetGuardianContactIpcResponseSchema
 >;
 
+// ── contacts_identity_snapshot ───────────────────────────────────────────────
+// Lean identity projection of every gateway contact + channel, for the
+// daemon's mirror reconciler: enough to converge the assistant identity
+// mirror onto gateway truth (ids, ownership, addresses), nothing more. No
+// ACL columns (the mirror never carries them) and no assistant-info join
+// (the daemon IS the assistant), so the read is uncapped and cheap.
+
+export const ContactsIdentitySnapshotIpcParamsSchema = z
+  .object({})
+  .strict()
+  .default({});
+
+export type ContactsIdentitySnapshotIpcParams = z.infer<
+  typeof ContactsIdentitySnapshotIpcParamsSchema
+>;
+
+export const ContactIdentityChannelSchema = z.object({
+  id: z.string(),
+  contactId: z.string(),
+  type: z.string(),
+  address: z.string(),
+  externalChatId: z.string().nullable(),
+  isPrimary: z.boolean(),
+});
+
+export type ContactIdentityChannel = z.infer<
+  typeof ContactIdentityChannelSchema
+>;
+
+export const ContactIdentitySchema = z.object({
+  id: z.string(),
+  displayName: z.string(),
+  channels: z.array(ContactIdentityChannelSchema),
+});
+
+export type ContactIdentity = z.infer<typeof ContactIdentitySchema>;
+
+export const ContactsIdentitySnapshotIpcResponseSchema = z.object({
+  ok: z.boolean(),
+  contacts: z.array(ContactIdentitySchema),
+});
+
+export type ContactsIdentitySnapshotIpcResponse = z.infer<
+  typeof ContactsIdentitySnapshotIpcResponseSchema
+>;
+
+// ── webhook ingress routes ───────────────────────────────────────────────────
+// The gateway owns the registry of subpaths this assistant answers from
+// outside; the daemon claims, drops, and inspects them over IPC. Both sides
+// read these schemas so a change to the stored row has to travel through the
+// contract.
+
+/**
+ * Feature flag gating the whole webhook ingress registry. The gateway reads it
+ * to decide whether to accept a claim and how to advertise its allowed paths,
+ * and the daemon reads it to decide whether to claim at all, so both sides have
+ * to name the same key.
+ */
+export const WebhookIngressRouteSchema = z.object({
+  path: z.string(),
+  type: z.string(),
+  source: z.string().nullable(),
+  match: z.literal("exact"),
+  createdAt: z.number(),
+  lastRegisteredAt: z.number(),
+});
+
+export type WebhookIngressRoute = z.infer<typeof WebhookIngressRouteSchema>;
+
+export const RegisterWebhookRouteIpcParamsSchema = z.object({
+  /** Exact subpath, leading slash included, under `/webhooks/`. */
+  path: z.string().min(1),
+  type: z.string().min(1),
+  source: z.string().nullish(),
+});
+
+export type RegisterWebhookRouteIpcParams = z.infer<
+  typeof RegisterWebhookRouteIpcParamsSchema
+>;
+
+/**
+ * A refusal is a normal result rather than an error: the daemon reads
+ * `disabled` as "this assistant is not serving its own webhooks" and falls
+ * back to the platform's callback routes.
+ */
+export const RegisterWebhookRouteIpcResponseSchema = z.union([
+  z.object({ disabled: z.literal(true) }),
+  z.object({ disabled: z.literal(false), route: WebhookIngressRouteSchema }),
+]);
+
+export type RegisterWebhookRouteIpcResponse = z.infer<
+  typeof RegisterWebhookRouteIpcResponseSchema
+>;
+
+export const UnregisterWebhookRouteIpcParamsSchema = z.object({
+  path: z.string().min(1),
+});
+
+export type UnregisterWebhookRouteIpcParams = z.infer<
+  typeof UnregisterWebhookRouteIpcParamsSchema
+>;
+
+export const UnregisterWebhookRouteIpcResponseSchema = z.object({
+  removed: z.boolean(),
+});
+
+export type UnregisterWebhookRouteIpcResponse = z.infer<
+  typeof UnregisterWebhookRouteIpcResponseSchema
+>;
+
+export const ListWebhookRoutesIpcResponseSchema = z.object({
+  routes: z.array(WebhookIngressRouteSchema),
+});
+
+export type ListWebhookRoutesIpcResponse = z.infer<
+  typeof ListWebhookRoutesIpcResponseSchema
+>;
+
 // ── classify_risk ────────────────────────────────────────────────────────────
 // Risk classification is gateway-owned; the assistant sends one request per
 // tool invocation and reads the whole answer back. The gateway validates the
@@ -401,6 +526,8 @@ export type ClassifyRiskSkillMetadata = z.infer<
 export const ClassifyRiskIpcParamsSchema = z.object({
   tool: z.string().min(1),
   command: z.string().optional(),
+  /** Shell grammar used by host_bash on the target desktop. */
+  shell: z.enum(["bash", "powershell"]).optional(),
   url: z.string().optional(),
   path: z.string().optional(),
   /**
@@ -554,4 +681,25 @@ export const ChannelSocketHealthIpcResponseSchema = z.object({
 
 export type ChannelSocketHealthIpcResponse = z.infer<
   typeof ChannelSocketHealthIpcResponseSchema
+>;
+
+/**
+ * Whether Discord admits anything in the guilds it has joined.
+ *
+ * Discord's allow-list is fail-closed and lives in gateway-owned config: an
+ * absent or empty setting admits nothing, because being invited to a guild is
+ * not consent to every channel in it. The daemon owns the readiness surface
+ * that reports this, so the count has to cross the boundary, the same way a
+ * socket's liveness does.
+ *
+ * Discord-shaped rather than channel-keyed, because Discord is the only
+ * channel with an allow-list. A second one generalizes this.
+ */
+export const DiscordAdmissionIpcResponseSchema = z.object({
+  /** How many channel ids the bot may act in. Zero admits no guild message. */
+  admittedChannelCount: z.number().int().nonnegative(),
+});
+
+export type DiscordAdmissionIpcResponse = z.infer<
+  typeof DiscordAdmissionIpcResponseSchema
 >;

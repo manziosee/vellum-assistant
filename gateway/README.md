@@ -48,6 +48,8 @@ Routing is configured via workspace config. See `ARCHITECTURE.md` for details.
 
 Webhook registration is now handled automatically by the gateway. On startup, the gateway reconciles the Telegram webhook by registering it at `${ingress.publicBaseUrl}/webhooks/telegram` with the configured secret and allowed updates. This also runs whenever the credential watcher detects changes to the bot token or webhook secret (e.g., secret rotation). If the ingress URL changes (e.g., tunnel restart), the config file watcher detects the change and triggers webhook reconciliation directly — no daemon involvement or gateway restart is needed.
 
+A managed platform pod owns no ingress of its own, so with the `velay-webhooks` flag off it registers a Django-hosted callback route instead of using an ingress URL. With the flag on, a pod claims `/webhooks/telegram` in the webhook ingress route registry and registers its published Velay URL, keeping the Django callback route as the fallback; flipping the flag re-runs the reconcile in either direction. See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full resolution order.
+
 For manual setup (or reference), register the webhook with Telegram using the `setWebhook` API method. Pass:
 
 - `url` — your gateway URL, e.g. `https://your-host/webhooks/telegram`
@@ -104,7 +106,7 @@ The gateway normalizes Telegram `callback_query` updates (inline button clicks) 
 
 These fields are forwarded to the runtime in the `/channels/inbound` payload alongside the standard `conversationExternalId`, `externalMessageId`, and actor metadata. The runtime uses `callbackData` to route the click to the appropriate approval handler.
 
-**Normalization constraints:** Only DM-only (`private` chat type) callback queries are processed. Group and channel callbacks are dropped and acknowledged with `answerCallbackQuery` so the Telegram button spinner clears. Callback queries with no `data` field or no associated `message` are also dropped.
+**Normalization constraints:** Callback queries from private chats, groups, and supergroups are processed; a tap on a keyboard the bot posted is addressed to the bot by construction, and who may press it is the runtime's decision. Callbacks from broadcast channels are dropped and acknowledged with `answerCallbackQuery` so the Telegram button spinner clears. Callback queries with no `data` field or no associated `message` are also dropped. Every drop is logged with its reason before the update is acknowledged (`telegram/drop-log.ts`).
 
 **Stale callback blocking:** When the runtime receives `callbackData` that does not match any pending approval (e.g., a button from an old prompt), it returns `stale_ignored` and does not process the payload as a regular message. This is enforced regardless of whether the callback has non-empty content. The gateway sends a best-effort `answerCallbackQuery` acknowledgment for normalized callback updates (including stale, rejected, and forward-failure paths) so the button spinner clears promptly. Transient forwarding failures may still return `500` so Telegram retries update delivery.
 
@@ -171,6 +173,16 @@ Control-plane routes are listed with their flat paths. Clients emit assistant-sc
 | `/healthz`                                            | GET             | Liveness probe                                                                                                                                |
 | `/readyz`                                             | GET             | Readiness probe                                                                                                                               |
 | `/schema`                                             | GET             | Returns the OpenAPI 3.1 schema for this gateway                                                                                               |
+
+### Webhook Ingress Route Registry
+
+Which of the `/webhooks/*` routes above an assistant actually answers through the Velay tunnel is a per-assistant allowlist, gated on the `velay-webhooks` feature flag. With the flag off the whole namespace is reachable, as it always was; with it on an assistant answers exactly the paths it has claimed.
+
+Three layers admit a request, each narrower than the last: Velay drops anything matching none of the RE2 rules the gateway advertises on the tunnel upgrade, the gateway's Velay bridge re-checks the registry as the frame arrives, and the route itself runs its own authentication (Telegram's `secret_token`, Twilio's signature, a plugin webhook's token).
+
+Claims are rows in `webhook_ingress_routes` in `gateway.sqlite`, which lives in `GATEWAY_SECURITY_DIR` and therefore survives a pod restart. The daemon claims over IPC for plugin webhooks; the gateway claims in-process for Telegram and Twilio. A claim that is unavailable, because the flag is off, no tunnel URL is published, or the write failed, falls back to registering a Django-hosted callback route, which is also the flag-off path. A new claim triggers a debounced tunnel reconnect so the edge rules catch up, so a path is always claimed before its URL is given to a provider.
+
+The `/webhooks/twilio/` subtree is still admitted by a static prefix rule, because the media-stream path carries per-call segments an exact-match row cannot express. See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full lifecycle.
 
 ### Tunnel Setup
 

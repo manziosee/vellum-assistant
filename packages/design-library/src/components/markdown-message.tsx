@@ -2,7 +2,9 @@ import { Check, Copy } from "lucide-react";
 import {
   type AnchorHTMLAttributes,
   Children,
+  type ClipboardEvent,
   isValidElement,
+  memo,
   type ReactNode,
   useCallback,
   useEffect,
@@ -11,15 +13,85 @@ import {
   useState,
 } from "react";
 import ReactMarkdown from "react-markdown";
-import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import remarkParse from "remark-parse";
 import { unified } from "unified";
 import type { Components } from "react-markdown";
-import "katex/dist/katex.min.css";
+import type { Pluggable, PluggableList } from "unified";
 
+import { asyncOnce } from "../utils/async-once";
 import { cn } from "../utils/cn";
+import {
+  splitMarkdownBlocks,
+  type MarkdownBlockSplit,
+} from "../utils/markdown-blocks";
+import { writeSelectionClipboard } from "../utils/selection-clipboard";
+
+type RehypeKatexPlugin = typeof import("rehype-katex").default;
+
+/**
+ * KaTeX (the rehype plugin, the katex renderer it pulls in, and the
+ * stylesheet, ~445 kB raw) loads on demand: markdown renders on the boot
+ * path, and most messages carry no math. Cached at module level so the page
+ * pays the load once, and so a synchronous render (renderToStaticMarkup,
+ * and any tree already warmed by {@link preloadMarkdownMath}) can pick the
+ * plugin up via `peek()` without an effect. A failed chunk load is not
+ * cached (see {@link asyncOnce}), so the next math-bearing mount or preload
+ * call invokes import() again. Whether that reaches the network is
+ * engine-dependent while whatwg/html#10327 rolls out: new-model engines
+ * evict failed fetches from the module map and refetch, old-model engines
+ * return the cached failure, where math stays raw TeX until reload.
+ */
+const rehypeKatexOnce = asyncOnce<RehypeKatexPlugin>(async () => {
+  const [mod] = await Promise.all([
+    import("rehype-katex"),
+    // Vite turns this into an on-demand stylesheet chunk alongside the JS.
+    import("katex/dist/katex.min.css"),
+  ]);
+  return mod.default;
+});
+
+/**
+ * Warms the math pipeline. Await it before rendering when math output must be
+ * present synchronously: server/static rendering, or a surface that knows
+ * its content is math-heavy and wants to skip the raw-TeX flash.
+ */
+export function preloadMarkdownMath(): Promise<void> {
+  return rehypeKatexOnce.load().then(() => undefined);
+}
+
+/**
+ * The KaTeX plugin once `needed` and loaded, else null (math renders as raw
+ * TeX text until the chunk arrives, then formats on the re-render).
+ */
+function useRehypeKatex(needed: boolean): RehypeKatexPlugin | null {
+  const [plugin, setPlugin] = useState<RehypeKatexPlugin | null>(() =>
+    rehypeKatexOnce.peek(),
+  );
+  useEffect(() => {
+    if (!needed || plugin !== null) {
+      return;
+    }
+    let cancelled = false;
+    rehypeKatexOnce.load().then(
+      (loaded) => {
+        if (!cancelled) {
+          setPlugin(() => loaded);
+        }
+      },
+      () => {
+        // Math stays raw TeX on this mount. Deliberately no same-mount
+        // retry, which would loop while offline; the uncached failure means
+        // the next math-bearing mount attempts a fresh load.
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [needed, plugin]);
+  return needed ? plugin : null;
+}
 
 const MAX_CODE_BLOCK_HEIGHT = 400;
 
@@ -60,6 +132,7 @@ function CopyButton({
       onClick={onClick}
       title={copied ? "Copied!" : "Copy"}
       data-reveal=""
+      data-copy-control=""
       className="flex h-6 w-6 cursor-pointer items-center justify-center rounded-md bg-stone-200/80 text-[var(--content-tertiary)] hover:bg-stone-300 hover:text-[var(--content-secondary)] dark:bg-moss-600/80 dark:hover:bg-moss-500 dark:hover:text-stone-200"
     >
       <div className="relative h-3.5 w-3.5">
@@ -127,7 +200,10 @@ function CodeBlockWrapper({ children }: { children: ReactNode }) {
       className="relative mb-2 overflow-hidden rounded-md bg-stone-100 last:mb-0 dark:bg-moss-800"
     >
       {language && (
-        <div className="flex items-center justify-between px-3 pt-2">
+        <div
+          data-code-block-header=""
+          className="flex items-center justify-between px-3 pt-2"
+        >
           {/* typography: off-scale — monospace language label */}
           {}
           <span className="font-mono text-xs font-medium uppercase text-[var(--content-tertiary)]">
@@ -138,6 +214,7 @@ function CodeBlockWrapper({ children }: { children: ReactNode }) {
       )}
       <pre
         ref={preRef}
+        data-owns-horizontal-scroll=""
         className="overflow-auto p-3"
         style={{ maxHeight: MAX_CODE_BLOCK_HEIGHT }}
       >
@@ -365,7 +442,10 @@ function buildMarkdownComponents(
       </blockquote>
     ),
     table: ({ children }) => (
-      <div className="mb-2 overflow-x-auto last:mb-0">
+      <div
+        data-owns-horizontal-scroll=""
+        className="mb-2 overflow-x-auto last:mb-0"
+      >
         <table className="min-w-full border-collapse text-body-small-lighter">
           {children}
         </table>
@@ -899,6 +979,28 @@ function remarkPreserveOrderedListNumbers() {
   };
 }
 
+/**
+ * Replace the browser's `copy` payload for a selection that covers nothing
+ * but the rendered markdown. The browser's own HTML flavor inlines computed
+ * colors, background colors and font sizes (grey shading when pasted into
+ * Outlook, the message's own dark theme when pasted into Gmail) and its
+ * plain-text flavor is a flat dump with a blank line after every block. The
+ * replacement is semantic HTML plus markdown. See
+ * `buildSelectionClipboardPayload`.
+ *
+ * A selection that also covers content outside the message is left to the
+ * browser. See `selectionRangesWithin` for why a boundary node outside the
+ * message does not on its own mean the reader selected anything outside.
+ */
+function handleSelectionCopy(event: ClipboardEvent<HTMLDivElement>) {
+  if (
+    event.clipboardData &&
+    writeSelectionClipboard(event.clipboardData, event.currentTarget)
+  ) {
+    event.preventDefault();
+  }
+}
+
 export interface MarkdownMessageProps {
   content: string;
   className?: string;
@@ -956,6 +1058,88 @@ export interface MarkdownMessageProps {
   extraComponents?: Readonly<
     Record<string, import("react").ComponentType<never>>
   >;
+  /**
+   * Parse and render `content` one top-level block at a time, reusing every
+   * block whose text is unchanged. For a document that grows by appends while
+   * it is displayed (a streamed reply, a reasoning trace) this keeps the work
+   * per update proportional to the open tail instead of the whole document,
+   * which otherwise re-parses in full on every delta and grows quadratic.
+   *
+   * The rendered tree is the same as a single parse: blocks are cut only at
+   * blank lines outside fences (see `splitMarkdownBlocks`), and each renders
+   * as a fragment under the one wrapper, so margins and `first`/`last` rules
+   * see the same siblings. The one difference is that link reference
+   * definitions and footnotes resolve only within the block that defines them,
+   * so leave this off for settled content that may rely on them.
+   */
+  incremental?: boolean;
+}
+
+const REMARK_PLUGINS: PluggableList = [
+  remarkGfm,
+  remarkMath,
+  remarkPreserveOrderedListNumbers,
+  remarkDisplayMathBlocks,
+];
+
+interface MarkdownBlockProps {
+  content: string;
+  hardLineBreaks: boolean | undefined;
+  components: Components;
+  rehypePlugins: Pluggable[];
+  urlTransform: ((url: string) => string) | undefined;
+}
+
+/**
+ * One parse-and-render unit: the source rewrites and the react-markdown
+ * pipeline for a single string. Rendered through {@link MemoizedMarkdownBlock}
+ * so that, in incremental mode, a block whose text and pipeline are unchanged
+ * is skipped entirely, its parsed tree and React subtree both intact.
+ */
+function MarkdownBlock({
+  content,
+  hardLineBreaks,
+  components,
+  rehypePlugins,
+  urlTransform,
+}: MarkdownBlockProps) {
+  const processed = useMemo(() => {
+    const escaped = escapeCurrencyDollars(content);
+    const broken = hardLineBreaks ? hardBreakNewlines(escaped) : escaped;
+    // Last: currency escaping would otherwise read a converted `\(5\)` as an
+    // amount and escape the `$` it just introduced.
+    return convertLatexDelimiters(broken);
+  }, [content, hardLineBreaks]);
+  return (
+    <ReactMarkdown
+      remarkPlugins={REMARK_PLUGINS}
+      rehypePlugins={rehypePlugins}
+      components={components}
+      urlTransform={urlTransform}
+    >
+      {processed}
+    </ReactMarkdown>
+  );
+}
+
+const MemoizedMarkdownBlock = memo(MarkdownBlock);
+
+/**
+ * The blocks of `content` for incremental rendering, rescanning only the open
+ * tail when `content` extends what this instance last saw. Held per component
+ * instance so two messages never share or thrash one cache.
+ */
+function useIncrementalMarkdownBlocks(content: string): readonly string[] {
+  const splitRef = useRef<MarkdownBlockSplit | null>(null);
+  // Intentional render-phase ref usage: the split is a per-instance cache
+  // like `useMemo` with a prefix-aware equality, and it must fold in the
+  // current content on every render to hand back the settled blocks as the
+  // same strings.
+  /* eslint-disable react-hooks/refs -- per-instance incremental split cache (see above) */
+  const split = splitMarkdownBlocks(content, splitRef.current ?? undefined);
+  splitRef.current = split;
+  /* eslint-enable react-hooks/refs */
+  return split.blocks;
 }
 
 export function MarkdownMessage({
@@ -967,14 +1151,9 @@ export function MarkdownMessage({
   urlTransform,
   extraRehypePlugins,
   extraComponents,
+  incremental = false,
 }: MarkdownMessageProps) {
-  const processed = useMemo(() => {
-    const escaped = escapeCurrencyDollars(content);
-    const broken = hardLineBreaks ? hardBreakNewlines(escaped) : escaped;
-    // Last: currency escaping would otherwise read a converted `\(5\)` as an
-    // amount and escape the `$` it just introduced.
-    return convertLatexDelimiters(broken);
-  }, [content, hardLineBreaks]);
+  const blocks = useIncrementalMarkdownBlocks(incremental ? content : "");
   const Link = linkComponent ?? DefaultLink;
   const components = useMemo(
     () =>
@@ -986,28 +1165,51 @@ export function MarkdownMessage({
       }) as Components,
     [Link, imageComponent, extraComponents],
   );
+  // Loosest possible trigger on purpose: every construct remark-math can
+  // treat as math contains a dollar sign, or one of the `\(` / `\[` openers
+  // that `convertLatexDelimiters` rewrites to the `$` forms, so testing for
+  // those characters can over-load KaTeX but can never leave real math
+  // unformatted. Anything cleverer (e.g. skipping escaped `\$`) risks the
+  // reverse, and the only cost of a false positive is a lazy chunk load.
+  const needsMath =
+    content.includes("$") || content.includes("\\(") || content.includes("\\[");
+  const katexPlugin = useRehypeKatex(needsMath);
   const rehypePlugins = useMemo(
-    () => [rehypeKatex, ...(extraRehypePlugins ?? [])],
-    [extraRehypePlugins],
+    () => [
+      ...(katexPlugin === null ? [] : [katexPlugin]),
+      ...(extraRehypePlugins ?? []),
+    ],
+    [katexPlugin, extraRehypePlugins],
   );
   return (
     <div
       data-slot="markdown-message"
       className={cn("text-chat text-[var(--content-default)]", className)}
+      onCopy={handleSelectionCopy}
     >
-      <ReactMarkdown
-        remarkPlugins={[
-          remarkGfm,
-          remarkMath,
-          remarkPreserveOrderedListNumbers,
-          remarkDisplayMathBlocks,
-        ]}
-        rehypePlugins={rehypePlugins}
-        components={components}
-        urlTransform={urlTransform}
-      >
-        {processed}
-      </ReactMarkdown>
+      {incremental ? (
+        // Keyed by position: a settled block never moves, and when an append
+        // cuts the tail, the part that settles keeps its key while only the
+        // new tail mounts.
+        blocks.map((block, index) => (
+          <MemoizedMarkdownBlock
+            key={index}
+            content={block}
+            hardLineBreaks={hardLineBreaks}
+            components={components}
+            rehypePlugins={rehypePlugins}
+            urlTransform={urlTransform}
+          />
+        ))
+      ) : (
+        <MemoizedMarkdownBlock
+          content={content}
+          hardLineBreaks={hardLineBreaks}
+          components={components}
+          rehypePlugins={rehypePlugins}
+          urlTransform={urlTransform}
+        />
+      )}
     </div>
   );
 }

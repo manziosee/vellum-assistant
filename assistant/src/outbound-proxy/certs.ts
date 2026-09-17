@@ -2,6 +2,8 @@ import { X509Certificate } from "node:crypto";
 import { chmod, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
+import { writeCombinedCABundle } from "../util/ca-bundle.js";
+
 const CA_CERT_FILENAME = "ca.pem";
 const CA_KEY_FILENAME = "ca-key.pem";
 const COMBINED_CA_FILENAME = "combined-ca-bundle.pem";
@@ -49,6 +51,7 @@ export async function ensureLocalCA(dataDir: string): Promise<void> {
   const keyProc = Bun.spawn(["openssl", "genrsa", "-out", keyPath, "2048"], {
     stdout: "pipe",
     stderr: "pipe",
+    windowsHide: true,
   });
   const keyExit = await keyProc.exited;
   if (keyExit !== 0) {
@@ -76,7 +79,7 @@ export async function ensureLocalCA(dataDir: string): Promise<void> {
       "-addext",
       "keyUsage=critical,keyCertSign,cRLSign",
     ],
-    { stdout: "pipe", stderr: "pipe" },
+    { stdout: "pipe", stderr: "pipe", windowsHide: true },
   );
   const certExit = await certProc.exited;
   if (certExit !== 0) {
@@ -144,7 +147,7 @@ export async function issueLeafCert(
   // Generate leaf key
   const keyProc = Bun.spawn(
     ["openssl", "genrsa", "-out", leafKeyPath, "2048"],
-    { stdout: "pipe", stderr: "pipe" },
+    { stdout: "pipe", stderr: "pipe", windowsHide: true },
   );
   const keyExit = await keyProc.exited;
   if (keyExit !== 0) {
@@ -166,7 +169,7 @@ export async function issueLeafCert(
       "-subj",
       `/CN=${hostname}`,
     ],
-    { stdout: "pipe", stderr: "pipe" },
+    { stdout: "pipe", stderr: "pipe", windowsHide: true },
   );
   const csrExit = await csrProc.exited;
   if (csrExit !== 0) {
@@ -198,7 +201,7 @@ export async function issueLeafCert(
       "-extfile",
       extPath,
     ],
-    { stdout: "pipe", stderr: "pipe" },
+    { stdout: "pipe", stderr: "pipe", windowsHide: true },
   );
   const signExit = await signProc.exited;
   if (signExit !== 0) {
@@ -262,11 +265,7 @@ export async function ensureCombinedCABundle(
   }
 
   try {
-    const [systemCAs, proxyCACert] = await Promise.all([
-      readFile(systemBundlePath, "utf-8"),
-      readFile(caCertPath, "utf-8"),
-    ]);
-    await writeFile(combinedPath, systemCAs + "\n" + proxyCACert);
+    await writeCombinedCABundle(systemBundlePath, caCertPath, combinedPath);
     return combinedPath;
   } catch {
     return null;

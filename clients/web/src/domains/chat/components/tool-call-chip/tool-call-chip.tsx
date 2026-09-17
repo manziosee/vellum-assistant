@@ -24,10 +24,15 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import {
+  ACTIVITY_KEY,
+  readToolInputString,
+} from "@/domains/chat/utils/tool-input";
 import { useTranslation } from "@/i18n";
 
 import { Button } from "@vellumai/design-library";
 
+import { MidlineDot } from "@/components/midline-dot";
 import { AllowOptionsMenu } from "@/domains/chat/components/allow-options-menu";
 import { offersRuleOption } from "@/domains/chat/confirmation-decisions";
 import { useChatSessionStore } from "@/domains/chat/chat-session-store";
@@ -46,12 +51,12 @@ import {
 import type { ConfirmationDecision } from "@/types/event-types";
 import type {
   AllowlistOption,
-  DirectoryScopeOption,
   ScopeOption,
 } from "@/types/interaction-ui-types";
 import type { ChatMessageToolCall } from "@/domains/chat/api/event-types";
 import { copyToClipboard } from "@/lib/copy-to-clipboard";
 import { perceivedStartedAt } from "@/domains/chat/utils/tool-call-status";
+import { confirmationAsk } from "@/domains/chat/utils/confirmation-ask";
 import {
   extractInputSummary,
   friendlyRunningLabel,
@@ -68,7 +73,6 @@ export interface ToolCallChipProps {
     input: Record<string, unknown>;
     allowlistOptions: AllowlistOption[];
     scopeOptions: ScopeOption[];
-    directoryScopeOptions: DirectoryScopeOption[];
     matchedTrustRuleId?: string;
   }) => void;
   onConfirmationSubmit?: (
@@ -163,21 +167,13 @@ export function InlineConfirmationCard({
   const hasDetails = !!confirmation.input;
   const offersRule = offersRuleOption(confirmation);
 
-  // Meta-line context: what the agent was doing when it hit the gate. The
-  // live activity label wins; a custom confirmation title and the friendly
-  // tool label are fallbacks.
-  const activity = toolCall.input?.activity ?? toolCall.input?.reason;
-  const contextLabel =
-    (typeof activity === "string" && activity.trim()) ||
-    confirmation.title ||
-    friendlyToolLabel(
-      toolCall.name,
-      extractInputSummary(toolCall.name, toolCall.input),
-    );
-
-  // The prominent body is the human-readable ask; older daemons only send
-  // the risk reason, which reads well enough in the same slot.
-  const body = confirmation.description || confirmation.riskReason || null;
+  // Meta-line context and the prominent body: what the agent was doing when
+  // it hit the gate, and the human-readable ask.
+  const { context: contextLabel, ask: body } = confirmationAsk(
+    toolCall.name,
+    toolCall.input,
+    confirmation,
+  );
 
   return (
     <div
@@ -193,10 +189,7 @@ export function InlineConfirmationCard({
           </span>
           {contextLabel ? (
             <>
-              <span
-                aria-hidden
-                className="size-[3px] shrink-0 rounded-full bg-[var(--content-tertiary)]"
-              />
+              <MidlineDot />
               <span className="min-w-0 truncate">{contextLabel}</span>
             </>
           ) : null}
@@ -271,7 +264,9 @@ export function InlineConfirmationCard({
             // typography: off-scale — 11px tertiary disclosure per the Figma spec
             className="flex items-center gap-1 self-start text-[11px] font-medium text-[var(--content-tertiary)] transition-colors hover:text-[var(--content-secondary)]"
           >
-            {showDetails ? t("toolCallChip.hideDetails") : t("toolCallChip.showDetails")}
+            {showDetails
+              ? t("toolCallChip.hideDetails")
+              : t("toolCallChip.showDetails")}
             <ChevronDown
               className={`size-2.5 transition-transform ${showDetails ? "rotate-180" : ""}`}
             />
@@ -340,9 +335,8 @@ export function ToolCallChip({
   );
 
   const inputSummary = extractInputSummary(toolCall.name, toolCall.input);
-  const activity = toolCall.input?.activity ?? toolCall.input?.reason;
   const activityLabel =
-    typeof activity === "string" && activity.trim() ? activity.trim() : null;
+    readToolInputString(toolCall.input ?? {}, ACTIVITY_KEY) || null;
   const label =
     activityLabel ??
     (isRunning
@@ -468,8 +462,6 @@ export function ToolCallChip({
                   input: toolCall.input,
                   allowlistOptions: toolCall.riskAllowlistOptions ?? [],
                   scopeOptions: toolCall.scopeOptions ?? [],
-                  directoryScopeOptions:
-                    toolCall.riskDirectoryScopeOptions ?? [],
                   matchedTrustRuleId: toolCall.matchedTrustRuleId,
                 });
               }}
@@ -524,7 +516,9 @@ export function ToolCallChip({
             <div className="mb-1.5 text-label-small-default uppercase tracking-wider text-[var(--content-tertiary)]">
               {t("toolCallChip.technicalDetails")}
             </div>
-            <div className="text-[var(--content-secondary)]">{t("toolCallChip.toolName")}</div>
+            <div className="text-[var(--content-secondary)]">
+              {t("toolCallChip.toolName")}
+            </div>
             <div className="text-[var(--content-secondary)]">
               {toolCall.name
                 .replace(/_/g, " ")

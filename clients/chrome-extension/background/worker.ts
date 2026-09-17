@@ -26,6 +26,7 @@
 import {
   type ExtensionEnvironment,
   cloudUrlsForEnvironment,
+  createFirstAssistantUrl,
   parseExtensionEnvironment,
   resolveBuildDefaultEnvironment,
 } from "./extension-environment.js";
@@ -726,6 +727,15 @@ function createSseConnection(mode: SseMode): SseConnection {
       console.log(`[vellum-sse] Connected (${label})`);
       setConnectionHealth("connected");
       void clearRelayAuthError();
+    },
+    onIdleTimeout: () => {
+      console.warn(
+        "[vellum-sse] Idle watchdog fired; no SSE traffic (including heartbeats) within the idle window",
+      );
+      appendEvent("outbound", "sse_idle_reconnect", {
+        summary: "reconnecting after a silent SSE stall",
+        isError: true,
+      });
     },
     onMessage: (data) => {
       void handleSseMessage(data).catch((err) => {
@@ -1480,6 +1490,20 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponseFn) => {
       const env = await getEffectiveEnvironment();
       const assistants = await fetchAssistants(env);
       sendResponseFn({ ok: true, assistants });
+    })().catch((err) =>
+      sendResponseFn({
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      }),
+    );
+    return true; // async
+  }
+
+  if (message.type === "open-create-assistant") {
+    (async () => {
+      const env = await getEffectiveEnvironment();
+      await chrome.tabs.create({ url: createFirstAssistantUrl(env) });
+      sendResponseFn({ ok: true });
     })().catch((err) =>
       sendResponseFn({
         ok: false,

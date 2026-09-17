@@ -1,14 +1,33 @@
-import { useCallback } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import type { QueryClient } from "@tanstack/react-query";
 
 import {
   fetchCharacterComponents,
   fetchAvatarState,
-  fetchAvatarImageUrl,
-  fetchCharacterTraits,
+  fetchAvatarImageUrlResult,
+  fetchCharacterTraitsResult,
 } from "@/assistant/avatar-api";
-import type { CharacterComponents, CharacterTraits } from "@/types/avatar";
 import { useSupportsAvatarStateManifest } from "@/lib/backwards-compat/avatar-state-manifest";
+import { trackBlobUrl } from "@/lib/blob-url-tracker";
+import { createGenerationGuard } from "@/lib/generation-guard";
+import { persistLastSeenAvatar } from "@/lib/persist-last-seen-avatar";
+import { getSelfHostedIngressUrl } from "@/lib/self-hosted/connection";
+import { resolveNotificationIdentityScope } from "@/runtime/notification-avatar";
+import { useAuthStore } from "@/stores/auth-store";
+import { useRequestOrganizationId } from "@/stores/organization-store";
+import {
+  useResolvedAssistantsStore,
+  type ResolvedAssistant,
+} from "@/stores/resolved-assistants-store";
+import type {
+  AvatarRead,
+  AvatarState,
+  CharacterComponents,
+  CharacterTraits,
+} from "@/types/avatar";
+import { resolveAvatarAccentHex } from "@/utils/avatar-accent";
+import { isUuid } from "@/utils/uuid";
 
 export const AVATAR_QUERY_KEY_PREFIX = "assistantAvatar";
 
@@ -18,33 +37,240 @@ export function avatarQueryKey(assistantId: string) {
 
 /** The shape cached under {@link avatarQueryKey}; read directly by cache consumers. */
 export interface AvatarData {
+  owner?: { scopeId: string; assistantId: string };
   components: CharacterComponents | null;
   traits: CharacterTraits | null;
   customImageUrl: string | null;
+  /**
+   * The render manifest the three fields above were derived from. Consumers
+   * that need `kind` rather than just traits read it from here so they stay on
+   * this one query, because a second query would miss the `avatar_updated`
+   * sweep that keeps this one live.
+   *
+   * Optional because surfaces that seed this cache by hand (the takeover
+   * avatar stash, stories) carry only what they paint with. A missing state
+   * reads as unknown, which every consumer must treat as "not a character".
+   */
+  state?: AvatarState | null;
+}
+
+interface AvatarQueryIdentity {
+  assistantId: string | null;
+  scopeKey: string;
+}
+
+export function shouldRetainAvatarPlaceholder(
+  previousMeta: Record<string, unknown> | undefined,
+  current: AvatarQueryIdentity,
+): boolean {
+  return (
+    previousMeta?.assistantId === current.assistantId &&
+    previousMeta.scopeKey === current.scopeKey
+  );
 }
 
 const activeBlobUrls = new Map<string, string>();
 
+/** Scope and cache currently allowed to own each assistant's fetched avatar. */
+const activeOwners = new Map<
+  string,
+  { scopeId: string; queryClient: QueryClient }
+>();
+
+/** Latest fetch generation per assistant; a superseded fetch must not persist or track. */
+const fetchGenerations = createGenerationGuard();
+
+/**
+ * Revoke the object URL this hook holds for a removed assistant, and
+ * supersede any in-flight fetch so it drops its own blob instead.
+ */
+export function releaseAssistantAvatarUrl(assistantId: string): void {
+  fetchGenerations.invalidate(assistantId);
+  trackBlobUrl(activeBlobUrls, assistantId, null);
+  activeOwners.delete(assistantId);
+}
+
+/**
+ * Resolve the complete connection/account owner shared by display and
+ * notification avatar consumers.
+ */
+export function resolveAssistantAvatarOwnerScopeId(
+  assistant: ResolvedAssistant | null | undefined,
+  platformAccountId: string | null,
+  organizationId: string | null,
+  connectionFallback: string | null,
+): string | null {
+  if (!assistant) {
+    return null;
+  }
+  return assistant.isPlatformHosted
+    ? resolveNotificationIdentityScope({
+        kind: "account",
+        accountId: platformAccountId,
+        organizationId,
+      })
+    : resolveNotificationIdentityScope({
+        kind: "connection",
+        url:
+          assistant.runtimeUrl ?? assistant.ingressUrl ?? connectionFallback,
+      });
+}
+
+/** Resolve the platform UUID shared by remote and local sender identities. */
+export function resolveAssistantNotificationPlatformId(
+  assistant: ResolvedAssistant | null | undefined,
+): string | null {
+  if (assistant?.platformAssistantId && isUuid(assistant.platformAssistantId)) {
+    return assistant.platformAssistantId;
+  }
+  return assistant?.isPlatformHosted && isUuid(assistant.id)
+    ? assistant.id
+    : null;
+}
+
+interface AvatarOwner {
+  assistantId: string;
+  scopeId: string;
+}
+
+function sameAvatarOwner(
+  left: AvatarOwner | null,
+  right: AvatarOwner | null,
+): boolean {
+  return (
+    left?.assistantId === right?.assistantId && left?.scopeId === right?.scopeId
+  );
+}
+
+function queryBelongsToOwner(
+  queryKey: readonly unknown[],
+  owner: AvatarOwner,
+): boolean {
+  return (
+    queryKey[0] === AVATAR_QUERY_KEY_PREFIX &&
+    queryKey[1] === owner.assistantId &&
+    queryKey.some(
+      (part) =>
+        typeof part === "object" &&
+        part !== null &&
+        "ownerScopeId" in part &&
+        (part as { ownerScopeId?: unknown }).ownerScopeId === owner.scopeId,
+    )
+  );
+}
+
+function removeAvatarOwnerQueries(
+  queryClient: QueryClient,
+  owner: AvatarOwner,
+): void {
+  queryClient.removeQueries({
+    queryKey: avatarQueryKey(owner.assistantId),
+    predicate: (query) => queryBelongsToOwner(query.queryKey, owner),
+  });
+}
+
+function transitionAvatarOwner(
+  queryClient: QueryClient,
+  previous: AvatarOwner | null,
+  next: AvatarOwner | null,
+  currentAssistantId: string | null,
+): void {
+  const previousRegistration = previous
+    ? activeOwners.get(previous.assistantId)
+    : undefined;
+  if (
+    previous &&
+    previous.assistantId === currentAssistantId &&
+    previousRegistration?.scopeId === previous.scopeId &&
+    !sameAvatarOwner(previous, next)
+  ) {
+    removeAvatarOwnerQueries(previousRegistration.queryClient, previous);
+    releaseAssistantAvatarUrl(previous.assistantId);
+  }
+
+  if (!next) {
+    return;
+  }
+  const installedRegistration = activeOwners.get(next.assistantId);
+  if (
+    installedRegistration &&
+    installedRegistration.scopeId !== next.scopeId
+  ) {
+    const installedOwner = {
+      assistantId: next.assistantId,
+      scopeId: installedRegistration.scopeId,
+    };
+    removeAvatarOwnerQueries(
+      installedRegistration.queryClient,
+      installedOwner,
+    );
+    releaseAssistantAvatarUrl(next.assistantId);
+  }
+  activeOwners.set(next.assistantId, { scopeId: next.scopeId, queryClient });
+}
+
+function withoutAvatarOwner(data: AvatarData): AvatarData {
+  const { owner: _owner, ...ownerless } = data;
+  return ownerless;
+}
+
 export interface AssistantAvatarOptions {
+  /** Exact request/connection owner used by notification publication. */
+  ownerScopeId?: string | null;
+  /** Resolved row already held by a caller before the global list catches up. */
+  ownerAssistant?: ResolvedAssistant | null;
   /**
-   * Per-assistant override for the avatar-state-manifest capability. The
-   * default gate reads the ACTIVE assistant's version, which is wrong for
-   * a sibling assistant on another runtime: a pre-manifest sibling would
-   * be asked for `/avatar/state` it doesn't serve and its avatar would
-   * collapse to the fallback. List surfaces resolve the sibling's own
-   * version (`versionSupportsAvatarStateManifest`) and pass it here;
-   * `undefined` keeps the active-assistant gate.
+   * Per-assistant manifest gate. The default reads the ACTIVE assistant's
+   * version, which is wrong for a sibling on another runtime; list surfaces
+   * resolve the sibling's own version and pass it here.
    */
   supportsManifest?: boolean;
   /**
-   * Skip the fetch entirely (`false`) and hand consumers the null avatar.
-   * For sibling assistants whose transport cannot be addressed
-   * independently: with a self-hosted ingress active, every daemon request
-   * is rewritten to that single gateway whatever assistant id the path
-   * carries, so a sibling fetch would return the ACTIVE assistant's
-   * avatar. Defaults to `true`.
+   * `false` skips the fetch and hands consumers the null avatar, for siblings
+   * whose transport cannot be addressed by id (see
+   * `canFetchRowAvatarViaPlatformProxy` in `use-chooser-row-avatar`).
    */
   enabled?: boolean;
+}
+
+/**
+ * Resolve the render mode from an already-fetched `/avatar/state` manifest.
+ * Throws when the manifest promises an image whose content request fails,
+ * so React Query keeps the previously cached avatar instead of blanking out.
+ */
+export async function resolveAvatarFromState(
+  assistantId: string,
+  state: AvatarState,
+): Promise<AvatarRead> {
+  if (state.kind === "character") {
+    // Built/AI character: render the animated SVG from traits. The daemon
+    // also writes a derived avatar-image.png raster, but the web never
+    // uses it, so we skip the image fetch entirely.
+    return { traits: state.traits, imageUrl: null };
+  }
+  if (state.kind === "image") {
+    // Custom uploaded image: render the static circle. A 404 here means
+    // the image went away after the manifest was read; that is a real none.
+    const image = await fetchAvatarImageUrlResult(assistantId);
+    if (image.status === "failed") {
+      throw new Error("Failed to fetch avatar image");
+    }
+    return {
+      traits: null,
+      imageUrl: image.status === "found" ? image.value : null,
+    };
+  }
+  // kind === "none": both stay null, and ChatAvatar falls back to default
+  // components / the "V".
+  return { traits: null, imageUrl: null };
+}
+
+/**
+ * A read plus the manifest it was resolved from, so a consumer that needs
+ * `kind` rather than just traits reads both off this one query.
+ */
+export interface AvatarReadWithState extends AvatarRead {
+  state: AvatarState;
 }
 
 /**
@@ -53,9 +279,9 @@ export interface AssistantAvatarOptions {
  * Query keeps the previously cached avatar instead of blanking out — see
  * the `retry` / `staleTime` options below.
  */
-async function fetchAvatarViaManifest(
+export async function fetchAvatarViaManifest(
   assistantId: string,
-): Promise<{ traits: CharacterTraits | null; imageUrl: string | null }> {
+): Promise<AvatarReadWithState> {
   const state = await fetchAvatarState(assistantId);
   if (state === null) {
     // `fetchAvatarState` returns null only on transport failure. Throw
@@ -65,20 +291,15 @@ async function fetchAvatarViaManifest(
     // showing the last good avatar instead of blanking out to the "V".
     throw new Error("Failed to fetch avatar state");
   }
+  return { ...(await resolveAvatarFromState(assistantId, state)), state };
+}
 
-  if (state.kind === "character") {
-    // Built/AI character: render the animated SVG from traits. The daemon
-    // also writes a derived avatar-image.png raster, but the web never
-    // uses it, so we skip the image fetch entirely.
-    return { traits: state.traits, imageUrl: null };
-  }
-  if (state.kind === "image") {
-    // Custom uploaded image: render the static circle.
-    return { traits: null, imageUrl: await fetchAvatarImageUrl(assistantId) };
-  }
-  // kind === "none": both stay null, and ChatAvatar falls back to default
-  // components / the "V".
-  return { traits: null, imageUrl: null };
+/**
+ * A read plus whether it is authoritative. A found file or manifest answer
+ * is; two sidecar 404s are a real bare avatar; a transport failure is not.
+ */
+export interface LegacyAvatarRead extends AvatarRead {
+  conclusive: boolean;
 }
 
 /**
@@ -88,16 +309,78 @@ async function fetchAvatarViaManifest(
  * alive behind the version gate — see
  * `lib/backwards-compat/avatar-state-manifest.ts`.
  */
-async function fetchAvatarViaLegacyFiles(
+export async function readAvatarViaLegacyFiles(
   assistantId: string,
-): Promise<{ traits: CharacterTraits | null; imageUrl: string | null }> {
-  const imageUrl = await fetchAvatarImageUrl(assistantId);
+): Promise<LegacyAvatarRead> {
+  const image = await fetchAvatarImageUrlResult(assistantId);
   // Skip the traits fetch when a custom image exists — the traits file is
   // intentionally deleted on the daemon side in that case, so requesting it
   // just generates 404s. `AvatarRenderer` only reads `traits` when there is
   // no `customImageUrl`.
-  const traits = imageUrl ? null : await fetchCharacterTraits(assistantId);
-  return { traits, imageUrl };
+  if (image.status === "found") {
+    return { traits: null, imageUrl: image.value, conclusive: true };
+  }
+  if (image.status === "failed") {
+    // The image outranks traits, so an unread image leaves the outcome unknown.
+    return { traits: null, imageUrl: null, conclusive: false };
+  }
+  const traits = await fetchCharacterTraitsResult(assistantId);
+  if (traits.status === "found") {
+    return { traits: traits.value, imageUrl: null, conclusive: true };
+  }
+  return {
+    traits: null,
+    imageUrl: null,
+    conclusive: traits.status === "absent",
+  };
+}
+
+/**
+ * The legacy file precedence restated as a manifest, so `state` has one shape
+ * on both paths. `source` and `image` stay null because the sidecar files
+ * carry neither.
+ */
+function legacyAvatarState(
+  traits: CharacterTraits | null,
+  imageUrl: string | null,
+): AvatarState {
+  if (imageUrl) {
+    return {
+      kind: "image",
+      traits: null,
+      source: null,
+      image: null,
+      accent: null,
+    };
+  }
+  if (traits) {
+    return {
+      kind: "character",
+      traits,
+      source: null,
+      image: null,
+      accent: null,
+    };
+  }
+  return {
+    kind: "none",
+    traits: null,
+    source: null,
+    image: null,
+    accent: null,
+  };
+}
+
+/** {@link readAvatarViaLegacyFiles} that throws on an inconclusive read, like the manifest path. */
+export async function fetchAvatarViaLegacyFiles(
+  assistantId: string,
+): Promise<AvatarReadWithState> {
+  const { traits, imageUrl, conclusive } =
+    await readAvatarViaLegacyFiles(assistantId);
+  if (!conclusive) {
+    throw new Error("Failed to fetch avatar sidecars");
+  }
+  return { traits, imageUrl, state: legacyAvatarState(traits, imageUrl) };
 }
 
 /**
@@ -119,12 +402,114 @@ export function useAssistantAvatar(
   const queryClient = useQueryClient();
   const activeSupportsManifest = useSupportsAvatarStateManifest();
   const supportsManifest = options?.supportsManifest ?? activeSupportsManifest;
+  const assistants = useResolvedAssistantsStore.use.assistants();
+  const authUser = useAuthStore.use.user();
+  const organizationId = useRequestOrganizationId();
+  const assistant =
+    options?.ownerAssistant === undefined
+      ? assistants.find((candidate) => candidate.id === assistantId)
+      : options.ownerAssistant?.id === assistantId
+        ? options.ownerAssistant
+        : null;
+  const platformAccountId =
+    authUser?.kind === "platform" ? authUser.id : null;
+  const connectionFallback =
+    getSelfHostedIngressUrl() ??
+    (typeof globalThis.location === "undefined"
+      ? null
+      : globalThis.location.href);
+  const canonicalScopeId = resolveAssistantAvatarOwnerScopeId(
+    assistant,
+    platformAccountId,
+    organizationId,
+    connectionFallback,
+  );
+  const scopeId =
+    options?.ownerScopeId === undefined
+      ? canonicalScopeId
+      : options.ownerScopeId === canonicalScopeId
+        ? canonicalScopeId
+        : null;
+  const requestedOwner =
+    assistantId && scopeId ? { scopeId, assistantId } : null;
+  const initialInstalledScope = assistantId
+    ? activeOwners.get(assistantId)?.scopeId
+    : undefined;
+  const [readyOwner, setReadyOwner] = useState<AvatarOwner | null>(() =>
+    initialInstalledScope && initialInstalledScope !== scopeId
+      ? null
+      : requestedOwner,
+  );
+  const previousOwnerRef = useRef<AvatarOwner | null>(
+    assistantId && initialInstalledScope
+      ? { assistantId, scopeId: initialInstalledScope }
+      : requestedOwner,
+  );
+  const ownerReady = sameAvatarOwner(readyOwner, requestedOwner);
 
-  const { data, isLoading } = useQuery<AvatarData>({
-    queryKey: [...avatarQueryKey(assistantId ?? ""), supportsManifest],
-    queryFn: async () => {
+  useEffect(() => {
+    const previousOwner = previousOwnerRef.current;
+    const nextOwner =
+      assistantId && scopeId ? { assistantId, scopeId } : null;
+    transitionAvatarOwner(
+      queryClient,
+      previousOwner,
+      nextOwner,
+      assistantId,
+    );
+    previousOwnerRef.current = nextOwner;
+    setReadyOwner(nextOwner);
+  }, [assistantId, queryClient, scopeId]);
+
+  const owner = requestedOwner
+    ? { scopeId: requestedOwner.scopeId, assistantId: requestedOwner.assistantId }
+    : undefined;
+  const queryKey = [
+    ...avatarQueryKey(assistantId ?? ""),
+    supportsManifest,
+    { ownerScopeId: scopeId ?? "" },
+  ];
+  const legacyQueryKey = [
+    ...avatarQueryKey(assistantId ?? ""),
+    supportsManifest,
+  ];
+
+  const { data, isLoading, isSuccess } = useQuery<AvatarData>({
+    queryKey,
+    meta: { assistantId, scopeKey: scopeId ?? "" },
+    placeholderData: (previousData, previousQuery) => {
+      if (
+        shouldRetainAvatarPlaceholder(previousQuery?.meta, {
+          assistantId,
+          scopeKey: scopeId ?? "",
+        })
+      ) {
+        return previousData;
+      }
+      if (previousQuery) {
+        return undefined;
+      }
+      const legacySeed =
+        queryClient.getQueryData<AvatarData>(legacyQueryKey) ??
+        queryClient.getQueryData<AvatarData>(
+          avatarQueryKey(assistantId ?? ""),
+        );
+      return legacySeed ? withoutAvatarOwner(legacySeed) : undefined;
+    },
+    queryFn: async ({ client }) => {
       const id = assistantId!;
-      const [components, { traits, imageUrl }] = await Promise.all([
+      // A re-key (manifest support flipping) starts a newer fetch while this
+      // one is in flight and does not abort it; when the older one finishes
+      // last it must neither overwrite the last-seen entry nor revoke the
+      // URL the newer query renders, so it drops its own blob instead.
+      const generation = fetchGenerations.claim(id);
+      // Decided at request time: the transport is pinned to whichever
+      // assistant is active when the request goes out, so a read that was
+      // issued for the active assistant is its avatar even if the user has
+      // switched away by the time it lands (a reconnect sweep, say).
+      const isActiveRead =
+        id === useResolvedAssistantsStore.getState().activeAssistantId;
+      const [components, { state, traits, imageUrl }] = await Promise.all([
         fetchCharacterComponents(id),
         supportsManifest
           ? fetchAvatarViaManifest(id)
@@ -139,19 +524,29 @@ export function useAssistantAvatar(
         throw new Error("Failed to fetch character components");
       }
 
-      const prev = activeBlobUrls.get(id);
-      if (prev && prev !== imageUrl) {
-        URL.revokeObjectURL(prev);
-      }
-      if (imageUrl) {
-        activeBlobUrls.set(id, imageUrl);
-      } else {
-        activeBlobUrls.delete(id);
+      if (!fetchGenerations.isCurrent(id, generation)) {
+        if (imageUrl) {
+          URL.revokeObjectURL(imageUrl);
+        }
+        return { owner, components, traits, customImageUrl: null, state };
       }
 
-      return { components, traits, customImageUrl: imageUrl };
+      trackBlobUrl(activeBlobUrls, id, imageUrl);
+      // A resolved read is conclusive (both paths throw otherwise), so it is
+      // what the chooser falls back to once this assistant is unreachable.
+      // Only the active assistant's read is trusted here: a sibling behind a
+      // transport that ignores the id would cache the wrong avatar.
+      if (isActiveRead) {
+        void persistLastSeenAvatar(client, id, { traits, imageUrl });
+      }
+
+      return { owner, components, traits, customImageUrl: imageUrl, state };
     },
-    enabled: Boolean(assistantId) && (options?.enabled ?? true),
+    enabled:
+      Boolean(assistantId) &&
+      Boolean(scopeId) &&
+      ownerReady &&
+      (options?.enabled ?? true),
     staleTime: Infinity,
     structuralSharing: false,
     // Retry transient failures (character-components or avatar-state) once
@@ -169,11 +564,36 @@ export function useAssistantAvatar(
     });
   }, [assistantId, queryClient]);
 
+  const components = data?.components ?? null;
+  const traits = data?.traits ?? null;
+  const customImageUrl = data?.customImageUrl ?? null;
+  const state = data?.state ?? null;
+
   return {
-    components: data?.components ?? null,
-    traits: data?.traits ?? null,
-    customImageUrl: data?.customImageUrl ?? null,
-    isLoading,
+    ...(data?.owner ? { owner: data.owner } : {}),
+    components,
+    traits,
+    customImageUrl,
+    state,
+    /**
+     * The colour every avatar-tinted surface paints with, or null while there
+     * is none. The one derivation; see `resolveAvatarAccentHex`.
+     */
+    accentHex: resolveAvatarAccentHex({
+      state,
+      components,
+      traits,
+      customImageUrl,
+    }),
+    /**
+     * The daemon's accent record, for the surface that edits it: its
+     * `source` says whether the user set the colour or it was read out of
+     * the image. Null on assistants that predate accents, which is also the
+     * signal that the accent route is not there to write to.
+     */
+    accent: state?.accent ?? null,
+    isLoading: isLoading || (!ownerReady && requestedOwner !== null),
+    isSuccess,
     invalidate,
   };
 }

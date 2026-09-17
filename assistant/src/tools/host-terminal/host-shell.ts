@@ -9,7 +9,7 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute } from "node:path";
+import { isAbsolute, join } from "node:path";
 
 import { z } from "zod";
 
@@ -17,13 +17,18 @@ import { supportsHostProxy } from "../../channels/types.js";
 import { getConfig } from "../../config/loader.js";
 import { HostBashProxy } from "../../daemon/host-bash-proxy.js";
 import { RiskLevel } from "../../permissions/types.js";
+import { applyActivePluginName } from "../../plugins/active-plugin-env.js";
 import { wakeAgentForOpportunity } from "../../runtime/agent-wake.js";
-import {
-  assistantEventHub,
-  broadcastMessage,
-} from "../../runtime/assistant-event-hub.js";
+import { broadcastMessage } from "../../runtime/assistant-event-hub.js";
 import { conversationRevealNonce } from "../../runtime/reveal-nonce.js";
 import { redactSecrets } from "../../security/secret-scanner.js";
+import {
+  buildShellInvocation,
+  buildShellSpawnFlags,
+  prependUniquePathEntries,
+  terminateProcessTree,
+  watchShellProcessStart,
+} from "../../util/host-process.js";
 import { getLogger } from "../../util/logger.js";
 import type { CompletedBackgroundTool } from "../background-tool-registry.js";
 import {
@@ -34,8 +39,9 @@ import {
   registerBackgroundTool,
   removeBackgroundTool,
 } from "../background-tool-registry.js";
+import { formatDesktopAppRequired } from "../capability-offer.js";
 import {
-  formatShellOutput,
+  attachBoundedStdio,
   MAX_OUTPUT_LENGTH,
 } from "../shared/shell-output.js";
 import {
@@ -67,15 +73,10 @@ const HOST_BASH_PROXY_ENV_KEYS = [
 function buildHostShellEnv(): Record<string, string> {
   const env = buildSanitizedEnv();
   // Ensure ~/.local/bin and ~/.bun/bin are in PATH so `vellum` and `bun` are
-  // always reachable, even when the daemon is launched from a macOS app
-  // bundle that inherits a minimal PATH.
+  // reachable when a desktop app launches the assistant with a minimal PATH.
   const home = homedir();
-  const extraDirs = [`${home}/.local/bin`, `${home}/.bun/bin`];
-  const currentPath = env.PATH ?? "";
-  const missing = extraDirs.filter((d) => !currentPath.split(":").includes(d));
-  if (missing.length > 0) {
-    env.PATH = [...missing, currentPath].filter(Boolean).join(":");
-  }
+  const extraDirs = [join(home, ".local", "bin"), join(home, ".bun", "bin")];
+  env.PATH = prependUniquePathEntries(env.PATH, extraDirs);
   return env;
 }
 
@@ -92,8 +93,9 @@ function buildHostBashProxyEnv(conversationId: string): Record<string, string> {
   // Keep nested `assistant` CLI calls in host_bash aligned with the
   // originating conversation so browser IPC can resolve live proxy context.
   env.__CONVERSATION_ID = conversationId;
-  // Secret binding for reveal-derived chat authority — see reveal-nonce.ts.
+  // Secret binding for reveal-derived chat authority. See reveal-nonce.ts.
   env.__REVEAL_NONCE = conversationRevealNonce(conversationId);
+  applyActivePluginName(env, conversationId);
   return env;
 }
 
@@ -141,7 +143,7 @@ export const hostShellInputSchema = z.looseObject({
   target_client_id: z
     .string()
     .describe(
-      "ID of the specific client to execute this command on. Required when multiple clients support host_bash; omit when only one client is connected. Obtain IDs from `assistant clients list --capability host_bash`.",
+      "Optional ID of the specific client to execute this command on. Without it, the most recently active eligible client is used. Obtain IDs from `assistant clients list --capability host_bash`.",
     )
     .optional()
     .catch(undefined),
@@ -202,20 +204,7 @@ export const hostShellTool = {
     const config = getConfig();
     const { shellDefaultTimeoutSec, shellMaxTimeoutSec } = config.timeouts;
 
-    // Guard: non-host-proxy interfaces need an explicit target when multiple
-    // capable clients are connected to avoid ambiguous untargeted broadcasts.
     const transportInterface = context.transportInterface;
-    if (
-      targetClientId == null &&
-      transportInterface != null &&
-      !supportsHostProxy(transportInterface) &&
-      assistantEventHub.listClientsByCapability("host_bash").length > 1
-    ) {
-      return {
-        content: `Error: multiple clients support host_bash. Specify which client to use with \`target_client_id\`. Run \`assistant clients list --capability host_bash\` to see client IDs and labels.`,
-        isError: true,
-      };
-    }
 
     // Guard: non-host-proxy interfaces with no capable clients connected.
     if (
@@ -225,8 +214,7 @@ export const hostShellTool = {
       !HostBashProxy.instance.isAvailable()
     ) {
       return {
-        content:
-          "Error: no client with host_bash capability is connected. Connect a macOS client to use host_bash from a non-desktop interface.",
+        content: formatDesktopAppRequired("shell"),
         isError: true,
       };
     }
@@ -336,7 +324,7 @@ export const hostShellTool = {
               untrustedOutput: {
                 content: output || "(no output)",
                 source: "tool_result",
-                // Preserve formatShellOutput's recovery marker (see shell.ts).
+                // Bounded output plus the truncation marker (see shell.ts).
                 maxChars: MAX_OUTPUT_LENGTH * 2,
               },
             });
@@ -452,6 +440,7 @@ export const hostShellTool = {
     // the active conversation when running through host_bash.
     hostEnv.__CONVERSATION_ID = context.conversationId;
     hostEnv.__REVEAL_NONCE = conversationRevealNonce(context.conversationId);
+    applyActivePluginName(hostEnv, context.conversationId);
 
     if (background) {
       // Check the registry limit BEFORE spawning so we never leak an
@@ -466,43 +455,27 @@ export const hostShellTool = {
       const bgId = generateBackgroundToolId();
       const startedAt = Date.now();
 
-      const child = spawn("bash", ["-c", "--", command], {
+      const wrapped = buildShellInvocation(command);
+      const child = spawn(wrapped.command, wrapped.args, {
         cwd: workingDir,
         env: hostEnv,
         stdio: ["ignore", "pipe", "pipe"],
-        detached: true,
+        ...buildShellSpawnFlags(),
       });
+      const launch = watchShellProcessStart(child);
 
-      const stdoutChunks: Buffer[] = [];
-      const stderrChunks: Buffer[] = [];
+      const collector = attachBoundedStdio(child);
       let timedOut = false;
       // Set when cancelled via the registry's cancel callback so the completion
       // event reports "cancelled" rather than "failed".
       let aborted = false;
 
-      const killTree = () => {
-        if (child.pid != null) {
-          try {
-            process.kill(-child.pid, "SIGKILL");
-            return;
-          } catch {
-            // Process group may have already exited — fall through.
-          }
-        }
-        try {
-          child.kill("SIGKILL");
-        } catch {
-          // Child may have already exited.
-        }
-      };
+      const killTree = () => terminateProcessTree(child);
 
       const timer = setTimeout(() => {
         timedOut = true;
         killTree();
       }, timeoutMs);
-
-      child.stdout.on("data", (data: Buffer) => stdoutChunks.push(data));
-      child.stderr.on("data", (data: Buffer) => stderrChunks.push(data));
 
       // Guard against double-wake: when spawn fails (e.g. invalid cwd),
       // Node emits both 'error' and 'close' for the same child process.
@@ -515,15 +488,9 @@ export const hostShellTool = {
         }
         completed = true;
         clearTimeout(timer);
-        const stdout = Buffer.concat(stdoutChunks).toString();
-        const stderr = Buffer.concat(stderrChunks).toString();
-        const result = formatShellOutput(
-          stdout,
-          stderr,
-          code,
-          timedOut,
-          timeoutSec,
-        );
+        const result = collector.format(code, timedOut, timeoutSec, {
+          started: launch.didStart(),
+        });
         // Cancel takes precedence over the SIGKILL-induced error result.
         const status = aborted
           ? "cancelled"
@@ -576,7 +543,7 @@ export const hostShellTool = {
           untrustedOutput: {
             content: output || "(no output)",
             source: "tool_result",
-            // Preserve formatShellOutput's recovery marker (see shell.ts).
+            // Bounded output plus the truncation marker (see shell.ts).
             maxChars: MAX_OUTPUT_LENGTH * 2,
           },
         });
@@ -662,35 +629,21 @@ export const hostShellTool = {
     }
 
     return new Promise<ToolExecutionResult>((resolve) => {
-      const stdoutChunks: Buffer[] = [];
-      const stderrChunks: Buffer[] = [];
       let timedOut = false;
 
-      const child = spawn("bash", ["-c", "--", command], {
+      const wrapped = buildShellInvocation(command);
+      const child = spawn(wrapped.command, wrapped.args, {
         cwd: workingDir,
         env: hostEnv,
         stdio: ["ignore", "pipe", "pipe"],
-        detached: true,
+        ...buildShellSpawnFlags(),
+      });
+      const launch = watchShellProcessStart(child);
+      const collector = attachBoundedStdio(child, {
+        onOutput: context.onOutput,
       });
 
-      // Kill the entire process tree. Tries the process group first
-      // (negative PID), then falls back to killing the direct child if the
-      // PID is unavailable or the group kill fails.
-      const killTree = () => {
-        if (child.pid != null) {
-          try {
-            process.kill(-child.pid, "SIGKILL");
-            return;
-          } catch {
-            // Process group may have already exited — fall through.
-          }
-        }
-        try {
-          child.kill("SIGKILL");
-        } catch {
-          // Child may have already exited.
-        }
-      };
+      const killTree = () => terminateProcessTree(child);
 
       const timer = setTimeout(() => {
         timedOut = true;
@@ -707,29 +660,13 @@ export const hostShellTool = {
         }
       }
 
-      child.stdout.on("data", (data: Buffer) => {
-        stdoutChunks.push(data);
-        context.onOutput?.(data.toString());
-      });
-
-      child.stderr.on("data", (data: Buffer) => {
-        stderrChunks.push(data);
-        context.onOutput?.(data.toString());
-      });
-
       child.on("close", (code) => {
         clearTimeout(timer);
         context.signal?.removeEventListener("abort", onAbort);
 
-        const stdout = Buffer.concat(stdoutChunks).toString();
-        const stderr = Buffer.concat(stderrChunks).toString();
-        const result = formatShellOutput(
-          stdout,
-          stderr,
-          code,
-          timedOut,
-          timeoutSec,
-        );
+        const result = collector.format(code, timedOut, timeoutSec, {
+          started: launch.didStart(),
+        });
 
         resolve({
           content: result.content,

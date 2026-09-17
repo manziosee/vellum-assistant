@@ -757,6 +757,7 @@ describe("AssistantConfigSchema", () => {
       maxFileSizeBytes: 256000,
       historyCompaction: { enabled: true },
       interactiveGitTimeoutMs: 10000,
+      stageBatchSize: 1000,
       enrichmentQueueSize: 50,
       enrichmentConcurrency: 1,
       enrichmentJobTimeoutMs: 30000,
@@ -809,6 +810,65 @@ describe("AssistantConfigSchema", () => {
       workspaceGit: { interactiveGitTimeoutMs: "fast" },
     });
     expect(result.success).toBe(false);
+  });
+
+  test("applies workspaceGit.stageBatchSize default", () => {
+    expect(AssistantConfigSchema.parse({}).workspaceGit.stageBatchSize).toBe(
+      1000,
+    );
+  });
+
+  test("accepts custom workspaceGit.stageBatchSize", () => {
+    const result = AssistantConfigSchema.parse({
+      workspaceGit: { stageBatchSize: 250 },
+    });
+    expect(result.workspaceGit.stageBatchSize).toBe(250);
+  });
+
+  test("rejects non-positive workspaceGit.stageBatchSize", () => {
+    const zeroResult = AssistantConfigSchema.safeParse({
+      workspaceGit: { stageBatchSize: 0 },
+    });
+    expect(zeroResult.success).toBe(false);
+
+    const negativeResult = AssistantConfigSchema.safeParse({
+      workspaceGit: { stageBatchSize: -1 },
+    });
+    expect(negativeResult.success).toBe(false);
+  });
+
+  test("applies sight defaults", () => {
+    expect(AssistantConfigSchema.parse({}).sight).toEqual({
+      keepLatestFrames: 2,
+    });
+  });
+
+  test("accepts a custom sight.keepLatestFrames", () => {
+    const result = AssistantConfigSchema.parse({
+      sight: { keepLatestFrames: 4 },
+    });
+    expect(result.sight.keepLatestFrames).toBe(4);
+  });
+
+  test("keeps an out-of-range sight.keepLatestFrames for the reader to clamp", () => {
+    // Rejecting it would reset the key to the default, which is fewer frames
+    // than either the config or the guardrail asked for. The clamp lives at
+    // read (`resolveSightKeepLatestFrames`).
+    const result = AssistantConfigSchema.parse({
+      sight: { keepLatestFrames: 99 },
+    });
+    expect(result.sight.keepLatestFrames).toBe(99);
+  });
+
+  test("rejects a non-integer sight.keepLatestFrames", () => {
+    expect(
+      AssistantConfigSchema.safeParse({ sight: { keepLatestFrames: 2.5 } })
+        .success,
+    ).toBe(false);
+    expect(
+      AssistantConfigSchema.safeParse({ sight: { keepLatestFrames: "two" } })
+        .success,
+    ).toBe(false);
   });
 
   // ── commitMessageLLM config ──────────────────────────────────────────
@@ -892,11 +952,7 @@ describe("AssistantConfigSchema", () => {
         enabled: true,
         text: 'At the very beginning of the call, introduce yourself as an assistant calling on behalf of the person you represent. Do not say "AI assistant".',
       },
-      safety: {
-        denyCategories: [],
-      },
       voice: {
-        interruptSensitivity: "low",
         telephonyStreaming: true,
         utteranceEndMs: 1000,
       },
@@ -918,7 +974,6 @@ describe("AssistantConfigSchema", () => {
         maxDurationSeconds: 1800,
         userConsultTimeoutSeconds: 60,
         disclosure: { enabled: false, text: "Custom disclosure" },
-        safety: { denyCategories: ["spam"] },
       },
     });
     expect(result.calls.enabled).toBe(false);
@@ -926,7 +981,6 @@ describe("AssistantConfigSchema", () => {
     expect(result.calls.userConsultTimeoutSeconds).toBe(60);
     expect(result.calls.disclosure.enabled).toBe(false);
     expect(result.calls.disclosure.text).toBe("Custom disclosure");
-    expect(result.calls.safety.denyCategories).toEqual(["spam"]);
   });
 
   // ── Live voice config ───────────────────────────────────────────────
@@ -934,9 +988,9 @@ describe("AssistantConfigSchema", () => {
   test("applies liveVoice defaults", () => {
     const result = AssistantConfigSchema.parse({});
     expect(result.liveVoice).toEqual({
-      mode: "open-mic",
       vad: {
         speechEnergyThreshold: 800,
+        noiseFloorMargin: 3,
         silenceThresholdMs: 1200,
         maxTurnDurationMs: 30000,
         bargeInMinSpeechMs: 250,
@@ -944,6 +998,18 @@ describe("AssistantConfigSchema", () => {
         echoEmaHalfLifeMs: 400,
         echoDrainSlackMs: 300,
       },
+      flux: {
+        turnEnd: { enabled: true },
+        eotThreshold: 0.7,
+        eotTimeoutMs: 5000,
+      },
+      archiveAudio: false,
+    });
+  });
+
+  test("applies voice defaults", () => {
+    const result = AssistantConfigSchema.parse({});
+    expect(result.voice).toEqual({
       frontModel: {
         endpointDecisionTimeoutMs: 1200,
         endpointExtensionMs: 1500,
@@ -955,41 +1021,29 @@ describe("AssistantConfigSchema", () => {
           maxSilenceMs: 35000,
           longOpMs: 15000,
           minGapMs: 6000,
-          generationTimeoutMs: 1500,
+          generationTimeoutMs: 5000,
         },
       },
-      flux: {
-        turnEnd: { enabled: false },
-        model: "flux-general-en",
-        eotThreshold: 0.7,
-        eotTimeoutMs: 5000,
-      },
-      maxSessionDurationSeconds: 1800,
-      archiveAudio: false,
     });
   });
 
   test("accepts valid liveVoice config overrides", () => {
     const result = AssistantConfigSchema.parse({
       liveVoice: {
-        mode: "ptt",
         vad: {
           speechEnergyThreshold: 1500,
           silenceThresholdMs: 1000,
           bargeInMinSpeechMs: 120,
         },
-        maxSessionDurationSeconds: 900,
       },
     });
-    expect(result.liveVoice.mode).toBe("ptt");
     expect(result.liveVoice.vad.speechEnergyThreshold).toBe(1500);
     expect(result.liveVoice.vad.silenceThresholdMs).toBe(1000);
     expect(result.liveVoice.vad.bargeInMinSpeechMs).toBe(120);
     // Unspecified vad fields still get defaults
     expect(result.liveVoice.vad.maxTurnDurationMs).toBe(30000);
-    expect(result.liveVoice.maxSessionDurationSeconds).toBe(900);
     // A partial liveVoice override leaves Flux turn-end disabled by default.
-    expect(result.liveVoice.flux.turnEnd.enabled).toBe(false);
+    expect(result.liveVoice.flux.turnEnd.enabled).toBe(true);
   });
 
   test("accepts a liveVoice.vad.bargeInMinSpeechMs of 0 (guard disabled)", () => {
@@ -1076,18 +1130,10 @@ describe("AssistantConfigSchema", () => {
     expect(result.success).toBe(false);
   });
 
-  test("rejects non-array calls.safety.denyCategories", () => {
-    const result = AssistantConfigSchema.safeParse({
-      calls: { safety: { denyCategories: "spam" } },
-    });
-    expect(result.success).toBe(false);
-  });
-
   // ── Calls voice config ──────────────────────────────────────────────
 
   test("config without calls.voice parses correctly and produces defaults", () => {
     const result = AssistantConfigSchema.parse({});
-    expect(result.calls.voice.interruptSensitivity).toBe("low");
     expect(result.calls.voice.telephonyStreaming).toBe(true);
     expect(result.calls.voice.utteranceEndMs).toBe(1000);
   });
@@ -1105,9 +1151,23 @@ describe("AssistantConfigSchema", () => {
     expect(result.calls.voice.utteranceEndMs).toBe(2500);
   });
 
+  test("persisted calls configs carrying retired keys keep parsing", () => {
+    // Zod strips unrecognized keys, so a persisted config that still carries
+    // `calls.safety.denyCategories` or `calls.voice.interruptSensitivity`
+    // parses.
+    const result = AssistantConfigSchema.parse({
+      calls: {
+        safety: { denyCategories: ["spam"] },
+        voice: { interruptSensitivity: "high" },
+      },
+    });
+    expect(result.calls).not.toHaveProperty("safety");
+    expect(result.calls.voice).not.toHaveProperty("interruptSensitivity");
+  });
+
   test("language is no longer part of the voice config schema", () => {
-    // The retired knob was read by nothing; Zod strips the unrecognized key
-    // so persisted configs that still carry it keep parsing.
+    // Zod strips the unrecognized key, so persisted configs that still carry
+    // it parse.
     const result = AssistantConfigSchema.parse({
       calls: { voice: { language: "es-ES" } },
     });
@@ -2573,7 +2633,6 @@ describe("loadConfig with schema validation", () => {
     expect(config.calls.maxDurationSeconds).toBe(3600);
     expect(config.calls.userConsultTimeoutSeconds).toBe(120);
     expect(config.calls.disclosure.enabled).toBe(true);
-    expect(config.calls.safety.denyCategories).toEqual([]);
     expect(
       (config.calls.voice as Record<string, unknown>).language,
     ).toBeUndefined();

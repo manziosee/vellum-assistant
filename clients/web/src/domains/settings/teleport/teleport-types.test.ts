@@ -2,8 +2,8 @@ import { describe, expect, it } from "bun:test";
 
 import {
   classifyHosting,
-  destinationDescription,
-  destinationLabel,
+  destinationDescriptionKey,
+  destinationLabelKey,
   parseVersionMismatch,
   resolveDestination,
 } from "./teleport-types";
@@ -41,11 +41,50 @@ describe("resolveDestination", () => {
 });
 
 describe("destination copy", () => {
-  it("has a label and description for each destination", () => {
-    for (const dest of ["docker", "platform", "local"] as const) {
-      expect(destinationLabel(dest).length).toBeGreaterThan(0);
-      expect(destinationDescription(dest).length).toBeGreaterThan(0);
-    }
+  it("uses macOS description keys by default", () => {
+    expect(
+      (["docker", "platform", "local"] as const).map((destination) =>
+        destinationDescriptionKey(destination),
+      ),
+    ).toEqual([
+      "teleportCard.dockerDescriptionMacos",
+      "teleportCard.platformDescription",
+      "teleportCard.localDescriptionMacos",
+    ]);
+  });
+
+  it("uses Windows description keys for local desktop destinations", () => {
+    expect(
+      (["docker", "platform", "local"] as const).map((destination) =>
+        destinationDescriptionKey(destination, "windows"),
+      ),
+    ).toEqual([
+      "teleportCard.dockerDescriptionWindows",
+      "teleportCard.platformDescription",
+      "teleportCard.localDescriptionWindows",
+    ]);
+  });
+
+  it("uses Linux description keys for local desktop destinations", () => {
+    expect(
+      (["docker", "platform", "local"] as const).map((destination) =>
+        destinationDescriptionKey(destination, "linux"),
+      ),
+    ).toEqual([
+      "teleportCard.dockerDescriptionLinux",
+      "teleportCard.platformDescription",
+      "teleportCard.localDescriptionLinux",
+    ]);
+  });
+
+  it("maps each destination to its action label key", () => {
+    expect(
+      (["docker", "platform", "local"] as const).map(destinationLabelKey),
+    ).toEqual([
+      "teleportCard.moveToDocker",
+      "teleportCard.moveToPlatform",
+      "teleportCard.moveToLocal",
+    ]);
   });
 });
 

@@ -45,7 +45,8 @@ export interface ApprovalInterceptionParams {
   assistantId: string;
   approvalCopyGenerator?: ApprovalCopyGenerator;
   approvalConversationGenerator?: ApprovalConversationGenerator;
-  /** Original approval message timestamp (Slack ts) for editing after resolution. */
+  /** Id of the channel message holding the approval buttons (Slack ts,
+   * Telegram message id), for editing the card after resolution. */
   approvalMessageId?: string;
 }
 
@@ -79,11 +80,6 @@ export async function handleApprovalInterception(
     approvalConversationGenerator,
     approvalMessageId,
   } = params;
-
-  // Slack emoji reactions are handled by the guardian decision
-  // pipeline (`routeGuardianReply`), invoked from the inbound reaction stage:
-  // it resolves the target request from the reacted card's delivery record.
-  // See `guardian-reply-router.ts`.
 
   // ── Standard approval interception (existing flow) ──
   const pendingPrompt = getChannelApprovalPrompt(conversationId);
@@ -242,7 +238,7 @@ export async function handleApprovalInterception(
             "Callback request ID does not match any pending interaction, ignoring stale button press",
           );
 
-          // Edit the original Slack approval message to remove stale buttons
+          // Edit the original approval message to remove stale buttons
           if (approvalMessageId) {
             editStaleApprovalMessage({
               replyCallbackUrl,
@@ -260,8 +256,10 @@ export async function handleApprovalInterception(
       const result = await handleChannelDecision(conversationId, cbDecision);
 
       if (result.applied) {
-        // Edit the original Slack approval message to show the decision
-        // and remove stale action buttons.
+        // Edit the original approval message to show the decision and drop
+        // its action buttons. Routed by the callback URL through the channel
+        // edit capability; a transport without edit declines, so this is
+        // safe to attempt on every channel.
         if (approvalMessageId) {
           const decisionOutcome: "approved" | "denied" =
             cbDecision.action === "reject" ? "denied" : "approved";
@@ -276,7 +274,7 @@ export async function handleApprovalInterception(
           }).catch((err) => {
             log.error(
               { err, conversationId, messageTs: approvalMessageId },
-              "Failed to edit Slack approval message after decision",
+              "Failed to edit approval message after decision",
             );
           });
         }
@@ -287,8 +285,8 @@ export async function handleApprovalInterception(
       }
 
       // Race condition: request was already resolved between the stale check
-      // above and the decision attempt.
-      // Edit the original Slack approval message to remove stale buttons
+      // above and the decision attempt. Edit the original approval message to
+      // remove stale buttons
       if (approvalMessageId) {
         editStaleApprovalMessage({
           replyCallbackUrl,
@@ -299,6 +297,30 @@ export async function handleApprovalInterception(
         });
       }
 
+      return { handled: true, type: "stale_ignored" };
+    }
+
+    // An approval callback that names no approval action is a button press
+    // the daemon does not serve (an id outside the decision vocabulary, or an
+    // answer token aimed at a card this rail does not resolve). It is never
+    // text: the channel normalizers copy callback data into `content`, so
+    // letting it fall through would hand the raw callback to the
+    // conversational and natural-language parsers, which can read a token
+    // like `approve_always` as an approval. Consume it as a stale button.
+    if (callbackData.startsWith("apr:")) {
+      log.warn(
+        { conversationId, callbackData },
+        "Approval callback carries no approval action, ignoring stale button press",
+      );
+      if (approvalMessageId) {
+        editStaleApprovalMessage({
+          replyCallbackUrl,
+          chatId: conversationExternalId,
+          messageId: approvalMessageId,
+          assistantId,
+          conversationId,
+        });
+      }
       return { handled: true, type: "stale_ignored" };
     }
   }
@@ -368,7 +390,7 @@ export async function handleApprovalInterception(
 }
 
 // ---------------------------------------------------------------------------
-// Slack approval message edit helper
+// Approval message edit helper
 // ---------------------------------------------------------------------------
 
 /**
@@ -399,7 +421,7 @@ function editStaleApprovalMessage(params: {
         conversationId: params.conversationId,
         messageId: params.messageId,
       },
-      "Failed to edit stale Slack approval message",
+      "Failed to edit stale approval message",
     );
   });
 }

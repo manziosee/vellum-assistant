@@ -410,7 +410,7 @@ This document enumerates every observed communication permutation between the th
 
 - **Protocol:** `ipc-unix-ndjson`
 - **Auth:** none (local socket)
-- **Description:** Assistant reads auto-approve threshold configuration from the gateway via IPC (get_global_thresholds, get_conversation_threshold methods).
+- **Description:** Assistant reads auto-approve threshold configuration via gateway IPC (get_global_thresholds, get_conversation_threshold, get_contact_threshold). Contact ceiling writes use gateway IPC set_contact_threshold from the gateway contacts CLI, or POST /v1/contacts.
 
 **Caller files:**
 - `assistant/src/permissions/gateway-threshold-reader.ts`
@@ -439,13 +439,13 @@ This document enumerates every observed communication permutation between the th
 
 - **Protocol:** `unix-socket-ndjson`
 - **Auth:** none (bootstrap socket)
-- **Description:** Assistant connects to the CES sidecar's bootstrap Unix socket (CES_BOOTSTRAP_SOCKET) for RPC in managed/Docker mode.
+- **Description:** Assistant connects to the CES sidecar's bootstrap Unix socket (CES_BOOTSTRAP_SOCKET_DIR) for RPC in managed/Docker mode.
 
 **Caller files:**
 - `assistant/src/credential-execution/process-manager.ts`
 
 **Callee files:**
-- `credential-executor/src/managed-main.ts`
+- `credential-executor/src/main.ts`
 - `credential-executor/src/server.ts`
 
 ### CES credential CRUD (HTTP)

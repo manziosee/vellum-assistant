@@ -169,19 +169,154 @@ whichever Swift channel you have around.
     deletes a file still in use, including one from a second Vellum build
     sharing at the same time.
 
-- **Downloads** (`src/main/downloads.ts`). The counterpart intent to the Share
-  Sheet. The renderer downloads the browser way (`saveFile` → an `<a download>`
-  click), which Chromium raises as a `will-download` on the default session.
-  Without a handler Electron falls back to its default routine and prompts a
-  Save panel for every download, so this picks the save path itself:
-  `~/Downloads`, uniquified Finder-style (`report.pdf`, `report (1).pdf`) so a
-  repeat download never clobbers an existing file, then a Dock Downloads-stack
-  bounce via `app.dock.downloadFinished` on completion. `setSavePath` is only
-  honored while the `will-download` listener is on the stack, hence the
-  synchronous `existsSync` collision check rather than the `node:fs/promises`
-  style used elsewhere in the main process. Any failure (unwritable directory,
-  no free name) simply skips `setSavePath` and lets Electron's Save panel take
-  over.
+- **Downloads** (`@vellumai/electron-desktop`'s `downloads.ts`, shared with the
+  Windows shell). The counterpart intent to the Share Sheet. The renderer
+  downloads the browser way (`saveFile` → an `<a download>` click), which
+  Chromium raises as a `will-download` on the default session. Without a
+  handler Electron falls back to its default routine and prompts a Save panel
+  for every download, so this picks the save path itself: `~/Downloads`,
+  uniquified Finder-style (`report.pdf`, `report (1).pdf`) so a repeat download
+  never clobbers an existing file. On each terminal state the originating
+  window is sent a `DownloadDoneEvent` (`vellum:downloads:done`), which the
+  renderer surfaces as a completion toast whose "Show in Finder" action calls
+  back over `vellum:downloads:reveal` with the event's opaque id. Main
+  resolves the id to the saved path itself, so the channel can only reveal
+  files this handler saved. The Dock Downloads-stack still bounces via
+  `app.dock.downloadFinished` on completion. `setSavePath` is only honored
+  while the `will-download` listener is on the stack, hence the synchronous
+  `existsSync` collision check rather than the `node:fs/promises` style used
+  elsewhere in the main process. Any failure (unwritable directory, no free
+  name) simply skips `setSavePath` and lets Electron's Save panel take over.
+
+## Native notifier
+
+**What:** `native/notifier/` is an Objective-C++ Node addon that posts
+notifications through `UNUserNotificationCenter` directly. When a notification
+carries a sender avatar it donates an `INSendMessageIntent` and updates the
+content with it, so macOS renders the Communication Notification treatment: the
+assistant's avatar as the icon with the app icon badged in the corner, the
+assistant's name on line one, the conversation title on line two. Electron
+exposes no intent API, so this is the only path to that layout.
+
+`src/main/notifier.ts` loads the addon (`process.dlopen`, inside a try/catch)
+and `src/main/native-notifications.ts` adapts it to the `create` /
+`isSupported` seams of `@vellumai/electron-desktop/notifications`. A checkout
+with no built addon reports unavailable and the app falls back to Electron's
+own notifications, and so does an addon that loads but answers
+`isSupported()` with false, which is what an unbundled run does because
+`UNUserNotificationCenter` raises there. Set
+`VELLUM_DISABLE_NATIVE_NOTIFIER=1` to force that fallback in a build that
+would otherwise use the addon.
+
+**Which notifications the addon posts.** The addon posts only notifications
+that carry a sender; everything else uses Electron's presenter, through the
+shared `createElectronNotification`. The avatar is the one thing the addon
+renders that Electron cannot, and the renderer attaches a sender only under the
+`push-avatar-sender` flag, so turning that flag off restores Electron as the
+delivery path for every notification without shipping a new build.
+
+The sender is process-local prepared state, not a value reconstructed in the
+preload or main process. The renderer supplies it only when the prepared scope,
+assistant, and native sender id exactly match the selected notification
+identity. A name or conversation title is presentation data and never becomes
+sender identity. The optional preload field preserves compatibility with older
+packaged shells;
+missing support and native unavailability take the existing plain Electron
+path. `local-notification-avatar` does not select the Electron sender route.
+
+**Permission confirmation.** Under `push-avatar-sender`, the notifications
+permission flow captures the exact selected identity before prompting. After a
+grant, it revalidates that identity and the prepared in-memory avatar, then asks
+the native notifier for one confirmation. Stale or missing identity, missing
+avatar resolution, or unavailable native support posts the confirmation
+plainly. Denied or unknown permission posts no confirmation. A confirmation
+failure does not change a granted permission result. Windows does not receive
+a sender through this permission-confirmation path.
+
+Packaged sender, fallback, and permission evidence is tracked in the canonical
+[notification avatar and local delivery QA ledger](../../docs/notification-avatar-local-qa.md).
+
+Notification categories carry the action buttons, and
+`setNotificationCategories:` applies asynchronously, so a category first
+registered in the runloop turn its notification is posted can miss it and the
+buttons never render. `src/main/index.ts` registers every action set through
+`registerCategories` at startup instead, deriving the set from the shared
+`NOTIFICATION_CATEGORIES` and `CATEGORY_ACTIONS` pair so it covers every set
+the app can post, and the addon unions its own set with whatever the
+notification center already holds rather than replacing it. That union is a
+read-modify-write, and Electron's own post path does the same one under no
+shared lock, so the addon re-reads what landed and re-applies once when its
+categories were written over. An identifier that
+is still unregistered when a notification is posted cannot be repaired in that
+same runloop turn, so the notification goes out with no category and the
+`shown` event carries the reason.
+
+**Delegate rule.** Electron's `NotificationPresenterMac` claims
+`UNUserNotificationCenter.currentNotificationCenter.delegate` the moment it is
+constructed, which `new Notification()`, `Notification.isSupported()`, and the
+renderer's Web Notification API all do. Three consequences:
+
+- The client must pass `isSupported` to `configureNotifications` alongside
+  `create`. The shared module otherwise falls back to
+  `electron.Notification.isSupported()`, and that call alone builds the
+  presenter, at whatever moment the first notification arrives.
+- The notifications permission probe in `src/main/permissions-service.ts` goes
+  through the addon's `requestAuthorization()` whenever the addon is loaded.
+  Constructing an `electron.Notification` there hands the presenter the
+  delegate and strands clicks on notifications already on screen.
+- The addon installs its own delegate, holds a strong reference to the one it
+  displaced, and forwards every response it does not own there. Electron's
+  presenter discards responses for identifiers it does not own, so the addon
+  has to be in front of it before anything the addon posted can be clicked:
+  `src/main/index.ts` builds Electron's presenter deliberately at startup, with
+  nothing on screen, then calls the addon's `ensureDelegate()`, which leaves the
+  addon's proxy in front and Electron's presenter as the delegate it forwards
+  to for the life of the process. `show`, `requestAuthorization`, and every
+  sender-less post through Electron re-assert it too. `restoreDelegate()` hands
+  the seat back at `before-quit`.
+
+**Rebuild:**
+
+```sh
+bash scripts/build-notifier.sh   # also runs as part of `bun run setup` and `bun run pack`
+```
+
+It compiles against the headers for the Electron version pinned in
+`package.json` and writes `resources/notifier/<arch>/vellum-notifier.node`,
+which `electron-builder` packs to `bin/notifier/` and `scripts/afterSign.js`
+re-signs with `inherit.plist`. `ELECTRON_TARGET_ARCH` picks the architecture,
+defaulting to the host's so a local `bun run setup` on any Mac builds an addon
+that machine's Electron can load. `pack.sh` exports the variable (arm64 unless
+it is already set, the same default `electron-builder.config.cjs` uses), so a
+pack builds the addon for the app it is packaging rather than for the builder.
+The script fails when the compiled slice is
+not the one that was asked for, and `afterSign.js` fails again when the packed
+addon is not the architecture being packaged, because a mismatched addon does
+not load and the app quietly falls back to plain notifications.
+
+**Provisioning profile switch.** `com.apple.developer.usernotifications.communication`
+is a restricted entitlement: an app declaring it without an authorizing
+provisioning profile is killed at launch. `electron-builder.config.cjs` sets
+`mac.provisioningProfile` only when `VELLUM_MAC_PROVISIONING_PROFILE` names a
+profile that exists on disk, and throws when the variable is set to a file that
+is not there rather than quietly signing the plain entitlements under a name
+that says otherwise. The release workflows decode one there from the
+`MAC_PROVISIONING_PROFILE` secret, then assert with `PlistBuddy` that its
+entitlements grant `com.apple.developer.usernotifications.communication` and
+that its `application-identifier` ends with the bundle id the environment
+packs, before exporting the variable. An unset secret is a warning saying the
+native notifier ships disabled.
+
+That build signs with an entitlements plist derived at pack time by
+`scripts/entitlements/derive-communication-entitlements.js`, which reads
+`scripts/entitlements/app.plist`, adds the one restricted key, and writes
+`build/entitlements/app-communication.plist` (gitignored), so `app.plist` stays
+the only place the entitlement set is edited. `scripts/afterSign.js` re-signs
+the outer app with whatever electron-builder was configured with, read back off
+`context.packager.platformSpecificBuildOptions`, so the two passes cannot
+disagree. Every other build signs with `app.plist` itself, the intent path
+fails closed inside `contentByUpdatingWithProvider:`, and notifications post
+plainly.
 
 ## Scripts
 
@@ -271,9 +406,12 @@ The preload script exposes a typed `window.vellum` API to the renderer:
   transport seam is [`clients/web/src/runtime/local-mode-host.ts`](../web/src/runtime/local-mode-host.ts),
   which selects this bridge on Electron and the dev-server `/assistant/__local/*`
   middleware on web/dev so both hosts honor the same contract.
-- `helper.hotkey.fnPushToTalk(enable)` — starts or stops the native helper
-  that captures the Fn key globally for Push to Talk, with
-  `helper.hotkey.onEvent(callback)` streaming `down` / `up` notifications.
+- `helper.hotkey.setModifierHold(hold)` points the native helper at the
+  modifier set the voice key rides on (Fn by default), watched globally as a
+  hold. `helper.hotkey.onEvent(callback)` streams its `down` / `up` edges, and
+  the `up` says why it closed, which is how the renderer tells a hold from a
+  double tap. `helper.hotkey.readFrontSelection()` reads what is highlighted
+  in the application in front, which a hold asks for once it has armed.
 - `helper.ping()` — health-checks the native helper over JSON-RPC stdio.
 - `auth.*` — typed stubs that reject with "not implemented yet" until the
   corresponding feature tickets land.

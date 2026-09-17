@@ -1,11 +1,10 @@
 /**
  * Tests for the browser live-voice WebSocket client.
  *
- * `mintVelayWsToken` is mocked at module scope so no real HTTP/SDK call
- * happens; `buildLiveVoiceWsUrl` is kept real so we exercise the genuine
- * connection.ts URL builder (no hardcoded host in the client). The WebSocket is
- * a hand-rolled fake injected via the client's `webSocketFactory` option — no
- * global patching needed.
+ * `resolveLiveVoiceWsUrl` is mocked at module scope to compose the velay URL
+ * the client would dial, so no real HTTP/SDK call happens. The WebSocket is a
+ * hand-rolled fake injected via the client's `webSocketFactory` option, so no
+ * global patching is needed.
  *
  * Coverage: start-frame on open, every server frame -> typed event, binary
  * audio passthrough, connect timeout when no `ready`, `busy` handling, mint
@@ -144,6 +143,7 @@ async function connectAndGetSocket(
     turnDetection?: "manual" | "server_vad";
     silenceThresholdMs?: number;
     bargeInMinSpeechMs?: number;
+    entry?: "companion";
   } = { assistantId: "assistant-1" },
 ): Promise<FakeWebSocket> {
   await client.connect(args);
@@ -200,6 +200,9 @@ describe("connect", () => {
       {
         type: "start",
         client: "web",
+        textInput: true,
+        sessionControls: ["end", "mute"],
+        lookFrames: true,
         audio: { mimeType: "audio/pcm", sampleRate: 16000, channels: 1 },
         conversationId: "conv-xyz",
       },
@@ -213,8 +216,24 @@ describe("connect", () => {
     expect(ws.sentJson[0]).toEqual({
       type: "start",
       client: "web",
+      textInput: true,
+      sessionControls: ["end", "mute"],
+      lookFrames: true,
       audio: { mimeType: "audio/pcm", sampleRate: 16000, channels: 1 },
     });
+  });
+
+  test("the start frame advertises textInput so a text-only session can open", async () => {
+    // The daemon decides whether to degrade a session whose speech-to-text leg
+    // is missing by reading this off the start frame, before `ready`. Without
+    // it that session is refused outright with `credentials_unavailable` and
+    // the text-only fallback is unreachable from this client.
+    const ws = await connectAndGetSocket(makeClient());
+    ws.open();
+
+    expect(ws.sentJson[0]).toMatchObject({ type: "start", textInput: true });
+    // Every surface this client runs on can end and mute when asked out loud.
+    expect(ws.sentJson[0]).toMatchObject({ sessionControls: ["end", "mute"] });
   });
 
   test("reports the detected OS surface as the start frame's client", async () => {
@@ -229,6 +248,16 @@ describe("connect", () => {
     expect(ws.sentJson[0]).toMatchObject({ client: "web" });
   });
 
+  test("sends the entry point on the start frame when given", async () => {
+    const ws = await connectAndGetSocket(makeClient(), {
+      assistantId: "assistant-1",
+      entry: "companion",
+    });
+    ws.open();
+
+    expect(ws.sentJson[0]).toMatchObject({ type: "start", entry: "companion" });
+  });
+
   test("includes turnDetection in the start frame when provided", async () => {
     const ws = await connectAndGetSocket(makeClient(), {
       assistantId: "assistant-1",
@@ -239,6 +268,9 @@ describe("connect", () => {
       {
         type: "start",
         client: "web",
+        textInput: true,
+        sessionControls: ["end", "mute"],
+        lookFrames: true,
         audio: { mimeType: "audio/pcm", sampleRate: 16000, channels: 1 },
         turnDetection: "server_vad",
       },
@@ -257,6 +289,9 @@ describe("connect", () => {
       {
         type: "start",
         client: "web",
+        textInput: true,
+        sessionControls: ["end", "mute"],
+        lookFrames: true,
         audio: { mimeType: "audio/pcm", sampleRate: 16000, channels: 1 },
         turnDetection: "server_vad",
         silenceThresholdMs: 1500,
@@ -295,7 +330,7 @@ describe("connect", () => {
 // ---------------------------------------------------------------------------
 
 describe("server frame dispatch", () => {
-  async function ready(): Promise<{
+  async function ready(extra: Record<string, unknown> = {}): Promise<{
     client: LiveVoiceChannelClientType;
     ws: FakeWebSocket;
   }> {
@@ -307,6 +342,7 @@ describe("server frame dispatch", () => {
       seq: 1,
       sessionId: "s1",
       conversationId: "c1",
+      ...extra,
     });
     return { client, ws };
   }
@@ -525,6 +561,242 @@ describe("server frame dispatch", () => {
     ]);
   });
 
+  test("sightFrame shares a kept camera frame while the session is active", async () => {
+    const { client, ws } = await ready();
+
+    expect(client.sightFrame("att-1")).toBe(true);
+    expect(ws.sentJson.at(-1)).toEqual({
+      type: "sight_frame",
+      attachmentId: "att-1",
+    });
+  });
+
+  test("sightFrame carries the frame's timing when it has one", async () => {
+    const { client, ws } = await ready();
+    const timing = {
+      reason: "forced",
+      armToKeepMs: 40,
+      keepToEncodedMs: 30,
+      encodedToUploadedMs: 200,
+      uploadedToSentMs: 0,
+      bytes: 12345,
+    };
+
+    expect(client.sightFrame("att-1", timing)).toBe(true);
+    expect(ws.sentJson.at(-1)).toEqual({
+      type: "sight_frame",
+      attachmentId: "att-1",
+      timing,
+    });
+  });
+
+  test("a rejected sight_frame is a routine drop, not a settings or session error", async () => {
+    // The daemon reclaims the attachment on the path that sends this, so there
+    // is nothing to retry and nothing to give back. What matters is where the
+    // rejection does NOT land: an `unknown_type` from a stale build must not
+    // latch config updates off, and the recoverable refusal must not reach the
+    // controller, which would return a hands-free session to `listening`
+    // mid-turn over a frame nobody asked to send.
+    const { client, ws } = await ready();
+    const errors: unknown[] = [];
+    client.on("error", (e) => errors.push(e));
+
+    client.sightFrame("att-1");
+    const sentAfterFrame = ws.sentJson.length;
+    ws.receive({
+      type: "error",
+      seq: 10,
+      code: "invalid_frame",
+      message: "Could not attach that camera frame to the conversation.",
+      frameType: "sight_frame",
+      recoverable: true,
+    });
+    ws.receive({
+      type: "error",
+      seq: 11,
+      code: "unknown_type",
+      message: "Unknown live voice client frame type: sight_frame",
+      frameType: "sight_frame",
+    });
+
+    expect(errors).toEqual([]);
+    expect(ws.closed).toBe(false);
+    // No retry: the client says nothing back, so the id is never reused.
+    expect(ws.sentJson.length).toBe(sentAfterFrame);
+    // The settings frame is untouched: neither rejection was about it.
+    client.updateConfig({ silenceThresholdMs: 1600 });
+    expect(ws.sentJson.length).toBe(sentAfterFrame + 1);
+  });
+
+  test("an unknown_type sight_frame rejection is reported as unsupported", async () => {
+    // What an assistant with no handler answers: the frame type fails the
+    // known-types check ahead of the validation switch, so the code is
+    // `unknown_type` and the attribution names the frame that failed.
+    const { client, ws } = await ready();
+    const refusals: unknown[] = [];
+    client.on("sightFrameRejected", (r) => refusals.push(r));
+
+    client.sightFrame("att-1");
+    ws.receive({
+      type: "error",
+      seq: 10,
+      code: "unknown_type",
+      message: "Unknown live voice client frame type: sight_frame",
+      frameType: "sight_frame",
+    });
+
+    expect(refusals).toEqual([{ unsupported: true, attachmentId: null }]);
+  });
+
+  test("a recoverable sight_frame rejection is reported as a routine drop", async () => {
+    // What an assistant that DOES understand the frame answers for one keep it
+    // could not persist. It reclaims that attachment itself, so the session
+    // must not treat this as a reason to stop sending.
+    const { client, ws } = await ready();
+    const refusals: unknown[] = [];
+    client.on("sightFrameRejected", (r) => refusals.push(r));
+
+    client.sightFrame("att-1");
+    ws.receive({
+      type: "error",
+      seq: 10,
+      code: "invalid_frame",
+      message: "Could not attach that camera frame to the conversation.",
+      frameType: "sight_frame",
+      recoverable: true,
+    });
+
+    expect(refusals).toEqual([{ unsupported: false, attachmentId: null }]);
+  });
+
+  test("a sight_frame rejection carries the attachment id when echoed", async () => {
+    // Optional on the wire and absent from every assistant at the version
+    // floor. When present it is what makes a refusal correlatable to its keep.
+    const { client, ws } = await ready();
+    const refusals: unknown[] = [];
+    client.on("sightFrameRejected", (r) => refusals.push(r));
+
+    client.sightFrame("att-7");
+    ws.receive({
+      type: "error",
+      seq: 10,
+      code: "invalid_frame",
+      message: "Could not attach that camera frame to the conversation.",
+      frameType: "sight_frame",
+      attachmentId: "att-7",
+      recoverable: true,
+    });
+
+    expect(refusals).toEqual([{ unsupported: false, attachmentId: "att-7" }]);
+  });
+
+  test("sendText refuses when the assistant did not echo textInput", async () => {
+    // The gate that keeps an `unknown_type` rejection from ever happening: an
+    // assistant predating typed turns rejects the frame identically to
+    // `update_config`, which would latch in-session settings off.
+    const { client, ws } = await ready();
+    const sentBefore = ws.sentJson.length;
+
+    expect(client.supportsTextInput).toBe(false);
+    expect(client.sendText("hello")).toBe(false);
+    expect(ws.sentJson.length).toBe(sentBefore);
+  });
+
+  test("sendText sends a text frame when the assistant echoed textInput", async () => {
+    const { client, ws } = await ready({ textInput: true });
+
+    expect(client.supportsTextInput).toBe(true);
+    expect(client.sendText("what is on my calendar")).toBe(true);
+    expect(ws.sentJson.at(-1)).toEqual({
+      type: "text",
+      text: "what is on my calendar",
+    });
+  });
+
+  test("sendText marks a turn hidden only when asked", async () => {
+    const { client, ws } = await ready({ textInput: true });
+
+    expect(client.sendText("an automatic greeting", { hidden: true })).toBe(
+      true,
+    );
+    expect(ws.sentJson.at(-1)).toEqual({
+      type: "text",
+      text: "an automatic greeting",
+      hidden: true,
+    });
+
+    // Omitted rather than `hidden: false`, so a turn the user typed is
+    // byte-identical on the wire to one from a client predating the field.
+    expect(client.sendText("typed by hand", { hidden: false })).toBe(true);
+    expect(ws.sentJson.at(-1)).toEqual({
+      type: "text",
+      text: "typed by hand",
+    });
+  });
+
+  test("sendText trims and refuses an empty turn", async () => {
+    const { client, ws } = await ready({ textInput: true });
+
+    expect(client.sendText("   \n  ")).toBe(false);
+    expect(client.sendText("  padded  ")).toBe(true);
+    expect(ws.sentJson.at(-1)).toEqual({ type: "text", text: "padded" });
+  });
+
+  test("a text-attributed error does not latch config updates off", async () => {
+    // The daemon refuses a typed turn sent mid-reply with a recoverable error
+    // carrying frameType "text". Falling through to the unattributed
+    // `unknown_type` fallback would silently disable the voice-room settings
+    // for the rest of the session.
+    const { client, ws } = await ready({ textInput: true });
+    const errors: unknown[] = [];
+    const rejections: unknown[] = [];
+    client.on("error", (e) => errors.push(e));
+    client.on("textTurnRejected", (r) => rejections.push(r));
+
+    ws.receive({
+      type: "error",
+      seq: 10,
+      code: "invalid_frame",
+      message: "The assistant is busy with the current turn. Send again.",
+      frameType: "text",
+      recoverable: true,
+    });
+
+    // Not surfaced as a session error: the session is fine.
+    expect(errors).toEqual([]);
+    // But surfaced as a typed-turn rejection, which is the only signal a
+    // composer gets that the turn it believed it sent will never be answered.
+    expect(rejections).toEqual([
+      {
+        reason: "busy",
+        message: "The assistant is busy with the current turn. Send again.",
+      },
+    ]);
+    // And settings still work.
+    const sentBefore = ws.sentJson.length;
+    client.updateConfig({ silenceThresholdMs: 1400 });
+    expect(ws.sentJson.length).toBe(sentBefore + 1);
+  });
+
+  test("an unknown_type text rejection reports unsupported, not busy", async () => {
+    // Reachable only if the sendText gate is bypassed, and the two mean
+    // different things to a caller: busy can simply be resent, unsupported
+    // never will be.
+    const { client, ws } = await ready({ textInput: true });
+    const rejections: { reason: string }[] = [];
+    client.on("textTurnRejected", (r) => rejections.push(r));
+
+    ws.receive({
+      type: "error",
+      seq: 11,
+      code: "unknown_type",
+      message: "Unknown live voice client frame type: text",
+      frameType: "text",
+    });
+
+    expect(rejections.map((r) => r.reason)).toEqual(["unsupported"]);
+  });
+
   test("recoverable error frame emits the error but keeps the session alive", async () => {
     const { client, ws } = await ready();
     const errors: {
@@ -648,6 +920,9 @@ describe("sendAudio", () => {
       {
         type: "start",
         client: "web",
+        textInput: true,
+        sessionControls: ["end", "mute"],
+        lookFrames: true,
         audio: { mimeType: "audio/pcm", sampleRate: 16000, channels: 1 },
       },
     ]);
@@ -708,6 +983,9 @@ describe("control frames", () => {
       {
         type: "start",
         client: "web",
+        textInput: true,
+        sessionControls: ["end", "mute"],
+        lookFrames: true,
         audio: { mimeType: "audio/pcm", sampleRate: 16000, channels: 1 },
       },
     ]);

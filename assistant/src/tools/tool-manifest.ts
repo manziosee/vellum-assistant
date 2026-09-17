@@ -12,6 +12,7 @@ import {
   rememberTool,
 } from "../plugins/defaults/memory/tools.js";
 import { askQuestionTool } from "./ask-question/ask-question-tool.js";
+import { reactToMessageTool } from "./channel/react-to-message.js";
 import { fileEditTool } from "./filesystem/edit.js";
 import { fileListTool } from "./filesystem/list.js";
 import { fileReadTool } from "./filesystem/read.js";
@@ -24,6 +25,7 @@ import { hostFileWriteTool } from "./host-filesystem/write.js";
 import { hostShellTool } from "./host-terminal/host-shell.js";
 import { webFetchTool } from "./network/web-fetch.js";
 import { webSearchTool } from "./network/web-search.js";
+import { sendUserMessageTool } from "./send-user-message/send-user-message-tool.js";
 import { skillExecuteTool } from "./skills/execute.js";
 import { skillLoadTool } from "./skills/load.js";
 import { notifyParentTool } from "./subagent/notify-parent.js";
@@ -35,6 +37,7 @@ import {
   uiShowTool,
   uiUpdateTool,
 } from "./ui-surface/definitions.js";
+import { watchRetroReportTool } from "./watch/watch-retro-report.js";
 
 // ── Explicit tool instances ─────────────────────────────────────────
 // Core tools registered by initializeTools(). Tool modules only export
@@ -65,6 +68,8 @@ export const explicitTools: ToolDefinition[] = [
   deleteMemoryPageTool,
   notifyParentTool,
   askQuestionTool,
+  reactToMessageTool,
+  sendUserMessageTool,
   hostFileReadTool,
   hostFileWriteTool,
   hostFileEditTool,
@@ -73,4 +78,5 @@ export const explicitTools: ToolDefinition[] = [
   uiShowTool,
   uiUpdateTool,
   uiDismissTool,
+  watchRetroReportTool,
 ];

@@ -21,16 +21,24 @@ import type { AvatarState } from "@/types/avatar";
 import { isAvatarState } from "@/types/avatar";
 
 import {
-  fetchAvatarImageUrl,
+  fetchAvatarImageUrlResult,
   fetchAvatarState,
+  fetchCharacterTraitsResult,
   uploadAvatarImage,
 } from "./avatar-api";
 
+const CHARACTER_TRAITS = {
+  bodyShape: "round",
+  eyeStyle: "happy",
+  color: "#123456",
+};
+
 const CHARACTER_STATE: AvatarState = {
   kind: "character",
-  traits: { bodyShape: "round", eyeStyle: "happy", color: "#123456" },
+  traits: CHARACTER_TRAITS,
   source: "builder",
   image: null,
+  accent: null,
 };
 
 const IMAGE_STATE: AvatarState = {
@@ -38,6 +46,7 @@ const IMAGE_STATE: AvatarState = {
   traits: null,
   source: "upload",
   image: { updatedAt: "2026-05-29T00:00:00Z", etag: "abc123" },
+  accent: null,
 };
 
 const NONE_STATE: AvatarState = {
@@ -45,6 +54,7 @@ const NONE_STATE: AvatarState = {
   traits: null,
   source: null,
   image: null,
+  accent: null,
 };
 
 describe("isAvatarState", () => {
@@ -182,7 +192,7 @@ describe("fetchAvatarState", () => {
   });
 });
 
-describe("fetchAvatarImageUrl", () => {
+describe("fetchAvatarImageUrlResult", () => {
   const originalCreateObjectURL = URL.createObjectURL;
 
   afterEach(() => {
@@ -201,7 +211,7 @@ describe("fetchAvatarImageUrl", () => {
       response: okResponse(),
     });
 
-    const result = await fetchAvatarImageUrl("asst-1");
+    const result = await fetchAvatarImageUrlResult("asst-1");
 
     // Regression guard: the image must be fetched through the daemon client
     // (the instance spied on here), not the platform `api` client. The latter
@@ -214,25 +224,80 @@ describe("fetchAvatarImageUrl", () => {
     expect(captured?.path).toEqual({ assistant_id: "asst-1" });
     expect(captured?.query).toEqual({ path: "data/avatar/avatar-image.png" });
     expect(captured?.parseAs).toBe("blob");
-    expect(result).toBe("blob:avatar");
+    expect(result).toEqual({ status: "found", value: "blob:avatar" });
   });
 
-  test("returns null on a non-2xx response", async () => {
+  test("a 404 is absent, an authoritative answer", async () => {
     stubGet({
       data: undefined,
-      error: { detail: "boom" },
+      error: { detail: "missing" },
       response: errorResponse(404),
     });
 
-    expect(await fetchAvatarImageUrl("asst-1")).toBeNull();
+    expect(await fetchAvatarImageUrlResult("asst-1")).toEqual({
+      status: "absent",
+    });
   });
 
-  test("returns null on a transport throw", async () => {
+  test("any other non-2xx is failed", async () => {
+    stubGet({
+      data: undefined,
+      error: { detail: "boom" },
+      response: errorResponse(502),
+    });
+
+    expect(await fetchAvatarImageUrlResult("asst-1")).toEqual({
+      status: "failed",
+    });
+  });
+
+  test("a transport throw is failed", async () => {
     client.get = mock(() =>
       Promise.reject(new Error("network down")),
     ) as typeof client.get;
 
-    expect(await fetchAvatarImageUrl("asst-1")).toBeNull();
+    expect(await fetchAvatarImageUrlResult("asst-1")).toEqual({
+      status: "failed",
+    });
+  });
+});
+
+describe("fetchCharacterTraitsResult", () => {
+  test("a 404 is absent while a 5xx is failed", async () => {
+    stubGet({ data: undefined, error: {}, response: errorResponse(404) });
+    expect(await fetchCharacterTraitsResult("asst-1")).toEqual({
+      status: "absent",
+    });
+
+    stubGet({ data: undefined, error: {}, response: errorResponse(500) });
+    expect(await fetchCharacterTraitsResult("asst-1")).toEqual({
+      status: "failed",
+    });
+  });
+
+  test("a sidecar that does not parse as traits is absent", async () => {
+    stubGet({
+      data: { content: "not json" },
+      error: undefined,
+      response: okResponse(),
+    });
+
+    expect(await fetchCharacterTraitsResult("asst-1")).toEqual({
+      status: "absent",
+    });
+  });
+
+  test("a valid sidecar is found", async () => {
+    stubGet({
+      data: { content: JSON.stringify(CHARACTER_TRAITS) },
+      error: undefined,
+      response: okResponse(),
+    });
+
+    expect(await fetchCharacterTraitsResult("asst-1")).toEqual({
+      status: "found",
+      value: CHARACTER_TRAITS,
+    });
   });
 });
 

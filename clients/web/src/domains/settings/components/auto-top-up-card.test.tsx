@@ -18,6 +18,23 @@
  *    fires an update mutation.
  *  - A successful enable invalidates the daily-limit and billing summary
  *    queries so the daily-limit card picks up the server-applied default.
+ *  - Save while the org has no daily credit limit opens the daily-limit gate
+ *    instead of persisting; saving a limit there persists it and then the
+ *    auto-reload config, while declining leaves auto-reload off (dropping a
+ *    pending enable, or disabling a config that was already on). Save stays
+ *    disabled while the limit is unknown: until the lookup settles (a
+ *    refetch over cached data included), and after a failed lookup, which
+ *    shows a retry that unblocks it.
+ *  - Save and Disable both seed the config cache from a response that carries
+ *    no payment-method fields, so both carry the cached ones forward: the card
+ *    expiry and the saved billing address survive until the next GET.
+ *  - Both add-a-card gates open the same modal in the mode the config calls
+ *    for (the repeated-declines cutoff still has the declined card attached,
+ *    so it replaces) and seed it with the saved billing address.
+ *  - Both gates are disabled while a 3DS redirect return is still resolving,
+ *    so no second modal can stack on the one that outcome replays into.
+ *  - The modal's `onSavedOptimistic` resolves with the synced card, which is
+ *    what titles its success panel.
  *
  * Strategy: the render-only cases pre-populate the React Query cache so the
  * card's `useQuery` resolves synchronously — `renderToStaticMarkup` is
@@ -29,19 +46,58 @@
 
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  waitFor,
+} from "@testing-library/react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { MemoryRouter } from "react-router";
 
+import * as savedSyncModule from "@/domains/settings/hooks/use-payment-method-saved-poll";
+import type { SavedPaymentMethod } from "@/domains/settings/hooks/use-payment-method-saved-poll";
 import * as sdkGen from "@/generated/api/sdk.gen";
+import * as platformDetection from "@/runtime/platform-detection";
+import * as runtimeBrowser from "@/runtime/browser";
+import type { AutoTopUpPaymentMethodModalProps } from "@/domains/settings/components/auto-top-up-payment-method-modal";
 import type {
   AutoTopUpConfigResponse,
+  BillingAddress,
   DailyCreditLimitResponse,
 } from "@/generated/api/types.gen";
 
+let nativeAndroid = false;
+mock.module("@/runtime/platform-detection", () => ({
+  ...platformDetection,
+  useIsNativeAndroid: () => nativeAndroid,
+}));
+
+let openedUrl: string | null = null;
+mock.module("@/runtime/browser", () => ({
+  ...runtimeBrowser,
+  openUrl: (url: string) => {
+    openedUrl = url;
+    return Promise.resolve();
+  },
+}));
+
 let updateCalls: Array<Record<string, unknown>> = [];
 let retrieveResponse: AutoTopUpConfigResponse;
+// What the PUT answers with, when it differs from the GET: the real endpoint
+// skips the Stripe payment-method retrieve, so its payment-method fields come
+// back null.
+let updateResponse: AutoTopUpConfigResponse | null = null;
 let dailyLimitResponse: DailyCreditLimitResponse;
+// Stands in for the daily-limit GET when a test needs it to hang or fail.
+let dailyLimitRetrieve:
+  | (() => Promise<{ data: DailyCreditLimitResponse; response: unknown }>)
+  | null = null;
+let dailyLimitUpdateCalls: Array<Record<string, unknown>> = [];
+let disableCalls = 0;
+// When set, the disable request stays pending until the test releases it.
+let releaseDisable: (() => void) | null = null;
 
 mock.module("@/generated/api/sdk.gen", () => ({
   ...sdkGen,
@@ -49,13 +105,97 @@ mock.module("@/generated/api/sdk.gen", () => ({
   // `configure_top_up` deeplink must never trigger this on mount.
   organizationsBillingAutoTopUpUpdate: (opts: Record<string, unknown>) => {
     updateCalls.push(opts);
-    return Promise.resolve({ data: retrieveResponse, response: { ok: true } });
+    return Promise.resolve({
+      data: updateResponse ?? retrieveResponse,
+      response: { ok: true },
+    });
   },
   organizationsBillingAutoTopUpRetrieve: () =>
     Promise.resolve({ data: retrieveResponse, response: { ok: true } }),
+  // The real disable response only echoes the enabled bit, which is what makes
+  // the card seed the cache from `DISABLED_CONFIG` instead.
+  organizationsBillingAutoTopUpDisableCreate: () => {
+    disableCalls += 1;
+    const result = {
+      data: { enabled: false, stubbed: false, message: "" },
+      response: { ok: true },
+    };
+    if (releaseDisable === null) {
+      return Promise.resolve(result);
+    }
+    return new Promise((resolve) => {
+      releaseDisable = () => resolve(result);
+    });
+  },
   organizationsBillingDailyCreditLimitRetrieve: () =>
+    dailyLimitRetrieve?.() ??
     Promise.resolve({ data: dailyLimitResponse, response: { ok: true } }),
+  // The daily-limit gate's PUT. Mirrors the saved limit into the GET so the
+  // refetch the save triggers agrees with the seeded cache.
+  organizationsBillingDailyCreditLimitUpdate: (
+    opts: Record<string, unknown>,
+  ) => {
+    dailyLimitUpdateCalls.push(opts);
+    const body = (opts.body ?? {}) as { daily_credit_limit_usd: string | null };
+    dailyLimitResponse = {
+      ...dailyLimitResponse,
+      daily_credit_limit_usd: body.daily_credit_limit_usd,
+    };
+    return Promise.resolve({ data: dailyLimitResponse, response: { ok: true } });
+  },
 }));
+
+// The saved-card sync the card hands the modal as `onSavedOptimistic`. Mocked
+// so the confirm endpoint and its webhook-poll fallback stay out of these
+// tests; what matters here is that the card passes the sync's answer back.
+let syncCalls: Array<{ setupIntentId: string | null }> = [];
+let syncedCard: SavedPaymentMethod | null = null;
+mock.module("@/domains/settings/hooks/use-payment-method-saved-poll", () => ({
+  ...savedSyncModule,
+  usePaymentMethodSavedSync:
+    () => async (args: { setupIntentId: string | null }) => {
+      syncCalls.push(args);
+      return syncedCard;
+    },
+}));
+
+// Stub the Stripe setup modal: these tests assert only which mode, card on
+// file, and billing address each gate hands it.
+let pmModalProps: AutoTopUpPaymentMethodModalProps | null = null;
+mock.module(
+  "@/domains/settings/components/auto-top-up-payment-method-modal",
+  () => ({
+    AutoTopUpPaymentMethodModal: (props: AutoTopUpPaymentMethodModalProps) => {
+      pmModalProps = props;
+      return props.open ? <div data-testid="pm-modal-stub" /> : null;
+    },
+  }),
+);
+
+// The real confirm is a portalled dialog; a bare button keeps the disable path
+// reachable from a test.
+mock.module(
+  "@/domains/settings/components/auto-top-up-disable-confirm",
+  () => ({
+    AutoTopUpDisableConfirm: ({
+      open,
+      onConfirm,
+    }: {
+      open: boolean;
+      onConfirm: () => void;
+    }) =>
+      open ? (
+        <button data-testid="disable-confirm" onClick={onConfirm} />
+      ) : null,
+  }),
+);
+
+function lastPmModalProps(): AutoTopUpPaymentMethodModalProps {
+  if (pmModalProps == null) {
+    throw new Error("AutoTopUpPaymentMethodModal was never rendered");
+  }
+  return pmModalProps;
+}
 
 import {
   organizationsBillingAutoTopUpRetrieveQueryKey,
@@ -64,6 +204,8 @@ import {
 } from "@/generated/api/@tanstack/react-query.gen";
 
 const { AutoTopUpCard, DISABLED_CONFIG } = await import("./auto-top-up-card");
+const { useSetupIntentReturnStore } =
+  await import("@/domains/settings/setup-intent-return-store");
 
 function makeClient(config: AutoTopUpConfigResponse): QueryClient {
   const client = new QueryClient({
@@ -83,14 +225,16 @@ function makeClient(config: AutoTopUpConfigResponse): QueryClient {
 /**
  * Wrap the card in a QueryClientProvider (cache pre-seeded from `config` and
  * the current `dailyLimitResponse`) and a MemoryRouter at `route`, so both
- * `useQuery` and `useSearchParams` resolve. Pass `client` to observe the cache
- * from the test.
+ * `useQuery` and `useSearchParams` resolve. The mocked config GET answers
+ * with `config` too, so the mount-time refetch agrees with the seeded cache.
+ * Pass `client` to observe the cache from the test.
  */
 function wrap(
   config: AutoTopUpConfigResponse,
   route = "/",
   client: QueryClient = makeClient(config),
 ) {
+  retrieveResponse = config;
   return (
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[route]}>
@@ -124,16 +268,108 @@ const DISABLED_WITH_CARD: AutoTopUpConfigResponse = {
   payment_method_last4: "4242",
 };
 
+const BILLING_ADDRESS: BillingAddress = {
+  line1: "100 Example Ave",
+  line2: null,
+  city: "Springfield",
+  state: "CA",
+  postal_code: "94000",
+  country: "US",
+};
+
+const CARD_ON_FILE = {
+  brand: "visa",
+  last4: "4242",
+  expMonth: 4,
+  expYear: 2042,
+};
+
+/** Configs carrying every payment-method field the GET can fill in. */
+const WITH_EXPIRY_AND_ADDRESS: AutoTopUpConfigResponse = {
+  ...DISABLED_WITH_CARD,
+  payment_method_exp_month: 4,
+  payment_method_exp_year: 2042,
+  billing_address: BILLING_ADDRESS,
+};
+
+const ENABLED_WITH_EXPIRY_AND_ADDRESS: AutoTopUpConfigResponse = {
+  ...ENABLED_WITH_CARD,
+  payment_method_exp_month: 4,
+  payment_method_exp_year: 2042,
+  billing_address: BILLING_ADDRESS,
+};
+
+/** The org already has a daily credit limit, so a save never hits the gate. */
+const WITH_DAILY_LIMIT: DailyCreditLimitResponse = {
+  daily_credit_limit_usd: "25.00",
+  current_day_spent_usd: "0.00",
+  day_bucket: "2026-09-04",
+  daily_limit_snoozed: false,
+  daily_limit_snoozed_day_bucket: null,
+};
+
+const NO_DAILY_LIMIT: DailyCreditLimitResponse = {
+  ...WITH_DAILY_LIMIT,
+  daily_credit_limit_usd: null,
+  day_bucket: null,
+};
+
+/** The payment-method fields neither the PUT nor the disable response carries. */
+const NO_PAYMENT_METHOD_FIELDS = {
+  payment_method_brand: null,
+  payment_method_last4: null,
+  payment_method_exp_month: null,
+  payment_method_exp_year: null,
+  billing_address: null,
+};
+
+function cachedConfig(client: QueryClient): AutoTopUpConfigResponse {
+  const config = client.getQueryData<AutoTopUpConfigResponse>(
+    organizationsBillingAutoTopUpRetrieveQueryKey(),
+  );
+  if (config == null) {
+    throw new Error("config query cache is empty");
+  }
+  return config;
+}
+
+/** Save unlocks once the mount-time daily-limit refetch has settled. */
+async function waitForSaveEnabled(getByTestId: (id: string) => HTMLElement) {
+  await waitFor(() => {
+    const save = getByTestId("auto-top-up-save-button") as HTMLButtonElement;
+    if (save.disabled) {
+      throw new Error("Save still disabled");
+    }
+  });
+}
+
+/**
+ * Wait out the mount-time background refetch so a later cache write is not
+ * clobbered when that response lands.
+ */
+async function settleConfigQuery(client: QueryClient) {
+  await waitFor(() => {
+    if (client.isFetching() > 0) {
+      throw new Error("config refetch still in flight");
+    }
+  });
+}
+
 beforeEach(() => {
   updateCalls = [];
+  dailyLimitRetrieve = null;
+  dailyLimitUpdateCalls = [];
+  disableCalls = 0;
+  releaseDisable = null;
+  syncCalls = [];
+  syncedCard = null;
+  nativeAndroid = false;
+  openedUrl = null;
+  pmModalProps = null;
+  updateResponse = null;
+  useSetupIntentReturnStore.setState({ pending: false, outcome: null });
   retrieveResponse = { ...DISABLED_CONFIG };
-  dailyLimitResponse = {
-    daily_credit_limit_usd: null,
-    current_day_spent_usd: "0.00",
-    day_bucket: null,
-    daily_limit_snoozed: false,
-    daily_limit_snoozed_day_bucket: null,
-  };
+  dailyLimitResponse = { ...WITH_DAILY_LIMIT };
 });
 
 afterEach(cleanup);
@@ -170,6 +406,42 @@ describe("AutoTopUpCard enabled-state layout", () => {
   });
 });
 
+describe("AutoTopUpCard on native Android", () => {
+  test("toggle-on opens the web configure deep link instead of the form", async () => {
+    nativeAndroid = true;
+    const { container, getByLabelText } = render(wrap(DISABLED_WITH_CARD));
+
+    fireEvent.click(getByLabelText("Enable auto-reload"));
+
+    await waitFor(() =>
+      expect(openedUrl).toBe(
+        `${window.location.origin}/assistant/settings/usage?tab=billing&configure_top_up=1`,
+      ),
+    );
+    expect(updateCalls).toEqual([]);
+    expect(
+      container.querySelector('[data-testid="auto-top-up-save-button"]'),
+    ).toBeNull();
+  });
+
+  test("Adjust opens the web configure deep link instead of the form", async () => {
+    nativeAndroid = true;
+    const { container, getByTestId } = render(wrap(ENABLED_WITH_CARD));
+
+    fireEvent.click(getByTestId("auto-top-up-edit-button"));
+
+    await waitFor(() =>
+      expect(openedUrl).toBe(
+        `${window.location.origin}/assistant/settings/usage?tab=billing&configure_top_up=1`,
+      ),
+    );
+    expect(updateCalls).toEqual([]);
+    expect(
+      container.querySelector('[data-testid="auto-top-up-save-button"]'),
+    ).toBeNull();
+  });
+});
+
 describe("AutoTopUpCard payment-method removal reaction", () => {
   test("losing the payment method while adjusting exits the form and turns the toggle off", async () => {
     retrieveResponse = { ...ENABLED_WITH_CARD };
@@ -181,11 +453,7 @@ describe("AutoTopUpCard payment-method removal reaction", () => {
     // Let the mount-time background refetch settle first, so its (stale)
     // result cannot land after the removal write below and mask the
     // transition.
-    await waitFor(() => {
-      if (client.isFetching() > 0) {
-        throw new Error("config refetch still in flight");
-      }
-    });
+    await settleConfigQuery(client);
 
     fireEvent.click(getByTestId("auto-top-up-edit-button"));
     expect(
@@ -364,11 +632,7 @@ describe("AutoTopUpCard enable gate", () => {
 
     // Let the mount-time background refetch settle so it cannot overwrite the
     // card-appeared write below.
-    await waitFor(() => {
-      if (client.isFetching() > 0) {
-        throw new Error("config refetch still in flight");
-      }
-    });
+    await settleConfigQuery(client);
 
     // Toggle on with no card: the add-card gate shows, no form.
     fireEvent.click(getByLabelText("Enable auto-reload"));
@@ -420,11 +684,7 @@ describe("AutoTopUpCard enable gate", () => {
     const client = makeClient(cutOff);
     const { container, getByLabelText } = render(wrap(cutOff, "/", client));
 
-    await waitFor(() => {
-      if (client.isFetching() > 0) {
-        throw new Error("config refetch still in flight");
-      }
-    });
+    await settleConfigQuery(client);
 
     fireEvent.click(getByLabelText("Enable auto-reload"));
     expect(
@@ -521,19 +781,22 @@ describe("AutoTopUpCard configure_top_up deeplink", () => {
     expect(updateCalls.length).toBe(0);
   });
 
-  test("arriving with ?configure_top_up=1 while already enabled is a no-op", () => {
+  test("arriving with ?configure_top_up=1 while already enabled opens the Adjust editor", () => {
     retrieveResponse = { ...ENABLED_WITH_CARD };
-    const { container } = render(
+    const { container, getByLabelText } = render(
       wrap(ENABLED_WITH_CARD, "/?configure_top_up=1"),
     );
 
-    // Already enabled: the effect strips the param but does not enter the form
-    // or fire a mutation — the enabled summary stays put.
+    // Already enabled: the link opens the same editor the Adjust button does.
+    // The toggle stays on and nothing mutates; persistence still needs Save.
     expect(
-      container.querySelector('[data-testid="auto-top-up-summary"]'),
-    ).not.toBeNull();
+      getByLabelText("Enable auto-reload").getAttribute("aria-checked"),
+    ).toBe("true");
     expect(
       container.querySelector('[data-testid="auto-top-up-save-button"]'),
+    ).not.toBeNull();
+    expect(
+      container.querySelector('[data-testid="auto-top-up-summary"]'),
     ).toBeNull();
     expect(updateCalls.length).toBe(0);
   });
@@ -572,6 +835,7 @@ describe("AutoTopUpCard default daily credit limit", () => {
     );
 
     fireEvent.click(getByLabelText("Enable auto-reload"));
+    await waitForSaveEnabled(getByTestId);
     fireEvent.click(getByTestId("auto-top-up-save-button"));
 
     await waitFor(() => {
@@ -609,6 +873,7 @@ describe("AutoTopUpCard default daily credit limit", () => {
     const { getByTestId } = render(wrap(ENABLED_WITH_CARD, "/", client));
 
     fireEvent.click(getByTestId("auto-top-up-edit-button"));
+    await waitForSaveEnabled(getByTestId);
     fireEvent.click(getByTestId("auto-top-up-save-button"));
 
     await waitFor(() => {
@@ -620,5 +885,433 @@ describe("AutoTopUpCard default daily credit limit", () => {
     expect(invalidated).not.toContain(
       JSON.stringify(organizationsBillingDailyCreditLimitRetrieveQueryKey()),
     );
+  });
+});
+
+describe("AutoTopUpCard daily credit limit gate", () => {
+  /** Wait for the auto-reload PUT the gate holds back or lets through. */
+  function waitForConfigUpdate() {
+    return waitFor(() => {
+      if (updateCalls.length === 0) {
+        throw new Error("update endpoint not called");
+      }
+    });
+  }
+
+  test("Save with no daily limit opens the gate instead of persisting", async () => {
+    dailyLimitResponse = { ...NO_DAILY_LIMIT };
+    const { getByLabelText, getByTestId, queryByTestId } = render(
+      wrap(DISABLED_WITH_CARD),
+    );
+
+    fireEvent.click(getByLabelText("Enable auto-reload"));
+    await waitForSaveEnabled(getByTestId);
+    fireEvent.click(getByTestId("auto-top-up-save-button"));
+
+    expect(queryByTestId("auto-top-up-daily-limit-modal")).not.toBeNull();
+    expect(
+      (getByTestId("auto-top-up-daily-limit-input") as HTMLInputElement).value,
+    ).toBe("25");
+    expect(updateCalls).toEqual([]);
+  });
+
+  test("Save with a daily limit on file persists straight away", async () => {
+    const { getByLabelText, getByTestId, queryByTestId } = render(
+      wrap(DISABLED_WITH_CARD),
+    );
+
+    fireEvent.click(getByLabelText("Enable auto-reload"));
+    await waitForSaveEnabled(getByTestId);
+    fireEvent.click(getByTestId("auto-top-up-save-button"));
+
+    await waitForConfigUpdate();
+    expect(queryByTestId("auto-top-up-daily-limit-modal")).toBeNull();
+    expect(dailyLimitUpdateCalls).toEqual([]);
+  });
+
+  test("saving a limit from the gate persists it, then the auto-reload config", async () => {
+    dailyLimitResponse = { ...NO_DAILY_LIMIT };
+    const client = makeClient(DISABLED_WITH_CARD);
+    const { getByLabelText, getByTestId, queryByTestId } = render(
+      wrap(DISABLED_WITH_CARD, "/", client),
+    );
+
+    fireEvent.click(getByLabelText("Enable auto-reload"));
+    await waitForSaveEnabled(getByTestId);
+    fireEvent.click(getByTestId("auto-top-up-save-button"));
+    fireEvent.change(getByTestId("auto-top-up-daily-limit-input"), {
+      target: { value: "40" },
+    });
+    fireEvent.click(getByTestId("auto-top-up-daily-limit-save-button"));
+
+    await waitForConfigUpdate();
+
+    // The limit lands first, in the body the daily-limit card would send,
+    // and the seeded cache is what that card's toggle and input read.
+    expect(dailyLimitUpdateCalls.length).toBe(1);
+    expect(dailyLimitUpdateCalls[0]!.body).toEqual({
+      daily_credit_limit_usd: "40.00",
+    });
+    expect(
+      client.getQueryData<DailyCreditLimitResponse>(
+        organizationsBillingDailyCreditLimitRetrieveQueryKey(),
+      )?.daily_credit_limit_usd,
+    ).toBe("40.00");
+    expect((updateCalls[0]!.body as { enabled: boolean }).enabled).toBe(true);
+    expect(queryByTestId("auto-top-up-daily-limit-modal")).toBeNull();
+  });
+
+  test("Save stays disabled until the daily-limit lookup settles", () => {
+    retrieveResponse = { ...DISABLED_WITH_CARD };
+    dailyLimitRetrieve = () => new Promise(() => {});
+    const client = makeClient(DISABLED_WITH_CARD);
+    client.removeQueries({
+      queryKey: organizationsBillingDailyCreditLimitRetrieveQueryKey(),
+    });
+    const { getByLabelText, getByTestId, queryByTestId } = render(
+      wrap(DISABLED_WITH_CARD, "/", client),
+    );
+
+    fireEvent.click(getByLabelText("Enable auto-reload"));
+    const save = getByTestId("auto-top-up-save-button") as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+    fireEvent.click(save);
+
+    expect(queryByTestId("auto-top-up-daily-limit-modal")).toBeNull();
+    expect(updateCalls).toEqual([]);
+  });
+
+  test("a failed daily-limit lookup keeps Save disabled until a retry settles it", async () => {
+    // With no cached limit and a failed GET, the org may still have a limit
+    // on file, so neither the gate (whose default would replace it) nor the
+    // PUT may run. The retry refetches; once the lookup reports no limit,
+    // Save unlocks and goes through the gate.
+    retrieveResponse = { ...DISABLED_WITH_CARD };
+    dailyLimitRetrieve = () => Promise.reject(new Error("lookup failed"));
+    const client = makeClient(DISABLED_WITH_CARD);
+    client.removeQueries({
+      queryKey: organizationsBillingDailyCreditLimitRetrieveQueryKey(),
+    });
+    const { getByLabelText, getByTestId, queryByTestId } = render(
+      wrap(DISABLED_WITH_CARD, "/", client),
+    );
+    await waitFor(() => {
+      const state = client.getQueryState(
+        organizationsBillingDailyCreditLimitRetrieveQueryKey(),
+      );
+      if (state?.status !== "error") {
+        throw new Error("daily-limit lookup not settled");
+      }
+    });
+
+    fireEvent.click(getByLabelText("Enable auto-reload"));
+    const save = () =>
+      getByTestId("auto-top-up-save-button") as HTMLButtonElement;
+    expect(save().disabled).toBe(true);
+    expect(
+      queryByTestId("auto-top-up-daily-limit-lookup-error"),
+    ).not.toBeNull();
+    fireEvent.click(save());
+    expect(queryByTestId("auto-top-up-daily-limit-modal")).toBeNull();
+
+    dailyLimitRetrieve = null;
+    dailyLimitResponse = { ...NO_DAILY_LIMIT };
+    fireEvent.click(getByTestId("auto-top-up-daily-limit-retry-button"));
+
+    await waitFor(() => {
+      if (save().disabled) {
+        throw new Error("Save still disabled after the retry");
+      }
+    });
+    expect(queryByTestId("auto-top-up-daily-limit-lookup-error")).toBeNull();
+    fireEvent.click(save());
+
+    expect(queryByTestId("auto-top-up-daily-limit-modal")).not.toBeNull();
+    expect(updateCalls).toEqual([]);
+  });
+
+  test("Save stays disabled while a cached limit is being refetched", () => {
+    dailyLimitRetrieve = () => new Promise(() => {});
+    const { getByLabelText, getByTestId, queryByTestId } = render(
+      wrap(DISABLED_WITH_CARD),
+    );
+
+    fireEvent.click(getByLabelText("Enable auto-reload"));
+    const save = getByTestId("auto-top-up-save-button") as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+    fireEvent.click(save);
+
+    expect(queryByTestId("auto-top-up-daily-limit-modal")).toBeNull();
+    expect(updateCalls).toEqual([]);
+  });
+
+  test("a failed refetch over a cached limit blocks Save until a retry settles it", async () => {
+    // The cached limit may be stale, so it must not decide the gate on its
+    // own; once the retry confirms the limit is on file, Save persists
+    // straight away.
+    dailyLimitRetrieve = () => Promise.reject(new Error("lookup failed"));
+    const client = makeClient(DISABLED_WITH_CARD);
+    const { getByLabelText, getByTestId, queryByTestId } = render(
+      wrap(DISABLED_WITH_CARD, "/", client),
+    );
+    await waitFor(() => {
+      const state = client.getQueryState(
+        organizationsBillingDailyCreditLimitRetrieveQueryKey(),
+      );
+      if (state?.status !== "error") {
+        throw new Error("daily-limit lookup not settled");
+      }
+    });
+
+    fireEvent.click(getByLabelText("Enable auto-reload"));
+    const save = () =>
+      getByTestId("auto-top-up-save-button") as HTMLButtonElement;
+    expect(save().disabled).toBe(true);
+    expect(
+      queryByTestId("auto-top-up-daily-limit-lookup-error"),
+    ).not.toBeNull();
+
+    dailyLimitRetrieve = null;
+    fireEvent.click(getByTestId("auto-top-up-daily-limit-retry-button"));
+
+    await waitForSaveEnabled(getByTestId);
+    expect(queryByTestId("auto-top-up-daily-limit-lookup-error")).toBeNull();
+    fireEvent.click(save());
+
+    await waitForConfigUpdate();
+    expect(queryByTestId("auto-top-up-daily-limit-modal")).toBeNull();
+  });
+
+  test("declining the gate drops a pending enable", async () => {
+    dailyLimitResponse = { ...NO_DAILY_LIMIT };
+    const { container, getByLabelText, getByTestId, queryByTestId } = render(
+      wrap(DISABLED_WITH_CARD),
+    );
+
+    fireEvent.click(getByLabelText("Enable auto-reload"));
+    await waitForSaveEnabled(getByTestId);
+    fireEvent.click(getByTestId("auto-top-up-save-button"));
+    fireEvent.click(getByTestId("auto-top-up-daily-limit-cancel-button"));
+
+    expect(queryByTestId("auto-top-up-daily-limit-modal")).toBeNull();
+    expect(
+      container.querySelector('[data-testid="auto-top-up-save-button"]'),
+    ).toBeNull();
+    expect(
+      getByLabelText("Enable auto-reload").getAttribute("aria-checked"),
+    ).toBe("false");
+    expect(updateCalls).toEqual([]);
+    expect(dailyLimitUpdateCalls).toEqual([]);
+    expect(disableCalls).toBe(0);
+  });
+
+  test("declining the gate while already enabled disables auto-reload", async () => {
+    dailyLimitResponse = { ...NO_DAILY_LIMIT };
+    releaseDisable = () => {};
+    const client = makeClient(ENABLED_WITH_CARD);
+    const { getByTestId, queryByTestId } = render(
+      wrap(ENABLED_WITH_CARD, "/", client),
+    );
+    await settleConfigQuery(client);
+
+    fireEvent.click(getByTestId("auto-top-up-edit-button"));
+    await waitForSaveEnabled(getByTestId);
+    fireEvent.click(getByTestId("auto-top-up-save-button"));
+    fireEvent.click(getByTestId("auto-top-up-daily-limit-cancel-button"));
+
+    // The form stays locked while the disable is in flight, so a second Save
+    // cannot reopen the gate against it.
+    await waitFor(() => {
+      const save = getByTestId("auto-top-up-save-button") as HTMLButtonElement;
+      if (!save.disabled) {
+        throw new Error("form still interactive during the disable");
+      }
+    });
+    fireEvent.click(getByTestId("auto-top-up-save-button"));
+    expect(queryByTestId("auto-top-up-daily-limit-modal")).toBeNull();
+    releaseDisable();
+
+    await waitFor(() => {
+      if (cachedConfig(client).enabled) {
+        throw new Error("config cache still reports auto-reload enabled");
+      }
+    });
+    expect(disableCalls).toBe(1);
+    expect(queryByTestId("auto-top-up-daily-limit-modal")).toBeNull();
+    expect(updateCalls).toEqual([]);
+  });
+});
+
+describe("AutoTopUpCard payment-method fields in the config cache", () => {
+  test("a save keeps the cached expiry and billing address", async () => {
+    // The PUT skips the Stripe payment-method retrieve, so its response has no
+    // payment-method fields; dropping them here empties the card expiry and the
+    // modal's address prefill until the next GET.
+    retrieveResponse = { ...ENABLED_WITH_EXPIRY_AND_ADDRESS };
+    const client = makeClient(ENABLED_WITH_EXPIRY_AND_ADDRESS);
+    const { getByTestId } = render(
+      wrap(ENABLED_WITH_EXPIRY_AND_ADDRESS, "/", client),
+    );
+    await settleConfigQuery(client);
+
+    updateResponse = {
+      ...ENABLED_WITH_EXPIRY_AND_ADDRESS,
+      ...NO_PAYMENT_METHOD_FIELDS,
+    };
+    fireEvent.click(getByTestId("auto-top-up-edit-button"));
+    await waitForSaveEnabled(getByTestId);
+    fireEvent.click(getByTestId("auto-top-up-save-button"));
+
+    await waitFor(() => {
+      if (updateCalls.length === 0) {
+        throw new Error("update endpoint not called");
+      }
+    });
+    await waitFor(() => {
+      if (cachedConfig(client).payment_method_exp_month == null) {
+        throw new Error("expiry not preserved in the config cache");
+      }
+    });
+
+    const cached = cachedConfig(client);
+    expect(cached.payment_method_brand).toBe("visa");
+    expect(cached.payment_method_last4).toBe("4242");
+    expect(cached.payment_method_exp_month).toBe(4);
+    expect(cached.payment_method_exp_year).toBe(2042);
+    expect(cached.billing_address).toEqual(BILLING_ADDRESS);
+  });
+
+  test("a disable keeps the cached expiry and billing address", async () => {
+    // The disable response echoes only the enabled bit, and the endpoint
+    // leaves the saved card attached, so the seeded config must still describe
+    // that card in full.
+    retrieveResponse = { ...ENABLED_WITH_EXPIRY_AND_ADDRESS };
+    const client = makeClient(ENABLED_WITH_EXPIRY_AND_ADDRESS);
+    const { getByLabelText, getByTestId } = render(
+      wrap(ENABLED_WITH_EXPIRY_AND_ADDRESS, "/", client),
+    );
+    await settleConfigQuery(client);
+
+    fireEvent.click(getByLabelText("Enable auto-reload"));
+    fireEvent.click(getByTestId("disable-confirm"));
+
+    await waitFor(() => {
+      if (cachedConfig(client).enabled) {
+        throw new Error("config cache still reports auto-reload enabled");
+      }
+    });
+
+    const cached = cachedConfig(client);
+    expect(cached.has_payment_method).toBe(true);
+    expect(cached.payment_method_brand).toBe("visa");
+    expect(cached.payment_method_last4).toBe("4242");
+    expect(cached.payment_method_exp_month).toBe(4);
+    expect(cached.payment_method_exp_year).toBe(2042);
+    expect(cached.billing_address).toEqual(BILLING_ADDRESS);
+  });
+});
+
+describe("AutoTopUpCard add-a-card gates", () => {
+  test("the declines cutoff opens the modal in replace mode on the declined card", () => {
+    // The cutoff keeps the declined card attached, so this entry point is a
+    // replacement; opening it in add mode would contradict the Billing card,
+    // which offers Replace for the same state.
+    const config: AutoTopUpConfigResponse = {
+      ...WITH_EXPIRY_AND_ADDRESS,
+      disabled_due_to_repeated_failures: true,
+    };
+    retrieveResponse = config;
+    const { container } = render(wrap(config));
+
+    const cutoffButton = container.querySelector(
+      '[data-testid="auto-top-up-declined-cutoff"] [data-testid="auto-top-up-add-pm-button"]',
+    );
+    expect(cutoffButton).not.toBeNull();
+    fireEvent.click(cutoffButton as HTMLElement);
+
+    expect(lastPmModalProps().open).toBe(true);
+    expect(lastPmModalProps().mode).toBe("replace");
+    expect(lastPmModalProps().cardOnFile).toEqual(CARD_ON_FILE);
+    expect(lastPmModalProps().billingAddress).toEqual(BILLING_ADDRESS);
+  });
+
+  test("the no-payment-method gate opens the modal in add mode", () => {
+    const config: AutoTopUpConfigResponse = {
+      ...DISABLED_CONFIG,
+      has_payment_method: false,
+    };
+    retrieveResponse = config;
+    const { container, getByLabelText } = render(wrap(config));
+
+    fireEvent.click(getByLabelText("Enable auto-reload"));
+    const gateButton = container.querySelector(
+      '[data-testid="auto-top-up-add-pm-button"]',
+    );
+    fireEvent.click(gateButton as HTMLElement);
+
+    expect(lastPmModalProps().open).toBe(true);
+    expect(lastPmModalProps().mode).toBe("add");
+    expect(lastPmModalProps().cardOnFile).toBeNull();
+    expect(lastPmModalProps().billingAddress).toBeNull();
+  });
+
+  test("both gates are disabled while a redirect return is unresolved", () => {
+    // The outcome replays into `PaymentMethodsCard`'s modal, so a second one
+    // opened here would stack on it and start an orphan SetupIntent.
+    useSetupIntentReturnStore.setState({ pending: true });
+    const config: AutoTopUpConfigResponse = {
+      ...WITH_EXPIRY_AND_ADDRESS,
+      disabled_due_to_repeated_failures: true,
+    };
+    retrieveResponse = config;
+    const { container } = render(wrap(config));
+
+    const buttons = container.querySelectorAll<HTMLButtonElement>(
+      '[data-testid="auto-top-up-add-pm-button"]',
+    );
+    expect(buttons.length).toBe(2);
+    for (const button of buttons) {
+      expect(button.disabled).toBe(true);
+    }
+  });
+
+  test("hands the modal a saved callback that resolves with the synced card", async () => {
+    // The modal titles its success panel with what this resolves to, so the
+    // card must return the sync's answer rather than swallowing it.
+    syncedCard = { brand: "visa", last4: "4242", autoReloadEnabled: false };
+    const config: AutoTopUpConfigResponse = {
+      ...DISABLED_CONFIG,
+      has_payment_method: false,
+    };
+    retrieveResponse = config;
+    render(wrap(config));
+
+    const saved = await act(async () =>
+      lastPmModalProps().onSavedOptimistic({ setupIntentId: "seti_1" }),
+    );
+
+    expect(syncCalls).toEqual([{ setupIntentId: "seti_1" }]);
+    expect(saved).toEqual({
+      brand: "visa",
+      last4: "4242",
+      autoReloadEnabled: false,
+    });
+  });
+
+  test("both gates stay usable when no return is in flight", () => {
+    const config: AutoTopUpConfigResponse = {
+      ...WITH_EXPIRY_AND_ADDRESS,
+      disabled_due_to_repeated_failures: true,
+    };
+    retrieveResponse = config;
+    const { container } = render(wrap(config));
+
+    const buttons = container.querySelectorAll<HTMLButtonElement>(
+      '[data-testid="auto-top-up-add-pm-button"]',
+    );
+    expect(buttons.length).toBe(2);
+    for (const button of buttons) {
+      expect(button.disabled).toBe(false);
+    }
   });
 });

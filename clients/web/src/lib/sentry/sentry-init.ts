@@ -2,11 +2,13 @@ import { Capacitor } from "@capacitor/core";
 import type { BrowserOptions } from "@sentry/react";
 
 import { snapshotCommitPressure } from "@/lib/commit-pressure";
+import { getRunningChannel } from "@/lib/preview-channel";
 import { diagnosticsConsentGranted } from "@/lib/sentry/consent-gate";
 import {
   installSentryControlListeners,
   syncSentryClient,
 } from "@/lib/sentry/sentry-control";
+import { installSentryUserSync } from "@/lib/sentry/user-sync";
 import { syncDiagnosticsToMain } from "@/runtime/diagnostics";
 import { sanitizeUrl } from "@/lib/sentry/url-sanitize";
 import { isElectron } from "@/runtime/is-electron";
@@ -39,9 +41,14 @@ function isReactError185(message: string): boolean {
 /** Resolve the Sentry DSN for the current host. */
 function resolveDsn(): string | undefined {
   if (isElectron()) {
-    return detectElectronHostOS() === "windows"
-      ? import.meta.env.VITE_SENTRY_DSN_WINDOWS
-      : import.meta.env.VITE_SENTRY_DSN_MACOS;
+    const hostOS = detectElectronHostOS();
+    if (hostOS === "windows") {
+      return import.meta.env.VITE_SENTRY_DSN_WINDOWS;
+    }
+    if (hostOS === "linux") {
+      return import.meta.env.VITE_SENTRY_DSN_LINUX;
+    }
+    return import.meta.env.VITE_SENTRY_DSN_MACOS;
   }
   if (isNativePlatform()) {
     const platform = Capacitor.getPlatform();
@@ -159,6 +166,25 @@ const options: BrowserOptions = {
     /^Load failed($| \()/,
     /^Failed to fetch($| \()/,
     /^NetworkError when attempting to fetch resource\.?($| \()/,
+    // Cancellation rejections: TanStack Query aborts its per-fetch
+    // AbortController whenever a fetch is cancelled (observer unmount,
+    // `invalidateQueries` restarting an in-flight refetch, SSE-reconnect
+    // refresh bursts), and the engines surface the resulting DOMException
+    // through `onunhandledrejection` from browser-internal promises that
+    // JavaScript cannot attach handlers to. TanStack considers these
+    // rejections working-as-designed (TanStack/query#9877). Manual
+    // captures are gated by `captureError()` + `isCancellationError()`;
+    // these patterns close the same gap for the SDK's automatic paths.
+    //
+    // Both patterns are anchored on the exception *type*: the inbound
+    // filter tests each pattern against the bare value and against
+    // `${type}: ${value}`, and a bare exception value never starts with
+    // its own type prefix. Anchoring this way covers every engine's
+    // wording of the abort DOMException while a first-party error whose
+    // message merely reads like one (say, an `ApiError` carrying "The
+    // operation was aborted.") stays reportable.
+    /^AbortError:/, // any AbortError-typed DOMException, all engines
+    /^Error: CancelledError$/, // TanStack Query's cancellation sentinel
   ],
   denyUrls: [
     // Browser-extension schemes.
@@ -175,9 +201,7 @@ const options: BrowserOptions = {
 };
 
 /**
- * Bootstrap Sentry consent gating. Must be called after
- * `migrateDeviceSettings()` so the `device:diagnostics_reporting` key
- * is available when the consent gate reads localStorage.
+ * Bootstrap Sentry consent gating.
  *
  * Also syncs the effective (session-gated) reporting gate to the Electron main
  * process (no-op on web and native mobile) so the main-process Sentry client
@@ -189,12 +213,20 @@ export function initSentry(): void {
   // DSN otherwise can't distinguish mobile-web (iOS/Android phone browsers)
   // from desktop. Shares the product `detectClientOs()` so Sentry, analytics,
   // and the assistant's `client_os` context all agree.
+  const { channel } = getRunningChannel();
   const resolved: BrowserOptions = {
     ...options,
     dsn: resolveDsn(),
-    initialScope: { tags: { client_os: detectClientOs() } },
+    initialScope: {
+      tags: {
+        client_os: detectClientOs(),
+        // Only preview builds carry a channel tag.
+        ...(channel === "preview" ? { channel } : {}),
+      },
+    },
   };
   syncSentryClient(resolved);
   installSentryControlListeners(resolved);
+  installSentryUserSync();
   syncDiagnosticsToMain(diagnosticsConsentGranted());
 }

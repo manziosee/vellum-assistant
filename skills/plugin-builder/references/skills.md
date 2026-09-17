@@ -23,6 +23,7 @@ These are the fields the `SKILL.md` frontmatter can set. Only `name` and `descri
 | `metadata.vellum.activation-hints` | `string[]` | No       | Plain-language situations where the skill should activate. These sharpen the match beyond the description.                                                                                                                                                                                     |
 | `metadata.vellum.avoid-when`       | `string[]` | No       | Situations where the skill should not activate, used to keep it from firing on adjacent-but-wrong requests.                                                                                                                                                                                    |
 | `metadata.vellum.category`         | `string`   | No       | Grouping used when the skill is listed in a client. Defaults to "system".                                                                                                                                                                                                                      |
+| `metadata.vellum.platforms`        | `string[]` | No       | Host operating systems where the skill may be offered and loaded. Supported values are `macos`, `windows`, and `linux`; omission means all platforms.                                                                                                                                          |
 
 ## Resolution order
 
@@ -86,7 +87,7 @@ Keep each section to a few short bullet points.
 
 The `scripts/` and `references/` directories are optional companions to `SKILL.md`. The body invokes them by relative path:
 
-- **Scripts:** Reference a script by its path relative to the skill directory. The assistant runs it via the `bash` tool when the instructions call for it. For example, a body that says "Run `scripts/post_summary.ts` to submit the summary" tells the assistant to execute `bun run scripts/post_summary.ts` from the skill directory.
+- **Scripts:** Reference a script by its path relative to the skill directory. Scripts that call `resolveCredential` should live under `scripts/` or `tools/` so the path itself identifies the plugin: `plugins/<service>/skills/<skill>/{scripts,tools}/<file>`. The assistant's bash tool also injects `VELLUM_PLUGIN_NAME` when exactly one plugin skill is active. Raw `bun` is fine for those scripts.
 - **References:** Cite a reference file by relative path when the body needs to defer detail. For example, "See `references/api-fields.md` for the full field contract" tells the assistant to read that file when it needs the details, rather than inlining them in the body. This keeps the body short and loads the detail only when relevant.
 
 ## Skill-scoped tools (`TOOLS.json`)
@@ -114,7 +115,7 @@ A skill can carry real, schema-validated tools that exist only while the skill i
 }
 ```
 
-The executor is a module inside the skill directory exporting `run(input, context)` that returns `{ content: string, isError: boolean }`. It executes in the skill sandbox — a subprocess with a sanitized environment (`VELLUM_WORKSPACE_DIR` is available for locating plugin data) — so it must be self-contained: node stdlib only, no imports from outside the skill directory, no shared module state with hooks.
+The executor is a module inside the skill directory exporting `run(input, context)` that returns `{ content: string, isError: boolean }`. It executes in the skill sandbox, a subprocess with a sanitized environment (`VELLUM_WORKSPACE_DIR` is available for locating plugin data). A plugin-resident skill tool also receives a short-lived invocation grant so `resolveCredential()` can read credentials under the owning plugin's service. Keep the executor self-contained: node stdlib and `@vellumai/plugin-api` only, no imports from outside the skill directory, no shared module state with hooks.
 
 Rules the host enforces:
 

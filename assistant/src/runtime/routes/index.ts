@@ -17,6 +17,7 @@ import { ROUTES as MEMORY_V3_ROUTES } from "../../plugins/defaults/memory/src/me
 import { ROUTES as MEMORY_WORKER_ROUTES } from "../../plugins/defaults/memory/src/memory-worker-routes.js";
 import { ROUTES as ACP_CLAUDE_AUTH_ROUTES } from "./acp-claude-auth-routes.js";
 import { ROUTES as ACP_ROUTES } from "./acp-routes.js";
+import { ROUTES as ACTIVATION_ROUTES } from "./activation-routes.js";
 import { ROUTES as APP_MANAGEMENT_ROUTES } from "./app-management-routes.js";
 import { ROUTES as APP_ROUTES } from "./app-routes.js";
 import { ROUTES as APPROVAL_ROUTES } from "./approval-routes.js";
@@ -38,6 +39,7 @@ import { ROUTES as CALL_ROUTES } from "./call-routes.js";
 import { ROUTES as CHANNEL_AVAILABILITY_ROUTES } from "./channel-availability-routes.js";
 import { ROUTES as CHANNEL_READINESS_ROUTES } from "./channel-readiness-routes.js";
 import { CHANNEL_ROUTES } from "./channel-route-definitions.js";
+import { ROUTES as CHANNEL_SEND_ROUTES } from "./channel-send-routes.js";
 import { ROUTES as CHANNEL_VERIFICATION_ROUTES } from "./channel-verification-routes.js";
 import { ROUTES as CHATGPT_SUBSCRIPTION_AUTH_ROUTES } from "./chatgpt-subscription-auth-routes.js";
 import { ROUTES as CLIENT_ROUTES } from "./client-routes.js";
@@ -57,10 +59,10 @@ import { ROUTES as CONVERSATIONS_IMPORT_ROUTES } from "./conversations-import-ro
 import { ROUTES as CREDENTIAL_PROMPT_ROUTES } from "./credential-prompt-routes.js";
 import { ROUTES as CREDENTIAL_REQUEST_ROUTES } from "./credential-request-routes.js";
 import { ROUTES as CREDENTIAL_ROUTES } from "./credential-routes.js";
-import { ROUTES as DEBUG_BASH_ROUTES } from "./debug-bash-routes.js";
 import { ROUTES as DEBUG_ROUTES } from "./debug-routes.js";
 import { ROUTES as DEFAULT_PROVIDER_ROUTES } from "./default-provider-routes.js";
 import { ROUTES as DEFER_ROUTES } from "./defer-routes.js";
+import { ROUTES as DESKTOP_SETUP_ROUTES } from "./desktop-setup-routes.js";
 import { ROUTES as DIAGNOSTICS_ROUTES } from "./diagnostics-routes.js";
 import { ROUTES as DISK_PRESSURE_ROUTES } from "./disk-pressure-routes.js";
 import { ROUTES as DOCUMENT_COMMENT_ROUTES } from "./document-comments-routes.js";
@@ -74,6 +76,7 @@ import { ROUTES as GATEWAY_STATUS_ROUTES } from "./gateway-status-routes.js";
 import { ROUTES as GLOBAL_SEARCH_ROUTES } from "./global-search-routes.js";
 import { ROUTES as GROUP_ROUTES } from "./group-routes.js";
 import { ROUTES as GUARDIAN_ACTION_ROUTES } from "./guardian-action-routes.js";
+import { GUARDIAN_FORM_ROUTES } from "./guardian-form-routes.js";
 import { ROUTES as HEARTBEAT_ROUTES } from "./heartbeat-routes.js";
 import { ROUTES as HOME_FEED_ROUTES } from "./home-feed-routes.js";
 import { ROUTES as HOME_STATE_ROUTES } from "./home-state-routes.js";
@@ -93,6 +96,7 @@ import { ROUTES as INFERENCE_PROVIDER_CONNECTION_ROUTES } from "./inference-prov
 import { ROUTES as INFERENCE_SEND_ROUTES } from "./inference-send-routes.js";
 import { ROUTES as INGRESS_STATUS_ROUTES } from "./ingress-status-routes.js";
 import { ROUTES as A2A_ROUTES } from "./integrations/a2a.js";
+import { ROUTES as DISCORD_CONFIG_ROUTES } from "./integrations/discord.js";
 import { ROUTES as SLACK_CHANNEL_CONFIG_ROUTES } from "./integrations/slack/channel.js";
 import { ROUTES as SLACK_CHANNELS_ROUTES } from "./integrations/slack/channels.js";
 import { ROUTES as SLACK_SHARE_ROUTES } from "./integrations/slack/share.js";
@@ -118,6 +122,8 @@ import { ROUTES as OAUTH_COMMANDS_ROUTES } from "./oauth-commands-routes.js";
 import { ROUTES as OAUTH_CONNECT_ROUTES } from "./oauth-connect-routes.js";
 import { ROUTES as OAUTH_LIFECYCLE_ROUTES } from "./oauth-lifecycle-routes.js";
 import { ROUTES as OAUTH_PROVIDERS_ROUTES } from "./oauth-providers.js";
+import { ROUTES as OAUTH_PROXY_GRANT_ROUTES } from "./oauth-proxy-grant-routes.js";
+import { ROUTES as OAUTH_PROXY_ROUTES } from "./oauth-proxy-routes.js";
 import { ROUTES as ONBOARDING_CHECKIN_ROUTES } from "./onboarding-checkin-routes.js";
 import { ROUTES as PLATFORM_ROUTES } from "./platform-routes.js";
 import { ROUTES as PLAYGROUND_ROUTES } from "./playground/index.js";
@@ -130,6 +136,7 @@ import { ROUTES as RECORDING_ROUTES } from "./recording-routes.js";
 import { ROUTES as RENAME_CONVERSATION_ROUTES } from "./rename-conversation-routes.js";
 import { ROUTES as RESOURCE_PRESSURE_ROUTES } from "./resource-pressure-routes.js";
 import { ROUTES as RETROSPECTIVE_ROUTES } from "./retrospective-routes.js";
+import { ROUTES as ROADMAP_ROUTES } from "./roadmap-routes.js";
 import { ROUTES as ROUTE_HOST_WORKER_ROUTES } from "./route-host-worker-routes.js";
 import { ROUTES as SANITY_ROUTES } from "./sanity-routes.js";
 import { ROUTES as SCHEDULE_ROUTES } from "./schedule-routes.js";
@@ -185,6 +192,7 @@ export const ROUTES: RouteDefinition[] = [
   ...CHANNEL_VERIFICATION_ROUTES,
   ...CHANNEL_AVAILABILITY_ROUTES,
   ...CHANNEL_READINESS_ROUTES,
+  ...CHANNEL_SEND_ROUTES,
   ...BROWSER_ROUTES,
   ...BROWSER_TABS_ROUTES,
   ...BTW_ROUTES,
@@ -192,6 +200,7 @@ export const ROUTES: RouteDefinition[] = [
   ...CLIENT_ROUTES,
   ...CONTENT_SOURCE_ROUTES,
   ...CONTACT_PROMPT_ROUTES,
+  ...GUARDIAN_FORM_ROUTES,
   ...CONTACT_ROUTES,
   ...CONVERSATION_ATTENTION_ROUTES,
   ...CONVERSATION_CLI_ROUTES,
@@ -207,9 +216,10 @@ export const ROUTES: RouteDefinition[] = [
   ...CONVERSATION_COMPACTION_ROUTES,
   ...CONVERSATION_QUERY_ROUTES,
   ...CONVERSATION_STARTER_ROUTES,
-  ...DEBUG_BASH_ROUTES,
+  ...ACTIVATION_ROUTES,
   ...DEBUG_ROUTES,
   ...DEFAULT_PROVIDER_ROUTES,
+  ...DESKTOP_SETUP_ROUTES,
   ...DIAGNOSTICS_ROUTES,
   ...DISK_PRESSURE_ROUTES,
   ...RESOURCE_PRESSURE_ROUTES,
@@ -265,6 +275,8 @@ export const ROUTES: RouteDefinition[] = [
   ...OAUTH_APPS_ROUTES,
   ...OAUTH_LIFECYCLE_ROUTES,
   ...OAUTH_COMMANDS_ROUTES,
+  ...OAUTH_PROXY_ROUTES,
+  ...OAUTH_PROXY_GRANT_ROUTES,
   ...OAUTH_PROVIDERS_ROUTES,
   ...ONBOARDING_CHECKIN_ROUTES,
   ...PLATFORM_ROUTES,
@@ -278,6 +290,7 @@ export const ROUTES: RouteDefinition[] = [
   ...RENAME_CONVERSATION_ROUTES,
   ...MONITORING_ROUTES,
   ...RETROSPECTIVE_ROUTES,
+  ...ROADMAP_ROUTES,
   ...SCHEDULE_ROUTES,
   ...SCHEDULE_WORKER_ROUTES,
   ...ROUTE_HOST_WORKER_ROUTES,
@@ -287,6 +300,7 @@ export const ROUTES: RouteDefinition[] = [
   ...SOUNDS_CONFIG_ROUTES,
   ...SKILL_ROUTES,
   ...A2A_ROUTES,
+  ...DISCORD_CONFIG_ROUTES,
   ...SLACK_CHANNEL_CONFIG_ROUTES,
   ...SLACK_CHANNEL_RESOLVE_ROUTES,
   ...SLACK_CHANNELS_ROUTES,

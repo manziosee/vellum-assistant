@@ -1,4 +1,5 @@
 import {
+  isUserTerminalHistoryError,
   ORDERING_ERROR_PATTERNS,
   WEB_SEARCH_ORDERING_PATTERNS,
 } from "../agent/history-repair/history-repair.js";
@@ -25,8 +26,11 @@ import {
 } from "../util/errors.js";
 import {
   INSUFFICIENT_CREDITS_PATTERNS,
+  isChatTemplateFailureError,
+  isModelNotFoundError,
   isVisionNotSupportedError,
 } from "../util/provider-error-patterns.js";
+import { safeStringSlice } from "../util/unicode.js";
 
 /**
  * Classified conversation error ready for client emission.
@@ -357,6 +361,8 @@ function connectionResolutionUserMessage(
       return `No provider connection is configured${usedBy}. Ask me to set one up right here, or add an API key in ${fixPath}.`;
     case "unroutable_managed_model":
       return `The model "${error.model ?? "<unset>"}"${usedBy} isn't served by the Vellum managed route. Pick a model from the Vellum catalog, or choose a concrete provider in ${fixPath}.`;
+    case "adapter_unavailable":
+      return `${connection}${usedBy} could not serve model "${error.model ?? "<unset>"}". This model is only available on the Vellum GPU route and was not sent through another provider.`;
     case "missing_credential":
       // Provider-neutral: api_key connections store keys, oauth_subscription
       // connections store login tokens — the fix differs but the location
@@ -425,6 +431,11 @@ function classifyCore(
       return contextTooLargeClassification();
     }
     if (error.statusCode === 401 || error.statusCode === 403) {
+      // OpenCode (and similar OpenAI-compat endpoints) return 401 for an
+      // unknown model id. That must not read as a rejected key.
+      if (isModelNotFoundError(message)) {
+        return modelNotFoundClassification();
+      }
       // Managed routes through the assistant API key; if that credential is
       // stale, the user cannot fix it from model settings. Everything else is
       // a credential the user owns, so the copy names which one to update and
@@ -478,6 +489,14 @@ function classifyCore(
             "Stale web-search results in conversation history. Please try again.",
           retryable: true,
           errorCategory: "stale_web_search_content",
+        };
+      }
+      if (isUserTerminalHistoryError(message)) {
+        return {
+          code: "PROVIDER_ORDERING",
+          userMessage: "An internal error occurred. Please try again.",
+          retryable: true,
+          errorCategory: "history_user_terminal",
         };
       }
       if (isOrderingError(message)) {
@@ -555,11 +574,14 @@ function classifyCore(
       if (isVisionNotSupportedError(message)) {
         return visionNotSupportedClassification();
       }
+      if (isChatTemplateFailureError(message)) {
+        return requestShapeUnsupportedClassification();
+      }
       // Extract the provider detail after "API error (NNN): " prefix
       const detailMatch = message.match(/API error \(\d+\):\s*(.+)/i);
       const detail = detailMatch?.[1];
       const suffix = detail
-        ? `: ${detail.length > 200 ? detail.slice(0, 200) + "…" : detail}`
+        ? `: ${detail.length > 200 ? safeStringSlice(detail, 0, 200) + "…" : detail}`
         : "";
       return {
         code: "PROVIDER_API",
@@ -591,7 +613,7 @@ function extractProviderDetail(message: string): string | undefined {
   if (!detail) {
     return undefined;
   }
-  return detail.length > 200 ? `${detail.slice(0, 200)}…` : detail;
+  return detail.length > 200 ? `${safeStringSlice(detail, 0, 200)}…` : detail;
 }
 
 /**
@@ -645,6 +667,8 @@ function reasonToClassification(
       return contextTooLargeClassification();
     case "vision_unsupported":
       return visionNotSupportedClassification();
+    case "request_shape_unsupported":
+      return requestShapeUnsupportedClassification();
     // Two producers share this reason: SDK transport failures that never got
     // a response (OpenAI APIConnectionError), and Gemini responses whose empty
     // body reveals a proxy/egress filter intercepting the request. The copy
@@ -658,13 +682,7 @@ function reasonToClassification(
         errorCategory: "provider_network_error",
       };
     case "model_not_found":
-      return {
-        code: "PROVIDER_API",
-        userMessage:
-          "The selected model wasn't found by the provider. Switch models in Settings → Models & Services.",
-        retryable: false,
-        errorCategory: "provider_model_not_found",
-      };
+      return modelNotFoundClassification();
     case "model_restricted": {
       const detail = extractProviderDetail(args.message);
       const prefix = "This model isn't available on your current provider plan";
@@ -873,6 +891,19 @@ function providerServerErrorClassification(): Omit<
   };
 }
 
+function modelNotFoundClassification(): Omit<
+  ClassifiedConversationError,
+  "debugDetails"
+> {
+  return {
+    code: "PROVIDER_API",
+    userMessage:
+      "The selected model wasn't found by the provider. Switch models in Settings → Models & Services.",
+    retryable: false,
+    errorCategory: "provider_model_not_found",
+  };
+}
+
 function contextTooLargeClassification(): Omit<
   ClassifiedConversationError,
   "debugDetails"
@@ -896,6 +927,25 @@ function visionNotSupportedClassification(): Omit<
       "This model doesn't support image input. Remove the image or switch to a vision-capable model.",
     retryable: false,
     errorCategory: "vision_not_supported",
+  };
+}
+
+/**
+ * Classification for a request rejected by the endpoint's server-side
+ * chat-template renderer. These endpoints choke on richer request shapes
+ * (tool calls, images, structured message content), so the copy points the
+ * user at a capability mismatch instead of the raw template error.
+ */
+function requestShapeUnsupportedClassification(): Omit<
+  ClassifiedConversationError,
+  "debugDetails"
+> {
+  return {
+    code: "PROVIDER_API",
+    userMessage:
+      "This model's provider couldn't process the request format (tool calls or images may not be supported). Switch to a different model in Settings → Models & Services and try again.",
+    retryable: false,
+    errorCategory: "request_shape_unsupported",
   };
 }
 
@@ -1100,6 +1150,15 @@ function classifyByMessage(
         "Stale web-search results in conversation history. Please try again.",
       retryable: true,
       errorCategory: "stale_web_search_content",
+    };
+  }
+
+  if (isUserTerminalHistoryError(message)) {
+    return {
+      code: "PROVIDER_ORDERING",
+      userMessage: "An internal error occurred. Please try again.",
+      retryable: true,
+      errorCategory: "history_user_terminal",
     };
   }
 

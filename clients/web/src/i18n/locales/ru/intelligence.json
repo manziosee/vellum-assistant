@@ -101,6 +101,13 @@
     "renameErrorToast": "Имя не сменилось. Повторите попытку.",
     "renameSuccessToast": "Знакомься, это {newName}!",
     "scheduleCadence": "{cadence} · следующее {nextRun}",
+    "scheduleGhosts": {
+      "inboxTriageCadence": "Каждые 2 часа",
+      "inboxTriageName": "Разбор входящих",
+      "morningBriefingCadence": "По будням в 8:00",
+      "morningBriefingName": "Утренняя сводка"
+    },
+    "setUpSchedule": "Создать расписание",
     "updateAvatarAndName": "Изменить аватар и имя",
     "viewMoreSchedules": "{count, plural, one {Показать ещё #…} few {Показать ещё #…} many {Показать ещё #…} other {Показать ещё #…}}"
   },
@@ -257,7 +264,9 @@
   },
   "pluginToast": {
     "alreadyUpToDate": "{name} уже в актуальной версии",
+    "cleanupWarning": "Очистка плагина завершена с предупреждением.",
     "installed": "Установлен {name}",
+    "mcpOAuthCredentialsUnchecked": "Хранилище учетных данных недоступно, поэтому не удалось проверить сохраненные учетные данные OAuth MCP плагина.",
     "pluginFallback": "плагин",
     "pluginFallbackCapitalized": "Плагин",
     "removed": "Удалён {name}",
@@ -279,6 +288,7 @@
     "workspace": "Рабочая область"
   },
   "skillDetail": {
+    "backToConversationAriaLabel": "Назад к диалогу",
     "backToSkillsAriaLabel": "Назад к навыкам",
     "filesTab": "Файлы",
     "fileViewModeAriaLabel": "Режим просмотра файла",
@@ -295,6 +305,7 @@
     "source": "Код"
   },
   "skillDetailPage": {
+    "backToConversation": "Назад к диалогу",
     "backToSuperpowers": "Назад к моим суперсилам",
     "notFoundSubtitle": "Этот навык могли удалить, или ссылка устарела.",
     "notFoundTitle": "Навык не найден"

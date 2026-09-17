@@ -78,6 +78,31 @@ describe("skills catalog loading", () => {
     expect(catalog.map((skill) => skill.id)).toEqual(["alpha", "zeta"]);
   });
 
+  test("parses supported host platforms from Vellum metadata", () => {
+    const skillDir = join(TEST_DIR, "skills", "platform-skill");
+    mkdirSync(skillDir, { recursive: true });
+    writeFileSync(
+      join(skillDir, "SKILL.md"),
+      `---
+name: platform-skill
+description: Platform-specific skill
+metadata:
+  vellum:
+    platforms:
+      - macos
+      - linux
+---
+
+Skill body
+`,
+    );
+
+    const skill = loadUserSkillCatalog().find(
+      (entry) => entry.id === "platform-skill",
+    );
+    expect(skill?.platforms).toEqual(["macos", "linux"]);
+  });
+
   test("ignores stale SKILLS.md while discovering valid skill directories", () => {
     writeSkill("first", "First Skill", "First");
     writeSkill("second", "Second Skill", "Second");
@@ -844,16 +869,53 @@ describe("always-candidate frontmatter parsing", () => {
     expect(card).toContain("Avoid when:");
   });
 
+  test("the bundled schedule skill's card fits the default budget", async () => {
+    // Recurring-monitoring turns only reach this skill if the card still
+    // carries that vocabulary after the default-budget truncation. An overrun
+    // drops trailing hints and the whole avoid-when list.
+    const { DEFAULT_CARD_CHARS, buildSkillContent } =
+      await import("../plugins/defaults/memory/substrate/skill-content.js");
+    const schedule = loadSkillCatalog().find(
+      (skill) => skill.id === "schedule",
+    );
+    expect(schedule).toBeDefined();
+
+    const card = buildSkillContent(schedule!);
+    expect(card.length).toBeLessThan(DEFAULT_CARD_CHARS);
+    expect(card).toContain("Avoid when:");
+  });
+
+  test("the bundled schedule card carries its monitoring vocabulary", async () => {
+    const { buildSkillContent } =
+      await import("../plugins/defaults/memory/substrate/skill-content.js");
+    const schedule = loadSkillCatalog().find(
+      (skill) => skill.id === "schedule",
+    );
+    const card = buildSkillContent(schedule!).toLowerCase();
+
+    for (const term of ["monitor", "page", "dashboard", "status", "alert"]) {
+      expect(card).toContain(term);
+    }
+  });
+
   test("the bundled acp card carries its setup and sign-in vocabulary", async () => {
     // A "configure Claude Code" or "let's do the auth" turn only reaches this
     // skill if the card actually says it covers setup and authentication;
     // delegation-only wording routes those turns to a terminal skill instead.
+    // "names" keeps a mention ("claude code will do it") from falling through
+    // as a competitor reference.
     const { buildSkillContent } =
       await import("../plugins/defaults/memory/substrate/skill-content.js");
     const acp = loadSkillCatalog().find((skill) => skill.id === "acp");
     const card = buildSkillContent(acp!).toLowerCase();
 
-    for (const term of ["set up", "install", "authenticate", "connect"]) {
+    for (const term of [
+      "names",
+      "set up",
+      "install",
+      "authenticate",
+      "connect",
+    ]) {
       expect(card).toContain(term);
     }
   });
@@ -992,6 +1054,17 @@ describe("ingress-dependent setup skills declare public-ingress intentionally", 
     expect(includes ?? []).not.toContain("public-ingress");
   });
 
+  test("telegram-setup documents which chats are supported and how a group is addressed", () => {
+    const content = readFileSync(
+      join(FIRST_PARTY_SKILLS_DIR, "telegram-setup", "SKILL.md"),
+      "utf-8",
+    );
+    expect(content).toMatch(/private chats and in groups and supergroups/i);
+    expect(content).toMatch(/@mention of the bot's username/i);
+    expect(content).toMatch(/reply to one of its posts/i);
+    expect(content).toMatch(/Broadcast channels are not supported/i);
+  });
+
   test("twilio-setup includes public-ingress", () => {
     const includes = readSkillIncludes(FIRST_PARTY_SKILLS_DIR, "twilio-setup");
     expect(includes).toBeDefined();
@@ -1029,14 +1102,14 @@ describe("bundled computer-use skill", () => {
     expect(cuSkill!.bundled).toBe(true);
   });
 
-  test("computer-use skill has a valid tool manifest with 11 tools", () => {
+  test("computer-use skill has a valid tool manifest with 12 tools", () => {
     const catalog = loadSkillCatalog();
     const cuSkill = catalog.find((s) => s.id === "computer-use");
     expect(cuSkill).toBeDefined();
     expect(cuSkill!.toolManifest).toBeDefined();
     expect(cuSkill!.toolManifest!.present).toBe(true);
     expect(cuSkill!.toolManifest!.valid).toBe(true);
-    expect(cuSkill!.toolManifest!.toolCount).toBe(11);
+    expect(cuSkill!.toolManifest!.toolCount).toBe(12);
     expect(cuSkill!.toolManifest!.toolNames).toEqual([
       "computer_use_observe",
       "computer_use_click",
@@ -1047,6 +1120,7 @@ describe("bundled computer-use skill", () => {
       "computer_use_wait",
       "computer_use_open_app",
       "computer_use_run_applescript",
+      "computer_use_sequence",
       "computer_use_done",
       "computer_use_respond",
     ]);

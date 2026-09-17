@@ -4,14 +4,16 @@ import { stripVellumLinks } from "../daemon/assistant-attachments.js";
 import type { RenderedHistoryContent } from "../daemon/handlers/shared.js";
 import { renderHistoryContent } from "../daemon/handlers/shared.js";
 import { editChannelMessage } from "../messaging/providers/index.js";
-import { readSlackMetadata } from "../messaging/providers/slack/message-metadata.js";
 import { getAttachmentMetadataForMessage } from "../persistence/attachments-store.js";
 import {
   getMessageById,
   getMessages,
-  updateMessageMetadata,
+  parseMessageMetadata,
 } from "../persistence/conversation-crud.js";
+import { isReactionMessageMetadata } from "../persistence/conversation-types.js";
+import { isPrivateAssistantText } from "../persistence/user-facing-content.js";
 import { getLogger } from "../util/logger.js";
+import { joinWithSpacing } from "../util/text-spacing.js";
 import type { ChannelDeliveryResult } from "./gateway-client.js";
 import { deliverChannelReply } from "./gateway-client.js";
 import type { RuntimeAttachmentMetadata } from "./http-types.js";
@@ -19,6 +21,7 @@ import {
   containsNoResponseMarker,
   stripNoResponseMarkers,
 } from "./no-response.js";
+import { makeSentMessageIdReconciler } from "./outbound-post-reconciliation.js";
 
 const log = getLogger("channel-reply-delivery");
 
@@ -47,8 +50,10 @@ type DeliverRenderedReplyParams = {
    *  identified by this ts instead of posting a new one (Slack-specific). */
   messageTs?: string;
   /** Called with the ts of the delivered/updated message so callers
-   *  can use it for subsequent updates. */
-  onMessageTs?: (ts: string) => void;
+   *  can use it for subsequent updates. Awaited when it returns a promise,
+   *  so an async handler (the sent-message-id reconciler) completes its
+   *  durable write before the next segment posts. */
+  onMessageTs?: (ts: string) => void | Promise<void>;
 };
 
 function sleep(ms: number): Promise<void> {
@@ -171,7 +176,7 @@ export async function deliverRenderedReplyViaCallback(
         },
       );
       if (result.ts) {
-        onMessageTs?.(result.ts);
+        await onMessageTs?.(result.ts);
       }
     }
     return;
@@ -190,10 +195,10 @@ export async function deliverRenderedReplyViaCallback(
       );
       const deliveredTs = result.ts ?? messageTs;
       if (deliveredTs) {
-        onMessageTs?.(deliveredTs);
+        await onMessageTs?.(deliveredTs);
       }
     } else if (messageTs) {
-      onMessageTs?.(messageTs);
+      await onMessageTs?.(messageTs);
     }
     return;
   }
@@ -254,7 +259,7 @@ export async function deliverRenderedReplyViaCallback(
 
     if (result.ts) {
       currentMessageTs = result.ts;
-      onMessageTs?.(result.ts);
+      await onMessageTs?.(result.ts);
     }
 
     onSegmentDelivered?.(i + 1);
@@ -281,18 +286,65 @@ export type DeliverReplyOptions = {
   audience?: MessageAudience;
   /** Update an existing message instead of posting a new one. */
   messageTs?: string;
-  /** Called with the ts of the delivered/updated message. */
-  onMessageTs?: (ts: string) => void;
+  /** Called with the ts of the delivered/updated message. Awaited when it
+   *  returns a promise. */
+  onMessageTs?: (ts: string) => void | Promise<void>;
 };
 
 type PersistedMessage = ReturnType<typeof getMessages>[number];
 
+/**
+ * A row read that contributes nothing to deliver. Spelled out rather than
+ * rendered from empty content so the read stays independent of the renderer;
+ * the annotation is what keeps it complete as the shape grows.
+ */
+const NO_REPLY_CONTENT: RenderedHistoryContent = {
+  text: "",
+  toolCalls: [],
+  toolCallsBeforeText: false,
+  textSegments: [],
+  contentOrder: [],
+  surfaces: [],
+  thinkingSegments: [],
+  attachments: [],
+  contentBlocks: [],
+};
+
+/**
+ * Read a persisted assistant row as a candidate channel reply.
+ *
+ * A reaction row reads as empty on purpose. Its `"[reaction]"` body is a
+ * storage sentinel for an emoji the react tool already delivered to the
+ * channel, not speech the turn owes anyone, and the row is drained at the
+ * turn boundary, so it is the newest assistant row of any turn that
+ * reacted. Read literally, its non-empty text counts as a real deliverable
+ * reply and outranks the turn's actual reply (or its `<no_response/>`
+ * silence) in every newest-first scan below, posting the raw sentinel to the
+ * channel as visible text. Reading it as empty is what makes a reaction-only
+ * turn silent, and it is the one seam every delivery path shares: the turn
+ * scan, the unbounded fallback sweep, and the targeted `messageId` path,
+ * which needs it too because the sweep durably stores whatever the scan
+ * returns. The history renderers project these rows as a structured reaction
+ * fact for the same reason; delivery owes the channel nothing for them.
+ */
 function readPersistedAssistantReply(msg: PersistedMessage): {
   rendered: RenderedHistoryContent;
   replyAttachments: RuntimeAttachmentMetadata[];
 } {
+  if (isReactionMessageMetadata(parseMessageMetadata(msg.metadata))) {
+    return { rendered: NO_REPLY_CONTENT, replyAttachments: [] };
+  }
+
   const parsed: unknown = msg.content;
-  const rendered = renderHistoryContent(parsed);
+  // The row's own metadata decides whether its plain text is working notes:
+  // a `send_user_message` turn delivers what the tool carried, and a fallback
+  // turn (marked visible) delivers the raw text the user already saw.
+  const rendered = renderHistoryContent(
+    parsed,
+    undefined,
+    undefined,
+    msg.metadata,
+  );
 
   const linked = getAttachmentMetadataForMessage(msg.id);
   const replyAttachments: RuntimeAttachmentMetadata[] = linked.map((a) => ({
@@ -324,6 +376,36 @@ function isToolResultUserMessage(msg: PersistedMessage): boolean {
     );
   } catch {
     return false;
+  }
+}
+
+/**
+ * The row a turn's reply actually lives on, for consumers outside channel
+ * delivery that would otherwise assume it is the turn's last assistant row.
+ *
+ * On a turn that routed its reply through `send_user_message`, the last row is
+ * usually the model's private wrap-up text, which projects to nothing a user
+ * reads; the reply is on the earlier row carrying the tool call. Resolving
+ * through the same scan channel delivery uses keeps the push preview and the
+ * attachment link on the row the user is actually shown, and falls back to the
+ * caller's row when the turn has no separately resolvable reply.
+ */
+export function resolveTurnReplyMessageId(
+  conversationId: string,
+  userMessageId: string | undefined,
+  fallbackMessageId: string,
+): string {
+  if (!userMessageId) {
+    return fallbackMessageId;
+  }
+  try {
+    return (
+      findAssistantReplyMessageIdForTurn(conversationId, userMessageId) ??
+      fallbackMessageId
+    );
+  } catch {
+    // Resolution is a refinement, never a reason to lose the reply.
+    return fallbackMessageId;
   }
 }
 
@@ -369,7 +451,57 @@ export function findAssistantReplyMessageIdForTurn(
   return sentinelRowId;
 }
 
+/**
+ * The messages a gated turn already spoke before the row being delivered, in
+ * the order it spoke them.
+ *
+ * A `send_user_message` turn can address the user more than once: a progress
+ * message before the tool work, the result after. Each lands on its own row
+ * marked `"private"`, and the durable scan resolves only one of them, so a
+ * transport with no live stream, or one whose stream evaporates rather than
+ * persisting (a Telegram draft), would deliver the last message and silently
+ * drop everything the tool already reported as `Delivered.`
+ *
+ * Bounded to the turn `userMessageId` opened, and gated on the rows' own
+ * visibility marker: an ordinary turn has no private rows, so this is empty
+ * and its delivery is unchanged.
+ */
+function earlierGatedSegmentsForTurn(
+  conversationId: string,
+  userMessageId: string,
+  replyMessageId: string,
+): string[] {
+  let msgs: PersistedMessage[];
+  try {
+    msgs = getMessages(conversationId);
+  } catch {
+    // Combining is a refinement, never a reason to lose the reply.
+    return [];
+  }
+  const userIndex = msgs.findIndex((msg) => msg.id === userMessageId);
+  if (userIndex === -1) {
+    return [];
+  }
+  const segments: string[] = [];
+  for (let i = userIndex + 1; i < msgs.length; i++) {
+    const msg = msgs[i];
+    if (msg.role === "user" && !isToolResultUserMessage(msg)) {
+      break;
+    }
+    if (msg.id === replyMessageId) {
+      break;
+    }
+    if (msg.role !== "assistant" || !isPrivateAssistantText(msg.metadata)) {
+      continue;
+    }
+    const { rendered } = readPersistedAssistantReply(msg);
+    segments.push(...rendered.textSegments);
+  }
+  return segments;
+}
+
 async function deliverPersistedAssistantMessageViaCallback(
+  conversationId: string,
   msg: PersistedMessage,
   externalChatId: string,
   callbackUrl: string,
@@ -383,27 +515,42 @@ async function deliverPersistedAssistantMessageViaCallback(
     return false;
   }
 
-  // Compose an `onMessageTs` that reconciles `slackMeta.channelTs` on the
-  // persisted assistant row once Slack returns the authoritative ts. The
-  // assistant row was written BEFORE the gateway POST in
-  // `handleMessageComplete`, so the partial `slackMeta` it carries is
-  // missing `channelTs` and would otherwise be rejected by
-  // `readSlackMetadata`, dropping the row out of chronological/thread-tag
-  // rendering. We only act on the FIRST ts (top-level segment); any
-  // subsequent split segments become independent Slack messages with
-  // their own ts and are not represented as separate DB rows.
-  const reconcileOnMessageTs = makeChannelTsReconciler(msg.id);
+  // Everything the turn said before this row, so a channel with no surviving
+  // live stream receives every message the model sent rather than only the
+  // last one. Empty on every non-gated turn.
+  const earlier = options?.sinceMessageId
+    ? earlierGatedSegmentsForTurn(
+        conversationId,
+        options.sinceMessageId,
+        msg.id,
+      )
+    : [];
+  const textSegments =
+    earlier.length > 0
+      ? [...earlier, ...rendered.textSegments]
+      : rendered.textSegments;
+  const fallbackText =
+    earlier.length > 0 ? joinWithSpacing(textSegments) : rendered.text;
+
+  // Compose an `onMessageTs` that reconciles the persisted assistant row's
+  // provider message ids as the transport reports the authoritative ones.
+  // The assistant row is written BEFORE the gateway POST, so its pre-send
+  // envelope lacks the `messageId` a later reaction or delete naming it
+  // resolves by. A reply split into several segments reports one id per
+  // posted provider message, all reconciled onto this one row; see
+  // `makeSentMessageIdReconciler`.
+  const reconcileOnMessageTs = makeSentMessageIdReconciler(msg.id);
   const callerOnMessageTs = options?.onMessageTs;
-  const composedOnMessageTs = (ts: string): void => {
-    reconcileOnMessageTs(ts);
-    callerOnMessageTs?.(ts);
+  const composedOnMessageTs = async (ts: string): Promise<void> => {
+    await reconcileOnMessageTs(ts);
+    await callerOnMessageTs?.(ts);
   };
 
   await deliverRenderedReplyViaCallback({
     callbackUrl,
     chatId: externalChatId,
-    textSegments: rendered.textSegments,
-    fallbackText: rendered.text,
+    textSegments,
+    fallbackText,
     attachments: replyAttachments,
     assistantId,
     startFromSegment: options?.startFromSegment,
@@ -441,6 +588,7 @@ export async function deliverReplyViaCallback(
       !options.sinceMessageId
     ) {
       await deliverPersistedAssistantMessageViaCallback(
+        conversationId,
         msg,
         externalChatId,
         callbackUrl,
@@ -461,6 +609,7 @@ export async function deliverReplyViaCallback(
       const msg = getMessageById(replyMessageId, conversationId);
       if (msg && msg.role === "assistant") {
         await deliverPersistedAssistantMessageViaCallback(
+          conversationId,
           msg,
           externalChatId,
           callbackUrl,
@@ -478,6 +627,7 @@ export async function deliverReplyViaCallback(
       continue;
     }
     const delivered = await deliverPersistedAssistantMessageViaCallback(
+      conversationId,
       msgs[i],
       externalChatId,
       callbackUrl,
@@ -488,94 +638,4 @@ export async function deliverReplyViaCallback(
       break;
     }
   }
-}
-
-/**
- * Build a one-shot `onMessageTs` handler that reconciles the persisted
- * assistant message's `slackMeta.channelTs` from Slack's authoritative `ts`.
- *
- * Behavior:
- * - Acts only on the first invocation per delivery (subsequent segments
- *   correspond to independent Slack messages with their own ts and are not
- *   represented as separate DB rows).
- * - No-op when the row was not persisted with a `slackMeta` envelope (the
- *   channel was not Slack at write-time, e.g. vellum/telegram outbound).
- * - No-op when the row's existing `slackMeta` already parses cleanly via
- *   `readSlackMetadata` (channelTs already present, e.g. from a prior
- *   reconciliation).
- * - Failures are logged and swallowed so a transient DB error cannot break
- *   the outbound delivery itself.
- */
-function makeChannelTsReconciler(messageId: string): (ts: string) => void {
-  let applied = false;
-  return (ts: string): void => {
-    if (applied) {
-      return;
-    }
-    applied = true;
-    if (!ts) {
-      return;
-    }
-    try {
-      // Re-read the row's current metadata so a concurrent edit-propagation
-      // write (e.g. `editedAt`) is not clobbered. `updateMessageMetadata`
-      // shallow-merges into the top-level envelope, and the slackMeta
-      // sub-object is merged manually below so we can preserve fields on
-      // the partial pre-send envelope (`mergeSlackMetadata` would call
-      // `readSlackMetadata` which rejects the partial form for lacking
-      // channelTs — exactly the state we are reconciling).
-      const row = getMessageById(messageId);
-      if (row === null || row.metadata === null) {
-        return;
-      }
-      let envelope: Record<string, unknown>;
-      try {
-        envelope = JSON.parse(row.metadata) as Record<string, unknown>;
-      } catch {
-        return;
-      }
-      const slackMetaRaw =
-        typeof envelope.slackMeta === "string" ? envelope.slackMeta : null;
-      if (slackMetaRaw === null) {
-        return;
-      }
-      // If the existing slackMeta already parses cleanly via the strict
-      // reader, channelTs is already present (a prior reconciliation ran,
-      // or backfill stamped the field) — nothing to do.
-      if (readSlackMetadata(slackMetaRaw) !== null) {
-        return;
-      }
-      // Lenient parse of the partial slackMeta so we can preserve every
-      // field already written by `handleMessageComplete` (source,
-      // eventKind, channelId, threadTs, ...) while patching channelTs in.
-      let existingSlackMeta: Record<string, unknown>;
-      try {
-        const parsed = JSON.parse(slackMetaRaw) as unknown;
-        if (
-          parsed === null ||
-          typeof parsed !== "object" ||
-          Array.isArray(parsed)
-        ) {
-          return;
-        }
-        existingSlackMeta = parsed as Record<string, unknown>;
-      } catch {
-        return;
-      }
-      const mergedSlackMeta = JSON.stringify({
-        ...existingSlackMeta,
-        channelTs: ts,
-        // Force `source: "slack"` for parity with `mergeSlackMetadata`'s
-        // invariant — the reader rejects anything else and we never want a
-        // reconciled row to slip through with a stale source.
-        source: "slack",
-      });
-      updateMessageMetadata(messageId, { slackMeta: mergedSlackMeta });
-    } catch (err) {
-      log.warn(
-        { err, messageId },
-        "Failed to reconcile slackMeta.channelTs on outbound assistant row",
-      );
-    }
-  };
 }

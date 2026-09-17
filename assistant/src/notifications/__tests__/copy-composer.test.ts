@@ -35,6 +35,89 @@ function makeSignal(
 
 const CHANNELS: NotificationChannel[] = ["vellum" as NotificationChannel];
 
+// ── activity.failed rendering ─────────────────────────────────────────
+
+describe("activity.failed copy", () => {
+  function failedSignal(
+    contextPayload: Record<string, unknown>,
+  ): NotificationSignal {
+    return makeSignal({
+      sourceEventName: "activity.failed",
+      contextPayload,
+    });
+  }
+
+  test("renders the carried classification message verbatim", () => {
+    const copy = composeFallbackCopy(
+      failedSignal({
+        jobName: "schedule:PR scan",
+        errorKind: "model_provider",
+        errorMessage: "Agent turn failed (PROVIDER_BILLING)",
+        failureSummary:
+          "You're out of credits. Add credits in Settings to continue.",
+      }),
+      CHANNELS,
+    );
+    expect(copy.vellum?.title).toBe("Background job failed: schedule:PR scan");
+    expect(copy.vellum?.body).toBe(
+      "You're out of credits. Add credits in Settings to continue.",
+    );
+  });
+
+  test("an oversized carried summary is bounded", () => {
+    const copy = composeFallbackCopy(
+      failedSignal({
+        jobName: "job",
+        errorKind: "model_provider",
+        errorMessage: "irrelevant",
+        failureSummary: "x".repeat(400),
+      }),
+      CHANNELS,
+    );
+    expect((copy.vellum?.body ?? "").length).toBeLessThanOrEqual(303);
+    expect(copy.vellum?.body).toEndWith("...");
+  });
+
+  test("constant-shaped raw detail never reaches the body", () => {
+    const copy = composeFallbackCopy(
+      failedSignal({
+        jobName: "heartbeat",
+        errorKind: "model_provider",
+        errorMessage: "Agent turn failed (PROVIDER_BILLING)",
+      }),
+      CHANNELS,
+    );
+    expect(copy.vellum?.body).toBe("The model provider did not respond.");
+    expect(copy.vellum?.body).not.toContain("PROVIDER_BILLING");
+  });
+
+  test("readable raw detail is appended to the kind prose", () => {
+    const copy = composeFallbackCopy(
+      failedSignal({
+        jobName: "watcher",
+        errorKind: "exception",
+        errorMessage: "The feed endpoint returned an empty document.",
+      }),
+      CHANNELS,
+    );
+    expect(copy.vellum?.body).toBe(
+      "It stopped with an error. The feed endpoint returned an empty document.",
+    );
+  });
+
+  test("timeout renders its own prose", () => {
+    const copy = composeFallbackCopy(
+      failedSignal({
+        jobName: "filing",
+        errorKind: "timeout",
+        errorMessage: "Background job 'filing' timed out after 1800000ms",
+      }),
+      CHANNELS,
+    );
+    expect(copy.vellum?.body).toContain("It ran out of time before finishing.");
+  });
+});
+
 // ── composeFallbackCopy with requestedMessage ─────────────────────────
 
 describe("composeFallbackCopy honors requestedMessage / requestedTitle", () => {
@@ -417,6 +500,76 @@ describe("composeFallbackCopy plugin schedule templates", () => {
     expect(copy.vellum?.body).toContain("bad expression");
     expect(copy.vellum?.body).not.toContain("\u001b");
     expect(copy.vellum?.body).not.toContain("\n");
+  });
+});
+
+// ── activity.complete rendering ───────────────────────────────────────
+
+describe("activity.complete copy", () => {
+  function completeSignal(
+    contextPayload: Record<string, unknown>,
+  ): NotificationSignal {
+    return makeSignal({
+      sourceEventName: "activity.complete",
+      contextPayload,
+    });
+  }
+
+  test("a producer-authored title survives the fallback path", () => {
+    // The home feed reads the payload title first; the popup must say the
+    // same thing when the classifier was unreachable.
+    const copy = composeFallbackCopy(
+      completeSignal({
+        title: "Skill updated: Weekly Report Export",
+        summary: "Added the retry after an expired session.",
+      }),
+      CHANNELS,
+    );
+    expect(copy.vellum?.title).toBe("Skill updated: Weekly Report Export");
+    expect(copy.vellum?.body).toBe("Added the retry after an expired session.");
+  });
+
+  test("the pass-through's requestedTitle is honored when no title is set", () => {
+    const copy = composeFallbackCopy(
+      completeSignal({
+        requestedTitle: "Nightly export finished",
+        summary: "Wrote 12 files to the reports folder.",
+      }),
+      CHANNELS,
+    );
+    expect(copy.vellum?.title).toBe("Nightly export finished");
+  });
+
+  test("without an authored title the headline is the summary's first sentence", () => {
+    const copy = composeFallbackCopy(
+      completeSignal({
+        summary:
+          "Added the retry after an expired session. Dropped the login step.",
+      }),
+      CHANNELS,
+    );
+    expect(copy.vellum?.title).toBe(
+      "Added the retry after an expired session.",
+    );
+  });
+
+  test("an authored title the normalizer rejects falls back to the derived one", () => {
+    const copy = composeFallbackCopy(
+      completeSignal({
+        title: "Skill\nupdated",
+        summary: "Added the retry after an expired session.",
+      }),
+      CHANNELS,
+    );
+    expect(copy.vellum?.title).toBe(
+      "Added the retry after an expired session.",
+    );
+  });
+
+  test("neither a title nor a summary still says something happened", () => {
+    const copy = composeFallbackCopy(completeSignal({}), CHANNELS);
+    expect(copy.vellum?.title).toBe("Activity complete");
+    expect(copy.vellum?.body).toBe("An activity has completed");
   });
 });
 

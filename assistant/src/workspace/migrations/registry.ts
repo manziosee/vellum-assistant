@@ -144,6 +144,16 @@ import { repairDeprecatedCodexModelIdMigration } from "./143-repair-deprecated-c
 import { convertStrandedSubscriptionOpenaiProfilesMigration } from "./144-convert-stranded-subscription-openai-profiles.js";
 import { collapseProfileBindingsToEntriesMigration } from "./145-collapse-profile-bindings-to-entries.js";
 import { repairRetiredFireworksDeepseekFlashModelIdMigration } from "./146-repair-retired-fireworks-deepseek-flash-model-id.js";
+import { renameCollidingBackupProfileNamesMigration } from "./147-rename-colliding-backup-profile-names.js";
+import { stripUnsupportedFallbackProfilesMigration } from "./148-strip-unsupported-fallback-profiles.js";
+import { repointBackupProfileSelectionsMigration } from "./149-repoint-backup-profile-selections.js";
+import { sttFluxProviderToModelFamilyMigration } from "./150-stt-flux-provider-to-model-family.js";
+import { repairRenamedFireworksDeepseekProModelIdMigration } from "./151-repair-renamed-fireworks-deepseek-pro-model-id.js";
+import { repairRetiredFireworksMinimaxM2p7ModelIdMigration } from "./152-repair-retired-fireworks-minimax-m2p7-model-id.js";
+import { stripMcpPolicyFieldsMigration } from "./153-strip-mcp-policy-fields.js";
+import { repairRetiredCodexGpt54ModelIdsMigration } from "./154-repair-retired-codex-gpt-5-4-model-ids.js";
+import { moveFrontModelConfigToVoiceMigration } from "./155-move-front-model-config-to-voice.js";
+import { extractWorkspaceMcpJsonMigration } from "./156-extract-workspace-mcp-json.js";
 import { migrateToWorkspaceVolumeMigration } from "./migrate-to-workspace-volume.js";
 import type { WorkspaceMigration } from "./types.js";
 
@@ -303,4 +313,14 @@ export const WORKSPACE_MIGRATIONS: WorkspaceMigration[] = [
   convertStrandedSubscriptionOpenaiProfilesMigration,
   collapseProfileBindingsToEntriesMigration,
   repairRetiredFireworksDeepseekFlashModelIdMigration,
+  renameCollidingBackupProfileNamesMigration,
+  stripUnsupportedFallbackProfilesMigration,
+  repointBackupProfileSelectionsMigration,
+  sttFluxProviderToModelFamilyMigration,
+  repairRenamedFireworksDeepseekProModelIdMigration,
+  repairRetiredFireworksMinimaxM2p7ModelIdMigration,
+  stripMcpPolicyFieldsMigration,
+  repairRetiredCodexGpt54ModelIdsMigration,
+  moveFrontModelConfigToVoiceMigration,
+  extractWorkspaceMcpJsonMigration,
 ];

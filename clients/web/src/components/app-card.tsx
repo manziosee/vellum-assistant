@@ -1,6 +1,8 @@
 import { ExternalLink, Pin, PinOff, Puzzle } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 
+import { useTranslation } from "@/i18n";
+import { AppIcon, getAppIcon } from "@/utils/app-icon-registry";
 import { cn } from "@/utils/misc";
 import { preparePreviewHtml } from "@/utils/sandbox-bridge";
 import { Button } from "@vellumai/design-library";
@@ -48,6 +50,10 @@ export function AppCard({
   onOpen,
   onPin,
 }: AppCardProps) {
+  const { t } = useTranslation();
+  /* Whether the manifest's icon is one the registry can draw. */
+  const hasGlyph = getAppIcon(icon) !== undefined;
+
   return (
     <div
       className={cn(
@@ -65,10 +71,13 @@ export function AppCard({
 
       <div className="flex flex-col gap-0.5 px-0.5">
         <span className="flex items-center gap-2 truncate text-body-large-default text-[color:var(--content-emphasised)]">
-          {icon ? (
-            <span aria-hidden className="leading-none">
-              {icon}
-            </span>
+          {hasGlyph ? (
+            <AppIcon
+              icon={icon}
+              size={16}
+              aria-hidden
+              className="shrink-0 text-[var(--content-tertiary)]"
+            />
           ) : null}
           <span className="truncate">{name}</span>
         </span>
@@ -86,7 +95,7 @@ export function AppCard({
           onClick={onOpen}
           disabled={isOpenDisabled || onOpen == null}
         >
-          Open App
+          {t("appCard.openApp")}
         </Button>
         <Button
           variant="outlined"
@@ -94,7 +103,7 @@ export function AppCard({
           onClick={onPin}
           disabled={onPin == null}
         >
-          {isPinned ? "Unpin" : "Pin"}
+          {isPinned ? t("appCard.unpin") : t("appCard.pin")}
         </Button>
       </div>
     </div>
@@ -123,6 +132,7 @@ export function AppPreviewThumbnail({
   isPreviewPending = false,
   className,
 }: AppPreviewThumbnailProps) {
+  const { t } = useTranslation();
   const containerRef = useRef<HTMLDivElement>(null);
   const [html, setHtml] = useState<string | null>(null);
   const [isVisible, setIsVisible] = useState(false);
@@ -152,6 +162,7 @@ export function AppPreviewThumbnail({
   }, [loadHtml]);
 
   useEffect(() => {
+    setHtml(null);
     if (!isVisible || loadHtml == null) {
       return;
     }
@@ -182,10 +193,15 @@ export function AppPreviewThumbnail({
       {/* Fallback layer — always rendered so it shows during iframe paint
           and serves as the placeholder when no html is available. */}
       <div className="absolute inset-0 flex items-center justify-center">
-        {isPreviewPending ? null : icon ? (
-          <span className="text-4xl">{icon}</span>
-        ) : (
-          <Puzzle size={32} className="text-[var(--content-tertiary)]" />
+        {isPreviewPending ? null : (
+          /* The registry glyph, else the puzzle piece the card always used
+             for an app with no icon. */
+          <AppIcon
+            icon={icon}
+            fallback={Puzzle}
+            size={32}
+            className="text-[var(--content-tertiary)]"
+          />
         )}
       </div>
 
@@ -198,7 +214,7 @@ export function AppPreviewThumbnail({
           srcDoc={preparePreviewHtml(html)}
           sandbox="allow-scripts"
           referrerPolicy="no-referrer"
-          title={`${name} preview`}
+          title={t("appCard.previewTitle", { name })}
           aria-hidden="true"
           tabIndex={-1}
           loading="lazy"

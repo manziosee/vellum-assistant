@@ -49,7 +49,11 @@ async function requestConfirmation(opts: {
     "--json",
   ];
 
-  const proc = Bun.spawn(args, { stdout: "pipe", stderr: "pipe" });
+  const proc = Bun.spawn(args, {
+    windowsHide: true,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
   const stdout = await new Response(proc.stdout).text();
   await proc.exited;
 
@@ -258,7 +262,9 @@ async function rsvp(argv: string[]): Promise<void> {
   const args = parseArgs(argv);
   const eventId = requireArg(args, "event-id");
   const responseStatus = requireArg(args, "response") as
-    "accepted" | "declined" | "tentative";
+    | "accepted"
+    | "declined"
+    | "tentative";
   const calendarId = optionalArg(args, "calendar-id") ?? "primary";
   const account = optionalArg(args, "account");
   const skipConfirm = args["skip-confirm"] === true;

@@ -2,6 +2,7 @@ import type {
   ConversationMessage,
   ConversationMessageSurface,
 } from "@vellumai/assistant-api";
+import { readAssistantTextVisibility } from "@/domains/chat/utils/assistant-text-visibility";
 import { runtimeAttachmentsToDisplay } from "@/domains/chat/utils/attachment-mapping";
 import { parseAttachmentSummariesFromContent } from "@/domains/chat/utils/parse-attachment-summaries";
 import type {
@@ -186,6 +187,19 @@ export function mapRuntimeToDisplayMessage(
   if (m.systemCard) {
     msg.isSystemCard = true;
   }
+  if (m.noResponse) {
+    msg.isNoResponse = true;
+  }
+  if (m.cameraFrame) {
+    msg.isCameraFrame = true;
+  }
+  const assistantTextVisibility = readAssistantTextVisibility(m);
+  if (assistantTextVisibility) {
+    msg.assistantTextVisibility = assistantTextVisibility;
+  }
+  if (m.reaction) {
+    msg.reaction = m.reaction;
+  }
   if (m.providerError) {
     msg.providerError = {
       code: m.providerError.code,
@@ -194,6 +208,9 @@ export function mapRuntimeToDisplayMessage(
   }
   if (m.slackMessage) {
     msg.slackMessage = m.slackMessage;
+  }
+  if (m.deletedAt != null) {
+    msg.deletedAt = m.deletedAt;
   }
   if (toolCalls) {
     msg.toolCalls = toolCalls;

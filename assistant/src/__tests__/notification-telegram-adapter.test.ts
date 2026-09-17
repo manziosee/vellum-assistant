@@ -13,7 +13,21 @@ const sendCalls: Array<{
 /** When true, sendTelegramReply throws if an approval argument is present. */
 let rejectRichDelivery = false;
 
+const editCalls: Array<{
+  chatId: string;
+  messageId: string;
+  text: string;
+}> = [];
+
+/** When set, editTelegramMessage rejects with this message. */
+let editFailure: string | undefined;
+
+const { acknowledgedSend } =
+  await import("../messaging/providers/send-result.js");
+const actualTelegramSend =
+  await import("../messaging/providers/telegram-bot/send.js");
 mock.module("../messaging/providers/telegram-bot/send.js", () => ({
+  ...actualTelegramSend,
   sendTelegramReply: async (
     chatId: string,
     text: string,
@@ -27,9 +41,9 @@ mock.module("../messaging/providers/telegram-bot/send.js", () => ({
       text,
       approval: approval as (typeof sendCalls)[0]["approval"],
     });
-    // Mirror the real send result: the id of the sent message, which the
-    // adapter surfaces so the delivery row can address the card later.
-    return { lastMessageId: String(1000 + sendCalls.length) };
+    // The real send result: the id of the sent message, which the adapter
+    // surfaces so the delivery row can address the card later.
+    return acknowledgedSend([String(1000 + sendCalls.length)]);
   },
   sendTelegramAttachments: async () => ({
     allFailed: false,
@@ -37,6 +51,16 @@ mock.module("../messaging/providers/telegram-bot/send.js", () => ({
     totalCount: 0,
   }),
   sendTelegramTypingIndicator: async () => true,
+  editTelegramMessage: async (
+    chatId: string,
+    messageId: string,
+    text: string,
+  ) => {
+    if (editFailure) {
+      throw new Error(editFailure);
+    }
+    editCalls.push({ chatId, messageId, text });
+  },
 }));
 
 import { TelegramAdapter } from "../notifications/adapters/telegram.js";
@@ -72,7 +96,9 @@ function makeDestination(
 describe("TelegramAdapter", () => {
   beforeEach(() => {
     sendCalls.length = 0;
+    editCalls.length = 0;
     rejectRichDelivery = false;
+    editFailure = undefined;
   });
 
   test("prefers deliveryText and does not append deterministic label", async () => {
@@ -300,5 +326,122 @@ describe("TelegramAdapter", () => {
       "Someone is requesting access to the assistant.",
     );
     expect(call.text).toContain("XYZW");
+  });
+
+  test("a question with no options is sent as text with its typed-reply instruction", async () => {
+    const adapter = new TelegramAdapter();
+    const payload = makePayload({
+      sourceEventName: "guardian.question",
+      copy: {
+        title: "Question",
+        body: "What time works?",
+        deliveryText: "What time works?",
+      },
+      contextPayload: {
+        requestId: "req-voice-1",
+        requestCode: "DEF456",
+        requestKind: "pending_question",
+        questionText: "What time works?",
+      },
+      approvalContext: {
+        requestId: "req-voice-1",
+        actions: [],
+        plainTextFallback:
+          'Reference code: DEF456. Reply "DEF456 <your answer>".',
+        intent: "question",
+      },
+    });
+
+    const result = await adapter.send(payload, makeDestination());
+
+    expect(result.success).toBe(true);
+    expect(sendCalls).toHaveLength(1);
+    // No buttons to draw, so no keyboard is attempted and the instruction
+    // joins the text: this is the only place the guardian learns the code.
+    expect(sendCalls[0]?.approval).toBeUndefined();
+    expect(sendCalls[0]?.text).toBe(
+      'What time works?\n\nReference code: DEF456. Reply "DEF456 <your answer>".',
+    );
+  });
+
+  describe("update", () => {
+    test("edits the delivered message in place and keeps its id", async () => {
+      const adapter = new TelegramAdapter();
+
+      const result = await adapter.update(
+        {
+          deliveryId: "del-1",
+          destination: "chat-123",
+          messageId: "5150",
+          conversationId: null,
+        },
+        { body: "Approved by Alice" },
+      );
+
+      expect(result.success).toBe(true);
+      expect(editCalls).toEqual([
+        { chatId: "chat-123", messageId: "5150", text: "Approved by Alice" },
+      ]);
+      // An edit addresses one message and leaves it in place, so the delivery
+      // row's id must still identify the card afterwards.
+      expect(result.messageId).toBe("5150");
+      // Revising a card must never post a second one beside it.
+      expect(sendCalls).toHaveLength(0);
+    });
+
+    test("falls back to the title when no body is supplied", async () => {
+      const adapter = new TelegramAdapter();
+
+      await adapter.update(
+        {
+          deliveryId: "del-1",
+          destination: "chat-123",
+          messageId: "5150",
+          conversationId: null,
+        },
+        { title: "Expired" },
+      );
+
+      expect(editCalls[0]?.text).toBe("Expired");
+    });
+
+    test("refuses a delivery that captured no message id", async () => {
+      const adapter = new TelegramAdapter();
+
+      const result = await adapter.update(
+        {
+          deliveryId: "del-1",
+          destination: "chat-123",
+          messageId: null,
+          conversationId: null,
+        },
+        { body: "Approved" },
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain("missing_message_id");
+      expect(editCalls).toHaveLength(0);
+    });
+
+    test("reports a failed edit rather than posting a replacement", async () => {
+      const adapter = new TelegramAdapter();
+      editFailure = "Telegram API error: message to edit not found";
+
+      const result = await adapter.update(
+        {
+          deliveryId: "del-1",
+          destination: "chat-123",
+          messageId: "5150",
+          conversationId: null,
+        },
+        { body: "Approved" },
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain("message to edit not found");
+      // The original would otherwise sit beside the replacement, which reads
+      // as the assistant answering twice.
+      expect(sendCalls).toHaveLength(0);
+    });
   });
 });

@@ -21,10 +21,22 @@ mock.module("@/runtime/main-window", () => ({
   ensureMainWindowVisible: ensureMainWindowVisibleMock,
 }));
 
+/**
+ * Whether the companion is on screen to take the request in its popover,
+ * which is what decides between the popover and the raise.
+ */
+let companionOnScreen = false;
+const realCompanionSurface = await import("@/runtime/companion-surface");
+mock.module("@/runtime/companion-surface", () => ({
+  ...realCompanionSurface,
+  companionTakesPrompts: () => Promise.resolve(companionOnScreen),
+}));
+
 const {
   handleSecretRequest,
   handleConfirmationRequest,
   handleContactRequest,
+  handleContactFormClosed,
   handleInteractionResolved,
 } = await import("@/domains/chat/utils/stream-handlers/interaction-handlers");
 
@@ -48,6 +60,7 @@ beforeEach(() => {
   useInteractionStore.getState().resetAll();
   useChatSessionStore.getState().deleteConfirmationToolCall("cr-1");
   ensureMainWindowVisibleMock.mockClear();
+  companionOnScreen = false;
 });
 
 afterEach(() => {
@@ -165,13 +178,13 @@ describe("handleConfirmationRequest", () => {
   });
 
   /**
-   * The card that answers a confirmation is drawn in the app's window, and the
-   * turn that raised it need not have been started there: a message typed on
-   * the companion, or a scheduled run, leaves the window behind whatever the
-   * user is working in, and a request nobody can see is a run that has stopped
-   * for no visible reason.
+   * The turn that raised a confirmation need not have been started in the
+   * app's window: a call on the companion, or a scheduled run, leaves the
+   * window behind whatever the user is working in, and a request nobody can
+   * see is a run that has stopped for no visible reason. With no companion on
+   * screen to take it, the window comes forward.
    */
-  it("brings the app forward so the request can be answered", () => {
+  it("brings the app forward so the request can be answered", async () => {
     handleConfirmationRequest(
       {
         type: "confirmation_request",
@@ -185,7 +198,34 @@ describe("handleConfirmationRequest", () => {
       makeCtx(),
     );
 
+    await Promise.resolve();
+    await Promise.resolve();
+
     expect(ensureMainWindowVisibleMock).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * With the companion on screen the request is answered in its popover, so
+   * the window stays behind the app the user is working in.
+   */
+  it("leaves the window where it is when the companion takes the request", async () => {
+    companionOnScreen = true;
+    handleConfirmationRequest(
+      {
+        type: "confirmation_request",
+        requestId: "cr-1",
+        toolName: "bash",
+        input: { command: "ls" },
+        riskLevel: "high",
+        allowlistOptions: [],
+        scopeOptions: [],
+      },
+      makeCtx(),
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(ensureMainWindowVisibleMock).not.toHaveBeenCalled();
   });
 });
 
@@ -367,14 +407,103 @@ describe("handleInteractionResolved", () => {
 });
 
 describe("handleContactRequest", () => {
-  it("dispatches CONTACT_REQUEST turn event and updates interaction store", () => {
+  it("raises the card without touching the turn", () => {
     const ctx = makeCtx();
     handleContactRequest(
       { type: "contact_request", requestId: "ctc-1", channel: "email" },
       ctx,
     );
-    expect(ctx.turnActions.onContactRequest).toHaveBeenCalled();
+
     const state = useInteractionStore.getState();
     expect(state.pendingContactRequest).toMatchObject({ requestId: "ctc-1" });
+    // The event carries no conversation, so the only turn available is
+    // whichever the guardian is viewing. A form raised by a background command
+    // would park a conversation that is not waiting on it, and show an
+    // unrelated turn as awaiting input.
+    expect(ctx.turnActions.onContactRequest).not.toHaveBeenCalled();
+  });
+});
+
+describe("handleContactFormClosed", () => {
+  beforeEach(() => {
+    useInteractionStore.setState(useInteractionStore.getInitialState(), true);
+  });
+
+  function raiseRecordForm(requestId: string) {
+    useInteractionStore
+      .getState()
+      .showContactRecordRequest({ requestId, operation: "create" });
+  }
+
+  it("retires the card on a client that did not answer", () => {
+    raiseRecordForm("r1");
+
+    handleContactFormClosed({
+      type: "contact_form_closed",
+      requestId: "r1",
+      reason: "answered",
+    });
+
+    expect(
+      useInteractionStore.getState().pendingContactRecordRequest,
+    ).toBeNull();
+  });
+
+  it("gives a card with a submission on the wire a moment before retiring it", () => {
+    raiseRecordForm("r1");
+    useInteractionStore
+      .getState()
+      .claimSubmission("contactRecordRequest", "r1");
+
+    // The gateway resolves the form before its HTTP response returns, so this
+    // can arrive while the submission is still on the wire.
+    handleContactFormClosed({
+      type: "contact_form_closed",
+      requestId: "r1",
+      reason: "answered",
+    });
+
+    expect(
+      useInteractionStore.getState().pendingContactRecordRequest?.requestId,
+    ).toBe("r1");
+    // Not marked answered: this broadcast names the form, and every client
+    // submitting it concurrently matches, including the ones that lost. Only
+    // this client's own response can say it wrote anything.
+    expect(useInteractionStore.getState().contactRecordRequestAccepted).toBe(
+      false,
+    );
+  });
+
+  it("retires a failed form on the client that submitted it", () => {
+    raiseRecordForm("r1");
+    useInteractionStore
+      .getState()
+      .claimSubmission("contactRecordRequest", "r1");
+
+    // A write that failed closes the form server-side, so the card has nothing
+    // left to submit to and must not stay up offering to retry.
+    handleContactFormClosed({
+      type: "contact_form_closed",
+      requestId: "r1",
+      reason: "cancelled",
+    });
+
+    expect(
+      useInteractionStore.getState().pendingContactRecordRequest,
+    ).toBeNull();
+  });
+
+  it("ignores a closure for a form this client is not showing", () => {
+    raiseRecordForm("r1");
+
+    handleContactFormClosed({
+      type: "contact_form_closed",
+      requestId: "other",
+      reason: "timed_out",
+    });
+
+    expect(
+      useInteractionStore.getState().pendingContactRecordRequest?.requestId,
+    ).toBe("r1");
   });
 });

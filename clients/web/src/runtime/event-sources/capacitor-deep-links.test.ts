@@ -468,6 +468,119 @@ describe("publishCapacitorDeepLinksSource", () => {
     }
   });
 
+  test("publishes deeplink.openCamera and deeplink.newChat for the widget hosts", async () => {
+    const cameras: unknown[] = [];
+    const newChats: unknown[] = [];
+    const unknowns: unknown[] = [];
+    const unsubCamera = subscribe("deeplink.openCamera", (p) => {
+      cameras.push(p);
+    });
+    const unsubNewChat = subscribe("deeplink.newChat", (p) => {
+      newChats.push(p);
+    });
+    const unsubUnknown = subscribe("deeplink.unknown", (p) => {
+      unknowns.push(p);
+    });
+
+    try {
+      publishCapacitorDeepLinksSource();
+      await flushAsyncWork();
+
+      urlOpenHandler!({ url: "vellum-assistant://camera?src=intent" });
+      urlOpenHandler!({ url: "vellum-assistant://new-chat" });
+
+      // The marker is honored here because the mocked platform is iOS.
+      expect(cameras).toEqual([{ provenance: "intent" }]);
+      expect(newChats).toEqual([{ provenance: null }]);
+      expect(unknowns).toEqual([]);
+    } finally {
+      unsubCamera();
+      unsubNewChat();
+      unsubUnknown();
+    }
+  });
+
+  test("publishes deeplink.openConversations for the widgets' unread hosts", async () => {
+    const lists: unknown[] = [];
+    const unknowns: unknown[] = [];
+    const unsubList = subscribe("deeplink.openConversations", (p) => {
+      lists.push(p);
+    });
+    const unsubUnknown = subscribe("deeplink.unknown", (p) => {
+      unknowns.push(p);
+    });
+
+    try {
+      publishCapacitorDeepLinksSource();
+      await flushAsyncWork();
+
+      urlOpenHandler!({ url: "vellum-assistant://conversations" });
+      // A path makes it a different link that merely shares the host.
+      urlOpenHandler!({ url: "vellum-assistant://conversations/abc-123" });
+
+      expect(lists).toEqual([{ provenance: null }]);
+      expect(unknowns).toEqual([
+        { url: "vellum-assistant://conversations/abc-123" },
+      ]);
+    } finally {
+      unsubList();
+      unsubUnknown();
+    }
+  });
+
+  test("a look-alike scheme falls through to unknown rather than opening the camera", async () => {
+    const cameras: unknown[] = [];
+    const unknowns: unknown[] = [];
+    const unsubCamera = subscribe("deeplink.openCamera", (p) => {
+      cameras.push(p);
+    });
+    const unsubUnknown = subscribe("deeplink.unknown", (p) => {
+      unknowns.push(p);
+    });
+
+    try {
+      publishCapacitorDeepLinksSource();
+      await flushAsyncWork();
+
+      urlOpenHandler!({ url: "vellum-assistant-evil://camera" });
+
+      expect(cameras).toEqual([]);
+      expect(unknowns).toEqual([{ url: "vellum-assistant-evil://camera" }]);
+    } finally {
+      unsubCamera();
+      unsubUnknown();
+    }
+  });
+
+  test("publishes deeplink.share for the share-inbox host", async () => {
+    const shares: unknown[] = [];
+    const unknowns: unknown[] = [];
+    const unsubShare = subscribe("deeplink.share", (p) => {
+      shares.push(p);
+    });
+    const unsubUnknown = subscribe("deeplink.unknown", (p) => {
+      unknowns.push(p);
+    });
+
+    try {
+      publishCapacitorDeepLinksSource();
+      await flushAsyncWork();
+
+      urlOpenHandler!({
+        url: "vellum-assistant://share/A1B2C3D4-E5F6-7890-ABCD-EF1234567890",
+      });
+      urlOpenHandler!({ url: "vellum-assistant://share/../x" });
+
+      expect(shares).toEqual([
+        { inboxId: "A1B2C3D4-E5F6-7890-ABCD-EF1234567890" },
+      ]);
+      expect(unknowns).toEqual([{ url: "vellum-assistant://share/../x" }]);
+    } finally {
+      unsubShare();
+      unsubUnknown();
+    }
+  });
+
   test("publishes deeplink.unknown on the bus for a non-OAuth URL", async () => {
     const received: { url: string }[] = [];
     const unsubscribeBus = subscribe("deeplink.unknown", (payload) => {

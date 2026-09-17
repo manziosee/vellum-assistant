@@ -1,8 +1,18 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
+import { getCharacterComponents } from "@vellumai/avatar-catalog";
+import {
+  AVATAR_TRAITS_FILENAME,
+  normalizeAvatarAccentHex,
+} from "@vellumai/avatar-manifest";
+import {
+  CLIENT_METADATA_HEADERS,
+  sanitizeClientMetadataValue,
+} from "@vellumai/service-contracts/client-metadata";
 import { z } from "zod";
 
+import { backfillAccent } from "../../avatar/accent-backfill.js";
 import { renderCharacterAscii } from "../../avatar/ascii-renderer.js";
 import {
   type AvatarState,
@@ -11,17 +21,17 @@ import {
   writeManifest,
 } from "../../avatar/avatar-manifest.js";
 import {
+  type AvatarChangeOptions,
   clearAvatar,
+  setAccent,
   setCharacter,
   setImage,
 } from "../../avatar/avatar-store.js";
-import { getCharacterComponents } from "../../avatar/character-components.js";
-import { updateIdentityAvatarSection } from "../../avatar/identity-avatar.js";
 import {
-  type CharacterTraits,
-  TRAITS_FILENAME,
-  writeTraitsAndRenderAvatar,
-} from "../../avatar/traits-png-sync.js";
+  ensureAvatarRaster,
+  ensureAvatarRasterPath,
+} from "../../avatar/ensure-raster.js";
+import type { CharacterTraits } from "../../avatar/traits-png-sync.js";
 import { setPlatformBaseUrl } from "../../config/env.js";
 import { credentialKey } from "../../security/credential-key.js";
 import { getSecureKeyAsync } from "../../security/secure-keys.js";
@@ -34,7 +44,10 @@ import {
   getWorkspaceDir,
 } from "../../util/platform.js";
 import { ACTOR_PRINCIPALS, LOCAL_PRINCIPALS } from "../auth/route-policy.js";
-import { publishAvatarChanged } from "../sync/resource-sync-events.js";
+import {
+  getOriginClientId,
+  publishAvatarChanged,
+} from "../sync/resource-sync-events.js";
 import {
   BadRequestError,
   RouteError,
@@ -44,6 +57,18 @@ import type { RouteDefinition, RouteHandlerArgs } from "./types.js";
 
 const log = getLogger("avatar-routes");
 
+/** What every mutation hands the store: who made the change, from which OS. */
+function changeOptions(
+  headers: RouteHandlerArgs["headers"],
+): AvatarChangeOptions {
+  return {
+    originClientId: getOriginClientId(headers),
+    clientOs: sanitizeClientMetadataValue(
+      headers?.[CLIENT_METADATA_HEADERS.os],
+    ),
+  };
+}
+
 function handleGetCharacterComponents() {
   return getCharacterComponents();
 }
@@ -51,7 +76,7 @@ function handleGetCharacterComponents() {
 /**
  * Reads the manifest, self-healing once if it is absent.
  *
- * The migration (092) seeds `avatar.json` for every workspace, so the manifest
+ * The migration (094) seeds `avatar.json` for every workspace, so the manifest
  * is normally present. If it is somehow missing (e.g. a workspace that predates
  * the manifest and skipped the migration), we derive state from the legacy
  * sidecar files. A *real* avatar (character/image) is persisted once so
@@ -84,12 +109,36 @@ function readManifestSelfHealing(): AvatarState {
  * Return the authoritative avatar render state.
  *
  * Reads the manifest (`avatar.json`). When the manifest is absent it is
- * self-healed once from the legacy sidecar files and persisted. Never 404s —
- * an empty workspace yields `{ kind: "none", traits: null, source: null,
- * image: null }`.
+ * self-healed once from the legacy sidecar files and persisted, and a manifest
+ * written before accents existed has its accent filled in the same way. Never
+ * 404s: an empty workspace yields `{ kind: "none" }` with every other field
+ * null.
  */
 function handleGetAvatarState() {
-  return readManifestSelfHealing();
+  return backfillAccent(readManifestSelfHealing());
+}
+
+/**
+ * Set the accent over the current avatar, or hand it back to the automatic
+ * one. Returns the state as written so the caller can paint without a
+ * second read.
+ */
+async function handleSetAvatarAccent({ body, headers }: RouteHandlerArgs) {
+  const payload = body as Record<string, unknown> | undefined;
+  const raw = payload?.hex;
+  let hex: string | null = null;
+  if (raw !== null && raw !== undefined) {
+    hex = normalizeAvatarAccentHex(raw);
+    if (!hex) {
+      throw new BadRequestError("hex must be a #rrggbb colour, or null");
+    }
+  }
+
+  const state = await setAccent(hex, changeOptions(headers));
+  if (!state) {
+    throw new BadRequestError("No avatar to set an accent on");
+  }
+  return state;
 }
 
 function handleRenderFromTraits({ body, headers }: RouteHandlerArgs) {
@@ -107,7 +156,7 @@ function handleRenderFromTraits({ body, headers }: RouteHandlerArgs) {
     );
   }
 
-  const result = setCharacter(traits);
+  const result = setCharacter(traits, changeOptions(headers));
 
   if (!result.ok) {
     switch (result.reason) {
@@ -119,15 +168,12 @@ function handleRenderFromTraits({ body, headers }: RouteHandlerArgs) {
         throw new RouteError(result.message, "INTERNAL_ERROR", 500);
     }
   }
-
-  publishAvatarChanged(headers?.["x-vellum-client-id"]?.trim() || undefined);
   return { ok: true };
 }
 
 async function handleGenerateAvatar({ body, headers }: RouteHandlerArgs) {
-  const description = (body as Record<string, unknown>)?.description as
-    | string
-    | undefined;
+  const raw = (body as Record<string, unknown>)?.description;
+  const description = typeof raw === "string" ? raw.trim() : "";
   if (!description) {
     throw new BadRequestError("description is required");
   }
@@ -148,11 +194,10 @@ async function handleGenerateAvatar({ body, headers }: RouteHandlerArgs) {
     throw new ServiceUnavailableError(result.content);
   }
 
-  // Route through the store: atomically writes the PNG, removes the now-stale
-  // character sidecars (traits + ASCII), and records an AI-sourced manifest.
-  setImage(result.pngBuffer, "ai");
-
-  publishAvatarChanged(headers?.["x-vellum-client-id"]?.trim() || undefined);
+  await setImage(result.pngBuffer, "ai", {
+    ...changeOptions(headers),
+    imageDescription: description,
+  });
   return { ok: true, message: result.content };
 }
 
@@ -162,7 +207,7 @@ async function handleGenerateAvatar({ body, headers }: RouteHandlerArgs) {
  * single server-authoritative endpoint: the store atomically writes the PNG,
  * clears the character sidecars, and records an `image` manifest.
  */
-function handleUploadAvatarImage({ body, headers }: RouteHandlerArgs) {
+async function handleUploadAvatarImage({ body, headers }: RouteHandlerArgs) {
   const payload = body as Record<string, unknown> | undefined;
   const content = payload?.content;
   const encoding = payload?.encoding;
@@ -196,15 +241,11 @@ function handleUploadAvatarImage({ body, headers }: RouteHandlerArgs) {
     );
   }
 
-  // Route through the store: atomically writes the PNG, removes the now-stale
-  // character sidecars (traits + ASCII), and records an uploaded-image manifest.
-  setImage(buffer, "upload");
-
-  publishAvatarChanged(headers?.["x-vellum-client-id"]?.trim() || undefined);
+  await setImage(buffer, "upload", changeOptions(headers));
   return { ok: true };
 }
 
-function handleSetAvatar({ body, headers }: RouteHandlerArgs) {
+async function handleSetAvatar({ body, headers }: RouteHandlerArgs) {
   const imagePath = (body as Record<string, unknown>)?.imagePath as
     | string
     | undefined;
@@ -228,38 +269,18 @@ function handleSetAvatar({ body, headers }: RouteHandlerArgs) {
     throw new BadRequestError(`Image file not found: ${normalized}`);
   }
 
-  // Route through the store so traits sidecars are cleared and the manifest is
-  // recorded as an uploaded image atomically (no more stale both-files state).
-  setImage(readFileSync(normalized), "upload");
-
-  publishAvatarChanged(headers?.["x-vellum-client-id"]?.trim() || undefined);
+  await setImage(readFileSync(normalized), "upload", changeOptions(headers));
   return { ok: true };
 }
 
 function handleRemoveAvatar({ headers }: RouteHandlerArgs) {
-  // `hadAvatar` must reflect whether *any* avatar was configured before the
-  // clear — not just a rendered PNG. A character-only workspace (traits present,
-  // no PNG) is still an avatar, and clearAvatar() deletes its traits/ascii too.
-  // Derive from the manifest (self-healing on a manifest-miss) and treat any
-  // non-"none" kind as hadAvatar.
-  const hadAvatar = readManifestSelfHealing().kind !== "none";
-
-  // Clear everything to a manifest-consistent kind:"none". Semantic change
-  // (intentional): traits no longer persist alongside an image, so there is
-  // nothing to revert to — the legacy "re-render character from traits" branch
-  // has been removed. avatar/remove is now a plain clear, reachable only via
-  // CLI/host.
-  clearAvatar();
-
-  updateIdentityAvatarSection(
-    "Default character avatar (no custom image set)",
-    log,
-  );
-  publishAvatarChanged(headers?.["x-vellum-client-id"]?.trim() || undefined);
+  // A character-only workspace (traits, no PNG) counts as an avatar, so
+  // `hadAvatar` comes from the cleared state's kind.
+  const hadAvatar = clearAvatar(changeOptions(headers)).kind !== "none";
   return { ok: true, hadAvatar };
 }
 
-function handleGetAvatar({ queryParams, body }: RouteHandlerArgs) {
+async function handleGetAvatar({ queryParams, body }: RouteHandlerArgs) {
   const format = (queryParams?.format ??
     (body as Record<string, unknown>)?.format ??
     "path") as string;
@@ -281,27 +302,17 @@ function handleGetAvatar({ queryParams, body }: RouteHandlerArgs) {
     return { exists: false };
   }
 
-  const avatarPath = getAvatarImagePath();
-
-  // For a character, the rendered PNG normally already exists on disk. Keep the
-  // existing safety net: if it's missing, re-render it from the persisted traits
-  // so the accessor still returns a raster.
-  if (state.kind === "character" && !existsSync(avatarPath) && state.traits) {
-    try {
-      writeTraitsAndRenderAvatar(state.traits);
-    } catch {
-      // Best-effort
-    }
+  // A character whose PNG is missing is regenerated on read. Path mode never
+  // loads the raster bytes.
+  if (format === "path") {
+    const path = await ensureAvatarRasterPath(state);
+    return path ? { exists: true, path } : { exists: false };
   }
-
-  if (!existsSync(avatarPath)) {
+  const raster = await ensureAvatarRaster(state);
+  if (!raster) {
     return { exists: false };
   }
-
-  if (format === "path") {
-    return { exists: true, path: avatarPath };
-  }
-  return { exists: true, base64: readFileSync(avatarPath).toString("base64") };
+  return { exists: true, base64: raster.toString("base64") };
 }
 
 function handleCharacterAscii({ queryParams, body }: RouteHandlerArgs) {
@@ -322,7 +333,7 @@ function handleCharacterAscii({ queryParams, body }: RouteHandlerArgs) {
     );
   }
 
-  const traitsPath = join(getAvatarDir(), TRAITS_FILENAME);
+  const traitsPath = join(getAvatarDir(), AVATAR_TRAITS_FILENAME);
   if (!existsSync(traitsPath)) {
     throw new BadRequestError(
       "No native character set. Use 'assistant avatar character update' first.",
@@ -345,6 +356,31 @@ function handleCharacterAscii({ queryParams, body }: RouteHandlerArgs) {
   );
   return { ascii };
 }
+
+/** The wire shape of `avatar.json`, shared by every route that answers with it. */
+const avatarStateSchema = z.object({
+  kind: z.enum(["character", "image", "none"]),
+  traits: z
+    .object({
+      bodyShape: z.string(),
+      eyeStyle: z.string(),
+      color: z.string(),
+    })
+    .nullable(),
+  source: z.enum(["builder", "upload", "ai"]).nullable(),
+  image: z
+    .object({
+      updatedAt: z.string(),
+      etag: z.string(),
+    })
+    .nullable(),
+  accent: z
+    .object({
+      hex: z.string(),
+      source: z.enum(["palette", "derived", "custom"]),
+    })
+    .nullable(),
+});
 
 export const ROUTES: RouteDefinition[] = [
   {
@@ -397,25 +433,25 @@ export const ROUTES: RouteDefinition[] = [
     handler: handleGetAvatarState,
     summary: "Get avatar state",
     description:
-      "Return the authoritative avatar render mode (character, image, or none).",
+      "Return the authoritative avatar render mode (character, image, or none) and its accent colour.",
     tags: ["avatar"],
-    responseBody: z.object({
-      kind: z.enum(["character", "image", "none"]),
-      traits: z
-        .object({
-          bodyShape: z.string(),
-          eyeStyle: z.string(),
-          color: z.string(),
-        })
-        .nullable(),
-      source: z.enum(["builder", "upload", "ai"]).nullable(),
-      image: z
-        .object({
-          updatedAt: z.string(),
-          etag: z.string(),
-        })
-        .nullable(),
-    }),
+    responseBody: avatarStateSchema,
+  },
+  {
+    operationId: "avatar_set_accent",
+    endpoint: "avatar/accent",
+    method: "POST",
+    policy: {
+      requiredScopes: ["settings.write"],
+      allowedPrincipalTypes: ACTOR_PRINCIPALS,
+    },
+    handler: handleSetAvatarAccent,
+    summary: "Set avatar accent",
+    description:
+      "Set the accent colour over the current avatar as #rrggbb, or null to return to the automatic one (the character's palette colour, or the colour read out of the uploaded image).",
+    tags: ["avatar"],
+    requestBody: z.object({ hex: z.string().nullable() }),
+    responseBody: avatarStateSchema,
   },
   {
     operationId: "avatar_render_from_traits",
@@ -447,9 +483,7 @@ export const ROUTES: RouteDefinition[] = [
       allowedPrincipalTypes: LOCAL_PRINCIPALS,
     },
     handler: ({ headers }: RouteHandlerArgs) => {
-      publishAvatarChanged(
-        headers?.["x-vellum-client-id"]?.trim() || undefined,
-      );
+      publishAvatarChanged(getOriginClientId(headers));
       return { ok: true };
     },
     summary: "Notify avatar updated",
@@ -473,6 +507,27 @@ export const ROUTES: RouteDefinition[] = [
     tags: ["avatar"],
     requestBody: z.object({ description: z.string() }),
     responseBody: z.object({ ok: z.boolean(), message: z.string() }),
+  },
+  {
+    // Swift macOS clients post here and read `avatarPath`: an alias of
+    // avatar/generate with the response shape they need.
+    operationId: "settings_avatar_generate_post",
+    endpoint: "settings/avatar/generate",
+    method: "POST",
+    policy: {
+      requiredScopes: ["settings.write"],
+      allowedPrincipalTypes: ACTOR_PRINCIPALS,
+    },
+    handler: async (args: RouteHandlerArgs) => {
+      await handleGenerateAvatar(args);
+      return { ok: true, avatarPath: getAvatarImagePath() };
+    },
+    summary: "Generate AI avatar (legacy alias)",
+    description:
+      "Alias of avatar/generate kept for older clients; returns the avatar image path.",
+    tags: ["settings"],
+    requestBody: z.object({ description: z.string() }),
+    responseBody: z.object({ ok: z.boolean(), avatarPath: z.string() }),
   },
   {
     operationId: "avatar_set",

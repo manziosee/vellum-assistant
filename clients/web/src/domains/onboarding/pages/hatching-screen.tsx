@@ -28,13 +28,18 @@ import {
   ProviderKeyRejectedError,
 } from "@/domains/onboarding/provider-key";
 import { onboardingProvider } from "@/domains/onboarding/provider-catalog";
-import { shouldSkipResearchAfterHatch } from "@/domains/onboarding/onboarding-destination";
+import {
+  NEW_ASSISTANT_PARAM,
+  shouldSkipResearchAfterHatch,
+} from "@/domains/onboarding/onboarding-destination";
+import { stampAssistantOnboarded } from "@/domains/onboarding/stamp-assistant-onboarded";
 import { ATTRIBUTED_PLUGIN_PARAM } from "@/domains/onboarding/plugin-attribution";
 import {
   awaitPurchasedProvisioning,
   MAX_HATCH_WAIT_MS,
   POLL_INTERVAL_MS,
 } from "@/domains/onboarding/purchased-provisioning";
+import { getDesktopAppDownloadActionKey } from "@/domains/onboarding/utils/desktop-app-copy";
 import {
   isLocalClient,
   loadLockfile,
@@ -51,6 +56,7 @@ import {
 import { buildNavigationState } from "@/lib/navigation/build-state";
 import { hatchLocalAssistant } from "@/runtime/local-mode-host";
 import { isElectron } from "@/runtime/is-electron";
+import { useDesktopAppPlatform } from "@/runtime/desktop-app-platform";
 import { setSelectedAssistant } from "@/assistant/selection";
 import { useAuthStore } from "@/stores/auth-store";
 import { getActiveOrganizationIdForRequests } from "@/stores/organization-store";
@@ -154,6 +160,7 @@ export function decideHatchGate(): HatchGateDecision {
 
 export function HatchingScreen() {
   const { t } = useTranslation("onboarding");
+  const desktopAppPlatform = useDesktopAppPlatform();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [searchParams] = useSearchParams();
@@ -195,6 +202,9 @@ export function HatchingScreen() {
       hatchTraits.color,
       320,
     );
+    if (!svg) {
+      return "";
+    }
     return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
   }, [hatchTraits]);
   const [phase, setPhase] = useState<HatchPhase>("initializing");
@@ -303,8 +313,11 @@ export function HatchingScreen() {
             return;
           }
           // Non-production skip-to-chat: the assistant is live, so drop into
-          // the workspace instead of the research/personality funnel.
+          // the workspace instead of the research/personality funnel. This
+          // bypasses the research route, so it is the terminal that has to
+          // record the completion itself.
           if (shouldSkipResearchAfterHatch(searchParams)) {
+            stampAssistantOnboarded(readyAssistantId);
             void navigate(`${routes.assistant}?onboarding=1`, {
               replace: true,
             });
@@ -647,7 +660,7 @@ export function HatchingScreen() {
         return;
       }
 
-      handleHatchReady();
+      handleHatchReady(assistantId);
     };
 
     const runPoll = async () => {
@@ -808,7 +821,7 @@ export function HatchingScreen() {
                 className={electron ? undefined : "h-11 text-base"}
               >
                 <a href={`${window.location.origin}/download`}>
-                  {t("actions.downloadMacApp")}
+                  {t(getDesktopAppDownloadActionKey(desktopAppPlatform))}
                 </a>
               </Button>
             </div>
@@ -871,7 +884,7 @@ export function HatchingScreen() {
                 void navigate(
                   useLocalHatch
                     ? routes.onboarding.hosting
-                    : routes.onboarding.privacy,
+                    : `${routes.onboarding.privacy}?${NEW_ASSISTANT_PARAM}=1`,
                   { replace: true },
                 )
               }

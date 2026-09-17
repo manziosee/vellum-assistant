@@ -9,9 +9,15 @@
 import type { Button, KnownBlock } from "@slack/types";
 import type {
   ApprovalUIMetadata,
+  ChannelDeliveryResult,
   MessageAudience,
-  SlackStreamOp,
+  StreamOp,
 } from "@vellumai/gateway-client";
+import {
+  classifyReactionEmojiSpelling,
+  type ReactionEmojiIdentity,
+} from "@vellumai/service-contracts/reactions";
+import { slackEmojiCharacter } from "@vellumai/slack-text";
 
 import type { AssistantActivityPhase } from "../../../api/index.js";
 import { getAttachmentContent } from "../../../persistence/attachments-store.js";
@@ -27,6 +33,7 @@ import {
   uploadToSlackUrl,
 } from "./api.js";
 import { renderSlackBlocks } from "./render.js";
+import { toSlackStreamTasks } from "./stream-tasks.js";
 import { SlackApiError } from "./web-api-transport.js";
 
 const log = getLogger("slack-send");
@@ -297,28 +304,47 @@ export async function sendSlackReply(
 }
 
 /**
- * Execute one Slack streaming operation against a channel, returning the
- * stream `ts` so the caller can carry it across `append`/`stop` calls. `start`
+ * Execute one growing-reply operation against a Slack channel, returning the
+ * stream `ts` so the caller can carry it across `append` and `stop`. `start`
  * mints a new `ts`; `append` and `stop` echo the one they were given.
+ *
+ * Slack's stream *is* the reply, so `stop` finalizes the message already on
+ * screen. That is why the appended delta is what goes on the wire here while
+ * the op's complete `text` is used only to hoist any images out of the
+ * finished reply: Slack has been shown every word already.
  *
  * Throwing on failure is intentional: the streaming session decides whether to
  * abandon the stream and let durable delivery post the full reply.
  */
 export async function sendSlackStreamOp(
   channel: string,
-  op: SlackStreamOp,
+  op: StreamOp,
 ): Promise<SlackSendResult> {
+  const tasks = op.plan ? toSlackStreamTasks(op.plan.steps) : undefined;
+  const planTitle = op.plan?.title;
+
   switch (op.action) {
     case "start": {
+      if (!op.anchorMessageId) {
+        // Slack streams into a thread and rejects a start without one. Saying
+        // so is the honest answer: an empty thread id would be refused by the
+        // API anyway, and the caller falls back to sending the reply whole.
+        log.warn({ channel }, "Slack stream start has no thread to open on");
+        return { ok: false };
+      }
       const ts = await startSlackStream({
         channel,
-        threadTs: op.threadTs,
-        markdownText: op.markdownText,
-        taskDisplayMode: op.taskDisplayMode,
-        planTitle: op.planTitle,
-        tasks: op.tasks,
-        recipientUserId: op.recipientUserId,
-        recipientTeamId: op.recipientTeamId,
+        threadTs: op.anchorMessageId,
+        markdownText: op.appended ?? op.text,
+        // Fixed for the stream's lifetime at start, so it is set
+        // unconditionally: a plan that first appears on a later append still
+        // renders as a plan. It only affects how task chunks render, so a
+        // stream that never carries one still reads as a plain message.
+        taskDisplayMode: "plan",
+        planTitle,
+        tasks,
+        recipientUserId: op.audience?.userId,
+        recipientTeamId: op.audience?.userOrgId,
       });
       log.info({ channel, ts }, "Slack stream started");
       return { ok: ts !== undefined, ts };
@@ -326,55 +352,105 @@ export async function sendSlackStreamOp(
     case "append": {
       await appendSlackStream({
         channel,
-        streamTs: op.streamTs,
-        markdownText: op.markdownText,
-        planTitle: op.planTitle,
-        tasks: op.tasks,
+        streamTs: op.streamId,
+        markdownText: op.appended,
+        planTitle,
+        tasks,
       });
-      return { ok: true, ts: op.streamTs };
+      return { ok: true, ts: op.streamId };
     }
     case "stop": {
       await stopSlackStream({
         channel,
-        streamTs: op.streamTs,
-        markdownText: op.markdownText,
-        blocks: op.blocks,
-        planTitle: op.planTitle,
-        tasks: op.tasks,
+        streamTs: op.streamId,
+        markdownText: op.appended,
+        // Images referenced in the reply do not render inside the streamed
+        // markdown, so they are hoisted into blocks below it. Derived here
+        // from the whole reply rather than handed down, because which parts of
+        // a message become blocks is Slack's rendering decision.
+        blocks: op.text ? imageBlocksFor(op.text) : undefined,
+        planTitle,
+        tasks,
       });
-      log.info({ channel, ts: op.streamTs }, "Slack stream stopped");
-      return { ok: true, ts: op.streamTs };
+      log.info({ channel, ts: op.streamId }, "Slack stream stopped");
+      return { ok: true, ts: op.streamId };
     }
   }
 }
 
+/** Image blocks for a finished reply, or nothing when it references none. */
+function imageBlocksFor(text: string): KnownBlock[] | undefined {
+  const blocks = renderSlackBlocks(text)?.filter(
+    (block) => block.type === "image",
+  );
+  return blocks && blocks.length > 0 ? blocks : undefined;
+}
+
 /**
  * Add or remove an emoji reaction on a Slack message.
- * Non-throwing: logs errors but returns silently.
+ *
+ * Non-throwing: failures are logged and reported through the result so a
+ * tool-driven react can tell the model the truth, while the activity
+ * fallback is free to ignore it. Colons are stripped from the name because
+ * `reactions.add` takes the bare emoji name, and `already_reacted` /
+ * `no_reaction` count as success: the requested end state already holds.
  */
 export async function sendSlackReaction(
   channel: string,
   name: string,
   messageTs: string,
   action: "add" | "remove",
-): Promise<void> {
+): Promise<ChannelDeliveryResult> {
   const method = action === "add" ? "reactions.add" : "reactions.remove";
+  const bareName = slackReactionName(name);
   try {
-    await callSlackApi(method, { channel, name, timestamp: messageTs });
+    await callSlackApi(method, {
+      channel,
+      name: bareName,
+      timestamp: messageTs,
+    });
+    return { ok: true };
   } catch (err) {
     if (err instanceof SlackApiError) {
       if (
         err.slackError === "already_reacted" ||
         err.slackError === "no_reaction"
       ) {
-        return;
+        return { ok: true };
       }
     }
     log.warn(
-      { err, channel, method, name },
+      { err, channel, method, name: bareName },
       "Failed to deliver Slack reaction",
     );
+    return { ok: false };
   }
+}
+
+/**
+ * The bare name Slack's reaction methods take: wrapping colons are how a
+ * person types a name, not part of it. Delivery and the recorded identity
+ * both read the spelling through this, so they cannot disagree about it.
+ */
+function slackReactionName(emoji: string): string {
+  return emoji.replace(/^:+|:+$/g, "");
+}
+
+/**
+ * What a name the assistant reacts with means on Slack: the character for a
+ * standard emoji, resolved from Slack's own list, or Slack's name for a
+ * workspace emoji only the workspace can render.
+ */
+export function describeSlackReactionEmoji(
+  emoji: string,
+): ReactionEmojiIdentity {
+  const bareName = slackReactionName(emoji);
+  const character = slackEmojiCharacter(bareName);
+  // A spelling Slack's list lacks is a workspace name, or the character
+  // itself; the contract's grammar tells those apart.
+  return character !== undefined
+    ? { emojiKind: "unicode", emojiName: character }
+    : classifyReactionEmojiSpelling(bareName);
 }
 
 /** How Slack spells each activity phase on an agent session. */

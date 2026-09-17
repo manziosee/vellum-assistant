@@ -1,4 +1,3 @@
-import type { ChildProcess } from "node:child_process";
 import { spawn } from "node:child_process";
 
 import { z } from "zod";
@@ -6,10 +5,17 @@ import { z } from "zod";
 import type { BackgroundToolCompletedEvent } from "../../api/events/background-tool-completed.js";
 import { getConfig } from "../../config/loader.js";
 import { RiskLevel } from "../../permissions/types.js";
+import { applyActivePluginName } from "../../plugins/active-plugin-env.js";
 import { wakeAgentForOpportunity } from "../../runtime/agent-wake.js";
 import { broadcastMessage } from "../../runtime/assistant-event-hub.js";
 import { conversationRevealNonce } from "../../runtime/reveal-nonce.js";
 import { redactSecrets } from "../../security/secret-scanner.js";
+import {
+  buildShellInvocation,
+  buildShellSpawnFlags,
+  terminateProcessTree,
+  watchShellProcessStart,
+} from "../../util/host-process.js";
 import { getLogger } from "../../util/logger.js";
 import { getDataDir } from "../../util/platform.js";
 import type { CompletedBackgroundTool } from "../background-tool-registry.js";
@@ -29,7 +35,7 @@ import {
   getSessionEnv,
 } from "../network/script-proxy/index.js";
 import {
-  formatShellOutput,
+  attachBoundedStdio,
   MAX_OUTPUT_LENGTH,
 } from "../shared/shell-output.js";
 import {
@@ -285,6 +291,7 @@ export const shellTool = {
 
     const env = buildSanitizedEnv();
     env.__CONVERSATION_ID = context.conversationId;
+    applyActivePluginName(env, context.conversationId);
     // Secret binding for reveal-derived chat authority — see reveal-nonce.ts.
     env.__REVEAL_NONCE = conversationRevealNonce(context.conversationId);
     // Surface the resolving model to assistant CLI commands so they can tailor
@@ -296,7 +303,7 @@ export const shellTool = {
       Object.assign(env, proxyEnv);
     }
 
-    const wrapped = { command: "bash", args: ["-c", "--", command] };
+    const wrapped = buildShellInvocation(command);
 
     // -----------------------------------------------------------------------
     // Background mode: spawn and return immediately. The process output is
@@ -313,8 +320,6 @@ export const shellTool = {
       }
 
       const bgId = generateBackgroundToolId();
-      const stdoutChunks: Buffer[] = [];
-      const stderrChunks: Buffer[] = [];
       let timedOut = false;
       let aborted = false;
       const startedAt = Date.now();
@@ -323,8 +328,10 @@ export const shellTool = {
         cwd: context.workingDir,
         env,
         stdio: ["ignore", "pipe", "pipe"],
-        detached: true,
+        ...buildShellSpawnFlags(),
       });
+      const launch = watchShellProcessStart(child);
+      const collector = attachBoundedStdio(child);
 
       const killTree = buildKillTree(child, {
         toolName: "bash",
@@ -338,14 +345,6 @@ export const shellTool = {
         timedOut = true;
         killTree("timeout");
       }, timeoutMs);
-
-      child.stdout.on("data", (data: Buffer) => {
-        stdoutChunks.push(data);
-      });
-
-      child.stderr.on("data", (data: Buffer) => {
-        stderrChunks.push(data);
-      });
 
       // Guard against double-wake: when spawn fails (e.g. invalid cwd),
       // Node emits both 'error' and 'close' for the same child process.
@@ -372,24 +371,18 @@ export const shellTool = {
           timedOut,
         });
 
-        const stdout = Buffer.concat(stdoutChunks).toString();
-        const stderr = Buffer.concat(stderrChunks).toString();
-        const fmtResult = formatShellOutput(
-          stdout,
-          stderr,
-          code,
-          timedOut,
-          timeoutSec,
-        );
+        const fmtResult = collector.format(code, timedOut, timeoutSec, {
+          started: launch.didStart(),
+        });
 
         const status: BackgroundToolCompletedEvent["status"] = aborted
           ? "cancelled"
-          : timedOut
+          : timedOut || fmtResult.isError
             ? "failed"
             : code === 0
               ? "completed"
               : "failed";
-        // A cancelled command exits with a null code, which formatShellOutput
+        // A cancelled command exits with a null code, which the formatter
         // frames as "failed"; surface the cancellation instead.
         const output =
           status === "cancelled"
@@ -424,8 +417,8 @@ export const shellTool = {
           untrustedOutput: {
             content: output,
             source: "tool_result",
-            // Already bounded + recovery-marked by formatShellOutput; a larger
-            // budget keeps wrapUntrustedContent from re-truncating the marker.
+            // Bounded output plus the truncation marker; a larger budget
+            // keeps wrapUntrustedContent from slicing the marker off.
             maxChars: MAX_OUTPUT_LENGTH * 2,
           },
         });
@@ -535,8 +528,6 @@ export const shellTool = {
     // Foreground mode: await the process and return its output.
     // -----------------------------------------------------------------------
     const result = await new Promise<ToolExecutionResult>((resolve) => {
-      const stdoutChunks: Buffer[] = [];
-      const stderrChunks: Buffer[] = [];
       let timedOut = false;
       const startedAt = Date.now();
 
@@ -544,7 +535,11 @@ export const shellTool = {
         cwd: context.workingDir,
         env,
         stdio: ["ignore", "pipe", "pipe"],
-        detached: true,
+        ...buildShellSpawnFlags(),
+      });
+      const launch = watchShellProcessStart(child);
+      const collector = attachBoundedStdio(child, {
+        onOutput: context.onOutput,
       });
 
       const killTree = buildKillTree(child, {
@@ -569,16 +564,6 @@ export const shellTool = {
         }
       }
 
-      child.stdout.on("data", (data: Buffer) => {
-        stdoutChunks.push(data);
-        context.onOutput?.(data.toString());
-      });
-
-      child.stderr.on("data", (data: Buffer) => {
-        stderrChunks.push(data);
-        context.onOutput?.(data.toString());
-      });
-
       child.on("close", (code, signal) => {
         clearTimeout(timer);
         context.signal?.removeEventListener("abort", onAbort);
@@ -594,15 +579,9 @@ export const shellTool = {
           timedOut,
         });
 
-        const stdout = Buffer.concat(stdoutChunks).toString();
-        const stderr = Buffer.concat(stderrChunks).toString();
-        const fmtResult = formatShellOutput(
-          stdout,
-          stderr,
-          code,
-          timedOut,
-          timeoutSec,
-        );
+        const fmtResult = collector.format(code, timedOut, timeoutSec, {
+          started: launch.didStart(),
+        });
 
         resolve({
           content: fmtResult.content,
@@ -644,12 +623,11 @@ export const shellTool = {
 
 /**
  * Structured teardown log. Pairs with the `"Executing shell command"`
- * start log: every shell invocation now produces a start/exit pair so
+ * start log: every shell invocation produces a start/exit pair so
  * orphan-leak post-mortems can correlate command + exitCode + signal +
  * timedOut + duration without spelunking through prose hints. The
- * `signal === "SIGKILL"` + `timedOut === true` combination is the
- * fingerprint left by the timeout watcher SIGKILLing the process group
- * — i.e. the moment that creates the orphans.
+ * `signal === "SIGKILL"` + `timedOut === true` combination identifies a
+ * timeout-driven process termination.
  */
 function logShellExit(args: {
   toolName: string;
@@ -681,19 +659,10 @@ function logShellExit(args: {
 }
 
 /**
- * Kill the entire process tree of a child process. Tries the process group
- * first (negative PID), then falls back to killing the direct child if the
- * PID is unavailable or the group kill fails.
- *
- * Emits a structured `warn` log on every invocation: this is the
- * ground-truth event that creates orphaned subprocesses (the SIGKILL hits
- * the entire group, so the immediate bash child has no chance to reap its
- * grandchildren; under bun-as-PID-1 they accumulate as `<defunct>`).
- * `reason` lets the next zombie report point at a specific call site (the
- * timeout watcher in the foreground/background branches, or an abort).
+ * Terminate the process tree and record the call site for timeout diagnostics.
  */
 function buildKillTree(
-  child: ChildProcess,
+  child: ReturnType<typeof spawn>,
   context: {
     toolName: string;
     conversationId: string;
@@ -715,20 +684,8 @@ function buildKillTree(
         groupPid,
         invocationId: context.invocationId,
       },
-      "Shell process group SIGKILL'd — orphans expected to reparent to PID 1",
+      "Shell process group SIGKILL'd",
     );
-    if (groupPid != null) {
-      try {
-        process.kill(-groupPid, "SIGKILL");
-        return;
-      } catch {
-        // Process group may have already exited — fall through.
-      }
-    }
-    try {
-      child.kill("SIGKILL");
-    } catch {
-      // Child may have already exited.
-    }
+    terminateProcessTree(child);
   };
 }

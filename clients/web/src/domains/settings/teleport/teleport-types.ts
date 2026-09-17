@@ -1,5 +1,7 @@
+import type { ElectronHostOS } from "@/runtime/platform-detection";
+
 /**
- * Pure types and decision logic for the teleport feature — the web/Electron
+ * Pure types and decision logic for the teleport feature in the web/Electron
  * port of the macOS `TeleportSection.swift`.
  *
  * Teleport moves an assistant between hosting environments (local, Docker, or
@@ -24,6 +26,7 @@ export type TeleportPhase =
 /** Stable error codes for teleport failures, mirroring Swift `TeleportError`. */
 export type TeleportErrorCode =
   | "not_signed_in"
+  | "backup_failed"
   | "export_failed"
   | "export_timed_out"
   | "export_job_failed"
@@ -91,29 +94,46 @@ export function resolveDestination(
   return null;
 }
 
-/** Human-facing label for a destination, mirroring Swift `displayLabel`. */
-export function destinationLabel(destination: TeleportDestination): string {
+/** Catalog key for a destination's action label, mirroring Swift `displayLabel`. */
+export function destinationLabelKey(
+  destination: TeleportDestination,
+):
+  | "teleportCard.moveToDocker"
+  | "teleportCard.moveToPlatform"
+  | "teleportCard.moveToLocal" {
   switch (destination) {
     case "docker":
-      return "Move to Docker";
+      return "teleportCard.moveToDocker";
     case "platform":
-      return "Move to Cloud (Platform)";
+      return "teleportCard.moveToPlatform";
     case "local":
-      return "Move to Local";
+      return "teleportCard.moveToLocal";
   }
 }
 
-/** One-line description for a destination, mirroring Swift `description`. */
-export function destinationDescription(
+type HostSuffix = "Macos" | "Windows" | "Linux";
+
+const HOST_SUFFIX: Record<ElectronHostOS, HostSuffix> = {
+  macos: "Macos",
+  windows: "Windows",
+  linux: "Linux",
+};
+
+/** Catalog key for a destination description, mirroring Swift `description`. */
+export function destinationDescriptionKey(
   destination: TeleportDestination,
-): string {
+  hostOS: ElectronHostOS = "macos",
+):
+  | `teleportCard.dockerDescription${HostSuffix}`
+  | "teleportCard.platformDescription"
+  | `teleportCard.localDescription${HostSuffix}` {
   switch (destination) {
     case "docker":
-      return "Run your assistant in a Docker container on this Mac.";
+      return `teleportCard.dockerDescription${HOST_SUFFIX[hostOS]}`;
     case "platform":
-      return "Run your assistant in the cloud, managed by the Vellum platform.";
+      return "teleportCard.platformDescription";
     case "local":
-      return "Run your assistant locally on this Mac.";
+      return `teleportCard.localDescription${HOST_SUFFIX[hostOS]}`;
   }
 }
 

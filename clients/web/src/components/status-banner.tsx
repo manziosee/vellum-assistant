@@ -47,13 +47,23 @@ import {
   wakeLocalAssistantHost,
 } from "@/runtime/local-mode-host";
 import { useIsNativePlatform } from "@/runtime/native-auth";
+import { useAssistantSleepStageStore } from "@/stores/assistant-sleep-stage-store";
 import { useOrganizationStore } from "@/stores/organization-store";
 import {
   assistantsValidForOrg,
   useResolvedAssistantsStore,
 } from "@/stores/resolved-assistants-store";
+import { t } from "@/i18n";
 import { cn } from "@/utils/misc";
 import { routes } from "@/utils/routes";
+
+/**
+ * The sleeping/waking phase a banner is reporting, when it is reporting one.
+ * `AssistantSleepStage` reads it through {@link useAssistantSleepPhase} to
+ * decide whether to take over the conversation page, and the banner itself
+ * stands down (see {@link StatusBanner}) while that stage is up.
+ */
+export type AssistantSleepPhase = "sleeping" | "waking";
 
 interface BannerConfig {
   title: ReactNode;
@@ -61,6 +71,7 @@ interface BannerConfig {
   children?: ReactNode;
   icon?: ReactNode;
   actions?: ReactNode;
+  sleepPhase?: AssistantSleepPhase;
 }
 
 const LOCAL_WAKE_SETTLING_MS = 60_000;
@@ -298,7 +309,7 @@ function failedOperationActions(
       ) : null}
       {onDismiss ? (
         <Button variant="ghost" size="compact" onClick={onDismiss}>
-          Dismiss
+          {t("statusBanner.dismiss")}
         </Button>
       ) : null}
     </>
@@ -347,6 +358,7 @@ function operationalStatusBannerConfig(
         tone: "neutral",
         title: OPERATIONAL_STATUS_TITLES[status.state],
         icon: <Moon className="h-4 w-4" aria-hidden="true" />,
+        sleepPhase: "sleeping",
       };
     case "maintenance_mode":
       return maintenanceModeBannerConfig();
@@ -366,6 +378,7 @@ function operationalStatusBannerConfig(
         tone: "info",
         title: OPERATIONAL_STATUS_TITLES[status.state],
         icon: wakingDotIcon(),
+        sleepPhase: "waking",
       };
     case "restarting":
     case "restoring_backup":
@@ -412,12 +425,16 @@ function localHealthBannerConfig(
         children: wakeError,
         icon: <Moon className="h-4 w-4" aria-hidden="true" />,
         actions: wakeAction,
+        // A failed wake is an error the user has to read and act on, so it
+        // keeps the banner rather than handing the surface to the stage.
+        sleepPhase: wakeError ? undefined : "sleeping",
       };
     case "starting":
       return {
         tone: "info",
         title: "Your assistant is waking up",
         icon: wakingDotIcon(),
+        sleepPhase: "waking",
       };
     case "upgrading":
       return {
@@ -445,8 +462,8 @@ function localHealthBannerConfig(
     case "unreachable":
       return {
         tone: wakeError ? "error" : "neutral",
-        title: "Your assistant is asleep",
-        icon: <Moon className="h-4 w-4" aria-hidden="true" />,
+        title: t("statusBanner.reconnecting"),
+        icon: <CloudOff className="h-4 w-4" aria-hidden="true" />,
         children: wakeError,
         actions: wakeAction,
       };
@@ -463,7 +480,9 @@ function localHealthBannerConfig(
 function doctorAction(): ReactNode {
   return (
     <Button asChild variant="outlined" size="compact">
-      <Link to={`${routes.settings.debug}?tab=doctor`}>Go to Doctor</Link>
+      <Link to={`${routes.settings.debug}?tab=doctor`}>
+        {t("statusBanner.goToDoctor")}
+      </Link>
     </Button>
   );
 }
@@ -575,18 +594,25 @@ function useAssistantBannerConfig(): BannerConfig | null {
   // Track whether the assistant was recently sleeping so we can suppress
   // the brief "unreachable" flash that occurs during the tail end of a
   // wake (pod ready per k8s but application healthz not yet ok).
-  const [wasRecentlySleeping, setWasRecentlySleeping] = useState(false);
+  const [wasRecentlySleeping, setWasRecentlySleeping] = useState<string | null>(
+    null,
+  );
   useEffect(() => {
-    if (operationalStatus?.state === "sleeping") {
-      setWasRecentlySleeping(true);
+    if (operationalStatus?.detail_state === "failed") {
+      setWasRecentlySleeping(null);
     } else if (
-      operationalStatus?.state === "active" ||
-      operationalStatus?.state === "crash_loop" ||
-      operationalStatus?.state === "not_found"
+      operationalStatus?.state === "sleeping" ||
+      operationalStatus?.state === "waking"
     ) {
-      setWasRecentlySleeping(false);
+      setWasRecentlySleeping(assistantId);
+    } else {
+      setWasRecentlySleeping((previous) =>
+        operationalStatus?.state === "unreachable" && previous === assistantId
+          ? previous
+          : null,
+      );
     }
-  }, [operationalStatus?.state]);
+  }, [assistantId, operationalStatus?.state, operationalStatus?.detail_state]);
 
   // Auto-clear the override after 60s so a genuinely failed wake surfaces
   // the real "unreachable" error with the Doctor action.
@@ -595,7 +621,7 @@ function useAssistantBannerConfig(): BannerConfig | null {
       return;
     }
     const timeout = setTimeout(() => {
-      setWasRecentlySleeping(false);
+      setWasRecentlySleeping(null);
     }, 60_000);
     return () => clearTimeout(timeout);
   }, [wasRecentlySleeping, operationalStatus?.state]);
@@ -603,18 +629,22 @@ function useAssistantBannerConfig(): BannerConfig | null {
   // Suppress the brief "unreachable" flash during the active → sleeping
   // transition. When the pod is shutting down, healthz fails before the
   // backend registers the sleep, causing a transient unreachable state.
-  const [wasRecentlyActive, setWasRecentlyActive] = useState(false);
+  const [wasRecentlyActive, setWasRecentlyActive] = useState<string | null>(
+    null,
+  );
   useEffect(() => {
-    if (operationalStatus?.state === "active") {
-      setWasRecentlyActive(true);
-    } else if (
-      operationalStatus?.state === "sleeping" ||
-      operationalStatus?.state === "crash_loop" ||
-      operationalStatus?.state === "not_found"
-    ) {
-      setWasRecentlyActive(false);
+    if (operationalStatus?.detail_state === "failed") {
+      setWasRecentlyActive(null);
+    } else if (operationalStatus?.state === "active") {
+      setWasRecentlyActive(assistantId);
+    } else {
+      setWasRecentlyActive((previous) =>
+        operationalStatus?.state === "unreachable" && previous === assistantId
+          ? previous
+          : null,
+      );
     }
-  }, [operationalStatus?.state]);
+  }, [assistantId, operationalStatus?.state, operationalStatus?.detail_state]);
 
   // Auto-clear after 15s so a genuinely unreachable assistant surfaces.
   useEffect(() => {
@@ -622,7 +652,7 @@ function useAssistantBannerConfig(): BannerConfig | null {
       return;
     }
     const timeout = setTimeout(() => {
-      setWasRecentlyActive(false);
+      setWasRecentlyActive(null);
     }, 15_000);
     return () => clearTimeout(timeout);
   }, [wasRecentlyActive, operationalStatus?.state]);
@@ -837,8 +867,11 @@ function useAssistantBannerConfig(): BannerConfig | null {
   ) {
     return {
       tone: "neutral",
-      title: "Your assistant runs locally",
-      icon: <Moon className="h-4 w-4" aria-hidden="true" />,
+      title:
+        localHealth === "unreachable"
+          ? t("statusBanner.reconnecting")
+          : "Your assistant runs locally",
+      icon: <CloudOff className="h-4 w-4" aria-hidden="true" />,
       children:
         "Open the Vellum desktop app or run vellum wake in your terminal to start it.",
     };
@@ -873,7 +906,7 @@ function useAssistantBannerConfig(): BannerConfig | null {
           void handleWakeLocalAssistant();
         }}
       >
-        Wake up
+        {t("statusBanner.wakeUp")}
       </Button>
     ) : undefined;
   const localHealthBanner = localHealthBannerConfig(
@@ -901,7 +934,7 @@ function useAssistantBannerConfig(): BannerConfig | null {
       icon: <CloudOff className="h-4 w-4" aria-hidden="true" />,
       actions: (
         <Button variant="outlined" size="compact" onClick={retryConnectivity}>
-          Retry now
+          {t("statusBanner.retryNow")}
         </Button>
       ),
     };
@@ -929,33 +962,34 @@ function useAssistantBannerConfig(): BannerConfig | null {
     };
   }
 
-  // When the status transitions from sleeping directly to unreachable, the
-  // assistant is in the final phase of waking (pod ready per k8s but the
-  // application healthz hasn't responded ok yet). Show "waking" so the user
-  // sees a smooth sleeping → waking → active progression.
-  // Conversely, when the status transitions from active directly to
-  // unreachable, the pod is shutting down for sleep. Show "sleeping" so
-  // the user sees a smooth active → sleeping progression.
-  // Similarly, a restart can briefly read as "crash_loop"; keep showing
-  // "restarting" until the grace window expires.
-  // Finally, within the resume grace window a transient "unreachable" reads
-  // as "waking" so returning to a backgrounded client shows the info/spinner
-  // treatment rather than the "unreachable" error banner.
   const effectiveStatus =
-    operationalStatus?.state === "unreachable" &&
-    (wasRecentlySleeping || isResumeGraceActive)
-      ? { ...operationalStatus, state: "waking" as AssistantOperationalState }
-      : operationalStatus?.state === "unreachable" && wasRecentlyActive
-        ? {
-            ...operationalStatus,
-            state: "sleeping" as AssistantOperationalState,
-          }
-        : operationalStatus?.state === "crash_loop" && wasRecentlyRestarting
-          ? {
-              ...operationalStatus,
-              state: "restarting" as AssistantOperationalState,
-            }
-          : operationalStatus;
+    operationalStatus?.state === "crash_loop" && wasRecentlyRestarting
+      ? {
+          ...operationalStatus,
+          state: "restarting" as AssistantOperationalState,
+        }
+      : operationalStatus;
+
+  if (
+    effectiveStatus?.state === "unreachable" &&
+    effectiveStatus.detail_state !== "failed" &&
+    assistantId &&
+    (isResumeGraceActive ||
+      wasRecentlyActive === assistantId ||
+      wasRecentlySleeping === assistantId)
+  ) {
+    if (wasRecentlySleeping === assistantId) {
+      return operationalStatusBannerConfig(
+        { ...effectiveStatus, state: "waking" },
+        showDoctorAction,
+      );
+    }
+    return {
+      tone: "neutral",
+      title: t("statusBanner.reconnecting"),
+      icon: spinnerIcon(),
+    };
+  }
 
   const isFailedOperationDismissed =
     effectiveStatus?.detail_state === "failed" &&
@@ -995,10 +1029,28 @@ function useAssistantBannerConfig(): BannerConfig | null {
           void handleExitMaintenanceMode();
         }}
       >
-        Resume Assistant
+        {t("statusBanner.resumeAssistant")}
       </Button>
     ) : undefined,
   };
+}
+
+/**
+ * The sleeping/waking phase the assistant is in, or null when it is in
+ * neither. `AssistantSleepStage` reads this to decide whether to take over the
+ * conversation page; every other banner state is the banner's own business.
+ *
+ * It re-derives the whole banner config rather than having the banner publish
+ * its phase, because the banner is not mounted everywhere the stage is (a
+ * pop-out window has no banner at all). The cost is a second pass over local
+ * state, not a second request: the operational status is one shared React
+ * Query entry. The two instances hold their own transient-state suppression
+ * history, so a stage mounted mid-wake can read no phase where the older
+ * banner still reads "waking"; that resolves in the safe direction, with the
+ * banner keeping the status rather than both surfaces going quiet.
+ */
+export function useAssistantSleepPhase(): AssistantSleepPhase | null {
+  return useAssistantBannerConfig()?.sleepPhase ?? null;
 }
 
 export function StatusBanner({
@@ -1009,8 +1061,12 @@ export function StatusBanner({
   placement?: StatusBannerPlacement;
 }) {
   const banner = useAssistantBannerConfig();
+  // The full-page sleep stage says the same thing at the size of the
+  // conversation page, so the banner stands down while it is up. Dismissing
+  // the stage clears this and the banner comes back.
+  const sleepStageVisible = useAssistantSleepStageStore.use.visible();
 
-  return banner ? (
+  return banner && !(banner.sleepPhase && sleepStageVisible) ? (
     <BannerNotice banner={banner} className={className} placement={placement} />
   ) : null;
 }

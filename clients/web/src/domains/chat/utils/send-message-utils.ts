@@ -12,6 +12,7 @@ import {
 } from "@/domains/chat/types/types";
 
 import { ERROR_MESSAGES } from "@/domains/chat/utils/chat";
+import { isSending, type TurnPhase } from "@/domains/chat/turn-store";
 import {
   filterMessageSurfaces,
   mapMessageSurfaces,
@@ -48,6 +49,22 @@ interface SupersededInteractionCleanupContext {
 // ---------------------------------------------------------------------------
 // Pure updater functions — no React state, fully testable
 // ---------------------------------------------------------------------------
+
+/**
+ * Whether a send made while a turn is in flight joins the queue.
+ *
+ * A busy conversation is the only reason a send ever queues, and under
+ * `interrupt-on-send` it stops being one: the daemon aborts the turn and runs
+ * the message at once, answering without `queued`. The send then takes the
+ * ordinary path (an optimistic row with no queue badge, reconciled by the
+ * echo), and the turn store never enters its `queued` phase.
+ */
+export function shouldQueueSend(
+  phase: TurnPhase,
+  interruptOnSend: boolean,
+): boolean {
+  return isSending(phase) && !interruptOnSend;
+}
 
 export function shouldCleanupSupersededInteractions(
   uiContext: SupersededInteractionCleanupContext | null | undefined,
@@ -255,4 +272,22 @@ export function parsePendingConfirmationData(
 /** Generate a unique turn ID for correlating the send → reconcile lifecycle. */
 export function newTurnId(): string {
   return `turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/**
+ * The milliseconds {@link newTurnId} embedded in a turn id, or null for any
+ * other shape. The embedded stamp is the send time, so `now - turnStartMs`
+ * bounds how long the turn ran before an observer (e.g. the silent-stall
+ * rescue) looked at it.
+ */
+export function turnStartMsFromId(turnId: string | null): number | null {
+  if (!turnId) {
+    return null;
+  }
+  const match = /^turn-(\d{10,})-/.exec(turnId);
+  if (!match) {
+    return null;
+  }
+  const ms = Number(match[1]);
+  return Number.isFinite(ms) ? ms : null;
 }

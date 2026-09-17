@@ -21,8 +21,10 @@ export const INFERENCE_PROVIDERS = [
   "minimax",
   "atlascloud",
   "litellm",
+  "opencode",
   "baseten",
   "poolside",
+  "jev",
 ] as const;
 
 /**

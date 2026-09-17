@@ -11,7 +11,9 @@ import { cleanup, renderHook, waitFor } from "@testing-library/react";
 import type { AssistantEventEnvelope } from "@vellumai/assistant-api";
 import { memoryGraphOptions } from "@/domains/intelligence/memory-graph/get-memory-graph";
 import { memoryStatsOptions } from "@/domains/intelligence/memory-graph/get-memory-stats";
+import { mcpQueryKeys } from "@/domains/settings/mcp/mcp-query-keys";
 import {
+  activationProgressGetQueryKey,
   appsGetQueryKey,
   configGetQueryKey,
   documentsGetQueryKey,
@@ -28,10 +30,13 @@ import type { AssistantEvent } from "@/types/event-types";
 import { useAssistantResourceSync } from "@/hooks/use-assistant-resource-sync";
 import { assistantIdentityQueryKey } from "@/hooks/use-assistant-identity-init";
 import { avatarQueryKey } from "@/hooks/use-assistant-avatar";
+import { chooserRowAvatarQueryKeyPrefix } from "@/hooks/use-chooser-row-avatar";
+import { platformAvatarUrlsQueryKey } from "@/hooks/use-platform-avatar-urls";
 import { SYNC_TAGS } from "@/lib/sync/types";
 import type { SyncChangedEvent } from "@/lib/sync/types";
 import { __resetForTesting, publish } from "@/lib/event-bus";
 import { getClientId } from "@/lib/telemetry/client-identity";
+import { useResolvedAssistantsStore } from "@/stores/resolved-assistants-store";
 
 function createWrapper(queryClient: QueryClient) {
   return function Wrapper({ children }: { children: ReactNode }) {
@@ -221,6 +226,8 @@ describe("useAssistantResourceSync", () => {
           configGetQueryKey(pathOpts),
           inferenceProfilesGetQueryKey(pathOpts),
           configLlmCallsitesGetQueryKey(pathOpts),
+          mcpQueryKeys.list("asst-1"),
+          mcpQueryKeys.details("asst-1"),
           soundsConfigGetQueryKey(pathOpts),
           schedulesGetQueryKey(pathOpts),
           [
@@ -231,6 +238,22 @@ describe("useAssistantResourceSync", () => {
           ],
         ]) as never,
       );
+    });
+  });
+
+  test("invalidates MCP queries on the mcp:list sync tag", async () => {
+    const queryClient = freshQueryClient();
+    const calls: InvalidateCall[] = [];
+    queryClient.invalidateQueries = recordInvalidations(calls) as never;
+    renderHook(() => useAssistantResourceSync("asst-1", true), {
+      wrapper: createWrapper(queryClient),
+    });
+
+    emit(syncEvent([SYNC_TAGS.mcpList]) as unknown as AssistantEvent);
+
+    await waitFor(() => {
+      expect(sweepsFor(calls, mcpQueryKeys.list("asst-1"))).toHaveLength(1);
+      expect(sweepsFor(calls, mcpQueryKeys.details("asst-1"))).toHaveLength(1);
     });
   });
 
@@ -293,8 +316,7 @@ describe("useAssistantResourceSync", () => {
   test("invalidates app list queries on apps:list sync tag", async () => {
     const queryClient = freshQueryClient();
     let predicate:
-      | ((query: { queryKey: readonly unknown[] }) => boolean)
-      | undefined;
+      ((query: { queryKey: readonly unknown[] }) => boolean) | undefined;
     queryClient.invalidateQueries = ((arg: unknown) => {
       predicate = (
         arg as {
@@ -360,6 +382,33 @@ describe("useAssistantResourceSync", () => {
     expect(claims(CONVERSATION_DOCUMENTS_KEY)).toBe(true);
   });
 
+  test("invalidates activation progress on the activation:progress sync tag", async () => {
+    const queryClient = freshQueryClient();
+    const calls: unknown[] = [];
+    queryClient.invalidateQueries = ((arg: unknown) => {
+      calls.push(arg);
+      return Promise.resolve();
+    }) as never;
+    renderHook(() => useAssistantResourceSync("asst-1", true), {
+      wrapper: createWrapper(queryClient),
+    });
+    emit(
+      syncEvent([SYNC_TAGS.activationProgress]) as unknown as AssistantEvent,
+    );
+    await waitFor(() => {
+      const queryKeys = calls.map(
+        (arg) => (arg as { queryKey: readonly unknown[] }).queryKey,
+      );
+      expect(queryKeys).toEqual(
+        expect.arrayContaining([
+          activationProgressGetQueryKey({
+            path: { assistant_id: "asst-1" },
+          }),
+        ]) as never,
+      );
+    });
+  });
+
   test("invalidates plugin list / catalog / open-detail queries on plugins:list sync tag", async () => {
     const queryClient = freshQueryClient();
     const calls: unknown[] = [];
@@ -380,6 +429,8 @@ describe("useAssistantResourceSync", () => {
         expect.arrayContaining([
           pluginsGetQueryKey(pathOpts),
           pluginsSearchGetQueryKey(pathOpts),
+          mcpQueryKeys.list("asst-1"),
+          mcpQueryKeys.details("asst-1"),
           // The broad sync carries no name, so every open plugin detail + drift
           // inspect is invalidated via partial key (see invalidatePluginQueries).
           [{ _id: "pluginsByNameGet", path: { assistant_id: "asst-1" } }],
@@ -415,6 +466,8 @@ describe("useAssistantResourceSync", () => {
         expect.arrayContaining([
           pluginsGetQueryKey(pathOpts),
           pluginsSearchGetQueryKey(pathOpts),
+          mcpQueryKeys.list("asst-1"),
+          mcpQueryKeys.details("asst-1"),
           // Reconnect reconcile is name-agnostic too — open details invalidate.
           [{ _id: "pluginsByNameGet", path: { assistant_id: "asst-1" } }],
           [
@@ -726,8 +779,7 @@ describe("useAssistantResourceSync", () => {
   test("invalidates home-feed query on home_feed_updated", async () => {
     const queryClient = freshQueryClient();
     let predicate:
-      | ((query: { queryKey: readonly unknown[] }) => boolean)
-      | undefined;
+      ((query: { queryKey: readonly unknown[] }) => boolean) | undefined;
     queryClient.invalidateQueries = ((arg: unknown) => {
       predicate = (
         arg as {
@@ -758,7 +810,7 @@ describe("useAssistantResourceSync", () => {
     expect(predicate!({ queryKey: avatarQueryKey("asst-1") })).toBe(false);
   });
 
-  test("invalidates both home-feed and home-state on relationship_state_updated", async () => {
+  test("invalidates the home feed on relationship_state_updated", async () => {
     const queryClient = freshQueryClient();
     const predicates: Array<
       (query: { queryKey: readonly unknown[] }) => boolean
@@ -782,20 +834,68 @@ describe("useAssistantResourceSync", () => {
       updatedAt: "2026-05-21T00:00:00Z",
     } as unknown as AssistantEvent);
     await waitFor(() => {
-      expect(predicates.length).toBe(2);
+      expect(predicates.length).toBe(1);
     });
     const feedKey = homeFeedGetQueryKey({
       path: { assistant_id: "asst-1" },
       query: { timeAwaySeconds: 0 },
     });
-    const stateKey = homeStateGetQueryKey({
-      path: { assistant_id: "asst-1" },
-    });
     expect(predicates.some((p) => p({ queryKey: feedKey }))).toBe(true);
-    expect(predicates.some((p) => p({ queryKey: stateKey }))).toBe(true);
     expect(
       predicates.every((p) => !p({ queryKey: avatarQueryKey("asst-1") })),
     ).toBe(true);
+  });
+
+  // The relationship snapshot carries the capability tiers the activation
+  // checklist reads (`domains/activation/capabilities.ts`), so a connection
+  // made on another client has to reach this query or an eligible task stays
+  // hidden behind a prerequisite that is already met.
+  test("invalidates the home state on relationship_state_updated", async () => {
+    const queryClient = freshQueryClient();
+    const calls: InvalidateCall[] = [];
+    queryClient.invalidateQueries = ((arg: InvalidateCall) => {
+      calls.push(arg);
+      return Promise.resolve();
+    }) as never;
+    renderHook(() => useAssistantResourceSync("asst-1", true), {
+      wrapper: createWrapper(queryClient),
+    });
+    emit({
+      type: "relationship_state_updated",
+      updatedAt: "2026-05-21T00:00:00Z",
+    } as unknown as AssistantEvent);
+    const homeStateKey = keyId(
+      homeStateGetQueryKey({ path: { assistant_id: "asst-1" } }),
+    );
+    await waitFor(() => {
+      expect(calls.some((call) => keyId(call.queryKey) === homeStateKey)).toBe(
+        true,
+      );
+    });
+  });
+
+  // The event above is missed outright while the transport is down, so the
+  // catch-up has to cover the same query.
+  test("reconciles the home state on non-fresh sse.opened reconnect", async () => {
+    const queryClient = freshQueryClient();
+    const calls: InvalidateCall[] = [];
+    queryClient.invalidateQueries = ((arg: InvalidateCall) => {
+      calls.push(arg);
+      return Promise.resolve();
+    }) as never;
+    renderHook(() => useAssistantResourceSync("asst-1", true), {
+      wrapper: createWrapper(queryClient),
+    });
+
+    publish("sse.opened", { assistantId: "asst-1", cause: "error" });
+    await flushReconnectSweep();
+
+    const homeStateKey = keyId(
+      homeStateGetQueryKey({ path: { assistant_id: "asst-1" } }),
+    );
+    expect(calls.some((call) => keyId(call.queryKey) === homeStateKey)).toBe(
+      true,
+    );
   });
 
   test("invalidates identity query on identity_changed event", async () => {
@@ -810,6 +910,140 @@ describe("useAssistantResourceSync", () => {
       expect(spy).toHaveBeenCalledWith({
         queryKey: assistantIdentityQueryKey("asst-1"),
       });
+    });
+  });
+
+  test("avatar sync tag also invalidates the chooser row cache by prefix", async () => {
+    const queryClient = freshQueryClient();
+    const calls: InvalidateCall[] = [];
+    queryClient.invalidateQueries = recordInvalidations(calls) as never;
+    renderHook(() => useAssistantResourceSync("asst-1", true), {
+      wrapper: createWrapper(queryClient),
+    });
+    emit(syncEvent([SYNC_TAGS.assistantAvatar]) as unknown as AssistantEvent);
+    await waitFor(() => {
+      expect(
+        sweepsFor(calls, chooserRowAvatarQueryKeyPrefix("asst-1")),
+      ).toEqual([
+        {
+          queryKey: chooserRowAvatarQueryKeyPrefix("asst-1"),
+          refetchType: "none",
+        },
+      ]);
+    });
+  });
+
+  test("avatar_updated also invalidates the chooser row cache by prefix", async () => {
+    const queryClient = freshQueryClient();
+    const calls: InvalidateCall[] = [];
+    queryClient.invalidateQueries = recordInvalidations(calls) as never;
+    renderHook(() => useAssistantResourceSync("asst-1", true), {
+      wrapper: createWrapper(queryClient),
+    });
+    emit({ type: "avatar_updated" } as unknown as AssistantEvent);
+    await waitFor(() => {
+      expect(
+        sweepsFor(calls, chooserRowAvatarQueryKeyPrefix("asst-1")),
+      ).toEqual([
+        {
+          queryKey: chooserRowAvatarQueryKeyPrefix("asst-1"),
+          refetchType: "none",
+        },
+      ]);
+    });
+  });
+
+  test("avatar change events clear the row's synced avatarUrl; the reconnect sweep does not", async () => {
+    const seed = () =>
+      useResolvedAssistantsStore.setState({
+        assistants: [
+          {
+            id: "asst-1",
+            isLocal: false,
+            isPlatformHosted: true,
+            isPaired: false,
+            avatarUrl: "https://cdn.example/a.png",
+          },
+        ],
+      });
+    const avatarUrl = () =>
+      useResolvedAssistantsStore.getState().assistants[0]?.avatarUrl;
+    const queryClient = freshQueryClient();
+    queryClient.invalidateQueries = mock(() => Promise.resolve()) as never;
+    renderHook(() => useAssistantResourceSync("asst-1", true), {
+      wrapper: createWrapper(queryClient),
+    });
+
+    seed();
+    emit({ type: "avatar_updated" } as unknown as AssistantEvent);
+    await waitFor(() => expect(avatarUrl()).toBeNull());
+
+    seed();
+    emit(syncEvent([SYNC_TAGS.assistantAvatar]) as unknown as AssistantEvent);
+    await waitFor(() => expect(avatarUrl()).toBeNull());
+
+    seed();
+    publish("sse.opened", { assistantId: "asst-1", cause: "error" });
+    await flushReconnectSweep();
+    expect(avatarUrl()).toBe("https://cdn.example/a.png");
+  });
+
+  test("avatar_updated drops the platform lookup entry without a refetch", async () => {
+    const queryClient = freshQueryClient();
+    queryClient.invalidateQueries = mock(() => Promise.resolve()) as never;
+    const key = platformAvatarUrlsQueryKey("user-1", null);
+    queryClient.setQueryData(
+      key,
+      new Map([
+        ["asst-1", "https://cdn.example/a.png"],
+        ["asst-2", "https://cdn.example/b.png"],
+      ]),
+    );
+    renderHook(() => useAssistantResourceSync("asst-1", true), {
+      wrapper: createWrapper(queryClient),
+    });
+
+    emit({ type: "avatar_updated" } as unknown as AssistantEvent);
+    await waitFor(() => {
+      expect(
+        queryClient.getQueryData<Map<string, string>>(key)?.has("asst-1"),
+      ).toBe(false);
+    });
+    expect(
+      queryClient.getQueryData<Map<string, string>>(key)?.get("asst-2"),
+    ).toBe("https://cdn.example/b.png");
+    expect(queryClient.getQueryState(key)?.fetchStatus).toBe("idle");
+  });
+
+  test("avatar_updated drops the lookup entry under the row's platform id", async () => {
+    const queryClient = freshQueryClient();
+    queryClient.invalidateQueries = mock(() => Promise.resolve()) as never;
+    useResolvedAssistantsStore.setState({
+      assistants: [
+        {
+          id: "asst-1",
+          isLocal: true,
+          isPlatformHosted: false,
+          isPaired: false,
+          cloud: "local",
+          platformAssistantId: "uuid-1",
+        },
+      ],
+    });
+    const key = platformAvatarUrlsQueryKey("user-1", null);
+    queryClient.setQueryData(
+      key,
+      new Map([["uuid-1", "https://cdn.example/a.png"]]),
+    );
+    renderHook(() => useAssistantResourceSync("asst-1", true), {
+      wrapper: createWrapper(queryClient),
+    });
+
+    emit({ type: "avatar_updated" } as unknown as AssistantEvent);
+    await waitFor(() => {
+      expect(
+        queryClient.getQueryData<Map<string, string>>(key)?.has("uuid-1"),
+      ).toBe(false);
     });
   });
 
@@ -856,7 +1090,7 @@ describe("useAssistantResourceSync", () => {
       },
     );
     emit(syncEvent([SYNC_TAGS.assistantAvatar]) as unknown as AssistantEvent);
-    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy).toHaveBeenCalled();
     spy.mockClear();
     rerender({ active: false });
     emit(syncEvent([SYNC_TAGS.assistantAvatar]) as unknown as AssistantEvent);

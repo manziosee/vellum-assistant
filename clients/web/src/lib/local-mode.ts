@@ -3,8 +3,10 @@ import {
   isLoopbackGatewayCloud,
   isUsableRuntimeUrl,
 } from "@vellumai/local-mode/contract";
+import { isRetryablePairingReason } from "@vellumai/service-contracts/remote-web-pairing";
 
 import { getLocalSetting, setLocalSetting } from "@/utils/local-settings";
+import { isPublicBaseUrlRejection } from "@/utils/pairing-address";
 import {
   clearSelectedAssistantId,
   readSelectedAssistantId,
@@ -25,16 +27,19 @@ import {
 import { useAssistantIdentityStore } from "@/stores/assistant-identity-store";
 import { useLockfileStore } from "@/stores/lockfile-store";
 import {
-  connectImportHost,
   fetchGuardianTokenHost,
   GuardianTokenError,
   isLocalModeHostAvailable,
   loadLockfileHost,
+  pairingCancelHost,
+  pairingPollHost,
+  pairingStartHost,
   parseLockfile,
   replacePlatformAssistantsHost,
   retireLocalAssistantHost,
   renameLockfileAssistantHost,
   saveLockfileAssistantHost,
+  stampLockfileAssistantOnboardedHost,
   unpairAssistantHost,
   wakeLocalAssistantHost,
 } from "@/runtime/local-mode-host";
@@ -42,7 +47,9 @@ import type {
   Lockfile,
   LockfileAssistant,
   LocalAssistantResources,
-  LocalConnectImportResult,
+  LocalPairingFailure,
+  LocalPairingPollResult,
+  LocalPairingStartResult,
   LocalRetireResult,
 } from "@/runtime/local-mode-host";
 
@@ -342,6 +349,37 @@ export async function renameLockfileAssistant(
 }
 
 /**
+ * Stamp `onboardedAt` on an existing entry so the CLI and tray see that this
+ * assistant finished first-run onboarding. Runs through the host's
+ * stamp-if-present operation for the same reason the rename above does: the
+ * host decides against the on-disk registry, so a completion racing a retire
+ * cannot re-create the entry from a stale renderer snapshot. The guards below
+ * are cheap early-outs, not the safety boundary.
+ *
+ * A cloud-only assistant simply has no lockfile entry; the device-scoped
+ * record in `onboarded-assistant-record.ts` is what covers it.
+ */
+export async function markLockfileAssistantOnboarded(
+  assistantId: string,
+  onboardedAt: string,
+): Promise<void> {
+  if (isRemoteGatewayMode() || !isLocalModeHostAvailable()) {
+    return;
+  }
+  const entry = getLockfileAssistant(assistantId);
+  if (!entry || entry.onboardedAt) {
+    return;
+  }
+  const result = await stampLockfileAssistantOnboardedHost(
+    assistantId,
+    onboardedAt,
+  );
+  if (result.ok) {
+    commitLockfile(result.lockfile);
+  }
+}
+
+/**
  * Mark an already-known assistant as the lockfile's active assistant, leaving
  * its other fields untouched. Used when switching managed assistants so the
  * lockfile `activeAssistant` — read by the macOS tray, the CLI, and the native
@@ -498,35 +536,83 @@ export async function removePairedAssistantFromLockfile(
   return { ok: true };
 }
 
+/** Stands in when a host reports a failure with no message of its own. */
+const PAIRING_FALLBACK_ERROR = "Failed to connect to that assistant.";
+
 /**
- * Register a pairing bundle printed by `vellum pair` on another machine: the
- * host persists its guardian token and creates a `cloud: "paired"` lockfile
- * entry, then the lockfile is reloaded so subscribers (the resolved-assistants
- * store) pick up the new entry, the write counterpart of
- * {@link removePairedAssistantFromLockfile}. `accessOnly` is true when the
- * bundle carried no refresh credential, so the pairing's access expires and
- * cannot renew itself.
+ * Whether a refused pairing step is worth polling through, classified by the
+ * shared reason table so the dialog and `vellum connect import` cannot drift.
  */
-export async function importPairedAssistantBundle(
-  bundle: string,
-  name?: string,
-): Promise<LocalConnectImportResult> {
-  const fallbackError = "Failed to import the pairing bundle.";
-  const result = await connectImportHost(bundle, name);
+export function isRetryablePairingFailure(
+  failure: LocalPairingFailure,
+): boolean {
+  return isRetryablePairingReason(failure.reason);
+}
+
+/**
+ * Begin pairing with the assistant at `address`, a pairing link or a bare
+ * `https://host` URL. The host runs the exchange and keeps the device code,
+ * so what comes back is an opaque handle plus, when the address carried no
+ * approved code, the code to approve on the assistant's machine.
+ */
+export async function startAssistantPairing(
+  address: string,
+): Promise<LocalPairingStartResult> {
+  const result = await pairingStartHost(address);
   if (!result.ok) {
-    return { ok: false, error: result.error || fallbackError };
+    return {
+      ...result,
+      error: result.error || PAIRING_FALLBACK_ERROR,
+      // Runtime guard, as on the poll below: the dev-server host branch parses
+      // untyped JSON, so a reason no caller has copy for degrades to the
+      // host's own message rather than to no message at all.
+      rejection: isPublicBaseUrlRejection(result.rejection)
+        ? result.rejection
+        : undefined,
+    };
+  }
+  return result;
+}
+
+/**
+ * One exchange attempt for a live pairing session. On `imported` the lockfile
+ * is reloaded so subscribers (the resolved-assistants store) pick up the new
+ * entry, the write counterpart of {@link removePairedAssistantFromLockfile}.
+ * `accessOnly` is true when the exchange yielded no refresh credential, so the
+ * pairing's access expires and cannot renew itself.
+ */
+export async function pollAssistantPairing(
+  handle: string,
+  name?: string,
+): Promise<LocalPairingPollResult> {
+  const result = await pairingPollHost(handle, name);
+  if (!result.ok) {
+    return { ...result, error: result.error || PAIRING_FALLBACK_ERROR };
+  }
+  if (result.status === "pending") {
+    return result;
   }
   // Runtime guard: the dev-server host branch parses untyped JSON, so a
   // malformed success degrades to a structured failure.
   if (!result.assistantId) {
-    return { ok: false, error: fallbackError };
+    return { ok: false, error: PAIRING_FALLBACK_ERROR };
   }
   await loadLockfile();
-  return {
-    ok: true,
-    assistantId: result.assistantId,
-    accessOnly: result.accessOnly === true,
-  };
+  return { ...result, accessOnly: result.accessOnly === true };
+}
+
+/**
+ * Forget a pending pairing session, so its code cannot be exchanged later.
+ * Callers cancel on the way out (a dismissed dialog, a dead transport) and
+ * have nothing to do about a failure, and a handle the host no longer knows
+ * is already the outcome they wanted, so a rejecting host resolves quietly.
+ */
+export async function cancelAssistantPairing(handle: string): Promise<void> {
+  try {
+    await pairingCancelHost(handle);
+  } catch {
+    // Unreachable session: cancelled, spent, or the host itself is gone.
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -974,15 +1060,20 @@ export async function primeLocalGatewayConnection(
 }
 
 /**
- * Classify a connect failure as repairable by `wake`. A `403` means the host
- * refused the loopback boundary — a security decision wake can't change — so
- * it surfaces as-is. Every other failure (a missing/expired/malformed guardian
- * token, or an unreachable or stopped gateway) is something `wake` can fix by
- * re-seeding the token and restarting the daemon + gateway.
+ * Classify a connect failure as something a plain `wake` can fix. A `403`
+ * is a loopback-boundary refusal, a security decision wake cannot change, so
+ * it surfaces as-is. A mint `401` (`GatewayTokenError`) is also excluded: a
+ * plain wake cannot re-lease a guardian token the running gateway rejects at
+ * `/auth/token`. Remaining failures (a missing/expired/malformed guardian
+ * token, an unresolved port, or an unreachable/stopped gateway) are what
+ * `wake` can fix by re-seeding the token and restarting the assistant + gateway.
  */
 function isRepairableConnectError(error: unknown): boolean {
   if (error instanceof GuardianTokenError) {
     return error.status !== 403;
+  }
+  if (error instanceof GatewayTokenError) {
+    return error.status !== 403 && error.status !== 401;
   }
   return true;
 }
@@ -990,51 +1081,76 @@ function isRepairableConnectError(error: unknown): boolean {
 /**
  * Retry budget for riding out the local gateway's startup window. On reboot the
  * gateway (a macOS Login Item) restarts concurrently with the desktop app, and
- * a `wake` restarts it in place — in both cases the loopback `/auth/token` mint
- * refuses connections or answers transiently (a `503` "starting", or a
- * repairable `401` before the guardian binding backfill lands) for the first
- * few seconds. A single prime races that window and dead-ends to the recovery
- * controls even though the gateway becomes usable moments later. Mutable so
- * tests can shrink the window.
+ * a `wake` restarts it in place. In both cases the loopback `/auth/token` mint
+ * refuses connections for tens of seconds (port not bound yet), then answers
+ * transiently (a `503` "starting", or a repairable `401` before the guardian
+ * binding backfill lands). A single prime races that window and dead-ends to
+ * the recovery controls even though the gateway becomes usable on its own.
+ * Mutable so tests can shrink the window.
  */
 export const LOCAL_GATEWAY_STARTUP_RETRY = {
-  attempts: 8,
+  attempts: 90,
   intervalMs: 1_000,
 };
 
+/** Guardian refresh `503`: the loopback gateway is unreachable or still starting. */
+function isTransientGuardianTokenError(error: unknown): boolean {
+  return error instanceof GuardianTokenError && error.status === 503;
+}
+
 /**
- * A gateway that is UP but transiently rejecting the mint as it finishes
- * starting after a reboot: a `503` "starting" (or another `5xx`) before its
- * post-assistant-ready work completes, or a repairable `401` in the window
- * after traffic opens but before the guardian-binding backfill lands — the
- * reported reboot symptom. Both heal on their own within seconds, so the boot
- * restore rides them out (never `wake`ing).
+ * A local loopback gateway that is still coming up: a thrown transport error
+ * (Login Item has not bound the port yet), a `503`/`5xx` "starting" mint, a
+ * repairable mint `401` after traffic opens but before the guardian-binding
+ * backfill lands, or a guardian refresh `503` while the host cannot reach a
+ * gateway that is still binding its port. These heal on their own, so boot
+ * and the pre-wake connect path ride them out instead of spawning `wake`.
  *
- * A `403` loopback-boundary refusal is terminal. A thrown transport error is
- * deliberately excluded: the gateway isn't answering at all (an intentionally
- * stopped assistant, not a starting one), so the boot restore falls through to
- * the chooser promptly instead of stalling the whole retry budget on an
- * assistant the user isn't running — the chooser's connect-with-repair path
- * (which may `wake`) handles that case.
+ * A `403` loopback-boundary refusal is terminal. A missing (`404`) or
+ * rejected (`401`) guardian token will not heal by waiting (the credential
+ * is missing or spent on disk). A guardian `500` is a malformed file, CLI
+ * spawn failure, or refresh timeout, not a starting gateway. An unresolved
+ * local gateway (no recorded port) needs `wake` to establish one.
+ * Paired/remote failures are never ridden out: waiting cannot fix a machine
+ * this device does not start.
  */
-function isGatewayStillStarting(error: unknown): boolean {
-  return error instanceof GatewayTokenError && error.status !== 403;
+function isGatewayStillStarting(
+  error: unknown,
+  target: LockfileAssistant | undefined,
+): boolean {
+  const assistant = target ?? getSelectedAssistant();
+  if (!assistant || !expectsLocalGateway(assistant)) {
+    return false;
+  }
+  if (error instanceof UnresolvedLocalGatewayError) {
+    return false;
+  }
+  if (error instanceof GuardianTokenError) {
+    return isTransientGuardianTokenError(error);
+  }
+  if (error instanceof GatewayTokenError) {
+    return error.status !== 403;
+  }
+  // Thrown fetch/transport error: the loopback port is not accepting
+  // connections yet.
+  return true;
 }
 
 /**
  * A `wake`-restarted gateway that hasn't finished coming back up: it refuses
  * connections (a thrown transport error), answers `503`/`5xx`, or rejects the
  * mint with a repairable `401` while it re-provisions its guardian binding.
- * A guardian refresh `5xx` is the same window: the host shells out to
+ * A guardian refresh `503` is the same window: the host shells out to
  * `vellum gateway token refresh`, which cannot reach a gateway that is still
- * binding its port. A `403` loopback-boundary refusal is terminal, and a
- * missing (`404`) or rejected (`401`) guardian token will not heal by
+ * binding its port. A `403` loopback-boundary refusal is terminal. A missing
+ * (`404`) or rejected (`401`) guardian token, or a guardian `500`
+ * (malformed file, CLI spawn failure, refresh timeout), will not heal by
  * waiting (the just-run `wake` already re-seeded the token and recorded the
  * port), so those fall through.
  */
 function isGatewayRestartTransient(error: unknown): boolean {
   if (error instanceof GuardianTokenError) {
-    return error.status >= 500;
+    return isTransientGuardianTokenError(error);
   }
   if (error instanceof UnresolvedLocalGatewayError) {
     return false;
@@ -1042,7 +1158,7 @@ function isGatewayRestartTransient(error: unknown): boolean {
   if (error instanceof GatewayTokenError) {
     return error.status !== 403;
   }
-  // A thrown fetch/transport error — the gateway isn't accepting connections
+  // A thrown fetch/transport error: the gateway isn't accepting connections
   // yet as it restarts.
   return true;
 }
@@ -1050,9 +1166,9 @@ function isGatewayRestartTransient(error: unknown): boolean {
 /**
  * Prime the local gateway connection, retrying on a bounded interval while the
  * failure is a transient startup condition (`shouldRideOut`). Rides out the
- * local gateway's startup window without spawning anything — the plain prime
- * only reads the on-disk guardian token and mints a gateway session — so it
- * respects the "app launch never spawns daemon processes" boot contract. The
+ * local gateway's startup window without spawning anything: the plain prime
+ * only reads the on-disk guardian token and mints a gateway session, so it
+ * respects the "app launch never spawns assistant processes" boot contract. The
  * last error propagates once the retry budget is spent or the failure is not a
  * ride-out-able one, so the existing connect-error classification is preserved.
  */
@@ -1077,33 +1193,39 @@ async function primeLocalGatewayWithStartupRideout(
 
 /**
  * Boot restore path: prime the selected local assistant's gateway connection,
- * riding out the gateway's startup window when it is up but still starting
- * ({@link isGatewayStillStarting}). Unlike the interactive
- * {@link primeLocalGatewayConnectionWithRepair}, this never `wake`s — app launch
- * must not spawn daemon processes — so a gateway that is down entirely, or one
- * that rejects the mint (a repairable `401`), falls through promptly to the
- * chooser, where the auto-connect flow's repair handles it.
+ * riding out the gateway's startup window ({@link isGatewayStillStarting}).
+ * Unlike the interactive {@link primeLocalGatewayConnectionWithRepair}, this
+ * never `wake`s: app launch must not spawn assistant processes. A missing or
+ * spent guardian token, an unresolved port, or a `403` falls through to the
+ * chooser. A mint `401` or transport failure rides the budget; if it is still
+ * failing after that, the chooser's connect-with-repair path handles it.
  */
 export async function primeLocalGatewayConnectionWithStartupRetry(
   target?: LockfileAssistant,
 ): Promise<void> {
-  await primeLocalGatewayWithStartupRideout(target, isGatewayStillStarting);
+  await primeLocalGatewayWithStartupRideout(target, (error) =>
+    isGatewayStillStarting(error, target),
+  );
 }
 
 /**
  * Prime the local gateway connection, transparently repairing the assistant in
- * place when the first attempt fails for a repairable reason.
+ * place when a startup ride-out still fails for a reason a plain `wake` can
+ * fix.
  *
  * This mirrors the native client's bootstrap, which revives a stopped or
- * unresolved local assistant before the failure ever reaches the user: on a
- * repairable failure it runs a plain `wake` (restarts the daemon + gateway,
- * leaving the assistant's data and identity untouched), then primes the
- * connection once more. A non-repairable failure, a wake that itself fails, or
- * a still-failing retry propagate the original error so the existing
- * connect-error UI surfaces it unchanged.
+ * unresolved local assistant before the failure ever reaches the user. The
+ * first pass rides out {@link isGatewayStillStarting} without waking, so a
+ * Login Item that is still binding its port is not restarted. A remaining
+ * repairable failure (unreachable gateway, unresolved port, missing
+ * guardian token) runs a plain `wake` (restarts the assistant + gateway,
+ * leaving the assistant's data and identity untouched), then primes again.
+ * A non-repairable failure, a wake that itself fails, or a still-failing
+ * retry propagate the original error so the existing connect-error UI
+ * surfaces it unchanged.
  *
  * A plain wake cannot re-lease a guardian token the gateway rejects at the
- * `/auth/token` mint, so a `401` that survives the retry propagates as a
+ * `/auth/token` mint, so a `401` that survives the ride-out propagates as a
  * {@link GatewayTokenError} for callers to route to the guardian re-provision
  * (`wakeLocalAssistantHost` with `repairGuardian`), the one repair that clears
  * it and the one this path must never run on its own.
@@ -1114,7 +1236,11 @@ export async function primeLocalGatewayConnectionWithRepair(
 ): Promise<void> {
   const assistant = target ?? getSelectedAssistant();
   try {
-    await primeLocalGatewayConnection(assistant, options);
+    await primeLocalGatewayWithStartupRideout(
+      assistant,
+      (error) => isGatewayStillStarting(error, assistant),
+      options,
+    );
     return;
   } catch (error) {
     // Wake operates only on plain local assistants (see
@@ -1133,15 +1259,15 @@ export async function primeLocalGatewayConnectionWithRepair(
       throw error;
     }
     // Wake may have established resources the renderer hadn't recorded (a legacy
-    // entry's gateway port) — reload so the retry resolves the fresh gateway.
+    // entry's gateway port). Reload so the retry resolves the fresh gateway.
     const lockfile = await loadLockfile();
     const refreshed = lockfile.assistants.find(
       (a) => a.assistantId === assistantId,
     );
-    // Wake restarts the daemon + gateway, so the retry races the gateway coming
-    // back up — a single prime here fails while it is still starting and the
-    // connect dead-ends to the recovery controls. Ride out that restart window
-    // instead, so a persisted local assistant reconnects on its own.
+    // Wake restarts the assistant + gateway, so the retry races the gateway
+    // coming back up. A single prime here fails while it is still starting and
+    // the connect dead-ends to the recovery controls. Ride out that restart
+    // window instead, so a persisted local assistant reconnects on its own.
     await primeLocalGatewayWithStartupRideout(
       refreshed ?? assistant,
       isGatewayRestartTransient,

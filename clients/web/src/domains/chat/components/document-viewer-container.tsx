@@ -8,6 +8,8 @@ import { useTranslation } from "@/i18n";
  * selection are wired via React props/callbacks (no iframe postMessage).
  *
  * One backing store: a document surface in the daemon's document database.
+ * Both the autosave and the rename write through it, so the title the header
+ * shows and the body the editor holds are always sent together.
  */
 
 import {
@@ -15,20 +17,23 @@ import {
   useCallback,
   useEffect,
   useImperativeHandle,
-  useLayoutEffect,
   useRef,
   useState,
   type Ref,
 } from "react";
 
+import { useQueryClient } from "@tanstack/react-query";
+
 import { LazyBoundary } from "@/components/lazy-boundary";
-import { Button, Typography } from "@vellumai/design-library";
+import { ActionMenu, Button, toast, Typography } from "@vellumai/design-library";
 import {
   Check,
   Download,
+  Ellipsis,
   FileText,
   Loader2,
   MessageSquareText,
+  PencilLine,
   X,
 } from "lucide-react";
 
@@ -37,10 +42,17 @@ import {
   fetchComments,
 } from "@/domains/chat/api/document-comments";
 import {
-  saveDocumentContent,
+  markdownWordCount,
   type DocumentSaveTarget,
 } from "@/domains/chat/api/document-save";
+import { NameInputDialog } from "@/domains/chat/components/name-input-dialog";
+import {
+  useDocumentEditorSave,
+  type DocumentEditorSnapshot,
+  type DocumentSendPreparation,
+} from "@/domains/chat/hooks/use-document-editor-save";
 import type { CommentAnchor } from "@/domains/chat/utils/tiptap-position-map";
+import { documentsGetQueryKey } from "@/generated/daemon/@tanstack/react-query.gen";
 import type { DocumentsByIdCommentsPostResponse } from "@/generated/daemon/types.gen";
 import {
   DocumentCommentPanel,
@@ -62,6 +74,8 @@ const TiptapDocumentEditor = lazy(() =>
 export interface DocumentViewerContainerHandle {
   /** Refresh the comment panel. Call when an SSE comment event arrives. */
   refreshComments: () => Promise<void>;
+  flushPendingSave: () => Promise<DocumentEditorSnapshot>;
+  beginSendPreparation: () => DocumentSendPreparation;
 }
 
 /** A document surface: autosave writes through the documents API. */
@@ -77,6 +91,15 @@ export interface DocumentViewerContainerProps {
   conversationId: string;
   onExport?: () => void;
   onSubmitFeedback?: () => void;
+  onViewConversation?: () => void;
+  /**
+   * The document was retitled to `documentName`. The write has already been
+   * sent; this is how the caller holding the name (the viewer store for the
+   * chat drawer, page state for the standalone route) adopts it. Called a
+   * second time with the previous name when that write fails, so an
+   * optimistic rename rolls back the way a conversation rename does.
+   */
+  onRenamed?: (documentName: string) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -103,7 +126,16 @@ interface TextSelection {
 // Component
 // ---------------------------------------------------------------------------
 
-export function DocumentViewerContainer({
+export function DocumentViewerContainer(props: DocumentViewerContainerProps) {
+  return (
+    <DocumentViewerContent
+      key={`${props.assistantId}:${props.surfaceId}`}
+      {...props}
+    />
+  );
+}
+
+function DocumentViewerContent({
   assistantId,
   documentName,
   content,
@@ -113,8 +145,11 @@ export function DocumentViewerContainer({
   conversationId,
   onExport,
   onSubmitFeedback,
+  onViewConversation,
+  onRenamed,
 }: DocumentViewerContainerProps) {
   const { t } = useTranslation("chat");
+  const queryClient = useQueryClient();
   // Where autosave writes.
   const saveTarget: DocumentSaveTarget = {
     source: "document",
@@ -135,82 +170,54 @@ export function DocumentViewerContainer({
     end: number;
   } | null>(null);
 
-  const [saveStatus, setSaveStatus] = useState<"idle" | "saving" | "saved">(
-    "idle",
-  );
+  const [renameOpen, setRenameOpen] = useState(false);
+  // What the header's status line says when nothing is being saved. Derived
+  // from the editor's live markdown rather than the documents list, so it
+  // counts what is on screen while it is being typed.
+  const [wordCount, setWordCount] = useState(() => markdownWordCount(content));
 
   const commentPanelRef = useRef<DocumentCommentPanelHandle>(null);
-  const saveTimerRef = useRef<ReturnType<typeof setTimeout>>(null);
-  const savedFadeRef = useRef<ReturnType<typeof setTimeout>>(null);
-
-  // The debounced save reads its destination through refs rather than the
-  // closure the keystroke created. The container is keyed per document, so a
-  // switch unmounts it with a save still pending, and a rename changes the
-  // title under a mounted one; both are cases where the value captured when
-  // the keystroke landed is no longer where the text belongs. The pending
-  // markdown rides along so the unmount flush below has something to write.
-  const saveTargetRef = useRef(saveTarget);
-  const pendingMarkdownRef = useRef<string | null>(null);
-  useLayoutEffect(() => {
-    saveTargetRef.current = saveTarget;
+  const {
+    saveStatus,
+    editingLocked,
+    editorContent,
+    title,
+    changeContent,
+    rename,
+    flushPendingSave,
+    beginSendPreparation,
+  } = useDocumentEditorSave({
+    target: saveTarget,
+    content,
+    onRenamed,
+    onRenameSaved: (savedTarget) => {
+      void queryClient.invalidateQueries({
+        queryKey: documentsGetQueryKey({
+          path: { assistant_id: savedTarget.assistantId },
+          query: { conversationId: savedTarget.conversationId },
+        }),
+      });
+      void queryClient.invalidateQueries({
+        queryKey: documentsGetQueryKey({
+          path: { assistant_id: savedTarget.assistantId },
+        }),
+      });
+    },
+    onRenameFailed: () => toast.error(t("documentViewerContainer.renameFailed")),
   });
-
-  const flushPendingSave = useCallback(() => {
-    const markdown = pendingMarkdownRef.current;
-    if (markdown === null) {
-      return;
-    }
-    pendingMarkdownRef.current = null;
-    const target = saveTargetRef.current;
-    void saveDocumentContent(target, markdown).then(
-      () => {
-        setSaveStatus("saved");
-        savedFadeRef.current = setTimeout(() => setSaveStatus("idle"), 2000);
-      },
-      () => setSaveStatus("idle"),
-    );
-  }, []);
 
   const handleContentChange = useCallback(
     (markdown: string) => {
-      if (saveTimerRef.current) {
-        clearTimeout(saveTimerRef.current);
+      if (changeContent(markdown)) {
+        setWordCount(markdownWordCount(markdown));
       }
-      if (savedFadeRef.current) {
-        clearTimeout(savedFadeRef.current);
-      }
-      pendingMarkdownRef.current = markdown;
-      setSaveStatus("saving");
-      saveTimerRef.current = setTimeout(() => {
-        saveTimerRef.current = null;
-        flushPendingSave();
-      }, 1000);
     },
-    [flushPendingSave],
+    [changeContent],
   );
 
-  // A keyed remount takes the pending timer down with it, so an edit made in
-  // the last second before a document switch or a close would never reach the
-  // daemon. Fire it now instead: the refs still name the document being left,
-  // so the text lands where it was typed.
-  const flushPendingSaveRef = useRef(flushPendingSave);
-  useLayoutEffect(() => {
-    flushPendingSaveRef.current = flushPendingSave;
-  });
-  useEffect(
-    () => () => {
-      if (savedFadeRef.current) {
-        clearTimeout(savedFadeRef.current);
-        savedFadeRef.current = null;
-      }
-      if (saveTimerRef.current) {
-        clearTimeout(saveTimerRef.current);
-        saveTimerRef.current = null;
-        flushPendingSaveRef.current();
-      }
-    },
-    [],
-  );
+  useEffect(() => {
+    setWordCount(markdownWordCount(editorContent));
+  }, [editorContent]);
 
   // Clear inline comment state when panel closes (but keep text selection
   // visible since the popover now works independently of the panel)
@@ -280,10 +287,11 @@ export function DocumentViewerContainer({
     }
   }, [assistantId, surfaceId, updateCommentAnchors]);
 
-  // Expose refreshComments for external callers (e.g. SSE handler in page).
-  useImperativeHandle(handleRef, () => ({ refreshComments }), [
-    refreshComments,
-  ]);
+  useImperativeHandle(
+    handleRef,
+    () => ({ refreshComments, flushPendingSave, beginSendPreparation }),
+    [refreshComments, flushPendingSave, beginSendPreparation],
+  );
 
   // -------------------------------------------------------------------------
   // Inline comment creation
@@ -322,6 +330,18 @@ export function DocumentViewerContainer({
   }, []);
 
   // -------------------------------------------------------------------------
+  // Rename
+  // -------------------------------------------------------------------------
+
+  const handleRenameSubmit = useCallback(
+    (nextTitle: string) => {
+      setRenameOpen(false);
+      rename(nextTitle);
+    },
+    [rename],
+  );
+
+  // -------------------------------------------------------------------------
   // Sync anchors when panel opens
   // -------------------------------------------------------------------------
 
@@ -354,63 +374,102 @@ export function DocumentViewerContainer({
 
   return (
     <div className="flex h-full flex-col overflow-hidden rounded-xl border border-[var(--border-base)] bg-[var(--surface-overlay)]">
-      {/* Navbar */}
-      <div className="flex shrink-0 items-center gap-2 border-b border-[var(--border-base)] px-4 py-2">
-        <FileText size={16} style={{ color: "var(--content-secondary)" }} />
-        <Typography
-          variant="title-small"
-          className="min-w-0 flex-1 truncate text-[var(--content-emphasised)]"
-        >
-          {documentName}
-        </Typography>
-
-        {saveStatus !== "idle" ? (
+      <header className="flex shrink-0 items-start gap-3 border-b border-[var(--border-base)] bg-[var(--surface-lift)] px-4 py-3">
+        <FileText
+          size={16}
+          className="mt-1 shrink-0"
+          style={{ color: "var(--content-secondary)" }}
+        />
+        <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+          {/* `title-small` sets `line-height: 1`, which `truncate` then crops
+              descenders against. Give the line the room the font needs. */}
+          <Typography
+            variant="title-small"
+            className="truncate leading-normal text-[var(--content-emphasised)]"
+          >
+            {title}
+          </Typography>
           <span className="flex items-center gap-1 text-[var(--content-tertiary)]">
             {saveStatus === "saving" ? (
-              <Loader2 size={12} className="animate-spin" />
-            ) : (
-              <Check size={12} />
-            )}
+              <Loader2 size={12} className="shrink-0 animate-spin" />
+            ) : null}
+            {saveStatus === "saved" ? <Check size={12} className="shrink-0" /> : null}
             <Typography
               variant="label-small-default"
-              className="text-[var(--content-tertiary)]"
+              className="truncate text-[var(--content-tertiary)]"
             >
-              {saveStatus === "saving" ? t("documentViewerContainer.saving") : t("documentViewerContainer.saved")}
+              {saveStatus === "saving"
+                ? t("documentViewerContainer.saving")
+                : saveStatus === "saved"
+                  ? t("documentViewerContainer.saved")
+                  : t("documentViewerContainer.wordCount", {
+                      count: wordCount,
+                    })}
             </Typography>
           </span>
-        ) : null}
+        </div>
 
-        {onExport ? (
+        {onViewConversation && (
           <Button
             variant="ghost"
-            size="compact"
-            leftIcon={<Download />}
-            onClick={onExport}
-          >
-            {t("documentViewerContainer.export")}
-          </Button>
-        ) : null}
+            iconOnly={<MessageSquareText />}
+            onClick={onViewConversation}
+            aria-label={t("documentChat.viewConversation")}
+            tooltip={t("documentChat.viewConversation")}
+          />
+        )}
 
-        <Button
-          variant={commentsPanelOpen ? "outlined" : "ghost"}
-          size="compact"
-          leftIcon={<MessageSquareText />}
-          onClick={toggleComments}
-          aria-label={commentsPanelOpen ? t("documentViewerContainer.closeCommentsAria") : t("documentViewerContainer.openCommentsAria")}
-          aria-pressed={commentsPanelOpen}
-        >
-          {t("documentViewerContainer.comments")}
-        </Button>
+        <ActionMenu.Root>
+          <ActionMenu.Trigger>
+            <Button
+              variant="ghost"
+              iconOnly={<Ellipsis />}
+              disabled={editingLocked}
+              aria-label={t("documentViewerContainer.menuAria")}
+              tooltip={t("documentViewerContainer.menuAria")}
+            />
+          </ActionMenu.Trigger>
+          <ActionMenu.Content
+            title={t("documentViewerContainer.menuAria")}
+            align="end"
+          >
+            <ActionMenu.Item
+              icon={MessageSquareText}
+              label={commentsPanelOpen ? t("documentViewerContainer.hideComments") : t("documentViewerContainer.comments")}
+              onSelect={toggleComments}
+            />
+            <ActionMenu.Item
+              icon={PencilLine}
+              label={t("documentViewerContainer.rename")}
+              onSelect={() => setRenameOpen(true)}
+            />
+            {onExport ? (
+              <ActionMenu.Item
+                icon={Download}
+                label={t("documentViewerContainer.export")}
+                onSelect={onExport}
+              />
+            ) : null}
+          </ActionMenu.Content>
+        </ActionMenu.Root>
 
         <Button
           variant="ghost"
-          size="compact"
           iconOnly={<X />}
           onClick={onClose}
           aria-label={t("documentViewerContainer.closeDocumentAria")}
           tooltip={t("documentViewerContainer.close")}
         />
-      </div>
+      </header>
+
+      <NameInputDialog
+        open={renameOpen}
+        title={t("documentViewerContainer.renameTitle")}
+        submitLabel={t("documentViewerContainer.renameSave")}
+        initialValue={title}
+        onSubmit={handleRenameSubmit}
+        onCancel={() => setRenameOpen(false)}
+      />
 
       {/* Body: editor + optional comment panel */}
       <div className="relative flex min-h-0 flex-1">
@@ -424,7 +483,8 @@ export function DocumentViewerContainer({
             }
           >
             <TiptapDocumentEditor
-              content={content}
+              content={editorContent}
+              editable={!editingLocked}
               onContentChange={handleContentChange}
               onTextSelect={(sel) => {
                 if (!sel) {

@@ -11,16 +11,22 @@
  * mounts them, so `defaultValue` decides which cards start open.
  */
 
+import { useState } from "react";
+
 import type { Meta, StoryObj } from "@storybook/react-vite";
 
 import { CollapsibleNavSection } from "@/components/collapsible-nav-section";
+import { AssistantSectionEmptyState } from "@/domains/chat/components/assistant-section-empty-state";
 import { GroupIndicatorDot } from "@/domains/chat/components/collapsed-group-icon";
 import { ConversationListProvider } from "@/domains/chat/components/conversation-list-context";
 import {
   GroupActionsMenu,
   type GroupMenuItemsProps,
 } from "@/domains/chat/components/group-actions-menu";
-import { SidebarSectionCard } from "@/domains/chat/components/sidebar-section-card";
+import {
+  SidebarSectionCard,
+  type SidebarSectionCardProps,
+} from "@/domains/chat/components/sidebar-section-card";
 import type { Conversation } from "@/types/conversation-types";
 
 function conversation(
@@ -201,6 +207,114 @@ export const Chats: Story = {
 };
 
 /**
+ * Thirty-plus threads: the case the expand control exists for. As the
+ * rail's bottom-most section, Chats rests at the same mid height every
+ * non-last section caps at, scrolling within itself, with "Expand" pinned
+ * at the card's foot. Expanded, the card grows to whatever height the rail
+ * has left (here, the frame) and the rows keep scrolling the same way;
+ * "Collapse" brings it back. The choice persists per section in the real
+ * sidebar; the story keeps it in local state.
+ *
+ * Mounted inside a frame the height of a small laptop's rail, because that
+ * is where the geometry matters: the card hugs its rows rather than
+ * stretching to the frame, and past thirty rows the list windows
+ * (virtualizes) with the control still in place.
+ */
+/* Synthetic titles at the widths a real list runs to, from a few words to
+   one that truncates, so the rows read as a list rather than a repeated
+   placeholder. Nothing here is drawn from anyone's conversations. */
+const LONG_TITLES = [
+  "Draft the release notes",
+  "Onboarding checklist review",
+  "Sample conversation three",
+  "Weekly sync agenda and follow-ups",
+  "Example thread five",
+  "Quarterly roadmap questions",
+  "Bug triage walkthrough",
+  "Example thread eight",
+  "Rename the staging environment",
+  "Placeholder conversation ten",
+  "Design review notes",
+  "Migration plan for the test suite",
+  "Sample conversation thirteen",
+  "Choosing a chart library",
+  "Example thread fifteen",
+  "Long title that runs past the rail and truncates",
+  "Retro action items",
+  "Placeholder conversation eighteen",
+];
+
+const MANY_CHATS: Conversation[] = Array.from({ length: 36 }, (_, index) =>
+  conversation(`t${index + 1}`, LONG_TITLES[index % LONG_TITLES.length]!, {
+    hasUnseenLatestAssistantMessage: index === 2 || index === 14,
+  }),
+);
+
+function railFrame(Story: () => React.ReactElement) {
+  return (
+    <div className="flex h-[640px] w-[272px] flex-col gap-2">
+      <Story />
+    </div>
+  );
+}
+
+/**
+ * The real sidebar keeps `expanded` in the layout store; the story holds
+ * it here so the control is live in the Canvas.
+ */
+function ExpandableChats({
+  initiallyExpanded = false,
+  ...args
+}: SidebarSectionCardProps & { initiallyExpanded?: boolean }) {
+  const [expanded, setExpanded] = useState(initiallyExpanded);
+  return (
+    <CollapsibleNavSection.Root
+      type="multiple"
+      defaultValue={["chats"]}
+      className="min-h-0 flex-1"
+    >
+      <SidebarSectionCard
+        {...args}
+        expanded={expanded}
+        onExpandedChange={setExpanded}
+      />
+    </CollapsibleNavSection.Root>
+  );
+}
+
+export const ChatsThirtyPlus: Story = {
+  name: "Chats · thirty-plus threads",
+  args: {
+    value: "chats",
+    label: "Chats",
+    items: MANY_CHATS,
+    isLast: true,
+    expandable: true,
+    groupMenu: CHATS_MENU,
+    trailing: <GroupActionsMenu label="Chats" {...CHATS_MENU} />,
+  },
+  decorators: [railFrame],
+  render: (args) => <ExpandableChats {...args} />,
+};
+
+/** The same section already expanded to the frame's full height. */
+export const ChatsThirtyPlusExpanded: Story = {
+  ...ChatsThirtyPlus,
+  name: "Chats · thirty-plus threads, expanded",
+  render: (args) => <ExpandableChats {...args} initiallyExpanded />,
+};
+
+/**
+ * Twelve threads: past the cap, so the control shows, but short enough
+ * that expanding hugs the rows rather than filling the frame.
+ */
+export const ChatsJustPastTheCap: Story = {
+  ...ChatsThirtyPlus,
+  name: "Chats · just past the cap",
+  args: { ...ChatsThirtyPlus.args, items: MANY_CHATS.slice(0, 12) },
+};
+
+/**
  * The two menus, which are not the same menu.
  *
  * The header's actions are the section's. This is the Chats card, so: mark all
@@ -260,6 +374,80 @@ export const Composed: Story = {
         groupMenu={CHATS_MENU}
         trailing={<GroupActionsMenu label="Chats" {...CHATS_MENU} />}
       />
+    </CollapsibleNavSection.Root>
+  ),
+};
+
+/**
+ * The assistant-initiated section: the one card painted in the assistant's
+ * own color, and the one that renders at zero.
+ *
+ * The tint reads `--avatar-accent`, which the real app publishes on `<html>`
+ * from the active avatar. Storybook has no assistant, so these stories set it
+ * on the card's own wrapper — same variable, same `color-mix`, so what shows
+ * here is what the sidebar paints. Change the hex below to check a different
+ * avatar color; the light end of the palette is the one worth looking at,
+ * since a 7% mix has to stay distinguishable from a plain card without
+ * turning into a highlight.
+ *
+ * The empty state's eyes are absent here for the same reason: the mark reads
+ * the real avatar and renders `null` without one, which is exactly what a
+ * custom-image avatar gets in the app.
+ */
+const ASSISTANT_TINT_CLASS =
+  "bg-[color-mix(in_srgb,var(--avatar-accent,var(--surface-lift))_7%,var(--surface-lift))]";
+
+const ASSISTANT_THREADS: Conversation[] = [
+  conversation("a1", "Your Tuesday reviews keep slipping past 6pm", {
+    hasUnseenLatestAssistantMessage: true,
+  }),
+  conversation("a2", "That contractor never sent the revised quote"),
+  conversation("a3", "You've rewritten the same paragraph four times"),
+];
+
+export const AssistantInitiated: Story = {
+  args: {
+    value: "assistant",
+    label: "From Ada",
+    items: ASSISTANT_THREADS,
+    cardClassName: ASSISTANT_TINT_CLASS,
+  },
+  decorators: [
+    (Story) => (
+      <div style={{ ["--avatar-accent" as string]: "#C4436A" }}>
+        <Story />
+      </div>
+    ),
+  ],
+  render: (args) => (
+    <CollapsibleNavSection.Root type="multiple" defaultValue={["assistant"]}>
+      <SidebarSectionCard {...args} />
+    </CollapsibleNavSection.Root>
+  ),
+};
+
+/**
+ * Nothing yet — the state the section spends its first days in, and the only
+ * reason it renders at zero at all.
+ */
+export const AssistantInitiatedEmpty: Story = {
+  args: {
+    value: "assistant",
+    label: "From Ada",
+    items: [],
+    cardClassName: ASSISTANT_TINT_CLASS,
+    children: <AssistantSectionEmptyState />,
+  },
+  decorators: [
+    (Story) => (
+      <div style={{ ["--avatar-accent" as string]: "#C4436A" }}>
+        <Story />
+      </div>
+    ),
+  ],
+  render: (args) => (
+    <CollapsibleNavSection.Root type="multiple" defaultValue={["assistant"]}>
+      <SidebarSectionCard {...args} />
     </CollapsibleNavSection.Root>
   ),
 };

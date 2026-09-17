@@ -23,12 +23,21 @@ import {
   getMessageById,
   updateMessageContent,
 } from "../persistence/conversation-crud.js";
-import { isBackgroundConversationType } from "../persistence/conversation-types.js";
+import {
+  ASSISTANT_INITIATED_SOURCE,
+  isBackgroundConversationType,
+} from "../persistence/conversation-types.js";
 import { publishConversationMessagesChanged } from "../runtime/sync/resource-sync-events.js";
 import { getLogger } from "../util/logger.js";
 import { normalizeTitle, stripMarkdown } from "../util/short-title.js";
 import { isConversationSeedSane } from "./conversation-seed-composer.js";
 import { deriveTitle } from "./copy-composer.js";
+import {
+  buildPendingGuardianProjection,
+  guardianFeedItemId,
+  isGuardianRequestSignalEvent,
+  receiptGuardianFeedItemIfRequestTerminal,
+} from "./guardian-feed-projection.js";
 import { readPayloadString } from "./notification-utils.js";
 import type { NotificationSignal } from "./signal.js";
 import type {
@@ -107,7 +116,14 @@ export async function writeHomeFeedItemForSignal(
       : undefined) ||
     renderedCopy?.body?.trim() ||
     payloadBody?.trim() ||
-    "";
+    // Guardian requests must never be dropped for missing copy: the
+    // producer's questionText (or, for access requests, the triggering
+    // message preview) is already the human-readable ask.
+    (isGuardianRequestSignalEvent(signal.sourceEventName)
+      ? (readPayloadString(signal.contextPayload, "questionText")?.trim() ??
+        readPayloadString(signal.contextPayload, "messagePreview")?.trim() ??
+        "")
+      : "");
   if (!resolvedSummary) {
     log.warn(
       { signalId: signal.signalId, sourceEventName: signal.sourceEventName },
@@ -155,8 +171,25 @@ export async function writeHomeFeedItemForSignal(
       ? { ...(baseMetadata ?? {}), scheduleId }
       : baseMetadata;
 
+  // A guardian request's item is keyed by the request rather than the
+  // signal, so the feed's replace-in-place merge keeps exactly one
+  // canonical "Needs attention" item per request across re-emits and
+  // the terminal-status receipt rewrite.
+  const guardianProjection = isGuardianRequestSignalEvent(
+    signal.sourceEventName,
+  )
+    ? buildPendingGuardianProjection(
+        signal.contextPayload,
+        signal.sourceEventName === "ingress.access_request"
+          ? "access_request"
+          : undefined,
+      )
+    : null;
+
   const item: FeedItem = {
-    id: `notif:${signal.signalId}`,
+    id: guardianProjection
+      ? guardianFeedItemId(guardianProjection.requestId)
+      : `notif:${signal.signalId}`,
     type: "notification",
     priority: 50,
     title: resolvedTitle,
@@ -164,9 +197,10 @@ export async function writeHomeFeedItemForSignal(
     timestamp: now,
     createdAt: now,
     status: "new",
-    category,
+    ...(category ? { category } : {}),
     noteworthy: deriveNoteworthy(signal),
     fromAssistant: signal.sourceChannel === "assistant_tool",
+    ...(guardianProjection ? { guardianRequest: guardianProjection } : {}),
     ...(urgency ? { urgency } : {}),
     ...(sourceConversationId ? { conversationId: sourceConversationId } : {}),
     ...(panelKind ? { detailPanel: { kind: panelKind } } : {}),
@@ -205,6 +239,16 @@ export async function writeHomeFeedItemForSignal(
     : item;
 
   await appendFeedItem(card);
+
+  // Converge the write-vs-resolve race: a request decided while this
+  // write was in flight already ran its receipt fan-out against an item
+  // that did not exist yet. Mirrors the delivery recorder's
+  // `withdrawIfRequestAlreadyTerminal`.
+  if (guardianProjection) {
+    await receiptGuardianFeedItemIfRequestTerminal(
+      guardianProjection.requestId,
+    );
+  }
   return card;
 }
 
@@ -231,6 +275,11 @@ async function resolveOwnedConversationMessageId(
   sourceConversationId: string | undefined,
   summary: string,
 ): Promise<string | undefined> {
+  // The completed reply is already the source conversation's canonical row.
+  // This signal's body is a compact push preview, not conversation content.
+  if (signal.sourceEventName === "chat.assistant_reply") {
+    return undefined;
+  }
   if (vellumDelivery?.conversationId) {
     return vellumDelivery.conversationId === sourceConversationId
       ? vellumDelivery.messageId
@@ -401,14 +450,26 @@ const EVENT_CATEGORY_MAP: Record<string, FeedItemCategory> = {
   "activity.complete": "background",
   "watcher.notification": "system",
   "schedule.notify": "scheduling",
+  "schedule.result": "scheduling",
   "guardian.question": "security",
   "guardian.channel_activation": "security",
   "ingress.access_request": "security",
   "telegram.webhook_health_alert": "system",
 };
 
-function deriveCategory(signal: NotificationSignal): FeedItemCategory {
-  return EVENT_CATEGORY_MAP[signal.sourceEventName] ?? "system";
+/**
+ * Map a signal's source event to a feed category, or nothing when the event
+ * has no entry. An unmapped event used to land in `system`, a bucket named
+ * for our architecture rather than the user's world, and every deliberate
+ * assistant notification (`user.send_notification`) ended up there. The
+ * category is optional on the wire, so an event without a home simply
+ * carries none: readers that filter by category skip it, and nothing has
+ * to guess.
+ */
+function deriveCategory(
+  signal: NotificationSignal,
+): FeedItemCategory | undefined {
+  return EVENT_CATEGORY_MAP[signal.sourceEventName];
 }
 
 function deriveDetailPanelKind(
@@ -418,15 +479,12 @@ function deriveDetailPanelKind(
     return "toolPermission";
   }
 
-  if (signal.sourceEventName === "guardian.question") {
-    const payload = signal.contextPayload;
-    const kind =
-      payload && typeof payload === "object" && "requestKind" in payload
-        ? payload.requestKind
-        : undefined;
-    if (kind === "tool_approval" || kind === "tool_grant_request") {
-      return "permissionChat";
-    }
+  // Every guardian request opens the permission-style panel: the client
+  // dispatches the guardian card off the item's `guardianRequest`
+  // projection, and the panel kind keeps pre-projection clients (and
+  // bucket-fallback derivations) treating the row as an approval.
+  if (isGuardianRequestSignalEvent(signal.sourceEventName)) {
+    return "permissionChat";
   }
 
   return undefined;
@@ -442,7 +500,21 @@ function deriveDetailPanelKind(
  * `assistant_tool` mirrors unconditionally because the documented
  * `notifications send` skill (and background-job failure emits) deliberately
  * does not require a background-typed conversation or the
- * `isAsyncBackground` hint.
+ * `isAsyncBackground` hint. `chat.assistant_reply` also mirrors: it is the
+ * durable in-app record for the push sent after a user leaves a chat, while
+ * retaining the normal interactive conversation as its navigation target.
+ *
+ * A delivery that materialized an assistant-initiated thread never mirrors.
+ * Under the `assistant-initiated-threads` flag, `conversation-pairing.ts`
+ * promotes a background `assistant.share` into a standard conversation
+ * stamped {@link ASSISTANT_INITIATED_SOURCE}, and that thread's row in the
+ * sidebar's assistant section is the share's one surface. Mirroring it here
+ * as well put the same share in the bell a second time, labeled by its
+ * source channel ("Heartbeat"). The check reads the paired conversation's
+ * `source` rather than re-deriving the promotion rule, so it holds however
+ * that rule narrows or widens. Guardian requests are checked first on
+ * purpose: the bell is their canonical home whatever conversation they pair
+ * with.
  */
 function resolveHomeFeedMirror(
   signal: NotificationSignal,
@@ -473,7 +545,19 @@ function resolveHomeFeedMirror(
     : fallbackConversationId;
   const sourceScheduleJobId = sourceRow?.scheduleJobId ?? undefined;
 
-  if (signal.sourceChannel === "assistant_tool") {
+  // Guardian requests always project into the feed: the "Needs
+  // attention" item is the request's canonical home, and the request
+  // blocks on the guardian whatever kind of conversation raised it.
+  if (isGuardianRequestSignalEvent(signal.sourceEventName)) {
+    return { mirror: true, sourceConversationId, sourceScheduleJobId };
+  }
+  if (isAssistantInitiatedThreadDelivery(fallbackConversationId)) {
+    return { mirror: false };
+  }
+  if (
+    signal.sourceChannel === "assistant_tool" ||
+    signal.sourceEventName === "chat.assistant_reply"
+  ) {
     return { mirror: true, sourceConversationId, sourceScheduleJobId };
   }
   if (signal.attentionHints.isAsyncBackground) {
@@ -483,6 +567,31 @@ function resolveHomeFeedMirror(
     return { mirror: true, sourceConversationId, sourceScheduleJobId };
   }
   return { mirror: false };
+}
+
+/**
+ * Whether the vellum delivery this signal produced landed in a thread the
+ * sidebar's assistant section already shows.
+ *
+ * Best-effort like the source lookup above: a missing id, a missing row, or
+ * a lookup failure all read as "not an assistant thread", so a storage
+ * hiccup degrades to the pre-existing behavior (a bell row) rather than
+ * dropping the notification everywhere.
+ */
+function isAssistantInitiatedThreadDelivery(
+  deliveryConversationId: string | undefined,
+): boolean {
+  if (!deliveryConversationId) {
+    return false;
+  }
+  try {
+    return (
+      getConversation(deliveryConversationId)?.source ===
+      ASSISTANT_INITIATED_SOURCE
+    );
+  } catch {
+    return false;
+  }
 }
 
 /**

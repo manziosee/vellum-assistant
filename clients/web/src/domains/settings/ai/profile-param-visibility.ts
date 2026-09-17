@@ -34,11 +34,14 @@ export const VISIBILITY_NONE: ProfileParamVisibility = {
   thinkingLevel: false,
 };
 
-function isOpenAIGPT5Family(modelId: string): boolean {
+function isOpenAIGptReasoningFamily(modelId: string): boolean {
   return (
     modelId === "gpt-5" ||
+    modelId === "gpt-6" ||
     modelId.startsWith("gpt-5.") ||
-    modelId.startsWith("gpt-5-")
+    modelId.startsWith("gpt-5-") ||
+    modelId.startsWith("gpt-6.") ||
+    modelId.startsWith("gpt-6-")
   );
 }
 
@@ -92,21 +95,28 @@ const GEMINI_THINKING_LEVELS_FULL = [
   "medium",
   "high",
 ] as const;
-const GEMINI_THINKING_LEVELS_PRO = ["low", "medium", "high"] as const;
+const GEMINI_THINKING_LEVELS_NO_MINIMAL = ["low", "medium", "high"] as const;
 
 /**
- * Gemini 3.x Pro family accepts only low/medium/high (no "minimal") and cannot
- * disable thinking. Mirrors the daemon's `isGeminiProModel` in
- * `assistant/src/providers/gemini/client.ts`.
+ * Gemini models whose thinking floor is `"low"` (they do not accept
+ * `"minimal"`). Prefers catalog `thinkingFloor`; uncatalogued Gemini 3.x Pro
+ * IDs fall back to the Pro regex so the picker stays conservative.
  */
-function isGeminiProModel(modelId: string): boolean {
+function geminiOmitsMinimalThinking(modelId: string): boolean {
+  const catalogFloor = findCatalogModel("gemini", modelId)?.thinkingFloor;
+  if (catalogFloor === "low") {
+    return true;
+  }
+  if (catalogFloor === "minimal") {
+    return false;
+  }
   return /^gemini-3.*pro/.test(modelId);
 }
 
 /**
- * Thinking levels selectable for a Gemini model, lowest → highest. Pro models
- * omit "minimal". The daemon clamps anything below a model's floor, so this is
- * a UX nicety rather than a correctness guarantee.
+ * Thinking levels selectable for a Gemini model, lowest → highest. Models that
+ * reject `"minimal"` omit it. The daemon clamps anything below a model's floor,
+ * so this is a UX nicety rather than a correctness guarantee.
  */
 export type GeminiThinkingLevel = (typeof GEMINI_THINKING_LEVELS_FULL)[number];
 
@@ -121,8 +131,8 @@ export function isGeminiThinkingLevel(v: unknown): v is GeminiThinkingLevel {
 export function geminiThinkingLevels(
   modelId: string,
 ): readonly GeminiThinkingLevel[] {
-  return isGeminiProModel(modelId.toLowerCase())
-    ? GEMINI_THINKING_LEVELS_PRO
+  return geminiOmitsMinimalThinking(modelId.toLowerCase())
+    ? GEMINI_THINKING_LEVELS_NO_MINIMAL
     : GEMINI_THINKING_LEVELS_FULL;
 }
 
@@ -161,7 +171,7 @@ function supportsEffort(
     return !modelId.includes("haiku") && supportsThinking;
   }
   if (provider === "openai") {
-    return isOpenAIGPT5Family(modelId);
+    return isOpenAIGptReasoningFamily(modelId);
   }
   if (provider === "openrouter" || provider === "vercel-ai-gateway") {
     if (isVendorPrefixedAnthropicModel(modelId)) {
@@ -192,6 +202,7 @@ const TOP_P_OPENAI_COMPAT_PROVIDERS = new Set([
   "atlascloud",
   "baseten",
   "ollama",
+  "opencode",
   "openrouter",
   "together",
   "vercel-ai-gateway",
@@ -232,7 +243,7 @@ export function resolveProfileParamVisibility(
     contextWindow: true,
     effort: supportsEffort(providerId, modelId, supportsThinkingResult),
     speed: providerId === "anthropic" && modelId.includes("opus"),
-    verbosity: providerId === "openai" && isOpenAIGPT5Family(modelId),
+    verbosity: providerId === "openai" && isOpenAIGptReasoningFamily(modelId),
     temperature: usesAnthropicWire,
     topP: supportsTopP(providerId, usesAnthropicWire),
     // Gateway thinking is anthropic/*-only: the OpenAI-compat path has no

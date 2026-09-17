@@ -179,6 +179,7 @@ describe("Invariant 2: no generic plaintext secret read API", () => {
       "providers/inference/credential-slot-repair.ts", // boot repair: copies the shared openai-compatible slot value into per-connection slots (get/set of provider API keys only; values never logged or returned)
       "runtime/routes/inference-provider-connection-routes.ts", // connection delete removes its dedicated per-connection key slot (deleteSecureKeyAsync only; no reads)
       "daemon/handlers/config-slack-channel.ts", // Slack channel config credential management
+      "daemon/handlers/config-discord-channel.ts", // Discord channel bot token management
       "providers/platform-proxy/context.ts", // managed proxy API key lookup for provider initialization
       "platform/client.ts", // platform client credential store fallback for standalone CLI auth
       "mcp/mcp-header-store.ts", // MCP static auth header persistence (credential store CRUD + legacy migration)
@@ -189,7 +190,7 @@ describe("Invariant 2: no generic plaintext secret read API", () => {
       "oauth/credential-token-resolver.ts", // centralized access-token key resolution for OAuth and manual-token providers
       "oauth/connection-resolver.ts", // resolve OAuthConnection from oauth-store (access_token lookup)
       "runtime/routes/secret-routes.ts", // HTTP secret management routes (set/delete secrets)
-      "acp/acp-claude-oauth.ts", // Connect Claude OAuth token vault-store helper (stores sk-ant-oat token via setSecureKeyAsync)
+      "acp/acp-claude-oauth.ts", // Connect Claude OAuth token vault-store helper (stores access token plus broker-owned refresh/expiry companions via setSecureKeyAsync)
       "runtime/routes/acp-claude-auth-routes.ts", // Connect Claude Code daemon OAuth flow (stores OAuth token in vault)
       "runtime/routes/migration-routes.ts", // migration import credential restore
       "daemon/conversation-messaging.ts", // credential storage during session messaging
@@ -203,15 +204,16 @@ describe("Invariant 2: no generic plaintext secret read API", () => {
       "providers/registry.ts", // provider registry API key lookup for initialization
       "providers/inference/resolve-auth.ts", // provider_connection auth resolver (api_key path reads vault, mirrors registry.ts)
       "providers/inference/codex-token-refresh.ts", // Codex OAuth token refresh (reads/writes access_token, refresh_token, expires_at)
-      "cli/commands/inference-providers.ts", // ChatGPT subscription OAuth token storage
-      "runtime/routes/chatgpt-subscription-auth-routes.ts", // ChatGPT subscription daemon OAuth flow (stores tokens in CES)
+      "providers/inference/service-account-token.ts", // Google service-account JWT exchange (reads service-account JSON, writes token_cache blob)
+      "providers/inference/chatgpt-subscription-credentials.ts", // ChatGPT subscription sign-in token storage, shared by the daemon routes and the CLI (setSecureKeyAsync only; no reads)
       "providers/provider-availability.ts", // provider availability API key check
       "media/image-credentials.ts", // shared image-gen credential resolver (provider API key lookup)
       "persistence/embeddings/embedding-backend.ts", // embedding backend API key lookup
       "persistence/llm-request-log-source-clickhouse.ts", // ClickHouse read source — lazy lookup of clickhouse:url + clickhouse:password + vellum:platform_assistant_id for self-scoped mirror reads
       "persistence/llm-request-log-sink-clickhouse.ts", // ClickHouse write sink — lazy lookup of clickhouse:url + clickhouse:password + vellum:platform_assistant_id for self-scoped log writes
       "persistence/compaction-log-store-clickhouse.ts", // ClickHouse compaction log writer — lazy lookup of clickhouse:url + clickhouse:password + vellum:platform_assistant_id for self-scoped event writes
-      "config/platform-rehydration.ts", // startup rehydration of platform base URL + IDs from credential store (daemon and schedule worker)
+      "config/platform-identity.ts", // assistant API key lookup for platform identity validate
+      "config/platform-rehydration.ts", // startup rehydration of platform base URL from the credential store and ids from platform validate
       "workspace/migrations/006-services-config.ts", // services config migration reads provider API keys
       "workspace/migrations/018-rekey-compound-credential-keys.ts", // re-key compound credential storage keys
       "daemon/conversation-process.ts", // masked provider key display
@@ -223,7 +225,8 @@ describe("Invariant 2: no generic plaintext secret read API", () => {
       "runtime/routes/credential-routes.ts", // CLI credential management routes (CLI-migrated to IPC)
       "runtime/routes/sanity-routes.ts", // Sanity connect/discover routes (reads stored api_token from credential store)
       "runtime/routes/platform-routes.ts", // CLI platform connect/disconnect/status routes (CLI-migrated to IPC)
-      "inbound/platform-callback-registration.ts", // managed credential lookup for platform base URL, assistant ID, and API key
+      "runtime/routes/roadmap-routes.ts", // signs public-roadmap calls with the assistant API key (outbound Authorization header only; the value never reaches a response, a log, or the CLI process)
+      "inbound/platform-callback-registration.ts", // managed credential lookup for platform base URL and API key
       "tts/providers/elevenlabs-provider.ts", // ElevenLabs TTS API key lookup
       "tts/providers/deepgram-provider.ts", // Deepgram TTS API key lookup
       "tts/providers/xai-provider.ts", // xAI TTS API key lookup
@@ -231,7 +234,6 @@ describe("Invariant 2: no generic plaintext secret read API", () => {
       "runtime/routes/avatar-routes.ts", // avatar generate route reads platform_base_url from credential store
       "cli/commands/keys.ts", // CLI provider key management
       "cli/commands/oauth/connect.ts", // CLI OAuth connect stored-secret verification
-      "runtime/routes/chatgpt-subscription-auth-routes.ts", // ChatGPT subscription OAuth token storage
       "runtime/routes/identity-routes.ts", // health/readyz endpoint checks CES connectivity via getCesClient
       "tools/executor.ts", // CES approval bridge resolves the CES RPC client via getCesClient
       "tools/network/web-fetch.ts", // Firecrawl /scrape BYOK fetch provider API key lookup (firecrawl provider key)
@@ -239,6 +241,7 @@ describe("Invariant 2: no generic plaintext secret read API", () => {
       "providers/inference/connection-availability.ts", // shared (provider, connection) availability status (credential presence check only; value never leaves the helper)
       "plugin-api/resolve-credential.ts", // plugin-facing resolveCredential: reveal-equivalent plaintext read, scoped to the in-context plugin's own service
       "tools/credentials/store.ts", // shared credential write path (setSecureKeyAsync only; no reads) behind credentials/set and plugin-facing storeCredential
+      "email/byo-email-credential.ts", // BYO email provider configuration check (credential presence only; value never leaves the helper)
     ]);
 
     const thisDir = dirname(fileURLToPath(import.meta.url));
@@ -470,21 +473,20 @@ describe("Invariant 4: credentials only used for allowed purpose", () => {
   });
 
   // PR 18 — vault policy fields with strict defaults
-  test("credential without explicit policy gets strict defaults (deny all)", () => {
+  test("credential without explicit policy gets strict defaults (deny all)", async () => {
     // A credential stored without allowed_tools defaults to empty array,
     // which the broker's isToolAllowed check fails closed on.
     upsertCredentialMetadata("test-svc", "pass", {});
 
-    const result = broker.authorize({
+    const result = await broker.browserFill({
       service: "test-svc",
       field: "pass",
       toolName: "browser_fill_credential",
+      fill: async () => {},
     });
 
-    expect(result.authorized).toBe(false);
-    expect(!result.authorized && result.reason).toContain(
-      "No tools are currently allowed",
-    );
+    expect(result.success).toBe(false);
+    expect(result.reason).toContain("No tools are currently allowed");
   });
 });
 

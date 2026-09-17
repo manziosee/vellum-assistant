@@ -1,3 +1,4 @@
+import { CHANNEL_BOT_PROVIDER } from "@vellumai/service-contracts/channels";
 import { describe, expect, test } from "bun:test";
 
 import { DEFAULT_COMMAND_REGISTRY } from "./command-registry/index.js";
@@ -390,6 +391,16 @@ describe("command-registry", () => {
       expect(assistantSpec.baseRisk).toBe("low");
     });
 
+    describe("apps", () => {
+      test("assistant apps inspect is low risk", () => {
+        expect(getAssistantPath("apps inspect").baseRisk).toBe("low");
+      });
+
+      test("assistant apps refresh is medium risk", () => {
+        expect(getAssistantPath("apps refresh").baseRisk).toBe("medium");
+      });
+    });
+
     // ── oauth subcommand ──────────────────────────────────────────────────
     describe("oauth", () => {
       const oauthSpec = assistantSubs.oauth;
@@ -420,12 +431,44 @@ describe("command-registry", () => {
         expect(oauthSpec.subcommands!.request.baseRisk).toBe("medium");
       });
 
+      // Both channel doors carry the bot's effects, so both are high: the
+      // request door because the endpoint decides what it does, the send
+      // door because it always posts a message somebody reads.
+      test("both assistant channels doors are high risk", () => {
+        expect(getAssistantPath("channels request").baseRisk).toBe("high");
+        expect(getAssistantPath("channels send").baseRisk).toBe("high");
+      });
+
+      test("assistant oauth request as a channel bot escalates to high, keyed on the contract's map", () => {
+        const requestSpec = oauthSpec.subcommands!.request;
+        const botRule = requestSpec.argRules!.find(
+          (r) => r.id === "assistant-oauth-request:bot-provider",
+        );
+        expect(botRule).toBeDefined();
+        expect(botRule!.flags).toEqual(["--provider"]);
+        expect(botRule!.risk).toBe("high");
+        expect(requestSpec.argSchema?.valueFlags).toContain("--provider");
+        // Every bot provider the contract names matches; a person's
+        // integration does not. The rule is derived from the map, so a
+        // channel that gains a bot credential is covered without a list here.
+        const pattern = new RegExp(botRule!.valuePattern!);
+        for (const key of Object.values(CHANNEL_BOT_PROVIDER)) {
+          expect(pattern.test(key)).toBe(true);
+        }
+        expect(pattern.test("google")).toBe(false);
+        expect(pattern.test("slack")).toBe(false);
+      });
+
       test("assistant oauth connect is low risk", () => {
         expect(oauthSpec.subcommands!.connect.baseRisk).toBe("low");
       });
 
       test("assistant oauth disconnect is medium risk", () => {
         expect(oauthSpec.subcommands!.disconnect.baseRisk).toBe("medium");
+      });
+
+      test("assistant oauth proxy-url is medium risk", () => {
+        expect(oauthSpec.subcommands!["proxy-url"].baseRisk).toBe("medium");
       });
     });
 
@@ -509,6 +552,7 @@ describe("command-registry", () => {
       expect(oauthSubs).toContain("request");
       expect(oauthSubs).toContain("connect");
       expect(oauthSubs).toContain("disconnect");
+      expect(oauthSubs).toContain("proxy-url");
     });
 
     test("credentials has all expected sub-subcommands", () => {
@@ -582,6 +626,21 @@ describe("command-registry", () => {
       }
     });
 
+    test("contacts write verbs keep their risk levels", () => {
+      // Every one opens a guardian form, so the levels describe the command
+      // itself: delete takes the contact's channels with it, while a merge
+      // moves them to the survivor.
+      expect(getAssistantPath("contacts prompt").baseRisk).toBe("medium");
+      expect(getAssistantPath("contacts create").baseRisk).toBe("medium");
+      expect(getAssistantPath("contacts update").baseRisk).toBe("medium");
+      expect(getAssistantPath("contacts delete").baseRisk).toBe("high");
+      expect(getAssistantPath("contacts merge").baseRisk).toBe("high");
+      expect(getAssistantPath("contacts channels add").baseRisk).toBe("medium");
+      expect(getAssistantPath("contacts channels update-status").baseRisk).toBe(
+        "medium",
+      );
+    });
+
     test("expanded assistant operations have expected risk levels", () => {
       expect(getAssistantPath("config set").baseRisk).toBe("low");
       expect(getAssistantPath("oauth providers register").baseRisk).toBe(
@@ -621,6 +680,20 @@ describe("command-registry", () => {
       expect(getAssistantPath("plugins disable").baseRisk).toBe("medium");
       expect(getAssistantPath("platform invoices list").baseRisk).toBe("low");
       expect(getAssistantPath("platform invoices get").baseRisk).toBe("low");
+    });
+
+    // Every roadmap write lands on the public Vellum roadmap under the
+    // assistant's name, so none of them may drift back to a risk level an
+    // auto-approve policy would wave through.
+    test("roadmap reads are low and every roadmap write is at least medium", () => {
+      expect(getAssistantPath("roadmap").baseRisk).toBe("low");
+      expect(getAssistantPath("roadmap list").baseRisk).toBe("low");
+      expect(getAssistantPath("roadmap get").baseRisk).toBe("low");
+      expect(getAssistantPath("roadmap create").baseRisk).toBe("high");
+      expect(getAssistantPath("roadmap delete").baseRisk).toBe("high");
+      expect(getAssistantPath("roadmap update").baseRisk).toBe("medium");
+      expect(getAssistantPath("roadmap upvote").baseRisk).toBe("medium");
+      expect(getAssistantPath("roadmap unvote").baseRisk).toBe("medium");
     });
 
     test("assistant schedules update escalates to high for script payloads", () => {

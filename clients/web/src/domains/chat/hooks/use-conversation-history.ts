@@ -61,10 +61,11 @@ import { reconcileSubagentStoreFromNotifications } from "@/domains/chat/hooks/re
 import { isSending, useTurnStore } from "@/domains/chat/turn-store";
 
 import {
+  clearConfirmationByRequestId,
   parsePendingSecretState,
   parsePendingConfirmationData,
 } from "@/domains/chat/utils/send-message-utils";
-import type { AssistantStateKind } from "@/domains/chat/types";
+import type { AssistantStateKind, ChatError } from "@/domains/chat/types";
 import type { DisplayMessage } from "@/domains/chat/types/types";
 import {
   getPendingInteractions,
@@ -78,6 +79,7 @@ import {
 } from "@/domains/chat/transcript/use-history-pagination";
 import type { PaginatedHistoryResult } from "@/domains/chat/transcript/types";
 import {
+  patchTranscriptMessages,
   registerHistoryCachePatcher,
   type MessagesUpdater,
 } from "@/domains/chat/transcript/patch-transcript-messages";
@@ -181,6 +183,12 @@ function applyReportedQuestion(params: {
   } else if (action.kind === "retire") {
     interactionStore.dismissQuestionIfMatches(action.requestId);
   }
+}
+
+function clearConfirmationTranscriptMarker(requestId: string): void {
+  patchTranscriptMessages((messages) =>
+    clearConfirmationByRequestId(messages, requestId),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -355,8 +363,9 @@ export function useConversationHistory({
     // failed acp_spawn (persisted `acp_claude_oauth_missing` marker). Without
     // this, a page reload or SSE reconnect wipes the in-memory prompt and the
     // card silently disappears. Skipped when a prompt is already active;
-    // `showAcpConnect` additionally no-ops a failure already retired this
-    // session (auto-continue or self-heal), so a reseed can't resurrect it.
+    // `showAcpConnect` additionally no-ops a failure already retired (auto-
+    // continue, self-heal, or a persisted user Dismiss), so a reseed can't
+    // resurrect it.
     const wirePendingAcpConnect = extractWirePendingAcpConnect(
       pagination.messages,
     );
@@ -364,7 +373,10 @@ export function useConversationHistory({
       wirePendingAcpConnect &&
       !useInteractionStore.getState().pendingAcpConnect
     ) {
-      useInteractionStore.getState().showAcpConnect(wirePendingAcpConnect);
+      useInteractionStore.getState().showAcpConnect({
+        ...wirePendingAcpConnect,
+        conversationId: activeConversationId,
+      });
     }
 
     // Refresh embedded surface content into the history cache.
@@ -478,6 +490,10 @@ export function useConversationHistory({
     // anything moved underneath it while the request was in flight.
     const questionRevisionBeforeFetch =
       useInteractionStore.getState().questionRevision;
+    const pendingSecretBeforeFetch =
+      useInteractionStore.getState().pendingSecret;
+    const pendingConfirmationBeforeFetch =
+      useInteractionStore.getState().pendingConfirmation;
     const generation = ++reconcileGenerationRef.current;
     void (async () => {
       // A read that never landed carries no opinion, exactly like an assistant
@@ -523,20 +539,65 @@ export function useConversationHistory({
               interactions.pendingSecret as Record<string, unknown>,
             )
           : null;
-        if (parsed_secret) {
-          useInteractionStore.getState().showSecret(parsed_secret);
-        }
         if (
-          interactions.pendingConfirmation &&
-          !useInteractionStore.getState().pendingConfirmation
+          parsed_secret &&
+          useInteractionStore.getState().pendingSecret ===
+            pendingSecretBeforeFetch
+        ) {
+          useInteractionStore.getState().showSecret(parsed_secret);
+        } else if (
+          !interactions.pendingSecret &&
+          pendingSecretBeforeFetch &&
+          useInteractionStore.getState().pendingSecret ===
+            pendingSecretBeforeFetch
         ) {
           useInteractionStore
             .getState()
-            .showConfirmation(
-              parsePendingConfirmationData(
-                interactions.pendingConfirmation as Record<string, unknown>,
-              ),
+            .dismissSecretIfMatches(pendingSecretBeforeFetch.requestId);
+        }
+        if (
+          interactions.pendingConfirmation &&
+          useInteractionStore.getState().pendingConfirmation ===
+            pendingConfirmationBeforeFetch
+        ) {
+          const parsedConfirmation = parsePendingConfirmationData(
+            interactions.pendingConfirmation as Record<string, unknown>,
+          );
+          if (
+            pendingConfirmationBeforeFetch &&
+            pendingConfirmationBeforeFetch.requestId !==
+              parsedConfirmation.requestId
+          ) {
+            const previousRequestId =
+              pendingConfirmationBeforeFetch.requestId;
+            const sessionStore = useChatSessionStore.getState();
+            useInteractionStore.getState().releaseInlineAnchorIfMatches(
+              sessionStore.confirmationToolCallMap.get(previousRequestId) ??
+                pendingConfirmationBeforeFetch.toolUseId,
             );
+            clearConfirmationTranscriptMarker(previousRequestId);
+            sessionStore.deleteConfirmationToolCall(previousRequestId);
+          }
+          useInteractionStore
+            .getState()
+            .showConfirmation(parsedConfirmation);
+        } else if (
+          !interactions.pendingConfirmation &&
+          pendingConfirmationBeforeFetch &&
+          useInteractionStore.getState().pendingConfirmation ===
+            pendingConfirmationBeforeFetch
+        ) {
+          const requestId = pendingConfirmationBeforeFetch.requestId;
+          const sessionStore = useChatSessionStore.getState();
+          useInteractionStore
+            .getState()
+            .dismissConfirmationIfMatches(requestId);
+          useInteractionStore.getState().releaseInlineAnchorIfMatches(
+            sessionStore.confirmationToolCallMap.get(requestId) ??
+              pendingConfirmationBeforeFetch.toolUseId,
+          );
+          clearConfirmationTranscriptMarker(requestId);
+          sessionStore.deleteConfirmationToolCall(requestId);
         }
         // A question parks the turn on the user exactly like a secret or a
         // confirmation does, and the rest of the attention machinery already
@@ -549,7 +610,10 @@ export function useConversationHistory({
         if (
           !interactions.pendingSecret &&
           !interactions.pendingConfirmation &&
-          !interactions.pendingQuestion
+          !interactions.pendingQuestion &&
+          !useInteractionStore.getState().pendingSecret &&
+          !useInteractionStore.getState().pendingConfirmation &&
+          !useInteractionStore.getState().pendingQuestion
         ) {
           useConversationStore
             .getState()
@@ -597,7 +661,7 @@ export function useConversationHistory({
         queryKey: organizationsBillingSummaryRetrieveQueryKey(),
       });
       // The BYOK banner gate's recent-spend probe
-      // (`useSuppressCreditBannersForByok`) must see a managed burn from this
+      // (`useByokCreditRouteVerdict`) must see a managed burn from this
       // turn too, or a cached zero keeps suppressing the banners in an open
       // tab. Its key carries a from/to window, so match on the key's base
       // fields (derived from the generated key builder, minus the window)
@@ -758,38 +822,45 @@ export function useConversationHistory({
   }, [pagination.isFetchingOlderPages, setTranscriptPagination]);
 
   // -------------------------------------------------------------------------
-  // Surface TanStack Query errors.
-  //
-  // An initial-page failure inside the resume grace window is held back: the
-  // refetch that fires when the client returns from the background often
-  // fails transiently against a still-waking pod. It is still reported, and
-  // the blocking error surfaces once the window expires.
+  // Cached history stays usable when a refresh or older-page fetch fails.
+  // Only an initial load can surface an error, after the resume grace window.
   // -------------------------------------------------------------------------
   const isResumeGraceActive = useResumeGrace();
+  const historyErrorRef = useRef<ChatError | null>(null);
   useEffect(() => {
+    if (historyErrorRef.current && (pagination.isSuccess || isResumeGraceActive)) {
+      const historyError = historyErrorRef.current;
+      setError((current) => (current === historyError ? null : current));
+      historyErrorRef.current = null;
+    }
+
     if (!pagination.isError || !pagination.error) {
       return;
     }
 
-    const isOlderPageError = pagination.isSuccess;
+    const hasLoadedHistory = pagination.latestPage !== undefined;
     captureError(pagination.error, {
-      context: isOlderPageError
-        ? "conversation_history_older_page"
+      context: hasLoadedHistory
+        ? "conversation_history_refresh"
         : "conversation_history_initial",
+      bestEffort: hasLoadedHistory,
     });
 
-    if (!isOlderPageError) {
+    if (!hasLoadedHistory) {
       setIsLoadingHistory(false);
       if (!isResumeGraceActive) {
-        setError({
+        const historyError: ChatError = {
           message: "Failed to load conversation history. Please try again.",
-        });
+        };
+        historyErrorRef.current = historyError;
+        setError(historyError);
       }
     }
   }, [
     pagination.isError,
     pagination.isSuccess,
     pagination.error,
+    pagination.latestPage,
     isResumeGraceActive,
     setIsLoadingHistory,
     setError,

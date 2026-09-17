@@ -31,8 +31,10 @@ export const LLM_PROVIDER_ENV_VAR_NAMES: Record<string, string> = {
   atlascloud: "ATLASCLOUD_API_KEY",
   together: "TOGETHER_API_KEY",
   litellm: "LITELLM_API_KEY",
+  opencode: "OPENCODE_API_KEY",
   baseten: "BASETEN_API_KEY",
   poolside: "POOLSIDE_API_KEY",
+  jev: "TYPESAFE_API_KEY",
 };
 
 /** Search-provider env var names. Mirrors `SEARCH_PROVIDER_CATALOG` BYOK entries. */

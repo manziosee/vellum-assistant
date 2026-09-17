@@ -8,6 +8,7 @@ import {
   type ProfilePickerEntry,
   profilePickerIssue,
   undispatchableProfileReason,
+  managedProfileModelName,
 } from "@/assistant/profile-pickers";
 
 // Config-shaped entries: `llm.profiles` values always carry a provider and
@@ -50,6 +51,21 @@ describe("isDispatchableProfile", () => {
 
   test("false when disabled, even if complete", () => {
     expect(isDispatchableProfile(profiles[2]!, profiles, STRICT)).toBe(false);
+  });
+
+  test("false when the catalog model does not produce chat text", () => {
+    expect(
+      isDispatchableProfile(
+        {
+          name: "jev",
+          label: "Jev",
+          provider: "jev",
+          model: "jev-latest",
+        },
+        profiles,
+        STRICT,
+      ),
+    ).toBe(false);
   });
 
   test("false when either half of the pair is missing", () => {
@@ -212,6 +228,24 @@ describe("visibleProfilesForPicker", () => {
     ).map((p) => p.name);
     expect(names).toEqual(["balanced", "quality"]);
   });
+
+  test("hides a non-text catalog profile unless it is the current selection", () => {
+    const withJev: ProfilePickerEntry[] = [
+      ...profiles,
+      {
+        name: "jev",
+        label: "Jev",
+        provider: "jev",
+        model: "jev-latest",
+      },
+    ];
+    expect(
+      visibleProfilesForPicker(withJev, [], STRICT).map((p) => p.name),
+    ).not.toContain("jev");
+    expect(
+      visibleProfilesForPicker(withJev, ["jev"], STRICT).map((p) => p.name),
+    ).toContain("jev");
+  });
 });
 
 describe("profilePickerLabel", () => {
@@ -281,6 +315,18 @@ describe("undispatchableProfileReason", () => {
     });
     expect(reason).toContain("some turns");
   });
+
+  test("a non-text catalog model names structured answers, not missing fields", () => {
+    const reason = undispatchableProfileReason({
+      name: "jev",
+      label: "Jev",
+      provider: "jev",
+      model: "jev-latest",
+    });
+    expect(reason).toContain("Jev");
+    expect(reason).toContain("structured answers");
+    expect(reason).not.toContain("no provider and model");
+  });
 });
 
 describe("assistants older than complete-profile-snapshots (0.10.8)", () => {
@@ -318,5 +364,71 @@ describe("assistants older than complete-profile-snapshots (0.10.8)", () => {
       (p) => p.name,
     );
     expect(names).toEqual(["balanced", "quality", "halfmade"]);
+  });
+});
+
+describe("managedProfileModelName", () => {
+  test("names the model a managed profile currently pins", () => {
+    expect(
+      managedProfileModelName({
+        name: "balanced",
+        label: "Balanced",
+        source: "managed",
+        provider: "vellum",
+        model: "accounts/fireworks/models/glm-5p2",
+      }),
+    ).toBe("GLM 5.2");
+  });
+
+  test("a user profile names nothing: its label is already the model", () => {
+    expect(
+      managedProfileModelName({
+        name: "my-luna",
+        label: "GPT-5.6 Luna",
+        source: "user",
+        provider: "openai",
+        model: "gpt-5.6-luna",
+      }),
+    ).toBeNull();
+  });
+
+  test("a profile with no source is treated as the user's", () => {
+    expect(
+      managedProfileModelName({
+        name: "legacy",
+        provider: "anthropic",
+        model: "claude-fable-5",
+      }),
+    ).toBeNull();
+  });
+
+  test("a managed mix names nothing: its arm is picked at dispatch", () => {
+    expect(
+      managedProfileModelName({
+        name: "ab",
+        source: "managed",
+        mix: [
+          { profile: "balanced", weight: 70 },
+          { profile: "quality", weight: 30 },
+        ],
+      }),
+    ).toBeNull();
+  });
+
+  test("a managed profile carrying no model names nothing", () => {
+    expect(
+      managedProfileModelName({ name: "half", source: "managed" }),
+    ).toBeNull();
+  });
+
+  test("an unknown model id degrades to its readable tail", () => {
+    expect(
+      managedProfileModelName({
+        name: "balanced",
+        source: "managed",
+        provider: "vellum",
+        model: "accounts/fireworks/models/not-in-the-catalog",
+      }),
+    ).toBe("not-in-the-catalog");
   });
 });
