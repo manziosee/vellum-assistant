@@ -38,8 +38,8 @@ import { ESCALATION_CONTINUATION_CONTENT } from "../../../../../calls/voice-tria
 import { MemoryV3GateSchema } from "../../../../../config/schemas/memory-v3.js";
 import { ensureMemoryV3SelectionsSchema } from "../../../../../persistence/migrations/338-move-memory-v3-selections-to-memory-db.js";
 import * as schema from "../../../../../persistence/schema/index.js";
-import { DEFAULT_BM25_NORM_K } from "../gate.js";
 import { stripOrphanedSurrogates } from "../../../../../util/unicode.js";
+import { DEFAULT_BM25_NORM_K } from "../gate.js";
 import type { HotSetEntry, HotSetOptions } from "../hot-set.js";
 import type { OrchestrateResult } from "../orchestrate.js";
 import {
