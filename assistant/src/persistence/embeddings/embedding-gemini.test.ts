@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 
-import { GeminiEmbeddingBackend } from "./embedding-gemini.js";
+import {
+  _setBypassWorkerForTests,
+  GeminiEmbeddingBackend,
+} from "./embedding-gemini.js";
 
 function makeSuccessResponse(values: number[]) {
   return new Response(JSON.stringify({ embedding: { values } }), {
@@ -442,8 +445,12 @@ function calledUrls(fetchMock: ReturnType<typeof mock>): string[] {
 
 describe("GeminiEmbeddingBackend: batched text inputs", () => {
   const originalFetch = globalThis.fetch;
+  beforeEach(() => {
+    _setBypassWorkerForTests(true);
+  });
   afterEach(() => {
     globalThis.fetch = originalFetch;
+    _setBypassWorkerForTests(false);
   });
 
   test("250 texts go out as three batchEmbedContents calls of 100, 100, and 50, vectors in input order", async () => {

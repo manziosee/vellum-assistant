@@ -50,6 +50,13 @@ export interface GeminiEmbeddingOptions {
   /** When set, routes requests through the managed proxy at this base URL. */
   managedBaseUrl?: string;
   /**
+   * Accepted for compatibility with callers that pass an inter-call delay.
+   * The worker subprocess manages its own scheduling, so this value has no
+   * effect on the worker path. Set to 0 in tests to suppress any legacy
+   * delay logic.
+   */
+  interCallDelayMs?: number;
+  /**
    * When true, runs HTTP calls in-process rather than spawning a worker
    * subprocess. Set in tests that mock globalThis.fetch.
    * @internal
