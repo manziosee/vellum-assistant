@@ -112,9 +112,19 @@ export class GeminiEmbeddingBackend implements EmbeddingBackend {
   }
 
   /**
-   * Embed `inputs` in order. Production calls go through the worker subprocess,
-   * which handles all fetches concurrently; the bypass path (test-only) makes
-   * in-process calls with batch support for runs of text inputs.
+   * Embed `inputs` in order. Managed requests use single `embedContent`
+   * calls because Vertex does not expose the batch route. Direct text runs use
+   * `batchEmbedContents`, {@link GEMINI_EMBED_BATCH_SIZE} texts per round
+   * trip, so a corpus re-embed costs one request per hundred sections rather
+   * than one per section; a lone text and every multimodal input take the
+   * single `embedContent` route. A batch that fails for any reason other
+   * than a cancelled request (a rejected request, a rate limit or server
+   * error, a network failure, a malformed body) is re-sent as single calls,
+   * so each of its inputs succeeds or fails independently and a fault
+   * confined to the batch route never fails an embed the single route can
+   * serve; a batch route that does not exist is remembered and skipped for
+   * the rest of the backend's life. Single calls throw on failure, so their
+   * errors reach the caller.
    */
   async embed(
     inputs: EmbeddingInput[],
@@ -144,6 +154,7 @@ export class GeminiEmbeddingBackend implements EmbeddingBackend {
       // Gather the run of text inputs starting here, up to one batch.
       let end = i;
       while (
+        !this.managed &&
         !this.batchRouteUnavailable &&
         end < normalized.length &&
         end - i < GEMINI_EMBED_BATCH_SIZE &&
