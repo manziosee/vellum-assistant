@@ -14,7 +14,7 @@ mock.module("../../providers/provider-send-message.js", () => ({
   resolveConfiguredProvider: async () => configured,
 }));
 
-const { resolveTypesafeProvider } = await import("../typesafe-noul.js");
+const { resolveTypesafeProvider } = await import("../../providers/jev/ask.js");
 
 afterAll(() => {
   mock.restore();
