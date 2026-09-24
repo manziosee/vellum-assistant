@@ -379,6 +379,22 @@
     "unsupported": "此设备无法打开相机。",
     "uploadFailed": "无法发送该照片。"
   },
+  "cameraExplainer": {
+    "close": "关闭",
+    "gotIt": "知道了",
+    "liveBody": "您移动相机时，{name} 会持续观看。直接聊聊 {name} 看到的内容。",
+    "liveBodyDesktop": "您移动相机时，{name} 会持续观看。直接聊聊 {name} 看到的内容。随时都可以停止。",
+    "liveTag": "实时",
+    "liveTitle": "实时",
+    "photoBody": "拍一张照片。{name} 只会看到那一张照片。",
+    "photoTitle": "照片",
+    "privacy": "{name} 看到的一切都保留在 {name} 自己的私人工作区。关闭相机时实时模式就会结束。",
+    "subtitle": "选择 {name} 如何查看您对准的画面。随时都可以切换。",
+    "title": "照片还是实时？",
+    "tryLive": "立即试用实时",
+    "tryLiveDesktop": "试用实时",
+    "yourAssistant": "您的助手"
+  },
   "cameraShutterHint": {
     "live": "实时 · 轻点停止",
     "liveDescription": "轻点停止实时视频。",
@@ -402,6 +418,7 @@
     "buttonAria": "相机显示选项",
     "gateHudDescription": "调试叠加层：实时模式如何挑选要发送的画面。",
     "gateHudTitle": "帧筛选调校",
+    "howItWorks": "“照片”和“实时”的运作方式",
     "keptFrameDescription": "显示实时模式最近发送的画面。",
     "keptFrameTitle": "最近分享的画面",
     "title": "显示"

@@ -163,6 +163,10 @@ import { useVoicePrefsStore } from "@/stores/voice-prefs-store";
 import { toneForBg } from "@/utils/avatar-tone";
 
 import {
+  CameraExplainer,
+  type CameraExplainerDismissal,
+} from "./camera-explainer";
+import {
   CameraFlashControl,
   liveFlashMode,
   nextFlashMode,
@@ -362,6 +366,46 @@ function isTextControl(target: EventTarget | null): boolean {
 }
 
 /**
+ * What a dialog layered over the room dims it with: the two scrims the design
+ * library's overlay primitives draw, and the dismiss backdrop the camera's view
+ * options portal beside their panel. None of them is inside the dialog it
+ * belongs to, so a press on one reaches none of the handlers that content
+ * carries.
+ *
+ * Each names itself with a slot, the way the library's own overlays do.
+ */
+const NESTED_DIALOG_SCRIM_SELECTOR = `[data-slot="bottom-sheet-overlay"], [data-slot="modal-overlay"], [data-slot="camera-view-settings-backdrop"]`;
+
+/**
+ * Whether an element sits inside a dialog layered over the room.
+ *
+ * The room's own dialog carries {@link ROOM_DIALOG_ATTR} in every variant, so a
+ * `role="dialog"` ancestor without it is something above the room, and what is
+ * above the room owns what lands on it. The pointer and the key ask the same
+ * question, so they ask it here.
+ */
+function isInsideLayeredDialog(element: Element | null): boolean {
+  const owner = element?.closest(`[role="dialog"]`) ?? null;
+  return owner !== null && !owner.hasAttribute(ROOM_DIALOG_ATTR);
+}
+
+/**
+ * Whether a press landed on a dialog layered over the room, scrim included.
+ *
+ * The scrims name themselves, since none of them is inside the dialog it
+ * belongs to; anything else is placed by {@link isInsideLayeredDialog}.
+ */
+function isNestedDialogSurface(target: EventTarget | null): boolean {
+  if (!(target instanceof Element)) {
+    return false;
+  }
+  if (target.closest(NESTED_DIALOG_SCRIM_SELECTOR)) {
+    return true;
+  }
+  return isInsideLayeredDialog(target);
+}
+
+/**
  * The element the mobile sheet portals into.
  *
  * `root-layout.tsx` wraps the whole app shell in `isolation: isolate`, so a
@@ -531,6 +575,11 @@ function VoiceRoomSheet({
           if (isTextControl(event.target)) {
             return;
           }
+          // A dialog layered over the room owns every press on its own
+          // surface, the scrim included, the way it owns Escape.
+          if (isNestedDialogSurface(event.target)) {
+            return;
+          }
           dragControls.start(event);
         }}
         draggable={false}
@@ -680,6 +729,11 @@ function VoiceRoomOverlay({ variant }: { variant: VoiceRoomVariant }) {
   // Where the view-options panel renders. See the host element near the foot
   // of the room, and {@link VIEW_OPTIONS_HOST_LAYER}.
   const [viewOptionsHost, setViewOptionsHost] = useState<HTMLDivElement | null>(
+    null,
+  );
+  // Where the "Photo or Live?" explainer renders. A box of its own rather than
+  // the one above, which is zero-size and so no containing block for a scrim.
+  const [explainerHost, setExplainerHost] = useState<HTMLDivElement | null>(
     null,
   );
 
@@ -886,6 +940,63 @@ function VoiceRoomOverlay({ variant }: { variant: VoiceRoomVariant }) {
   // Live cannot run there is nothing for either to show, so the corner carries
   // no button rather than a panel of switches that do nothing.
   const viewOptionsOffered = liveOffered;
+
+  // The "Photo or Live?" explainer, once per device. It is raised only once the
+  // preview has drawn, never before the camera control is pressed, which is
+  // what keeps it clear of the pre-permission rule in `docs/CAPACITOR.md`.
+  //
+  // Only where Live is offered: two cards describing a mode the user cannot
+  // reach advertise nothing. A spoken "look at this" that arms Live still gets
+  // it, since it is education rather than a gate; the offer to try Live is
+  // what goes, not the explainer.
+  const cameraExplainerSeen = useVoicePrefsStore.use.cameraExplainerSeen();
+  const markCameraExplainerSeen =
+    useVoicePrefsStore.use.markCameraExplainerSeen();
+  const [explainerOpen, setExplainerOpen] = useState(false);
+  // What "the preview is up" means on each path. The native shells draw theirs
+  // behind the web view the moment acquisition succeeds and raise no frame
+  // event to wait for; the browser's `<video>` takes the stream first and
+  // decodes a frame a beat later, and until it does the sheet would be over
+  // the look rather than over anything the camera sees. Same signal the look
+  // stands down on.
+  const previewDrawn = camera.native || feedHasFrame;
+  // Once per camera open. The seen flag is written on dismissal and covers
+  // every later open; this holds the frames in between. Both it and the sheet
+  // come down with the viewfinder, so nothing about one open reaches the next,
+  // and a flip's dropped frame cannot raise it a second time.
+  const explainerShown = useRef(false);
+  // The view options ride `liveOffered` alone while this also waits for a drawn
+  // preview, so on the browser path the panel can be open under the explainer,
+  // and it is still open and still working once the explainer goes.
+  useEffect(() => {
+    if (!cameraOpen) {
+      explainerShown.current = false;
+      setExplainerOpen(false);
+      return;
+    }
+    if (
+      !liveOffered ||
+      !previewDrawn ||
+      cameraExplainerSeen ||
+      explainerShown.current
+    ) {
+      return;
+    }
+    explainerShown.current = true;
+    setExplainerOpen(true);
+  }, [cameraOpen, liveOffered, previewDrawn, cameraExplainerSeen]);
+  // Every way out is a dismissal the device remembers; only one of them acts.
+  const dismissExplainer = useCallback(
+    (how: CameraExplainerDismissal) => {
+      setExplainerOpen(false);
+      markCameraExplainerSeen();
+      if (how === "tryLive" && liveOffered && !live) {
+        setLive(true);
+      }
+    },
+    [live, liveOffered, markCameraExplainerSeen, setLive],
+  );
+
   // The shutter's two acts, which are two different sentences rather than one
   // with the mode pushed into it.
   const shutterLabel = live
@@ -1029,13 +1140,9 @@ function VoiceRoomOverlay({ variant }: { variant: VoiceRoomVariant }) {
       // Keyed on the focused dialog rather than the event target, which is what
       // keeps the unguarded behavior the room needs: the key still reaches us
       // when the composer textarea holds focus as the room opens, since that is
-      // inside no dialog at all. The room's own dialog carries
-      // {@link ROOM_DIALOG_ATTR} in every variant, including the sheet, whose
-      // Radix content is the dialog and takes focus on open.
+      // inside no dialog at all.
       const active = document.activeElement;
-      const owner =
-        active instanceof Element ? active.closest(`[role="dialog"]`) : null;
-      if (owner && !owner.hasAttribute(ROOM_DIALOG_ATTR)) {
+      if (isInsideLayeredDialog(active instanceof Element ? active : null)) {
         return;
       }
       event.preventDefault();
@@ -1401,7 +1508,17 @@ function VoiceRoomOverlay({ variant }: { variant: VoiceRoomVariant }) {
           style={{ left: VOICE_ROOM_CORNER_LEFT }}
           className="absolute top-[var(--room-chrome-top)] z-10 flex"
         >
-          <CameraViewSettings panelHost={viewOptionsHost} />
+          <CameraViewSettings
+            panelHost={viewOptionsHost}
+            // Nothing to reset beside it: the seen flag is already written, and
+            // every way out of a re-shown explainer does what it does on the
+            // first. Offered on the same signal the first open waits for, so
+            // the row is absent while the feed has yet to draw and the sheet
+            // never lands over the look rather than over the camera.
+            onShowExplainer={
+              previewDrawn ? () => setExplainerOpen(true) : undefined
+            }
+          />
         </div>
       ) : null}
 
@@ -1797,6 +1914,38 @@ function VoiceRoomOverlay({ variant }: { variant: VoiceRoomVariant }) {
           data-testid="camera-view-settings-host"
           className={cn("absolute left-0 top-0", VIEW_OPTIONS_HOST_LAYER)}
         />
+      ) : null}
+
+      {/* The explainer's own host, and the explainer inside it. In the room for
+          the reasons above; full-size, because the scrim and the panel are laid
+          out against it and a zero-size box would collapse both; and
+          press-through, so the shutter and the controls still answer a tap for
+          as long as the explainer is closed (it opts back in for itself).
+          Later than the host above, so it stacks over the panel inside their
+          shared tier. */}
+      {liveOffered ? (
+        <>
+          <div
+            ref={setExplainerHost}
+            data-testid="camera-explainer-host"
+            className={cn(
+              "pointer-events-none absolute inset-0",
+              VIEW_OPTIONS_HOST_LAYER,
+            )}
+          />
+          <CameraExplainer
+            open={explainerOpen}
+            host={explainerHost}
+            // The name lands mid-sentence here, so this fallback is lowercase
+            // where the pill's, which leads one, is not. Blank is the same as
+            // absent, as it is for the pill.
+            assistantName={
+              assistantName?.trim() || t("cameraExplainer.yourAssistant")
+            }
+            tryLiveOffered={!live}
+            onDismiss={dismissExplainer}
+          />
+        </>
       ) : null}
 
       {/* Screen readers get session-state changes here; the avatar is the
