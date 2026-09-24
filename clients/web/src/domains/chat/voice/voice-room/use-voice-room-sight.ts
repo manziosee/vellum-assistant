@@ -113,6 +113,7 @@ import {
   createNativeFrameSource,
   type NativeFrameSource,
 } from "@/lib/camera/native-frame-source";
+import { recordLifecycleDiagnostic } from "@/lib/diagnostics";
 import { captureNativeVoiceCameraSample } from "@/runtime/native-voice-camera";
 import { haptic } from "@/utils/haptics";
 
@@ -571,21 +572,21 @@ export function useVoiceRoomSight(
       sampler.start(video);
       stopSampling = sampler.stop;
     } else {
+      const { conversationId } = useLiveVoiceStore.getState();
       const source = createNativeFrameSource({
         gate,
-        captureSample: async () => {
-          const run = currentRunRef.current;
-          if (!run || useLiveVoiceStore.getState().reconnecting) {
-            return null;
-          }
-          const sample = await captureNativeVoiceCameraSample(
-            NATIVE_CAPTURE_QUALITY,
-          );
-          return currentRunRef.current === run &&
-            !useLiveVoiceStore.getState().reconnecting
-            ? sample
-            : null;
+        onDiagnostics: (diagnostics) => {
+          recordLifecycleDiagnostic("native_camera_sampling", {
+            assistantId,
+            conversationId,
+            ...diagnostics,
+          });
         },
+        canCapture: () =>
+          currentRunRef.current !== null &&
+          !useLiveVoiceStore.getState().reconnecting,
+        captureSample: () =>
+          captureNativeVoiceCameraSample(NATIVE_CAPTURE_QUALITY),
         onDecision: (decision, nowMs, sample) => {
           recordFrameGateDecision("voice", decision, nowMs);
           const run = currentRunRef.current;
