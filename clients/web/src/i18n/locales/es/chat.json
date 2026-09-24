@@ -820,8 +820,8 @@
   },
   "csvPreview": {
     "emptyFile": "Este archivo está vacío",
-    "summary": "{rows} filas x {columns} columnas",
-    "summaryTruncated": "{rows} filas x {columns} columnas (truncado)"
+    "summary": "{rows, plural, one {# fila} other {# filas}} x {columns, plural, one {# columna} other {# columnas}}",
+    "summaryTruncated": "{rows, plural, one {# fila} other {# filas}} x {columns, plural, one {# columna} other {# columnas}} (truncado)"
   },
   "dailyLimitBanner": {
     "skipConfirmTitle": "¿Omitir el límite de créditos de hoy?",
@@ -2044,6 +2044,21 @@
   },
   "workspacePathLink": {
     "openTitle": "Abrir {path}"
+  },
+  "xlsxPreview": {
+    "beyondPreviewLimit": "Esta hoja solo tiene celdas más allá del límite de previsualización",
+    "emptySheet": "Esta hoja está vacía",
+    "sheetUnreadable": "No se pudo leer esta hoja",
+    "sheetsAria": "Hojas",
+    "sheetsOmitted": "{count, plural, one {# hoja más no se muestra} other {# hojas más no se muestran}}",
+    "summary": "{sheet}: {rows, plural, one {# fila} other {# filas}} x {columns, plural, one {# columna} other {# columnas}}",
+    "summaryTruncated": "{sheet}: {rows, plural, one {# fila} other {# filas}} x {columns, plural, one {# columna} other {# columnas}} (truncado)",
+    "summaryColumnsCut": "{sheet}: {rows, plural, one {# fila} other {# filas}} x {columns, number} de {total, plural, one {# columna} other {# columnas}}",
+    "summaryRowsCut": "{sheet}: {rows, number} de {total, plural, one {# fila} other {# filas}} x {columns, plural, one {# columna} other {# columnas}}",
+    "summaryBothCut": "{sheet}: {rows, number} de {totalRows, plural, one {# fila} other {# filas}} x {columns, number} de {totalColumns, plural, one {# columna} other {# columnas}}",
+    "countsColumnsCut": "{rows, plural, one {# fila} other {# filas}} x {columns, number} de {total, plural, one {# columna} other {# columnas}}",
+    "countsRowsCut": "{rows, number} de {total, plural, one {# fila} other {# filas}} x {columns, plural, one {# columna} other {# columnas}}",
+    "countsBothCut": "{rows, number} de {totalRows, plural, one {# fila} other {# filas}} x {columns, number} de {totalColumns, plural, one {# columna} other {# columnas}}"
   },
   "transcript": {
     "noResponse": "Decidió no responder",
