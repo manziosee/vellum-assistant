@@ -21,9 +21,10 @@
     "inboxEmptyBody": "Comparte {address} y todo lo que llegue aparecerá aquí.",
     "sentEmptyTitle": "Aún no hay correos enviados",
     "sentEmptyBody": "Pídeme que escriba a alguien y guardaré una copia aquí.",
-    "selectPrompt": "Elige un correo para leerlo.",
+    "selectPromptTitle": "Elige un correo para leerlo",
+    "selectPromptBody": "Elige un mensaje de la lista. Marca varios para iniciar un chat con ellos adjuntos, o para eliminarlos.",
     "backToList": "Volver a la lista",
-    "searchPlaceholder": "Buscar correo",
+    "searchPlaceholder": "Buscar correos",
     "searchAriaLabel": "Buscar en esta carpeta",
     "searchEmptyTitle": "Sin resultados",
     "searchEmptyBody": "Nada en esta carpeta coincide con tu búsqueda."
@@ -31,16 +32,33 @@
   "emailListRow": {
     "toPrefix": "Para {name}",
     "attachments": "{count, plural, one {# adjunto} other {# adjuntos}}",
-    "noSubject": "(sin asunto)"
+    "noSubject": "(sin asunto)",
+    "selectAria": "Seleccionar \"{subject}\""
+  },
+  "emailSelectionBar": {
+    "ariaLabel": "Correos seleccionados",
+    "count": "{count, plural, one {# correo seleccionado} other {# correos seleccionados}}",
+    "mixed": "{received, plural, one {# recibido} other {# recibidos}} · {sent, plural, one {# enviado} other {# enviados}}",
+    "startChat": "Iniciar un chat nuevo",
+    "delete": "Eliminar de la bandeja",
+    "clear": "Borrar selección"
+  },
+  "deleteEmailsDialog": {
+    "title": "¿Eliminar {count, plural, one {este correo} other {# correos}}?",
+    "message": "{count, plural, one {Desaparecerá de tu bandeja en este dispositivo.} other {Desaparecerán de tu bandeja en este dispositivo.}}",
+    "confirm": "Eliminar",
+    "cancel": "Cancelar"
   },
   "emailDetail": {
-    "from": "De",
-    "to": "Para",
-    "sentBy": "Enviado por {name}",
+    "from": "De:",
+    "to": "Para:",
     "attachments": "Adjuntos",
     "askToReply": "Pedir a {name} que responda",
     "loading": "Cargando el mensaje…",
-    "loadFailed": "No se pudo cargar este mensaje."
+    "loadFailed": "No se pudo cargar este mensaje.",
+    "copyEmail": "Copiar correo",
+    "copied": "Copiado",
+    "copyFailed": "No se pudo copiar el correo."
   },
   "emailAddressFields": {
     "prefixLabel": "Prefijo",
@@ -61,6 +79,8 @@
     "changeHandle": "Cambiar identificador"
   },
   "assistantInboxSetupCard": {
+    "pageTitle": "Correo",
+    "back": "Atrás",
     "title": "Correo del asistente",
     "subtitle": "Configura un correo para tu asistente.",
     "getStarted": "Empezar",
@@ -74,7 +94,8 @@
     "setupSucceeded": "{address} está lista.",
     "replyPrompt": "Responde al correo con id {id} de tu bandeja (de {sender}, asunto \"{subject}\"). Léelo primero con `assistant email download {id}`, redacta una respuesta y muéstramela antes de enviarla.",
     "mailFailed": "No se pudo cargar el correo.",
-    "retry": "Reintentar"
+    "retry": "Reintentar",
+    "deletedToast": "{count, plural, one {Correo eliminado.} other {# correos eliminados.}}"
   },
   "inboxRailRestore": {
     "hiddenNote": "La bandeja del asistente está oculta en tu menú lateral.",

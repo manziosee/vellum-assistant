@@ -502,6 +502,24 @@
     "dismiss": "Dismiss",
     "removeAria": "Remove {filename}"
   },
+  "emailReferenceChip": {
+    "noSubject": "(no subject)",
+    "captionReceived": "Received · From {name} · {date}",
+    "captionReceivedUndated": "Received · From {name}",
+    "captionSent": "Sent · To {name} · {date}",
+    "captionSentUndated": "Sent · To {name}",
+    "tooltip": "{subject}\n{caption}",
+    "removeAria": "Remove email {subject}"
+  },
+  "emailReferenceCard": {
+    "noSubject": "(no subject)",
+    "captionReceived": "Received · From {name} · {date}",
+    "captionReceivedUndated": "Received · From {name}",
+    "captionSent": "Sent · To {name} · {date}",
+    "captionSentUndated": "Sent · To {name}",
+    "tooltip": "{subject}\n{caption}",
+    "openAria": "Open email {subject} in the inbox"
+  },
   "chatBody": {
     "dropFiles": "Drop files to attach"
   },

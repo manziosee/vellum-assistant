@@ -1204,5 +1204,23 @@
     "subtitle": "Вы использовали бесплатный лимит на сегодня. Он сбросится в {resetPhrase}. Обновите план или добавьте кредиты, чтобы продолжить.",
     "title": "Дневной бесплатный лимит исчерпан",
     "viewPlans": "Посмотреть планы"
+  },
+  "emailReferenceChip": {
+    "noSubject": "(без темы)",
+    "captionReceived": "Получено · От {name} · {date}",
+    "captionReceivedUndated": "Получено · От {name}",
+    "captionSent": "Отправлено · Кому: {name} · {date}",
+    "captionSentUndated": "Отправлено · Кому: {name}",
+    "tooltip": "{subject}\n{caption}",
+    "removeAria": "Убрать письмо {subject}"
+  },
+  "emailReferenceCard": {
+    "noSubject": "(без темы)",
+    "captionReceived": "Получено · От {name} · {date}",
+    "captionReceivedUndated": "Получено · От {name}",
+    "captionSent": "Отправлено · Кому: {name} · {date}",
+    "captionSentUndated": "Отправлено · Кому: {name}",
+    "tooltip": "{subject}\n{caption}",
+    "openAria": "Открыть письмо {subject} в почте"
   }
 }

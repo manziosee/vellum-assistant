@@ -488,6 +488,24 @@
     "dismiss": "Descartar",
     "removeAria": "Quitar {filename}"
   },
+  "emailReferenceChip": {
+    "noSubject": "(sin asunto)",
+    "captionReceived": "Recibido · De {name} · {date}",
+    "captionReceivedUndated": "Recibido · De {name}",
+    "captionSent": "Enviado · Para {name} · {date}",
+    "captionSentUndated": "Enviado · Para {name}",
+    "tooltip": "{subject}\n{caption}",
+    "removeAria": "Quitar el correo {subject}"
+  },
+  "emailReferenceCard": {
+    "noSubject": "(sin asunto)",
+    "captionReceived": "Recibido · De {name} · {date}",
+    "captionReceivedUndated": "Recibido · De {name}",
+    "captionSent": "Enviado · Para {name} · {date}",
+    "captionSentUndated": "Enviado · Para {name}",
+    "tooltip": "{subject}\n{caption}",
+    "openAria": "Abrir el correo {subject} en la bandeja"
+  },
   "chatBody": {
     "dropFiles": "Suelta archivos para adjuntarlos"
   },

@@ -304,6 +304,7 @@ export const SetUpEmail: Story = {
       handle={MOCK_ASSISTANT_HANDLE}
       rootDomain={MOCK_ROOT_DOMAIN}
       onConfirm={fn().mockName("onConfirm")}
+      onBack={fn().mockName("onBack")}
     />
   ),
 };
@@ -327,6 +328,7 @@ export const SetUpEmailChooseHandle: Story = {
           : { available: true }
       }
       onConfirm={fn().mockName("onConfirm")}
+      onBack={fn().mockName("onBack")}
     />
   ),
 };
@@ -345,6 +347,7 @@ export const SetUpEmailRefused: Story = {
       rootDomain={MOCK_ROOT_DOMAIN}
       error="That address is already taken on this domain."
       onConfirm={fn().mockName("onConfirm")}
+      onBack={fn().mockName("onBack")}
     />
   ),
 };
@@ -362,6 +365,8 @@ export const Inbox: Story = {
       usage={MOCK_USAGE}
       now={MOCK_NOW}
       onAskToReply={fn().mockName("onAskToReply")}
+      onStartChat={fn().mockName("onStartChat")}
+      onDeleteEmails={fn().mockName("onDeleteEmails")}
     />
   ),
 };
@@ -380,6 +385,34 @@ export const InboxReading: Story = {
       now={MOCK_NOW}
       initialSelectedId="in-2"
       onAskToReply={fn().mockName("onAskToReply")}
+    />
+  ),
+};
+
+/**
+ * Two messages checked in Received and one in Sent: the checkbox holds the
+ * disc's place on every row, and the bar over the cards counts the selection
+ * by folder. Hover an unchecked row to see the box take the disc's place.
+ */
+export const InboxSelecting: Story = {
+  name: "3f · Selecting messages",
+  render: () => (
+    <AssistantInboxPage
+      assistantId={ASSISTANT_ID}
+      assistantName={MOCK_ASSISTANT_NAME}
+      address={MOCK_ADDRESS}
+      inbox={MOCK_INBOX}
+      sent={MOCK_SENT}
+      usage={MOCK_USAGE}
+      now={MOCK_NOW}
+      initialCheckedIds={[
+        MOCK_INBOX[0]!.id,
+        MOCK_INBOX[1]!.id,
+        MOCK_SENT[0]!.id,
+      ]}
+      onAskToReply={fn().mockName("onAskToReply")}
+      onStartChat={fn().mockName("onStartChat")}
+      onDeleteEmails={fn().mockName("onDeleteEmails")}
     />
   ),
 };

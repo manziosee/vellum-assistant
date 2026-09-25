@@ -488,6 +488,24 @@
     "dismiss": "關閉",
     "removeAria": "移除 {filename}"
   },
+  "emailReferenceChip": {
+    "noSubject": "(無主旨)",
+    "captionReceived": "已接收 · 來自 {name} · {date}",
+    "captionReceivedUndated": "已接收 · 來自 {name}",
+    "captionSent": "已寄出 · 寄給 {name} · {date}",
+    "captionSentUndated": "已寄出 · 寄給 {name}",
+    "tooltip": "{subject}\n{caption}",
+    "removeAria": "移除郵件 {subject}"
+  },
+  "emailReferenceCard": {
+    "noSubject": "(無主旨)",
+    "captionReceived": "已接收 · 來自 {name} · {date}",
+    "captionReceivedUndated": "已接收 · 來自 {name}",
+    "captionSent": "已寄出 · 寄給 {name} · {date}",
+    "captionSentUndated": "已寄出 · 寄給 {name}",
+    "tooltip": "{subject}\n{caption}",
+    "openAria": "在收件匣中開啟郵件 {subject}"
+  },
   "chatBody": {
     "dropFiles": "拖曳檔案以附加"
   },
