@@ -661,7 +661,16 @@ function assistantTextOf(content: ReadonlyArray<ContentBlock>): string {
   return text;
 }
 
-type AgentLoopContextWindowResolver = () => {
+/**
+ * Resolves the context-window parameters for the current call. An optional
+ * `overrideProfile` hint lets the budget gate size itself against the profile
+ * a pre-model-call routing hook has chosen rather than the turn-start default,
+ * so a hook that routes to a smaller-window model (e.g. 200k → 32k) is
+ * reflected in the compaction threshold before the provider call goes out.
+ * Callers that do not have a hook-settled profile omit the argument and the
+ * resolver falls back to the conversation's current effective profile.
+ */
+type AgentLoopContextWindowResolver = (overrideProfile?: string | null) => {
   maxInputTokens: number;
   overflowRecovery: { enabled: boolean; safetyMarginRatio: number };
 };
@@ -1743,6 +1752,50 @@ export class AgentLoop {
       let streamedTokens = false;
 
       try {
+        // ── Pre-model-call hook (early: profile routing) ─────────────
+        // Run the hook chain before the budget gate so that a routing hook
+        // switching to a smaller-window profile (e.g. 200k → 32k) is
+        // reflected in the compaction threshold. The hook result is cached in
+        // `preModelHookResult` and applied at the standard hook position below
+        // — the hook must not run twice.
+        //
+        // The hook needs only the values available before the budget gate:
+        // the current system prompt, the effective override profile, and the
+        // call site. `providerOptions` is not yet built; systemPrompt and
+        // modelProfile are read directly from the run-level values.
+        let preModelHookResult: {
+          modelProfile: string | null;
+          systemPrompt: string | null;
+          deferAssistantOutput: boolean;
+        } | null = null;
+        try {
+          const earlyPreModelCtx: PreModelCallInputContext = {
+            conversationId: this.conversationId,
+            callSite: callSite ?? null,
+            systemPrompt: runSystemPrompt,
+            modelProfile: resolveEffectiveOverrideProfile() ?? null,
+            deferAssistantOutput: false,
+          };
+          const earlyFinalCtx = await traceAsyncSection(
+            "agent-loop:pre-model-call-hook",
+            () => runHook(HOOKS.PRE_MODEL_CALL, earlyPreModelCtx),
+          );
+          preModelHookResult = {
+            modelProfile: earlyFinalCtx.modelProfile?.trim() ?? null,
+            systemPrompt:
+              typeof earlyFinalCtx.systemPrompt === "string"
+                ? earlyFinalCtx.systemPrompt
+                : null,
+            deferAssistantOutput: earlyFinalCtx.deferAssistantOutput,
+          };
+        } catch (earlyHookErr) {
+          rlog.error(
+            { err: earlyHookErr },
+            "pre-model-call hook failed — proceeding with the original request",
+          );
+        }
+        const hookRoutedProfile = preModelHookResult?.modelProfile;
+
         // ── Pre-call budget gate ─────────────────────────────────────
         // Compact the running history before issuing the provider call when
         // either the running estimate approaches the preflight budget
@@ -1771,7 +1824,8 @@ export class AgentLoop {
           // already rejected the call, so it must reduce regardless.
           const isFirstCallGate = toolUseTurns === 0;
           if (options.resolveContextWindow != null) {
-            const contextWindow = options.resolveContextWindow();
+            const contextWindow =
+              options.resolveContextWindow(hookRoutedProfile);
             if (contextWindow.overflowRecovery.enabled) {
               const { maxInputTokens, overflowRecovery } = contextWindow;
               const safetyMargin =
@@ -2216,39 +2270,26 @@ export class AgentLoop {
           signal,
         };
 
-        // Let plugins edit the outbound request and opt this call into deferred
-        // output streaming. Runs for every provider call; hooks self-gate on
-        // call site / conversation. Fail-open: a throwing hook leaves the
-        // request unchanged and streaming live.
-        try {
-          const preModelCtx: PreModelCallInputContext = {
-            conversationId: this.conversationId,
-            callSite: callSite ?? null,
-            systemPrompt: providerOptions.systemPrompt ?? null,
-            modelProfile: effectiveOverrideProfile ?? null,
-            deferAssistantOutput: false,
-          };
-          const finalPreModelCtx = await traceAsyncSection(
-            "agent-loop:pre-model-call-hook",
-            () => runHook(HOOKS.PRE_MODEL_CALL, preModelCtx),
-          );
-          // Emit a changed event when the hook mutated the prompt. Compare
-          // against the pre-hook value from providerOptions, not
-          // preModelCtx — the hook may mutate the context object in place,
-          // which would make preModelCtx.systemPrompt already reflect the
-          // change and hide the diff.
+        // Apply the pre-model-call hook result captured before the budget gate.
+        // The hook already ran; applying its output here (rather than re-running
+        // it) preserves the original hook contract while letting the budget gate
+        // use the hook-settled profile to size its compaction threshold.
+        if (preModelHookResult !== null) {
+          // Emit a changed event when the hook mutated the system prompt.
+          // Compare against the pre-hook value from providerOptions (which was
+          // built from runSystemPrompt) to detect the diff.
           const preHookSystemPrompt = providerOptions.systemPrompt ?? null;
           if (
-            typeof finalPreModelCtx.systemPrompt === "string" &&
-            finalPreModelCtx.systemPrompt !== preHookSystemPrompt
+            typeof preModelHookResult.systemPrompt === "string" &&
+            preModelHookResult.systemPrompt !== preHookSystemPrompt
           ) {
             await onEvent({
               type: "system_prompt_changed",
-              systemPrompt: finalPreModelCtx.systemPrompt,
+              systemPrompt: preModelHookResult.systemPrompt,
             });
           }
           providerOptions.systemPrompt =
-            finalPreModelCtx.systemPrompt ?? undefined;
+            preModelHookResult.systemPrompt ?? undefined;
           // Route this call to the hook's chosen inference profile. The
           // resolver layers `llm.profiles[overrideProfile]` at the top of
           // precedence for the user-facing call, so a model router can pick
@@ -2256,7 +2297,7 @@ export class AgentLoop {
           // The hook context is seeded with the effective override, so an
           // unchanged profile is still the router's pick and keeps its
           // origin; a profile the hook changed or cleared is the hook's.
-          const hookModelProfile = finalPreModelCtx.modelProfile?.trim();
+          const hookModelProfile = preModelHookResult.modelProfile;
           if (hookModelProfile !== effectiveOverrideProfile) {
             delete providerConfig.overrideProfileOrigin;
           }
@@ -2271,12 +2312,7 @@ export class AgentLoop {
           }
           // The hook owns the policy (it sees `callSite`/conversation and
           // self-gates); the loop honors whatever it decides.
-          deferAssistantOutput = finalPreModelCtx.deferAssistantOutput;
-        } catch (preModelCallError) {
-          rlog.error(
-            { err: preModelCallError },
-            "pre-model-call hook failed — proceeding with the original request",
-          );
+          deferAssistantOutput = preModelHookResult.deferAssistantOutput;
         }
 
         if (onModelCallPrepared && !signal?.aborted) {

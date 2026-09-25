@@ -880,11 +880,35 @@ export async function runAgentLoopImpl(
    * `overflowRecovery` for its mid-loop budget gate, applying the long-history
    * safety-margin bump itself off its own running history. Resolved fresh on
    * each access so a mid-turn profile change is reflected.
+   *
+   * When `overrideProfile` is provided (a profile a pre-model-call routing
+   * hook chose for this specific call) the resolver re-derives the context
+   * window for that profile rather than the conversation-level effective
+   * profile. This lets the budget gate use the smaller of the two windows when
+   * a hook routes to a model with fewer input tokens.
    */
-  const resolveContextWindow = (): {
+  const resolveContextWindow = (
+    overrideProfile?: string | null,
+  ): {
     maxInputTokens: number;
     overflowRecovery: { enabled: boolean; safetyMarginRatio: number };
   } => {
+    if (overrideProfile != null) {
+      const hinted = resolveEffectiveContextWindow({
+        llm: config.llm,
+        callSite: inferenceCallSite,
+        overrideProfile,
+        forceOverrideProfile,
+        selectionSeed: ctx.conversationId,
+      });
+      return {
+        maxInputTokens: hinted.maxInputTokens,
+        overflowRecovery: {
+          enabled: hinted.overflowRecovery.enabled,
+          safetyMarginRatio: hinted.overflowRecovery.safetyMarginRatio,
+        },
+      };
+    }
     refreshCurrentProfileState();
     const { enabled, safetyMarginRatio } =
       currentEffectiveContextWindow.overflowRecovery;

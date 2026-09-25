@@ -4,19 +4,26 @@
  * (persisted + streamed), and defer the live stream so the transformed text is
  * emitted once. All hooks here use neutral transforms (redaction / uppercasing).
  */
-import { beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 
 import type { AgentEvent, PreparedModelCall } from "../agent/loop.js";
 import { AgentLoop } from "../agent/loop.js";
+import type { ContextWindowConfig } from "../config/types.js";
 import type {
   PostModelCallContext,
   PreModelCallContext,
 } from "../plugin-api/types.js";
+import {
+  createContextWindowManager,
+  disposeContextWindowManager,
+  getContextWindowManager,
+} from "../plugins/defaults/compaction/manager-store.js";
 import { resetPluginRegistryAndRegisterDefaults } from "../plugins/defaults/index.js";
 import { registerPlugin } from "../plugins/registry.js";
 import type {
   ContentBlock,
   Message,
+  Provider,
   ProviderResponse,
   ToolDefinition,
 } from "../providers/types.js";
@@ -584,14 +591,63 @@ describe("agent loop output hooks", () => {
     expect(calls[0].options?.config?.overrideProfile).toBeUndefined();
   });
 
-  // Context-window sizing and overflow recovery read the profile resolved
-  // before the hook runs, so a hook routing to a smaller-window profile does
-  // not resize the budget gate for that call. Tracked for a follow-up that
-  // resolves the routed profile ahead of the context-sizing gate.
-  test.todo(
-    "pre-model-call routing resizes the context-window budget for the routed profile",
-    () => {},
-  );
+  test("pre-model-call routing resizes the context-window budget for the routed profile", async () => {
+    // GIVEN a hook that routes every call to a smaller-window profile
+    registerOutputHookPlugin({
+      preModelCall: (ctx) => {
+        ctx.modelProfile = "small-window";
+      },
+    });
+
+    const conversationId = "routing-resize-test-conv";
+
+    // AND a compaction manager for the conversation so compaction can execute
+    createContextWindowManager({
+      provider: {} as unknown as Provider,
+      config: {} as unknown as ContextWindowConfig,
+      conversationId,
+    });
+    const manager = getContextWindowManager(conversationId);
+    let compactionRan = false;
+    if (manager) {
+      manager.maybeCompact = (async () => {
+        compactionRan = true;
+        return { messages: [userMessage], compacted: true, exhausted: false };
+      }) as unknown as typeof manager.maybeCompact;
+    }
+
+    // AND a resolver that returns a huge window by default (so the estimate
+    // never triggers compaction) but a 1-token window for the routed profile
+    // (so any real estimate exceeds it)
+    const { provider } = createMockProvider([textResponse("ok")]);
+    const loop = new AgentLoop({
+      provider,
+      systemPrompt: "system",
+      conversationId,
+    });
+
+    // WHEN the loop runs with the gate pre-armed
+    await loop.run({
+      requestId: "routing-resize-req",
+      messages: [userMessage],
+      onEvent: collect([]),
+      trust: { sourceChannel: "vellum", trustClass: "unknown" },
+      compactInPlace: true,
+      modelProfileKey: "balanced",
+      resolveContextWindow: (profile) => ({
+        maxInputTokens: profile === "small-window" ? 1 : 200_000,
+        overflowRecovery: { enabled: true, safetyMarginRatio: 0 },
+      }),
+    });
+
+    // THEN compaction ran because the budget gate was sized against the
+    // 1-token window that the routing hook chose, not the 200k default
+    expect(compactionRan).toBe(true);
+  });
+
+  afterEach(() => {
+    disposeContextWindowManager("routing-resize-test-conv");
+  });
 
   test("fail-open: a hook that mutates in place AND then throws cannot corrupt the persisted content", async () => {
     // The hook mutates the array it receives before throwing. If the loop
