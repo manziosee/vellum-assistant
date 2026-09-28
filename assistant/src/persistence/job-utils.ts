@@ -54,6 +54,16 @@ export const RETRY_MAX_ATTEMPTS = 8;
  * Fatal: 400 bad request, 401 auth, 403 permission, other 4xx client errors.
  */
 export function classifyError(err: unknown): ErrorCategory {
+  // LOCAL PATCH (juno, 2026-09-26): SQLite write contention is transient, retry it.
+  if (
+    err instanceof Error &&
+    (/database is locked|SQLITE_BUSY/i.test(err.message) ||
+      /^SQLITE_(BUSY|IOERR)/.test(
+        String((err as Error & { code?: string }).code ?? ""),
+      ))
+  ) {
+    return "retryable";
+  }
   // Timeout errors from our own Promise.race wrappers
   if (err instanceof Error && err.message.includes("timeout")) {
     return "retryable";

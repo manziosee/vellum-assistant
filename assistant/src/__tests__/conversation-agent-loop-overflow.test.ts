@@ -770,14 +770,9 @@ describe("session-agent-loop overflow recovery (JARVIS-110)", () => {
   });
 
   // ── Test 1 ────────────────────────────────────────────────────────
-  // BUG: When the agent loop makes progress (adds messages to history)
-  // before hitting context_too_large, the convergence loop's progress
-  // check must recognize that the loop appended messages. If it fails to,
-  // the reducer is never invoked — the error is surfaced immediately
-  // without any compaction attempt.
-  //
-  // Expected behavior (PR 2 fix): After progress + context_too_large,
-  // the system should still attempt compaction before surfacing error.
+  // Verifies overflow recovery fires even when the agent made tool-use progress
+  // before hitting context_too_large. The convergence path must not skip
+  // compaction just because messages were appended earlier in the turn.
   test("context too large after progress triggers compaction retry instead of immediate failure", async () => {
     const events: AssistantEvent[] = [];
     let reducerCalled = false;
@@ -845,13 +840,9 @@ describe("session-agent-loop overflow recovery (JARVIS-110)", () => {
 
     await runAgentLoopImpl(ctx, "hello", "msg-1", (msg) => events.push(msg));
 
-    // BUG: Currently the reducer is NOT called when progress was made before
-    // context_too_large. The error is surfaced immediately.
-    // After PR 2 fix, the reducer SHOULD be called to attempt compaction.
     expect(reducerCalled).toBe(true);
 
-    // BUG: Currently a conversation_error IS emitted instead of retrying.
-    // After PR 2 fix, there should be no conversation_error.
+
     const conversationError = events.find(
       (e) => e.type === "conversation_error",
     );
