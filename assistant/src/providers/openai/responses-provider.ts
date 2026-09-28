@@ -109,7 +109,9 @@ function mapResponsesReasoningEffort(
     return "none";
   }
   const clamped = clampReasoningEffort(raw, effortCeilingForModel(model));
-  return supported ? snapReasoningEffortToSupported(clamped, supported) : clamped;
+  return supported
+    ? snapReasoningEffortToSupported(clamped, supported)
+    : clamped;
 }
 
 /** Values accepted by the Responses API `text.verbosity` parameter. */
@@ -280,7 +282,11 @@ export class OpenAIResponsesProvider implements Provider {
     const effort = configObj?.effort as string | undefined;
     const verbosity = configObj?.verbosity as string | undefined;
     const usageAttributionHeaders = configObj?.usageAttributionHeaders as
-      Record<string, string> | undefined;
+      | Record<string, string>
+      | undefined;
+    const perRequestHeaders = configObj?.requestHeaders as
+      | Record<string, string>
+      | undefined;
     const disableCache = configObj?.disableCache === true;
     const disableTurnStartCache = configObj?.disableTurnStartCache === true;
     const promptCacheKey =
@@ -288,6 +294,7 @@ export class OpenAIResponsesProvider implements Provider {
       configObj.promptCacheKey.length > 0
         ? (configObj.promptCacheKey as string)
         : undefined;
+    let inspectableRequest: unknown | undefined;
 
     try {
       const effectiveModel = modelOverride ?? this.model;
@@ -422,6 +429,7 @@ export class OpenAIResponsesProvider implements Provider {
       }
 
       Object.assign(params, this.buildExtraCreateParams(options));
+      inspectableRequest = params;
 
       const { signal: timeoutSignal, cleanup: cleanupTimeout } =
         createStreamTimeout(this.streamTimeoutMs, signal);
@@ -463,6 +471,7 @@ export class OpenAIResponsesProvider implements Provider {
         const requestHeaders = {
           ...this.requestHeaders,
           ...(usageAttributionHeaders ?? {}),
+          ...(perRequestHeaders ?? {}),
         };
         const stream = await responsesApi.create(
           { ...params, stream: true },
@@ -729,6 +738,9 @@ export class OpenAIResponsesProvider implements Provider {
             maxTokens: overflow.maxTokens,
             statusCode: error.status,
             cause: error,
+            ...(inspectableRequest !== undefined
+              ? { rawRequest: inspectableRequest }
+              : {}),
           });
         }
         const retryAfterMs = extractRetryAfterMs(error.headers);
@@ -743,6 +755,7 @@ export class OpenAIResponsesProvider implements Provider {
           apiErrorParam?: string;
           requestId?: string;
           rawBody?: string;
+          rawRequest?: unknown;
           reason?: ProviderErrorReason;
         } = { cause: error };
         if (retryAfterMs !== undefined) {
@@ -769,6 +782,9 @@ export class OpenAIResponsesProvider implements Provider {
         if (normalized.reason) {
           errorOptions.reason = normalized.reason;
         }
+        if (inspectableRequest !== undefined) {
+          errorOptions.rawRequest = inspectableRequest;
+        }
         throw new ProviderError(
           formattedMessage,
           this.name,
@@ -782,7 +798,20 @@ export class OpenAIResponsesProvider implements Provider {
         }`,
         this.name,
         undefined,
-        abortReason ? { cause: error, abortReason } : { cause: error },
+        abortReason
+          ? {
+              cause: error,
+              abortReason,
+              ...(inspectableRequest !== undefined
+                ? { rawRequest: inspectableRequest }
+                : {}),
+            }
+          : {
+              cause: error,
+              ...(inspectableRequest !== undefined
+                ? { rawRequest: inspectableRequest }
+                : {}),
+            },
       );
     }
   }

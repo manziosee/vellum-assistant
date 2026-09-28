@@ -128,10 +128,17 @@ const {
 } = await import("./frame-scroll-watch");
 
 const {
+  __resetCoachmarkPressWatchForTesting,
+  unwatchCoachmarkPress,
+  watchCoachmarkPress,
+} = await import("./coachmark-press-watch");
+
+const {
   __resetForTesting,
   __setPlatformForTesting,
   __setSupervisorOptionsForTesting,
   installHotkeyHelper,
+  postFrontAppShortcut,
   queryFreshMacHelperPermission,
   requestMacHelperInputMonitoringPermission,
   requestMacHelperSpeechRecognitionPermission,
@@ -248,6 +255,7 @@ beforeEach(() => {
 afterEach(() => {
   __resetForTesting();
   __resetFrameScrollWatchForTesting();
+  __resetCoachmarkPressWatchForTesting();
 });
 
 describe("getMacHelperPath", () => {
@@ -666,6 +674,53 @@ describe("installHotkeyHelper", () => {
     );
   });
 
+  /**
+   * Whether the paste may be sent again another way turns on this answer: a
+   * helper that says it sent nothing can be retried, and one whose reply was
+   * lost cannot, since the keystroke may have gone before the reply did.
+   */
+  describe("front app shortcut", () => {
+    const reply = (json: string) => {
+      lastChild?.stdout.emit("data", Buffer.from(`${json}\n`));
+    };
+
+    test("reports a posted shortcut", async () => {
+      installHotkeyHelper();
+      const pending = postFrontAppShortcut("v");
+      reply('{"jsonrpc":"2.0","id":1,"result":{"outcome":"posted"}}');
+
+      expect(lastChild?.stdin.writes[0]).toContain('"method":"keys.shortcut"');
+      expect(lastChild?.stdin.writes[0]).toContain('"key":"v"');
+      expect(await pending).toBe("posted");
+    });
+
+    test("reads a helper without Accessibility as declined", async () => {
+      installHotkeyHelper();
+      const pending = postFrontAppShortcut("v");
+      reply('{"jsonrpc":"2.0","id":1,"result":{"outcome":"untrusted"}}');
+
+      expect(await pending).toBe("declined");
+    });
+
+    test("reads a helper that does not know the method as declined", async () => {
+      installHotkeyHelper();
+      const pending = postFrontAppShortcut("v");
+      reply(
+        '{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}',
+      );
+
+      expect(await pending).toBe("declined");
+    });
+
+    test("reads a helper that exits before replying as unknown", async () => {
+      installHotkeyHelper();
+      const pending = postFrontAppShortcut("v");
+      lastChild?.emit("close", 1, null);
+
+      expect(await pending).toBe("unknown");
+    });
+  });
+
   test("reads what is highlighted in the application in front", async () => {
     installHotkeyHelper();
 
@@ -715,7 +770,7 @@ describe("installHotkeyHelper", () => {
     expect(await pending).toBeNull();
   });
 
-  test("reads a refused selection as no selection", async () => {
+  test("keeps a refused selection distinct from no selection", async () => {
     installHotkeyHelper();
 
     const pending = invokeReadFrontSelection();
@@ -726,7 +781,99 @@ describe("installHotkeyHelper", () => {
       ),
     );
 
-    expect(await pending).toBeNull();
+    expect(await pending).toEqual({ unavailable: true });
+  });
+
+  test("retries accessibility warmup with the original hold id", async () => {
+    installHotkeyHelper();
+    const pending = invokeReadFrontSelection();
+    lastChild?.stdout.emit(
+      "data",
+      Buffer.from(
+        '{"jsonrpc":"2.0","id":1,"result":{"unavailable":true,"holdId":7}}\n',
+      ),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 130));
+    expect(JSON.parse(lastChild!.stdin.writes[1]!)).toMatchObject({
+      method: "selection.read",
+      params: { holdId: 7 },
+    });
+    lastChild?.stdout.emit(
+      "data",
+      Buffer.from(
+        '{"jsonrpc":"2.0","id":2,"result":{"selection":{"text":"Example passage","truncated":false,"editable":true}}}\n',
+      ),
+    );
+    expect(await pending).toEqual({
+      text: "Example passage",
+      truncated: false,
+      editable: true,
+    });
+  });
+
+  test("stops retrying when the hold or foreground app changes", async () => {
+    installHotkeyHelper();
+    const pending = invokeReadFrontSelection();
+    lastChild?.stdout.emit(
+      "data",
+      Buffer.from(
+        '{"jsonrpc":"2.0","id":1,"result":{"unavailable":true,"holdId":7}}\n',
+      ),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 130));
+    lastChild?.stdout.emit(
+      "data",
+      Buffer.from('{"jsonrpc":"2.0","id":2,"result":{"unavailable":true}}\n'),
+    );
+    expect(await pending).toEqual({ unavailable: true });
+    expect(lastChild?.stdin.writes).toHaveLength(2);
+  });
+
+  test("does not retry a non-retryable capture failure", async () => {
+    installHotkeyHelper();
+    const pending = invokeReadFrontSelection();
+    lastChild?.stdout.emit(
+      "data",
+      Buffer.from('{"jsonrpc":"2.0","id":1,"result":{"unavailable":true}}\n'),
+    );
+    expect(await pending).toEqual({ unavailable: true });
+    expect(lastChild?.stdin.writes).toHaveLength(1);
+  });
+
+  test("bounds warmup retries beyond Chromium's two-second debounce", async () => {
+    installHotkeyHelper();
+    const pending = invokeReadFrontSelection();
+    for (let id = 1; id <= 31; id++) {
+      while ((lastChild?.stdin.writes.length ?? 0) < id) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      const request = JSON.parse(lastChild!.stdin.writes[id - 1]!);
+      expect(request.params).toEqual(id === 1 ? undefined : { holdId: 7 });
+      lastChild?.stdout.emit(
+        "data",
+        Buffer.from(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id,
+            result: { unavailable: true, holdId: 7 },
+          }) + "\n",
+        ),
+      );
+    }
+    expect(await pending).toEqual({ unavailable: true });
+    expect(lastChild?.stdin.writes).toHaveLength(31);
+  });
+
+  test("does not treat malformed selection data as no selection", async () => {
+    installHotkeyHelper();
+    const pending = invokeReadFrontSelection();
+    lastChild?.stdout.emit(
+      "data",
+      Buffer.from(
+        '{"jsonrpc":"2.0","id":1,"result":{"selection":{"text":42}}}\n',
+      ),
+    );
+    expect(await pending).toEqual({ unavailable: true });
   });
 
   test("asks the helper which of the named apps are running", async () => {
@@ -892,6 +1039,53 @@ describe("installHotkeyHelper", () => {
     await wait(0);
     writes = lastChild?.stdin.writes.join("") ?? "";
     expect(writes).toContain('"enable":false');
+  });
+
+  /**
+   * The marks ask for the press watch through `coachmark-press-watch.ts`, the
+   * way the frame asks for the scroll watch: they are main's, and the press
+   * is main's to act on.
+   */
+  test("asks the helper to watch for a press on a pointed-at control and reports it", async () => {
+    __setSupervisorOptionsForTesting({ initialBackoffMs: 1, maxBackoffMs: 1 });
+    installHotkeyHelper();
+    expect(await registerHold()).toEqual({ ok: true, enabled: true });
+
+    const pressed: number[] = [];
+    const rect = { x: 120, y: 80, width: 60, height: 20 };
+    watchCoachmarkPress([rect], (index) => {
+      pressed.push(index);
+    });
+    await wait(0);
+    let writes = lastChild?.stdin.writes.join("") ?? "";
+    expect(writes).toContain('"method":"input.setPressWatch"');
+    expect(writes).toContain(JSON.stringify({ rects: [rect] }));
+
+    // The watch goes down with the helper and comes back with it, still on
+    // the same rectangles.
+    lastChild?.emit("close", 1, null);
+    await wait(10);
+    writes = lastChild?.stdin.writes.join("") ?? "";
+    expect(writes).toContain('"method":"input.setPressWatch"');
+
+    lastChild?.stdout.emit(
+      "data",
+      Buffer.from('{"jsonrpc":"2.0","method":"input.pressed","params":{"index":0}}\n'),
+    );
+    expect(pressed).toEqual([0]);
+
+    // A press is one-shot on both sides: a second report is nobody's.
+    lastChild?.stdout.emit(
+      "data",
+      Buffer.from('{"jsonrpc":"2.0","method":"input.pressed","params":{"index":0}}\n'),
+    );
+    expect(pressed).toEqual([0]);
+
+    watchCoachmarkPress([rect], () => {});
+    unwatchCoachmarkPress();
+    await wait(0);
+    writes = lastChild?.stdin.writes.join("") ?? "";
+    expect(writes).toContain('"rects":[]');
   });
 
   test("forwards input activity to the window that holds the key", async () => {

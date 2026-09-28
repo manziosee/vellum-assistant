@@ -24,6 +24,13 @@ import {
 import { isGuardianSensitiveEvent } from "./adapters/macos.js";
 import { resolveMessageText } from "./adapters/shared.js";
 import {
+  isCompletionNotification,
+  isCompletionRecipientUnavailable,
+  isLocalNotificationSilent,
+  notificationConversationId,
+  resolveCompletionRecipient,
+} from "./completion-policy.js";
+import {
   pairDeliveryWithConversation,
   type PairingResult,
 } from "./conversation-pairing.js";
@@ -241,8 +248,8 @@ export interface ConversationCreatedInfo {
   /** Semantic source from the signal producer (e.g. "schedule", "reminder"). */
   source?: string;
   /**
-   * Mirrors the vellum adapter's `silent` flag. When true the client
-   * must skip the fallback OS banner — the sidebar entry still appears.
+   * Mirrors the vellum adapter's `silent` flag (true for low- and
+   * medium-urgency signals).
    */
   silent: boolean;
 }
@@ -351,13 +358,16 @@ export class NotificationBroadcaster {
       decision.selectedChannels,
       guardians,
     );
+    const silent = isLocalNotificationSilent({
+      ...signal,
+      urgency: signal.attentionHints.urgency,
+    });
 
     // Ensure vellum is processed first so the notification_conversation_created
     // event fires immediately, before slower channel sends (e.g. Telegram 30s
-    // timeout) can delay it past the macOS deep-link retry window. Platform
-    // sorts second: the vellum intent carries remotePushDispatched, so its
-    // deferred send (below) flushes right after the platform outcome is known
-    // instead of waiting behind slower channels.
+    // timeout) can delay it. Platform sorts second: the vellum intent carries
+    // remotePushDispatched, so its deferred send (below) flushes right after
+    // the platform outcome is known instead of waiting behind slower channels.
     const dispatchRank = (channel: NotificationChannel): number => {
       if (channel === "vellum") {
         return 0;
@@ -454,6 +464,16 @@ export class NotificationBroadcaster {
             destination: "",
             status: "skipped",
             errorMessage: `Destination not resolved for channel: ${channel}`,
+          });
+          continue;
+        }
+
+        if (isCompletionRecipientUnavailable(signal, destination)) {
+          results.push({
+            channel,
+            destination: destination.endpoint ?? channel,
+            status: "failed",
+            errorMessage: "completion recipient unavailable",
           });
           continue;
         }
@@ -602,7 +622,7 @@ export class NotificationBroadcaster {
               : pairing;
           const deepLinkConversationId =
             deepLinkPairing.conversationId ??
-            resolveSourceConversationId(signal.sourceContextId) ??
+            resolveSourceConversationId(notificationConversationId(signal)) ??
             resolveDeepLinkConversationId(signal.contextPayload);
           if (deepLinkConversationId) {
             deepLinkTarget = {
@@ -626,17 +646,15 @@ export class NotificationBroadcaster {
             typeof destination.metadata?.guardianPrincipalId === "string"
               ? destination.metadata.guardianPrincipalId
               : undefined;
-          const targetGuardianPrincipalId =
-            guardianPrincipalId &&
-            isGuardianSensitiveEvent(signal.sourceEventName)
+          const targetGuardianPrincipalId = isCompletionNotification(signal)
+            ? resolveCompletionRecipient(signal, destination)
+            : guardianPrincipalId &&
+                isGuardianSensitiveEvent(signal.sourceEventName)
               ? guardianPrincipalId
               : undefined;
 
           const conversationTitle =
             copy.conversationTitle ?? copy.title ?? signal.sourceEventName;
-          const conversationSilent =
-            signal.attentionHints.urgency !== "high" &&
-            signal.attentionHints.urgency !== "critical";
           const info: ConversationCreatedInfo = {
             conversationId: pairing.conversationId,
             title: conversationTitle,
@@ -644,7 +662,7 @@ export class NotificationBroadcaster {
             targetGuardianPrincipalId,
             groupId: signal.conversationMetadata?.groupId,
             source: signal.conversationMetadata?.source,
-            silent: conversationSilent,
+            silent,
           };
 
           // The per-dispatch onConversationCreated callback fires whenever a vellum
@@ -696,6 +714,7 @@ export class NotificationBroadcaster {
           deepLinkTarget,
           contextPayload: signal.contextPayload,
           urgency: signal.attentionHints.urgency,
+          silent,
           approvalContext,
           accessRequestContext,
           toolApprovalSource,

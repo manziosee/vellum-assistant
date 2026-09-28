@@ -26,7 +26,6 @@ import type {
   LiveVoiceClientEventMap,
   LiveVoiceClientEventName,
   LiveVoiceConnectArgs,
-  LiveVoiceSightFrameTiming,
 } from "@/domains/chat/voice/live-voice/live-voice-client";
 import type {
   LiveVoiceAudioCaptureOptions,
@@ -59,10 +58,7 @@ export class FakeClient {
   textInputSupported = false;
   pttReleaseCount = 0;
   interruptCount = 0;
-  updateConfigCalls: {
-    silenceThresholdMs?: number;
-    bargeInMinSpeechMs?: number;
-  }[] = [];
+  updateConfigCalls: Parameters<LiveVoiceSessionControls["updateConfig"]>[0][] = [];
   ended = false;
   closed = false;
 
@@ -108,10 +104,9 @@ export class FakeClient {
   interrupt(): void {
     this.interruptCount++;
   }
-  updateConfig(config: {
-    silenceThresholdMs?: number;
-    bargeInMinSpeechMs?: number;
-  }): void {
+  updateConfig(
+    config: Parameters<LiveVoiceSessionControls["updateConfig"]>[0],
+  ): void {
     this.updateConfigCalls.push(config);
   }
   end(): void {
@@ -211,6 +206,8 @@ export class FakePlayer {
   /** Route the fake reports, and how many times it was asked to re-render it. */
   outputRoute: TtsOutputRoute = "unsupported";
   restartOutputRouteCount = 0;
+  /** Cues the controller played on the session bus. */
+  tones: unknown[] = [];
   /**
    * Chunks a `holdPlayback()` flush retained, or null when nothing is held.
    * The real player keeps the audio scheduled but not yet sounded; the fake
@@ -233,6 +230,9 @@ export class FakePlayer {
   }
   readOutputLevel(): number {
     return this.outputAmplitude;
+  }
+  playTone(recipe: unknown): void {
+    this.tones.push(recipe);
   }
   restartOutputRoute(): Promise<void> {
     this.restartOutputRouteCount++;
@@ -340,16 +340,13 @@ export function makeControlsSpies() {
     setMuted: mock((_muted: boolean) => {}),
     setOutputMuted: mock((_muted: boolean) => {}),
     updateConfig: mock(
-      (_config: {
-        silenceThresholdMs?: number;
-        bargeInMinSpeechMs?: number;
-      }) => {},
+      (_config: Parameters<LiveVoiceSessionControls["updateConfig"]>[0]) => {},
     ),
     // Defaults to delivered. The reconnect-gap case (false) is asserted by the
     // tests that care, so the common path stays uncluttered.
     attachImage: mock((_attachmentId: string) => true),
     sightFrame: mock(
-      (_attachmentId: string, _timing?: LiveVoiceSightFrameTiming) => true,
+      (..._args: Parameters<LiveVoiceSessionControls["sightFrame"]>) => true,
     ),
   } satisfies LiveVoiceSessionControls;
 }

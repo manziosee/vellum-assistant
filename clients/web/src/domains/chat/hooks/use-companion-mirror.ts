@@ -26,6 +26,7 @@ import { useEffect } from "react";
 import { assistantDisplayName } from "@/utils/assistant-display-name";
 import { isPopoutWindowLifetime } from "@/runtime/popout-window";
 import {
+  clearCompanionPopover,
   clearCompanionWorking,
   setCompanionContext,
   setCompanionDictation,
@@ -42,9 +43,17 @@ import {
 } from "@/domains/chat/watch/watch-controller";
 import { useLiveVoiceStore } from "@/domains/chat/voice/live-voice/live-voice-store";
 import { liveVoiceCanBeShownTheScreen } from "@/domains/chat/voice/live-voice/screen-share-availability";
+import { useIntroCallChordStore } from "@/domains/chat/voice/intro-call-chord-store";
+import { useVoiceKeyTapStore } from "@/domains/chat/voice/voice-key-tap-store";
 import { useVoiceRecordingStore } from "@/domains/chat/voice/voice-recording-store";
 import { useDictationOfferStore } from "@/domains/chat/voice/dictation-offer-store";
 import { useWatchRetroStore } from "@/domains/chat/watch/watch-retro";
+import {
+  currentCompanionPopover,
+  samePopover,
+  useCompanionPopoverStore,
+} from "@/domains/chat/companion-popover";
+import { useInteractionStore } from "@/domains/chat/interaction-store";
 import { COMPANION_DICTATION_TAIL } from "@vellumai/ipc-contract";
 import type {
   CompanionContext,
@@ -145,6 +154,25 @@ function currentContext(): CompanionContext {
     // Published from here for the reason `watchRetro` is: the words and the
     // way into the application they would go to are both this window's.
     dictationOffer: currentOffer(),
+    // The approval the turn is blocked on, or the surface the assistant put
+    // up, for the popover beside the companion. Both live in this window's
+    // stores. See `companion-popover.ts`.
+    popover: currentCompanionPopover(),
+    // Whether the call bar's voice chevron has a catalog to open.
+    voicesPickable: useCompanionPopoverStore.getState().voicesPickable,
+    // Taps of the voice key. Published from here because the binding is this
+    // window's: raw key edges reach only the window that claimed it, and the
+    // surface that draws the key while teaching it is a different renderer
+    // entirely.
+    voiceKeyTaps: useVoiceKeyTapStore.getState().taps,
+    // Presses of a call's shortcut, published from here for the reason the
+    // taps are: the chord reaches only the window that armed it, and the card
+    // drawing that shortcut is a different renderer. The control travels with
+    // the count the way `captureTarget` travels with `captureCount`: the two
+    // are one fact about one press, and a count that arrived a push apart from
+    // the control it belongs to would light a chip on the wrong card.
+    introChordPresses: useIntroCallChordStore.getState().presses,
+    introChordControl: useIntroCallChordStore.getState().control ?? undefined,
   };
 }
 
@@ -153,8 +181,8 @@ function currentOffer(): CompanionDictationOffer | undefined {
   if (offer === null) {
     return undefined;
   }
-  if (offer.reason === "no-text-field") {
-    return { reason: "no-text-field", id: offer.id, text: offer.text };
+  if (offer.reason !== "claimed") {
+    return { reason: offer.reason, id: offer.id, text: offer.text };
   }
   return {
     reason: "claimed",
@@ -279,7 +307,12 @@ function sameContext(a: CompanionContext, b: CompanionContext): boolean {
     a.dictationOffer?.id === b.dictationOffer?.id &&
     a.dictationOffer?.reason === b.dictationOffer?.reason &&
     offerApp(a.dictationOffer) === offerApp(b.dictationOffer) &&
-    a.dictationOffer?.text === b.dictationOffer?.text
+    a.dictationOffer?.text === b.dictationOffer?.text &&
+    samePopover(a.popover, b.popover) &&
+    a.voicesPickable === b.voicesPickable &&
+    a.voiceKeyTaps === b.voiceKeyTaps &&
+    a.introChordPresses === b.introChordPresses &&
+    a.introChordControl === b.introChordControl
   );
 }
 
@@ -305,12 +338,16 @@ export function useCompanionMirror(): void {
     // The words that came with it. Declared beside the phase because `sync`
     // writes both, and `sync` runs before the subscriptions are set up.
     let dictationText = dictationTail();
+    // The popover, so a transcript write can be told apart from one that
+    // completes or replaces the surface it shows.
+    let popover = currentCompanionPopover();
 
     const sync = (): void => {
       const context = currentContext();
       working = context.working;
       dictating = context.dictating;
       dictationText = context.dictationText ?? "";
+      popover = context.popover;
       if (pushed !== null && sameContext(pushed, context)) {
         return;
       }
@@ -327,7 +364,10 @@ export function useCompanionMirror(): void {
     // flag flipping rather than on the store being written, since almost none
     // of those writes move anything the surface draws.
     const onMaybeFlipped = (): void => {
-      if (isWorking() === working) {
+      if (
+        isWorking() === working &&
+        samePopover(currentCompanionPopover(), popover)
+      ) {
         return;
       }
       sync();
@@ -366,6 +406,10 @@ export function useCompanionMirror(): void {
     };
     const unsubscribeShare = useLiveVoiceStore.subscribe(onShareMaybeFlipped);
     const unsubscribeOffer = useDictationOfferStore.subscribe(sync);
+    // The approval and the offered surface. Both stores move only on the edges
+    // the popover draws, so neither needs a gate.
+    const unsubscribeInteraction = useInteractionStore.subscribe(sync);
+    const unsubscribePopover = useCompanionPopoverStore.subscribe(sync);
     // The microphone a held key opened. Nothing above reports it: the
     // recording is this window's, it starts and stops from the keyboard rather
     // than from anything the conversation knows about, and while it runs the
@@ -396,6 +440,25 @@ export function useCompanionMirror(): void {
     const unsubscribeDictation = useVoiceRecordingStore.subscribe(
       onDictationMaybeFlipped,
     );
+    // The key being touched, which only the introduction has ever drawn. No
+    // gate here on purpose: the gate is upstream, on the count itself
+    // (`global-push-to-talk-bridge`), so the store moves only while a run is up
+    // and every move it makes is one the surface wants. A push is not the cheap
+    // thing it looks like, since `sync` reselects and remaps the whole context
+    // before it crosses two process boundaries and lands as a render, so the
+    // question is not what the payload costs but whether anybody asked for it.
+    //
+    // Gating here instead would leave the store climbing behind a closed
+    // publish, and the card baselines on what it is handed when the beat
+    // changes: the next run's first push would arrive carrying every tap made
+    // since, and open with the cap already filled.
+    const unsubscribeTaps = useVoiceKeyTapStore.subscribe(sync);
+    // The call's shortcuts being pressed, which only the introduction has ever
+    // drawn. Ungated here for the reason the taps are, and with a sharper
+    // version of the same gate upstream: nothing is armed to hear one of these
+    // outside the three beats that ask (`use-call-chords`), so a move of this
+    // store is a press a card is waiting for.
+    const unsubscribeChords = useIntroCallChordStore.subscribe(sync);
     return () => {
       // **Before the unsubscribes**, so the flip this causes is still published
       // and the surface does not keep a capture indicator over a machine
@@ -414,11 +477,17 @@ export function useCompanionMirror(): void {
       unsubscribeWatchRetro();
       unsubscribeShare();
       unsubscribeOffer();
+      unsubscribeInteraction();
+      unsubscribePopover();
       unsubscribeDictation();
+      unsubscribeTaps();
+      unsubscribeChords();
       // Nothing is left to report a turn ending, so the last thing this does is
       // stop claiming one is running. The name is left standing: it is a record
       // of whose surface this is, and the surface is still on screen.
       clearCompanionWorking();
+      // Nor is anything left to answer the popover.
+      clearCompanionPopover();
     };
   }, []);
 }

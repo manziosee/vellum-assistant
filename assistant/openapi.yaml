@@ -3,7 +3,7 @@
 openapi: 3.1.0
 info:
   title: Vellum Assistant API
-  version: 0.11.10
+  version: 0.12.5
   description: Auto-generated OpenAPI specification for the Vellum Assistant runtime HTTP server.
 servers:
   - url: http://127.0.0.1:7821
@@ -469,6 +469,33 @@ paths:
                           type: string
                         authErrorCode:
                           type: string
+                        model:
+                          type: string
+                        availableModels:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              value:
+                                type: string
+                              label:
+                                type: string
+                              description:
+                                type: string
+                              group:
+                                type: string
+                            required:
+                              - value
+                              - label
+                            additionalProperties: false
+                        modelRevisionEpoch:
+                          type: string
+                          format: uuid
+                          pattern: ^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$
+                        modelRevision:
+                          type: integer
+                          minimum: 0
+                          maximum: 9007199254740991
                         usedTokens:
                           type: number
                         contextSize:
@@ -548,6 +575,9 @@ paths:
                 cwd:
                   type: string
                   description: Working directory
+                model:
+                  description: Optional model id or alias to request for the session.
+                  type: string
               required:
                 - agent
                 - task
@@ -566,11 +596,379 @@ paths:
                     type: string
                   agent:
                     type: string
+                  requestedModel:
+                    anyOf:
+                      - type: string
+                      - type: "null"
+                    description: The model explicitly requested for this spawn, if any.
+                  effectiveModel:
+                    anyOf:
+                      - type: string
+                      - type: "null"
+                    description: The top-level session model reported by the ACP adapter, if any.
+                  modelWarning:
+                    description: Why the requested model was not applied. The session is running on the agent's own model.
+                    type: string
                 required:
                   - acpSessionId
                   - protocolSessionId
                   - agent
+                  - requestedModel
+                  - effectiveModel
                 additionalProperties: false
+  /v1/activation/dismiss:
+    post:
+      operationId: activation_dismiss_post
+      summary: Dismiss an activation surface
+      description: Record that the welcome modal or the celebration modal was dismissed.
+      tags:
+        - activation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                kind:
+                  type: string
+                  enum:
+                    - modal
+                    - all-done
+                  description: Which surface was dismissed
+                listId:
+                  description: List the surface showed, stored only while no list is frozen
+                  type: string
+                  pattern: ^[a-z0-9-]{1,64}$
+              required:
+                - kind
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version:
+                    type: number
+                    const: 1
+                    description: Schema version
+                  listId:
+                    anyOf:
+                      - type: string
+                      - type: "null"
+                    description: Task list frozen on the first write, null before then
+                  modalDismissedAt:
+                    anyOf:
+                      - type: string
+                      - type: "null"
+                    description: ISO timestamp the welcome modal was dismissed
+                  allDoneShownAt:
+                    anyOf:
+                      - type: string
+                      - type: "null"
+                    description: ISO timestamp the celebration modal was dismissed
+                  tasks:
+                    type: object
+                    propertyNames:
+                      type: string
+                    additionalProperties:
+                      type: object
+                      properties:
+                        status:
+                          type: string
+                          enum:
+                            - started
+                            - done
+                          description: "`started` while the linked conversation is working the task"
+                        conversationId:
+                          type: string
+                          maxLength: 128
+                          description: Conversation the task was launched into
+                        startedAt:
+                          type: string
+                          description: ISO timestamp of the launch
+                        completedAt:
+                          anyOf:
+                            - type: string
+                            - type: "null"
+                          description: ISO timestamp of the completing turn, null while started
+                        stepCount:
+                          anyOf:
+                            - type: integer
+                              minimum: -9007199254740991
+                              maximum: 9007199254740991
+                            - type: "null"
+                          description: Tool calls observed in the linked conversation so far
+                        artifacts:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              workspacePath:
+                                type: string
+                                description: Path of the produced file, as the assistant attached it
+                              displayName:
+                                type: string
+                                description: Human-readable file name for the card
+                            required:
+                              - workspacePath
+                              - displayName
+                            additionalProperties: false
+                          description: Files the completing turn attached
+                      required:
+                        - status
+                        - conversationId
+                        - startedAt
+                        - completedAt
+                        - stepCount
+                        - artifacts
+                      additionalProperties: false
+                    description: Progress keyed by task id
+                required:
+                  - version
+                  - listId
+                  - modalDismissedAt
+                  - allDoneShownAt
+                  - tasks
+                additionalProperties: false
+        "400":
+          description: Malformed dismiss kind or list id
+        "409":
+          description: Stored progress was written by a newer build; the dismissal was not recorded
+        "503":
+          description: Stored progress is locked by another process; the dismissal was not recorded
+  /v1/activation/progress:
+    get:
+      operationId: activation_progress_get
+      summary: Get activation progress
+      description: "Return the activation checklist progress: the frozen list, dismissed surfaces, and per-task state."
+      tags:
+        - activation
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version:
+                    type: number
+                    const: 1
+                    description: Schema version
+                  listId:
+                    anyOf:
+                      - type: string
+                      - type: "null"
+                    description: Task list frozen on the first write, null before then
+                  modalDismissedAt:
+                    anyOf:
+                      - type: string
+                      - type: "null"
+                    description: ISO timestamp the welcome modal was dismissed
+                  allDoneShownAt:
+                    anyOf:
+                      - type: string
+                      - type: "null"
+                    description: ISO timestamp the celebration modal was dismissed
+                  tasks:
+                    type: object
+                    propertyNames:
+                      type: string
+                    additionalProperties:
+                      type: object
+                      properties:
+                        status:
+                          type: string
+                          enum:
+                            - started
+                            - done
+                          description: "`started` while the linked conversation is working the task"
+                        conversationId:
+                          type: string
+                          maxLength: 128
+                          description: Conversation the task was launched into
+                        startedAt:
+                          type: string
+                          description: ISO timestamp of the launch
+                        completedAt:
+                          anyOf:
+                            - type: string
+                            - type: "null"
+                          description: ISO timestamp of the completing turn, null while started
+                        stepCount:
+                          anyOf:
+                            - type: integer
+                              minimum: -9007199254740991
+                              maximum: 9007199254740991
+                            - type: "null"
+                          description: Tool calls observed in the linked conversation so far
+                        artifacts:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              workspacePath:
+                                type: string
+                                description: Path of the produced file, as the assistant attached it
+                              displayName:
+                                type: string
+                                description: Human-readable file name for the card
+                            required:
+                              - workspacePath
+                              - displayName
+                            additionalProperties: false
+                          description: Files the completing turn attached
+                      required:
+                        - status
+                        - conversationId
+                        - startedAt
+                        - completedAt
+                        - stepCount
+                        - artifacts
+                      additionalProperties: false
+                    description: Progress keyed by task id
+                required:
+                  - version
+                  - listId
+                  - modalDismissedAt
+                  - allDoneShownAt
+                  - tasks
+                additionalProperties: false
+  /v1/activation/tasks/{taskId}/start:
+    post:
+      operationId: activation_tasks_by_taskId_start_post
+      summary: Start an activation task
+      description:
+        Link an activation task to the conversation its prompt was sent to. Idempotent per task; a different
+        conversation replaces the link only while the task is not done.
+      tags:
+        - activation
+      parameters:
+        - name: taskId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                conversationId:
+                  type: string
+                  minLength: 1
+                  maxLength: 128
+                  description: Conversation the task prompt was sent to
+                listId:
+                  description: List the task came from, stored only while no list is frozen
+                  type: string
+                  pattern: ^[a-z0-9-]{1,64}$
+              required:
+                - conversationId
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version:
+                    type: number
+                    const: 1
+                    description: Schema version
+                  listId:
+                    anyOf:
+                      - type: string
+                      - type: "null"
+                    description: Task list frozen on the first write, null before then
+                  modalDismissedAt:
+                    anyOf:
+                      - type: string
+                      - type: "null"
+                    description: ISO timestamp the welcome modal was dismissed
+                  allDoneShownAt:
+                    anyOf:
+                      - type: string
+                      - type: "null"
+                    description: ISO timestamp the celebration modal was dismissed
+                  tasks:
+                    type: object
+                    propertyNames:
+                      type: string
+                    additionalProperties:
+                      type: object
+                      properties:
+                        status:
+                          type: string
+                          enum:
+                            - started
+                            - done
+                          description: "`started` while the linked conversation is working the task"
+                        conversationId:
+                          type: string
+                          maxLength: 128
+                          description: Conversation the task was launched into
+                        startedAt:
+                          type: string
+                          description: ISO timestamp of the launch
+                        completedAt:
+                          anyOf:
+                            - type: string
+                            - type: "null"
+                          description: ISO timestamp of the completing turn, null while started
+                        stepCount:
+                          anyOf:
+                            - type: integer
+                              minimum: -9007199254740991
+                              maximum: 9007199254740991
+                            - type: "null"
+                          description: Tool calls observed in the linked conversation so far
+                        artifacts:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              workspacePath:
+                                type: string
+                                description: Path of the produced file, as the assistant attached it
+                              displayName:
+                                type: string
+                                description: Human-readable file name for the card
+                            required:
+                              - workspacePath
+                              - displayName
+                            additionalProperties: false
+                          description: Files the completing turn attached
+                      required:
+                        - status
+                        - conversationId
+                        - startedAt
+                        - completedAt
+                        - stepCount
+                        - artifacts
+                      additionalProperties: false
+                    description: Progress keyed by task id
+                required:
+                  - version
+                  - listId
+                  - modalDismissedAt
+                  - allDoneShownAt
+                  - tasks
+                additionalProperties: false
+        "400":
+          description: Malformed task id, list id, or conversation id
+        "404":
+          description: No such conversation; the link was not recorded
+        "409":
+          description: Stored progress was written by a newer build; the link was not recorded
+        "503":
+          description: Stored progress is locked by another process; the link was not recorded
   /v1/admin/rollback-migrations:
     post:
       operationId: admin_rollbackmigrations_post
@@ -1226,6 +1624,93 @@ paths:
                     type: number
                 required:
                   - published
+                additionalProperties: false
+  /v1/apps/{id}/refresh:
+    post:
+      operationId: apps_by_id_refresh_post
+      summary: Compile an app
+      description: Compile workspace or plugin app source into dist/ and refresh open surfaces.
+      tags:
+        - apps
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                    const: true
+                  appId:
+                    type: string
+                  name:
+                    type: string
+                  compiled:
+                    type: boolean
+                  compile_duration_ms:
+                    type: number
+                  compile_errors:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        text:
+                          type: string
+                        location:
+                          type: object
+                          properties:
+                            file:
+                              type: string
+                            line:
+                              type: number
+                            column:
+                              type: number
+                          required:
+                            - file
+                            - line
+                            - column
+                          additionalProperties: false
+                      required:
+                        - text
+                      additionalProperties: false
+                  compile_warnings:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        text:
+                          type: string
+                        location:
+                          type: object
+                          properties:
+                            file:
+                              type: string
+                            line:
+                              type: number
+                            column:
+                              type: number
+                          required:
+                            - file
+                            - line
+                            - column
+                          additionalProperties: false
+                      required:
+                        - text
+                      additionalProperties: false
+                required:
+                  - ok
+                  - appId
+                  - name
+                  - compiled
+                  - compile_duration_ms
                 additionalProperties: false
   /v1/apps/{id}/share-cloud:
     post:
@@ -2111,6 +2596,58 @@ paths:
                   - organizationId
                   - userId
                   - authenticated
+                additionalProperties: false
+  /v1/auto-profile/preview:
+    post:
+      operationId: autoprofile_preview_post
+      summary: Preview the Auto profile's pick for a draft
+      description:
+        Ask the Auto profile which default profile a draft message would run on, using the conversation's recent
+        history when one is given. The pick is kept briefly so the turn that sends the same text reuses it. Spends one
+        Jev call per request.
+      tags:
+        - conversations
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                text:
+                  type: string
+                  minLength: 1
+                  maxLength: 20000
+                conversationId:
+                  type: string
+                  description: Conversation the draft belongs to, for recent history. Omit for a new chat.
+              required:
+                - text
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  profile:
+                    anyOf:
+                      - type: string
+                      - type: "null"
+                  outcome:
+                    type: string
+                    enum:
+                      - routed
+                      - unavailable
+                      - timeout
+                      - error
+                      - fallback
+                  confidence:
+                    type: number
+                required:
+                  - profile
+                  - outcome
                 additionalProperties: false
   /v1/avatar/accent:
     post:
@@ -3661,6 +4198,8 @@ paths:
                 conversationId:
                   type: string
                   minLength: 1
+                desktop:
+                  type: boolean
               required:
                 - operation
       responses:
@@ -3696,7 +4235,7 @@ paths:
     post:
       operationId: browser_tabs_post
       summary: Manage browser tabs
-      description: List, create, select, or close browser tabs via the Chrome extension backend.
+      description: List, create, select, or close browser tabs in the Chrome extension or streamed desktop browser.
       tags:
         - browser
       requestBody:
@@ -3720,6 +4259,10 @@ paths:
                 conversationId:
                   type: string
                   minLength: 1
+                desktop:
+                  type: boolean
+                browserMode:
+                  type: string
                 tabId:
                   type: number
                 url:
@@ -4551,7 +5094,7 @@ paths:
                           type: string
                       required:
                         - type
-                    slackBotMentioned:
+                    botMentioned:
                       type: boolean
                     slackEditedTs:
                       type: string
@@ -4997,6 +5540,101 @@ paths:
       responses:
         "200":
           description: Successful response
+  /v1/channels/send:
+    post:
+      operationId: channels_send_post
+      summary: Send text to a channel chat
+      description: Deliver text to a chat on a channel through the channel's transport, recorded after the channel acknowledges it.
+      tags:
+        - channels
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                channel:
+                  type: string
+                  enum:
+                    - telegram
+                    - phone
+                    - vellum
+                    - whatsapp
+                    - slack
+                    - email
+                    - platform
+                    - a2a
+                    - discord
+                    - plugin
+                  description: Channel to send on
+                target:
+                  type: object
+                  properties:
+                    kind:
+                      type: string
+                      const: chat
+                    chatId:
+                      type: string
+                      minLength: 1
+                      description: Chat id in the channel's own id space
+                    threadId:
+                      description: Thread within the chat, in the channel's own id space
+                      type: string
+                      minLength: 1
+                  required:
+                    - kind
+                    - chatId
+                text:
+                  type: string
+                  minLength: 1
+                  description: Text to send
+                renderRichly:
+                  description: Ask the channel for its rich rendering, where it has one
+                  type: boolean
+              required:
+                - channel
+                - target
+                - text
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  channel:
+                    type: string
+                    enum:
+                      - telegram
+                      - phone
+                      - vellum
+                      - whatsapp
+                      - slack
+                      - email
+                      - platform
+                      - a2a
+                      - discord
+                      - plugin
+                  chatId:
+                    type: string
+                  threadId:
+                    type: string
+                  messageIds:
+                    type: array
+                    items:
+                      type: string
+                  lastMessageId:
+                    type: string
+                  recordedIn:
+                    type: string
+                required:
+                  - channel
+                  - chatId
+                  - messageIds
+                  - lastMessageId
+                additionalProperties: false
   /v1/clients:
     get:
       operationId: clients_get
@@ -5060,6 +5698,64 @@ paths:
                     description: Number of disposed subscribers.
                 required:
                   - disconnected
+                additionalProperties: false
+  /v1/clients/history:
+    get:
+      operationId: clients_history_get
+      summary: List client connection history
+      description:
+        Return persisted client subscribe/dispose events and coalesced sessions. Reconnects shorter than 60 seconds
+        are flaps, not outages.
+      tags:
+        - clients
+      parameters:
+        - name: clientId
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Restrict history to one client UUID.
+        - name: interfaceId
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Restrict history to one interface (e.g. chrome-extension).
+        - name: since
+          in: query
+          required: false
+          schema:
+            type: string
+          description: ISO-8601 or epoch-ms lower bound. Sessions already open at this time are included.
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Max coalesced sessions to return (1-500, default 50).
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sessions:
+                    type: array
+                    items:
+                      type: object
+                      properties: {}
+                      additionalProperties: {}
+                  events:
+                    type: array
+                    items:
+                      type: object
+                      properties: {}
+                      additionalProperties: {}
+                required:
+                  - sessions
+                  - events
                 additionalProperties: false
   /v1/clients/presence:
     post:
@@ -7341,9 +8037,13 @@ paths:
             enum:
               - background
               - scheduled
+              - all
           description:
             Filter by conversation type. Pass "background" to list background and scheduled conversations together (the
-            back-compat umbrella), or "scheduled" to list only scheduled conversations.
+            back-compat umbrella), "scheduled" to list only scheduled conversations, or "all" for the union of the
+            standard listing and that umbrella, so one paginated cursor spans every type. Combine "all" with
+            archiveStatus=all for a whole-history read; rows are recency-ordered (COALESCE(last_message_at, updated_at)
+            descending) like every other list read, and pinned rows are never appended to it.
         - name: archiveStatus
           in: query
           required: false
@@ -10793,7 +11493,9 @@ paths:
     post:
       operationId: credentials_list_post
       summary: List all credentials with metadata
-      description: Return all stored credentials with metadata, OAuth connection info, and platform-managed credentials.
+      description:
+        Return credentials from the live credential vault, with OAuth connection info and platform-managed
+        credentials. Fails if the vault is unreachable.
       tags:
         - credentials
       requestBody:
@@ -11128,54 +11830,6 @@ paths:
                   - schedules
                   - timestamp
                 additionalProperties: false
-  /v1/debug/bash:
-    post:
-      operationId: debug_bash_post
-      summary: Execute a shell command in the assistant process
-      description: Developer debugging tool. Requires the assistant to be running with VELLUM_DEBUG=1.
-      tags:
-        - debug
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              properties:
-                command:
-                  type: string
-                  description: Shell command to execute via bash -c
-                timeoutMs:
-                  description: "Execution timeout in milliseconds (default: 30000)"
-                  type: number
-              required:
-                - command
-      responses:
-        "200":
-          description: Successful response
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  stdout:
-                    type: string
-                  stderr:
-                    type: string
-                  exitCode:
-                    anyOf:
-                      - type: number
-                      - type: "null"
-                  timedOut:
-                    type: boolean
-                  error:
-                    type: string
-                required:
-                  - stdout
-                  - stderr
-                  - exitCode
-                  - timedOut
-                additionalProperties: false
   /v1/debug/database:
     get:
       operationId: debug_database_get
@@ -11379,6 +12033,71 @@ paths:
                 required:
                   - defers
                 additionalProperties: false
+  /v1/desktop/setup:
+    get:
+      operationId: desktop_setup_get
+      summary: Get virtual desktop setup status
+      tags:
+        - desktop
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  state:
+                    type: string
+                    enum:
+                      - required
+                      - installing
+                      - ready
+                      - failed
+                      - unsupported
+                  automationActive:
+                    type: boolean
+                  stage:
+                    type: string
+                    enum:
+                      - packages
+                      - chrome
+                      - checking
+                required:
+                  - state
+                additionalProperties: false
+    post:
+      operationId: desktop_setup_post
+      summary: Check virtual desktop readiness (legacy POST)
+      tags:
+        - desktop
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  state:
+                    type: string
+                    enum:
+                      - required
+                      - installing
+                      - ready
+                      - failed
+                      - unsupported
+                  automationActive:
+                    type: boolean
+                  stage:
+                    type: string
+                    enum:
+                      - packages
+                      - chrome
+                      - checking
+                required:
+                  - state
+                additionalProperties: false
   /v1/diagnostics/env-vars:
     get:
       operationId: diagnostics_envvars_get
@@ -11393,7 +12112,9 @@ paths:
     post:
       operationId: dictation_post
       summary: Process dictation
-      description: Classify voice input as dictation or action, clean up text, and apply user style preferences.
+      description:
+        Preserve dictated words with explicit dictionary and snippet replacements, classify actions, or edit
+        selected text when instructed.
       tags:
         - diagnostics
       requestBody:
@@ -11761,6 +12482,9 @@ paths:
                           type: number
                         updatedAt:
                           type: number
+                        revision:
+                          description: Bumped by one on every write. Absent from assistants that predate document revisions.
+                          type: number
                       required:
                         - surfaceId
                         - conversationId
@@ -11775,7 +12499,10 @@ paths:
     post:
       operationId: documents_post
       summary: Save a document
-      description: Create or upsert a document (by surfaceId).
+      description:
+        Create or upsert a document (by surfaceId). With `baseRevision`, an existing document is only overwritten
+        while its revision still equals `baseRevision`; otherwise the save is rejected with 409 CONFLICT and
+        `error.details` carries the current `revision`, `title`, and `content`.
       tags:
         - documents
       requestBody:
@@ -11800,6 +12527,13 @@ paths:
                 wordCount:
                   type: number
                   description: Word count
+                baseRevision:
+                  description:
+                    The revision this save was edited from. When set and the stored revision differs, nothing is written and
+                    the request fails with 409. Omit for an unconditional write.
+                  type: integer
+                  minimum: 0
+                  maximum: 9007199254740991
               required:
                 - surfaceId
                 - conversationId
@@ -11819,6 +12553,9 @@ paths:
                     const: true
                   surfaceId:
                     type: string
+                  revision:
+                    description: The document's revision after the save. Absent from assistants that predate document revisions.
+                    type: number
                 required:
                   - success
                   - surfaceId
@@ -11859,6 +12596,9 @@ paths:
                   createdAt:
                     type: number
                   updatedAt:
+                    type: number
+                  revision:
+                    description: Bumped by one on every write. Absent from assistants that predate document revisions.
                     type: number
                 required:
                   - success
@@ -12286,6 +13026,216 @@ paths:
               schema:
                 type: string
                 format: binary
+  /v1/documents/{id}/revisions:
+    get:
+      operationId: documents_by_id_revisions_get
+      summary: List a document's revisions
+      description: Return the document's history snapshots, newest first, without their content.
+      tags:
+        - documents
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  revisions:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        revision:
+                          type: number
+                          description: The document revision this snapshot holds
+                        author:
+                          type: string
+                          enum:
+                            - user
+                            - assistant
+                          description: Who made the edit that replaced this state
+                        createdAt:
+                          type: number
+                          description: When the snapshot was taken
+                        wordCount:
+                          type: number
+                        title:
+                          type: string
+                      required:
+                        - revision
+                        - author
+                        - createdAt
+                        - wordCount
+                        - title
+                      additionalProperties: false
+                required:
+                  - revisions
+                additionalProperties: false
+  /v1/documents/{id}/revisions/{revision}:
+    get:
+      operationId: documents_by_id_revisions_by_revision_get
+      summary: Get a document revision
+      description: Return one history snapshot with its content.
+      tags:
+        - documents
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: revision
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  revision:
+                    type: number
+                    description: The document revision this snapshot holds
+                  author:
+                    type: string
+                    enum:
+                      - user
+                      - assistant
+                    description: Who made the edit that replaced this state
+                  createdAt:
+                    type: number
+                    description: When the snapshot was taken
+                  wordCount:
+                    type: number
+                  title:
+                    type: string
+                  content:
+                    type: string
+                required:
+                  - revision
+                  - author
+                  - createdAt
+                  - wordCount
+                  - title
+                  - content
+                additionalProperties: false
+  /v1/documents/{id}/revisions/{revision}/restore:
+    post:
+      operationId: documents_by_id_revisions_by_revision_restore_post
+      summary: Restore a document revision
+      description:
+        Write a snapshot's title and content back as a new revision. The current state is snapshotted first, so the
+        restore can itself be undone.
+      tags:
+        - documents
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: revision
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    const: true
+                  surfaceId:
+                    type: string
+                  revision:
+                    type: number
+                    description: The document's revision after the restore
+                  title:
+                    type: string
+                  content:
+                    type: string
+                required:
+                  - success
+                  - surfaceId
+                  - revision
+                  - title
+                  - content
+                additionalProperties: false
+  /v1/documents/create:
+    post:
+      operationId: documents_create_post
+      summary: Create a document
+      description: Create an empty document owned by a conversation and return it with its new surface ID.
+      tags:
+        - documents
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                conversationId:
+                  type: string
+                  description: Owning conversation
+                title:
+                  description: Document title. Defaults to "Untitled Document".
+                  type: string
+              required:
+                - conversationId
+      responses:
+        "200":
+          description: Successful response
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  surfaceId:
+                    type: string
+                  conversationId:
+                    type: string
+                  title:
+                    type: string
+                  content:
+                    type: string
+                  wordCount:
+                    type: number
+                  createdAt:
+                    type: number
+                  updatedAt:
+                    type: number
+                  revision:
+                    description: Bumped by one on every write. Absent from assistants that predate document revisions.
+                    type: number
+                required:
+                  - success
+                  - surfaceId
+                  - conversationId
+                  - title
+                  - content
+                  - wordCount
+                  - createdAt
+                  - updatedAt
+                additionalProperties: false
   /v1/domain/register:
     post:
       operationId: domain_register_post
@@ -13329,7 +14279,7 @@ paths:
     post:
       operationId: guardianactions_decision_post
       summary: Submit guardian decision
-      description: Submit a guardian action decision (approve/reject).
+      description: Submit a guardian decision on a pending request.
       tags:
         - guardian
       requestBody:
@@ -13341,9 +14291,17 @@ paths:
               properties:
                 requestId:
                   type: string
+                  minLength: 1
                   description: Guardian request ID
                 action:
                   type: string
+                  enum:
+                    - approve_once
+                    - reject
+                    - trust
+                    - verify_code
+                    - leave_unverified
+                    - block
                   description: Decision action
                 conversationId:
                   type: string
@@ -14354,6 +15312,24 @@ paths:
                             - intent
                             - status
                           additionalProperties: false
+                        updates:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              skillId:
+                                type: string
+                              name:
+                                type: string
+                              summary:
+                                type: string
+                              conversationId:
+                                type: string
+                            required:
+                              - skillId
+                              - name
+                              - summary
+                            additionalProperties: false
                         category:
                           type: string
                           enum:
@@ -14589,6 +15565,24 @@ paths:
                       - intent
                       - status
                     additionalProperties: false
+                  updates:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        skillId:
+                          type: string
+                        name:
+                          type: string
+                        summary:
+                          type: string
+                        conversationId:
+                          type: string
+                      required:
+                        - skillId
+                        - name
+                        - summary
+                      additionalProperties: false
                   category:
                     type: string
                     enum:
@@ -14918,6 +15912,24 @@ paths:
                             - intent
                             - status
                           additionalProperties: false
+                        updates:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              skillId:
+                                type: string
+                              name:
+                                type: string
+                              summary:
+                                type: string
+                              conversationId:
+                                type: string
+                            required:
+                              - skillId
+                              - name
+                              - summary
+                            additionalProperties: false
                         category:
                           type: string
                           enum:
@@ -15386,6 +16398,13 @@ paths:
                   type: string
                 userGuidance:
                   type: string
+                timings:
+                  type: object
+                  propertyNames:
+                    type: string
+                  additionalProperties:
+                    type: number
+                  description: Per-phase helper timings in milliseconds
               required:
                 - requestId
       responses:
@@ -15605,7 +16624,7 @@ paths:
     post:
       operationId: imagegeneration_generate_post
       summary: Generate or edit images using AI
-      description: Calls the configured image-generation provider (Gemini or OpenAI) to produce one or more images.
+      description: Calls the configured image-generation provider (Gemini, OpenAI, or OpenRouter) to produce one or more images.
       tags:
         - image-generation
       requestBody:
@@ -15944,7 +16963,8 @@ paths:
             type: string
           description:
             "Filter by provider id. One of: anthropic, openai, gemini, ollama, fireworks, together, openrouter,
-            vercel-ai-gateway, litellm, opencode, openai-compatible, minimax, atlascloud, baseten, poolside, vellum"
+            vercel-ai-gateway, litellm, opencode, openai-compatible, minimax, atlascloud, baseten, poolside, typesafe,
+            vellum"
       responses:
         "200":
           description: Successful response
@@ -16216,8 +17236,8 @@ paths:
             type: string
           description:
             "Filter by provider. One of: anthropic, openai, gemini, ollama, fireworks, together, openrouter,
-            vercel-ai-gateway, litellm, opencode, openai-compatible, minimax, atlascloud, baseten, poolside, vellum,
-            chatgpt"
+            vercel-ai-gateway, litellm, opencode, openai-compatible, minimax, atlascloud, baseten, poolside, typesafe,
+            vellum, chatgpt"
       responses:
         "200":
           description: Successful response
@@ -17824,7 +18844,7 @@ paths:
     get:
       operationId: internal_mcp_list_get
       summary: List MCP servers with health status
-      description: Returns configured MCP servers with live health-check results (connected, needs auth, error).
+      description: Returns configured MCP servers with recorded runtime status without opening new connections.
       tags:
         - internal
       responses:
@@ -20331,6 +21351,12 @@ paths:
           schema:
             type: integer
           description: Maximum number of messages to return.
+        - name: modeSessionIds
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Comma-separated mode-session IDs to include with summaries for loaded active groups outside this page.
       responses:
         "200":
           description: Successful response
@@ -20346,6 +21372,38 @@ paths:
                       properties:
                         id:
                           type: string
+                        modeSession:
+                          type: object
+                          properties:
+                            mode:
+                              type: string
+                              enum:
+                                - computer_use
+                                - browser
+                                - live_vision
+                                - ambient
+                            id:
+                              type: string
+                              minLength: 1
+                          required:
+                            - mode
+                            - id
+                          additionalProperties: false
+                        modeSessionActivity:
+                          type: object
+                          properties:
+                            firstAt:
+                              type: integer
+                              minimum: 0
+                              maximum: 8640000000000000
+                            lastAt:
+                              type: integer
+                              minimum: 0
+                              maximum: 8640000000000000
+                          required:
+                            - firstAt
+                            - lastAt
+                          additionalProperties: false
                         mergedMessageIds:
                           type: array
                           items:
@@ -20379,6 +21437,8 @@ paths:
                               thumbnailData:
                                 type: string
                               fileBacked:
+                                type: boolean
+                              computerUseScreenshot:
                                 type: boolean
                             required:
                               - id
@@ -20505,6 +21565,9 @@ paths:
                                           - keenable
                                           - firecrawl
                                           - fastcrw
+                                          - searxng
+                                          - tinyfish
+                                          - exa
                                       resultCount:
                                         type: number
                                       durationMs:
@@ -20558,6 +21621,7 @@ paths:
                                           - default
                                           - firecrawl
                                           - fastcrw
+                                          - tinyfish
                                       status:
                                         type: number
                                       contentType:
@@ -20582,6 +21646,10 @@ paths:
                                         type: string
                                       mayRequireJavaScript:
                                         type: boolean
+                                      startIndexPastEnd:
+                                        type: boolean
+                                      providerWarning:
+                                        type: string
                                     required:
                                       - url
                                       - finalUrl
@@ -20592,6 +21660,100 @@ paths:
                                       - domain
                                       - redirectCount
                                       - durationMs
+                                    additionalProperties: false
+                                  recall:
+                                    type: object
+                                    properties:
+                                      query:
+                                        type: string
+                                      depth:
+                                        type: string
+                                        enum:
+                                          - fast
+                                          - standard
+                                          - deep
+                                      sources:
+                                        type: array
+                                        items:
+                                          type: string
+                                          enum:
+                                            - memory
+                                            - conversations
+                                            - workspace
+                                      answer:
+                                        type: string
+                                      evidence:
+                                        type: array
+                                        items:
+                                          type: object
+                                          properties:
+                                            source:
+                                              type: string
+                                              enum:
+                                                - memory
+                                                - conversations
+                                                - workspace
+                                            title:
+                                              type: string
+                                            locator:
+                                              type: string
+                                            excerpt:
+                                              type: string
+                                            timestampMs:
+                                              type: number
+                                            path:
+                                              type: string
+                                            conversationId:
+                                              type: string
+                                            messageId:
+                                              type: string
+                                          required:
+                                            - source
+                                            - title
+                                            - locator
+                                            - excerpt
+                                          additionalProperties: false
+                                      searchedSources:
+                                        type: array
+                                        items:
+                                          type: object
+                                          properties:
+                                            source:
+                                              type: string
+                                              enum:
+                                                - memory
+                                                - conversations
+                                                - workspace
+                                            status:
+                                              type: string
+                                              enum:
+                                                - searched
+                                                - degraded
+                                            evidenceCount:
+                                              type: number
+                                            error:
+                                              type: string
+                                          required:
+                                            - source
+                                            - status
+                                            - evidenceCount
+                                          additionalProperties: false
+                                    required:
+                                      - query
+                                      - depth
+                                      - sources
+                                      - evidence
+                                      - searchedSources
+                                    additionalProperties: false
+                                  remember:
+                                    type: object
+                                    properties:
+                                      facts:
+                                        type: array
+                                        items:
+                                          type: string
+                                    required:
+                                      - facts
                                     additionalProperties: false
                                 additionalProperties: false
                               scopeOptions:
@@ -20707,6 +21869,9 @@ paths:
                                             additionalProperties: false
                                         freeTextPlaceholder:
                                           type: string
+                                        presentation:
+                                          type: string
+                                          const: virtual_desktop
                                       required:
                                         - id
                                         - question
@@ -20749,6 +21914,9 @@ paths:
                                             additionalProperties: false
                                         freeTextPlaceholder:
                                           type: string
+                                        presentation:
+                                          type: string
+                                          const: virtual_desktop
                                       required:
                                         - id
                                         - question
@@ -21016,6 +22184,9 @@ paths:
                                                   - keenable
                                                   - firecrawl
                                                   - fastcrw
+                                                  - searxng
+                                                  - tinyfish
+                                                  - exa
                                               resultCount:
                                                 type: number
                                               durationMs:
@@ -21069,6 +22240,7 @@ paths:
                                                   - default
                                                   - firecrawl
                                                   - fastcrw
+                                                  - tinyfish
                                               status:
                                                 type: number
                                               contentType:
@@ -21093,6 +22265,10 @@ paths:
                                                 type: string
                                               mayRequireJavaScript:
                                                 type: boolean
+                                              startIndexPastEnd:
+                                                type: boolean
+                                              providerWarning:
+                                                type: string
                                             required:
                                               - url
                                               - finalUrl
@@ -21103,6 +22279,100 @@ paths:
                                               - domain
                                               - redirectCount
                                               - durationMs
+                                            additionalProperties: false
+                                          recall:
+                                            type: object
+                                            properties:
+                                              query:
+                                                type: string
+                                              depth:
+                                                type: string
+                                                enum:
+                                                  - fast
+                                                  - standard
+                                                  - deep
+                                              sources:
+                                                type: array
+                                                items:
+                                                  type: string
+                                                  enum:
+                                                    - memory
+                                                    - conversations
+                                                    - workspace
+                                              answer:
+                                                type: string
+                                              evidence:
+                                                type: array
+                                                items:
+                                                  type: object
+                                                  properties:
+                                                    source:
+                                                      type: string
+                                                      enum:
+                                                        - memory
+                                                        - conversations
+                                                        - workspace
+                                                    title:
+                                                      type: string
+                                                    locator:
+                                                      type: string
+                                                    excerpt:
+                                                      type: string
+                                                    timestampMs:
+                                                      type: number
+                                                    path:
+                                                      type: string
+                                                    conversationId:
+                                                      type: string
+                                                    messageId:
+                                                      type: string
+                                                  required:
+                                                    - source
+                                                    - title
+                                                    - locator
+                                                    - excerpt
+                                                  additionalProperties: false
+                                              searchedSources:
+                                                type: array
+                                                items:
+                                                  type: object
+                                                  properties:
+                                                    source:
+                                                      type: string
+                                                      enum:
+                                                        - memory
+                                                        - conversations
+                                                        - workspace
+                                                    status:
+                                                      type: string
+                                                      enum:
+                                                        - searched
+                                                        - degraded
+                                                    evidenceCount:
+                                                      type: number
+                                                    error:
+                                                      type: string
+                                                  required:
+                                                    - source
+                                                    - status
+                                                    - evidenceCount
+                                                  additionalProperties: false
+                                            required:
+                                              - query
+                                              - depth
+                                              - sources
+                                              - evidence
+                                              - searchedSources
+                                            additionalProperties: false
+                                          remember:
+                                            type: object
+                                            properties:
+                                              facts:
+                                                type: array
+                                                items:
+                                                  type: string
+                                            required:
+                                              - facts
                                             additionalProperties: false
                                         additionalProperties: false
                                       scopeOptions:
@@ -21218,6 +22488,9 @@ paths:
                                                     additionalProperties: false
                                                 freeTextPlaceholder:
                                                   type: string
+                                                presentation:
+                                                  type: string
+                                                  const: virtual_desktop
                                               required:
                                                 - id
                                                 - question
@@ -21260,6 +22533,9 @@ paths:
                                                     additionalProperties: false
                                                 freeTextPlaceholder:
                                                   type: string
+                                                presentation:
+                                                  type: string
+                                                  const: virtual_desktop
                                               required:
                                                 - id
                                                 - question
@@ -21387,6 +22663,8 @@ paths:
                                         type: string
                                       fileBacked:
                                         type: boolean
+                                      computerUseScreenshot:
+                                        type: boolean
                                     required:
                                       - id
                                       - filename
@@ -21473,6 +22751,11 @@ paths:
                           type: boolean
                         noResponse:
                           type: boolean
+                        autoRoutedProfile:
+                          type: string
+                        cameraFrame:
+                          type: boolean
+                          const: true
                         assistantTextVisibility:
                           type: string
                           enum:
@@ -21643,6 +22926,223 @@ paths:
                       locally but the server reports `processing: false`, the turn has ended (or died) and the UI should
                       stop waiting rather than spin indefinitely. Absent on older daemons that predate this field."
                     type: boolean
+                  modeSessions:
+                    description: Conversation-owned mode-session summaries referenced by this page or explicitly requested by ID.
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        summary:
+                          oneOf:
+                            - type: object
+                              properties:
+                                id:
+                                  type: string
+                                  minLength: 1
+                                conversationId:
+                                  type: string
+                                  minLength: 1
+                                mode:
+                                  type: string
+                                  enum:
+                                    - computer_use
+                                    - browser
+                                    - live_vision
+                                    - ambient
+                                sourceStartedAt:
+                                  type: integer
+                                  minimum: 0
+                                  maximum: 9007199254740991
+                                firstIncludedAt:
+                                  anyOf:
+                                    - type: integer
+                                      minimum: 0
+                                      maximum: 9007199254740991
+                                    - type: "null"
+                                firstIncludedMessageId:
+                                  anyOf:
+                                    - type: string
+                                      minLength: 1
+                                    - type: "null"
+                                lastActivityAt:
+                                  type: integer
+                                  minimum: 0
+                                  maximum: 9007199254740991
+                                lastOwnedMessageId:
+                                  anyOf:
+                                    - type: string
+                                      minLength: 1
+                                    - type: "null"
+                                revision:
+                                  type: integer
+                                  exclusiveMinimum: 0
+                                  maximum: 9007199254740991
+                                status:
+                                  type: string
+                                  const: active
+                                endedAt:
+                                  type: "null"
+                                endReason:
+                                  type: "null"
+                              required:
+                                - id
+                                - conversationId
+                                - mode
+                                - sourceStartedAt
+                                - firstIncludedAt
+                                - firstIncludedMessageId
+                                - lastActivityAt
+                                - lastOwnedMessageId
+                                - revision
+                                - status
+                                - endedAt
+                                - endReason
+                              additionalProperties: false
+                            - type: object
+                              properties:
+                                id:
+                                  type: string
+                                  minLength: 1
+                                conversationId:
+                                  type: string
+                                  minLength: 1
+                                mode:
+                                  type: string
+                                  enum:
+                                    - computer_use
+                                    - browser
+                                    - live_vision
+                                    - ambient
+                                sourceStartedAt:
+                                  type: integer
+                                  minimum: 0
+                                  maximum: 9007199254740991
+                                firstIncludedAt:
+                                  anyOf:
+                                    - type: integer
+                                      minimum: 0
+                                      maximum: 9007199254740991
+                                    - type: "null"
+                                firstIncludedMessageId:
+                                  anyOf:
+                                    - type: string
+                                      minLength: 1
+                                    - type: "null"
+                                lastActivityAt:
+                                  type: integer
+                                  minimum: 0
+                                  maximum: 9007199254740991
+                                lastOwnedMessageId:
+                                  anyOf:
+                                    - type: string
+                                      minLength: 1
+                                    - type: "null"
+                                revision:
+                                  type: integer
+                                  exclusiveMinimum: 0
+                                  maximum: 9007199254740991
+                                status:
+                                  type: string
+                                  const: completed
+                                endedAt:
+                                  type: integer
+                                  minimum: 0
+                                  maximum: 9007199254740991
+                                endReason:
+                                  type: string
+                                  minLength: 1
+                              required:
+                                - id
+                                - conversationId
+                                - mode
+                                - sourceStartedAt
+                                - firstIncludedAt
+                                - firstIncludedMessageId
+                                - lastActivityAt
+                                - lastOwnedMessageId
+                                - revision
+                                - status
+                                - endedAt
+                                - endReason
+                              additionalProperties: false
+                            - type: object
+                              properties:
+                                id:
+                                  type: string
+                                  minLength: 1
+                                conversationId:
+                                  type: string
+                                  minLength: 1
+                                mode:
+                                  type: string
+                                  enum:
+                                    - computer_use
+                                    - browser
+                                    - live_vision
+                                    - ambient
+                                sourceStartedAt:
+                                  type: integer
+                                  minimum: 0
+                                  maximum: 9007199254740991
+                                firstIncludedAt:
+                                  anyOf:
+                                    - type: integer
+                                      minimum: 0
+                                      maximum: 9007199254740991
+                                    - type: "null"
+                                firstIncludedMessageId:
+                                  anyOf:
+                                    - type: string
+                                      minLength: 1
+                                    - type: "null"
+                                lastActivityAt:
+                                  type: integer
+                                  minimum: 0
+                                  maximum: 9007199254740991
+                                lastOwnedMessageId:
+                                  anyOf:
+                                    - type: string
+                                      minLength: 1
+                                    - type: "null"
+                                revision:
+                                  type: integer
+                                  exclusiveMinimum: 0
+                                  maximum: 9007199254740991
+                                status:
+                                  type: string
+                                  const: interrupted
+                                endedAt:
+                                  anyOf:
+                                    - type: integer
+                                      minimum: 0
+                                      maximum: 9007199254740991
+                                    - type: "null"
+                                endReason:
+                                  type: string
+                                  minLength: 1
+                              required:
+                                - id
+                                - conversationId
+                                - mode
+                                - sourceStartedAt
+                                - firstIncludedAt
+                                - firstIncludedMessageId
+                                - lastActivityAt
+                                - lastOwnedMessageId
+                                - revision
+                                - status
+                                - endedAt
+                                - endReason
+                              additionalProperties: false
+                          type: object
+                        runtimeState:
+                          type: string
+                          enum:
+                            - waiting
+                            - finishing
+                      required:
+                        - summary
+                      additionalProperties: false
                 required:
                   - messages
                 additionalProperties: false
@@ -22602,6 +24102,14 @@ paths:
                 description:
                   description: Human-readable export description.
                   type: string
+                profile:
+                  description:
+                    "Export profile. 'migration' (default) builds a teleport bundle. 'debug' builds a bundle for Vellum staff
+                    to open on a debug clone: no credentials, plus the gateway's database and logs under gateway/."
+                  type: string
+                  enum:
+                    - migration
+                    - debug
               required:
                 - upload_url
       responses:
@@ -23585,6 +25093,24 @@ paths:
                           - intent
                           - status
                         additionalProperties: false
+                      updates:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            skillId:
+                              type: string
+                            name:
+                              type: string
+                            summary:
+                              type: string
+                            conversationId:
+                              type: string
+                          required:
+                            - skillId
+                            - name
+                            - summary
+                          additionalProperties: false
                       category:
                         type: string
                         enum:
@@ -23757,11 +25283,58 @@ paths:
                     type: boolean
                   reason:
                     type: string
+                  selectedChannels:
+                    type: array
+                    items:
+                      type: string
+                  deliveryResults:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        channel:
+                          type: string
+                        destination:
+                          type: string
+                        status:
+                          type: string
+                          enum:
+                            - pending
+                            - sent
+                            - failed
+                            - skipped
+                        errorCode:
+                          type: string
+                        errorMessage:
+                          type: string
+                        sentAt:
+                          type: number
+                        conversationId:
+                          type: string
+                        messageId:
+                          type: string
+                        conversationStrategy:
+                          type: string
+                      required:
+                        - channel
+                        - destination
+                        - status
+                      additionalProperties: false
+                  receiptClass:
+                    type: string
+                    enum:
+                      - provider_accepted
+                      - gateway_accepted
+                      - client_os_posted
+                      - unknown
                 required:
                   - signalId
                   - dispatched
                   - deduplicated
                   - reason
+                  - selectedChannels
+                  - deliveryResults
+                  - receiptClass
                 additionalProperties: false
   /v1/notifications/events:
     post:
@@ -23876,6 +25449,38 @@ paths:
                             anyOf:
                               - type: string
                               - type: "null"
+                          category:
+                            anyOf:
+                              - type: string
+                                enum:
+                                  - productivity
+                                  - communication
+                                  - meetings
+                                  - sales
+                                  - marketing
+                                  - finance
+                                  - commerce
+                                  - engineering
+                                  - knowledge
+                                  - recruiting
+                              - type: "null"
+                            description: Where the integrations catalog files the provider; null for a provider without a seed entry.
+                          tenant_host:
+                            anyOf:
+                              - type: object
+                                properties:
+                                  pattern:
+                                    type: string
+                                  label:
+                                    type: string
+                                  placeholder:
+                                    type: string
+                                required:
+                                  - pattern
+                                  - label
+                                  - placeholder
+                                additionalProperties: false
+                              - type: "null"
                           acts_as:
                             type: string
                             enum:
@@ -23892,6 +25497,8 @@ paths:
                           - supports_managed_mode
                           - managed_service_is_paid
                           - feature_flag
+                          - category
+                          - tenant_host
                           - acts_as
                         additionalProperties: false
                       - type: "null"
@@ -24410,6 +26017,38 @@ paths:
                           anyOf:
                             - type: string
                             - type: "null"
+                        category:
+                          anyOf:
+                            - type: string
+                              enum:
+                                - productivity
+                                - communication
+                                - meetings
+                                - sales
+                                - marketing
+                                - finance
+                                - commerce
+                                - engineering
+                                - knowledge
+                                - recruiting
+                            - type: "null"
+                          description: Where the integrations catalog files the provider; null for a provider without a seed entry.
+                        tenant_host:
+                          anyOf:
+                            - type: object
+                              properties:
+                                pattern:
+                                  type: string
+                                label:
+                                  type: string
+                                placeholder:
+                                  type: string
+                              required:
+                                - pattern
+                                - label
+                                - placeholder
+                              additionalProperties: false
+                            - type: "null"
                         acts_as:
                           type: string
                           enum:
@@ -24426,6 +26065,8 @@ paths:
                         - supports_managed_mode
                         - managed_service_is_paid
                         - feature_flag
+                        - category
+                        - tenant_host
                         - acts_as
                       additionalProperties: false
                 required:
@@ -25074,6 +26715,9 @@ paths:
                                     additionalProperties: false
                                 freeTextPlaceholder:
                                   type: string
+                                presentation:
+                                  type: string
+                                  const: virtual_desktop
                               required:
                                 - id
                                 - question
@@ -25564,7 +27208,12 @@ paths:
                   assistantId:
                     type: string
                   hasAssistantApiKey:
-                    type: boolean
+                    anyOf:
+                      - type: boolean
+                      - type: "null"
+                    description:
+                      Whether a managed assistant API key is stored. Null when the credential store could not be read, which is
+                      not evidence that no key is stored.
                   hasWebhookSecret:
                     type: boolean
                   clientInstallationId:
@@ -25905,6 +27554,12 @@ paths:
                   target:
                     type: string
                     description: Absolute path that was removed on the assistant host. Useful for audit logs and confirmation toasts.
+                  warnings:
+                    description: Stable keys for non-fatal cleanup limitations that should be localized at the presentation edge.
+                    type: array
+                    items:
+                      type: string
+                      const: plugin.uninstall.mcp_oauth_credentials_unchecked
                 required:
                   - name
                   - target
@@ -25971,26 +27626,44 @@ paths:
                     description: Resolved version (installed copy first, then repo `package.json`).
                   source:
                     anyOf:
-                      - type: object
-                        properties:
-                          kind:
-                            type: string
-                            const: github
-                          repo:
-                            type: string
-                            description: "`owner/repo` of the external plugin repository."
-                          path:
-                            description: Directory within the repo, when the plugin is not at the root.
-                            type: string
-                          ref:
-                            type: string
-                            description: Pinned git ref the plugin is fetched from.
-                        required:
-                          - kind
-                          - repo
-                          - ref
-                        additionalProperties: false
-                        description: "Origin of the match: a whitelisted external plugin repository."
+                      - oneOf:
+                          - type: object
+                            properties:
+                              kind:
+                                type: string
+                                const: github
+                              repo:
+                                type: string
+                                description: "`owner/repo` of the external plugin repository."
+                              path:
+                                description: Directory within the repo, when the plugin is not at the root.
+                                type: string
+                              ref:
+                                type: string
+                                description: Pinned git ref the plugin is fetched from.
+                            required:
+                              - kind
+                              - repo
+                              - ref
+                            additionalProperties: false
+                          - type: object
+                            properties:
+                              kind:
+                                type: string
+                                const: local
+                              path:
+                                type: string
+                                description: Package key in the assistant bundle.
+                              version:
+                                type: string
+                                description: Bundled package version.
+                            required:
+                              - kind
+                              - path
+                              - version
+                            additionalProperties: false
+                        description: Reviewed source of the marketplace entry.
+                        type: object
                       - type: "null"
                     description: Pinned origin from the marketplace entry, or null when an installed copy has no catalog entry.
                   readme:
@@ -26345,28 +28018,42 @@ paths:
                             description: ISO-8601 install timestamp from the sidecar; null when absent.
                           source:
                             anyOf:
-                              - type: object
-                                properties:
-                                  kind:
-                                    type: string
-                                    description: Source kind. Only `github` is written today.
-                                  owner:
-                                    type: string
-                                  repo:
-                                    type: string
-                                  path:
-                                    description: Repo-relative directory holding the plugin root; absent = repo root.
-                                    type: string
-                                  ref:
-                                    type: string
-                                    description: Ref the install resolved through (the pinned commit SHA for marketplace installs).
-                                required:
-                                  - kind
-                                  - owner
-                                  - repo
-                                  - ref
-                                additionalProperties: false
+                              - oneOf:
+                                  - type: object
+                                    properties:
+                                      kind:
+                                        type: string
+                                        const: github
+                                      owner:
+                                        type: string
+                                      repo:
+                                        type: string
+                                      path:
+                                        type: string
+                                      ref:
+                                        type: string
+                                    required:
+                                      - kind
+                                      - owner
+                                      - repo
+                                      - ref
+                                    additionalProperties: false
+                                  - type: object
+                                    properties:
+                                      kind:
+                                        type: string
+                                        const: local
+                                      path:
+                                        type: string
+                                      version:
+                                        type: string
+                                    required:
+                                      - kind
+                                      - path
+                                      - version
+                                    additionalProperties: false
                                 description: Source coordinates recorded in the install-time provenance sidecar.
+                                type: object
                               - type: "null"
                             description: Source recorded at install time; null when no sidecar exists.
                           localChanges:
@@ -26425,6 +28112,9 @@ paths:
                     anyOf:
                       - type: object
                         properties:
+                          kind:
+                            type: string
+                            const: local
                           repo:
                             type: string
                             description: "`owner/repo` of the external plugin repository."
@@ -26460,6 +28150,9 @@ paths:
                           marketplaceRef:
                             type: string
                             description: Ref of the canonical repo the marketplace manifest was read from.
+                          version:
+                            description: Bundled package version.
+                            type: string
                         required:
                           - repo
                           - path
@@ -26896,7 +28589,7 @@ paths:
                           description: Install name. Matches `assistant plugins install <name>`.
                         path:
                           type: string
-                          description: "Human-readable origin: a `github:owner/repo@ref` locator for the external plugin."
+                          description: Human-readable catalog origin locator.
                         description:
                           description: Short description, when known (external entries only today).
                           type: string
@@ -26910,27 +28603,92 @@ paths:
                             - type: string
                             - type: "null"
                           description: Marketplace category slug (Skills taxonomy); null when the entry declares none.
-                        source:
+                        integration:
                           type: object
                           properties:
                             kind:
                               type: string
-                              const: github
-                            repo:
+                              const: mcp
+                            displayName:
                               type: string
-                              description: "`owner/repo` of the external plugin repository."
-                            path:
-                              description: Directory within the repo, when the plugin is not at the root.
+                            documentationUrl:
                               type: string
-                            ref:
+                            verifiedAt:
                               type: string
-                              description: Pinned git ref the plugin is fetched from.
+                            verification:
+                              type: string
+                              const: documentation-only
+                            setup:
+                              type: object
+                              properties:
+                                mode:
+                                  type: string
+                                  enum:
+                                    - oauth
+                                    - manual
+                                instructions:
+                                  type: string
+                              required:
+                                - mode
+                                - instructions
+                              additionalProperties: false
+                            logo:
+                              type: string
+                            oauthProvider:
+                              type: string
+                            category:
+                              description:
+                                "Where the integrations catalog files the entry: a slug from the shared integration-category vocabulary,
+                                passed through as the catalog declares it."
+                              type: string
                           required:
                             - kind
-                            - repo
-                            - ref
+                            - displayName
+                            - documentationUrl
+                            - verifiedAt
+                            - verification
+                            - setup
+                            - logo
                           additionalProperties: false
-                          description: "Origin of the match: a whitelisted external plugin repository."
+                        source:
+                          oneOf:
+                            - type: object
+                              properties:
+                                kind:
+                                  type: string
+                                  const: github
+                                repo:
+                                  type: string
+                                  description: "`owner/repo` of the external plugin repository."
+                                path:
+                                  description: Directory within the repo, when the plugin is not at the root.
+                                  type: string
+                                ref:
+                                  type: string
+                                  description: Pinned git ref the plugin is fetched from.
+                              required:
+                                - kind
+                                - repo
+                                - ref
+                              additionalProperties: false
+                            - type: object
+                              properties:
+                                kind:
+                                  type: string
+                                  const: local
+                                path:
+                                  type: string
+                                  description: Package key in the assistant bundle.
+                                version:
+                                  type: string
+                                  description: Bundled package version.
+                              required:
+                                - kind
+                                - path
+                                - version
+                              additionalProperties: false
+                          description: Reviewed source of the marketplace entry.
+                          type: object
                       required:
                         - name
                         - path
@@ -28038,8 +29796,8 @@ paths:
       operationId: roadmap_by_slug_patch
       summary: Update a roadmap item
       description:
-        Updates a roadmap item. At least one field is required; the roadmap service decides which items this
-        assistant may edit.
+        Updates the title or description of a roadmap item this assistant filed, while the item is still open.
+        Status and tags are set by Vellum staff.
       tags:
         - roadmap
       parameters:
@@ -28059,13 +29817,7 @@ paths:
                   type: string
                 description:
                   type: string
-                status:
-                  type: string
-                tags:
-                  description: Tag slugs
-                  type: array
-                  items:
-                    type: string
+              additionalProperties: false
       responses:
         "200":
           description: Successful response
@@ -28385,6 +30137,8 @@ paths:
                             - single_channel
                             - multi_channel
                             - all_channels
+                        quiet:
+                          type: boolean
                         reuseConversation:
                           type: boolean
                         wakeConversationId:
@@ -28454,6 +30208,7 @@ paths:
                         - mode
                         - status
                         - routingIntent
+                        - quiet
                         - reuseConversation
                         - wakeConversationId
                         - workflowName
@@ -28633,6 +30388,8 @@ paths:
                           - single_channel
                           - multi_channel
                           - all_channels
+                      quiet:
+                        type: boolean
                       reuseConversation:
                         type: boolean
                       wakeConversationId:
@@ -28702,6 +30459,7 @@ paths:
                       - mode
                       - status
                       - routingIntent
+                      - quiet
                       - reuseConversation
                       - wakeConversationId
                       - workflowName
@@ -28833,6 +30591,8 @@ paths:
                             - single_channel
                             - multi_channel
                             - all_channels
+                        quiet:
+                          type: boolean
                         reuseConversation:
                           type: boolean
                         wakeConversationId:
@@ -28902,6 +30662,7 @@ paths:
                         - mode
                         - status
                         - routingIntent
+                        - quiet
                         - reuseConversation
                         - wakeConversationId
                         - workflowName
@@ -29030,6 +30791,8 @@ paths:
                           - single_channel
                           - multi_channel
                           - all_channels
+                      quiet:
+                        type: boolean
                       reuseConversation:
                         type: boolean
                       wakeConversationId:
@@ -29099,6 +30862,7 @@ paths:
                       - mode
                       - status
                       - routingIntent
+                      - quiet
                       - reuseConversation
                       - wakeConversationId
                       - workflowName
@@ -29287,6 +31051,8 @@ paths:
                             - single_channel
                             - multi_channel
                             - all_channels
+                        quiet:
+                          type: boolean
                         reuseConversation:
                           type: boolean
                         wakeConversationId:
@@ -29356,6 +31122,7 @@ paths:
                         - mode
                         - status
                         - routingIntent
+                        - quiet
                         - reuseConversation
                         - wakeConversationId
                         - workflowName
@@ -29487,6 +31254,8 @@ paths:
                             - single_channel
                             - multi_channel
                             - all_channels
+                        quiet:
+                          type: boolean
                         reuseConversation:
                           type: boolean
                         wakeConversationId:
@@ -29556,6 +31325,7 @@ paths:
                         - mode
                         - status
                         - routingIntent
+                        - quiet
                         - reuseConversation
                         - wakeConversationId
                         - workflowName
@@ -29690,6 +31460,8 @@ paths:
                             - single_channel
                             - multi_channel
                             - all_channels
+                        quiet:
+                          type: boolean
                         reuseConversation:
                           type: boolean
                         wakeConversationId:
@@ -29759,6 +31531,7 @@ paths:
                         - mode
                         - status
                         - routingIntent
+                        - quiet
                         - reuseConversation
                         - wakeConversationId
                         - workflowName
@@ -30029,6 +31802,8 @@ paths:
                             - single_channel
                             - multi_channel
                             - all_channels
+                        quiet:
+                          type: boolean
                         reuseConversation:
                           type: boolean
                         wakeConversationId:
@@ -30098,6 +31873,7 @@ paths:
                         - mode
                         - status
                         - routingIntent
+                        - quiet
                         - reuseConversation
                         - wakeConversationId
                         - workflowName
@@ -36452,8 +38228,18 @@ paths:
           schema:
             type: string
           description:
-            "Compute recursive byte size for each directory entry (true/false). Budget-bounded — large subtrees may
-            return size: null."
+            "Compute recursive byte size for each directory entry (true/false). Budget-bounded: large subtrees may
+            return size: null. Not applied to a recursive listing, which carries every file for the client to sum."
+        - name: recursive
+          in: query
+          required: false
+          schema:
+            type: string
+          description:
+            "List the whole subtree in one response (true/false). Depth-first, each directory's entries in listing
+            order, so grouping by parent path recovers per-directory listings. Bounded: sets truncated when the entry
+            cap or deadline stops the walk, and does not enter directories the workspace gitignore rules exclude, which
+            are named in skipped."
       responses:
         "200":
           description: Successful response
@@ -36497,6 +38283,19 @@ paths:
                         - modifiedAt
                       additionalProperties: false
                     description: Directory entry objects
+                  truncated:
+                    description:
+                      A recursive walk stopped at its entry cap or deadline, so deeper entries are missing. Absent from
+                      assistants that predate recursive listings.
+                    type: boolean
+                  skipped:
+                    description:
+                      Directories a recursive walk listed but did not enter, whether because a workspace gitignore rule excludes
+                      them, they are symlinks, or they could not be read. Each can still be listed on its own. Absent
+                      from assistants that predate recursive listings.
+                    type: array
+                    items:
+                      type: string
                 required:
                   - path
                   - entries
@@ -36640,6 +38439,281 @@ paths:
       tags:
         - user-routes
       parameters:
+        - name: path
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Successful response
+  /v1/x/plugins/{plugin}/notices:
+    delete:
+      operationId: x_plugins_by_plugin_notices_delete
+      summary: Gateway DELETE notice to a plugin (namespace root)
+      description:
+        "Dispatches DELETE requests to the root handler of a plugin's reserved notices/ namespace. Served to the
+        gateway's service principal only: a notice is the gateway's own decision, never a client's."
+      tags:
+        - user-routes
+      parameters:
+        - name: plugin
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Successful response
+    get:
+      operationId: x_plugins_by_plugin_notices_get
+      summary: Gateway GET notice to a plugin (namespace root)
+      description:
+        "Dispatches GET requests to the root handler of a plugin's reserved notices/ namespace. Served to the
+        gateway's service principal only: a notice is the gateway's own decision, never a client's."
+      tags:
+        - user-routes
+      parameters:
+        - name: plugin
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Successful response
+    head:
+      operationId: x_plugins_by_plugin_notices_head
+      summary: Gateway HEAD notice to a plugin (namespace root)
+      description:
+        "Dispatches HEAD requests to the root handler of a plugin's reserved notices/ namespace. Served to the
+        gateway's service principal only: a notice is the gateway's own decision, never a client's."
+      tags:
+        - user-routes
+      parameters:
+        - name: plugin
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Successful response
+    options:
+      operationId: x_plugins_by_plugin_notices_options
+      summary: Gateway OPTIONS notice to a plugin (namespace root)
+      description:
+        "Dispatches OPTIONS requests to the root handler of a plugin's reserved notices/ namespace. Served to the
+        gateway's service principal only: a notice is the gateway's own decision, never a client's."
+      tags:
+        - user-routes
+      parameters:
+        - name: plugin
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Successful response
+    patch:
+      operationId: x_plugins_by_plugin_notices_patch
+      summary: Gateway PATCH notice to a plugin (namespace root)
+      description:
+        "Dispatches PATCH requests to the root handler of a plugin's reserved notices/ namespace. Served to the
+        gateway's service principal only: a notice is the gateway's own decision, never a client's."
+      tags:
+        - user-routes
+      parameters:
+        - name: plugin
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Successful response
+    post:
+      operationId: x_plugins_by_plugin_notices_post
+      summary: Gateway POST notice to a plugin (namespace root)
+      description:
+        "Dispatches POST requests to the root handler of a plugin's reserved notices/ namespace. Served to the
+        gateway's service principal only: a notice is the gateway's own decision, never a client's."
+      tags:
+        - user-routes
+      parameters:
+        - name: plugin
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Successful response
+    put:
+      operationId: x_plugins_by_plugin_notices_put
+      summary: Gateway PUT notice to a plugin (namespace root)
+      description:
+        "Dispatches PUT requests to the root handler of a plugin's reserved notices/ namespace. Served to the
+        gateway's service principal only: a notice is the gateway's own decision, never a client's."
+      tags:
+        - user-routes
+      parameters:
+        - name: plugin
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Successful response
+  /v1/x/plugins/{plugin}/notices/{path}:
+    delete:
+      operationId: x_plugins_by_plugin_notices_by_path_delete
+      summary: Gateway DELETE notice to a plugin
+      description:
+        "Dispatches DELETE requests under a plugin's reserved notices/ namespace to that plugin's handler files.
+        Served to the gateway's service principal only: a notice is the gateway's own decision, never a client's."
+      tags:
+        - user-routes
+      parameters:
+        - name: plugin
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: path
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Successful response
+    get:
+      operationId: x_plugins_by_plugin_notices_by_path_get
+      summary: Gateway GET notice to a plugin
+      description:
+        "Dispatches GET requests under a plugin's reserved notices/ namespace to that plugin's handler files.
+        Served to the gateway's service principal only: a notice is the gateway's own decision, never a client's."
+      tags:
+        - user-routes
+      parameters:
+        - name: plugin
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: path
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Successful response
+    head:
+      operationId: x_plugins_by_plugin_notices_by_path_head
+      summary: Gateway HEAD notice to a plugin
+      description:
+        "Dispatches HEAD requests under a plugin's reserved notices/ namespace to that plugin's handler files.
+        Served to the gateway's service principal only: a notice is the gateway's own decision, never a client's."
+      tags:
+        - user-routes
+      parameters:
+        - name: plugin
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: path
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Successful response
+    options:
+      operationId: x_plugins_by_plugin_notices_by_path_options
+      summary: Gateway OPTIONS notice to a plugin
+      description:
+        "Dispatches OPTIONS requests under a plugin's reserved notices/ namespace to that plugin's handler files.
+        Served to the gateway's service principal only: a notice is the gateway's own decision, never a client's."
+      tags:
+        - user-routes
+      parameters:
+        - name: plugin
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: path
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Successful response
+    patch:
+      operationId: x_plugins_by_plugin_notices_by_path_patch
+      summary: Gateway PATCH notice to a plugin
+      description:
+        "Dispatches PATCH requests under a plugin's reserved notices/ namespace to that plugin's handler files.
+        Served to the gateway's service principal only: a notice is the gateway's own decision, never a client's."
+      tags:
+        - user-routes
+      parameters:
+        - name: plugin
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: path
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Successful response
+    post:
+      operationId: x_plugins_by_plugin_notices_by_path_post
+      summary: Gateway POST notice to a plugin
+      description:
+        "Dispatches POST requests under a plugin's reserved notices/ namespace to that plugin's handler files.
+        Served to the gateway's service principal only: a notice is the gateway's own decision, never a client's."
+      tags:
+        - user-routes
+      parameters:
+        - name: plugin
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: path
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Successful response
+    put:
+      operationId: x_plugins_by_plugin_notices_by_path_put
+      summary: Gateway PUT notice to a plugin
+      description:
+        "Dispatches PUT requests under a plugin's reserved notices/ namespace to that plugin's handler files.
+        Served to the gateway's service principal only: a notice is the gateway's own decision, never a client's."
+      tags:
+        - user-routes
+      parameters:
+        - name: plugin
+          in: path
+          required: true
+          schema:
+            type: string
         - name: path
           in: path
           required: true
@@ -37305,6 +39379,7 @@ components:
         - atlascloud
         - baseten
         - poolside
+        - typesafe
         - vellum
         - chatgpt
     Auth:

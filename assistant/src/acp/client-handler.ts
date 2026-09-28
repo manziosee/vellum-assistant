@@ -21,6 +21,7 @@ import type {
   ReleaseTerminalResponse,
   RequestPermissionRequest,
   RequestPermissionResponse,
+  SessionConfigOption,
   SessionNotification,
   TerminalOutputRequest,
   TerminalOutputResponse,
@@ -37,6 +38,7 @@ import { redactJsonStringLeaves } from "../security/redact-json.js";
 import { redactSensitiveFields } from "../security/redaction.js";
 import { redactSecrets } from "../security/secret-scanner.js";
 import { getLogger } from "../util/logger.js";
+import { CHILD_OOM_SCORE_ADJ, withOomScoreAdj } from "../util/oom-priority.js";
 
 const log = getLogger("acp:client-handler");
 
@@ -103,6 +105,9 @@ export class VellumAcpClientHandler implements Client {
     private readonly acpSessionId: string,
     private readonly sendToVellum: (msg: AssistantEvent) => void,
     private readonly parentConversationId: string,
+    private readonly onConfigOptions?: (
+      configOptions: SessionConfigOption[],
+    ) => void,
   ) {}
 
   /** Forwards an update to Vellum, stamping a contiguous per-session `seq`. */
@@ -182,7 +187,12 @@ export class VellumAcpClientHandler implements Client {
   async sessionUpdate(params: SessionNotification): Promise<void> {
     const update = params.update;
 
-    if (this.suppressForwarding) {
+    // Config options are current state rather than transcript history, so they
+    // are applied even while a replay is being suppressed.
+    if (
+      this.suppressForwarding &&
+      update.sessionUpdate !== "config_option_update"
+    ) {
       log.debug(
         { acpSessionId: this.acpSessionId, updateType: update.sessionUpdate },
         "Dropping replayed session update during suppression",
@@ -286,10 +296,14 @@ export class VellumAcpClientHandler implements Client {
         break;
       }
 
+      case "config_option_update": {
+        this.onConfigOptions?.(update.configOptions);
+        break;
+      }
+
       default: {
         // Other update types (available_commands_update, current_mode_update,
-        // config_option_update, session_info_update) are not forwarded to
-        // Vellum.
+        // session_info_update) are not forwarded to Vellum.
         log.debug(
           {
             acpSessionId: this.acpSessionId,
@@ -376,7 +390,11 @@ export class VellumAcpClientHandler implements Client {
       }
     }
 
-    const proc = spawn(params.command, args, {
+    const [command, ...wrappedArgs] = withOomScoreAdj(
+      [params.command, ...args],
+      CHILD_OOM_SCORE_ADJ,
+    );
+    const proc = spawn(command, wrappedArgs, {
       cwd: params.cwd ?? undefined,
       stdio: ["ignore", "pipe", "pipe"],
       env,

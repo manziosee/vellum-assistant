@@ -19,15 +19,24 @@ import {
 import type { FetchLike } from "../fetch-like.js";
 import {
   getPluginCatalog,
+  getPluginCatalogForInstalledMetadata,
   invalidatePluginCatalogCache,
+  mergePlatformCatalogWithBundledLocals,
   PLUGIN_CATALOG_CACHE_TTL_MS,
 } from "../plugin-catalog-cache.js";
 import { readBundledPluginCatalog } from "../plugin-catalog-local.js";
 import type { SearchPluginsDeps } from "../search-plugins.js";
+import type { PluginCatalog } from "../search-plugins.js";
 
 // A non-zero base time. Bun treats `setSystemTime(new Date(0))` as "reset to
 // the real clock", so the fake clock must start from a positive epoch.
 const BASE_TIME_MS = 1_700_000_000_000;
+
+function githubNames(catalog: PluginCatalog): string[] {
+  return catalog.matches
+    .filter((match) => match.source.kind === "github")
+    .map((match) => match.name);
+}
 
 /** A `deps.fetch` that serves a `/v1/plugins/` payload and counts its calls. */
 function platformFetch(names: string[]): {
@@ -94,8 +103,8 @@ describe("getPluginCatalog", () => {
 
     // THEN the platform is fetched exactly once — the second call is cached
     expect(calls()).toBe(1);
-    expect(first).toBe(second);
-    expect(first.matches.map((m) => m.name)).toEqual(["a"]);
+    expect(first).toEqual(second);
+    expect(githubNames(first)).toEqual(["a"]);
     expect(first.ref).toBe("main");
   });
 
@@ -133,7 +142,7 @@ describe("getPluginCatalog", () => {
     setSystemTime(new Date(BASE_TIME_MS));
     const good = platformFetch(["good"]);
     const cached = await getPluginCatalog("main", { fetch: good.fetch });
-    expect(cached.matches.map((m) => m.name)).toEqual(["good"]);
+    expect(githubNames(cached)).toEqual(["good"]);
 
     // WHEN the TTL has elapsed and the refresh fails
     setSystemTime(new Date(BASE_TIME_MS + PLUGIN_CATALOG_CACHE_TTL_MS + 1));
@@ -153,7 +162,10 @@ describe("getPluginCatalog", () => {
     delete process.env.IS_PLATFORM;
 
     const { fetch, calls } = platformFetch(["ignored"]);
-    const deps: SearchPluginsDeps = { fetch };
+    const deps: SearchPluginsDeps = {
+      fetch,
+      featureFlagEnabled: () => true,
+    };
 
     // WHEN we request the catalog
     const result = await getPluginCatalog("main", deps);
@@ -164,5 +176,146 @@ describe("getPluginCatalog", () => {
     expect(result.matches).toEqual(bundled.matches);
     // The requested ref is echoed onto the wire contract.
     expect(result.ref).toBe("main");
+  });
+
+  test("applies feature-flag visibility to bundled catalog entries", async () => {
+    process.env.VELLUM_DISABLE_PLATFORM = "true";
+    delete process.env.IS_PLATFORM;
+
+    const { fetch } = platformFetch(["ignored"]);
+    const result = await getPluginCatalog("main", {
+      fetch,
+      featureFlagEnabled: () => false,
+    });
+
+    expect(result.matches.map((match) => match.name)).not.toContain("gamma");
+    expect(result.matches.map((match) => match.name)).toContain("fathom");
+  });
+
+  test("preserves hidden entries for installed-plugin metadata", async () => {
+    process.env.VELLUM_DISABLE_PLATFORM = "true";
+    delete process.env.IS_PLATFORM;
+
+    const { fetch } = platformFetch(["ignored"]);
+    const result = await getPluginCatalogForInstalledMetadata("main", {
+      fetch,
+    });
+
+    expect(result.matches.map((match) => match.name)).toContain("gamma");
+  });
+});
+
+describe("mergePlatformCatalogWithBundledLocals", () => {
+  test("adds local packages while keeping a platform row on name collision", () => {
+    const platform: PluginCatalog = {
+      ref: "main",
+      matches: [
+        {
+          name: "fathom",
+          path: "github:provider/fathom@pin",
+          category: null,
+          source: {
+            kind: "github",
+            repo: "provider/fathom",
+            ref: "0".repeat(40),
+          },
+        },
+      ],
+    };
+    const bundled: PluginCatalog = {
+      ref: "bundled",
+      matches: [
+        {
+          name: "fathom",
+          path: "local:plugins/mcp-catalog/fathom@1.0.0",
+          category: null,
+          source: {
+            kind: "local",
+            path: "plugins/mcp-catalog/fathom",
+            version: "1.0.0",
+          },
+        },
+        {
+          name: "notion",
+          path: "local:plugins/mcp-catalog/notion@1.0.0",
+          category: null,
+          source: {
+            kind: "local",
+            path: "plugins/mcp-catalog/notion",
+            version: "1.0.0",
+          },
+        },
+      ],
+    };
+
+    const merged = mergePlatformCatalogWithBundledLocals(platform, bundled);
+
+    expect(merged.matches.map((match) => match.name)).toEqual([
+      "fathom",
+      "notion",
+    ]);
+    expect(merged.matches[0]?.source.kind).toBe("github");
+    expect(merged.matches[1]?.source.kind).toBe("local");
+    expect(merged.ref).toBe("main");
+  });
+  test("keeps the bundled integration when a platform row without one shadows it", () => {
+    const integration = {
+      kind: "mcp",
+      displayName: "Fathom",
+      documentationUrl: "https://example.com/docs",
+      verifiedAt: "2026-09-10",
+      verification: "documentation-only",
+      setup: { mode: "oauth", instructions: "Sign in." },
+      logo: "fathom.png",
+    } as const;
+    const platformIntegration = { ...integration, displayName: "Platform" };
+    const platform: PluginCatalog = {
+      ref: "main",
+      matches: [
+        {
+          name: "fathom",
+          path: "github:provider/fathom@pin",
+          category: null,
+          source: {
+            kind: "github",
+            repo: "provider/fathom",
+            ref: "0".repeat(40),
+          },
+        },
+        {
+          name: "linear",
+          path: "github:provider/linear@pin",
+          category: null,
+          integration: platformIntegration,
+          source: {
+            kind: "github",
+            repo: "provider/linear",
+            ref: "0".repeat(40),
+          },
+        },
+      ],
+    };
+    const bundled: PluginCatalog = {
+      ref: "bundled",
+      matches: ["fathom", "linear"].map((name) => ({
+        name,
+        path: `local:plugins/mcp-catalog/${name}@1.0.0`,
+        category: null,
+        integration,
+        source: {
+          kind: "local",
+          path: `plugins/mcp-catalog/${name}`,
+          version: "1.0.0",
+        },
+      })),
+    };
+
+    const merged = mergePlatformCatalogWithBundledLocals(platform, bundled);
+
+    const [fathom, linear] = merged.matches;
+    expect(fathom?.source.kind).toBe("github");
+    expect(fathom?.integration).toEqual(integration);
+    expect(linear?.source.kind).toBe("github");
+    expect(linear?.integration).toEqual(platformIntegration);
   });
 });

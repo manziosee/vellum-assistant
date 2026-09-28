@@ -10,7 +10,6 @@ import {
   FileText,
   FilePlus,
   Globe,
-  Loader2,
   Pencil,
   Search,
   Terminal,
@@ -25,7 +24,7 @@ import {
   type ReactNode,
 } from "react";
 import {
-  ACTIVITY_KEYS,
+  ACTIVITY_KEY,
   readToolInputString,
 } from "@/domains/chat/utils/tool-input";
 import { useTranslation } from "@/i18n";
@@ -56,6 +55,7 @@ import type {
 import type { ChatMessageToolCall } from "@/domains/chat/api/event-types";
 import { copyToClipboard } from "@/lib/copy-to-clipboard";
 import { perceivedStartedAt } from "@/domains/chat/utils/tool-call-status";
+import { confirmationAsk } from "@/domains/chat/utils/confirmation-ask";
 import {
   extractInputSummary,
   friendlyRunningLabel,
@@ -166,21 +166,13 @@ export function InlineConfirmationCard({
   const hasDetails = !!confirmation.input;
   const offersRule = offersRuleOption(confirmation);
 
-  // Meta-line context: what the agent was doing when it hit the gate. The
-  // live activity label wins; a custom confirmation title and the friendly
-  // tool label are fallbacks.
-  const activity = readToolInputString(toolCall.input ?? {}, ...ACTIVITY_KEYS);
-  const contextLabel =
-    activity ||
-    confirmation.title ||
-    friendlyToolLabel(
-      toolCall.name,
-      extractInputSummary(toolCall.name, toolCall.input),
-    );
-
-  // The prominent body is the human-readable ask; older daemons only send
-  // the risk reason, which reads well enough in the same slot.
-  const body = confirmation.description || confirmation.riskReason || null;
+  // Meta-line context and the prominent body: what the agent was doing when
+  // it hit the gate, and the human-readable ask.
+  const { context: contextLabel, ask: body } = confirmationAsk(
+    toolCall.name,
+    toolCall.input,
+    confirmation,
+  );
 
   return (
     <div
@@ -215,11 +207,11 @@ export function InlineConfirmationCard({
           <div className="flex">
             <Button
               variant="primary"
+              loading={isSubmitting}
               disabled={isSubmitting}
               onClick={() => onSubmit?.("allow")}
               className="rounded-r-none"
             >
-              {isSubmitting && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
               {t("toolCallChip.allow")}
             </Button>
             {/* Internal divider between the two halves of the split pill. */}
@@ -244,10 +236,10 @@ export function InlineConfirmationCard({
         ) : (
           <Button
             variant="primary"
+            loading={isSubmitting}
             disabled={isSubmitting}
             onClick={() => onSubmit?.("allow")}
           >
-            {isSubmitting && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
             {t("toolCallChip.allow")}
           </Button>
         )}
@@ -268,6 +260,7 @@ export function InlineConfirmationCard({
           <button
             type="button"
             onClick={() => setShowDetails(!showDetails)}
+            aria-expanded={showDetails}
             // typography: off-scale — 11px tertiary disclosure per the Figma spec
             className="flex items-center gap-1 self-start text-[11px] font-medium text-[var(--content-tertiary)] transition-colors hover:text-[var(--content-secondary)]"
           >
@@ -343,7 +336,7 @@ export function ToolCallChip({
 
   const inputSummary = extractInputSummary(toolCall.name, toolCall.input);
   const activityLabel =
-    readToolInputString(toolCall.input ?? {}, ...ACTIVITY_KEYS) || null;
+    readToolInputString(toolCall.input ?? {}, ACTIVITY_KEY) || null;
   const label =
     activityLabel ??
     (isRunning
@@ -653,6 +646,7 @@ export function ToolCallChip({
       {/* Header row */}
       <button
         type="button"
+        aria-expanded={canExpand ? expanded : undefined}
         onClick={() => {
           if (canExpand) {
             toggleExpanded(!expanded);

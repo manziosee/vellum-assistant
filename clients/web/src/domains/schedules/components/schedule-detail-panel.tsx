@@ -1,19 +1,19 @@
 import type { ReactNode } from "react";
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import {
-  BarChart3,
-  ChevronRight,
-  Coins,
-  Loader2,
-  Repeat,
-  Trash2,
-} from "lucide-react";
+import { BarChart3, ChevronRight, Coins, Repeat, Trash2 } from "lucide-react";
 import { useState } from "react";
 import { useNavigate } from "react-router";
 
-import { DetailShellHeader } from "@/components/detail-shell";
+import {
+  DetailShellHeader,
+  DetailShellLoading,
+  DetailShellNotice,
+} from "@/components/detail-shell";
+import { StatSquare } from "@vellumai/design-library/components/stat-square";
+
 import { InsetDetailCard } from "@/components/inset-detail-card";
+import { useScheduleConversationDoneLabel } from "@/utils/done-labels";
 import { useTranslation } from "@/i18n";
 import { SCHEDULE_USAGE_WINDOW_DAYS } from "@/utils/usage-window";
 import {
@@ -194,39 +194,15 @@ function ScheduleModelProfileField({
   );
 }
 
-function StatCard({
-  icon,
-  value,
-  label,
-}: {
-  icon: ReactNode;
-  value: string;
-  label: string;
-}) {
-  return (
-    <div className="flex items-center gap-3 rounded-lg border border-[var(--border-base)] bg-[var(--surface-lift)] p-3">
-      <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-[var(--surface-sunken)] text-[var(--content-secondary)]">
-        {icon}
-      </span>
-      <div className="min-w-0">
-        <div className="truncate text-body-large-default text-[var(--content-default)]">
-          {value}
-        </div>
-        <div className="text-body-small-default text-[var(--content-tertiary)]">
-          {label}
-        </div>
-      </div>
-    </div>
-  );
-}
-
 function StatCards({ usage }: { usage: ScheduleRowUsage }) {
   const { t } = useTranslation("schedules");
   if (usage.status === "loading") {
     return (
       <div className="grid grid-cols-2 gap-3 pt-2">
         {Array.from({ length: 2 }, (_, i) => (
-          <Skeleton key={i} className="h-[60px] rounded-lg" />
+          // 62px is a `StatSquare`: a 20px value line and an 18px label
+          // line inside 12px of padding.
+          <Skeleton key={i} className="h-15.5 rounded-xl" />
         ))}
       </div>
     );
@@ -236,15 +212,15 @@ function StatCards({ usage }: { usage: ScheduleRowUsage }) {
   }
   return (
     <div className="grid grid-cols-2 gap-3 pt-2">
-      <StatCard
-        icon={<Coins className="h-4 w-4" />}
+      <StatSquare
+        icon={<Coins />}
         value={formatScheduleCost(usage.summary.totalEstimatedCostUsd)}
         label={t("scheduleDetail.costLabel", {
           days: SCHEDULE_USAGE_WINDOW_DAYS,
         })}
       />
-      <StatCard
-        icon={<Repeat className="h-4 w-4" />}
+      <StatSquare
+        icon={<Repeat />}
         value={formatScheduleRunCount(usage.summary.runCount)}
         label={t("scheduleDetail.runsLabel", {
           days: SCHEDULE_USAGE_WINDOW_DAYS,
@@ -278,6 +254,7 @@ function RunRow({
   onToggleDetails: (runId: string) => void;
 }) {
   const { t } = useTranslation("schedules");
+  const conversationDoneLabel = useScheduleConversationDoneLabel();
   // Older daemons do not send `conversations`, so the scalar pointer is
   // wrapped in the same shape here. Newer daemons fold that pointer into the
   // array themselves.
@@ -363,7 +340,7 @@ function RunRow({
                         ? c.title
                         : t("scheduleDetail.conversation")}{" "}
                       {c.exists
-                        ? t("scheduleDetail.conversationArchived")
+                        ? conversationDoneLabel
                         : t("scheduleDetail.conversationUnavailable")}
                     </span>
                   ),
@@ -404,7 +381,7 @@ function RunRow({
           aria-label={t("scheduleDetail.openRunConversationAria", {
             time: formatTimestamp(run.startedAt),
           })}
-          className="flex w-full cursor-pointer items-center gap-3 px-2 py-3 text-left shadow-none transition-colors hover:bg-[var(--surface-hover)] focus:outline-none"
+          className="flex w-full cursor-pointer items-center gap-3 px-2 py-3 text-left shadow-none transition-colors hover:bg-[var(--surface-hover)] focus:outline-none keyboard-focus:ring-2 keyboard-focus:ring-inset keyboard-focus:ring-[var(--ring)]"
         >
           {body}
         </button>
@@ -423,7 +400,7 @@ function RunRow({
           })}
           aria-expanded={isExpanded}
           aria-controls={detailsId}
-          className="flex w-full cursor-pointer items-center gap-3 px-2 py-3 text-left shadow-none transition-colors hover:bg-[var(--surface-hover)] focus:outline-none"
+          className="flex w-full cursor-pointer items-center gap-3 px-2 py-3 text-left shadow-none transition-colors hover:bg-[var(--surface-hover)] focus:outline-none keyboard-focus:ring-2 keyboard-focus:ring-inset keyboard-focus:ring-[var(--ring)]"
         >
           {body}
         </button>
@@ -450,17 +427,13 @@ function RecentRuns({
   const [expandedRunId, setExpandedRunId] = useState<string | null>(null);
 
   if (isLoading) {
-    return (
-      <div className="flex items-center justify-center py-6">
-        <Loader2 className="h-5 w-5 animate-spin text-stone-400" />
-      </div>
-    );
+    return <DetailShellLoading placement="section" />;
   }
   if (!runs || runs.length === 0) {
     return (
-      <p className="py-2 text-body-medium-lighter text-[var(--content-tertiary)] italic">
+      <DetailShellNotice placement="section">
         {t("scheduleDetail.noRunsYet")}
-      </p>
+      </DetailShellNotice>
     );
   }
   return (
@@ -601,7 +574,7 @@ export function ScheduleDetailPanel({
         />
 
         {/* Scrollable body */}
-        <div className="flex-1 space-y-6 overflow-y-auto px-[var(--app-spacing-lg)] py-[var(--app-spacing-lg)]">
+        <div className="flex flex-1 flex-col gap-5 overflow-y-auto px-5 py-5">
           {schedule.description ? (
             <p className="text-body-medium-lighter text-[var(--content-secondary)]">
               {schedule.description}
@@ -711,11 +684,7 @@ export function ScheduleDetailPanel({
                 ) : null}
                 <Button
                   variant="primary"
-                  leftIcon={
-                    isRunning ? (
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                    ) : undefined
-                  }
+                  loading={isRunning}
                   onClick={() => void handleRunNow()}
                   disabled={isRunning || runNowBlocked}
                 >

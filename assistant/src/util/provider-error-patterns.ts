@@ -33,6 +33,9 @@ export function isVisionNotSupportedError(message: string): boolean {
 export const CHAT_TEMPLATE_FAILURE_PATTERNS = [
   /appl\w* (?:the )?chat[ _-]?template/i,
   /chat[ _-]?template (?:error|render)/i,
+  // Fireworks surfaces the renderer's raw Python str.join TypeError without
+  // naming the template: "sequence item 0: expected str instance, list found".
+  /sequence item \d+: expected str instance, list found/i,
 ];
 
 /**
@@ -96,3 +99,14 @@ export const INSUFFICIENT_CREDITS_PATTERNS = [
 // credit-exhaustion prose above — both are 402s from the same proxy — so
 // classification sites must test this before INSUFFICIENT_CREDITS_PATTERNS.
 export const DAILY_LIMIT_PATTERNS = [/"code"\s*:\s*"daily_limit_reached"/i];
+
+// Managed-proxy free-tier daily usage-credit cap: a 402 whose body carries
+// `"code": "free_tier_daily_limit_reached"`. The platform imposes it on a
+// cohort of free-tier orgs (it is not the user-configured daily limit above,
+// which caps purchased spend), so it gets its own reason and copy: there is
+// no limit for the user to raise, only the UTC reset, an upgrade, or extra
+// credits. Anchored on the opening quote so DAILY_LIMIT_PATTERNS, which is
+// anchored the same way, never matches this code as its suffix.
+export const FREE_TIER_DAILY_LIMIT_PATTERNS = [
+  /"code"\s*:\s*"free_tier_daily_limit_reached"/i,
+];

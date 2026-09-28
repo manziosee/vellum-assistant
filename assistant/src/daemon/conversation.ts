@@ -16,7 +16,7 @@
  */
 
 import { repairHistory } from "../agent/history-repair/history-repair.js";
-import type { AgentLoopConfig } from "../agent/loop.js";
+import type { AgentLoopConfig, PreparedModelCall } from "../agent/loop.js";
 import { AgentLoop } from "../agent/loop.js";
 import type { AssistantActivityStateEvent } from "../api/events/assistant-activity-state.js";
 import type { ConfirmationStateChangedEvent } from "../api/events/confirmation-state-changed.js";
@@ -39,6 +39,7 @@ import { resolveCallSiteConfig } from "../config/llm-resolver.js";
 import { getConfig } from "../config/loader.js";
 import type { LLMCallSite, Speed } from "../config/schemas/llm.js";
 import { resolveSendUserMessageActive } from "../config/send-user-message-gate.js";
+import { isSessionGroupsEnabled } from "../config/session-groups-gate.js";
 import {
   derefToolResultReReads,
   postTurnTruncateToolResults,
@@ -92,6 +93,7 @@ import {
   markV3LiveBlock,
   MEMORY_V3_POINTER_BLOCK_METADATA_KEY,
 } from "../plugins/defaults/memory/v3/types.js";
+import { resolveDelegateIndependentTasks } from "../prompts/delegation-gate.js";
 import {
   applyBootstrapTemplate,
   buildSystemPrompt,
@@ -116,7 +118,10 @@ import { getLogger } from "../util/logger.js";
 import { withSqliteRetry } from "../util/sqlite-retry.js";
 import type { WorkspaceGitService } from "../workspace/git-service.js";
 import type { commitTurnChanges } from "../workspace/turn-commit.js";
+import { trackDaemonActivity, turnActivityLabel } from "./activity-trail.js";
 import type { AssistantAttachmentDraft } from "./assistant-attachments.js";
+import { BrowserModeSessionProducer } from "./browser-mode-session.js";
+import { ComputerUseModeSessionProducer } from "./computer-use-mode-session.js";
 import type { AssistantSurface } from "./conversation-agent-loop.js";
 import {
   applyCompactionResult,
@@ -126,6 +131,7 @@ import type { HistoryConversationContext } from "./conversation-history.js";
 import { undo as undoImpl } from "./conversation-history.js";
 import {
   abortConversation,
+  abortScheduledRun,
   disposeConversation,
   reinjectAttachmentPathAnnotations,
   reinjectInterruptTurnNote,
@@ -140,6 +146,7 @@ import {
   persistUserMessage as persistUserMessageImpl,
   redirectToSecurePrompt as redirectToSecurePromptImpl,
 } from "./conversation-messaging.js";
+import { ConversationModeSessionCoordinator } from "./conversation-mode-session.js";
 // Extracted modules
 import { registerConversationNotifiers } from "./conversation-notifiers.js";
 import type { ProcessMessageOptions } from "./conversation-process.js";
@@ -149,8 +156,10 @@ import {
   processMessage as processMessageImpl,
 } from "./conversation-process.js";
 import type {
+  QueuedDispatch,
   QueuedMessage,
   QueueDrainReason,
+  TurnWorkOrigin,
 } from "./conversation-queue-manager.js";
 import { MessageQueue } from "./conversation-queue-manager.js";
 import {
@@ -181,6 +190,7 @@ import {
   canSpawnSubagentsForTurn,
   createResolveToolsCallback,
   createToolExecutor,
+  createWireToolSurfaceRecorder,
 } from "./conversation-tool-setup.js";
 import { canonicalizeTimeZone } from "./date-context.js";
 import { HostAppControlProxy } from "./host-app-control-proxy.js";
@@ -191,6 +201,7 @@ import { filterMessagesForUntrustedActor } from "./message-provenance.js";
 import type { ConversationTransportMetadata } from "./message-types/conversations.js";
 import { isHostProxyTransport } from "./message-types/conversations.js";
 import { conversationMetadataSyncTag } from "./message-types/sync.js";
+import { bestEffortModeSessionTracking } from "./mode-session-tracking.js";
 import { renderReactionHistoryText } from "./reaction-history-render.js";
 import type { QueuedReactionRecord } from "./reaction-record.js";
 import {
@@ -199,6 +210,7 @@ import {
 } from "./summarize-boundary.js";
 
 const log = getLogger("conversation");
+const PROMPT_CACHE_WARM_MAX_TOKENS = 16;
 
 /**
  * First text block of a persisted message row's content, mirroring
@@ -452,6 +464,41 @@ export class Conversation {
    * @internal
    */
   toolContextPin?: WakeToolContextPin;
+  /**
+   * Tool definitions sent verbatim in place of the resolved wire array, for
+   * a wake replaying its source conversation's recorded surface
+   * (`recordConversationToolSurface`). Set and restored alongside the
+   * allowlist by `scopeWakeAllowedTools`; read only where the resolver returns
+   * the wire array, so it never widens what may execute.
+   * @internal
+   */
+  wireToolReplay?: readonly ToolDefinition[];
+  /**
+   * The delegation section's rendered state a wake replaying its source's
+   * recorded surface carries into its system prompt, in place of the answer
+   * derived from the wake's own scope (`canSpawnSubagentsForTurn`). Set and
+   * restored alongside {@link wireToolReplay} by `scopeWakeAllowedTools`;
+   * read only by {@link buildCurrentSystemPrompt}, so it never widens what
+   * may execute.
+   * @internal
+   */
+  delegateIndependentTasksReplay?: boolean;
+  /**
+   * The delegation-section state the system prompt most recently built by
+   * {@link buildCurrentSystemPrompt} rendered: the value the loop's prompt
+   * carries until the next build. `null` when that prompt is a verbatim
+   * override, unset before the first build. Read by the wire-surface recorder
+   * so the recorded state is the one the provider received, not a
+   * re-derivation that a config change mid-turn could flip.
+   * @internal
+   */
+  renderedDelegateIndependentTasks?: boolean | null;
+  /**
+   * Hash of the wire surface last recorded for this conversation in this
+   * process, so an unchanged surface is not rewritten on every provider call.
+   * @internal
+   */
+  recordedToolSurfaceHash?: string;
   /** @internal */ readonly skillProjectionState = new Map<string, string>();
   /** @internal */ readonly skillProjectionCache: SkillProjectionCache = {};
   /** @internal */ usageStats: UsageStats = {
@@ -488,6 +535,13 @@ export class Conversation {
    */
   enabledPlugins: string[] | null = null;
   /** @internal */ currentRequestId?: string;
+  /** Canonical recorded-session ownership for this conversation. */
+  readonly modeSessions: ConversationModeSessionCoordinator;
+  /** Computer-use producer mapped onto the canonical session coordinator. */
+  readonly computerUseModeSessions: ComputerUseModeSessionProducer;
+  /** Browser producer mapped onto the canonical session coordinator. */
+  readonly browserModeSessions: BrowserModeSessionProducer;
+  private liveVoiceResidencyLeases = 0;
   /**
    * The `clientMessageId` the running turn was started by, recorded in the same
    * synchronous step that takes the processing lock.
@@ -526,6 +580,8 @@ export class Conversation {
    * @internal
    */
   currentCallSite?: LLMCallSite;
+  /** Skip fresh memory retrieval for this turn, retaining context already in history. */
+  currentTurnSkipMemoryRetrieval?: boolean;
   /**
    * Whether no human is present to see UI or answer prompts. Derived from the
    * in-flight turn's interactivity ({@link currentTurnIsNonInteractive}); a
@@ -606,6 +662,8 @@ export class Conversation {
    * @internal
    */
   currentTurnCronRunId?: string | null;
+  currentTurnWorkOrigins?: readonly TurnWorkOrigin[];
+  pendingQueuedDispatches = new Map<string | null, Set<QueuedDispatch>>();
   /** @internal */ currentTurnIsNonInteractive?: boolean;
   /** @internal */ currentTurnModelProfileNoticeKey?: string;
   /** @internal */ currentTurnRequestOrigin?: string;
@@ -746,17 +804,22 @@ export class Conversation {
    */
   pendingInterruptActivityBridge = false;
   /**
-   * Set by `interruptRunningTurn` when the abort it ran landed with no tool
-   * call in flight, and consumed exactly once by the persist of the
-   * interrupting user message, which appends
+   * Set by `interruptRunningTurn` on every handover it completes, and consumed
+   * exactly once by the first user message persisted after it, which appends
    * {@link INTERRUPTED_TURN_NOTE_TEXT} to that message's LLM-facing content
    * and stamps `interruptedPriorTurn` on the row.
    *
-   * An interrupt caught mid-tool needs nothing here: the synthetic
-   * `tool_result` the loop or the repair writes already tells the model a
-   * message preempted it. Caught mid-provider-call there is no `tool_use` to
-   * answer, so the note is the only signal, and it rides on the message that
-   * did the interrupting.
+   * The note is the only place the behavior after an interrupt is spelled out.
+   * A synthetic `tool_result` states what happened to the one call it answers
+   * and nothing more, so an interrupt caught mid-tool arms this too.
+   *
+   * It belongs to the history position, not to the send that armed it. That
+   * first row is the one sitting directly under the work the handover stopped,
+   * so it is the row whose note the model reads in the right place. Normally it
+   * is the interrupting message itself. When that send loses the lock race and
+   * queues, the message that persists first was also sent while the assistant
+   * was working, and the note is true of it; the queued one drains after a
+   * completed turn, where the same note would be stale.
    * @internal
    */
   pendingInterruptNote = false;
@@ -938,6 +1001,16 @@ export class Conversation {
     const { maxTokens, speedOverride, cacheTtl, modelOverride } = options ?? {};
     const enableNativeWebSearch = options?.enableNativeWebSearch ?? false;
     this.conversationId = conversationId;
+    this.modeSessions = new ConversationModeSessionCoordinator(conversationId);
+    this.computerUseModeSessions = new ComputerUseModeSessionProducer(
+      this.modeSessions,
+      isSessionGroupsEnabled,
+    );
+    this.browserModeSessions = new BrowserModeSessionProducer(
+      this.modeSessions,
+      1,
+      isSessionGroupsEnabled,
+    );
     this.parentConversationId = options?.parentConversationId;
     this.systemPrompt = systemPrompt;
     this.provider = provider;
@@ -1038,6 +1111,7 @@ export class Conversation {
       tools: toolDefs.length > 0 ? toolDefs : undefined,
       toolExecutor: toolDefs.length > 0 ? toolExecutor : undefined,
       resolveTools,
+      onToolsSent: createWireToolSurfaceRecorder(this),
       resolveConversationDir: () => {
         const conv = getConversation(this.conversationId);
         if (!conv) {
@@ -1132,23 +1206,40 @@ export class Conversation {
    * the provider's prefix cache).
    */
   buildCurrentSystemPrompt(): string {
-    return this.hasSystemPromptOverride
-      ? this.systemPrompt
-      : buildSystemPrompt({
-          hasNoClient: this.hasNoClient,
-          trustContext: this.currentTurnTrustContext,
-          channelCapabilities: this.currentTurnChannelCapabilities,
-          personaOverride: this.wakePersonaOverride,
-          onboardingContext: this.getOnboardingContext(),
-          conversationId: this.conversationId,
-          sendUserMessageTool: resolveSendUserMessageActive(this),
-          // Read off this turn's resolved tool surface: a workspace
-          // `tools.exclude` entry, a background run's `allowedTools` scope, a
-          // read-only subagent pass, or tools disabled all answer no, and the
-          // delegation section renders off rather than pointing at a tool the
-          // turn cannot call.
-          canSpawnSubagents: canSpawnSubagentsForTurn(this),
-        });
+    if (this.hasSystemPromptOverride) {
+      this.renderedDelegateIndependentTasks = null;
+      return this.systemPrompt;
+    }
+    // Resolved once here, handed to the builder, and kept for the
+    // wire-surface recorder, so the prompt the provider receives and the state
+    // a fork replays are the same value by construction. A wake replaying its
+    // source's recorded surface renders the section the source's live turn
+    // rendered; otherwise the answer is read off this turn's resolved tool
+    // surface: a workspace `tools.exclude` entry, a background run's
+    // `allowedTools` scope, a read-only subagent pass, or tools disabled all
+    // answer no, and the section renders off rather than pointing at a tool
+    // the turn cannot call.
+    const delegateIndependentTasks =
+      this.delegateIndependentTasksReplay ??
+      resolveDelegateIndependentTasks({
+        canSpawnSubagents: canSpawnSubagentsForTurn(this),
+        channelCapabilities: this.currentTurnChannelCapabilities,
+      });
+    const prompt = buildSystemPrompt({
+      hasNoClient: this.hasNoClient,
+      trustContext: this.currentTurnTrustContext,
+      channelCapabilities: this.currentTurnChannelCapabilities,
+      personaOverride: this.wakePersonaOverride,
+      onboardingContext: this.getOnboardingContext(),
+      conversationId: this.conversationId,
+      sendUserMessageTool: resolveSendUserMessageActive(this),
+      delegateIndependentTasks,
+    });
+    // Recorded only once the build succeeds: a wake's prompt sync swallows a
+    // failed rebuild and runs on the previous prompt, whose state must stay
+    // the recorded one.
+    this.renderedDelegateIndependentTasks = delegateIndependentTasks;
+    return prompt;
   }
 
   /**
@@ -1182,48 +1273,91 @@ export class Conversation {
   // ── Prompt Cache Warming ─────────────────────────────────────────
 
   /**
-   * Fire-and-forget LLM call with max_tokens=1 to populate the provider's
-   * prompt cache (system prompt + tools). Called after the canned first
-   * greeting so the user's next real message gets a cache hit.
+   * Non-rejecting LLM call with a minimal output budget to populate the selected
+   * provider's prompt cache (system prompt + tools).
    */
-  warmPromptCache(): void {
+  async warmPromptCache(options?: {
+    callSite?: LLMCallSite;
+    overrideProfile?: string;
+    forceOverrideProfile?: boolean;
+    signal?: AbortSignal;
+    systemPrompt?: string | null;
+    tools?: ToolDefinition[];
+  }): Promise<void> {
     this.cacheWarmAbort?.abort();
     const abort = new AbortController();
     this.cacheWarmAbort = abort;
 
-    const systemPrompt = this.buildCurrentSystemPrompt();
-    const tools = getAllToolDefinitions();
-    const provider = this.provider;
+    const externalSignal = options?.signal;
+    const relayAbort = (): void => abort.abort(externalSignal?.reason);
+    if (externalSignal?.aborted) {
+      relayAbort();
+    } else {
+      externalSignal?.addEventListener("abort", relayAbort, { once: true });
+    }
 
-    const warmMessage: Message = {
-      role: "user",
-      content: [{ type: "text", text: "hi" }],
-    };
+    const callSite = options?.callSite ?? "mainAgent";
 
-    provider
-      .sendMessage([warmMessage], {
-        tools,
-        systemPrompt,
+    try {
+      const hasSystemPrompt =
+        options !== undefined &&
+        Object.prototype.hasOwnProperty.call(options, "systemPrompt");
+      const systemPrompt = hasSystemPrompt
+        ? (options.systemPrompt ?? undefined)
+        : this.buildCurrentSystemPrompt();
+      const tools =
+        options?.tools ?? this.agentLoop.getResolvedTools(this.messages);
+      const providerConfig = {
+        ...(options?.overrideProfile !== undefined
+          ? { overrideProfile: options.overrideProfile }
+          : {}),
+        ...(options?.forceOverrideProfile !== undefined
+          ? { forceOverrideProfile: options.forceOverrideProfile }
+          : {}),
+        selectionSeed: this.conversationId,
+      };
+      const warmMessage: Message = {
+        role: "user",
+        content: [{ type: "text", text: "hi" }],
+      };
+
+      await this.provider.sendMessage([warmMessage], {
+        tools: tools.length > 0 ? tools : undefined,
+        ...(systemPrompt !== undefined ? { systemPrompt } : {}),
         config: {
-          max_tokens: 1,
-          callSite: "mainAgent",
-          usageTracking: "manual",
+          max_tokens: PROMPT_CACHE_WARM_MAX_TOKENS,
+          callSite,
+          ...providerConfig,
+          conversationId: this.conversationId,
         },
         signal: abort.signal,
-      })
-      .then(() => {
-        log.info("Prompt cache warmed successfully");
-      })
-      .catch((err) => {
-        if (!abort.signal.aborted) {
-          log.warn({ err }, "Prompt cache warming failed (non-fatal)");
-        }
-      })
-      .finally(() => {
-        if (this.cacheWarmAbort === abort) {
-          this.cacheWarmAbort = undefined;
-        }
       });
+      if (!abort.signal.aborted) {
+        log.info(
+          {
+            callSite,
+            profile: options?.overrideProfile ?? null,
+          },
+          "Prompt cache warmed successfully",
+        );
+      }
+    } catch (err) {
+      if (!abort.signal.aborted) {
+        log.warn(
+          {
+            err,
+            callSite,
+            profile: options?.overrideProfile ?? null,
+          },
+          "Prompt cache warming failed (non-fatal)",
+        );
+      }
+    } finally {
+      externalSignal?.removeEventListener("abort", relayAbort);
+      if (this.cacheWarmAbort === abort) {
+        this.cacheWarmAbort = undefined;
+      }
+    }
   }
 
   // ── Lifecycle ────────────────────────────────────────────────────
@@ -2366,9 +2500,6 @@ export class Conversation {
 
   markStale(): void {
     this.stale = true;
-    // Invalidate the cached skill catalog so the next projection picks up
-    // filesystem changes (e.g. a skill created during this run).
-    this.skillProjectionCache.catalog = undefined;
   }
 
   isStale(): boolean {
@@ -2377,6 +2508,10 @@ export class Conversation {
 
   abort(reason?: AbortReason): void {
     abortConversation(this, reason);
+  }
+
+  abortScheduledRun(runId: string): void {
+    abortScheduledRun(this, runId);
   }
 
   dispose(): void {
@@ -2457,14 +2592,32 @@ export class Conversation {
     return !this.queue.isEmpty;
   }
 
+  acquireLiveVoiceResidency(): () => void {
+    this.liveVoiceResidencyLeases += 1;
+    let released = false;
+    return () => {
+      if (released) {
+        return;
+      }
+      released = true;
+      this.liveVoiceResidencyLeases = Math.max(
+        0,
+        this.liveVoiceResidencyLeases - 1,
+      );
+    };
+  }
+
   /**
    * True when dropping this instance would lose work that is still in flight:
-   * a live turn, a queued successor, or a child subagent.
+   * a live turn, queued successor, child subagent, or mode-session lifecycle.
    */
   hasInFlightWork(): boolean {
     return (
       this.isProcessing() ||
       this.hasQueuedMessages() ||
+      this.pendingQueuedDispatches.size > 0 ||
+      this.liveVoiceResidencyLeases > 0 ||
+      this.modeSessions.hasResidentWork() ||
       getSubagentManager().hasActiveChildren(this.conversationId)
     );
   }
@@ -2591,6 +2744,16 @@ export class Conversation {
 
   setHostCuProxy(proxy: HostCuProxy | undefined): void {
     if (this.hostCuProxy && this.hostCuProxy !== proxy) {
+      const previousProxy = this.hostCuProxy;
+      bestEffortModeSessionTracking("computer use proxy replacement", () => {
+        this.computerUseModeSessions.endTask({
+          turnId: this.currentRequestId,
+          source: {
+            sourceId: previousProxy.sourceId,
+            generation: previousProxy.resetGeneration,
+          },
+        });
+      });
       this.hostCuProxy.dispose();
     }
     this.hostCuProxy = proxy;
@@ -3365,6 +3528,10 @@ export class Conversation {
        */
       replyDeliveredInAppOnly?: boolean;
       callSite?: LLMCallSite;
+      /** Skip fresh retrieval while keeping resident memory and static context. */
+      skipMemoryRetrieval?: boolean;
+      /** Provider configuration source when distinct from turn semantics. */
+      inferenceCallSite?: LLMCallSite;
       /**
        * Optional ad-hoc inference-profile override applied to every LLM call
        * the loop issues for this turn. Forwarded into
@@ -3376,6 +3543,8 @@ export class Conversation {
       overrideProfile?: string;
       /** Float `overrideProfile` above call-site layers for this run. */
       forceOverrideProfile?: boolean;
+      /** Observe the first finalized model request without delaying it. */
+      onFirstModelCallPrepared?: (prepared: PreparedModelCall) => void;
       /**
        * Firing's `cron_runs.id` stamped onto this turn's usage rows. Per-turn:
        * forwarded into {@link runAgentLoopImpl} and threaded to `recordUsage`.
@@ -3390,12 +3559,16 @@ export class Conversation {
     },
   ): Promise<void> {
     const { onEvent, ...rest } = options ?? {};
-    return runAgentLoopImpl(
-      this,
-      content,
-      userMessageId,
-      onEvent ?? this.emit,
-      rest,
+    return trackDaemonActivity(
+      turnActivityLabel(this, options?.callSite, options?.isInteractive),
+      () =>
+        runAgentLoopImpl(
+          this,
+          content,
+          userMessageId,
+          onEvent ?? this.emit,
+          rest,
+        ),
     );
   }
 

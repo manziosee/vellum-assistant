@@ -88,6 +88,7 @@
     "cardHoverLine": {
       "channels": "All the places you can reach me",
       "contacts": "The people I know and trust",
+      "email": "Everything that lands in my inbox",
       "library": "The apps and docs I've made for you",
       "memory": "Everything I remember",
       "personality": "Go ahead, tweak my soul",
@@ -109,7 +110,11 @@
     },
     "setUpSchedule": "Set one up",
     "updateAvatarAndName": "Update avatar and name",
-    "viewMoreSchedules": "{count, plural, one {View # more…} other {View # more…}}"
+    "viewMoreSchedules": "{count, plural, one {View # more…} other {View # more…}}",
+    "lockedBadge": "Needs the Super plan",
+    "pinEmail": "Pin Email to the side menu",
+    "unpinEmail": "Unpin Email from the side menu",
+    "dismissEmail": "Close"
   },
   "identitySections": {
     "channels": {
@@ -120,13 +125,13 @@
       "description": "People I know",
       "label": "Contacts"
     },
+    "email": {
+      "description": "Mail I've sent and received",
+      "label": "Email"
+    },
     "library": {
       "description": "My apps & docs",
       "label": "Library"
-    },
-    "memory": {
-      "description": "What I remember",
-      "label": "Memory"
     },
     "personality": {
       "description": "Tune how I talk",
@@ -264,7 +269,9 @@
   },
   "pluginToast": {
     "alreadyUpToDate": "{name} is already up to date",
+    "cleanupWarning": "Plugin cleanup completed with a warning.",
     "installed": "Installed {name}",
+    "mcpOAuthCredentialsUnchecked": "Credential storage is unavailable, so historical plugin MCP OAuth credentials could not be checked.",
     "pluginFallback": "plugin",
     "pluginFallbackCapitalized": "Plugin",
     "removed": "Removed {name}",
@@ -289,18 +296,15 @@
     "backToConversationAriaLabel": "Back to conversation",
     "backToSkillsAriaLabel": "Back to skills",
     "filesTab": "Files",
-    "fileViewModeAriaLabel": "File view mode",
     "historyTab": "History",
     "install": "Install",
     "noFilesAvailable": "No files available.",
     "openInWorkspaceAriaLabel": "Open in Workspace",
     "pendingAriaLabel": "Pending",
-    "preview": "Preview",
     "remove": "Remove",
     "saveFailed": "Save failed",
     "selectAFile": "Select a file",
-    "selectFilePrompt": "Select a file to view its contents.",
-    "source": "Source"
+    "selectFilePrompt": "Select a file to view its contents."
   },
   "skillDetailPage": {
     "backToConversation": "Back to conversation",
@@ -446,5 +450,9 @@
     "system": "System",
     "integrations": "Integrations",
     "other": "Other"
+  },
+  "assistantHandleLine": {
+    "edit": "Edit handle @{handle}",
+    "editTitle": "Edit handle"
   }
 }

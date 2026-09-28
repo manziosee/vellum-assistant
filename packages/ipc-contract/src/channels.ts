@@ -19,6 +19,15 @@ export const TEXT_UNDO = "vellum:text:undoInFrontApp";
 export const TEXT_OPEN_SETTINGS = "vellum:text:openAutomationSettings";
 
 // System permissions
+export const PERMISSION_GUIDE_CANCEL = "vellum:permissions:guide:cancel";
+export const PERMISSION_SETUP_BEGIN = "vellum:permissions:setup:begin";
+export const PERMISSION_GUIDE_GET = "vellum:permissions:guide:get";
+export const PERMISSION_GUIDE_STATE = "vellum:permissions:guide:state";
+export const PERMISSION_GUIDE_READY = "vellum:permissions:guide:ready";
+export const PERMISSION_GUIDE_DISMISS = "vellum:permissions:guide:dismiss";
+export const PERMISSION_GUIDE_DRAG = "vellum:permissions:guide:drag";
+export const PERMISSION_GUIDE_REVEAL = "vellum:permissions:guide:reveal";
+
 export const PERMISSIONS_GET_STATE = "vellum:permissions:getState";
 export const PERMISSIONS_REQUEST = "vellum:permissions:request";
 export const PERMISSIONS_OPEN_SETTINGS = "vellum:permissions:openSettings";
@@ -152,6 +161,12 @@ export const CONNECTIVITY_RETRY = "vellum:connectivity:retry";
 // Notifications
 export const NOTIFICATIONS_SHOW = "vellum:notifications:show";
 export const NOTIFICATIONS_ACTION = "vellum:notifications:action";
+export const NOTIFICATIONS_REGISTER_IDENTITY_PUBLISHER =
+  "vellum:notifications:registerIdentityPublisher";
+export const NOTIFICATIONS_PREPARE_IDENTITY =
+  "vellum:notifications:prepareIdentity";
+export const NOTIFICATIONS_RESET_IDENTITIES =
+  "vellum:notifications:resetIdentities";
 
 // Window attention
 export const WINDOW_ATTENTION = "vellum:window:attention";
@@ -195,6 +210,7 @@ export const COMPANION_GET_STATE = "vellum:companion:getState";
 export const COMPANION_STATE_EVENT = "vellum:companion:state";
 export const COMPANION_SET_INTERACTIVE = "vellum:companion:setInteractive";
 export const COMPANION_MOVE_BY = "vellum:companion:moveBy";
+export const COMPANION_RELEASE = "vellum:companion:release";
 export const COMPANION_START_VOICE = "vellum:companion:startVoice";
 export const COMPANION_TOGGLE_WATCH = "vellum:companion:toggleWatch";
 export const COMPANION_LIST_CAPTURE_SOURCES =
@@ -202,14 +218,29 @@ export const COMPANION_LIST_CAPTURE_SOURCES =
 export const COMPANION_SET_SCREEN_SHARE = "vellum:companion:setScreenShare";
 export const COMPANION_SET_ANNOTATING = "vellum:companion:setAnnotating";
 export const COMPANION_TOGGLE_ANNOTATING = "vellum:companion:toggleAnnotating";
+export const COMPANION_CLEAR_MARKS = "vellum:companion:clearMarks";
+export const COMPANION_SET_ANNOTATION_TOOL =
+  "vellum:companion:setAnnotationTool";
 export const COMPANION_ANNOTATE_SHARE = "vellum:companion:annotateShare";
 export const COMPANION_SET_FRAME_SCROLLING =
   "vellum:companion:setFrameScrolling";
+export const COMPANION_FRAME_DRAWN = "vellum:companion:frameDrawn";
 export const COMPANION_CAPTURE_SCREEN = "vellum:companion:captureScreen";
 export const COMPANION_SHARED_FRAME = "vellum:companion:sharedFrame";
+export const COMPANION_SHARE_TARGETS = "vellum:companion:shareTargets";
 export const COMPANION_ANSWER_WATCH_RETRO = "vellum:companion:answerWatchRetro";
 export const COMPANION_ANSWER_DICTATION_OFFER =
   "vellum:companion:answerDictationOffer";
+export const COMPANION_SET_UNPLACED_DICTATION_OFFER =
+  "vellum:companion:setUnplacedDictationOffer";
+export const COMPANION_ANSWER_POPOVER = "vellum:companion:answerPopover";
+export const COMPANION_SET_POPOVER_SIZE = "vellum:companion:setPopoverSize";
+export const COMPANION_SET_POPOVER_VIEW = "vellum:companion:setPopoverView";
+export const COMPANION_SET_ATTACHED_POPOVER_HEIGHT =
+  "vellum:companion:setAttachedPopoverHeight";
+export const COMPANION_TOGGLE_PICKER = "vellum:companion:togglePicker";
+export const COMPANION_OPEN_LINK = "vellum:companion:openLink";
+export const COMPANION_TAKES_PROMPTS = "vellum:companion:takesPrompts";
 export const COMPANION_ACTIVATE = "vellum:companion:activate";
 export const COMPANION_SET_CONTEXT = "vellum:companion:setContext";
 export const COMPANION_ADVANCE_INTRO = "vellum:companion:advanceIntro";

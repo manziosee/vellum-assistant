@@ -119,6 +119,7 @@ import {
   applyRuntimeInjections,
   assembleSlackActiveThreadFocusBlock,
   assembleSlackChronologicalMessages,
+  buildChannelCapabilityBlock,
   buildSubagentStatusBlock,
   getSlackCompactionWatermarkForPrefix,
   getSlackWatermarkAdvanceForRowPrefix,
@@ -586,6 +587,35 @@ describe("injectChannelCapabilityContext", () => {
     expect(text).not.toContain("Do NOT use ui_show, ui_update, or app_create");
   });
 
+  test("guides non-interactive turns to persist UI for a later capable client", () => {
+    const slack: ChannelCapabilities = {
+      channel: "slack",
+      dashboardCapable: false,
+      supportsDynamicUi: false,
+      supportsVoiceInput: false,
+    };
+    const phone: ChannelCapabilities = {
+      channel: "phone",
+      dashboardCapable: false,
+      supportsDynamicUi: false,
+      supportsVoiceInput: false,
+    };
+
+    for (const caps of [slack, phone]) {
+      const text = buildChannelCapabilityBlock(caps, undefined, true)!;
+      expect(text).toContain(
+        "ui_show, ui_update, and ui_dismiss persist conversation content",
+      );
+      expect(text).not.toContain("Only use ui_show/ui_update");
+      expect(text).not.toContain(
+        "Do NOT use ui_show, ui_update, or app_create",
+      );
+      expect(text).not.toContain(
+        "Present information as well-formatted text instead of dynamic UI.",
+      );
+    }
+  });
+
   test("keeps blanket ui_show/ui_update prohibition for other non-dynamic channels", () => {
     const caps: ChannelCapabilities = {
       channel: "phone",
@@ -642,6 +672,35 @@ describe("injectChannelCapabilityContext", () => {
     const result = injectChannelCapabilityContext(baseUserMessage, caps);
     const text = (result.content[0] as { type: "text"; text: string }).text;
     expect(text).not.toContain("Do NOT use markdown tables");
+  });
+
+  test("injects email send CLI constraint for email channel", () => {
+    const caps: ChannelCapabilities = {
+      channel: "email",
+      dashboardCapable: false,
+      supportsDynamicUi: false,
+      supportsVoiceInput: false,
+    };
+
+    const result = injectChannelCapabilityContext(baseUserMessage, caps);
+    const text = (result.content[0] as { type: "text"; text: string }).text;
+    expect(text).toContain("Conversation text is not emailed");
+    expect(text).toContain("assistant email send");
+    expect(text).toContain("--reply-to");
+  });
+
+  test("does NOT inject email send CLI constraint for non-email channels", () => {
+    const caps: ChannelCapabilities = {
+      channel: "telegram",
+      dashboardCapable: false,
+      supportsDynamicUi: false,
+      supportsVoiceInput: false,
+    };
+
+    const result = injectChannelCapabilityContext(baseUserMessage, caps);
+    const text = (result.content[0] as { type: "text"; text: string }).text;
+    expect(text).not.toContain("Conversation text is not emailed");
+    expect(text).not.toContain("assistant email send");
   });
 });
 
@@ -870,12 +929,12 @@ describe("trust-gating via channel capabilities", () => {
 
     const result = injectChannelCapabilityContext(message, caps);
 
-    // macOS clients now get osascript guidance injected
+    // macOS clients get app-scripting guidance injected
     expect(result).not.toBe(message);
     const injected = (result.content[0] as { type: "text"; text: string }).text;
     expect(injected).toContain("client_os: macos");
-    expect(injected).toContain("osascript");
-    expect(injected).toContain("host_bash");
+    expect(injected).toContain("drive apps with the computer-use skill");
+    expect(injected).toContain("`host_bash` is for shell commands");
     // No channel constraints — full desktop capabilities
     expect(injected).not.toContain("CHANNEL CONSTRAINTS");
   });
@@ -4028,6 +4087,33 @@ describe("Slack channel chronological rendering — multi-thread", () => {
       },
     };
   }
+
+  test("fresh memory policy reaches injectors on initial assembly and re-entry", async () => {
+    const seen = { ctx: null as TurnContext | null, commits: 0 };
+    registerPluginInjectors(V3_PROBE_PLUGIN, [probeMemoryV3Injector(seen)]);
+    try {
+      setConversation(
+        FALLBACK_CONVERSATION_ID,
+        asConversation({
+          conversationId: FALLBACK_CONVERSATION_ID,
+          currentCallSite: "callAgent",
+          currentTurnSkipMemoryRetrieval: true,
+        }),
+      );
+      for (const isReInjection of [false, true]) {
+        await applyRuntimeInjections(
+          [{ role: "user", content: [{ type: "text", text: "circle that" }] }],
+          {
+            conversationId: FALLBACK_CONVERSATION_ID,
+            reinjection: isReInjection,
+          },
+        );
+        expect(seen.ctx?.skipMemoryRetrieval).toBe(true);
+      }
+    } finally {
+      unregisterPluginInjectors(V3_PROBE_PLUGIN);
+    }
+  });
 
   test("slack replacement is stated on the turn context and attaches the memory-v3 block in memory only: uncaptured, uncommitted", async () => {
     const seen = { ctx: null as TurnContext | null, commits: 0 };

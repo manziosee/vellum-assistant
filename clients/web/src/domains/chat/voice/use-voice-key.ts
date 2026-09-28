@@ -1,6 +1,9 @@
 import { useEffect, useRef } from "react";
 
-import type { HotkeySelection, KeyboardModifier } from "@vellumai/ipc-contract";
+import type {
+  HotkeySelectionResult,
+  KeyboardModifier,
+} from "@vellumai/ipc-contract";
 
 import {
   readFrontSelection,
@@ -8,10 +11,7 @@ import {
   subscribeToHotkeyEvents,
   supportsModifierHold,
 } from "@/runtime/hotkey";
-import {
-  getSystemPermissionsState,
-  requestSystemPermission,
-} from "@/runtime/system-permissions";
+import { subscribeToInputMonitoringGranted } from "@/runtime/system-permissions";
 import { createVoiceKeyGestureClassifier } from "@/domains/chat/voice/voice-key-gestures";
 import type { VoiceKey } from "@/utils/voice-key";
 
@@ -27,10 +27,10 @@ export interface HoldStart {
    * waiting on the read; what was selected cannot change while the key is
    * held, and the transcript that needs it lands well after the read does.
    * The helper answers only while the hold is still open, so a read that
-   * lands after the keys are up resolves to nothing rather than to whatever
+   * lands after the keys are up resolves as unavailable rather than to whatever
    * the user has moved on to.
    */
-  selection: Promise<HotkeySelection | null>;
+  selection: Promise<HotkeySelectionResult>;
 }
 
 export interface VoiceKeyHandlers {
@@ -44,31 +44,20 @@ export interface VoiceKeyHandlers {
   /** Start a call, or end the one that is running. */
   onDoubleTap: () => void;
   /**
+   * The key was touched, once. Both halves of a double tap arrive here too,
+   * each on its own release.
+   *
+   * Optional because a tap asks for nothing: it starts no dictation and no
+   * call, and a caller with nothing to draw is right to ignore it. What it is
+   * for is saying the key works, to a surface that is in the middle of teaching
+   * it.
+   */
+  onTap?: () => void;
+  /**
    * Whether the host took the key. `false` when it refused (no helper, or
    * Input Monitoring ungranted), which is the settings card's cue to say so.
    */
   onRegistered?: (registered: boolean) => void;
-}
-
-/**
- * Whether this launch has asked for Input Monitoring on the key's behalf.
- *
- * The grant is asked for when the key is armed and not yet granted, which on a
- * fresh install is the first launch. Once per launch: a refusal is the user's
- * answer for the session, and the settings card offers the question again.
- */
-let inputMonitoringAskedThisLaunch = false;
-
-async function askForInputMonitoringOnce(): Promise<void> {
-  if (inputMonitoringAskedThisLaunch) {
-    return;
-  }
-  const state = await getSystemPermissionsState();
-  if (state?.inputMonitoring.status === "granted") {
-    return;
-  }
-  inputMonitoringAskedThisLaunch = true;
-  await requestSystemPermission("inputMonitoring");
 }
 
 /**
@@ -80,6 +69,9 @@ async function askForInputMonitoringOnce(): Promise<void> {
  * user is somewhere else entirely. The helper reports the key as a hold span,
  * and the gestures are read off the span here (see `voice-key-gestures`).
  *
+ * A single tap asks for nothing and is reported anyway, for a caller that wants
+ * to show the key being touched. Nothing here acts on it.
+ *
  * **A hold is a microphone.** Every `onHoldStart` is closed exactly once, so
  * the effect's teardown closes an open hold too: a binding that goes away
  * mid-hold would otherwise leave the microphone on with nothing left to turn
@@ -90,6 +82,7 @@ export function useVoiceKey({
   onHoldStart,
   onHoldEnd,
   onDoubleTap,
+  onTap,
   onRegistered,
 }: VoiceKeyHandlers & { key: VoiceKey }): void {
   // Read through a ref so a caller that re-renders does not re-register the
@@ -98,11 +91,18 @@ export function useVoiceKey({
     onHoldStart,
     onHoldEnd,
     onDoubleTap,
+    onTap,
     onRegistered,
   });
   useEffect(() => {
-    handlers.current = { onHoldStart, onHoldEnd, onDoubleTap, onRegistered };
-  }, [onHoldStart, onHoldEnd, onDoubleTap, onRegistered]);
+    handlers.current = {
+      onHoldStart,
+      onHoldEnd,
+      onDoubleTap,
+      onTap,
+      onRegistered,
+    };
+  }, [onHoldStart, onHoldEnd, onDoubleTap, onTap, onRegistered]);
 
   // The binding as a string, so the effect re-runs on a real change of key and
   // not on every render that hands over an equal array.
@@ -123,6 +123,9 @@ export function useVoiceKey({
           case "holdEnd":
             handlers.current.onHoldEnd();
             return;
+          case "tap":
+            handlers.current.onTap?.();
+            return;
           case "doubleTap":
             handlers.current.onDoubleTap();
             return;
@@ -138,26 +141,30 @@ export function useVoiceKey({
     });
 
     let disposed = false;
-    void setModifierHold({
-      kind: "modifierOnly",
-      modifiers: modifiers.split("+") as KeyboardModifier[],
-    }).then(
-      (result) => {
-        if (!disposed) {
-          handlers.current.onRegistered?.(result.ok && result.enabled);
-        }
-      },
-      () => {
-        if (!disposed) {
-          handlers.current.onRegistered?.(false);
-        }
-      },
-    );
-    void askForInputMonitoringOnce();
+    const register = () => {
+      void setModifierHold({
+        kind: "modifierOnly",
+        modifiers: modifiers.split("+") as KeyboardModifier[],
+      }).then(
+        (result) => {
+          if (!disposed) {
+            handlers.current.onRegistered?.(result.ok && result.enabled);
+          }
+        },
+        () => {
+          if (!disposed) {
+            handlers.current.onRegistered?.(false);
+          }
+        },
+      );
+    };
+    const unsubscribePermission = subscribeToInputMonitoringGranted(register);
+    register();
 
     return () => {
       disposed = true;
       unsubscribe();
+      unsubscribePermission();
       classifier.cancel();
       void setModifierHold({ kind: "off" });
     };

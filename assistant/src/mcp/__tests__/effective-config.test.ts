@@ -4,8 +4,8 @@
  * The properties worth pinning are the ones a refactor could quietly
  * break, each of which fails silently rather than loudly:
  *
- * 1. Plugin servers reach the manager at all. Reading only `config.mcp`
- *    leaves a plugin's tools missing with nothing logged.
+ * 1. Plugin servers reach the manager at all. Reading only the workspace
+ *    `mcp.json` leaves a plugin's tools missing with nothing logged.
  * 2. A workspace entry of the same id wins, so a plugin cannot redirect a
  *    server the user configured by hand.
  * 3. Every server is attributed. `source` is what `McpClient` reads to
@@ -24,6 +24,7 @@ import { getWorkspacePluginsDir } from "../../util/platform.js";
 import {
   buildEffectiveMcpConfig,
   pluginMcpServersChangedSinceLastBuild,
+  readEffectiveMcpConfig,
   resetEffectiveMcpConfigForTests,
 } from "../effective-config.js";
 
@@ -179,6 +180,16 @@ describe("pluginMcpServersChangedSinceLastBuild", () => {
     buildEffectiveMcpConfig(workspaceConfig({}));
     writePlugin("unabyss", UNABYSS);
 
+    expect(pluginMcpServersChangedSinceLastBuild()).toBe(true);
+  });
+
+  test("a read-only resolution does not record the changed plugin set as applied", () => {
+    buildEffectiveMcpConfig(workspaceConfig({}));
+    writePlugin("unabyss", UNABYSS);
+
+    expect(
+      readEffectiveMcpConfig(workspaceConfig({})).servers.unabyss,
+    ).toBeDefined();
     expect(pluginMcpServersChangedSinceLastBuild()).toBe(true);
   });
 

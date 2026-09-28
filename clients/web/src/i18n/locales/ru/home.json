@@ -33,10 +33,17 @@
       "unreachable": "Недоступно"
     }
   },
+  "homeUpdatesList": {
+    "titleOne": "Навык обновлён: {name}",
+    "titleMany": "{count, plural, one {Обновлён # навык} few {Обновлены # навыка} many {Обновлено # навыков} other {Обновлено # навыка}}"
+  },
   "notificationsBell": {
     "ariaLabel": "Уведомления",
     "ariaLabelUnread": "Уведомления (непрочитанные)",
     "heading": "Уведомления",
+    "unread": "Непрочитанные",
+    "actionsTitle": "Действия с уведомлениями",
+    "noUnread": "Нет непрочитанных уведомлений.",
     "loadFailed": "Не удалось загрузить уведомления.",
     "actionFailed": "Не удалось начать этот диалог. Повторите попытку.",
     "decisionNotPermitted": "У вас нет прав принимать решение по этому запросу.",

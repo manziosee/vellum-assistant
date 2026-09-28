@@ -28,6 +28,8 @@ import {
   resolveEffectiveAppHtml,
   updateApp,
 } from "../apps/app-store.js";
+import { executeDesktopComputerUse } from "../desktop/desktop-computer-use.js";
+import { canUseVirtualDesktop } from "../desktop/virtual-desktop-feature.js";
 import { recordActivationEvent } from "../onboarding/onboarding-events-store.js";
 import {
   getMessages,
@@ -55,7 +57,9 @@ import {
   isActivationMomentParam,
 } from "../telemetry/activation-funnel.js";
 import { resolveAppId } from "../tools/apps/resolve-app-id.js";
+import { formatDesktopAppRequired } from "../tools/capability-offer.js";
 import { POINT_AT_PROXY_TOOL } from "../tools/computer-use/skill-proxy-bridge.js";
+import { computerUseTarget } from "../tools/computer-use/target.js";
 import type { ToolExecutionResult } from "../tools/types.js";
 import { getLogger } from "../util/logger.js";
 import { isPlainObject } from "../util/object.js";
@@ -69,7 +73,7 @@ import {
   type SurfaceShowPair,
   type SurfaceStateEntry,
 } from "./conversation-surface-state.js";
-import type { HostCuProxy } from "./host-cu-proxy.js";
+import { HostCuProxy } from "./host-cu-proxy.js";
 import { resolveHostCuTarget } from "./host-cu-target.js";
 import type {
   AnySurfaceData,
@@ -88,9 +92,11 @@ import type {
 } from "./message-protocol.js";
 import { INTERACTIVE_SURFACE_TYPES } from "./message-protocol.js";
 import { isRowVisibleToUntrustedActor } from "./message-provenance.js";
+import { bestEffortModeSessionTracking } from "./mode-session-tracking.js";
 import type { TrustContext } from "./trust-context-types.js";
 import { restingTrust } from "./trust-context-types.js";
 import { turnActorPrincipalId } from "./turn-actor.js";
+import { virtualDesktopContext } from "./virtual-desktop-context.js";
 export {
   buildSurfaceShowPair,
   type CurrentTurnSurface,
@@ -100,6 +106,7 @@ export {
   type SurfaceShowPair,
   type SurfaceStateEntry,
 } from "./conversation-surface-state.js";
+import { safeStringSlice } from "../util/unicode.js";
 import type { HostAppControlInput } from "./message-types/host-app-control.js";
 import type { UserMessageAttachment } from "./message-types/shared.js";
 
@@ -165,6 +172,73 @@ const NON_BLOCKING_PENDING_SURFACE_TYPES = new Set<SurfaceType>([
   "visual",
   "voice_picker",
 ]);
+
+/**
+ * Whether a surface this conversation showed is still waiting on the user.
+ *
+ * The one-interactive-surface-at-a-time gate reads it to reject a second
+ * card, and the turn boundary reads it to tell a turn that delivered from a
+ * turn that posed a question and handed control back.
+ */
+export function hasBlockingPendingSurface(ctx: {
+  pendingSurfaceActions: Map<string, { surfaceType: SurfaceType }>;
+}): boolean {
+  return blockingPendingSurfaceIds(ctx).length > 0;
+}
+
+export function blockingPendingSurfaceIds(ctx: {
+  pendingSurfaceActions: Map<string, { surfaceType: SurfaceType }>;
+}): string[] {
+  const ids: string[] = [];
+  for (const [surfaceId, entry] of ctx.pendingSurfaceActions) {
+    if (!NON_BLOCKING_PENDING_SURFACE_TYPES.has(entry.surfaceType)) {
+      ids.push(surfaceId);
+    }
+  }
+  return ids;
+}
+
+function acceptModeSessionSurfaceResponse(
+  ctx: Conversation,
+  requestId: string,
+  surfaceId: string,
+): void {
+  bestEffortModeSessionTracking("surface response admission", () =>
+    ctx.modeSessions?.acceptTurn(requestId, {
+      kind: "surface",
+      responseId: surfaceId,
+    }),
+  );
+}
+
+function invalidateModeSessionSurfaceWait(
+  ctx: Partial<Pick<Conversation, "modeSessions">>,
+  surfaceId: string,
+): void {
+  bestEffortModeSessionTracking("surface wait invalidation", () =>
+    ctx.modeSessions?.invalidateStructuralWait({
+      kind: "surface",
+      responseId: surfaceId,
+    }),
+  );
+}
+
+function settleModeSessionSurfaceWait(
+  ctx: Pick<Conversation, "conversationId" | "modeSessions">,
+  surfaceId: string,
+): void {
+  try {
+    ctx.modeSessions?.settleStructuralWait(
+      { kind: "surface", responseId: surfaceId },
+      { status: "completed", endReason: "surface_launch_settled" },
+    );
+  } catch (err) {
+    log.warn(
+      { err, conversationId: ctx.conversationId, surfaceId },
+      "Mode-session launcher settlement failed",
+    );
+  }
+}
 
 /**
  * Surface types that carry no terminal action: the card settles when the user
@@ -1272,7 +1346,8 @@ export function cleanupStandaloneSurface(
     | "lastSurfaceAction"
     | "accumulatedSurfaceState"
     | "surfaceUndoStacks"
-  >,
+  > &
+    Partial<Pick<Conversation, "modeSessions">>,
   surfaceId: string,
 ): void {
   const entry = ctx.pendingStandaloneSurfaces?.get(surfaceId);
@@ -1285,6 +1360,7 @@ export function cleanupStandaloneSurface(
   ctx.lastSurfaceAction.delete(surfaceId);
   ctx.accumulatedSurfaceState.delete(surfaceId);
   ctx.surfaceUndoStacks.delete(surfaceId);
+  invalidateModeSessionSurfaceWait(ctx, surfaceId);
 
   // Record a tombstone so late client actions are silently dropped.
   if (ctx.recentlyCompletedStandaloneSurfaces) {
@@ -1468,7 +1544,10 @@ function handleDocumentContentChanged(
         updateApp(appId, {
           name: title || app.name,
           description: `Document with ${wordCount ?? 0} words`,
-          preview: content?.slice(0, 200),
+          preview:
+            content === undefined
+              ? undefined
+              : safeStringSlice(content, 0, 200),
           htmlDefinition: updatedHtml,
         });
 
@@ -2087,6 +2166,7 @@ export async function handleSurfaceAction(
       ...(anchorMessageId ? { anchorMessageId } : {}),
       ...(originTrustContext ? { originTrustContext } : {}),
     });
+    settleModeSessionSurfaceWait(ctx, surfaceId);
     log.info(
       { originConversationId: ctx.conversationId, conversationId, surfaceId },
       "launch_conversation dispatched inline from surface action",
@@ -2261,6 +2341,8 @@ export async function handleSurfaceAction(
       return QUEUE_FULL_RESULT;
     }
 
+    acceptModeSessionSurfaceResponse(ctx, requestId, surfaceId);
+
     // Terminal user commit accepted — record the activation milestone if this
     // surface was tagged (best-effort, no-op otherwise). Deferred until after
     // the rejection check so a queue-full click doesn't over-report a moment
@@ -2287,6 +2369,7 @@ export async function handleSurfaceAction(
         type: "user_message_echo",
         text: prompt,
         conversationId: ctx.conversationId,
+        modeSession: ctx.modeSessions.getTurnOwner(requestId),
       });
     }
 
@@ -2514,6 +2597,8 @@ export async function handleSurfaceAction(
     return QUEUE_FULL_RESULT;
   }
 
+  acceptModeSessionSurfaceResponse(ctx, requestId, surfaceId);
+
   // Terminal user commit accepted — record the activation milestone if this
   // surface was tagged (best-effort, no-op otherwise). Deferred until after the
   // rejection check so a queue-full click doesn't over-report a moment (and the
@@ -2540,6 +2625,7 @@ export async function handleSurfaceAction(
       type: "user_message_echo",
       text: prompt,
       conversationId: ctx.conversationId,
+      modeSession: ctx.modeSessions.getTurnOwner(requestId),
     });
   }
   if (result.queued) {
@@ -2918,7 +3004,7 @@ export function buildAppOpenPreview(
 function describeComputerUseUnavailable(ctx: Conversation): string {
   const capable = assistantEventHub.listClientsByCapability("host_cu");
   if (capable.length === 0) {
-    return "Computer use is not available — no desktop client connected. Open the Vellum desktop app on the machine you want to control, then retry.";
+    return formatDesktopAppRequired("screen");
   }
   return `Computer use is not available for this conversation — ${capable.length} desktop client(s) advertise host_cu, but none of them can be driven from this conversation's interface (${ctx.transportInterface ?? "unknown"}) as its current user.`;
 }
@@ -3138,6 +3224,28 @@ export async function surfaceProxyResolver(
 ): Promise<ToolExecutionResult> {
   // Route CU proxy tools (all computer_use_* action tools)
   if (toolName.startsWith("computer_use_")) {
+    const desktopContext = virtualDesktopContext(ctx, signal);
+    if (
+      toolName !== POINT_AT_PROXY_TOOL &&
+      computerUseTarget(input, desktopContext) === "assistant-desktop"
+    ) {
+      if (!canUseVirtualDesktop(desktopContext)) {
+        return {
+          content:
+            "The assistant desktop requires an identified guardian and an enabled platform-hosted assistant.",
+          isError: true,
+        };
+      }
+      if (!ctx.hostCuProxy) {
+        ctx.setHostCuProxy(new HostCuProxy());
+      }
+      return executeDesktopComputerUse(
+        toolName,
+        input,
+        desktopContext,
+        ctx.hostCuProxy!,
+      );
+    }
     const hostCuProxy = ensureHostCuProxy(ctx);
     if (!hostCuProxy || !hostCuProxy.isAvailable()) {
       return {
@@ -3157,7 +3265,16 @@ export async function surfaceProxyResolver(
           : typeof input.answer === "string"
             ? input.answer
             : "Task complete";
-      hostCuProxy.reset();
+      bestEffortModeSessionTracking("computer completion", () =>
+        ctx.computerUseModeSessions.endTask({
+          turnId: ctx.currentRequestId,
+          source: {
+            sourceId: hostCuProxy.sourceId,
+            generation: hostCuProxy.resetGeneration,
+          },
+        }),
+      );
+      hostCuProxy.endTask(ctx.conversationId);
       return { content: summary, isError: false };
     }
 
@@ -3192,9 +3309,11 @@ export async function surfaceProxyResolver(
     // `maxStepsPerSession` would let a long walkthrough exhaust a budget
     // meant for actions and be told to call `computer_use_done`, which has
     // nothing to do with what it was doing.
+    const activityAt = Date.now();
     if (toolName !== POINT_AT_PROXY_TOOL) {
       hostCuProxy.recordAction(toolName, input, reasoning);
     }
+    const turnId = ctx.currentRequestId;
     return hostCuProxy.request(
       toolName,
       input,
@@ -3204,6 +3323,18 @@ export async function surfaceProxyResolver(
       signal,
       targetClientId,
       sourceActorPrincipalId,
+      toolName !== POINT_AT_PROXY_TOOL && turnId
+        ? () => {
+            ctx.computerUseModeSessions.recordAction({
+              turnId,
+              source: {
+                sourceId: hostCuProxy.sourceId,
+                generation: hostCuProxy.resetGeneration,
+              },
+              at: activityAt,
+            });
+          }
+        : undefined,
     );
   }
 
@@ -3233,8 +3364,7 @@ export async function surfaceProxyResolver(
 
     if (!ctx.hostAppControlProxy || !ctx.hostAppControlProxy.isAvailable()) {
       return {
-        content:
-          "App control is not available — enable the `app-control` feature flag and connect a macOS client.",
+        content: formatDesktopAppRequired("apps"),
         isError: true,
       };
     }
@@ -3324,8 +3454,14 @@ export async function surfaceProxyResolver(
 
   if (toolName === "ui_show" || toolName === "ui_update") {
     const caps = ctx.channelCapabilities;
+    // Live non-dynamic channels reject unsupported surfaces. Clientless turns
+    // skip this gate so surfaces persist for a later capable client.
+    // `canShowInteractiveUi` fails closed on clientless turns because
+    // standalone surfaces have nobody to answer them, so it is not the
+    // predicate here.
     if (
       caps &&
+      !ctx.hasNoClient &&
       !caps.supportsDynamicUi &&
       !isSlackTaskProgressUiException(ctx, toolName, input)
     ) {
@@ -3534,11 +3670,12 @@ export async function surfaceProxyResolver(
           : surfaceType === "table"
             ? hasActions
             : INTERACTIVE_SURFACE_TYPES.includes(surfaceType);
-    // An explicit `await_action: true` is honored for every other type; an
-    // actionless surface has nothing to await, so it is forced false.
-    const awaitAction = isActionless
-      ? false
-      : ((input.await_action as boolean) ?? isInteractive);
+    // Background turns persist surfaces for a later conversation open and
+    // return immediately. An actionless surface also has nothing to await.
+    const awaitAction =
+      !ctx.hasNoClient &&
+      !isActionless &&
+      ((input.await_action as boolean) ?? isInteractive);
 
     // Only one non-persistent interactive surface at a time. If another
     // surface is already awaiting user input, reject this one so the LLM
@@ -3546,10 +3683,7 @@ export async function surfaceProxyResolver(
     // content rather than a question posed to the user, so a pending one
     // never blocks the next surface.
     if (awaitAction) {
-      const hasExistingPending = [...ctx.pendingSurfaceActions.values()].some(
-        (entry) => !NON_BLOCKING_PENDING_SURFACE_TYPES.has(entry.surfaceType),
-      );
-      if (hasExistingPending) {
+      if (hasBlockingPendingSurface(ctx)) {
         return {
           content:
             "Another interactive surface is already awaiting user input. Present one at a time — wait for the user to respond to the current surface before showing the next.",

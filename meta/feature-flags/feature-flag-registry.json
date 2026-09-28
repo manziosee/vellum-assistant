@@ -16,7 +16,10 @@
       "label": "In-Chat Onboarding Tour",
       "description": "Multivariate experiment for the eyes-led in-chat onboarding tour. control = straight to chat after research onboarding (current behavior); tour = the extended tour auto-plays on first workspace entry. Desktop-only: phone-width viewports and the native shell get neither the tour nor its telemetry (not even the exposure event), so the funnel measures desktop sessions exclusively. Targeted via LaunchDarkly (70% tour / 30% control).",
       "defaultEnabled": "control",
-      "values": ["control", "tour"]
+      "values": [
+        "control",
+        "tour"
+      ]
     },
     {
       "id": "user-hosted-enabled",
@@ -27,22 +30,16 @@
       "defaultEnabled": false
     },
     {
-      "id": "proactive-tips",
-      "scope": "client",
-      "key": "proactive-tips",
-      "label": "Proactive Tips",
-      "description": "Gates the dismissible proactive tip card in the web sidebar. String-valued so future A/B arms can be added as new values.",
-      "defaultEnabled": "off",
-      "values": ["off", "on"]
-    },
-    {
       "id": "vision-mode",
       "scope": "client",
       "key": "vision-mode",
       "label": "Vision Mode",
       "description": "Gates hold-to-Live ambient frame sampling in the voice room camera. String-valued so future A/B arms can be added as new values.",
       "defaultEnabled": "off",
-      "values": ["off", "on"]
+      "values": [
+        "off",
+        "on"
+      ]
     },
     {
       "id": "assistant-initiated-threads",
@@ -51,7 +48,10 @@
       "label": "Assistant-Initiated Threads",
       "description": "Gates the sidebar section collecting the conversations the assistant started on its own: rows stamped `source='assistant_initiated'` at creation by producers that opt a thread in (heartbeat realizations worth the user's time; nothing stamps it yet, so the section starts empty and holds only new threads by construction). Transactional notification trails keep `source='notification'` and stay in Chats and the bell. When on, the daemon emits an `assistant` row from the section index and withholds member conversations from the Chats bucket; when off, they stay in Chats and no `assistant` row is emitted, which is the shipped behavior. Deliberately daemon-scope only: the index row is self-describing, so clients render the section on its presence rather than on a flag of their own. A second client-side gate could only hide a section whose rows the daemon has already withheld from Chats, which would lose those threads instead of reverting the feature. String-valued so future A/B arms can be added as new values.",
       "defaultEnabled": "off",
-      "values": ["off", "on"]
+      "values": [
+        "off",
+        "on"
+      ]
     },
     {
       "id": "experiment-activation-flow-2026-06-03",
@@ -60,7 +60,11 @@
       "label": "Activation Flow Experiment 2026-06-03",
       "description": "Multivariate activation-flow experiment. control = standard flow; variant-a = activation rail; personal-page = new sign-up-page variant (front-end only). Targeted via LaunchDarkly.",
       "defaultEnabled": "control",
-      "values": ["control", "variant-a", "personal-page"]
+      "values": [
+        "control",
+        "variant-a",
+        "personal-page"
+      ]
     },
     {
       "id": "local-docker-enabled",
@@ -164,14 +168,6 @@
       "key": "fast-mode",
       "label": "Fast Mode",
       "description": "Enable Anthropic fast mode for Opus models (4.6, 4.7, 4.8), delivering up to 2.5x higher output tokens per second at premium pricing",
-      "defaultEnabled": false
-    },
-    {
-      "id": "teleport",
-      "scope": "client",
-      "key": "teleport",
-      "label": "Teleport",
-      "description": "Enable teleport UI in General settings for moving assistants between hosting environments",
       "defaultEnabled": false
     },
     {
@@ -343,11 +339,27 @@
       "defaultEnabled": false
     },
     {
+      "id": "mcp-catalog-qa-integrations",
+      "scope": "assistant",
+      "key": "mcp-catalog-qa-integrations",
+      "label": "MCP Catalog QA Integrations",
+      "description": "Show Gamma, Guru, Intercom, Ramp, Semrush, and Typeform in the installable plugin catalog while their OAuth flows are validated. When off, catalog search, detail, and install-by-name cannot resolve them. Existing installed connections remain available.",
+      "defaultEnabled": false
+    },
+    {
       "id": "os-beta",
       "scope": "assistant",
       "key": "os-beta",
       "label": "OS Beta",
       "description": "Enable the OS Beta model profile (MiniMax M3 / Together) in the assistant's model profile selection.",
+      "defaultEnabled": false
+    },
+    {
+      "id": "auto-profile",
+      "scope": "assistant",
+      "key": "auto-profile",
+      "label": "Auto Profile",
+      "description": "Enable the Auto model profile, which asks Jev which default profile should answer each message.",
       "defaultEnabled": false
     },
     {
@@ -439,19 +451,19 @@
       "defaultEnabled": false
     },
     {
+      "id": "local-notification-avatar",
+      "scope": "client",
+      "key": "local-notification-avatar",
+      "label": "Local Notification Avatar",
+      "description": "Shows the assistant name and avatar in notifications posted locally by native clients and supported browsers. Independent of remote push avatar presentation.",
+      "defaultEnabled": false
+    },
+    {
       "id": "channel-conversation-sidecar",
       "scope": "client",
       "key": "channel-conversation-sidecar",
       "label": "Channel Conversation Sidecar",
       "description": "Renders a conversation bound to an external channel (Slack, Telegram, Discord, phone, email, and any other channel adapter) as two lanes in web chat: Vellum stays the primary full-width lane, and the canonical external-channel transcript moves into the existing read-only right drawer, opened from a channel-thread control in the chat header. Rows the client can attribute to the external channel are drawn once, in the drawer, instead of being blended into the Vellum lane. The drawer offers an Open in <channel> secondary action and a per-message Reference in Vellum action that stages one quoted reference above the Vellum composer. The Vellum composer stays the only input; nothing about delivery, routing, or permissions changes. Off leaves the header deep-link pill and the blended transcript unchanged.",
-      "defaultEnabled": false
-    },
-    {
-      "id": "stripe-link-oauth",
-      "scope": "assistant",
-      "key": "stripe-link-oauth",
-      "label": "Link by Stripe Integration",
-      "description": "Gates the seeded Link by Stripe OAuth provider. When off, the provider is hidden from GET /v1/oauth/providers, its get-by-id route, and the connect/update routes, so it cannot be listed or connected from the CLI, gateway, or web integrations list. The row is still seeded into oauth_providers on startup; only its visibility changes. Off by default because a connected wallet lets an assistant spend real money.",
       "defaultEnabled": false
     },
     {
@@ -468,6 +480,22 @@
       "key": "figma-oauth",
       "label": "Figma Integration",
       "description": "Gates the seeded Figma OAuth provider. When off, the provider is hidden from GET /v1/oauth/providers, its get-by-id route, and the connect/update routes, so it cannot be listed or connected from the CLI, gateway, or web integrations list. The row is still seeded into oauth_providers on startup, and existing connections keep injecting credentials; only its visibility changes.",
+      "defaultEnabled": false
+    },
+    {
+      "id": "quickbooks-oauth",
+      "scope": "assistant",
+      "key": "quickbooks-oauth",
+      "label": "QuickBooks Integration",
+      "description": "Gates the seeded QuickBooks OAuth provider. When off, the provider is hidden from GET /v1/oauth/providers, its get-by-id route, and the connect/update routes, so it cannot be listed or connected from the CLI, gateway, or web integrations list. The row is still seeded into oauth_providers on startup, and existing connections keep injecting credentials; only its visibility changes.",
+      "defaultEnabled": false
+    },
+    {
+      "id": "shopify-oauth",
+      "scope": "assistant",
+      "key": "shopify-oauth",
+      "label": "Shopify Integration",
+      "description": "Gates the seeded Shopify OAuth provider. When off, the provider is hidden from GET /v1/oauth/providers, its get-by-id route, and the connect/update routes, so it cannot be listed or connected from the CLI, gateway, or web integrations list. The row is still seeded into oauth_providers on startup, and existing connections keep injecting credentials; only its visibility changes. Off by default because Shopify is the first per-tenant provider: connecting needs the merchant's myshopify.com domain, and the shop-domain input in the clients ships separately from the seed.",
       "defaultEnabled": false
     },
     {
@@ -495,11 +523,57 @@
       "defaultEnabled": false
     },
     {
+      "id": "experiment-activation-checklist-2026-09-10",
+      "scope": "client",
+      "key": "experiment-activation-checklist-2026-09-10",
+      "label": "Experiment: Activation Checklist (2026-09-10)",
+      "description": "A/B test of the post-onboarding activation checklist (welcome modal, suggestions pill, inspiration list). off = control, the standard chat landing with no checklist; smb / parent / general = the checklist with that persona's task list. Any other value hides the checklist. Percentages per arm are set in LaunchDarkly; the readout keys a user on their first-ever assignment, so a new round gets a new key.",
+      "defaultEnabled": "off",
+      "values": [
+        "off",
+        "smb",
+        "parent",
+        "general"
+      ]
+    },
+    {
       "id": "send-user-message",
       "scope": "both",
       "key": "send-user-message",
       "label": "Send User Message Tool",
       "description": "Route all user-facing assistant text through the send_user_message tool instead of streamed assistant text",
+      "defaultEnabled": false
+    },
+    {
+      "id": "session-groups",
+      "scope": "both",
+      "key": "session-groups",
+      "label": "Session Groups",
+      "description": "Records eligible computer use, browser, live vision, and ambient runs and presents them as collapsible transcript groups. Off preserves ordinary actions and the flat transcript without new session tracking.",
+      "defaultEnabled": false
+    },
+    {
+      "id": "assistant-desktop",
+      "scope": "assistant",
+      "key": "assistant-desktop",
+      "label": "Virtual desktop",
+      "description": "Streams an interactive virtual desktop from a platform-hosted, containerized assistant over /v1/desktop/stream. Requires platform hosting; self-hosted assistants are excluded. Off: the virtual desktop is hidden. On: the chat header offers its viewer and controls.",
+      "defaultEnabled": false
+    },
+    {
+      "id": "assistant-inbox",
+      "scope": "client",
+      "key": "assistant-inbox",
+      "label": "Assistant Inbox",
+      "description": "Shows an Assistant Inbox entry above Preferences in the web sidebar and the /assistant/inbox page it opens: a mailbox for the assistant's managed vellum.me address (received and sent, with a reading pane), the inline email setup card for entitled orgs with no address yet, and an upgrade card for orgs without the managed_email entitlement. With it on, email setup happens only there: the billing wizard hands off to the inbox instead of its own domain step, the billing page's finish-setup nudge gives way to the inbox's rail entry, and the Channels page's Email section points there instead of registering an address itself. Off hides the entry, redirects the route to chat, and keeps the older setup surfaces.",
+      "defaultEnabled": false
+    },
+    {
+      "id": "sidebar-done",
+      "scope": "both",
+      "key": "sidebar-done",
+      "label": "Sidebar Done",
+      "description": "Turns archiving a chat into marking it done: the sidebar row carries a Done check instead of the overflow menu, an All chats page lists the full history, and done chats stay findable in search by default. Off keeps today's Archive wording, the overflow menu, and search that hides archived rows unless the query asks for them.",
       "defaultEnabled": false
     }
   ]

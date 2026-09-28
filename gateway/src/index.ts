@@ -55,6 +55,11 @@ import {
   type WatchStreamSocketData,
 } from "./http/routes/watch-stream-websocket.js";
 import {
+  createDesktopStreamWebsocketHandler,
+  getDesktopStreamWebsocketHandlers,
+  type DesktopStreamSocketData,
+} from "./http/routes/desktop-stream-websocket.js";
+import {
   createSpeechRelayUpgradeHandler,
   getSpeechRelayWebsocketHandlers,
   type SpeechRelaySocketData,
@@ -136,6 +141,7 @@ import {
 } from "./backup/backup-routes.js";
 import { startBackupWorker } from "./backup/backup-worker.js";
 import { createWorkspaceCommitProxyHandler } from "./http/routes/workspace-commit-proxy.js";
+import { createDesktopSetupProxyHandler } from "./http/routes/desktop-setup-proxy.js";
 import { createBrainGraphProxyHandler } from "./http/routes/brain-graph-proxy.js";
 import { createLogExportHandler } from "./http/routes/log-export.js";
 import { createLogTailHandler } from "./http/routes/log-tail.js";
@@ -182,6 +188,11 @@ import {
   createChannelPermissionResolveHandler,
 } from "./http/routes/channel-permission-overrides.js";
 import { getLogger, initLogger } from "./logger.js";
+import {
+  bindPlatformIdentityCredentialCache,
+  ensurePlatformIdentityIds,
+  resolvePlatformAssistantIdOrUndefined,
+} from "./platform-identity.js";
 import { getPlatformBaseUrl } from "./platform-url.js";
 import { CircuitBreakerOpenError, uploadAttachment } from "./runtime/client.js";
 import {
@@ -242,6 +253,7 @@ import { admissionPolicyRoutes } from "./ipc/admission-policy-handlers.js";
 import { channelPermissionRoutes } from "./ipc/channel-permission-handlers.js";
 import { trustVerdictRoutes } from "./ipc/trust-verdict-handlers.js";
 import { guardianDeliveryRoutes } from "./ipc/guardian-delivery-handlers.js";
+import { createDebugExportRoutes } from "./ipc/debug-export-handlers.js";
 import { createLogTailRoutes } from "./ipc/log-tail-handlers.js";
 import { createChannelSocketHealthRoutes } from "./ipc/channel-socket-health-handlers.js";
 import { createCredentialRequestIpcRoutes } from "./ipc/credential-request-handlers.js";
@@ -329,6 +341,16 @@ function isWatchStreamSocketData(data: unknown): data is WatchStreamSocketData {
     !!data &&
     typeof data === "object" &&
     (data as { wsType?: unknown }).wsType === "watch-stream"
+  );
+}
+
+function isDesktopStreamSocketData(
+  data: unknown,
+): data is DesktopStreamSocketData {
+  return (
+    !!data &&
+    typeof data === "object" &&
+    (data as { wsType?: unknown }).wsType === "desktop-stream"
   );
 }
 
@@ -420,6 +442,8 @@ async function main() {
   // Handlers read dynamic credentials and config.json values from these
   // caches at call time, with automatic TTL refresh.
   const credentialCache = new CredentialCache();
+  bindPlatformIdentityCredentialCache(credentialCache);
+  void ensurePlatformIdentityIds();
   const configFileCache = new ConfigFileCache();
   const velayTunnelClient = createVelayTunnelClient(config, {
     credentials: credentialCache,
@@ -565,9 +589,7 @@ async function main() {
   );
   const handleTwilioVoiceVerifyCallback =
     createTwilioVoiceVerifyCallbackHandler(config, twilioValidationCaches);
-  const handleTwilioMediaWs = createTwilioMediaWebsocketHandler(config, {
-    configFile: configFileCache,
-  });
+  const handleTwilioMediaWs = createTwilioMediaWebsocketHandler(config);
   const handlePluginWebhookWs = createPluginWebhookWebsocketHandler({
     config,
     resolve: resolveCachedPluginIngress,
@@ -575,6 +597,7 @@ async function main() {
   });
   const handleSttStreamWs = createSttStreamWebsocketHandler(config);
   const handleWatchStreamWs = createWatchStreamWebsocketHandler(config);
+  const handleDesktopStreamWs = createDesktopStreamWebsocketHandler(config);
   const handleLiveVoiceWs = createLiveVoiceWebsocketHandler(config);
   const handleSpeechRelaySttWs = createSpeechRelayUpgradeHandler(
     config,
@@ -599,6 +622,7 @@ async function main() {
   const pluginWebhookWebsocketHandlers = getPluginWebhookWebsocketHandlers();
   const sttStreamWebsocketHandlers = getSttStreamWebsocketHandlers();
   const watchStreamWebsocketHandlers = getWatchStreamWebsocketHandlers();
+  const desktopStreamWebsocketHandlers = getDesktopStreamWebsocketHandlers();
   const liveVoiceWebsocketHandlers = getLiveVoiceWebsocketHandlers();
   const speechRelayWebsocketHandlers = getSpeechRelayWebsocketHandlers();
   const { handler: handleWhatsAppWebhook, dedupCache: whatsappDedupCache } =
@@ -656,6 +680,7 @@ async function main() {
   const migrationJobStatusProxy = createMigrationJobStatusProxyHandler(config);
   const migrationRollbackProxy = createMigrationRollbackProxyHandler(config);
   const workspaceCommitProxy = createWorkspaceCommitProxyHandler(config);
+  const desktopSetupProxy = createDesktopSetupProxyHandler(config);
   const brainGraphProxy = createBrainGraphProxyHandler(config);
   const handleLogExport = createLogExportHandler(config);
   const handleLogTail = createLogTailHandler(config);
@@ -694,6 +719,10 @@ async function main() {
     config,
     resolve: resolveCachedPluginIngress,
     credentials: credentialCache,
+    // HMAC payloads can sign the public request URL. Read through the cache
+    // so a tunnel registering a public base is picked up without a restart.
+    ingressPublicBaseUrl: () =>
+      configFileCache.getString("ingress", "publicBaseUrl"),
   });
   const handleChannelPermissionOverridesList =
     createChannelPermissionOverridesListHandler();
@@ -1929,6 +1958,18 @@ async function main() {
     handler: (req) => handleCreateToken(req, server, config.trustProxy),
   });
 
+  for (const method of ["GET", "POST"] as const) {
+    const setupRoute = {
+      method,
+      auth: "edge-guardian" as const,
+      handler: desktopSetupProxy,
+    };
+    routes.push(
+      { path: /^\/v1\/desktop\/setup\/?$/, ...setupRoute },
+      { path: /^\/v1\/assistants\/[^/]+\/desktop\/setup\/?$/, ...setupRoute },
+    );
+  }
+
   // Runtime proxy catch-all — must be last so specific routes are checked first.
   routes.push({
     path: /^\//, // match everything
@@ -1972,6 +2013,10 @@ async function main() {
           watchStreamWebsocketHandlers.open(ws as never);
           return;
         }
+        if (isDesktopStreamSocketData(ws.data)) {
+          desktopStreamWebsocketHandlers.open(ws as never);
+          return;
+        }
         if (isLiveVoiceSocketData(ws.data)) {
           liveVoiceWebsocketHandlers.open(ws as never);
           return;
@@ -1999,6 +2044,10 @@ async function main() {
           watchStreamWebsocketHandlers.message(ws as never, message);
           return;
         }
+        if (isDesktopStreamSocketData(ws.data)) {
+          desktopStreamWebsocketHandlers.message(ws as never, message);
+          return;
+        }
         if (isLiveVoiceSocketData(ws.data)) {
           liveVoiceWebsocketHandlers.message(ws as never, message);
           return;
@@ -2024,6 +2073,10 @@ async function main() {
         }
         if (isWatchStreamSocketData(ws.data)) {
           watchStreamWebsocketHandlers.close(ws as never, code, reason);
+          return;
+        }
+        if (isDesktopStreamSocketData(ws.data)) {
+          desktopStreamWebsocketHandlers.close(ws as never, code, reason);
           return;
         }
         if (isLiveVoiceSocketData(ws.data)) {
@@ -2261,6 +2314,15 @@ async function main() {
       return undefined as unknown as Response;
     }
 
+    // Guardian-only through the same gate as the watch stream.
+    if (url.pathname === "/v1/desktop/stream") {
+      const upgradeResult = await handleDesktopStreamWs(req, server);
+      if (upgradeResult !== undefined) {
+        return upgradeResult;
+      }
+      return undefined as unknown as Response;
+    }
+
     if (url.pathname === "/v1/live-voice") {
       const upgradeResult = await handleLiveVoiceWs(req, server);
       if (upgradeResult !== undefined) return upgradeResult;
@@ -2429,14 +2491,13 @@ async function main() {
     lastRecordActivityTs = now;
 
     try {
-      const [platformBaseUrl, assistantApiKey, assistantIdRaw] =
-        await Promise.all([
+      const [platformBaseUrl, assistantApiKey, assistantId] = await Promise.all(
+        [
           getPlatformBaseUrl(credentialCache),
           credentialCache.get(credentialKey("vellum", "assistant_api_key")),
-          credentialCache.get(credentialKey("vellum", "platform_assistant_id")),
-        ]);
-
-      const assistantId = assistantIdRaw?.trim() || undefined;
+          resolvePlatformAssistantIdOrUndefined(),
+        ],
+      );
 
       if (!platformBaseUrl || !assistantApiKey || !assistantId) return;
 
@@ -2632,7 +2693,7 @@ async function main() {
               attachmentIds = result.attachmentIds;
               normalized.event.message.content = appendFailedAttachmentNotice(
                 normalized.event.message.content,
-                result.failedAttachmentNames,
+                result,
               );
             }
 
@@ -2799,10 +2860,13 @@ async function main() {
 
     const vellumCreds = event.credentials.get("vellum");
     vellumReady = !!(
-      vellumCreds?.platform_base_url &&
-      vellumCreds?.assistant_api_key &&
-      vellumCreds?.platform_assistant_id
+      vellumCreds?.platform_base_url && vellumCreds?.assistant_api_key
     );
+    if (vellumReady) {
+      // Re-run validate when the API key / base URL change so a warm-pool
+      // claim does not keep the previous assistant's bound owner ids.
+      void ensurePlatformIdentityIds();
+    }
     const twilioCreds = event.credentials.get("twilio");
 
     // Side effects keyed by service name
@@ -3010,6 +3074,7 @@ async function main() {
     ...guardianDeliveryRoutes,
     ...riskClassificationRoutes,
     ...createLogTailRoutes(config),
+    ...createDebugExportRoutes(config),
     ...createChannelSocketHealthRoutes({
       slack: () => slackSocketClient,
       discord: () => discordGatewayClient,
@@ -3020,7 +3085,6 @@ async function main() {
     ...createCredentialRequestIpcRoutes(
       config,
       configFileCache,
-      credentialCache,
       ensurePublicIngressLiveForCredentialLink,
     ),
   ]);

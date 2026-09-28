@@ -33,6 +33,8 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { getWorkspacePluginsDir } from "../../util/platform.js";
+import { readPluginManifest } from "../../util/plugin-manifest.js";
+import { readBundledPluginFile } from "./bundled-plugin-packages.js";
 import type { FetchLike } from "./fetch-like.js";
 import { sanitizePluginName } from "./install-from-github.js";
 import {
@@ -44,6 +46,7 @@ import {
   findCatalogEntry,
   resolveSourceFromMatch,
 } from "./plugin-catalog-resolve.js";
+import { isPluginCatalogEntryVisible } from "./plugin-catalog-visibility.js";
 import { DEFAULT_PLUGIN_REF } from "./plugin-constants.js";
 import { readValidatedPluginIcon } from "./plugin-icon-file.js";
 import { fetchMarketplaceEntries } from "./plugin-marketplace.js";
@@ -154,8 +157,8 @@ export class PluginDetailsNotFoundError extends Error {
  * Resolve the detail view for {@link opts.name}.
  *
  * Throws {@link PluginDetailsNotFoundError} when the name is neither installed
- * locally nor present in the catalog (gated at the default ref, the GitHub
- * marketplace at an explicit historical ref). A gated-catalog outage
+ * locally nor present in the visibility-gated catalog at either the default
+ * or an explicit historical ref. A gated-catalog outage
  * ({@link PluginCatalogUnavailableError}) degrades to the on-disk fields only
  * when a local copy exists; with nothing installed to render it propagates so
  * the caller can map the transient failure to a retryable 503 rather than a
@@ -230,22 +233,34 @@ interface LocalPlugin {
   readonly readme: string | null;
 }
 
-/** Read an installed copy's `package.json` + README off disk, if present. */
+/** Read an installed copy's selected manifest and README off disk, if present. */
 function readLocalPlugin(pluginsDir: string, name: string): LocalPlugin {
   const target = join(pluginsDir, name);
   if (!existsSync(target)) {
     return { installed: false, manifest: emptyManifest(), readme: null };
   }
 
-  const pkgPath = join(target, "package.json");
   let manifest = emptyManifest();
-  if (existsSync(pkgPath)) {
-    try {
-      manifest = parseManifest(readFileSync(pkgPath, "utf8"));
-    } catch {
-      // A malformed local manifest degrades to empty fields — the entry is
-      // still "installed", we just have nothing extra to surface from it.
+  try {
+    const packagePath = join(target, "package.json");
+    if (existsSync(packagePath)) {
+      // Detail metadata is intentionally lenient. An installed legacy package
+      // may omit the loader-required name while still carrying useful fields.
+      manifest = parseManifest(readFileSync(packagePath, "utf8"));
+    } else {
+      const selected = readPluginManifest(target);
+      manifest = {
+        version: selected.version ?? null,
+        description: selected.description ?? null,
+        homepage: selected.homepage ?? null,
+        license: normalizeLicense(selected.license),
+        artifact: null,
+        icon: null,
+      };
     }
+  } catch {
+    // A malformed local manifest degrades to empty fields. The entry is still
+    // installed, but it has no manifest metadata to surface.
   }
 
   return { installed: true, manifest, readme: readLocalReadme(target) };
@@ -287,6 +302,17 @@ async function readRemotePlugin(
   source: PluginMatchSource,
   fetchFn: FetchLike,
 ): Promise<RemotePlugin> {
+  if (source.kind === "local") {
+    const manifest = readBundledPluginFile(
+      source.path,
+      source.version,
+      "plugin.json",
+    );
+    return {
+      manifest: manifest ? safeParseManifest(manifest) : emptyManifest(),
+      readme: null,
+    };
+  }
   const [owner, repo] = source.repo.split("/", 2) as [string, string];
   const entries = await listDirSafe(
     owner,
@@ -375,11 +401,10 @@ async function fetchRawFile(
 /**
  * Resolve the external catalog entry claiming {@link name}.
  *
- * The default ref reads the gated catalog (the same source search / install
- * use). An explicit historical {@link ref} reads the GitHub marketplace
- * manifest at that revision — the gated catalog is ref-agnostic, so honoring a
- * reviewed/rolled-back revision is inherently a git lookup, matching the pin
- * history / inspect carve-out.
+ * Both default and historical-ref lookups apply catalog visibility first. The
+ * default ref then reads the gated catalog used by search and install, while an
+ * explicit historical {@link ref} reads the GitHub marketplace manifest at
+ * that revision.
  *
  * A gated-catalog outage (fail-hard {@link PluginCatalogUnavailableError})
  * propagates when nothing is installed — there is nothing to render and the
@@ -395,6 +420,9 @@ async function resolveCatalogEntry(
   fetchFn: FetchLike,
   installed: boolean,
 ): Promise<PluginSearchMatch | null> {
+  if (!isPluginCatalogEntryVisible(name)) {
+    return null;
+  }
   try {
     const match =
       ref === DEFAULT_PLUGIN_REF

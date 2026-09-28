@@ -9,11 +9,15 @@
  * the trigger with an empty label and the user wondering what's in effect.
  */
 
+import { catalogModelSupportsText } from "@/assistant/llm-model-catalog";
 import { resolveModelDisplayName } from "@/assistant/model-display";
 import type {
   ProfileEntry,
   ProviderConnection,
 } from "@/generated/daemon/types.gen";
+
+/** The managed profile the assistant routes per message (`AUTO_PROFILE_KEY`). */
+export const AUTO_PROFILE_NAME = "auto";
 
 /**
  * The subset of a profile a picker needs. Fields are typed from the generated
@@ -45,17 +49,33 @@ export interface ProfileDispatchOptions {
    * profile, so only the disabled check applies there.
    */
   readonly requireOwnProviderAndModel: boolean;
+  /**
+   * Whether a profile must name a chat-text model. Conversation pickers
+   * keep the default (true) so structured-decision models cannot be the
+   * conversation model. Call-site override pickers pass false so those
+   * profiles can be assigned for experimentation.
+   */
+  readonly requireTextGeneration?: boolean;
 }
 
 /** A profile that names no other profiles: it dispatches on its own fields. */
 function isDispatchableStandardProfile(
   p: ProfilePickerEntry,
-  { requireOwnProviderAndModel }: ProfileDispatchOptions,
+  {
+    requireOwnProviderAndModel,
+    requireTextGeneration = true,
+  }: ProfileDispatchOptions,
 ): boolean {
   if (p.status === "disabled") {
     return false;
   }
-  return requireOwnProviderAndModel ? !!p.provider && !!p.model : true;
+  if (requireOwnProviderAndModel && (!p.provider || !p.model)) {
+    return false;
+  }
+  if (requireTextGeneration) {
+    return catalogModelSupportsText(p.provider, p.model);
+  }
+  return true;
 }
 
 /**
@@ -191,6 +211,9 @@ export function undispatchableProfileReason(p: ProfilePickerEntry): string {
   if (p.mix != null) {
     return `"${base}" mixes a profile that has no provider and model, so some turns would fall back to another profile.`;
   }
+  if (p.provider && p.model && !catalogModelSupportsText(p.provider, p.model)) {
+    return `"${base}" uses a model that returns structured answers rather than chat text, so it cannot be the conversation model.`;
+  }
   return `"${base}" has no provider and model, so it cannot be used and the action falls back to another profile.`;
 }
 
@@ -204,14 +227,20 @@ export function undispatchableProfileReason(p: ProfilePickerEntry): string {
  * model there would only repeat the label beside it.
  *
  * Returns null when there is nothing definite to name: a user profile, a
- * profile carrying no model, or a mix, whose arm is picked per conversation at
- * dispatch time and so is not knowable when a picker is drawn.
+ * profile carrying no model, a mix, whose arm is picked per conversation at
+ * dispatch time, or the Auto profile, whose model is picked per message, so
+ * neither is knowable when a picker is drawn.
  */
 export function managedProfileModelName(
   p: ProfilePickerEntry,
   connections?: ProviderConnection[],
 ): string | null {
-  if (p.source !== "managed" || p.mix != null || !p.model) {
+  if (
+    p.source !== "managed" ||
+    p.mix != null ||
+    !p.model ||
+    p.name === AUTO_PROFILE_NAME
+  ) {
     return null;
   }
   return resolveModelDisplayName(p.provider ?? undefined, p.model, connections);

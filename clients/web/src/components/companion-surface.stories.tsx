@@ -10,11 +10,17 @@ import {
 
 import {
   CompanionIntro,
+  INTRO_DEMO_SHORTCUTS,
+  introDemoState,
   introPhase,
   introSpotlight,
 } from "@/components/companion-intro";
 import { CompanionCapturePicker } from "@/components/companion-capture-picker";
-import { onCompanionSurface } from "@/components/companion-layout";
+import { CompanionPromptRow } from "@/components/companion-popover";
+import {
+  containsPoint,
+  onCompanionSurface,
+} from "@/components/companion-layout";
 import {
   CompanionSurface,
   type CompanionSurfacePhase,
@@ -24,7 +30,9 @@ import { composeSvg } from "@/utils/avatar-svg-compositor";
 import {
   COMPANION_INTRO_BEATS,
   COMPANION_SIZES,
+  DEFAULT_COMPANION_SIZE,
   companionBoxFor,
+  companionIntroCallControlFor,
   type CompanionIntroBeat,
   type CompanionSizeAxis,
   type VoiceActivityState,
@@ -112,6 +120,37 @@ type StoryArgs = React.ComponentProps<typeof CompanionSurface> & {
    * beat goes unreviewed.
    */
   introBeat?: CompanionIntroBeat;
+  /**
+   * Whether the Talk beat is drawn as though its creature had been clicked.
+   *
+   * A control for the same reason `introBeat` is: that state is behind a click
+   * and then walks on by itself after a couple of seconds, which is not long
+   * enough to look at it properly, let alone screenshot it.
+   */
+  introGreeted?: boolean;
+  /**
+   * How many presses of the real key the drawn keycap is told about.
+   *
+   * A control for the reason `introGreeted` is: the cap's lit and filled states
+   * are answers to a key on a physical keyboard, which a story has none of, and
+   * they are the states most worth looking at on the two beats that draw it.
+   *
+   * Sent to the card once the beat is up rather than with it, which is how they
+   * arrive on a desktop: the card counts from the beat it is on, so a total
+   * handed to it at the first paint is a total it discounts as history. Moving
+   * the control sends that many presses again.
+   */
+  introTaps?: number;
+  /**
+   * Whether the beat's own call shortcut is drawn as having been pressed.
+   *
+   * A control for the reason `introTaps` is: the lit chip is an answer to a
+   * chord made on a physical keyboard, which a story has none of, and it is
+   * the state worth checking on the three beats that draw one. Sent as a press
+   * of the beat's own control once the beat is up, which is how a desktop
+   * sends one.
+   */
+  introShortcutPressed?: boolean;
 };
 
 const meta: Meta<StoryArgs> = {
@@ -154,6 +193,9 @@ const meta: Meta<StoryArgs> = {
       control: "inline-radio",
       options: COMPANION_INTRO_BEATS,
     },
+    introGreeted: { control: "boolean" },
+    introTaps: { control: { type: "range", min: 0, max: 2, step: 1 } },
+    introShortcutPressed: { control: "boolean" },
   },
   args: {
     phase: "resting",
@@ -482,10 +524,50 @@ export const InCallWhileWatching: Story = {
 /**
  * Mid-call with the screen shared: Share held down beside Teach, since the
  * two are the same gesture aimed at different ends, and the call is being
- * shown what a Teach session would be reading.
+ * shown what a Teach session would be reading. The captions carry the keys
+ * the desktop app's helper answers for these four controls.
  */
 export const InCallSharing: Story = {
-  args: { phase: "call", shareEnabled: true, sharing: true, call: DEMO_CALL },
+  args: {
+    phase: "call",
+    shareEnabled: true,
+    sharing: true,
+    call: DEMO_CALL,
+    shortcuts: {
+      share: "⌥S",
+      draw: "⌥D",
+      muteMicrophone: "⌥M",
+      muteAssistant: "⌥A",
+    },
+  },
+};
+
+/**
+ * Drawing on what is shared, with the box tool current: the strip of tools
+ * stands off the Draw control on the card side of the pill.
+ */
+export const InCallDrawing: Story = {
+  args: {
+    phase: "call",
+    shareEnabled: true,
+    sharing: true,
+    annotating: true,
+    annotationTool: "box",
+    call: DEMO_CALL,
+  },
+};
+
+/** The same strip where the card grows down, so it stands under the pill. */
+export const InCallDrawingCardDown: Story = {
+  args: {
+    phase: "call",
+    shareEnabled: true,
+    sharing: true,
+    annotating: true,
+    annotationTool: "circle",
+    cardGrowth: "down",
+    call: DEMO_CALL,
+  },
 };
 
 /**
@@ -684,24 +766,37 @@ export const InCall: Story = {
 };
 
 /**
- * Mid-call with a turn stopped on a confirmation.
- *
- * The decision takes the control row rather than crowding in beside it, which
- * is the same trade the iOS Lock Screen card makes: the turn is going nowhere
- * until this is answered, so it is the only thing here worth pressing. The
- * activity line says what is being asked; the pill is not the place to render a
- * tool call's arguments, and the app is a click away for that.
+ * Mid-call with approvals waiting: the prompt's short form joins the bar as a
+ * row of its own, and the two read as one shape.
  */
-export const PendingApproval: Story = {
+export const InCallWithPrompt: Story = {
   args: {
     phase: "call",
-    call: {
-      ...DEMO_CALL,
-      phase: "thinking",
-      label: "Thinking…",
-      detail: "Read package.json",
-      approvalRequestId: "req-1",
-    },
+    call: DEMO_CALL,
+    watchEnabled: false,
+    prompt: (
+      <CompanionPromptRow
+        popover={{
+          kind: "approvals",
+          id: "req-1,req-2,req-3",
+          items: [
+            { id: "req-1", title: "Read the Downloads folder", detail: "" },
+            { id: "req-2", title: "Open Safari", detail: "" },
+            { id: "req-3", title: "Send an email", detail: "" },
+          ],
+        }}
+      />
+    ),
+  },
+};
+
+/** The same approvals put off: counted on the bar, a press away. */
+export const InCallWithPromptsDeferred: Story = {
+  args: {
+    phase: "call",
+    call: DEMO_CALL,
+    watchEnabled: false,
+    promptsDeferred: 3,
   },
 };
 
@@ -721,6 +816,23 @@ export const InCallAssistantTurn: Story = {
       label: "Thinking\u2026",
     },
   },
+};
+
+/**
+ * Mid-call docked to a side of the display, which stands the bar up.
+ *
+ * The controls run down a column under the creature, their captions and the
+ * activity line stand off it toward the middle of the screen, and the host
+ * builds a canvas symmetric about the creature for it. Compare with `InCall`:
+ * the same controls in the same order, read down rather than across.
+ */
+export const InCallDockedLeft: Story = {
+  args: { phase: "call", call: DEMO_CALL, dock: "left", sharing: true },
+};
+
+/** The same column against the right edge, with everything facing left. */
+export const InCallDockedRight: Story = {
+  args: { phase: "call", call: DEMO_CALL, dock: "right", sharing: true },
 };
 
 /** Mid-call with both mutes on, which is what the two buttons swap to. */
@@ -1158,7 +1270,13 @@ function DemoReelPlayer(args: StoryArgs) {
  * that it has been seen and there is no way back into it from the app; this is
  * a story, and a story that could only be watched once would be useless.
  */
-function IntroWalkthrough({ introBeat, ...args }: StoryArgs) {
+function IntroWalkthrough({
+  introBeat,
+  introGreeted,
+  introTaps,
+  introShortcutPressed,
+  ...args
+}: StoryArgs) {
   const [beat, setBeat] = useState<CompanionIntroBeat | null>(
     introBeat ?? COMPANION_INTRO_BEATS[0],
   );
@@ -1169,41 +1287,144 @@ function IntroWalkthrough({ introBeat, ...args }: StoryArgs) {
     setBeat(introBeat ?? COMPANION_INTRO_BEATS[0]);
   }, [introBeat]);
 
+  // The call beat is drawn around a call that is not happening, with every
+  // handler withheld, exactly as the surface's own page does it.
+  const demo = introDemoState(beat, "Listening");
+  // The click the Talk beat asks for, which starts nothing here for the same
+  // reason it starts nothing in the product: it is a rehearsal.
+  const [greeted, setGreeted] = useState(introGreeted ?? false);
+  useEffect(() => {
+    setGreeted(introGreeted ?? false);
+  }, [beat, introGreeted]);
+  // The presses the card is told about, as the running total a desktop sends.
+  // Pushed up after the beat has painted rather than handed over with it, since
+  // the card measures presses from the beat it is on.
+  const [taps, setTaps] = useState(0);
+  useEffect(() => {
+    setTaps((total) => total + (introTaps ?? 0));
+  }, [beat, introTaps]);
+  // The press the chip answers, sent the way the taps are and for the same
+  // reason: the card counts presses from the beat it is on, so one handed over
+  // with the beat is one it discounts as history. Addressed to the beat's own
+  // control, since that is the only chord armed while the beat is up.
+  const [chordPresses, setChordPresses] = useState(0);
+  useEffect(() => {
+    if (introShortcutPressed !== true) {
+      return;
+    }
+    setChordPresses((total) => total + 1);
+  }, [beat, introShortcutPressed]);
+  // The pill's element, which the card measures its beak against.
+  const pillRef = useRef<HTMLDivElement | null>(null);
+  // The creature's own element, so the story can tell a pointer on the creature
+  // from a pointer on the card, which is the distinction the first beat turns
+  // on. The real page does the same hit test against the same rect.
+  const avatarRef = useRef<HTMLDivElement | null>(null);
+  const [hovered, setHovered] = useState(false);
+  const demoing = demo !== null;
+
   return (
-    <CompanionSurface
-      {...args}
-      phase={introPhase(beat) ?? args.phase}
-      spotlight={introSpotlight(beat)}
-      intro={
-        beat === null ? null : (
-          <CompanionIntro
-            beat={beat}
-            growth={args.growth}
-            cardGrowth={args.cardGrowth}
-            // The same pair the surface is drawn at, so a mixed one shows the
-            // card clearing the pill rather than landing inside it.
-            avatarBox={args.avatarBox}
-            optionsBox={args.optionsBox}
-            accentHex={args.accentHex}
-            onAdvance={(action) => {
-              const next =
-                action === "dismiss"
-                  ? null
-                  : (COMPANION_INTRO_BEATS[
-                      COMPANION_INTRO_BEATS.indexOf(beat) + 1
-                    ] ?? null);
-              // Back to the top rather than gone, so the run can be watched
-              // again without reloading the story.
-              setBeat(next ?? COMPANION_INTRO_BEATS[0]);
-            }}
-          />
-        )
-      }
-    />
+    <div
+      // The canvas, where the pointer is tracked: only the creature arms the
+      // hover, exactly as in the real window.
+      className="absolute inset-0"
+      onMouseMove={(event) => {
+        const avatar = avatarRef.current;
+        const on =
+          avatar !== null &&
+          containsPoint(
+            avatar.getBoundingClientRect(),
+            event.clientX,
+            event.clientY,
+          );
+        setHovered(on);
+        // The first beat asks for a hover and is finished by one, the way the
+        // page does it.
+        if (on && beat === "idle") {
+          setBeat("meet");
+        }
+      }}
+      onMouseLeave={() => {
+        setHovered(false);
+      }}
+    >
+      <CompanionSurface
+        {...args}
+        hovered={hovered}
+        avatarRef={avatarRef}
+        rootRef={pillRef}
+        phase={introPhase(beat) ?? args.phase}
+        spotlight={introSpotlight(beat)}
+        avatarStaged={beat === "talk" || beat === "try"}
+        avatarTucked={beat === "idle"}
+        onAvatarClick={() => {
+          if (beat === "talk") {
+            setGreeted(true);
+          }
+        }}
+        call={demo?.call ?? args.call}
+        sharing={demo?.sharing ?? args.sharing}
+        shareEnabled={demoing || args.shareEnabled}
+        shortcuts={demoing ? INTRO_DEMO_SHORTCUTS : args.shortcuts}
+        intro={
+          beat === null ? null : (
+            <CompanionIntro
+              beat={beat}
+              greeted={greeted}
+              voiceKeyTaps={taps}
+              chordPresses={chordPresses}
+              chordControl={companionIntroCallControlFor(beat)}
+              // The assistant's own name, which the greeting cards use. A real
+              // surface is told one by the app's window; clear it here to see
+              // the cold-launch cards, which greet with no name at all.
+              assistantName={
+                args.assistantName === "" ? undefined : args.assistantName
+              }
+              growth={args.growth}
+              cardGrowth={args.cardGrowth}
+              // The same pair the surface is drawn at, so a mixed one shows the
+              // card clearing the pill rather than landing inside it.
+              avatarBox={args.avatarBox}
+              optionsBox={args.optionsBox}
+              accentHex={args.accentHex}
+              onAdvance={(action) => {
+                // `try` starts a real session, which a story has none of: it
+                // holds the beat, the way main does.
+                if (action === "try") {
+                  return;
+                }
+                const at = COMPANION_INTRO_BEATS.indexOf(beat);
+                const next =
+                  action === "dismiss"
+                    ? null
+                    : action === "back"
+                      ? (COMPANION_INTRO_BEATS[Math.max(0, at - 1)] ?? null)
+                      : (COMPANION_INTRO_BEATS[at + 1] ?? null);
+                // Back to the top rather than gone, so the run can be watched
+                // again without reloading the story.
+                setBeat(next ?? COMPANION_INTRO_BEATS[0]);
+              }}
+            />
+          )
+        }
+      />
+    </div>
   );
 }
 
 export const Introduction: Story = {
-  args: { phase: "resting", introBeat: COMPANION_INTRO_BEATS[0] },
+  args: {
+    phase: "resting",
+    introBeat: COMPANION_INTRO_BEATS[0],
+    introTaps: 0,
+    introShortcutPressed: false,
+    assistantName: "Quill",
+    // The sizes a real user actually has: `DEFAULT_COMPANION_SIZE` is medium on
+    // both tables, which is a creature half again as big as the one this layout
+    // is authored at. Reviewing the run at the authored size was reviewing a
+    // surface nobody is given.
+    avatarBox: companionBoxFor("avatar", DEFAULT_COMPANION_SIZE),
+    optionsBox: companionBoxFor("options", DEFAULT_COMPANION_SIZE),
+  },
   render: (args) => <IntroWalkthrough {...args} />,
 };

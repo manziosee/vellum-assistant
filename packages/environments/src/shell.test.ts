@@ -2,15 +2,28 @@ import { describe, expect, test } from "bun:test";
 
 import {
   buildShellInvocation,
+  buildShellSpawnFlags,
+  CHILD_OOM_SCORE_ADJ,
   pathListDelimiter,
   prependUniquePathEntries,
 } from "./shell.js";
 
 describe("buildShellInvocation", () => {
   test("uses Bash on POSIX hosts", () => {
-    expect(buildShellInvocation("printf hello", "linux")).toEqual({
+    expect(buildShellInvocation("printf hello", "darwin")).toEqual({
       command: "bash",
       args: ["-c", "--", "printf hello"],
+    });
+  });
+
+  test("raises the shell's OOM-kill priority on Linux", () => {
+    expect(buildShellInvocation("printf hello", "linux")).toEqual({
+      command: "bash",
+      args: [
+        "-c",
+        "--",
+        `echo ${CHILD_OOM_SCORE_ADJ} 2>/dev/null >/proc/self/oom_score_adj; printf hello`,
+      ],
     });
   });
 
@@ -35,6 +48,26 @@ describe("buildShellInvocation", () => {
     expect(decoded).toContain("Write-Output 'hello 世界'");
     expect(decoded).toContain("exit $__vellumNativeExitCode");
     expect(decoded).toEndWith("exit 0");
+  });
+});
+
+describe("buildShellSpawnFlags", () => {
+  test("creates a POSIX process group and hides Windows consoles", () => {
+    expect(buildShellSpawnFlags("linux")).toEqual({
+      detached: true,
+      windowsHide: true,
+    });
+    expect(buildShellSpawnFlags("darwin")).toEqual({
+      detached: true,
+      windowsHide: true,
+    });
+  });
+
+  test("does not detach Windows children that use piped stdio", () => {
+    expect(buildShellSpawnFlags("win32")).toEqual({
+      detached: false,
+      windowsHide: true,
+    });
   });
 });
 

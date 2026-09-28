@@ -185,11 +185,13 @@ mock.module("@/domains/chat/voice/voice-room/voice-first-run-card", () => ({
 // `.use.phase()` and `.use.setAudioLevel()` selectors are consumed by the
 // composer.
 let mockVoicePhase = "idle";
+let mockVoiceHold = false;
 const setAudioLevelSpy = mock((_level: number) => undefined);
 mock.module("@/domains/chat/voice/voice-recording-store", () => ({
   useVoiceRecordingStore: {
     use: {
       phase: () => mockVoicePhase,
+      hold: () => mockVoiceHold,
       setAudioLevel: () => setAudioLevelSpy,
     },
   },
@@ -213,8 +215,8 @@ mock.module("@/domains/chat/voice/live-voice/live-voice-preflight-api", () => ({
 // Out-of-band session end, behind the failure notice's reclaim action. Mocked
 // so the action can be driven without a daemon; the wrapper's own shape mirrors
 // `preflightLiveVoice` above.
-const sessionEndSpy = mock((_assistantId: string): Promise<boolean> =>
-  Promise.resolve(true),
+const sessionEndSpy = mock(
+  (_assistantId: string): Promise<boolean> => Promise.resolve(true),
 );
 mock.module(
   "@/domains/chat/voice/live-voice/live-voice-session-end-api",
@@ -328,6 +330,7 @@ function resetLiveVoiceMocks() {
   mockNativePickersAvailable = false;
   mockIsNativePlatform = false;
   mockVoicePhase = "idle";
+  mockVoiceHold = false;
   mockPreflightVerdict = { status: "ready" };
   preflightSpy.mockClear();
   navigateSpy.mockClear();
@@ -360,8 +363,9 @@ function resetLiveVoiceMocks() {
 // voice-input-button imports) resolve against the mocked modules. The pure
 // helpers (computeGhostSuffix / shouldSubmitOnEnter) come from
 // `chat-composer-utils`, imported statically above.
-const { ChatComposer } =
-  await import("@/domains/chat/components/chat-composer/chat-composer");
+const { ChatComposer } = await import(
+  "@/domains/chat/components/chat-composer/chat-composer"
+);
 
 // ---------------------------------------------------------------------------
 // shouldSubmitOnEnter — keyboard policy
@@ -472,6 +476,51 @@ describe("shouldSubmitOnEnter — guards still preventDefault but skip submit", 
         cmdEnterMode: false,
       }),
     ).toBe("submit");
+  });
+});
+
+describe("shouldSubmitOnEnter — dictation in flight", () => {
+  const DICTATING_POLICY = {
+    input: "",
+    canSendAttachments: false,
+    dictationInFlight: true,
+    sendDisabled: false,
+    attachmentsUploadingCount: 0,
+    cmdEnterMode: false,
+  };
+
+  test("Enter with an empty draft submits while dictating", () => {
+    // Words already spoken are content the composer does not hold yet, so
+    // Enter has to reach onSubmit, which finishes dictation before it sends
+    // (LUM-3432).
+    expect(shouldSubmitOnEnter(ENTER, false, DICTATING_POLICY)).toBe("submit");
+  });
+
+  test("Enter with an empty draft and no dictation still prevents", () => {
+    expect(
+      shouldSubmitOnEnter(ENTER, false, {
+        ...DICTATING_POLICY,
+        dictationInFlight: false,
+      }),
+    ).toBe("prevent");
+  });
+
+  test("dictation does not override sendDisabled", () => {
+    expect(
+      shouldSubmitOnEnter(ENTER, false, {
+        ...DICTATING_POLICY,
+        sendDisabled: true,
+      }),
+    ).toBe("prevent");
+  });
+
+  test("dictation does not override an uploading attachment", () => {
+    expect(
+      shouldSubmitOnEnter(ENTER, false, {
+        ...DICTATING_POLICY,
+        attachmentsUploadingCount: 1,
+      }),
+    ).toBe("prevent");
   });
 });
 
@@ -867,9 +916,7 @@ function renderTouchTabletComposer(props: RenderComposerProps = {}) {
  * composer has focus, because the status controls beside the pills do.
  */
 function pillsRow(container: HTMLElement) {
-  return container.querySelector(
-    '[data-slot="composer-settings-pills-group"]',
-  );
+  return container.querySelector('[data-slot="composer-settings-pills-group"]');
 }
 
 /** The always-present row that holds the pills group and the status controls. */
@@ -1162,8 +1209,9 @@ describe("ChatComposer — send/stop button visibility", () => {
 /**
  * Under `interrupt-on-send` a turn in flight is not a reason to take Send
  * away: the message the user types stops that turn and is answered at once, so
- * Stop has nothing left to offer that Send does not. The row keeps its resting
- * shape for the whole turn.
+ * the row keeps its resting shape for the whole turn. The send slot is the one
+ * control that changes, holding Stop wherever Send cannot be pressed, which is
+ * the only way to end a turn without sending something.
  */
 describe("ChatComposer: send/stop under interrupt-on-send", () => {
   function setInterruptOnSend(value: boolean) {
@@ -1178,7 +1226,7 @@ describe("ChatComposer: send/stop under interrupt-on-send", () => {
     setInterruptOnSend(false);
   });
 
-  test("a busy composer offers Send, never Stop", () => {
+  test("a busy composer with a draft offers Send, never Stop", () => {
     setInterruptOnSend(true);
     viewport.set({ narrow: false, coarsePointer: false });
     const html = renderComposer({ input: "hello", isAssistantBusy: true });
@@ -1186,11 +1234,108 @@ describe("ChatComposer: send/stop under interrupt-on-send", () => {
     expect(html).not.toContain('aria-label="Stop generating"');
   });
 
-  test("a busy composer with an empty draft still offers Send, not Stop", () => {
+  test("a draft holds Send on desktop too, where the keyboard can submit", () => {
+    // The flag-off row hands the slot to Send only under a coarse pointer.
+    // Here the draft's own send is the interrupt, so it keeps the slot at
+    // every width.
+    setInterruptOnSend(true);
+    for (const coarsePointer of [true, false]) {
+      cleanup();
+      viewport.set({ narrow: false, coarsePointer });
+      const html = renderComposer({ input: "hello", isAssistantBusy: true });
+      expect(html).toContain('aria-label="Send message"');
+      expect(html).not.toContain('aria-label="Stop generating"');
+    }
+  });
+
+  test("a busy composer with nothing to send offers Stop in the send slot", () => {
     setInterruptOnSend(true);
     viewport.set({ narrow: false, coarsePointer: false });
     const html = renderComposer({ input: "", isAssistantBusy: true });
+    expect(html).toContain('aria-label="Stop generating"');
+    expect(html).not.toContain('aria-label="Send message"');
+  });
+
+  test("Stop in the send slot stops the turn", () => {
+    setInterruptOnSend(true);
+    viewport.set({ narrow: false, coarsePointer: false });
+    const onStopGenerating = mock(() => {});
+    const { getByLabelText } = renderComposerView({
+      input: "",
+      isAssistantBusy: true,
+      onStopGenerating,
+    });
+    fireEvent.click(getByLabelText("Stop generating"));
+    expect(onStopGenerating).toHaveBeenCalledTimes(1);
+  });
+
+  test("an attachment alone is something to send, so Send keeps the slot", () => {
+    setInterruptOnSend(true);
+    viewport.set({ narrow: false, coarsePointer: false });
+    const html = renderComposer({
+      input: "",
+      canSendAttachments: true,
+      isAssistantBusy: true,
+    });
+    expect(html).toContain('aria-label="Send message"');
     expect(html).not.toContain('aria-label="Stop generating"');
+  });
+
+  test("a dictation session this composer owns keeps Send, since it holds words", () => {
+    setInterruptOnSend(true);
+    viewport.set({ narrow: false, coarsePointer: false });
+    mockVoicePhase = "recording";
+    const html = renderComposer({ input: "", isAssistantBusy: true });
+    expect(html).toContain('aria-label="Send message"');
+    expect(html).not.toContain('aria-label="Stop generating"');
+  });
+
+  test("a draft the composer refuses to send hands the slot to Stop", () => {
+    // A send nobody can press is no interrupt, so the turn would have no end
+    // the user can reach.
+    setInterruptOnSend(true);
+    viewport.set({ narrow: false, coarsePointer: false });
+    const html = renderComposer({
+      input: "hello",
+      sendDisabled: true,
+      isAssistantBusy: true,
+    });
+    expect(html).toContain('aria-label="Stop generating"');
+    expect(html).not.toContain('aria-label="Send message"');
+  });
+
+  test("a draft held by an uploading attachment hands the slot to Stop", () => {
+    setInterruptOnSend(true);
+    viewport.set({ narrow: false, coarsePointer: false });
+    const html = renderComposer({
+      input: "hello",
+      attachmentsUploadingCount: 1,
+      isAssistantBusy: true,
+    });
+    expect(html).toContain('aria-label="Stop generating"');
+    expect(html).not.toContain('aria-label="Send message"');
+  });
+
+  test("an idle composer with nothing to send offers no Stop", () => {
+    setInterruptOnSend(true);
+    viewport.set({ narrow: false, coarsePointer: false });
+    const html = renderComposer({ input: "", isAssistantBusy: false });
+    expect(html).not.toContain('aria-label="Stop generating"');
+  });
+
+  test("a live-voice session this composer owns leaves the slot as it rests", () => {
+    // The bar above the card owns that session and the turn it is speaking,
+    // so the slot gains no second control over it.
+    setInterruptOnSend(true);
+    viewport.set({ narrow: false, coarsePointer: false });
+    useTurnStore.setState(INITIAL_TURN_STATE);
+    seedLiveVoiceSession("listening");
+    const { queryByLabelText } = renderVoiceComposer({
+      input: "",
+      isAssistantBusy: true,
+    });
+    expect(queryByLabelText("Stop generating")).toBeNull();
+    expect(queryByLabelText("Send message")).not.toBeNull();
   });
 
   test("the attach control stays on the busy row", () => {
@@ -2068,7 +2213,8 @@ describe("ChatComposer: the mobile send slot", () => {
   // classes: it answers to the same width signal that produces the row, so it
   // lands on every narrow window rather than only on the coarse-pointer ones
   // the `touch-mobile:` variant reaches.
-  const SEND_FILL_CLASS = "bg-[var(--system-positive-strong)]";
+  // The fill is the assistant's accent: the `Button` primitive's `accent`
+  // variant, which the app maps onto the avatar accent.
 
   test("an empty draft leaves the circular live-voice button in the slot", () => {
     // GIVEN a phone composer with nothing to send
@@ -2089,7 +2235,7 @@ describe("ChatComposer: the mobile send slot", () => {
     // THEN send takes the circle over, in the filled tone of the design
     const send = queryByLabelText("Send message");
     expect(send?.className).toContain(MOBILE_CONTROL_CLASS);
-    expect(send?.className).toContain(SEND_FILL_CLASS);
+    expect(send?.getAttribute("data-variant")).toBe("accent");
     expect(queryByLabelText("Start voice mode")).toBeNull();
 
     // AND dictation is untouched beside it
@@ -2104,11 +2250,11 @@ describe("ChatComposer: the mobile send slot", () => {
       sendDisabled: true,
     });
 
-    // THEN the circle stays but the filled tone does not, so a blocked send
-    // never reads as one waiting to be pressed
+    // THEN the circle stays and the button is disabled, so it takes the
+    // variant's disabled fill and never reads as one waiting to be pressed
     const send = queryByLabelText("Send message");
     expect(send?.className).toContain(MOBILE_CONTROL_CLASS);
-    expect(send?.className).not.toContain(SEND_FILL_CLASS);
+    expect(send?.hasAttribute("disabled")).toBe(true);
   });
 
   test("a busy turn keeps the phone row's stop/send swap", () => {
@@ -2150,7 +2296,7 @@ describe("ChatComposer: the mobile send slot", () => {
     });
     const send = drafted.queryByLabelText("Send message");
     expect(send?.className).toContain(MOBILE_CONTROL_CLASS);
-    expect(send?.className).toContain(SEND_FILL_CLASS);
+    expect(send?.getAttribute("data-variant")).toBe("accent");
   });
 
   test("a narrow mouse-driven window gets the circle a phone gets", () => {
@@ -2162,7 +2308,7 @@ describe("ChatComposer: the mobile send slot", () => {
     // pairing a mobile layout with desktop controls
     const send = queryByLabelText("Send message");
     expect(send?.className).toContain(MOBILE_CONTROL_CLASS);
-    expect(send?.className).toContain(SEND_FILL_CLASS);
+    expect(send?.getAttribute("data-variant")).toBe("accent");
     expect(glyphClassOf(send)).toContain(MOBILE_GLYPH_CLASS);
   });
 
@@ -2180,15 +2326,16 @@ describe("ChatComposer: the mobile send slot", () => {
     }
   });
 
-  test("desktop keeps the primitive's own send chrome", () => {
+  test("desktop keeps the primitive's own send chrome, in the accent", () => {
     // GIVEN a roomy window
     viewport.set({ narrow: false, coarsePointer: false });
     const { queryByLabelText } = renderVoiceComposer({ input: "hello" });
 
-    // THEN none of the row's chrome reaches it
+    // THEN none of the row's chrome reaches it, but the fill is the
+    // assistant's accent at every width
     const send = queryByLabelText("Send message");
     expect(send?.className).not.toContain("rounded-full");
-    expect(send?.className).not.toContain(SEND_FILL_CLASS);
+    expect(send?.getAttribute("data-variant")).toBe("accent");
     expect(glyphClassOf(send)).not.toContain(MOBILE_GLYPH_CLASS);
   });
 });
@@ -2389,6 +2536,82 @@ function renderVoiceComposer(
       result.rerender(element(overrides)),
   };
 }
+
+describe("ChatComposer document context before live voice", () => {
+  test("keeps prewarmed voice closed until document preparation allows entry", async () => {
+    let allow!: (value: boolean) => void;
+    const onBeforeLiveVoiceStart = mock(
+      () =>
+        new Promise<boolean>((resolve) => {
+          allow = resolve;
+        }),
+    );
+    const { getByLabelText } = renderVoiceComposer({ onBeforeLiveVoiceStart });
+    fireEvent.click(getByLabelText("Start voice mode"));
+    await flushPreflight();
+    expect(livePrewarmSpy).toHaveBeenCalledTimes(1);
+    expect(onBeforeLiveVoiceStart).toHaveBeenCalledTimes(1);
+    expect(liveStarterSpy).not.toHaveBeenCalled();
+    fireEvent.click(getByLabelText("Start voice mode"));
+    expect(onBeforeLiveVoiceStart).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      allow(true);
+    });
+    await flushPreflight();
+    expect(liveStarterSpy).toHaveBeenCalledTimes(1);
+    expect(liveStarterSpy.mock.calls[0]?.slice(0, 2)).toEqual([
+      "asst_test",
+      "conv_test",
+    ]);
+  });
+
+  test("a failed or cancelled document preparation releases prewarm without starting voice", async () => {
+    const onBeforeLiveVoiceStart = mock(async () => false);
+    const { getByLabelText } = renderVoiceComposer({ onBeforeLiveVoiceStart });
+    fireEvent.click(getByLabelText("Start voice mode"));
+    await flushPreflight();
+    expect(onBeforeLiveVoiceStart).toHaveBeenCalledTimes(1);
+    expect(liveStarterSpy).not.toHaveBeenCalled();
+    expect(liveCancelPrewarmSpy).toHaveBeenCalledTimes(1);
+    expect(useLiveVoiceStore.getState().state).toBe("idle");
+  });
+
+  test("a chat switch while the document saves cannot start voice for the old chat", async () => {
+    let allow!: (value: boolean) => void;
+    const onBeforeLiveVoiceStart = mock(
+      () =>
+        new Promise<boolean>((resolve) => {
+          allow = resolve;
+        }),
+    );
+    const { getByLabelText, rerenderWith } = renderVoiceComposer({
+      onBeforeLiveVoiceStart,
+    });
+    fireEvent.click(getByLabelText("Start voice mode"));
+    await flushPreflight();
+    rerenderWith({ conversationId: "conversation-2" });
+    await act(async () => {
+      allow(true);
+    });
+    await flushPreflight();
+    expect(liveStarterSpy).not.toHaveBeenCalled();
+    expect(liveCancelPrewarmSpy).toHaveBeenCalledTimes(1);
+  });
+
+  test("voice readiness refusal does not start document preparation", async () => {
+    mockPreflightVerdict = {
+      status: "not-ready",
+      missing: [{ kind: "tts", providerId: "elevenlabs", reason: "no key" }],
+      userMessage: "Add a voice provider to start talking.",
+    };
+    const onBeforeLiveVoiceStart = mock(async () => true);
+    const { getByLabelText } = renderVoiceComposer({ onBeforeLiveVoiceStart });
+    fireEvent.click(getByLabelText("Start voice mode"));
+    await flushPreflight();
+    expect(onBeforeLiveVoiceStart).not.toHaveBeenCalled();
+    expect(liveStarterSpy).not.toHaveBeenCalled();
+  });
+});
 
 describe("ChatComposer — live-voice integration", () => {
   test("assistant too old for live voice: no voice button, dictation mic stays enabled", () => {
@@ -2945,10 +3168,44 @@ describe("ChatComposer — live-voice integration", () => {
     // WHEN the composer renders
     const { queryByLabelText } = renderVoiceComposer();
 
-    // THEN the send slot (which holds the voice-mode entry point while idle) is
-    // hidden entirely during dictation, so no second mic/voice session can open
-    // alongside the recorder — mutual exclusion by absence.
+    // THEN the voice-mode entry point is gone from the send slot: dictation
+    // counts as something to send, so the send arrow takes the slot and no
+    // second mic/voice session can open alongside the recorder.
     expect(queryByLabelText("Start voice mode")).toBeNull();
+  });
+
+  test("dictation keeps a live send button so Send can finish the session", () => {
+    // GIVEN dictation is in flight with an empty draft. The send arrow used
+    // to be hidden for the whole session, which left no gesture for ending
+    // dictation and sending in one move (LUM-3432).
+    useTurnStore.setState(INITIAL_TURN_STATE);
+    mockVoicePhase = "processing";
+
+    // WHEN the composer renders
+    const { getByLabelText } = renderVoiceComposer();
+
+    // THEN the send arrow is mounted and pressable, even with nothing in the
+    // draft: the words the user spoke are the payload, and `submitMessage`
+    // waits for them before it reads the composer.
+    const send = getByLabelText("Send message") as HTMLButtonElement;
+    expect(send.disabled).toBe(false);
+  });
+
+  test("a held key's dictation into another app does not light Send", () => {
+    // GIVEN the bridge's hidden recorder is running a hold. The store is
+    // window-global, so this composer sees the phase, but the session is
+    // not its content and its target cannot stop that recorder.
+    useTurnStore.setState(INITIAL_TURN_STATE);
+    mockVoicePhase = "recording";
+    mockVoiceHold = true;
+
+    // WHEN the composer renders with an empty draft
+    const { queryByLabelText } = renderVoiceComposer();
+
+    // THEN there is nothing to send: the slot holds the voice-mode entry
+    // point exactly as it does with no microphone open at all.
+    expect(queryByLabelText("Send message")).toBeNull();
+    expect(queryByLabelText("Start voice mode")).not.toBeNull();
   });
 
   test("electron dictation uses the system overlay instead of the inline composer preview", () => {
@@ -2961,8 +3218,8 @@ describe("ChatComposer — live-voice integration", () => {
     const { queryByLabelText } = renderVoiceComposer();
 
     // THEN the shared top-center dictation overlay owns the visual treatment,
-    // so the composer-specific preview is absent; and the send slot (voice-mode
-    // entry point) stays hidden during dictation — mutual exclusion by absence.
+    // so the composer-specific preview is absent; and the voice-mode entry
+    // point has given the send slot up to the send arrow for the session.
     expect(queryByLabelText("Transcribing")).toBeNull();
     expect(queryByLabelText("Start voice mode")).toBeNull();
   });

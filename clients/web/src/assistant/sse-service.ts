@@ -2,11 +2,11 @@
  * Assistant-scoped SSE connection — the non-React core.
  *
  * Owns: opening the daemon's `/v1/events` stream for the active
- * assistant, republishing every envelope on the bus as `sse.event`,
- * publishing `sse.opened` / `sse.closed` lifecycle signals, and the
- * bounce policy that recovers half-dead sockets across renderer
- * visibility, system suspend/wake, screen lock/unlock, and
- * reachability-driven retries.
+ * assistant, republishing every envelope on the bus as `sse.event`
+ * (a task's worth per drain, see `docs/EVENT_BUS.md`), publishing
+ * `sse.opened` / `sse.closed` lifecycle signals, and the bounce policy
+ * that recovers half-dead sockets across renderer visibility, system
+ * suspend/wake, screen lock/unlock, and reachability-driven retries.
  *
  * Producer + consumer: republishes SSE events into the bus AND
  * subscribes to bus events (`app.hidden`, `app.resume`, `power.*`,
@@ -25,6 +25,7 @@
  */
 
 import * as Sentry from "@sentry/react";
+import type { AssistantEventEnvelope } from "@vellumai/assistant-api";
 
 import { lifecycleService } from "@/assistant/lifecycle-service";
 import {
@@ -47,23 +48,8 @@ import { useSSEConnectedStore } from "@/stores/sse-connected-store";
 
 const RESUME_DEDUP_WINDOW_MS = 1000;
 
-// Grace window before a hidden tab tears its SSE connection down. A
-// brief tab-out — alt-tab, a glance at another window, tapping a
-// notification — shouldn't kill a live streaming turn: tearing down
-// forces a cold reopen + reconcile on return, which the user perceives
-// as a frozen transcript they have to refresh to clear. Only a tab that
-// stays hidden past this window is treated as real backgrounding and
-// torn down; a resume inside the window cancels the pending teardown and
-// keeps the socket. `power.suspend` (system sleep) is deliberately NOT
-// debounced — it still tears down immediately so the daemon sees a clean
-// disconnect.
-const DESKTOP_HIDDEN_TEARDOWN_GRACE_MS = 5_000;
-
-// Native mobile gets a far longer grace. Switching apps is the normal way
-// to use a phone, so at the desktop window every glance at another app
-// paid a teardown, a cold reopen, and the whole `sse.opened` reconcile
-// fan-out on return. A minute covers the quick switch and keeps the live
-// socket through it.
+// Native mobile keeps its connection for brief app switches before suspension.
+// Desktop browsers keep the stream open for notifications while the tab lives.
 const NATIVE_MOBILE_HIDDEN_TEARDOWN_GRACE_MS = 60_000;
 
 // How long a background has to run before a socket we still hold a handle
@@ -85,9 +71,7 @@ const resolveHiddenTeardownGraceMs = (): number => {
   if (hiddenTeardownGraceOverrideMs !== null) {
     return hiddenTeardownGraceOverrideMs;
   }
-  return isNativeMobile()
-    ? NATIVE_MOBILE_HIDDEN_TEARDOWN_GRACE_MS
-    : DESKTOP_HIDDEN_TEARDOWN_GRACE_MS;
+  return NATIVE_MOBILE_HIDDEN_TEARDOWN_GRACE_MS;
 };
 
 /**
@@ -157,7 +141,12 @@ export const sseService: SseService = {
     let lastAppResumeAt = 0;
     let lastPowerActionAt = 0;
     let nextOpenCause:
-      "fresh" | "error" | "watchdog" | "resume" | "debug" | "anchor" = "fresh";
+      | "fresh"
+      | "error"
+      | "watchdog"
+      | "resume"
+      | "debug"
+      | "anchor" = "fresh";
     // Pending timer for a delayed debug-triggered reconnect, so detach
     // can cancel a reconnect that hasn't fired yet.
     let debugReconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -173,6 +162,74 @@ export const sseService: SseService = {
         clearTimeout(hiddenTeardownTimer);
         hiddenTeardownTimer = null;
       }
+    };
+
+    // Envelopes received since the last drain, in arrival order. The
+    // transport hands them over one per microtask (its `for await` read
+    // loop), and React flushes a synchronous commit in the microtask after
+    // every store write, so publishing from that callback costs one full
+    // commit per envelope. A chunk or a reconnect replay of N envelopes is
+    // then N back-to-back commits inside one task, which is what trips
+    // React's nested-update limit (`Maximum update depth exceeded`) and
+    // keeps a slower renderer saturated for the length of a reply.
+    // Publishing the whole run from a single task lets React batch every
+    // write the run causes into one commit. Each envelope still reaches
+    // every handler, synchronously from `publish`, in arrival order.
+    const pendingEnvelopes: AssistantEventEnvelope[] = [];
+    let draining = false;
+    const flushPendingEnvelopes = (): void => {
+      // A handler can reach a teardown path, which flushes. The run in
+      // progress already owns the queue, so the nested call has nothing to do.
+      if (draining) {
+        return;
+      }
+      draining = true;
+      // Counts envelopes handed to `publish`, the one in flight included, so
+      // a throw that escapes it removes exactly what was delivered. The bus
+      // catches handler errors itself; this keeps the queue from depending
+      // on that. Whatever is left drains on the next task.
+      let published = 0;
+      try {
+        while (published < pendingEnvelopes.length) {
+          const envelope = pendingEnvelopes[published];
+          published += 1;
+          publish("sse.event", envelope);
+        }
+      } finally {
+        pendingEnvelopes.splice(0, published);
+        draining = false;
+        if (pendingEnvelopes.length > 0) {
+          scheduleDrain();
+        }
+      }
+    };
+    // The drain runs from a `MessageChannel` task. It has to be a task so
+    // the transport's microtask chain finishes first, and it cannot be a
+    // timer or an animation frame: browsers throttle timers in a background
+    // tab (to once a minute after five hidden minutes) and stop animation
+    // frames outright, while this stream stays open through the hidden grace
+    // window to deliver notifications.
+    const drainChannel = new MessageChannel();
+    let drainScheduled = false;
+    const scheduleDrain = (): void => {
+      if (!drainScheduled) {
+        drainScheduled = true;
+        drainChannel.port2.postMessage(null);
+      }
+    };
+    drainChannel.port1.onmessage = () => {
+      drainScheduled = false;
+      flushPendingEnvelopes();
+    };
+    const enqueueEnvelope = (envelope: AssistantEventEnvelope): void => {
+      // Detach closes the drain channel, so an envelope from a stream that
+      // is still winding down would sit here unpublished. Its seq never
+      // advanced the reconnect cursor, and the next attach starts cold.
+      if (cancelled) {
+        return;
+      }
+      pendingEnvelopes.push(envelope);
+      scheduleDrain();
     };
 
     const openConnection = () => {
@@ -203,9 +260,7 @@ export const sseService: SseService = {
         ownStream === null || ownStream === current;
       const stream = subscribeEvents(
         assistantId,
-        (envelope) => {
-          publish("sse.event", envelope);
-        },
+        enqueueEnvelope,
         (err) => {
           Sentry.addBreadcrumb({
             category: "event_bus.sse",
@@ -217,11 +272,13 @@ export const sseService: SseService = {
           }
           setCurrent(null);
           setConnected(false);
+          flushPendingEnvelopes();
           publish("sse.closed", { reason: err.message });
         },
         {
           onReconnect: (cause) => {
             if (everOpened && isLiveStream()) {
+              flushPendingEnvelopes();
               publish("sse.opened", { assistantId, cause });
             }
           },
@@ -233,6 +290,7 @@ export const sseService: SseService = {
             // when its handle is created, so an attempt that never connects
             // does not fan out a reconcile across every domain.
             if (firstOpen && isLiveStream()) {
+              flushPendingEnvelopes();
               publish("sse.opened", { assistantId, cause: causeAtOpen });
             }
           },
@@ -259,17 +317,18 @@ export const sseService: SseService = {
       // whatever opens next is fresh rather than suspect.
       clearHiddenTeardownTimer();
       hiddenAt = null;
+      // Envelopes already received belong to the stream being dropped.
+      // Publishing them first keeps them ahead of whatever the next
+      // connection announces.
+      flushPendingEnvelopes();
       current?.cancel();
       setCurrent(null);
       setConnected(false);
     };
 
-    // App lifecycle (renderer-visibility): a hidden tab does NOT tear the
-    // connection down immediately — see `handleAppHidden`, which debounces
-    // it behind the platform's grace window. On a foreground resume we
-    // cancel any pending grace teardown (so a brief tab-out keeps its live
-    // socket) and reopen only if the connection was torn down, or if the
-    // background ran long enough that the socket we still hold is suspect.
+    // Desktop browsers retain their stream while hidden; native mobile tears
+    // it down after a grace period. Resume cancels pending teardown and replaces
+    // sockets that may have been suspended during a long background interval.
     // `runtime/event-sources/lifecycle-edge.ts` is the primary collapse: the
     // visibilitychange + Capacitor appStateChange pair for one physical edge
     // reaches the bus as a single `app.resume`. The self-dedup window below
@@ -344,22 +403,16 @@ export const sseService: SseService = {
       openConnection();
     };
 
-    // Renderer went hidden. Debounce the teardown: schedule it behind the
-    // grace window instead of cancelling the stream now, so a brief
-    // tab-out doesn't drop a live turn. A resume inside the window clears
-    // this timer; if the tab is still hidden when it fires, tear down for
-    // real. Idempotent — a repeat `app.hidden` while already scheduled is
-    // ignored.
+    // Native mobile gives brief app switches a grace period before teardown.
+    // Desktop streams remain connected for notifications while their page lives.
     const handleAppHidden = ({ signal }: { signal: AppHiddenSignal }) => {
       if (signal === "window_attention") {
-        // A desktop window off screen is not a backgrounded client. Nothing
-        // froze this renderer: the Electron host reported its own window
-        // minimized or hidden, and the assistant broadcasts notifications
-        // fire-and-forget with no queue, no redelivery, and no push fallback
-        // on the desktop. Tearing down here would drop every notification
-        // published while the window was away, which is the failure a
-        // minimized window most needs this stream to avoid. Every other
-        // signal means the client itself went away and still tears down.
+        return;
+      }
+      if (!isNativeMobile()) {
+        // Desktop delivery depends on this live transport, including hidden
+        // browser tabs. Lifecycle consumers still pause foreground work.
+        hiddenAt ??= Date.now();
         return;
       }
       if (!current) {
@@ -491,6 +544,10 @@ export const sseService: SseService = {
       unsubPowerUnlock();
       unsubReachabilityRetry();
       unsubAnchorRequested();
+      flushPendingEnvelopes();
+      drainChannel.port1.onmessage = null;
+      drainChannel.port1.close();
+      drainChannel.port2.close();
       current?.cancel();
       setCurrent(null);
       setConnected(false);

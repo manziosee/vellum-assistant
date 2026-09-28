@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 
+import type { VellumBridge } from "@vellumai/ipc-contract";
+
 import {
   isElectron,
   type SystemPermissionKind,
@@ -70,11 +72,17 @@ export async function getSystemPermissionsState(): Promise<SystemPermissionsStat
 
 export async function requestSystemPermission(
   kind: SystemPermissionKind,
+  presentation?: Parameters<VellumBridge["permissions"]["request"]>[1],
 ): Promise<SystemPermissionStateItem | null> {
   if (!supportsSystemPermissions()) {
     return null;
   }
-  return await window.vellum!.permissions!.request(kind);
+  const request = window.vellum!.permissions!
+    .request as VellumBridge["permissions"]["request"];
+  if (presentation && detectElectronHostOS() === "macos") {
+    return await request(kind, presentation);
+  }
+  return await request(kind);
 }
 
 export async function openSystemPermissionSettings(
@@ -122,6 +130,21 @@ export function subscribeToSystemPermissions(
     return () => undefined;
   }
   return window.vellum!.permissions!.onState(callback);
+}
+
+/** Re-arm keyboard bindings when a Settings grant reaches this renderer. */
+export function subscribeToInputMonitoringGranted(
+  callback: () => void,
+): () => void {
+  let granted = false;
+  return subscribeToSystemPermissions((state) => {
+    const next = state.inputMonitoring.status === "granted";
+    const newlyGranted = next && !granted;
+    granted = next;
+    if (newlyGranted) {
+      callback();
+    }
+  });
 }
 
 export function useSystemPermissionsState() {

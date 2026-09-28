@@ -4,24 +4,27 @@ import {
   Download,
   FileIcon,
   Loader2,
-  X,
 } from "lucide-react";
 import type { FC, KeyboardEvent, MouseEvent } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { usePortalContainer } from "@vellumai/design-library/utils/portal-container";
 
 import { Button, Typography } from "@vellumai/design-library";
+
+import { PreviewModalHeader } from "@/domains/chat/components/preview-modal-header";
 
 import { PdfPreview } from "@/domains/chat/components/chat-attachments/pdf-preview";
 import { PreviewMessageCard } from "@/domains/chat/components/chat-attachments/preview-message-card";
 import { TextPreview } from "@/domains/chat/components/chat-attachments/text-preview";
+import { downloadAttachment } from "@/domains/chat/components/chat-attachments/download-attachment";
 import {
   classifyAttachment,
   formatAttachmentSize,
-} from "@/domains/chat/components/chat-attachments/utils";
+} from "@/utils/attachment-utils";
 import { useAttachmentObjectUrl } from "@/domains/chat/components/chat-attachments/use-attachment-object-url";
 import { useGallerySwipe } from "@/domains/chat/components/chat-attachments/use-gallery-swipe";
-import { baseMimeType, extensionOf } from "@/domains/chat/utils/mime-sniff";
+import { baseMimeType, extensionOf } from "@/utils/mime-sniff";
 import { useEdgeSwipeArbiterStore } from "@/stores/edge-swipe-arbiter-store";
 import type { DisplayAttachment } from "@/types/attachment-types";
 import { useTranslation } from "@/i18n";
@@ -51,10 +54,14 @@ const TEXT_PREVIEW_APPLICATION_MIMES = new Set([
   "application/xml",
 ]);
 
+type PreviewAttachment = DisplayAttachment & {
+  resolveReferenceMetadata?: boolean;
+};
+
 interface AttachmentPreviewModalProps {
   open: boolean;
   onClose: () => void;
-  attachment: DisplayAttachment;
+  attachment: PreviewAttachment;
   /** When set, the modal will fetch missing content from
    *  /v1/assistants/{assistantId}/attachments/{attachment.id}/content. */
   assistantId?: string | null;
@@ -90,6 +97,7 @@ export const AttachmentPreviewModal: FC<AttachmentPreviewModalProps> = ({
   onNavigate,
 }) => {
   const overlayRef = useRef<HTMLDivElement>(null);
+  const portalContainer = usePortalContainer();
 
   // Focus the overlay itself (not a child button) on open so the keydown
   // handler receives ArrowLeft/ArrowRight reliably — a focused child can steal
@@ -225,9 +233,13 @@ export const AttachmentPreviewModal: FC<AttachmentPreviewModalProps> = ({
     if (!effectiveUrl) {
       return;
     }
+    if (attachment.resolveReferenceMetadata) {
+      await downloadAttachment(attachment, assistantId);
+      return;
+    }
     const { saveFile } = await import("@/runtime/native-file");
     await saveFile(effectiveUrl, attachment.filename);
-  }, [effectiveUrl, attachment.filename]);
+  }, [assistantId, attachment, effectiveUrl]);
 
   if (!open) {
     return null;
@@ -361,7 +373,7 @@ export const AttachmentPreviewModal: FC<AttachmentPreviewModalProps> = ({
       // Focusable so the overlay can hold keyboard focus for the arrow-key
       // handler; the ring is suppressed since the dialog is the whole screen.
       tabIndex={-1}
-      className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-black/80 outline-none [-webkit-app-region:no-drag]"
+      className="pointer-events-auto fixed inset-0 z-50 flex flex-col items-center justify-center bg-black/80 outline-none [-webkit-app-region:no-drag]"
       style={{
         paddingTop: "var(--safe-area-inset-top, env(safe-area-inset-top, 0px))",
         paddingBottom:
@@ -374,43 +386,18 @@ export const AttachmentPreviewModal: FC<AttachmentPreviewModalProps> = ({
       onKeyDown={handleKeyDown}
       onClick={handleBackdropClick}
     >
-      {/* Top chrome: file size (left), filename (center), download + close
-          (right). Absolute children anchor to the overlay's padding box, so the
-          parent's safe-area paddingTop does not offset them — the bar carries
-          the top inset itself to clear the notch/status bar.
-
-          The bar spans the full width above the preview, so it stays
-          click-through except for its own controls: on a short viewport the
-          preview's top edge reaches under it, and an opaque bar would eat
-          clicks on whatever the preview renders there (a link in a scrolled
-          text preview, for instance). Same treatment as the gallery chevrons
-          below. */}
-      <div
-        className="pointer-events-none absolute inset-x-0 top-0 z-10 flex items-center gap-3 px-4"
-        style={{
-          paddingTop:
-            "calc(var(--safe-area-inset-top, env(safe-area-inset-top, 0px)) + 1rem)",
-        }}
-      >
-        <Typography
-          variant="body-small-default"
-          className="pointer-events-auto w-11 shrink-0 truncate text-white/50"
-        >
-          {formatAttachmentSize(attachment.sizeBytes)}
-        </Typography>
-        <Typography
-          as="div"
-          variant="body-medium-lighter"
-          className="min-w-0 flex-1 truncate text-center text-white/90"
-        >
-          {/* The centred label is only as wide as its text, but its flex track
-              spans the whole middle of the bar. Take pointer events on the text
-              itself so it stays selectable and inert, and leave the empty track
-              either side click-through to whatever sits beneath. */}
-          <span className="pointer-events-auto">{attachment.filename}</span>
-        </Typography>
-        <div className="pointer-events-auto flex shrink-0 items-center gap-2">
+      <PreviewModalHeader
+        title={attachment.filename}
+        onClose={onClose}
+        leading={
+          <Typography variant="body-small-default" className="text-white/50">
+            {formatAttachmentSize(attachment.sizeBytes)}
+          </Typography>
+        }
+        actions={
           <Button
+            size="large"
+            shape="pill"
             variant="ghost"
             iconOnly={<Download />}
             expandOnMobile={false}
@@ -419,39 +406,34 @@ export const AttachmentPreviewModal: FC<AttachmentPreviewModalProps> = ({
             aria-label={t("attachmentPreviewModal.downloadAria", {
               filename: attachment.filename,
             })}
-            className="h-11 w-11 rounded-full bg-white/10 text-white/70 hover:bg-white/20 hover:text-white"
+            className="bg-white/10 text-white/70 hover:bg-white/20 hover:text-white"
             tintColor="currentColor"
           />
-          <Button
-            variant="ghost"
-            iconOnly={<X />}
-            expandOnMobile={false}
-            onClick={onClose}
-            aria-label={t("attachmentPreviewModal.closePreviewAria")}
-            className="h-11 w-11 rounded-full bg-white/10 text-white/70 hover:bg-white/20 hover:text-white"
-            tintColor="currentColor"
-          />
-        </div>
-      </div>
+        }
+      />
 
       {hasGallery && (
         <div className="pointer-events-none absolute inset-x-0 top-1/2 z-10 flex -translate-y-1/2 items-center justify-between px-4">
           <Button
+            size="large"
+            shape="pill"
             variant="ghost"
             iconOnly={<ChevronLeft />}
             expandOnMobile={false}
             onClick={goToPrev}
             aria-label={t("attachmentPreviewModal.previousAttachmentAria")}
-            className="pointer-events-auto h-11 w-11 rounded-full bg-white/10 text-white/70 hover:bg-white/20 hover:text-white"
+            className="pointer-events-auto bg-white/10 text-white/70 hover:bg-white/20 hover:text-white"
             tintColor="currentColor"
           />
           <Button
+            size="large"
+            shape="pill"
             variant="ghost"
             iconOnly={<ChevronRight />}
             expandOnMobile={false}
             onClick={goToNext}
             aria-label={t("attachmentPreviewModal.nextAttachmentAria")}
-            className="pointer-events-auto h-11 w-11 rounded-full bg-white/10 text-white/70 hover:bg-white/20 hover:text-white"
+            className="pointer-events-auto bg-white/10 text-white/70 hover:bg-white/20 hover:text-white"
             tintColor="currentColor"
           />
         </div>
@@ -492,6 +474,6 @@ export const AttachmentPreviewModal: FC<AttachmentPreviewModalProps> = ({
         </div>
       )}
     </div>,
-    document.body,
+    portalContainer ?? document.body,
   );
 };

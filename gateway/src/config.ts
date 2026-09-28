@@ -8,7 +8,7 @@ import type { InboundChannelId } from "./channels/inbound-event.js";
 
 const log = getLogger("config");
 
-export type AttachmentByteChannel = InboundChannelId | "telegramOutbound";
+export type AttachmentByteChannel = InboundChannelId;
 
 export type AttachmentByteLimits = {
   default: number;
@@ -134,14 +134,15 @@ export function loadConfig(): GatewayConfig {
   const wsConfig = readWorkspaceConfig();
   const gw = (wsConfig.gateway ?? {}) as Record<string, unknown>;
 
-  // Env vars take precedence over workspace config values. This allows the
-  // CLI to pass gateway settings directly via the process environment instead
-  // of writing to the workspace config file.
+  // Client-facing auth on the runtime proxy is on unless this process was
+  // launched with RUNTIME_PROXY_REQUIRE_AUTH=false. Workspace config is not
+  // consulted, so the setting cannot persist across restarts.
   const runtimeProxyRequireAuth =
-    process.env.RUNTIME_PROXY_REQUIRE_AUTH !== undefined
-      ? process.env.RUNTIME_PROXY_REQUIRE_AUTH !== "false"
-      : gw.runtimeProxyRequireAuth !== false &&
-        gw.runtimeProxyRequireAuth !== "false";
+    process.env.RUNTIME_PROXY_REQUIRE_AUTH !== "false";
+
+  // For the settings below, env vars take precedence over workspace config
+  // values. This allows the CLI to pass gateway settings directly via the
+  // process environment instead of writing to the workspace config file.
 
   // When the gateway is fronted by a trusted reverse proxy (e.g. the
   // self-hosted nginx edge), enable this so the real client IP is resolved
@@ -206,7 +207,6 @@ export function loadConfig(): GatewayConfig {
     logFile,
     maxAttachmentBytes: {
       telegram: 20 * 1024 * 1024, // Telegram Bot API getFile (download) limit
-      telegramOutbound: 50 * 1024 * 1024, // Telegram Bot API sendDocument (upload) limit
       slack: 100 * 1024 * 1024, // Slack standard plan
       whatsapp: 16 * 1024 * 1024, // WhatsApp Business API limit
       // Discord's attachment limit can exceed this value; the runtime's

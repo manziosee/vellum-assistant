@@ -7,6 +7,7 @@
  * **State managed:**
  * - `mainView` — which top-level panel is displayed
  * - `activeAppId` / `openedAppState` — app viewer
+ * - `appLoad`: the app request in flight, owning which settlement may write
  * - `activeDocumentTarget` / `openedDocumentState` — document viewer, holding
  *   a document surface or a read-only preview of a workspace file
  * - `isAppMinimized` — mobile-only: app viewer minimized
@@ -28,6 +29,7 @@
  * Reference: {@link https://zustand.docs.pmnd.rs/}
  */
 
+import type { AnsweredQuestion } from "@vellumai/assistant-api";
 import { captureError } from "@/lib/sentry/capture-error";
 import { create } from "zustand";
 
@@ -41,12 +43,15 @@ import type { ChatMessageToolCall } from "@/domains/chat/api/event-types";
 import type { ToolCallCardItem } from "@/domains/chat/utils/tool-call-card-utils";
 import type { DisplayAttachment } from "@/types/attachment-types";
 
-import { appsByIdOpenPost, documentsByIdGet } from "@/generated/daemon/sdk.gen";
+import { appsByIdOpenPost } from "@/generated/daemon/sdk.gen";
 import { primeAppHtmlCache } from "@/utils/app-html-cache";
-import { workspaceBasenameOf } from "@/domains/chat/utils/workspace-path-links";
+import { workspaceBasenameOf } from "@/utils/workspace-path-links";
 import { useUnseenDocumentChangesStore } from "@/domains/chat/unseen-document-changes-store";
 
-import type { WebSearchResultItem } from "@/assistant/web-activity-types";
+import type {
+  ToolActivityMetadata,
+  WebSearchResultItem,
+} from "@vellumai/assistant-api";
 import { createSelectors } from "@/utils/create-selectors";
 import { isAppMainView } from "@/stores/pane-state";
 
@@ -124,22 +129,33 @@ export function isAppNotFoundError(err: unknown): boolean {
   return typeof message === "string" && message.startsWith("App not found");
 }
 
+/** Whether `token` still names the request the store is waiting on. */
+function isCurrentAppLoad(state: ViewerState, token: number): boolean {
+  return state.appLoad?.token === token;
+}
+
+/** Every overlay's restore target: the view it was opened over. */
+const VIEW_BEFORE_FIELDS = [
+  "viewBeforeDocument",
+  "viewBeforeSubagentDetail",
+  "viewBeforeToolDetail",
+  "viewBeforeActivitySteps",
+  "viewBeforeMessageFiles",
+  "viewBeforeWorkflowDetail",
+  "viewBeforeAcpRunDetail",
+  "viewBeforeBackgroundTaskDetail",
+  "viewBeforeSkillDetail",
+  "viewBeforeWakeDetail",
+  "viewBeforeChannelSetup",
+  "viewBeforeChannelTranscript",
+  "viewBeforeChatInfo",
+] as const;
+
+type ViewBeforeField = (typeof VIEW_BEFORE_FIELDS)[number];
+
 function resolveViewBefore(
   state: ViewerState,
-  field:
-    | "viewBeforeDocument"
-    | "viewBeforeSubagentDetail"
-    | "viewBeforeToolDetail"
-    | "viewBeforeActivitySteps"
-    | "viewBeforeMessageFiles"
-    | "viewBeforeWorkflowDetail"
-    | "viewBeforeAcpRunDetail"
-    | "viewBeforeBackgroundTaskDetail"
-    | "viewBeforeSkillDetail"
-    | "viewBeforeWakeDetail"
-    | "viewBeforeChannelSetup"
-    | "viewBeforeChannelTranscript"
-    | "viewBeforeChatInfo",
+  field: ViewBeforeField,
 ): Exclude<MainView, OverlayView> {
   const mv = state.mainView;
   if (
@@ -187,10 +203,20 @@ export type MainView =
 export type IntelligenceTab = "identity" | "skills" | "workspace" | "contacts";
 
 export interface OpenedAppState {
+  /** The assistant the app was loaded from: an app id is assistant-scoped. */
+  assistantId: string;
   appId: string;
   dirName?: string;
   name: string;
   html: string;
+}
+
+/** One app request in flight. See {@link ViewerState.appLoad} for the rules. */
+export interface AppLoadRequest {
+  assistantId: string;
+  appId: string;
+  token: number;
+  promise: Promise<boolean>;
 }
 
 /**
@@ -200,6 +226,7 @@ export interface OpenedAppState {
  */
 export interface OpenedDbDocumentState {
   source: "document";
+  assistantId?: string;
   surfaceId: string;
   conversationId: string;
   documentName: string;
@@ -214,6 +241,7 @@ export interface OpenedDbDocumentState {
  */
 export type WorkspaceFilePreviewKind =
   | "csv"
+  | "xlsx"
   | "markdown"
   | "text"
   | "pdf"
@@ -398,6 +426,18 @@ export interface ToolDetailPayload {
    */
   searchResults?: WebSearchResultItem[];
   /**
+   * The `ask_question` record the daemon persists once a prompt settles: the
+   * questions as asked and what the user chose. Like `result`, an open-time
+   * snapshot the drawer falls back to when the call can't be resolved live.
+   */
+  answeredQuestion?: AnsweredQuestion;
+  /**
+   * The call's structured result, for the tools that report one alongside
+   * their text. Like `result`, an open-time snapshot the drawer falls back to
+   * when the call can't be resolved live.
+   */
+  activityMetadata?: ToolActivityMetadata;
+  /**
    * Stable identity of the reasoning run this drawer mirrors. When present, the
    * panel re-derives live text from the chat-session store (via
    * `useLiveThinkingText`) so an open drawer streams instead of freezing
@@ -410,17 +450,6 @@ export interface ToolDetailPayload {
   thinkingItemIndex?: number;
 }
 
-/**
- * Payload for the activity-steps side panel — the full steps timeline of one
- * contiguous thinking + tool run (a `MultiActivityGroup`).
- *
- * `messageId` + `groupIndex` are the stable identity of the activity group in
- * the transcript: the open panel re-derives live items from the chat-session
- * store (via `useLiveActivityGroup`) so it streams as new steps land. The
- * embedded `items` / `toolCalls` are the open-time snapshot, used only when
- * the live source can't be resolved (message paged out, or identity-less
- * callers like stories).
- */
 /**
  * Payload for the wake-detail side panel: everything the transcript card
  * folds away behind "View details".
@@ -436,26 +465,53 @@ export interface WakeDetailPayload {
   metadata: Array<{ label: string; value: string }>;
 }
 
+/**
+ * Payload for the activity-steps side panel: the full steps timeline of one
+ * contiguous thinking + tool run (a `MultiActivityGroup`).
+ *
+ * `messageId` plus the raw group tool-call ids identify the activity group as
+ * pagination shifts its numeric index or older history extends the group.
+ * Thinking-only groups retain exact-index identity. The embedded `items` /
+ * `toolCalls` are the open-time snapshot, used only when the live source can't
+ * be resolved (message paged out, or identity-less callers like stories).
+ */
 export interface ActivityStepsPayload {
   messageId?: string;
   groupIndex?: number;
+  /** Tool-call occurrence ids from the group before display suppression. */
+  groupToolCallIds?: string[];
   items: ToolCallCardItem[];
   toolCalls: ChatMessageToolCall[];
+  /** Open-time evidence that this was the active trailing transcript group. */
+  active?: boolean;
 }
 
 /**
  * Whether two activity-steps payloads address the same transcript group.
- * Keys on the stable (message, group) identity when present, falling back to
- * the first tool-call id for identity-less callers.
+ * Within one message, overlapping raw tool-call ids keep the same group
+ * selected when pagination prepends older groups. Exact indexes identify
+ * groups that have no raw tool-call evidence.
  */
 export function sameActivityStepsTarget(
   a: ActivityStepsPayload,
   b: ActivityStepsPayload,
 ): boolean {
   if (a.messageId != null || b.messageId != null) {
-    return a.messageId === b.messageId && a.groupIndex === b.groupIndex;
+    if (a.messageId !== b.messageId) {
+      return false;
+    }
+    if (a.groupToolCallIds?.length && b.groupToolCallIds?.length) {
+      const bIds = new Set(b.groupToolCallIds);
+      return a.groupToolCallIds.some((id) => bIds.has(id));
+    }
+    return a.groupIndex === b.groupIndex;
   }
-  return a.toolCalls[0]?.id === b.toolCalls[0]?.id;
+  const aAnchor = a.toolCalls[0]?.id;
+  const bAnchor = b.toolCalls[0]?.id;
+  if (aAnchor != null && bAnchor != null) {
+    return aAnchor === bAnchor;
+  }
+  return a.groupIndex != null && a.groupIndex === b.groupIndex;
 }
 
 /**
@@ -557,6 +613,17 @@ export interface ViewerState {
   mainView: MainView;
   activeAppId: string | null;
   openedAppState: OpenedAppState | null;
+  /**
+   * The app load in flight, shared by every caller asking for the same
+   * assistant and app so a surface that mounts mid-load observes the request
+   * already running instead of starting a second one. `token` is what a
+   * settlement checks: a load whose token is not the current one has been
+   * abandoned and must not touch the viewer. A pending request always names
+   * the app the viewer holds.
+   */
+  appLoad: AppLoadRequest | null;
+  /** Monotonic source of {@link AppLoadRequest.token}. */
+  appLoadSeq: number;
   activeDocumentTarget: DocumentTarget | null;
   openedDocumentState: OpenedDocumentState | null;
   isAppMinimized: boolean;
@@ -609,9 +676,18 @@ export interface ViewerActions {
 
   // --- App viewer ---
   openApp: (appId: string) => void;
-  loadApp: (assistantId: string, appId: string) => Promise<void>;
+  /**
+   * Resolves to whether this app ended up on screen: false when the load
+   * failed, or when the viewer left the app view while the request was in
+   * flight. Callers asking for the same assistant and app share one request.
+   */
+  loadApp: (assistantId: string, appId: string) => Promise<boolean>;
   setLoadedApp: (app: OpenedAppState) => void;
-  handleAppLoadFailed: () => void;
+  /**
+   * Let go of the app without touching `mainView`, so a view that opened over
+   * it (a document, a subagent detail) stays in front.
+   */
+  releaseApp: () => void;
   closeApp: () => void;
   toggleAppMinimized: () => void;
   minimizeApp: () => void;
@@ -806,6 +882,8 @@ const INITIAL_STATE: ViewerState = {
   mainView: "chat",
   activeAppId: null,
   openedAppState: null,
+  appLoad: null,
+  appLoadSeq: 0,
   activeDocumentTarget: null,
   openedDocumentState: null,
   isAppMinimized: false,
@@ -870,67 +948,102 @@ const useViewerStoreBase = create<ViewerStore>()((set, get) => ({
       activeAppId: appId,
       openedAppState: null,
       isAppMinimized: false,
+      appLoad: null,
     });
   },
 
-  loadApp: async (assistantId, appId) => {
+  loadApp: (assistantId, appId) => {
+    const pending = get().appLoad;
+    if (
+      pending &&
+      pending.assistantId === assistantId &&
+      pending.appId === appId
+    ) {
+      // One request per app: a mount that lands mid-load (Back onto the app
+      // URL) waits on the result the first caller is already waiting on.
+      return pending.promise;
+    }
+    const token = get().appLoadSeq + 1;
     set({
+      appLoadSeq: token,
       mainView: "app",
       activeAppId: appId,
       openedAppState: null,
       isAppMinimized: false,
     });
-    try {
-      const { data: result } = await appsByIdOpenPost({
-        path: { assistant_id: assistantId, id: appId },
-        throwOnError: true,
-      });
-      if (get().activeAppId !== appId) {
-        return;
+    const promise = (async (): Promise<boolean> => {
+      // The request waits one microtask for the registration below, so every
+      // settlement has a token to compare against.
+      await Promise.resolve();
+      try {
+        const { data: result } = await appsByIdOpenPost({
+          path: { assistant_id: assistantId, id: appId },
+          throwOnError: true,
+        });
+        if (!isCurrentAppLoad(get(), token)) {
+          return false;
+        }
+        set({
+          appLoad: null,
+          openedAppState: {
+            assistantId,
+            appId: result.appId,
+            dirName: result.dirName,
+            name: result.name,
+            html: result.html,
+          },
+        });
+        primeAppHtmlCache(assistantId, result.appId, result.html);
+        // The viewer can leave the app view without dropping activeAppId, so the
+        // id match alone does not mean the app is what the reader sees.
+        return isAppMainView(get().mainView);
+      } catch (err) {
+        if (!isCurrentAppLoad(get(), token)) {
+          return false;
+        }
+        set({ appLoad: null });
+        // 404s here are an expected condition (app was deleted on the
+        // server but the client still has a reference). Skip the Sentry
+        // capture for those, since the daemon already returns a structured
+        // `{ code: "NOT_FOUND", message }` body, and let the UI fall back to
+        // chat as below. Unexpected failures still report.
+        if (!isAppNotFoundError(err)) {
+          captureError(err, { context: "openApp" });
+        }
+        get().closeApp();
+        return false;
       }
-      const app = {
-        appId: result.appId,
-        dirName: result.dirName,
-        name: result.name,
-        html: result.html,
-      };
-      set({ openedAppState: app });
-      primeAppHtmlCache(assistantId, result.appId, result.html);
-    } catch (err) {
-      if (get().activeAppId !== appId) {
-        return;
-      }
-      // 404s here are an expected condition (app was deleted on the
-      // server but the client still has a reference). Skip the Sentry
-      // capture for those — the daemon already returns a structured
-      // `{ code: "NOT_FOUND", message }` body — and let the UI fall
-      // back to chat as below. Unexpected failures still report.
-      if (!isAppNotFoundError(err)) {
-        captureError(err, { context: "openApp" });
-      }
-      set({ mainView: "chat", activeAppId: null, openedAppState: null });
-    }
+    })();
+    set({ appLoad: { assistantId, appId, token, promise } });
+    return promise;
   },
 
   setLoadedApp: (app) => {
     set({ openedAppState: app });
   },
 
-  handleAppLoadFailed: () => {
+  releaseApp: () => {
+    // An overlay opened over the app restores to it on close. With the app
+    // gone there is nothing to restore to, so those targets settle on chat.
+    const state = get();
+    const settled: Partial<Record<ViewBeforeField, "chat">> = {};
+    for (const field of VIEW_BEFORE_FIELDS) {
+      if (isAppMainView(state[field])) {
+        settled[field] = "chat";
+      }
+    }
     set({
-      mainView: "chat",
       activeAppId: null,
       openedAppState: null,
+      isAppMinimized: false,
+      appLoad: null,
+      ...settled,
     });
   },
 
   closeApp: () => {
-    set({
-      mainView: "chat",
-      activeAppId: null,
-      openedAppState: null,
-      isAppMinimized: false,
-    });
+    get().releaseApp();
+    set({ mainView: "chat" });
   },
 
   toggleAppMinimized: () => {
@@ -1406,11 +1519,24 @@ const useViewerStoreBase = create<ViewerStore>()((set, get) => ({
   },
 
   loadDocument: async (assistantId, documentSurfaceId) => {
+    const current = get();
+    const opened = current.openedDocumentState;
+    if (
+      current.mainView === "document" &&
+      current.activeDocumentTarget?.source === "document" &&
+      current.activeDocumentTarget.surfaceId === documentSurfaceId &&
+      opened?.source === "document" &&
+      opened.assistantId === assistantId &&
+      opened.surfaceId === documentSurfaceId
+    ) {
+      return;
+    }
     const viewBeforeDocument = resolveViewBefore(get(), "viewBeforeDocument");
     const target: DocumentTarget = {
       source: "document",
       surfaceId: documentSurfaceId,
     };
+    const isCurrent = () => get().activeDocumentTarget === target;
     set({
       mainView: "document",
       activeDocumentTarget: target,
@@ -1418,11 +1544,14 @@ const useViewerStoreBase = create<ViewerStore>()((set, get) => ({
       viewBeforeDocument,
     });
     try {
-      const { data: result } = await documentsByIdGet({
-        path: { assistant_id: assistantId, id: documentSurfaceId },
-        throwOnError: true,
+      const { loadDocumentContent } =
+        await import("@/domains/chat/api/document-load");
+      const result = await loadDocumentContent({
+        assistantId,
+        surfaceId: documentSurfaceId,
+        isCurrent,
       });
-      if (!sameDocumentTarget(get().activeDocumentTarget, target)) {
+      if (!isCurrent()) {
         return;
       }
       if (!result) {
@@ -1436,6 +1565,7 @@ const useViewerStoreBase = create<ViewerStore>()((set, get) => ({
       set({
         openedDocumentState: {
           source: "document",
+          assistantId,
           surfaceId: result.surfaceId,
           conversationId: result.conversationId,
           documentName: result.title ?? "Untitled",
@@ -1446,7 +1576,7 @@ const useViewerStoreBase = create<ViewerStore>()((set, get) => ({
         .getState()
         .clearDocumentEverywhere(result.surfaceId);
     } catch {
-      if (!sameDocumentTarget(get().activeDocumentTarget, target)) {
+      if (!isCurrent()) {
         return;
       }
       set({

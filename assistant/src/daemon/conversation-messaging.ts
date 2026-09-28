@@ -63,7 +63,10 @@ import {
   syncMessageToDisk,
   updateMetaFile,
 } from "../persistence/conversation-disk-view.js";
-import { SIGHT_FRAME_ATTACHMENT_IDS_KEY } from "../persistence/conversation-types.js";
+import {
+  isEchoSuppressedUserMessage,
+  SIGHT_FRAME_ATTACHMENT_IDS_KEY,
+} from "../persistence/conversation-types.js";
 import {
   attachmentIdFragment,
   type ContentBlock,
@@ -72,10 +75,16 @@ import {
 import type { AuthContext } from "../runtime/auth/types.js";
 import { INTERRUPTED_TURN_NOTE_TEXT } from "../util/abort-reasons.js";
 import { getLogger } from "../util/logger.js";
-import type { MessageQueue } from "./conversation-queue-manager.js";
+import type { ConversationModeSessionCoordinator } from "./conversation-mode-session.js";
+import type {
+  MessageQueue,
+  TurnWorkOrigin,
+} from "./conversation-queue-manager.js";
 import type { SlackInboundMessageMetadata } from "./handlers/shared.js";
 import type { UserMessageAttachment } from "./message-protocol.js";
+import { actorAuthorProvenance } from "./message-provenance.js";
 import type { ConversationTransportMetadata } from "./message-types/conversations.js";
+import { bestEffortModeSessionTracking } from "./mode-session-tracking.js";
 import {
   assembleUserContentBlocks,
   offloadLinkPlan,
@@ -229,7 +238,14 @@ export interface MessagingConversationContext {
   acquireProcessingFenced(): Promise<number | null>;
   releaseProcessing(owner: number): boolean;
   abortController: AbortController | null;
+  currentTurnCronRunId?: string | null;
+  currentTurnWorkOrigins?: readonly TurnWorkOrigin[];
   currentRequestId?: string;
+  currentActiveSurfaceId?: string;
+  readonly modeSessions?: Pick<
+    ConversationModeSessionCoordinator,
+    "acceptTurn" | "trackPersistedRow"
+  >;
   /** See {@link Conversation.currentTurnClientMessageId}. */
   currentTurnClientMessageId?: string;
   readonly queue: MessageQueue;
@@ -943,6 +959,8 @@ export function enqueueMessage(
 
 /** Shared options for `persistUserMessage` and `persistQueuedMessageBody`. */
 export interface PersistMessageOptions {
+  cronRunId?: string | null;
+  signal?: AbortSignal;
   content: string;
   attachments?: UserMessageAttachment[];
   requestId?: string;
@@ -957,6 +975,13 @@ export interface PersistMessageOptions {
    * persisting a message the current actor just sent.
    */
   trustContext?: TrustContext;
+  /**
+   * The person whose own inbound message this row records, passed only by a
+   * caller relaying one (channel ingress and its retry replay). It names the
+   * row's author (`actorAuthorProvenance`). Machine-authored callers omit it,
+   * so their rows name no author whatever the conversation's trust is.
+   */
+  author?: TrustContext;
   /**
    * Persist the row without indexing it (no memory segments, embeddings, or
    * lexical-index entry). For machine-authored prompts that must not enter
@@ -1005,6 +1030,10 @@ export interface PersistMessageOptions {
    * what a consumer that must not misattribute a turn to a surface needs.
    */
   requestClientOs?: string;
+  /** Existing structural surface whose accepted action created this turn. */
+  activeSurfaceId?: string;
+  /** Whether mode-session stamping publishes its own history invalidation. */
+  publishModeSessionChanges?: boolean;
   /**
    * Which of `attachments`, by the id the caller holds, arrived as ambient
    * camera frames rather than files the user picked. Stamps
@@ -1090,13 +1119,27 @@ export async function persistUserMessage(
     throw new Error("Message content or attachments are required");
   }
 
+  options.signal?.throwIfAborted();
   const reqId = options.requestId ?? uuidv7();
   ctx.currentRequestId = reqId;
   // Recorded in the same synchronous step as the abort controller and the lock
   // below, so a retransmission of this very send can never find the turn armed
   // but unattributed and abort it.
   ctx.currentTurnClientMessageId = options.clientMessageId;
-  ctx.abortController = new AbortController();
+  const controller = new AbortController();
+  ctx.abortController = controller;
+  ctx.currentTurnCronRunId = options.cronRunId ?? null;
+  ctx.currentTurnWorkOrigins = [
+    {
+      sentAt:
+        typeof options.metadata?.sentAt === "number"
+          ? options.metadata.sentAt
+          : Date.now(),
+      metadata: options.metadata,
+    },
+  ];
+  const abort = () => controller.abort(options.signal?.reason);
+  options.signal?.addEventListener("abort", abort, { once: true });
 
   let owner: number | null = null;
   try {
@@ -1118,16 +1161,20 @@ export async function persistUserMessage(
     if (owner === null) {
       throw new Error(CONVERSATION_BUSY_MESSAGE);
     }
+    options.signal?.throwIfAborted();
     const result = await persistQueuedMessageBody(ctx, {
       ...options,
       attachments,
       requestId: reqId,
     });
+    options.signal?.throwIfAborted();
     if (result.deduplicated) {
       ctx.releaseProcessing(owner);
       ctx.abortController = null;
       ctx.currentRequestId = undefined;
       ctx.currentTurnClientMessageId = undefined;
+      ctx.currentTurnCronRunId = undefined;
+      ctx.currentTurnWorkOrigins = undefined;
     }
     return result;
   } catch (err) {
@@ -1148,7 +1195,11 @@ export async function persistUserMessage(
     ctx.abortController = null;
     ctx.currentRequestId = undefined;
     ctx.currentTurnClientMessageId = undefined;
+    ctx.currentTurnCronRunId = undefined;
+    ctx.currentTurnWorkOrigins = undefined;
     throw err;
+  } finally {
+    options.signal?.removeEventListener("abort", abort);
   }
 }
 
@@ -1229,12 +1280,14 @@ export async function persistQueuedMessageBody(
       channelInbound: rawChannelInbound,
       scripted: rawScriptedFromMetadata,
       clientOsFromRequest: _rawClientOsFromRequest,
+      modeSession: _rawModeSession,
       ...metadataWithoutSlackInbound
     } = (metadata ?? {}) as Record<string, unknown> & {
       slackInbound?: SlackInboundMessageMetadata;
       channelInbound?: ProviderMessageMetadata;
       scripted?: unknown;
       clientOsFromRequest?: unknown;
+      modeSession?: unknown;
     };
     const slackMeta = buildSlackMetaForPersistence({
       slackInbound: rawSlackInbound,
@@ -1307,6 +1360,13 @@ export async function persistQueuedMessageBody(
     const mergedMetadata = {
       ...metadataWithoutSlackInbound,
       ...provenance,
+      // A scripted row, or one the repo classes as machine-injected (hidden,
+      // ACP or subagent notification, background event), is not a person's
+      // own words, so even a relayed author is not named on one.
+      ...(resolvedScripted ||
+      isEchoSuppressedUserMessage(metadataWithoutSlackInbound)
+        ? {}
+        : actorAuthorProvenance(options.author)),
       ...(turnCtx
         ? {
             userMessageChannel: turnCtx.userMessageChannel,
@@ -1440,6 +1500,26 @@ export async function persistQueuedMessageBody(
       return { id: persistedUserMessage.id, deduplicated: true };
     }
 
+    const activeSurfaceId =
+      options.activeSurfaceId ?? ctx.currentActiveSurfaceId;
+    bestEffortModeSessionTracking("persist_user_message", () => {
+      ctx.modeSessions?.acceptTurn(
+        requestId,
+        activeSurfaceId
+          ? { kind: "surface", responseId: activeSurfaceId }
+          : undefined,
+      );
+      ctx.modeSessions?.trackPersistedRow(
+        requestId,
+        persistedUserMessage.id,
+        persistedUserMessage.createdAt,
+        {
+          startsDisplayBoundary: false,
+          publishMessagesChanged: options.publishModeSessionChanges ?? true,
+        },
+      );
+    });
+
     if (turnCtx) {
       setConversationOriginChannelIfUnset(
         ctx.conversationId,
@@ -1560,10 +1640,12 @@ export async function persistQueuedMessageBody(
       updateMessageMetadata(persistedUserMessage.id, { attachmentStoredPaths });
     }
 
-    // An interrupt whose abort landed before the turn made a tool call left
-    // the model no `tool_result` saying it was cut off, so this message
-    // carries the notice instead. Consumed here, once: a second message must
-    // not repeat a note about a turn it did not interrupt. Stamped after the
+    // This is the first user row after a handover, so it carries the note that
+    // tells the model what to do about the work the handover stopped. The note
+    // goes on this row because that work sits directly above it in the history,
+    // which is also why it is usually the interrupting message and never has to
+    // be the one that armed the flag. Consumed here, once: a later message sits
+    // under a completed turn, where the note would be stale. Stamped after the
     // insert, like the stored paths above, so a persist that never lands
     // leaves the flag armed for the send that replaces it.
     const carriesInterruptNote = ctx.pendingInterruptNote === true;

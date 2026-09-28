@@ -4,6 +4,7 @@ import { useTranslation } from "@/i18n";
 
 import type { ChatHeaderSupplements } from "@/components/layout/chat-layout-slots-store";
 import { ConversationActionsMenu } from "@/domains/chat/components/conversation-actions-menu";
+import { useConversationDoneLabels } from "@/utils/done-labels";
 import { isChannelConversation } from "@/domains/chat/utils/conversation-channel";
 import { copyIdToClipboard } from "@/domains/chat/utils/copy-id-to-clipboard";
 import {
@@ -12,6 +13,7 @@ import {
 } from "@/utils/channel-presentation";
 import { useConversationMenuShortcuts } from "@/domains/chat/hooks/use-conversation-menu-shortcuts";
 import type { Conversation } from "@/types/conversation-types";
+import { useDisplayConversationTitle } from "@/utils/conversation-title";
 
 interface ChatConversationHeaderProps {
   assistantId: string | null;
@@ -47,6 +49,8 @@ export function ChatConversationHeader({
   // act on too, so its rows may advertise them.
   const shortcuts = useConversationMenuShortcuts(true);
   const { t } = useTranslation("chat");
+  const doneLabels = useConversationDoneLabels();
+  const displayTitle = useDisplayConversationTitle();
   if (!activeConversation) {
     if (!assistantId) {
       return null;
@@ -185,10 +189,10 @@ export function ChatConversationHeader({
             <span className="min-w-0 max-w-[220px] truncate leading-6">
               {isArchived && (
                 <span className="mr-1 text-[var(--content-tertiary)]">
-                  {t("chatConversationHeader.archived")}
+                  {doneLabels.headerBadge}
                 </span>
               )}
-              {activeConversation.title ?? t("chatConversationHeader.untitled")}
+              {displayTitle(activeConversation.title)}
             </span>
             {channelHeaderLabel ? (
               <span className="hidden max-w-[160px] shrink truncate leading-6 text-[var(--content-tertiary)] sm:inline">

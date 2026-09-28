@@ -36,6 +36,11 @@ import {
   buildToolApprovalSeedContentBlocks,
 } from "./approval-card-data.js";
 import {
+  intersectChannelAllowlist,
+  readChannelAllowlist,
+} from "./channel-allowlist.js";
+import { readCompletionContext } from "./completion-policy.js";
+import {
   buildConversationCandidates,
   type ConversationCandidateSet,
   serializeCandidatesForPrompt,
@@ -52,6 +57,7 @@ import {
   nonEmpty,
   readPayloadObject,
   readPayloadString,
+  readPayloadStringArray,
 } from "./notification-utils.js";
 import { getPreferenceSummary } from "./preference-summary.js";
 import type { NotificationSignal, RoutingIntent } from "./signal.js";
@@ -76,26 +82,8 @@ const PROMPT_VERSION = "v4";
  */
 const MAX_IDENTITY_CONTEXT_CHARS = 2000;
 
-/**
- * Delivery scope for `chat.assistant_reply` signals: the platform channel is a
- * push_only relay that never materializes a conversation, so these signals
- * reach the user exclusively as a push. Adding a channel here widens delivery
- * to it.
- */
-const ASSISTANT_REPLY_CHANNELS = [
-  "platform",
-] as const satisfies readonly NotificationChannel[];
-
-/**
- * Delivery scope for `schedule.result` signals. Wider than
- * {@link ASSISTANT_REPLY_CHANNELS} by one channel, and the difference is the
- * point: an unseen chat reply is already sitting in a conversation the user
- * opened, so a push is the only thing it can add. A scheduled run's output has
- * no such home — nobody is looking at the run's conversation — so `vellum`
- * carries it into the notification center where it persists, and `platform`
- * pushes it.
- */
-const SCHEDULE_RESULT_CHANNELS = [
+/** Completion alerts reach connected clients and registered mobile devices. */
+const COMPLETION_CHANNELS = [
   "vellum",
   "platform",
 ] as const satisfies readonly NotificationChannel[];
@@ -833,6 +821,19 @@ function buildPassThroughDecision(params: {
   return decision;
 }
 
+function selectDefaultChannelsByUrgency(
+  urgency: NotificationSignal["attentionHints"]["urgency"],
+  availableChannels: NotificationChannel[],
+): NotificationChannel[] {
+  const isUrgent = urgency === "critical" || urgency === "high";
+  if (isUrgent) {
+    return [...availableChannels];
+  }
+  return availableChannels.includes("vellum")
+    ? ["vellum" as NotificationChannel]
+    : [];
+}
+
 /**
  * The deterministic guards every decision passes through once the model,
  * the assistant-tool pass-through, or the fallback has rendered copy.
@@ -868,32 +869,44 @@ export async function evaluateSignal(
   const requestedBody = nonEmpty(
     readPayloadString(signal.contextPayload, "requestedMessage"),
   );
+  if (readCompletionContext(signal) && requestedBody) {
+    return buildPassThroughDecision({
+      signal,
+      availableChannels,
+      selectedChannels: COMPLETION_CHANNELS.filter((channel) =>
+        availableChannels.includes(channel),
+      ),
+      body: requestedBody,
+      reasoningSummary: "background_result pass-through",
+    });
+  }
   if (signal.sourceChannel === "assistant_tool" && requestedBody) {
     const payload = signal.contextPayload as Record<string, unknown>;
-    const isUrgent =
-      signal.attentionHints.urgency === "critical" ||
-      signal.attentionHints.urgency === "high";
-    const defaultChannels: NotificationChannel[] = isUrgent
-      ? [...availableChannels]
-      : availableChannels.includes("vellum")
-        ? ["vellum" as NotificationChannel]
-        : [];
-    // Honor `--preferred-channels` as ADDITIVE push targets on top of
-    // the default channel set. The notification center (vellum) is the
-    // always-on canonical inbox; preferred channels add push surfaces
-    // on top, they never replace vellum. Disconnected channels are
-    // filtered out so we never try to deliver on something unavailable.
-    const preferredChannelsRaw = Array.isArray(payload.preferredChannels)
-      ? (payload.preferredChannels as unknown[]).filter(
-          (c): c is string => typeof c === "string",
-        )
-      : undefined;
+    const defaultChannels = selectDefaultChannelsByUrgency(
+      signal.attentionHints.urgency,
+      availableChannels,
+    );
+    // `channelAllowlist` is exclusive: only those available channels are
+    // selected. `preferredChannels` is additive on top of the default set
+    // (vellum stays the canonical inbox) and is ignored when an allowlist
+    // is present. Disconnected names are dropped so we never deliver on
+    // something unavailable.
+    const exclusiveAllowlist = readChannelAllowlist(payload);
+    const preferredChannelsRaw = readPayloadStringArray(
+      payload,
+      "preferredChannels",
+    );
     let selectedChannels = defaultChannels;
-    if (preferredChannelsRaw && preferredChannelsRaw.length > 0) {
+    if (exclusiveAllowlist) {
+      selectedChannels = intersectChannelAllowlist(
+        exclusiveAllowlist,
+        availableChannels,
+      );
+    } else if (preferredChannelsRaw && preferredChannelsRaw.length > 0) {
       const availableSet = new Set<string>(availableChannels);
-      const preferredAvailable = preferredChannelsRaw.filter((c) =>
-        availableSet.has(c),
-      ) as NotificationChannel[];
+      const preferredAvailable = preferredChannelsRaw.filter((c) => {
+        return availableSet.has(c);
+      }) as NotificationChannel[];
       if (preferredAvailable.length > 0) {
         selectedChannels = Array.from(
           new Set<NotificationChannel>([
@@ -913,12 +926,12 @@ export async function evaluateSignal(
   }
 
   // Assistant-reply pass-through: the delivery scope is fixed
-  // (ASSISTANT_REPLY_CHANNELS), so the LLM classifier has nothing to decide.
+  // (COMPLETION_CHANNELS), so the LLM classifier has nothing to decide.
   if (signal.sourceEventName === "chat.assistant_reply" && requestedBody) {
     return buildPassThroughDecision({
       signal,
       availableChannels,
-      selectedChannels: ASSISTANT_REPLY_CHANNELS.filter((ch) =>
+      selectedChannels: COMPLETION_CHANNELS.filter((ch) =>
         availableChannels.includes(ch),
       ),
       body: requestedBody,
@@ -926,8 +939,34 @@ export async function evaluateSignal(
     });
   }
 
+  // Scheduler-owned requested copy: the scheduler already authored the
+  // complete message. Ownership requires both the signal source and the
+  // payload marker so schedule.result (requestedMessage, no
+  // requestedBySource) and notify-mode (message, no requestedBySource)
+  // stay on their existing paths. Urgency still chooses channels; every
+  // selected channel keeps the producer body.
+  const requestedBySource = nonEmpty(
+    readPayloadString(signal.contextPayload, "requestedBySource"),
+  );
+  if (
+    signal.sourceChannel === "scheduler" &&
+    requestedBySource === "scheduler" &&
+    requestedBody
+  ) {
+    return buildPassThroughDecision({
+      signal,
+      availableChannels,
+      selectedChannels: selectDefaultChannelsByUrgency(
+        signal.attentionHints.urgency,
+        availableChannels,
+      ),
+      body: requestedBody,
+      reasoningSummary: "scheduler requested-message pass-through",
+    });
+  }
+
   // Schedule-result pass-through: the body is the run's own reply, which is
-  // the whole point of the notification — a briefing, a digest, a report. The
+  // the whole point of the notification: a briefing, a digest, a report. The
   // classifier rewrites bodies into short alerts, which would throw away the
   // content the user set the schedule up to receive. Routing has nothing to
   // decide either: the user asked for this cadence, so it goes to the inbox
@@ -936,7 +975,7 @@ export async function evaluateSignal(
     return buildPassThroughDecision({
       signal,
       availableChannels,
-      selectedChannels: SCHEDULE_RESULT_CHANNELS.filter((ch) =>
+      selectedChannels: COMPLETION_CHANNELS.filter((ch) =>
         availableChannels.includes(ch),
       ),
       body: requestedBody,

@@ -1,0 +1,104 @@
+{
+  "assistantInboxHeader": {
+    "title": "Correo",
+    "settingsAria": "Ajustes del correo"
+  },
+  "addressPill": {
+    "copyAddress": "Copiar dirección de correo",
+    "copied": "Copiado",
+    "copyFailed": "No se pudo copiar la dirección."
+  },
+  "assistantInboxPage": {
+    "folderAriaLabel": "Carpeta de correo",
+    "inboxTab": "Recibidos",
+    "sentTab": "Enviados",
+    "inboxEmptyTitle": "Todavía no hay nada",
+    "inboxEmptyBody": "Comparte {address} y todo lo que llegue aparecerá aquí.",
+    "sentEmptyTitle": "Aún no hay correos enviados",
+    "sentEmptyBody": "Pídeme que escriba a alguien y guardaré una copia aquí.",
+    "selectPromptTitle": "Elige un correo para leerlo",
+    "selectPromptBody": "Elige un mensaje de la lista. Marca varios para iniciar un chat con ellos adjuntos, o para eliminarlos.",
+    "backToList": "Volver a la lista",
+    "searchPlaceholder": "Buscar correos",
+    "searchAriaLabel": "Buscar en esta carpeta",
+    "searchEmptyTitle": "Sin resultados",
+    "searchEmptyBody": "Nada en esta carpeta coincide con tu búsqueda."
+  },
+  "emailListRow": {
+    "toPrefix": "Para {name}",
+    "attachments": "{count, plural, one {# adjunto} other {# adjuntos}}",
+    "noSubject": "(sin asunto)",
+    "selectAria": "Seleccionar \"{subject}\"",
+    "unread": "No leído"
+  },
+  "emailSelectionBar": {
+    "ariaLabel": "Correos seleccionados",
+    "count": "{count, plural, one {# correo seleccionado} other {# correos seleccionados}}",
+    "mixed": "{received, plural, one {# recibido} other {# recibidos}} · {sent, plural, one {# enviado} other {# enviados}}",
+    "startChat": "Iniciar un chat nuevo",
+    "delete": "Eliminar de la bandeja",
+    "clear": "Borrar selección"
+  },
+  "deleteEmailsDialog": {
+    "title": "¿Eliminar {count, plural, one {este correo} other {# correos}}?",
+    "message": "{count, plural, one {Desaparecerá de tu bandeja en este dispositivo.} other {Desaparecerán de tu bandeja en este dispositivo.}}",
+    "confirm": "Eliminar",
+    "cancel": "Cancelar"
+  },
+  "emailDetail": {
+    "from": "De:",
+    "to": "Para:",
+    "attachments": "Adjuntos",
+    "askToReply": "Pedir a {name} que responda",
+    "loading": "Cargando el mensaje…",
+    "loadFailed": "No se pudo cargar este mensaje.",
+    "copyEmail": "Copiar correo",
+    "copied": "Copiado",
+    "copyFailed": "No se pudo copiar el correo."
+  },
+  "emailAddressFields": {
+    "prefixLabel": "Prefijo",
+    "prefixPlaceholder": "hola",
+    "handleLabel": "Identificador (público)",
+    "handlePlaceholder": "mi-asistente"
+  },
+  "assistantInboxUpgradeState": {
+    "title": "Dale una bandeja de entrada a {name}",
+    "subtitle": "Una dirección de correo a la que la gente pueda escribir y un solo lugar para leer todo lo que llega.",
+    "perkAddress": "Una dirección real en {rootDomain}",
+    "perkReads": "{name} lee, ordena y responde por ti",
+    "perkHistory": "Cada mensaje guardado aquí, recibidos y enviados",
+    "upgradeButton": "Mejorar a Super",
+    "seePlans": "Planes",
+    "titleNoName": "Dale una bandeja de entrada a tu asistente",
+    "perkReadsNoName": "Tu asistente lee, ordena y responde por ti",
+    "changeHandle": "Cambiar handle ({address})",
+    "planNotice": "El correo no está incluido en el plan Free. Pasa a un plan con correo."
+  },
+  "assistantInboxSetupCard": {
+    "headline": "Bien, vamos a prepararlo.",
+    "fieldLabel": "Elige un handle de correo:",
+    "fieldLabelChooseHandle": "Elige un handle y un prefijo de correo:",
+    "confirm": "Confirmar",
+    "immutableNotice": "El identificador pasa a ser el identificador público de tu asistente. No podrás cambiarlo una vez establecido."
+  },
+  "assistantInboxRoute": {
+    "loading": "Abriendo la bandeja…",
+    "setupFailed": "No se pudo configurar la dirección.",
+    "setupIncomplete": "No se creó la dirección. Inténtalo de nuevo en un momento.",
+    "replyPrompt": "Responde al correo con id {id} de tu bandeja (de {sender}, asunto \"{subject}\"). Léelo primero con `assistant email download {id}`, redacta una respuesta y muéstramela antes de enviarla.",
+    "mailFailed": "No se pudo cargar el correo.",
+    "retry": "Reintentar",
+    "deletedToast": "{count, plural, one {Correo eliminado.} other {# correos eliminados.}}"
+  },
+  "assistantInboxPageFrame": {
+    "title": "Correo",
+    "back": "Atrás"
+  },
+  "assistantInboxSetupSuccess": {
+    "title": "{name} ya tiene bandeja.",
+    "titleNoName": "Tu asistente ya tiene bandeja.",
+    "body": "Comparte la dirección y todo lo que llegue aparecerá aquí.",
+    "openInbox": "Abrir bandeja"
+  }
+}

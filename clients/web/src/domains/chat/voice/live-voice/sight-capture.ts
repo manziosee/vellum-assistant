@@ -52,6 +52,7 @@ import { recordFrameGateKeep } from "@/lib/camera/frame-gate-debug";
 import { captureError } from "@/lib/sentry/capture-error";
 
 import type { LiveVoiceSightFrameTiming } from "./live-voice-client";
+import type { LiveVoiceSightSource } from "./protocol";
 import { sendLiveVoiceSightFrame, useLiveVoiceStore } from "./live-voice-store";
 
 /**
@@ -80,11 +81,19 @@ export interface SightSharedFrame {
   readonly frame: File;
 }
 
+/**
+ * The keep reason of the fresh frame taken because the assistant asked to
+ * look. The one reason the daemon acts on rather than only logs: it answers
+ * the look from the frame that carries it (see the `lookFrames` start field).
+ */
+export const LOOK_FRAME_REASON = "look";
+
 /** Why a frame was kept, for the timing it reports. */
 export interface SightKeepOrigin {
   /**
    * The gate's reason, or a source's own word for a keep no gate judged. Goes
-   * to the daemon's log as-is.
+   * to the daemon's log as-is, and {@link LOOK_FRAME_REASON} also has the
+   * daemon answer a look from the frame.
    */
   readonly reason: string;
   /**
@@ -100,6 +109,11 @@ export interface SightCaptureRequest {
   readonly assistantId: string;
   /** Why this frame was kept, carried to the daemon with the frame's timing. */
   readonly keep: SightKeepOrigin;
+  /** Camera run captured before encoding and upload begin. */
+  readonly lifecycle?: {
+    readonly cameraEpoch: number;
+    readonly source: LiveVoiceSightSource;
+  };
   /**
    * The JPEG: the browser path encodes the `<video>` it is watching, the
    * native path wraps the sample the gate has already judged. Null is a frame
@@ -268,6 +282,7 @@ export function createSightCapture(errorContext: string): SightCapture {
   async function capture({
     assistantId,
     keep,
+    lifecycle,
     produceFrame,
     onShared,
     onDropped,
@@ -359,7 +374,12 @@ export function createSightCapture(errorContext: string): SightCapture {
           // reconnect gap it has not been, and a frame that never left is this
           // module's to give back, since the daemon never saw it.
           if (
-            !sendLiveVoiceSightFrame(uploaded.id, sessionGeneration, timing)
+            !sendLiveVoiceSightFrame(
+              uploaded.id,
+              sessionGeneration,
+              timing,
+              lifecycle,
+            )
           ) {
             abandonUpload();
             return;

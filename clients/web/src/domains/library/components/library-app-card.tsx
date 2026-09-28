@@ -57,8 +57,8 @@ export function LibraryAppCard({
   const deleteAction = readOnly ? undefined : onDelete;
   const deployAction = readOnly ? undefined : onDeploy;
   const loadHtml = useCallback(
-    () => getCachedAppHtml(assistantId, app.id),
-    [assistantId, app.id],
+    () => getCachedAppHtml(assistantId, app.id, app.updatedAt),
+    [assistantId, app.id, app.updatedAt],
   );
   const share = useShareApp(assistantId, app, {
     exported: t("libraryAppCard.exported"),
@@ -161,12 +161,12 @@ export function LibraryAppCard({
         <button
           type="button"
           onClick={() => onOpen(app.id)}
-          className="flex cursor-pointer flex-col gap-0.5 px-0.5 text-left outline-none"
+          className="flex cursor-pointer flex-col gap-0.5 rounded-sm px-0.5 text-left outline-none keyboard-focus:ring-2 keyboard-focus:ring-inset keyboard-focus:ring-[var(--ring)]"
         >
-          <span className="truncate text-body-large-default text-[color:var(--content-emphasised)]">
+          <span className="truncate text-body-large-default text-[color:var(--content-emphasised)] max-md:text-body-medium-lighter max-md:text-[color:var(--content-secondary)]">
             {app.name}
           </span>
-          <span className="text-body-small-default text-[color:var(--content-tertiary)]">
+          <span className="text-body-small-default text-[color:var(--content-tertiary)] max-md:hidden">
             {formatFriendlyDate(new Date(app.createdAt))}
           </span>
         </button>

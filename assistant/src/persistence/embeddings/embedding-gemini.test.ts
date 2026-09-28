@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import {
   _setBypassWorkerForTests,
   GeminiEmbeddingBackend,
+  GeminiEmbedError,
 } from "./embedding-gemini.js";
 
 function makeSuccessResponse(values: number[]) {
@@ -208,7 +209,7 @@ describe("GeminiEmbeddingBackend", () => {
   });
 
   describe("error handling", () => {
-    test("throws on non-OK response", async () => {
+    test("throws GeminiEmbedError on non-OK response", async () => {
       mockFetch = mock(() =>
         Promise.resolve(new Response("Internal Server Error", { status: 500 })),
       );
@@ -217,9 +218,46 @@ describe("GeminiEmbeddingBackend", () => {
       const backend = new GeminiEmbeddingBackend("test-key", "test-model", {
         bypassWorker: true,
       });
-      await expect(backend.embed(["hello"])).rejects.toThrow(
+      const err = await backend.embed(["hello"]).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(GeminiEmbedError);
+      expect((err as GeminiEmbedError).status).toBe(500);
+      expect((err as GeminiEmbedError).message).toContain(
         "Gemini embeddings request failed (500): Internal Server Error",
       );
+    });
+
+    test("attaches retryAfterMs from Retry-After delta-seconds header on 429", async () => {
+      mockFetch = mock(() =>
+        Promise.resolve(
+          new Response("rate limited", {
+            status: 429,
+            headers: { "Retry-After": "30" },
+          }),
+        ),
+      );
+      globalThis.fetch = mockFetch as unknown as typeof fetch;
+
+      const backend = new GeminiEmbeddingBackend("test-key", "test-model", {
+        bypassWorker: true,
+      });
+      const err = await backend.embed(["hello"]).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(GeminiEmbedError);
+      expect((err as GeminiEmbedError).status).toBe(429);
+      expect((err as GeminiEmbedError).retryAfterMs).toBe(30000);
+    });
+
+    test("retryAfterMs is undefined on 429 without Retry-After header", async () => {
+      mockFetch = mock(() =>
+        Promise.resolve(new Response("rate limited", { status: 429 })),
+      );
+      globalThis.fetch = mockFetch as unknown as typeof fetch;
+
+      const backend = new GeminiEmbeddingBackend("test-key", "test-model", {
+        bypassWorker: true,
+      });
+      const err = await backend.embed(["hello"]).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(GeminiEmbedError);
+      expect((err as GeminiEmbedError).retryAfterMs).toBeUndefined();
     });
 
     test("throws when response is missing embedding values", async () => {
@@ -475,6 +513,23 @@ describe("GeminiEmbeddingBackend: batched text inputs", () => {
     );
     expect(sizes).toEqual([100, 100, 50]);
     expect(vectors.map((v) => v[0])).toEqual(texts(250).map(textIndex));
+  });
+
+  test("managed text inputs use single calls from the first request and preserve vector order", async () => {
+    const fetchMock = routedFetch();
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const backend = new GeminiEmbeddingBackend("test-key", "test-model", {
+      managedBaseUrl: "https://proxy.example.com/v1/runtime-proxy/gemini",
+      interCallDelayMs: 0,
+    });
+
+    expect(await backend.embed(texts(3))).toEqual([[0], [1], [2]]);
+    expect(await backend.embed(["t4", "t5"])).toEqual([[4], [5]]);
+    expect(calledUrls(fetchMock)).toEqual(
+      Array(5).fill(
+        "https://proxy.example.com/v1/runtime-proxy/gemini/v1beta/models/test-model:embedContent",
+      ),
+    );
   });
 
   test("each batched request names the model with the models/ prefix and carries taskType and outputDimensionality", async () => {

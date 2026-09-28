@@ -10,8 +10,15 @@ import { SENTINEL_REDACTION_VERSION } from "@vellumai/service-contracts/redacted
 import type pino from "pino";
 import { v4 as uuid } from "uuid";
 
+import { onActivationToolCall } from "../activation/turn-hooks.js";
 import type { AgentEvent } from "../agent/loop.js";
+import { resolveComputerUseToolName } from "../api/computer-use-tool.js";
 import type { AnsweredQuestion } from "../api/events/question-answered.js";
+import type {
+  ToolActivityMetadata,
+  WebSearchMetadata,
+  WebSearchResultItem,
+} from "../api/events/tool-result.js";
 import type { AssistantEvent } from "../api/index.js";
 import type {
   TurnChannelContext,
@@ -46,6 +53,7 @@ import {
   updateMessageContent,
 } from "../persistence/conversation-crud.js";
 import { syncMessageToDisk } from "../persistence/conversation-disk-view.js";
+import { AUTO_ROUTED_PROFILE_METADATA_KEY } from "../persistence/conversation-types.js";
 import { enqueueLexicalIndexForMessage } from "../persistence/job-handlers/message-lexical.js";
 import {
   backfillMessageIdOnLogs,
@@ -145,11 +153,7 @@ import type {
   SurfaceAction,
   UiSurfaceShow,
 } from "./message-protocol.js";
-import type {
-  ToolActivityMetadata,
-  WebSearchMetadata,
-  WebSearchResultItem,
-} from "./message-types/web-activity.js";
+import { bestEffortModeSessionTracking } from "./mode-session-tracking.js";
 import { referenceMediaBlocksForPersist } from "./persist-media-references.js";
 import { buildProviderRejectionLogFields } from "./provider-rejection-log-fields.js";
 import { turnOrRestingTrust } from "./trust-context-types.js";
@@ -272,6 +276,12 @@ export interface EventHandlerState {
    * the model ever having seen it.
    */
   pendingNotifiedInferenceProfile: string | null;
+  /**
+   * The default profile the Auto profile routed this turn to, stamped on the
+   * turn's assistant rows and carried on `message_complete` so clients can
+   * show which profile answered. `undefined` on every turn not run on Auto.
+   */
+  autoRoutedProfile: string | undefined;
   pendingDirectiveDisplayBuffer: string;
   firstAssistantText: string;
   /** Most recent resolved provider for the current exchange's usage accounting. */
@@ -320,6 +330,8 @@ export interface EventHandlerState {
   providerErrorProfile: string | null;
   persistProviderErrorAsAssistantMessage: boolean;
   lastAssistantMessageId: string | undefined;
+  /** Assistant rows that must join the turn's final disk-view export. */
+  readonly assistantMessageIdsToSync: Set<string>;
   /**
    * Visibility marker stamped on {@link lastAssistantMessageId}, when the turn
    * routed its reply through `send_user_message`. The turn's terminal
@@ -364,6 +376,12 @@ export interface EventHandlerState {
   readonly accumulatedToolContentBlocks: ContentBlock[];
   /** Maps index in accumulatedToolContentBlocks → tool name that produced it. */
   readonly toolContentBlockToolNames: Map<number, string>;
+  /** Supported computer-use calls in model invocation order for this run. */
+  readonly computerUseToolUseIds: string[];
+  /** Tool names for supported computer-use ids, also used for persisted names. */
+  readonly computerUseToolNames: Map<string, string>;
+  /** Latest screenshot block for each supported invocation. */
+  readonly computerUseScreenshotBlocks: Map<string, ImageContent>;
   readonly directiveWarnings: string[];
   readonly toolUseIdToName: Map<string, string>;
   /** Sticky for the whole run: this turn created/refreshed an app. */
@@ -687,6 +705,7 @@ export interface EventHandlerDeps {
 export function createEventHandlerState(): EventHandlerState {
   return {
     pendingNotifiedInferenceProfile: null,
+    autoRoutedProfile: undefined,
     pendingDirectiveDisplayBuffer: "",
     firstAssistantText: "",
     exchangeProviderName: undefined,
@@ -706,6 +725,7 @@ export function createEventHandlerState(): EventHandlerState {
     providerErrorProfile: null,
     persistProviderErrorAsAssistantMessage: false,
     lastAssistantMessageId: undefined,
+    assistantMessageIdsToSync: new Set(),
     assistantRowAwaitingFinalization: false,
     inflightWriters: new Map(),
     pendingToolResults: new Map(),
@@ -714,6 +734,9 @@ export function createEventHandlerState(): EventHandlerState {
     accumulatedDirectives: [],
     accumulatedToolContentBlocks: [],
     toolContentBlockToolNames: new Map(),
+    computerUseToolUseIds: [],
+    computerUseToolNames: new Map(),
+    computerUseScreenshotBlocks: new Map(),
     directiveWarnings: [],
     toolUseIdToName: new Map(),
     appBuildToolUsedThisRun: false,
@@ -756,6 +779,26 @@ export function createEventHandlerState(): EventHandlerState {
     surfacePendingScannedToolUseIds: new Set(),
     liveRevealGuardPriming: undefined,
   };
+}
+
+/** Select the last screenshot-bearing computer-use call by invocation order. */
+export function selectFinalComputerUseScreenshotCandidate(
+  state: Pick<
+    EventHandlerState,
+    | "computerUseToolUseIds"
+    | "computerUseToolNames"
+    | "computerUseScreenshotBlocks"
+  >,
+): { toolName: string; block: ImageContent } | undefined {
+  for (let i = state.computerUseToolUseIds.length - 1; i >= 0; i--) {
+    const toolUseId = state.computerUseToolUseIds[i]!;
+    const block = state.computerUseScreenshotBlocks.get(toolUseId);
+    const toolName = state.computerUseToolNames.get(toolUseId);
+    if (block && toolName) {
+      return { toolName, block };
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -1171,7 +1214,7 @@ async function reserveInflightMessageRow(
   conversationId: string,
   role: "assistant" | "user",
   metadata: Record<string, unknown> | undefined,
-): Promise<{ id: string }> {
+): Promise<{ id: string; createdAt: number }> {
   const writer = createInflightContentWriter(conversationId);
   const reserved = await reserveMessage(
     conversationId,
@@ -1610,7 +1653,11 @@ export async function handleLlmCallStarted(
     }
   }
 
-  const metadata = buildAssistantChannelMetadata(state, deps);
+  const modeSession = deps.ctx.modeSessions.getTurnOwner(deps.reqId);
+  const metadata = {
+    ...buildAssistantChannelMetadata(state, deps),
+    ...(modeSession ? { modeSession } : {}),
+  };
   const reservedRow = await reserveInflightMessageRow(
     state,
     deps.ctx.conversationId,
@@ -1618,6 +1665,13 @@ export async function handleLlmCallStarted(
     metadata,
   );
   state.lastAssistantMessageId = reservedRow.id;
+  bestEffortModeSessionTracking("assistant row reservation", () =>
+    deps.ctx.modeSessions.trackPersistedRow(
+      deps.reqId,
+      reservedRow.id,
+      reservedRow.createdAt,
+    ),
+  );
   state.assistantRowAwaitingFinalization = true;
   // Fresh row → fresh accumulator. If an earlier (failed) LLM call
   // within the same run left partial state behind, the
@@ -1629,6 +1683,7 @@ export async function handleLlmCallStarted(
     type: "assistant_turn_start",
     messageId: reservedRow.id,
     conversationId: deps.ctx.conversationId,
+    ...(modeSession ? { modeSession } : {}),
   });
 }
 
@@ -1760,6 +1815,18 @@ export function handleToolUse(
   event: Extract<AgentEvent, { type: "tool_use" }>,
 ): void {
   state.toolUseIdToName.set(event.id, event.name);
+  const computerUseToolName = resolveComputerUseToolName(
+    event.name,
+    event.input,
+  );
+  if (computerUseToolName) {
+    state.computerUseToolUseIds.push(event.id);
+    state.computerUseToolNames.set(event.id, computerUseToolName);
+  }
+  // Activation checklist: keep the launched task's live step count moving.
+  // Fire-and-forget and throttled inside the hook; a no-op for every
+  // conversation no activation task points at.
+  onActivationToolCall(deps.ctx.conversationId);
   if (event.name === "app_create" || event.name === "app_refresh") {
     state.appBuildToolUsedThisRun = true;
   }
@@ -1835,6 +1902,7 @@ export function handleToolUse(
     // Carry the first-byte timestamp through so a client that connected after
     // the preview event still anchors the perceived-latency timer to it.
     previewStartedAt: state.toolPreviewStartedAt.get(event.id),
+    modeSession: deps.ctx.modeSessions.getTurnOwner(deps.reqId),
   });
   // `message_complete` always precedes tool events (see handleMessageComplete),
   // so this tool_use block is already durable in the assistant row. The
@@ -2106,6 +2174,7 @@ function buildToolResultBlocks(
 function buildToolResultMetadata(
   deps: EventHandlerDeps,
 ): Record<string, unknown> {
+  const modeSession = deps.ctx.modeSessions.getTurnOwner(deps.reqId);
   return {
     ...provenanceFromTrustContext(turnOrRestingTrust(deps.ctx)),
     userMessageChannel: deps.turnChannelContext.userMessageChannel,
@@ -2113,6 +2182,7 @@ function buildToolResultMetadata(
     userMessageInterface: deps.turnInterfaceContext.userMessageInterface,
     assistantMessageInterface:
       deps.turnInterfaceContext.assistantMessageInterface,
+    ...(modeSession ? { modeSession } : {}),
   };
 }
 
@@ -2169,6 +2239,19 @@ async function persistPendingToolResultRow(
     deps.ctx.conversationId,
     buildToolResultMetadata(deps),
   );
+  bestEffortModeSessionTracking("tool result persistence", () => {
+    const row = getMessageById(rowId, deps.ctx.conversationId);
+    if (row) {
+      deps.ctx.modeSessions.trackPersistedRow(
+        deps.reqId,
+        rowId,
+        row.createdAt,
+        {
+          startsDisplayBoundary: false,
+        },
+      );
+    }
+  });
   // Snapshot the batch after the reservation resolves so the last of the
   // concurrent writers reflects the fullest batch. On-arrival writes go to
   // the in-flight delta file; the finalize seam folds the row inline.
@@ -2207,7 +2290,7 @@ export async function finalizePendingToolResultRow(
   conversationId: string,
   metadata: Record<string, unknown>,
   rlog: pino.Logger,
-): Promise<void> {
+): Promise<string | undefined> {
   if (state.pendingToolResults.size === 0) {
     return;
   }
@@ -2228,16 +2311,41 @@ export async function finalizePendingToolResultRow(
     state.pendingToolResults,
     await resolvedRevealCandidatesForState(state),
   );
-  const contentJson = JSON.stringify(
+  const referencedBlocks =
     conv != null
       ? await referenceMediaBlocksForPersist(
           conversationId,
           conv.createdAt,
           rowId,
           blocks as ContentBlock[],
+          state.computerUseToolNames,
         )
-      : blocks,
-  );
+      : blocks;
+  for (const block of referencedBlocks) {
+    // guard:allow-tool-result-only: locally-executed tool results carry rich
+    // contentBlocks and pending computer-use state; provider web-search
+    // results carry opaque content and never enter the local pending-tool map.
+    if (block.type !== "tool_result") {
+      continue;
+    }
+    const pending = state.pendingToolResults.get(block.tool_use_id);
+    if (pending && block.contentBlocks) {
+      pending.contentBlocks = block.contentBlocks;
+    }
+    if (!state.computerUseToolNames.has(block.tool_use_id)) {
+      continue;
+    }
+    const screenshot = block.contentBlocks
+      ?.filter(
+        (contentBlock): contentBlock is ImageContent =>
+          contentBlock.type === "image",
+      )
+      .at(-1);
+    if (screenshot) {
+      state.computerUseScreenshotBlocks.set(block.tool_use_id, screenshot);
+    }
+  }
+  const contentJson = JSON.stringify(referencedBlocks);
   const toolRowFinalized = await finalizeInflightContent(
     state.inflightWriters.get(rowId),
     rowId,
@@ -2309,6 +2417,7 @@ export async function finalizePendingToolResultRow(
   }
   state.pendingToolResults.clear();
   state.pendingToolResultRowReservation = undefined;
+  return rowId;
 }
 
 export async function handleToolResult(
@@ -2416,6 +2525,7 @@ export async function handleToolResult(
       conversationId: deps.ctx.conversationId,
       messageId: state.lastAssistantMessageId,
       toolUseId: event.toolUseId,
+      modeSession: deps.ctx.modeSessions.getTurnOwner(deps.reqId),
     });
     // Capture the seq synchronously (before the persist await) so it reflects
     // the just-stamped tool_result event, then persist on arrival. A failure
@@ -2523,8 +2633,13 @@ export async function handleToolResult(
     deps.ctx.markWorkspaceTopLevelDirty();
   }
 
+  const computerUseCall = state.computerUseToolNames.has(event.toolUseId);
   if (event.contentBlocks) {
     for (const cb of event.contentBlocks) {
+      if (computerUseCall && cb.type === "image") {
+        state.computerUseScreenshotBlocks.set(event.toolUseId, cb);
+        continue;
+      }
       if (cb.type === "image" || cb.type === "file") {
         state.accumulatedToolContentBlocks.push(cb);
         if (toolName) {
@@ -2604,6 +2719,7 @@ export async function handleToolResult(
     answeredQuestion: event.answeredQuestion,
     errorCode: event.errorCode,
     completedAt,
+    modeSession: deps.ctx.modeSessions.getTurnOwner(deps.reqId),
   });
 
   // Capture the seq synchronously (before the persist await) so it reflects the
@@ -3091,12 +3207,28 @@ export async function handleMessageComplete(
   // row as it arrived (`persistPendingToolResultRow`); this rewrites it to the
   // full batch (covering the case where a mid-arrival write failed), indexes it
   // for memory recall, and clears the batch state.
-  await finalizePendingToolResultRow(
+  const toolResultRowId = await finalizePendingToolResultRow(
     state,
     deps.ctx.conversationId,
     buildToolResultMetadata(deps),
     deps.rlog,
   );
+  if (toolResultRowId) {
+    bestEffortModeSessionTracking("tool result finalization", () => {
+      const toolResultRow = getMessageById(
+        toolResultRowId,
+        deps.ctx.conversationId,
+      );
+      if (toolResultRow) {
+        deps.ctx.modeSessions.trackPersistedRow(
+          deps.reqId,
+          toolResultRowId,
+          toolResultRow.createdAt,
+          { startsDisplayBoundary: false },
+        );
+      }
+    });
+  }
 
   // Accumulate directives + warnings from the assistant content for
   // downstream attachment processing. `cleanAssistantContent` is also
@@ -3180,6 +3312,9 @@ export async function handleMessageComplete(
     ...(event.model ? { model: event.model } : {}),
     ...(event.assistantTextVisibility
       ? { [ASSISTANT_TEXT_VISIBILITY_KEY]: event.assistantTextVisibility }
+      : {}),
+    ...(state.autoRoutedProfile
+      ? { [AUTO_ROUTED_PROFILE_METADATA_KEY]: state.autoRoutedProfile }
       : {}),
   };
   state.lastAssistantTextVisibility = event.assistantTextVisibility;
@@ -3450,7 +3585,7 @@ function handleProviderError(
   try {
     recordRequestLog(
       deps.ctx.conversationId,
-      JSON.stringify(event.rawRequest),
+      JSON.stringify(event.rawRequest ?? null),
       JSON.stringify(buildProviderErrorResponsePayload(event.error)),
       undefined,
       event.actualProvider,

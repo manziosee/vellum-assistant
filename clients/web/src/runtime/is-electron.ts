@@ -22,21 +22,30 @@ import type {
   BundleScanData,
   CompanionAnnotationPhase,
   CompanionAnnotationStroke,
+  CompanionAnnotationTool,
   CompanionCapturePick,
   CompanionCaptureSources,
   CompanionCharacter,
   CompanionGrowth,
   CompanionContext,
   CompanionIntroAction,
+  CompanionIntroAnnouncementAction,
+  CompanionIntroCallControl,
+  CompanionIntroReport,
   CompanionSurfaceState,
   ConnectivityState,
   ScreenCaptureFrame,
+  ShareTargetSnapshot,
   DeepLink,
   DictationOverlayHitRegion,
   DictationOverlayMessage,
   DictationOverlayState,
   DictationPartialEvent,
   DictationOfferAnswer,
+  UnplacedDictationOffer,
+  CompanionPopoverAnswer,
+  CompanionPopoverView,
+  CompanionPicker,
   ChordBinding,
   ChordRegistrationResult,
   DictationPartialsResult,
@@ -50,7 +59,7 @@ import type {
   HotkeyEvent,
   HotkeyEventState,
   HotkeyScope,
-  HotkeySelection,
+  HotkeySelectionResult,
   LocalAssistantStatusResult,
   LocalListDevicesResult,
   LocalPairingPollResult,
@@ -76,6 +85,7 @@ import type {
   UpdateState,
   UpdateStatus,
   VellumCommand,
+  VellumBridge,
   VoiceActivityContent,
   VoiceActivityControl,
   VoiceActivityControlAction,
@@ -93,6 +103,8 @@ export type {
   CompanionGrowth,
   CompanionContext,
   CompanionIntroAction,
+  CompanionIntroCallControl,
+  CompanionIntroReport,
   CompanionSurfaceState,
   ConnectivityState,
   DeepLink,
@@ -107,7 +119,7 @@ export type {
   HotkeyEvent,
   HotkeyEventState,
   HotkeyScope,
-  HotkeySelection,
+  HotkeySelectionResult,
   NotificationCategory,
   PowerEvent,
   PowerEventKind,
@@ -186,7 +198,7 @@ declare global {
             hold: ModifierHold,
           ): Promise<ModifierHoldRegistrationResult>;
           setChords?(binding: ChordBinding): Promise<ChordRegistrationResult>;
-          readFrontSelection?(): Promise<HotkeySelection | null>;
+          readFrontSelection?(): Promise<HotkeySelectionResult>;
           onRegistrationChange?(
             callback: (active: boolean) => void,
           ): () => void;
@@ -211,15 +223,7 @@ declare global {
           ): () => void;
         };
       };
-      permissions?: {
-        getState(): Promise<SystemPermissionsState>;
-        request(kind: SystemPermissionKind): Promise<SystemPermissionStateItem>;
-        openSettings(
-          kind: SystemPermissionKind,
-        ): Promise<SystemPermissionStateItem>;
-        quitAndReopen(): Promise<void>;
-        onState(callback: (state: SystemPermissionsState) => void): () => void;
-      };
+      permissions?: VellumBridge["permissions"];
       commands: {
         on(callback: (command: VellumCommand) => void): () => void;
       };
@@ -402,32 +406,74 @@ declare global {
       companion?: {
         getState(): Promise<CompanionSurfaceState | null>;
         onState(callback: (state: CompanionSurfaceState) => void): () => void;
+        /** Optional: shells that predate the app-side announcement have none. */
+        getIntroAnnouncement?(): Promise<boolean>;
+        answerIntroAnnouncement?(
+          action: CompanionIntroAnnouncementAction,
+        ): void;
+        onIntroAnnouncement?(callback: (open: boolean) => void): () => void;
+        /** Optional: shells that predate the staged introduction have none. */
+        getIntroStage?(): Promise<boolean>;
+        onIntroStage?(callback: (staged: boolean) => void): () => void;
+        /**
+         * Optional for the same reason: a shell that predates the run's call
+         * beats asks for no chord. Pushed to the app's own window only, since
+         * that is the window a chord reaches.
+         */
+        getIntroChord?(): Promise<CompanionIntroCallControl | null>;
+        onIntroChord?(
+          callback: (control: CompanionIntroCallControl | null) => void,
+        ): () => void;
+        /**
+         * Optional for the same reason: a shell that predates the run reports
+         * nothing about it. Pushed to the app's own window only, since it is
+         * the window that can report one.
+         */
+        onIntroReport?(
+          callback: (report: CompanionIntroReport) => void,
+        ): () => void;
+        takeIntroReports?(): Promise<CompanionIntroReport[]>;
         setInteractive?(interactive: boolean): void;
         moveBy?(dx: number, dy: number): void;
+        release?(): void;
         startVoice?(): void;
         toggleWatch?(pick?: CompanionCapturePick): void;
         listCaptureSources?(): Promise<CompanionCaptureSources>;
         setScreenShare?(pick?: CompanionCapturePick): void;
         setAnnotating?(annotating: boolean): void;
         toggleAnnotating?(): void;
+        clearMarks?(): void;
+        setAnnotationTool?(tool: CompanionAnnotationTool): void;
         annotateShare?(
           phase: CompanionAnnotationPhase,
           strokes: readonly CompanionAnnotationStroke[],
           ink: string,
         ): void;
         setFrameScrolling?(scrolling: boolean): void;
+        frameDrawn?(): void;
         sharedFrame?(target: WatchCaptureTarget): void;
         captureScreen?(
           target: WatchCaptureTarget,
         ): Promise<ScreenCaptureFrame | null>;
+        shareTargets?(
+          target: WatchCaptureTarget,
+        ): Promise<ShareTargetSnapshot | null>;
         captureSourceThumbnail?(
           target: WatchCaptureTarget,
         ): Promise<string | null>;
         answerWatchRetro?(open: boolean): void;
+        setUnplacedDictationOffer?(offer: UnplacedDictationOffer | null): void;
         answerDictationOffer?(
           answer: DictationOfferAnswer,
           offerId: string,
         ): void;
+        answerPopover?(answer: CompanionPopoverAnswer, popoverId: string): void;
+        setPopoverSize?(popoverId: string, width: number, height: number): void;
+        setPopoverView?(popoverId: string, view: CompanionPopoverView): void;
+        setAttachedPopoverHeight?(popoverId: string, height: number): void;
+        togglePicker?(picker: CompanionPicker): void;
+        openLink?(url: string): void;
+        takesPrompts?(): Promise<boolean>;
         activate?(): void;
         setContext?(context: CompanionContext): void;
         advanceIntro?(action: CompanionIntroAction): void;

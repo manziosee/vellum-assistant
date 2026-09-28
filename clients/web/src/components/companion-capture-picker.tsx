@@ -11,13 +11,19 @@ import {
 
 import { companionLayoutFor } from "@/components/companion-layout";
 import { useTranslation } from "@/i18n";
+import { Button } from "@vellumai/design-library/components/button";
 import { ScrollShadow } from "@vellumai/design-library/components/scroll-shadow";
 import { SegmentControl } from "@vellumai/design-library/components/segment-control";
-import { COMPANION_BASE_AVATAR_BOX } from "@vellumai/ipc-contract";
+import {
+  COMPANION_BASE_AVATAR_BOX,
+  COMPANION_BASE_CAPTURE_PICKER_WIDTH,
+  companionLowerReachFor,
+} from "@vellumai/ipc-contract";
 import type {
   CompanionCapturePick,
   CompanionCaptureSources,
   CompanionCardGrowth,
+  CompanionGrowth,
   WatchCaptureTarget,
 } from "@vellumai/ipc-contract";
 
@@ -60,9 +66,9 @@ import type {
  * Three tiles across at a size a window is still recognisable at. The canvas
  * holds it: main sizes the canvas for the call bar's own reach either side of
  * the creature, which is wider than this at every size the surface is drawn
- * at.
+ * at, and on a side dock for this card beside the column.
  */
-const CARD_WIDTH = 460;
+const CARD_WIDTH = COMPANION_BASE_CAPTURE_PICKER_WIDTH;
 
 /** How many tiles stand across the card. */
 const GRID_COLUMNS = 3;
@@ -126,6 +132,12 @@ export interface CompanionCapturePickerProps {
    */
   captureThumbnail?: (target: WatchCaptureTarget) => Promise<string | null>;
   cardGrowth?: CompanionCardGrowth;
+  /**
+   * The side of the call bar the card opens on while the bar stands up as a
+   * column on a side dock: away from the edge it is docked to. Absent on a
+   * row, where the card opens over or under the bar by `cardGrowth`.
+   */
+  side?: CompanionGrowth;
   avatarBox?: number;
   optionsBox?: number;
   /**
@@ -141,20 +153,27 @@ export interface CompanionCapturePickerProps {
    */
   label?: string;
   onPick?: (pick: CompanionCapturePick) => void;
+  /**
+   * The press on the card's ask for Screen Recording, drawn in place of the
+   * tiles when the host says the grant is missing.
+   */
+  onAllowScreenRecording?: () => void;
 }
 
 export function CompanionCapturePicker({
   sources,
   captureThumbnail,
   cardGrowth = "up",
+  side,
   avatarBox = COMPANION_BASE_AVATAR_BOX,
   optionsBox = COMPANION_BASE_AVATAR_BOX,
   cardRef,
   label,
   onPick,
+  onAllowScreenRecording,
 }: CompanionCapturePickerProps) {
   const { t } = useTranslation();
-  const { inUnits, lineAt, introStepOff } = companionLayoutFor(
+  const { inUnits, lineAt, edgeAt, introStepOff, gap } = companionLayoutFor(
     avatarBox,
     optionsBox,
   );
@@ -167,21 +186,40 @@ export function CompanionCapturePicker({
   // introduction hangs its card off the creature's edge because the pill is
   // beside the creature then; here the bar closes around it, and a card hung
   // off one edge of a centred bar would sit lopsided over it. Teach is only
-  // on the call row, so this card is only ever over the bar.
-  const anchor: CSSProperties = {
-    left: "50%",
-    top: lineAt(cardGrowth, 0),
-    transform:
-      cardGrowth === "up"
-        ? `translate(-50%, calc(-100% - ${stepOff}px))`
-        : `translate(-50%, ${stepOff}px)`,
-  };
+  // on the call row, so on a row this card is only ever over the bar.
+  //
+  // On a side dock the bar is a column against the display's edge, and a card
+  // centred over it would hang half off the screen. So it stands beside the
+  // column instead, clear of its cross reach and the gap, centred on the
+  // column's middle, which is the canvas's.
+  const anchor: CSSProperties =
+    side !== undefined
+      ? {
+          ...edgeAt(side, companionLowerReachFor(avatarBox, optionsBox) + gap),
+          top: "50%",
+          transform: "translateY(-50%)",
+        }
+      : {
+          left: "50%",
+          top: lineAt(cardGrowth, 0),
+          transform:
+            cardGrowth === "up"
+              ? `translate(-50%, calc(-100% - ${stepOff}px))`
+              : `translate(-50%, ${stepOff}px)`,
+        };
+
+  // What the host listed, while there is anything that could be drawn from
+  // it. Without Screen Recording no tile could show or share what it names,
+  // so the card asks for the grant in their place.
+  const needsGrant =
+    sources !== null && sources.screenRecordingGranted === false;
+  const listed = needsGrant ? null : sources;
 
   const kinds =
-    sources === null
+    listed === null
       ? []
-      : KIND_ORDER.filter((kind) => countOf(sources, kind) > 0);
-  const empty = sources !== null && kinds.length === 0;
+      : KIND_ORDER.filter((kind) => countOf(listed, kind) > 0);
+  const empty = listed !== null && kinds.length === 0;
 
   // The user's answer, and null until they give one. Derived rather than
   // seeded, because the card is drawn before the host has answered: a state
@@ -190,18 +228,18 @@ export function CompanionCapturePicker({
   // way, which is what a list arriving without it means.
   const [chosen, setChosen] = useState<CaptureKind | null>(null);
   const kind =
-    sources === null
+    listed === null
       ? "screens"
       : chosen !== null && kinds.includes(chosen)
         ? chosen
-        : openingKind(sources);
+        : openingKind(listed);
 
   const targets = useMemo((): { key: string; target: WatchCaptureTarget }[] => {
-    if (sources === null) {
+    if (listed === null) {
       return [];
     }
     if (kind === "screens") {
-      return sources.displays.map((display) => {
+      return listed.displays.map((display) => {
         const target: WatchCaptureTarget = {
           kind: "display",
           displayId: display.displayId,
@@ -210,7 +248,7 @@ export function CompanionCapturePicker({
       });
     }
     if (kind === "windows") {
-      return sources.windows.map((window) => {
+      return listed.windows.map((window) => {
         const target: WatchCaptureTarget = {
           kind: "window",
           windowId: window.windowId,
@@ -220,7 +258,7 @@ export function CompanionCapturePicker({
     }
     // A tab is not a window yet, so there is nothing to take a picture of.
     return [];
-  }, [kind, sources]);
+  }, [kind, listed]);
 
   /**
    * What the host has answered, per tile. A key with no entry has not been
@@ -380,9 +418,27 @@ export function CompanionCapturePicker({
       >
         <div className="flex flex-col" data-slot="capture-sources">
           {sources === null && <SkeletonGrid />}
-          {sources !== null && kind === "screens" && (
+          {needsGrant && (
+            <div
+              className="flex items-center justify-between gap-3 px-2 py-2"
+              data-slot="capture-needs-grant"
+            >
+              <span className="text-[12px] text-white/70">
+                {t("companionSurface.captureScreenRecordingOff")}
+              </span>
+              <Button
+                variant="primary"
+                size="compact"
+                className="shrink-0"
+                onClick={onAllowScreenRecording}
+              >
+                {t("companionSurface.captureTurnOnScreenRecording")}
+              </Button>
+            </div>
+          )}
+          {listed !== null && kind === "screens" && (
             <Grid>
-              {sources.displays.map((display) => {
+              {listed.displays.map((display) => {
                 const name = t("companionSurface.captureScreen", {
                   n: display.index + 1,
                 });
@@ -410,9 +466,9 @@ export function CompanionCapturePicker({
               })}
             </Grid>
           )}
-          {sources !== null && kind === "windows" && (
+          {listed !== null && kind === "windows" && (
             <Grid>
-              {sources.windows.map((window) => {
+              {listed.windows.map((window) => {
                 const key = keyOf({
                   kind: "window",
                   windowId: window.windowId,
@@ -442,9 +498,9 @@ export function CompanionCapturePicker({
               })}
             </Grid>
           )}
-          {sources !== null && kind === "tabs" && (
+          {listed !== null && kind === "tabs" && (
             <div className="flex flex-col">
-              {sources.tabs.map((tab) => (
+              {listed.tabs.map((tab) => (
                 <Row
                   key={`tab-${tab.chromeWindowId}-${tab.tabIndex}`}
                   icon={<SourceIcon icon={tab.icon} />}

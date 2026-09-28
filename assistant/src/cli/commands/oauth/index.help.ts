@@ -259,6 +259,11 @@ Examples:
                 "Dot-notation path to a boolean field that must be truthy for the response to be valid",
             },
             {
+              flags: "--response-ok-field <field>",
+              description:
+                "Dot-notation path to the boolean every response body carries to report success (Slack: ok); an explicit false under a 2xx fails the request",
+            },
+            {
               flags: "--setup-notes <json>",
               description:
                 "JSON array of setup instruction notes shown during guided setup",
@@ -429,6 +434,11 @@ Examples:
             {
               flags: "--identity-ok-field <field>",
               description: "Dot-notation path to a boolean ok field",
+            },
+            {
+              flags: "--response-ok-field <field>",
+              description:
+                "Dot-notation path to the boolean every response body carries to report success",
             },
             {
               flags: "--setup-notes <json>",
@@ -794,7 +804,8 @@ Examples:
   $ assistant oauth request --provider google https://www.googleapis.com/calendar/v3/calendars/primary/events
   $ assistant oauth request --provider slack -H "Content-Type: application/json" -d '{"channel":"C123"}' /api/chat.postMessage --json
   $ assistant oauth request --provider google -X POST -H "Content-Type: multipart/related; boundary=b" -d @upload.txt "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart"
-  $ assistant oauth request --provider google -X POST -H "Content-Type: application/pdf" -d @report.pdf "https://www.googleapis.com/upload/drive/v3/files?uploadType=media"`,
+  $ assistant oauth request --provider google -X POST -H "Content-Type: application/pdf" -d @report.pdf "https://www.googleapis.com/upload/drive/v3/files?uploadType=media"
+  $ assistant oauth request --provider google -X POST -H "Content-Type: message/rfc822" -d @draft.eml "https://www.googleapis.com/upload/gmail/v1/users/me/drafts?uploadType=media"`,
     },
     {
       name: "disconnect",
@@ -919,9 +930,14 @@ Requests with unsupported headers, including If-Match and Idempotency-Key,
 are rejected before calling the provider. A connection using your own OAuth
 app can preserve those headers.
 
+The printed base URL is a path prefix. Concatenating a provider path onto it
+works, and so does a host-absolute path such as /upload/gmail/... or
+/v1/charges: the gateway remaps that request onto the grant's prefix.
+
 Examples:
   $ assistant oauth proxy-url stripe_link
-  $ eval "$(assistant oauth proxy-url stripe_link --export)" && LINK_API_BASE_URL="$VELLUM_OAUTH_PROXY_BASE_URL" LINK_ACCESS_TOKEN="$VELLUM_OAUTH_PROXY_TOKEN" LINK_NO_REFRESH=1 link-cli payment-methods list --format json`,
+  $ eval "$(assistant oauth proxy-url stripe_link --export)" && LINK_API_BASE_URL="$VELLUM_OAUTH_PROXY_BASE_URL" LINK_ACCESS_TOKEN="$VELLUM_OAUTH_PROXY_TOKEN" LINK_NO_REFRESH=1 link-cli payment-methods list --format json
+  $ eval "$(assistant oauth proxy-url google --export)" && curl -X POST -H "Authorization: Bearer $VELLUM_OAUTH_PROXY_TOKEN" -H "Content-Type: message/rfc822" --data-binary @draft.eml "$VELLUM_OAUTH_PROXY_BASE_URL/upload/gmail/v1/users/me/drafts?uploadType=media"`,
     },
   ],
 };

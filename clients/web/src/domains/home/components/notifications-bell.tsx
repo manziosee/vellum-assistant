@@ -14,6 +14,7 @@ import { useResolvedAssistantsStore } from "@/stores/resolved-assistants-store";
 import { mergeConversationLists } from "@/utils/conversation-cache";
 import { navigateToConversation } from "@/utils/conversation-navigation";
 import type { FeedItem, FeedItemStatus } from "@vellumai/assistant-api";
+import type { GuardianDecisionActionId } from "@vellumai/service-contracts/guardian-requests";
 import {
   BottomSheet,
   Button,
@@ -23,14 +24,16 @@ import {
 } from "@vellumai/design-library";
 import { toast } from "@vellumai/design-library/components/toast";
 
-import type { HomeRecapRowDecision } from "../home-recap-row";
 import { useFeedItemConversationLink } from "../hooks/use-feed-item-conversation-link";
 import { useFeedItemEntityLinks } from "../hooks/use-feed-item-entity-links";
+import { useFeedItemReceiptTitle } from "../hooks/use-feed-item-receipt-title";
+import { useFeedItemUpdateLinks } from "../hooks/use-feed-item-update-links";
 import { useGuardianDecision } from "../hooks/use-guardian-decision";
 import { useHomeFeedQuery } from "../hooks/use-home-feed-query";
 import { useShouldOfferBriefingRecipe } from "../hooks/use-should-offer-briefing-recipe";
 import {
   clearAllArgs,
+  getFeedItemUpdates,
   getVisibleFeedItems,
   markAllReadArgs,
   resolveFeedItemTitle,
@@ -41,15 +44,14 @@ import { NotificationsBellEmptyState } from "./notifications-bell-empty-state";
 import { NotificationsBellList } from "./notifications-bell-list";
 import { NotificationsBellPanel } from "./notifications-bell-panel";
 
-// The height budget the panel's content region is drawn against: the list's
-// 16px top padding, then six rows and the five 12px gaps between them. A row
-// that carries a thread name is 54px tall: a 24px title line (sized by the h-6
-// hover actions that share it with the timestamp), a 4px gap, a 13px thread
-// line, 12px of bottom padding, and its 1px rule. 16 + 6 * 54 + 5 * 12 = 400.
-// The list takes it as a cap, so a short feed draws a short panel and older
-// notifications stay reachable by scrolling. The detail takes it as a fixed
-// height, so every notification renders in the same frame.
+// The detail's content budget stays fixed so every notification renders in the
+// same frame. Its footer sits outside this region.
 export const PANEL_CONTENT_HEIGHT = "400px";
+
+// The list has no footer, so it can use the 65px that the old bulk-action strip
+// occupied without making the panel taller. A short feed still draws a short
+// panel, while a long one seats another row before it scrolls.
+export const PANEL_LIST_CONTENT_HEIGHT = "465px";
 
 // Ceiling on that budget, so a viewport too short to seat it shrinks the
 // content region instead of running the popover off the bottom edge. The
@@ -65,12 +67,16 @@ export const PANEL_CONTENT_HEIGHT = "400px";
 // clearance at the bottom edge. 48 + 8 + 57 + 65 + 8 = 186, rounded up to
 // 192. The clamp therefore only engages below a 592px viewport, leaving every
 // ordinary desktop window on the budget exactly.
-const PANEL_VIEWPORT_MAX_HEIGHT = "calc(100dvh - 192px)";
+const PANEL_DETAIL_VIEWPORT_MAX_HEIGHT = "calc(100dvh - 192px)";
+
+// The list has no footer beneath it: 48px top bar + 8px popover offset + 57px
+// header + 8px bottom clearance = 121px, rounded up to the spacing grid.
+const PANEL_LIST_VIEWPORT_MAX_HEIGHT = "calc(100dvh - 128px)";
 
 // The list caps rather than fixes, so its one `max-height` has to carry both
 // terms; the detail splits them across `height` and `max-height`, which is the
 // same minimum.
-const PANEL_LIST_MAX_HEIGHT = `min(${PANEL_CONTENT_HEIGHT}, ${PANEL_VIEWPORT_MAX_HEIGHT})`;
+const PANEL_LIST_MAX_HEIGHT = `min(${PANEL_LIST_CONTENT_HEIGHT}, ${PANEL_LIST_VIEWPORT_MAX_HEIGHT})`;
 
 // The same budget on a bottom sheet, where the content region is measured
 // against the viewport rather than the popover. No viewport ceiling of its
@@ -78,6 +84,7 @@ const PANEL_LIST_MAX_HEIGHT = `min(${PANEL_CONTENT_HEIGHT}, ${PANEL_VIEWPORT_MAX
 // frame scrolls inside the sheet rather than escaping the viewport. The
 // popover has no such scrolling ancestor, which is why only it needs one.
 const MOBILE_PANEL_CONTENT_HEIGHT = "60dvh";
+const MOBILE_PANEL_LIST_MAX_HEIGHT = "calc(60dvh + 65px)";
 
 /**
  * Notification bell for the top nav: a ghost icon button with an unread dot
@@ -95,6 +102,7 @@ const MOBILE_PANEL_CONTENT_HEIGHT = "60dvh";
 export function NotificationsBell() {
   const [isOpen, setIsOpen] = useState(false);
   const [selectedItemId, setSelectedItemId] = useState<string | null>(null);
+  const [unreadOnly, setUnreadOnly] = useState(true);
   const isTouchMobile = useTouchMobile();
   const { t } = useTranslation("home");
   const navigate = useNavigate();
@@ -110,7 +118,24 @@ export function NotificationsBell() {
     () => sortFeedItems(getVisibleFeedItems(items ?? [])),
     [items],
   );
+  const displayedItems = useMemo(
+    () =>
+      unreadOnly
+        ? visibleItems.filter((item) => item.status === "new")
+        : visibleItems,
+    [unreadOnly, visibleItems],
+  );
   const hasUnread = visibleItems.some((item) => item.status === "new");
+  const markAllReadPayload = useMemo(
+    () => markAllReadArgs(visibleItems),
+    [visibleItems],
+  );
+  const clearAllPayload = useMemo(
+    () => clearAllArgs(visibleItems),
+    [visibleItems],
+  );
+  const canMarkAllRead = markAllReadPayload.ids.length > 0;
+  const hasBulkActions = canMarkAllRead || clearAllPayload.ids.length > 0;
 
   // Tracked by id, not by value: the feed is the one owner of an item's
   // status, so the detail follows a mark-read without a second copy to
@@ -198,7 +223,7 @@ export function NotificationsBell() {
   // One decision serves every row, so all of their buttons go inert together
   // while one is in flight.
   const decision = useGuardianDecision();
-  const handleDecide = (item: FeedItem, action: HomeRecapRowDecision) => {
+  const handleDecide = (item: FeedItem, action: GuardianDecisionActionId) => {
     const requestId = item.guardianRequest?.requestId;
     if (requestId) {
       decision.decide(requestId, action);
@@ -212,6 +237,19 @@ export function NotificationsBell() {
   // conversation lists: the list view has no use for those ids.
   const { links: entityLinks, isPending: areEntityLinksPending } =
     useFeedItemEntityLinks(selectedItem, assistantId, isDetailOpen);
+
+  // A skill-update receipt names several skills and source conversations at
+  // once, each checked the same way as the single links above. Same gate.
+  const selectedUpdates = useMemo(
+    () => getFeedItemUpdates(selectedItem),
+    [selectedItem],
+  );
+  const updateLinks = useFeedItemUpdateLinks(
+    selectedUpdates,
+    assistantId,
+    isDetailOpen,
+  );
+  const selectedReceiptTitle = useFeedItemReceiptTitle(selectedItem);
 
   // The list unmounts while the detail is open, so its scroll offset is parked
   // here and written back when the list mounts again.
@@ -244,6 +282,7 @@ export function NotificationsBell() {
       // A fresh close cycle: neither flag carries over from the last one.
       closedByPointerRef.current = false;
       isPointerInteractionRef.current = false;
+      setUnreadOnly(true);
     } else {
       // Reopening always lands on the list, at the top.
       setSelectedItemId(null);
@@ -314,11 +353,15 @@ export function NotificationsBell() {
   };
 
   const handleMarkAllRead = () => {
-    feedQuery.markAll.mutate(markAllReadArgs(visibleItems));
+    if (markAllReadPayload.ids.length > 0) {
+      feedQuery.markAll.mutate(markAllReadPayload);
+    }
   };
 
   const handleClearAll = () => {
-    feedQuery.markAll.mutate(clearAllArgs(visibleItems));
+    if (clearAllPayload.ids.length > 0) {
+      feedQuery.markAll.mutate(clearAllPayload);
+    }
   };
 
   // No `tooltip` prop on the Button: it would wrap the button in a Tooltip
@@ -332,17 +375,17 @@ export function NotificationsBell() {
         <span className="relative flex" aria-hidden>
           <Bell />
           {hasUnread ? (
-            // Same green dot as the unread rows inside (HomeRecapRow), but
-            // top-right (the BellDot arrangement) and ringed in the color of
+            // The trigger's alert signal stays red regardless of the active
+            // assistant accent. It is top-right and ringed in the color of
             // the surface behind it so the ring reads as a gap carved out of
             // the bell outline: --surface-base under the desktop top bar,
             // --surface-lift inside the circular tap target that ghost
             // icon-only buttons grow on touch-mobile. The 2px ring eats into
             // the box (border-box), so size/offset grow by 2px each to keep
-            // the 6px green core in place.
+            // the 6px red core in place.
             <span
               data-testid="notifications-bell-unread-dot"
-              className="absolute -right-1 -top-1 h-2.5 w-2.5 rounded-full border-2 border-[var(--surface-base)] bg-[var(--system-positive-strong)] touch-mobile:border-[var(--surface-lift)]"
+              className="absolute -right-1 -top-1 h-2.5 w-2.5 rounded-full border-2 border-[var(--surface-base)] bg-[var(--notification-attention)] touch-mobile:border-[var(--surface-lift)]"
             />
           ) : null}
         </span>
@@ -360,19 +403,26 @@ export function NotificationsBell() {
     : PANEL_CONTENT_HEIGHT;
   const contentMaxHeight = isTouchMobile
     ? undefined
-    : PANEL_VIEWPORT_MAX_HEIGHT;
+    : PANEL_DETAIL_VIEWPORT_MAX_HEIGHT;
   const listMaxHeight = isTouchMobile
-    ? MOBILE_PANEL_CONTENT_HEIGHT
+    ? MOBILE_PANEL_LIST_MAX_HEIGHT
     : PANEL_LIST_MAX_HEIGHT;
 
   const list =
-    visibleItems.length === 0 ? (
-      feedQuery.isError ? (
+    displayedItems.length === 0 ? (
+      feedQuery.isError && visibleItems.length === 0 ? (
         <Typography
           variant="body-medium-lighter"
           className="px-[var(--app-spacing-lg)] py-[var(--app-spacing-xl)] text-center text-[var(--content-tertiary)]"
         >
           {t("notificationsBell.loadFailed")}
+        </Typography>
+      ) : visibleItems.length > 0 ? (
+        <Typography
+          variant="body-medium-lighter"
+          className="px-[var(--app-spacing-lg)] py-[var(--app-spacing-xl)] text-center text-[var(--content-tertiary)]"
+        >
+          {t("notificationsBell.noUnread")}
         </Typography>
       ) : (
         <div className="px-[var(--app-spacing-lg)] pt-[var(--app-spacing-lg)]">
@@ -384,7 +434,7 @@ export function NotificationsBell() {
       )
     ) : (
       <NotificationsBellList
-        items={visibleItems}
+        items={displayedItems}
         maxHeight={listMaxHeight}
         conversationTitles={conversationTitles}
         scrollRef={restoreListScroll}
@@ -424,6 +474,7 @@ export function NotificationsBell() {
           areConversationListsPending={conversationLink.isPending}
           entityLinks={entityLinks}
           areEntityLinksPending={areEntityLinksPending}
+          updateLinks={updateLinks}
           isActionPending={feedQuery.triggerAction.isPending}
           onBack={() => setSelectedItemId(null)}
           onGoToConversation={handleGoToConversation}
@@ -434,9 +485,11 @@ export function NotificationsBell() {
         />
       ) : (
         <NotificationsBellPanel
-          count={visibleItems.length}
-          hasUnread={hasUnread}
-          showsBulkActions={supportsBulkStatus && visibleItems.length > 0}
+          count={displayedItems.length}
+          canMarkAllRead={canMarkAllRead}
+          unreadOnly={unreadOnly}
+          onUnreadOnlyChange={setUnreadOnly}
+          showsBulkActions={supportsBulkStatus && hasBulkActions}
           isBulkPending={feedQuery.markAll.isPending}
           onMarkAllRead={handleMarkAllRead}
           onClearAll={handleClearAll}
@@ -455,7 +508,7 @@ export function NotificationsBell() {
           <BottomSheet.Header className="sr-only">
             <BottomSheet.Title>
               {selectedItem
-                ? resolveFeedItemTitle(selectedItem)
+                ? (selectedReceiptTitle ?? resolveFeedItemTitle(selectedItem))
                 : t("notificationsBell.heading")}
             </BottomSheet.Title>
           </BottomSheet.Header>

@@ -114,6 +114,7 @@ export type ProviderErrorReason =
   | "model_not_found"
   | "insufficient_credits"
   | "daily_limit_reached"
+  | "free_tier_daily_limit_reached"
   | "rate_limited"
   | "overloaded"
   | "context_overflow"
@@ -151,11 +152,19 @@ export class ProviderError extends AssistantError {
   public readonly apiErrorParam?: string;
   public readonly requestId?: string;
   /**
-   * Verbatim upstream non-2xx body (possibly truncated). Persisted so the
-   * inspector's Raw tab can show the actual provider error payload, not just
-   * the extracted fields.
+   * Verbatim upstream non-2xx response body (possibly truncated). This is
+   * what the provider returned after rejecting the call, not the request
+   * we sent. The inspector's Raw tab uses it when a 4xx/5xx body carries
+   * detail the extracted `apiError*` fields drop.
    */
   public readonly rawBody?: string;
+  /**
+   * Inspectable SDK/wire request payload for the call that failed. This is
+   * the outbound request, not the error response (`rawBody`). Provider
+   * `sendMessage` throws attach it so inspector rows show the same request
+   * shape as a successful `usage` row.
+   */
+  public readonly rawRequest?: unknown;
   /**
    * Tagged daemon-owned abort reason carried over from the AbortSignal that
    * triggered this error. Untyped here to avoid a daemon→util import cycle;
@@ -181,6 +190,7 @@ export class ProviderError extends AssistantError {
       apiErrorParam?: string;
       requestId?: string;
       rawBody?: string;
+      rawRequest?: unknown;
       reason?: ProviderErrorReason;
     },
   ) {
@@ -192,6 +202,7 @@ export class ProviderError extends AssistantError {
     this.apiErrorParam = options?.apiErrorParam;
     this.requestId = options?.requestId;
     this.rawBody = options?.rawBody;
+    this.rawRequest = options?.rawRequest;
     this.abortReason = options?.abortReason;
     this.reason = options?.reason;
   }

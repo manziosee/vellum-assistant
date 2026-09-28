@@ -33,10 +33,17 @@
       "unreachable": "Unreachable"
     }
   },
+  "homeUpdatesList": {
+    "titleOne": "Skill updated: {name}",
+    "titleMany": "{count, plural, one {# skill} other {# skills}} updated"
+  },
   "notificationsBell": {
     "ariaLabel": "Notifications",
     "ariaLabelUnread": "Notifications (unread)",
     "heading": "Notifications",
+    "unread": "Unread",
+    "actionsTitle": "Notification actions",
+    "noUnread": "No unread notifications.",
     "loadFailed": "Couldn't load notifications.",
     "actionFailed": "Couldn't start that conversation. Try again.",
     "decisionNotPermitted": "You don't have permission to decide this request.",

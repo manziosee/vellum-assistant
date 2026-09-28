@@ -238,6 +238,104 @@ function assistantDeltaTexts(frames: LiveVoiceServerFrame[]): string[] {
 }
 
 describe("LiveVoiceSession assistant turn", () => {
+  test.each([true, false])(
+    "passes current screen sharing state %p to the desktop voice bridge",
+    async (screenSharing) => {
+      const startVoiceTurn = mock(async (_options: VoiceTurnOptions) => ({
+        turnId: "bridge-turn-1",
+        abort: mock(),
+      }));
+      const { session, transcriber } = createSessionHarness({
+        startFrame: { ...START_FRAME, client: "macos" },
+        startVoiceTurn,
+      });
+      await session.start();
+      await session.handleClientFrame({
+        type: "update_config",
+        screenSharing: true,
+      });
+      await session.handleClientFrame({ type: "update_config", screenSharing });
+      transcriber.emit({ type: "final", text: "Show me the speed control" });
+      await session.handleClientFrame({ type: "ptt_release" });
+      expect(startVoiceTurn.mock.calls[0]?.[0]).toMatchObject({
+        macosDesktopSession: true,
+        screenSharing,
+      });
+      await session.close("client_end");
+    },
+  );
+
+  test("offers the newest snapshot of the shared surface's controls to the bridge, until the share ends", async () => {
+    const startVoiceTurn = mock(async (_options: VoiceTurnOptions) => ({
+      turnId: "bridge-turn-1",
+      abort: mock(),
+    }));
+    const { session, transcriber } = createSessionHarness({
+      startFrame: { ...START_FRAME, client: "macos" },
+      startVoiceTurn,
+    });
+    const snapshotNaming = (label: string) => ({
+      targets: [
+        {
+          id: `t-${label}`,
+          label,
+          role: "AXButton",
+          x: 0.8,
+          y: 0.05,
+          width: 0.05,
+          height: 0.03,
+        },
+      ],
+      total: 1,
+    });
+    await session.start();
+    await session.handleClientFrame({
+      type: "update_config",
+      screenSharing: true,
+    });
+    await session.handleClientFrame({
+      type: "update_config",
+      shareTargets: snapshotNaming("Filters"),
+    });
+    await session.handleClientFrame({
+      type: "update_config",
+      shareTargets: snapshotNaming("root_Filters"),
+    });
+    transcriber.emit({ type: "final", text: "Where is Filters?" });
+    await session.handleClientFrame({ type: "ptt_release" });
+    expect(startVoiceTurn.mock.calls[0]?.[0].shareTargets).toEqual(
+      snapshotNaming("root_Filters"),
+    );
+    await session.close("client_end");
+
+    // A share that ended takes its snapshot with it.
+    const ended = createSessionHarness({
+      startFrame: { ...START_FRAME, client: "macos" },
+      startVoiceTurn,
+    });
+    startVoiceTurn.mockClear();
+    await ended.session.start();
+    await ended.session.handleClientFrame({
+      type: "update_config",
+      screenSharing: true,
+      shareTargets: snapshotNaming("root_Filters"),
+    });
+    await ended.session.handleClientFrame({
+      type: "update_config",
+      screenSharing: false,
+    });
+    await ended.session.handleClientFrame({
+      type: "update_config",
+      screenSharing: true,
+    });
+    ended.transcriber.emit({ type: "final", text: "Where is Filters?" });
+    await ended.session.handleClientFrame({ type: "ptt_release" });
+    expect(startVoiceTurn.mock.calls[0]?.[0]).not.toHaveProperty(
+      "shareTargets",
+    );
+    await ended.session.close("client_end");
+  });
+
   test("runs final transcripts through the voice bridge and forwards ordered assistant events", async () => {
     const startVoiceTurn = mock(async (options: VoiceTurnOptions) => {
       options.callbacks?.assistant_text_delta?.({
@@ -978,5 +1076,148 @@ describe("LiveVoiceSession room reveal", () => {
     expect(joined).not.toContain("ASK_GUARDIAN_APPROVAL");
     expect(joined).toContain("Anything else?");
     expect(ttsTexts.join(" ")).not.toContain("ASK_GUARDIAN_APPROVAL");
+  });
+});
+
+describe("LiveVoiceSession spoken session controls", () => {
+  function createControlsHarness(
+    sessionControls?: LiveVoiceClientStartFrame["sessionControls"],
+  ) {
+    const { startVoiceTurn, getCallbacks } = createCapturingTurnStarter();
+    const { streamTtsAudio, ttsTexts } = createRecordingTtsStreamer();
+    const harness = createSessionHarness({
+      startVoiceTurn,
+      streamTtsAudio,
+      startFrame: {
+        ...START_FRAME,
+        ...(sessionControls ? { sessionControls } : {}),
+      },
+    });
+    return { ...harness, getCallbacks, ttsTexts };
+  }
+
+  test("a reply ending with [END_CALL] sends an end control after tts_done", async () => {
+    const { frames, session, getCallbacks, ttsTexts } = createControlsHarness([
+      "end",
+      "mute",
+    ]);
+
+    await startReleasedTurn(session, getCallbacks);
+    emitTextDelta(getCallbacks, "Okay, talk soon. [END_CALL]");
+    emitMessageComplete(getCallbacks);
+    await waitFor(() =>
+      frames.some((frame) => frame.type === "session_control"),
+    );
+
+    const ttsDoneIndex = frames.findIndex((frame) => frame.type === "tts_done");
+    const controlIndex = frames.findIndex(
+      (frame) => frame.type === "session_control",
+    );
+    // The goodbye is heard before the call ends.
+    expect(controlIndex).toBeGreaterThan(ttsDoneIndex);
+    expect(frames[controlIndex]).toMatchObject({
+      type: "session_control",
+      turnId: "live-turn-1",
+      action: "end",
+    });
+    expect(assistantDeltaTexts(frames).join("").trim()).toBe(
+      "Okay, talk soon.",
+    );
+    expect(ttsTexts.join(" ")).not.toContain("[END_CALL]");
+  });
+
+  test("a timed mute carries its duration", async () => {
+    const { frames, session, getCallbacks } = createControlsHarness(["mute"]);
+
+    await startReleasedTurn(session, getCallbacks);
+    emitTextDelta(getCallbacks, "Muting you for thirty seconds. [MUTE:30]");
+    emitMessageComplete(getCallbacks);
+    await waitFor(() =>
+      frames.some((frame) => frame.type === "session_control"),
+    );
+
+    expect(
+      frames.find((frame) => frame.type === "session_control"),
+    ).toMatchObject({ action: "mute", durationMs: 30_000 });
+  });
+
+  test("a declared look sends its look control after the acknowledgement", async () => {
+    const { frames, session, getCallbacks } = createControlsHarness([
+      "look_screen",
+    ]);
+
+    await startReleasedTurn(session, getCallbacks);
+    emitTextDelta(
+      getCallbacks,
+      "Taking a look. What should I focus on? [LOOK:SCREEN]",
+    );
+    emitMessageComplete(getCallbacks);
+    await waitFor(() =>
+      frames.some((frame) => frame.type === "session_control"),
+    );
+
+    expect(
+      frames.find((frame) => frame.type === "session_control"),
+    ).toMatchObject({ action: "look_screen" });
+    // The marker is control, never caption text.
+    expect(assistantDeltaTexts(frames).join("").includes("[LOOK")).toBe(false);
+  });
+
+  test("a control the client did not declare is never sent", async () => {
+    const { frames, session, getCallbacks } = createControlsHarness(["mute"]);
+
+    await startReleasedTurn(session, getCallbacks);
+    emitTextDelta(getCallbacks, "Bye. [END_CALL]");
+    emitMessageComplete(getCallbacks);
+    await waitFor(() => frames.some((frame) => frame.type === "tts_done"));
+    await flushAsyncCallbacks();
+
+    expect(frames.some((frame) => frame.type === "session_control")).toBe(
+      false,
+    );
+  });
+
+  test("a marker mid-reply controls nothing", async () => {
+    const { frames, session, getCallbacks } = createControlsHarness(["end"]);
+
+    await startReleasedTurn(session, getCallbacks);
+    emitTextDelta(getCallbacks, "Say [END_CALL] and I would hang up, but no.");
+    emitMessageComplete(getCallbacks);
+    await waitFor(() => frames.some((frame) => frame.type === "tts_done"));
+    await flushAsyncCallbacks();
+
+    expect(frames.some((frame) => frame.type === "session_control")).toBe(
+      false,
+    );
+  });
+
+  // Talking over "okay, bye" means they are not leaving.
+  test("an interrupted goodbye does not end the call", async () => {
+    const { frames, session, getCallbacks } = createControlsHarness(["end"]);
+
+    await startReleasedTurn(session, getCallbacks);
+    emitTextDelta(getCallbacks, "Okay, talk soon. [END_CALL]");
+    await flushAsyncCallbacks();
+    await session.handleClientFrame({ type: "interrupt" });
+    emitMessageComplete(getCallbacks);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(frames.some((frame) => frame.type === "session_control")).toBe(
+      false,
+    );
+  });
+
+  test("the prompt teaches only the declared controls", async () => {
+    const { session, getCallbacks, startVoiceTurn } = createControlsHarness([
+      "mute",
+    ]);
+
+    await startReleasedTurn(session, getCallbacks);
+    const prompt =
+      (startVoiceTurn as ReturnType<typeof mock>).mock.calls[0]?.[0]
+        ?.voiceControlPrompt ?? "";
+
+    expect(prompt).toContain("[MUTE]");
+    expect(prompt).not.toContain("[END_CALL]");
   });
 });

@@ -29,6 +29,8 @@ import { client as daemonClient } from "@/generated/daemon/client.gen";
 import { captureError } from "@/lib/sentry/capture-error";
 import {
   useAcpRunStore,
+  type AcpModelOption,
+  type AcpModelRevision,
   type AcpRunEntry,
   type AcpRunRawEvent,
 } from "@/domains/chat/acp-run-store";
@@ -73,6 +75,10 @@ interface AcpSessionRow {
   outputTokens?: number;
   costAmount?: number;
   costCurrency?: string;
+  model?: string;
+  availableModels?: AcpModelOption[];
+  modelRevisionEpoch?: string;
+  modelRevision?: number;
   eventLog?: AcpSessionEventLogItem[];
 }
 
@@ -152,6 +158,10 @@ function toRunEntry(row: AcpSessionRow): AcpRunEntry {
     outputTokens: row.outputTokens,
     costAmount: row.costAmount,
     costCurrency: row.costCurrency,
+    model: row.model,
+    availableModels: row.availableModels,
+    modelRevisionEpoch: row.modelRevisionEpoch,
+    modelRevision: row.modelRevision,
     events,
   };
 }
@@ -329,6 +339,30 @@ function activeRunIdsFor(conversationId: string): string[] {
   });
 }
 
+/** Model revisions known when an ACP snapshot request begins. */
+function captureModelRevisions(): Map<string, AcpModelRevision> {
+  const { byId, pendingModelUpdates } = useAcpRunStore.getState();
+  const revisions = new Map<string, AcpModelRevision>();
+  for (const [id, entry] of Object.entries(byId)) {
+    if (
+      entry.modelRevisionEpoch !== undefined ||
+      entry.modelRevision !== undefined
+    ) {
+      revisions.set(id, {
+        modelRevisionEpoch: entry.modelRevisionEpoch,
+        modelRevision: entry.modelRevision,
+      });
+    }
+  }
+  for (const [id, pending] of pendingModelUpdates) {
+    revisions.set(id, {
+      modelRevisionEpoch: pending.modelRevisionEpoch,
+      modelRevision: pending.modelRevision,
+    });
+  }
+  return revisions;
+}
+
 /**
  * Apply an authoritative snapshot: seed the reported runs and retire any run
  * that was active in the store for this conversation but is absent from the
@@ -386,6 +420,8 @@ function applyAcpSnapshot(
   snapshotConversationId: string | null = null,
   revisionAtFetch: number = useInteractionStore.getState().acpConnectRevision,
   generation?: number,
+  modelRevisionsAtFetch?: ReadonlyMap<string, AcpModelRevision>,
+  restorePrompt = true,
 ): void {
   if (entries === null) {
     return;
@@ -397,12 +433,25 @@ function applyAcpSnapshot(
     isNewestAcpSnapshot(snapshotConversationId, generation);
   const store = useAcpRunStore.getState();
   if (entries.length > 0) {
-    store.seedFromHistory(entries);
+    // Superseded responses still contribute status, usage, and event history.
+    // Their model state cannot update the baseline captured by a newer request,
+    // because that would make the newer process epoch look like a live update
+    // that arrived while its request was open.
+    const entriesToSeed = newest
+      ? entries
+      : entries.map((entry) => ({
+          ...entry,
+          model: undefined,
+          availableModels: undefined,
+          modelRevisionEpoch: undefined,
+          modelRevision: undefined,
+        }));
+    store.seedFromHistory(entriesToSeed, modelRevisionsAtFetch);
   }
   // Outside the length check: a conversation whose only marked run was cleared
   // can come back empty, and that emptiness is exactly the signal that the
   // prompt is stale.
-  if (newest) {
+  if (newest && restorePrompt) {
     raiseAcpConnectFromSnapshot(
       entries,
       snapshotConversationId,
@@ -422,6 +471,31 @@ function applyAcpSnapshot(
   }
 }
 
+/** Reconcile one conversation, optionally without restoring its inline auth prompt. */
+export async function reconcileAcpSessions(
+  assistantId: string,
+  conversationId: string,
+  isCurrent: () => boolean = () => true,
+  restorePrompt = true,
+): Promise<void> {
+  const priorActiveIds = activeRunIdsFor(conversationId);
+  const revisionAtFetch = useInteractionStore.getState().acpConnectRevision;
+  const generation = beginAcpSnapshot(conversationId);
+  const modelRevisionsAtFetch = captureModelRevisions();
+  const entries = await fetchAcpSessions(assistantId, conversationId);
+  if (isCurrent()) {
+    applyAcpSnapshot(
+      entries,
+      priorActiveIds,
+      conversationId,
+      revisionAtFetch,
+      generation,
+      modelRevisionsAtFetch,
+      restorePrompt,
+    );
+  }
+}
+
 export function useAcpRunRehydration(
   assistantId: string | null,
   conversationId: string | null,
@@ -431,25 +505,7 @@ export function useAcpRunRehydration(
       return;
     }
     let cancelled = false;
-    const priorActiveIds = activeRunIdsFor(conversationId);
-    // Captured before the request, like the reconnect paths. A default
-    // evaluated at apply time samples the prompt a live `acp_auth_required`
-    // raised while this was in flight, which is exactly the prompt the stale
-    // response must not speak for.
-    const revisionAtFetch = useInteractionStore.getState().acpConnectRevision;
-    const generation = beginAcpSnapshot(conversationId);
-    void fetchAcpSessions(assistantId, conversationId).then((entries) => {
-      if (cancelled) {
-        return;
-      }
-      applyAcpSnapshot(
-        entries,
-        priorActiveIds,
-        conversationId ?? null,
-        revisionAtFetch,
-        generation,
-      );
-    });
+    void reconcileAcpSessions(assistantId, conversationId, () => !cancelled);
     return () => {
       cancelled = true;
     };
@@ -495,18 +551,7 @@ export function useAcpRunRehydration(
     if (!assistantId || !conversationId) {
       return;
     }
-    const priorActiveIds = activeRunIdsFor(conversationId);
-    const revisionAtFetch = useInteractionStore.getState().acpConnectRevision;
-    const generation = beginAcpSnapshot(conversationId);
-    void fetchAcpSessions(assistantId, conversationId).then((entries) => {
-      applyAcpSnapshot(
-        entries,
-        priorActiveIds,
-        conversationId ?? null,
-        revisionAtFetch,
-        generation,
-      );
-    });
+    void reconcileAcpSessions(assistantId, conversationId);
   });
 
   // A Connect flow holds the prompt on its own anchor, so any auth failure
@@ -529,18 +574,7 @@ export function useAcpRunRehydration(
     if (!settled || !assistantId || !conversationId) {
       return;
     }
-    const priorActiveIds = activeRunIdsFor(conversationId);
-    const revisionAtFetch = useInteractionStore.getState().acpConnectRevision;
-    const generation = beginAcpSnapshot(conversationId);
-    void fetchAcpSessions(assistantId, conversationId).then((entries) => {
-      applyAcpSnapshot(
-        entries,
-        priorActiveIds,
-        conversationId,
-        revisionAtFetch,
-        generation,
-      );
-    });
+    void reconcileAcpSessions(assistantId, conversationId);
   }, [flowActive, assistantId, conversationId]);
 
   useBusSubscription(
@@ -556,18 +590,7 @@ export function useAcpRunRehydration(
       ) {
         return;
       }
-      const priorActiveIds = activeRunIdsFor(conversationId);
-      const revisionAtFetch = useInteractionStore.getState().acpConnectRevision;
-      const generation = beginAcpSnapshot(conversationId);
-      void fetchAcpSessions(assistantId, conversationId).then((entries) => {
-        applyAcpSnapshot(
-          entries,
-          priorActiveIds,
-          conversationId ?? null,
-          revisionAtFetch,
-          generation,
-        );
-      });
+      void reconcileAcpSessions(assistantId, conversationId);
     },
   );
 }

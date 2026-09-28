@@ -30,6 +30,7 @@ import {
   isModelNotFoundError,
   isVisionNotSupportedError,
 } from "../util/provider-error-patterns.js";
+import { safeStringSlice } from "../util/unicode.js";
 
 /**
  * Classified conversation error ready for client emission.
@@ -580,7 +581,7 @@ function classifyCore(
       const detailMatch = message.match(/API error \(\d+\):\s*(.+)/i);
       const detail = detailMatch?.[1];
       const suffix = detail
-        ? `: ${detail.length > 200 ? detail.slice(0, 200) + "…" : detail}`
+        ? `: ${detail.length > 200 ? safeStringSlice(detail, 0, 200) + "…" : detail}`
         : "";
       return {
         code: "PROVIDER_API",
@@ -612,7 +613,7 @@ function extractProviderDetail(message: string): string | undefined {
   if (!detail) {
     return undefined;
   }
-  return detail.length > 200 ? `${detail.slice(0, 200)}…` : detail;
+  return detail.length > 200 ? `${safeStringSlice(detail, 0, 200)}…` : detail;
 }
 
 /**
@@ -658,6 +659,10 @@ function reasonToClassification(
       // own — the global routing map can lag per-connection platform-auth
       // routes and must not downgrade this to the generic billing surface.
       return dailyLimitClassification();
+    case "free_tier_daily_limit_reached":
+      // Same provenance as `daily_limit_reached`: only the platform proxy's
+      // `"code":"free_tier_daily_limit_reached"` body stamps it.
+      return freeTierDailyLimitClassification();
     case "overloaded":
       return providerOverloadedClassification();
     case "server_error":
@@ -813,6 +818,21 @@ function dailyLimitClassification(): Omit<
       "You've hit your daily credit limit. Raise the limit in Billing settings to keep going today.",
     retryable: false,
     errorCategory: "daily_limit_reached",
+  };
+}
+
+function freeTierDailyLimitClassification(): Omit<
+  ClassifiedConversationError,
+  "debugDetails"
+> {
+  return {
+    code: "PROVIDER_BILLING",
+    // Unlike the user-configured daily limit there is nothing to raise: the
+    // free-tier cap lifts at the UTC reset, on upgrade, or with extra credits.
+    userMessage:
+      "You've used today's free usage. It resets at midnight UTC. Upgrade or add credits to keep going.",
+    retryable: false,
+    errorCategory: "free_tier_daily_limit_reached",
   };
 }
 

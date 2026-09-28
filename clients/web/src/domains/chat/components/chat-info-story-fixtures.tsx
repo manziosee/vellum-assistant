@@ -33,7 +33,7 @@ import {
 import { attachmentContentQueryKey } from "@/domains/chat/components/chat-attachments/use-attachment-object-url";
 import {
   attachmentRows,
-  CHAT_INFO_DRAWER_WIDTH_PX,
+  CHAT_INFO_BODY_WIDTH_PX,
   CHAT_INFO_NARROW_PHONE_PX,
   CHAT_INFO_T0,
   clearTranscriptMessages,
@@ -54,7 +54,11 @@ import {
 } from "@/domains/chat/components/chat-info.test-helper";
 import type { ConversationFileAsset } from "@/domains/chat/hooks/use-conversation-assets";
 import type { DisplayAttachment } from "@/domains/chat/types/types";
-import { documentsGetQueryKey } from "@/generated/daemon/@tanstack/react-query.gen";
+import { conversationAttachmentListArgs } from "@/domains/chat/hooks/use-conversation-attachments";
+import {
+  attachmentsGetInfiniteQueryKey,
+  documentsGetQueryKey,
+} from "@/generated/daemon/@tanstack/react-query.gen";
 import type { AppSummary } from "@/types/app-types";
 import type { ConversationAttachmentSummary } from "@/types/attachment-types";
 import type { DocumentSummary } from "@/types/document-types";
@@ -185,7 +189,7 @@ export const inChatInfoDrawerColumn: Decorator = (Story) => (
     className="bg-[var(--surface-lift)]"
     style={{ padding: DETAIL_SHELL_BODY_INSET_PX }}
   >
-    <div style={{ width: CHAT_INFO_DRAWER_WIDTH_PX }}>
+    <div style={{ width: CHAT_INFO_BODY_WIDTH_PX }}>
       <Story />
     </div>
   </div>
@@ -393,6 +397,30 @@ export function failChatInfoDocuments(
   seedQueryFailure(client, queryKey);
 }
 
+export function failChatInfoFrames(
+  client: QueryClient,
+  { assistantId, conversationId }: ChatInfoStoryConversation,
+): void {
+  const queryKey = attachmentsGetInfiniteQueryKey(
+    conversationAttachmentListArgs(assistantId, conversationId, "only"),
+  );
+  client.removeQueries({ queryKey });
+  seedQueryFailure(client, queryKey);
+}
+
+export function failChatInfoDocumentRefresh(
+  client: QueryClient,
+  { assistantId, conversationId }: ChatInfoStoryConversation,
+): void {
+  seedQueryFailure(
+    client,
+    documentsGetQueryKey({
+      path: { assistant_id: assistantId },
+      query: { conversationId },
+    }),
+  );
+}
+
 /** A worked-in trip conversation, the set most stories are shown against. */
 const DEFAULT_CONVERSATION: ChatInfoStoryConversation = {
   assistantId: CHAT_INFO_ASSISTANT_ID,
@@ -416,6 +444,7 @@ export function primeChatInfoAppPreviews(
       assistantId,
       app.id,
       chatInfoPreviewHtml(app.name, seed.lines),
+      app.updatedAt,
     );
   }
 }

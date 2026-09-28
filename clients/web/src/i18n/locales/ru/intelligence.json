@@ -88,6 +88,7 @@
     "cardHoverLine": {
       "channels": "Все места, где можно меня найти",
       "contacts": "Люди, которых я знаю и которым доверяю",
+      "email": "Всё, что приходит в мою почту",
       "library": "Приложения и документы, которые я сделал",
       "memory": "Всё, что я помню",
       "personality": "Давай, подкрути мне душу",
@@ -109,7 +110,11 @@
     },
     "setUpSchedule": "Создать расписание",
     "updateAvatarAndName": "Изменить аватар и имя",
-    "viewMoreSchedules": "{count, plural, one {Показать ещё #…} few {Показать ещё #…} many {Показать ещё #…} other {Показать ещё #…}}"
+    "viewMoreSchedules": "{count, plural, one {Показать ещё #…} few {Показать ещё #…} many {Показать ещё #…} other {Показать ещё #…}}",
+    "lockedBadge": "Нужен план Super",
+    "pinEmail": "Закрепить Почту в боковом меню",
+    "unpinEmail": "Открепить Почту от бокового меню",
+    "dismissEmail": "Закрыть"
   },
   "identitySections": {
     "channels": {
@@ -120,13 +125,13 @@
       "description": "Кого я знаю",
       "label": "Контакты"
     },
+    "email": {
+      "description": "Что я отправил и получил",
+      "label": "Почта"
+    },
     "library": {
       "description": "Мои приложения и документы",
       "label": "Библиотека"
-    },
-    "memory": {
-      "description": "Что я помню",
-      "label": "Память"
     },
     "personality": {
       "description": "Настройка того, как я говорю",
@@ -264,7 +269,9 @@
   },
   "pluginToast": {
     "alreadyUpToDate": "{name} уже в актуальной версии",
+    "cleanupWarning": "Очистка плагина завершена с предупреждением.",
     "installed": "Установлен {name}",
+    "mcpOAuthCredentialsUnchecked": "Хранилище учетных данных недоступно, поэтому не удалось проверить сохраненные учетные данные OAuth MCP плагина.",
     "pluginFallback": "плагин",
     "pluginFallbackCapitalized": "Плагин",
     "removed": "Удалён {name}",
@@ -289,18 +296,15 @@
     "backToConversationAriaLabel": "Назад к диалогу",
     "backToSkillsAriaLabel": "Назад к навыкам",
     "filesTab": "Файлы",
-    "fileViewModeAriaLabel": "Режим просмотра файла",
     "historyTab": "История",
     "install": "Установить",
     "noFilesAvailable": "Файлов нет.",
     "openInWorkspaceAriaLabel": "Открыть в рабочей области",
     "pendingAriaLabel": "Ожидание",
-    "preview": "Предпросмотр",
     "remove": "Удалить",
     "saveFailed": "Не удалось сохранить",
     "selectAFile": "Выбор файла",
-    "selectFilePrompt": "Выбор файла, чтобы посмотреть содержимое.",
-    "source": "Код"
+    "selectFilePrompt": "Выбор файла, чтобы посмотреть содержимое."
   },
   "skillDetailPage": {
     "backToConversation": "Назад к диалогу",
@@ -431,5 +435,9 @@
       "v1": "Перенеси мою память с v1 на v3. Скорее всего это два шага: твой навык \"Memory v2 Migration\", а затем \"Memory v3 Migration\". Но разберись, что на самом деле нужно моему ассистенту, и точно следуй тем навыкам, которыми пользуешься.\n\nЗапусти в фоне и скажи, когда закончишь, или если что-то помешает.",
       "enable": "Включи мою память снова. Хочу, чтобы ты опять запоминал вещи из наших диалогов."
     }
+  },
+  "assistantHandleLine": {
+    "edit": "Изменить имя @{handle}",
+    "editTitle": "Изменить имя"
   }
 }

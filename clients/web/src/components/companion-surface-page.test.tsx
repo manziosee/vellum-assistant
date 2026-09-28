@@ -10,20 +10,30 @@ import {
   beforeEach,
   describe,
   expect,
+  jest,
   mock,
   spyOn,
   test,
 } from "bun:test";
 
-import type { CompanionSurfaceState } from "@vellumai/ipc-contract";
+import {
+  COMPANION_INTRO_BEATS,
+  type CompanionSurfaceState,
+} from "@vellumai/ipc-contract";
 
 const moveByMock = mock((_dx: number, _dy: number) => undefined);
+const releaseMock = mock(() => undefined);
 const setInteractiveMock = mock((_interactive: boolean) => undefined);
 const activateMock = mock(() => undefined);
 const startVoiceMock = mock(() => undefined);
 const toggleWatchMock = mock((_pick?: unknown) => undefined);
 const setScreenShareMock = mock((_pick?: unknown) => undefined);
 const setAnnotatingMock = mock((_annotating: boolean) => undefined);
+const clearMarksMock = mock(() => undefined);
+const togglePickerMock = mock((_picker: string) => undefined);
+/** Whether the shell takes a chevron's press. */
+let hasPickers = true;
+const setAnnotationToolMock = mock((_tool: string) => undefined);
 /**
  * What the shell lists for the picker. Null is a shell with no picker to
  * offer, which is what a bridge that predates it answers.
@@ -49,6 +59,15 @@ const answerOfferMock = mock((_answer: string, _offerId: string) => undefined);
 const advanceIntroMock = mock((_action: string) => undefined);
 const contextMenuMock = mock(() => undefined);
 const sendControlMock = mock((_control: { action: string }) => undefined);
+const answerPopoverMock = mock(
+  (_answer: unknown, _popoverId: string) => undefined,
+);
+const setPopoverViewMock = mock(
+  (_popoverId: string, _view: string) => undefined,
+);
+const attachedHeightMock = mock(
+  (_popoverId: string, _height: number) => undefined,
+);
 
 const STATE: CompanionSurfaceState = {
   growth: "right",
@@ -90,11 +109,15 @@ const resetState = () => {
   delete STATE.captureTarget;
   delete STATE.screenShare;
   delete STATE.screenShareEnabled;
+  delete STATE.voicesPickable;
   STATE.watchEnabled = true;
   STATE.intro = null;
   STATE.assistantName = "Ziggy";
   delete STATE.character;
   delete STATE.dictationOffer;
+  delete STATE.popover;
+  delete STATE.popoverView;
+  delete STATE.dock;
 };
 
 /**
@@ -132,11 +155,16 @@ mock.module("@/runtime/companion-surface", () => ({
   },
   setCompanionInteractive: setInteractiveMock,
   moveCompanionBy: moveByMock,
+  releaseCompanionSurface: releaseMock,
   activateCompanionApp: activateMock,
   startCompanionVoice: startVoiceMock,
   toggleCompanionWatch: toggleWatchMock,
   setCompanionScreenShare: setScreenShareMock,
   setCompanionAnnotating: setAnnotatingMock,
+  clearCompanionMarks: clearMarksMock,
+  toggleCompanionPicker: togglePickerMock,
+  companionHasPickers: () => hasPickers,
+  setCompanionAnnotationTool: setAnnotationToolMock,
   listCompanionCaptureSources: listSourcesMock,
   // The picker's tiles ask for these; a desktop with nothing to picture is
   // the shape the page is exercised in.
@@ -145,6 +173,10 @@ mock.module("@/runtime/companion-surface", () => ({
   // missing export is a load-time failure for the whole file.
   answerCompanionWatchRetro: answerRetroMock,
   answerCompanionDictationOffer: answerOfferMock,
+  answerCompanionPopover: answerPopoverMock,
+  setCompanionPopoverView: setPopoverViewMock,
+  setCompanionAttachedPopoverHeight: attachedHeightMock,
+  openCompanionLink: () => undefined,
   setCompanionContext: () => undefined,
   advanceCompanionIntro: advanceIntroMock,
   showCompanionContextMenu: contextMenuMock,
@@ -158,20 +190,29 @@ const { CompanionSurfacePage } = await import("./companion-surface-page");
 
 afterEach(() => {
   cleanup();
+  jest.useRealTimers();
   resetState();
   moveByMock.mockClear();
+  releaseMock.mockClear();
   setInteractiveMock.mockClear();
   activateMock.mockClear();
   startVoiceMock.mockClear();
   toggleWatchMock.mockClear();
   setScreenShareMock.mockClear();
   setAnnotatingMock.mockClear();
+  clearMarksMock.mockClear();
+  togglePickerMock.mockClear();
+  hasPickers = true;
+  setAnnotationToolMock.mockClear();
   listSourcesMock.mockClear();
   captureSources = null;
   answerOfferMock.mockClear();
   advanceIntroMock.mockClear();
   contextMenuMock.mockClear();
   sendControlMock.mockClear();
+  answerPopoverMock.mockClear();
+  setPopoverViewMock.mockClear();
+  attachedHeightMock.mockClear();
 });
 
 /** The canvas the page fills, which is where the pointer handlers live. */
@@ -502,6 +543,101 @@ describe("the companion surface at two sizes", () => {
 });
 
 describe("dragging the companion surface", () => {
+  /**
+   * Main hears the hand let go after every press, moved or not: mid-call a
+   * drag's release is the drop that docks the bar to an edge, and main is
+   * the side that knows whether this press was one. A press that never
+   * moved lets go too, since a click on the creature is a press main may
+   * have been shown moves for that this window never saw as a drag.
+   */
+  test("tells main when the hand lets go", async () => {
+    const { container } = render(<CompanionSurfacePage />);
+    const { pill } = await pinSurface(container);
+    const canvas = canvasOf(container);
+
+    fireEvent.mouseMove(canvas, { clientX: 120, clientY: 120 });
+    fireEvent.pointerDown(pill, {
+      button: 0,
+      pointerId: 1,
+      screenX: 500,
+      screenY: 500,
+    });
+    fireEvent.mouseMove(canvas, {
+      clientX: 120,
+      clientY: 120,
+      screenX: 530,
+      screenY: 520,
+      buttons: 1,
+    });
+    expect(releaseMock).not.toHaveBeenCalled();
+    fireEvent.mouseUp(canvas);
+    expect(releaseMock).toHaveBeenCalledTimes(1);
+    // A release with no press behind it is nothing to tell main about.
+    fireEvent.mouseUp(canvas);
+    expect(releaseMock).toHaveBeenCalledTimes(1);
+  });
+
+  test("tells main about a release this window never saw", async () => {
+    const { container } = render(<CompanionSurfacePage />);
+    const { pill } = await pinSurface(container);
+    const canvas = canvasOf(container);
+
+    fireEvent.mouseMove(canvas, { clientX: 120, clientY: 120 });
+    fireEvent.pointerDown(pill, {
+      button: 0,
+      pointerId: 1,
+      screenX: 500,
+      screenY: 500,
+    });
+    fireEvent.mouseMove(canvas, {
+      clientX: 120,
+      clientY: 120,
+      screenX: 530,
+      screenY: 520,
+      buttons: 0,
+    });
+    expect(releaseMock).toHaveBeenCalledTimes(1);
+  });
+
+  test("tells main when the host takes the pointer away mid-press", async () => {
+    const { container } = render(<CompanionSurfacePage />);
+    const { pill } = await pinSurface(container);
+    const canvas = canvasOf(container);
+
+    fireEvent.mouseMove(canvas, { clientX: 120, clientY: 120 });
+    fireEvent.pointerDown(pill, {
+      button: 0,
+      pointerId: 1,
+      screenX: 500,
+      screenY: 500,
+    });
+    fireEvent.pointerCancel(canvas);
+    expect(releaseMock).toHaveBeenCalledTimes(1);
+  });
+
+  /**
+   * The edge the bar rests on arrives on the state, like the growths, and
+   * the surface draws the bar for it: a column against a side.
+   */
+  test("stands the call bar up on the side main docked it to", async () => {
+    const { container } = render(<CompanionSurfacePage />);
+    await pinSurface(container);
+    pushState({ ...STATE, call: LISTENING_CALL, dock: "left" });
+    await waitFor(() => {
+      if (
+        container.querySelector(".transition-\\[width\\,height\\]") === null
+      ) {
+        throw new Error("Expected the bar to stand up");
+      }
+    });
+    pushState({ ...STATE, call: LISTENING_CALL, dock: "top" });
+    await waitFor(() => {
+      if (container.querySelector(".transition-\\[width\\]") === null) {
+        throw new Error("Expected the bar to lie back down");
+      }
+    });
+  });
+
   /**
    * Both drawn halves are handles. The drag is a window move, so whichever the
    * hand happens to land on takes the whole surface with it, and a creature
@@ -1246,6 +1382,20 @@ describe("the offer of a dictation's words", () => {
  * the beat; these are about what the page does with the one it is handed.
  */
 describe("the companion's introduction", () => {
+  test.each(COMPANION_INTRO_BEATS.filter((beat) => beat !== "try"))(
+    "clicking the avatar on %s cannot start a call",
+    async (beat) => {
+      STATE.intro = beat;
+      const { container } = render(<CompanionSurfacePage />);
+      const { avatar } = await pinSurface(container);
+
+      fireEvent.click(avatar);
+
+      expect(startVoiceMock).not.toHaveBeenCalled();
+      expect(advanceIntroMock).not.toHaveBeenCalledWith("try");
+    },
+  );
+
   /** The introduction's card, pinned somewhere the hit-test can find it. */
   const pinCard = async (container: HTMLElement): Promise<HTMLElement> => {
     const card = await waitFor(() => {
@@ -1268,12 +1418,14 @@ describe("the companion's introduction", () => {
   });
 
   test("draws the beat main is holding", async () => {
-    STATE.intro = "meet";
+    STATE.intro = "idle";
     const { container } = render(<CompanionSurfacePage />);
     const card = await pinCard(container);
-    // The creature introduces itself by name. The surface is the one place it
-    // appears with none of the app around it to say whose it is.
-    expect(card.textContent).toContain("I’m Ziggy");
+    // The creature introduces itself by name on the first card, which is the
+    // one the user meets before they know there is a creature in there at all.
+    // The surface is the one place it appears with none of the app around it to
+    // say whose it is.
+    expect(card.textContent).toContain("Hey, it’s Ziggy");
   });
 
   /**
@@ -1283,11 +1435,11 @@ describe("the companion's introduction", () => {
    * with a hole where the name goes.
    */
   test("introduces the creature unnamed until a name arrives", async () => {
-    STATE.intro = "meet";
+    STATE.intro = "idle";
     STATE.assistantName = "";
     const { container } = render(<CompanionSurfacePage />);
     const card = await pinCard(container);
-    expect(card.textContent).toContain("This is me");
+    expect(card.textContent).toContain("Hey, it’s me");
   });
 
   test("a press asks main to move the run on", async () => {
@@ -1301,21 +1453,40 @@ describe("the companion's introduction", () => {
     expect(advanceIntroMock.mock.calls).toEqual([["next"]]);
   });
 
-  test("Skip ends the run rather than advancing it", async () => {
+  test("keeps the avatar's success message until Next is pressed", async () => {
+    STATE.intro = "talk";
+    const { container } = render(<CompanionSurfacePage />);
+    const { avatar } = await pinSurface(container);
+    const card = await pinCard(container);
+    jest.useFakeTimers();
+
+    fireEvent.click(avatar);
+    expect(card.textContent).toContain("You did it!");
+    await act(async () => jest.advanceTimersByTime(60_000));
+    expect(card.textContent).toContain("You did it!");
+    expect(startVoiceMock).not.toHaveBeenCalled();
+    expect(advanceIntroMock).not.toHaveBeenCalled();
+
+    const next = Array.from(card.querySelectorAll("button")).find(
+      (button) => button.textContent === "Next",
+    );
+    fireEvent.click(next as HTMLElement);
+    expect(advanceIntroMock.mock.calls).toEqual([["next"]]);
+  });
+
+  test("the close glyph ends the run rather than advancing it", async () => {
     STATE.intro = "meet";
     const { container } = render(<CompanionSurfacePage />);
     const card = await pinCard(container);
-    const skip = Array.from(card.querySelectorAll("button")).find(
-      (button) => button.textContent === "Skip",
-    );
-    fireEvent.click(skip as HTMLElement);
+    const close = card.querySelector('[aria-label="Close"]');
+    fireEvent.click(close as HTMLElement);
     expect(advanceIntroMock.mock.calls).toEqual([["dismiss"]]);
   });
 
   /**
-   * The window is click-through everywhere it has not been told otherwise, so a
-   * card that did not make it interactive would put Next and Skip on screen
-   * with every press on them landing in whatever app is behind.
+   * The window is click-through everywhere it has not been told otherwise, so
+   * a card that did not make it interactive would put Next and the close glyph
+   * on screen with every press on them landing in whatever app is behind.
    */
   test("makes the window clickable while the pointer is on the card", async () => {
     STATE.intro = "meet";
@@ -1356,7 +1527,7 @@ describe("the companion's introduction", () => {
    * presses meant for whatever the user was working in.
    */
   test("gives the desktop back when the run ends under the pointer", async () => {
-    STATE.intro = "menu";
+    STATE.intro = "try";
     const { container } = render(<CompanionSurfacePage />);
     await pinSurface(container);
     await pinCard(container);
@@ -1906,5 +2077,467 @@ describe("the picker behind Share", () => {
       fireEvent.click(drawOf(container));
       expect(setAnnotatingMock.mock.calls).toEqual([[false]]);
     });
+
+    /**
+     * Clear, beside Draw. What is on the shared surface is main's to say:
+     * the assistant's marks arrive on the pushed state, and the mode is
+     * where the user's own ink is drawn, which main never sees. A shell
+     * with a Clear to answer names the count it steps on every clear.
+     */
+    describe("clearing what is on it", () => {
+      const clearOf = (container: HTMLElement): HTMLButtonElement | null =>
+        container.querySelector<HTMLButtonElement>(
+          'button[aria-label="Clear marks"]',
+        );
+      const MARK = {
+        kind: "region" as const,
+        x: 0.1,
+        y: 0.2,
+        width: 0.3,
+        height: 0.1,
+      };
+
+      test("is offered while the assistant has marks up", async () => {
+        STATE.screenShare = { kind: "window", windowId: 9 };
+        const { container } = render(<CompanionSurfacePage />);
+        await pinSurface(container);
+        expect(clearOf(container)).toBeNull();
+
+        pushState({ ...STATE, marksCleared: 0, coachmarks: [MARK] });
+        expect(clearOf(container)).not.toBeNull();
+
+        pushState({ ...STATE, marksCleared: 0 });
+        expect(clearOf(container)).toBeNull();
+      });
+
+      test("is offered while drawing is on, where the user's own ink is", async () => {
+        STATE.screenShare = { kind: "window", windowId: 9 };
+        const { container } = render(<CompanionSurfacePage />);
+        await pinSurface(container);
+        pushState({ ...STATE, marksCleared: 0, annotating: true });
+        expect(clearOf(container)).not.toBeNull();
+      });
+
+      /**
+       * A newer renderer can meet an older shell, which publishes marks and
+       * the mode but has no Clear on its bridge. A control drawn for it
+       * would be one whose press goes nowhere.
+       */
+      test("is not offered by a shell that has no Clear to answer it", async () => {
+        STATE.screenShare = { kind: "window", windowId: 9 };
+        const { container } = render(<CompanionSurfacePage />);
+        await pinSurface(container);
+        pushState({ ...STATE, coachmarks: [MARK], annotating: true });
+        expect(clearOf(container)).toBeNull();
+      });
+
+      test("the press asks main to clear", async () => {
+        STATE.screenShare = { kind: "window", windowId: 9 };
+        const { container } = render(<CompanionSurfacePage />);
+        await pinSurface(container);
+        pushState({ ...STATE, marksCleared: 0, coachmarks: [MARK] });
+        const clear = clearOf(container);
+        if (clear === null) {
+          throw new Error("Expected Clear to render");
+        }
+        fireEvent.click(clear);
+        expect(clearMarksMock).toHaveBeenCalledTimes(1);
+        // Nothing comes down off the press: the marks going from the pushed
+        // state is what happened.
+        expect(clearOf(container)).not.toBeNull();
+      });
+    });
+
+    /**
+     * The tools, main's the same way: a press asks, and what draws a tool
+     * held down is main saying it is the one the frame draws with.
+     */
+    describe("the tools", () => {
+      const stripOf = (container: HTMLElement): HTMLElement | null =>
+        container.querySelector<HTMLElement>(
+          "[data-testid='companion-draw-tools']",
+        );
+      const toolOf = (
+        container: HTMLElement,
+        label: string,
+      ): HTMLButtonElement => {
+        const found = stripOf(container)?.querySelector<HTMLButtonElement>(
+          `button[aria-label="${label}"]`,
+        );
+        if (!found) {
+          throw new Error(`Expected the ${label} tool to render`);
+        }
+        return found;
+      };
+      const drawing = (): void => {
+        STATE.screenShare = { kind: "window", windowId: 9 };
+        STATE.annotating = true;
+        STATE.annotationTool = "freehand";
+      };
+      afterEach(() => {
+        delete STATE.annotating;
+        delete STATE.annotationTool;
+      });
+
+      test("are offered once main says the frame took the mouse", async () => {
+        STATE.screenShare = { kind: "window", windowId: 9 };
+        const { container } = render(<CompanionSurfacePage />);
+        await pinSurface(container);
+        expect(stripOf(container)).toBeNull();
+
+        pushState({ ...STATE, annotating: true, annotationTool: "freehand" });
+        expect(stripOf(container)).not.toBeNull();
+      });
+
+      /**
+       * A shell that predates the shapes names no tool and has no channel to
+       * take one on: a press on Line there would leave the pencil held down.
+       * So it is offered nothing beyond the pencil it already has.
+       */
+      test("are not offered by a shell that names no tool", async () => {
+        STATE.screenShare = { kind: "window", windowId: 9 };
+        const { container } = render(<CompanionSurfacePage />);
+        await pinSurface(container);
+        pushState({ ...STATE, annotating: true });
+        expect(drawOf(container).getAttribute("aria-pressed")).toBe("true");
+        expect(stripOf(container)).toBeNull();
+      });
+
+      test("a press asks main for the tool, and main's answer is what draws it held down", async () => {
+        drawing();
+        const { container } = render(<CompanionSurfacePage />);
+        await pinSurface(container);
+
+        fireEvent.click(toolOf(container, "Box"));
+        expect(setAnnotationToolMock.mock.calls).toEqual([["box"]]);
+        expect(toolOf(container, "Box").getAttribute("aria-pressed")).toBe(
+          "false",
+        );
+
+        pushState({ ...STATE, annotationTool: "box" });
+        expect(toolOf(container, "Box").getAttribute("aria-pressed")).toBe(
+          "true",
+        );
+      });
+
+      /**
+       * The strip stands off the pill, so a window that tested the pill
+       * alone would be click-through over every tool on it.
+       */
+      test("keep the window clickable under the pointer", async () => {
+        drawing();
+        const { container } = render(<CompanionSurfacePage />);
+        await pinSurface(container);
+        const canvas = canvasOf(container);
+        const strip = stripOf(container);
+        if (strip === null) {
+          throw new Error("Expected the tools to render");
+        }
+        pin(strip, { left: 250, right: 370, top: 40, bottom: 72 });
+
+        fireEvent.mouseMove(canvas, { clientX: 300, clientY: 56 });
+        expect(setInteractiveMock.mock.calls.at(-1)).toEqual([true]);
+
+        fireEvent.mouseMove(canvas, { clientX: 300, clientY: 20 });
+        expect(setInteractiveMock.mock.calls.at(-1)).toEqual([false]);
+      });
+
+      /**
+       * The mode can end from the keyboard or with the share, under a
+       * pointer resting on the strip that nothing then moves: no mouse-move
+       * arrives to say the pointer is now over empty canvas.
+       */
+      test("give the desktop back when the strip goes under a still pointer", async () => {
+        drawing();
+        const { container } = render(<CompanionSurfacePage />);
+        await pinSurface(container);
+        const canvas = canvasOf(container);
+        const strip = stripOf(container);
+        if (strip === null) {
+          throw new Error("Expected the tools to render");
+        }
+        pin(strip, { left: 250, right: 370, top: 40, bottom: 72 });
+        fireEvent.mouseMove(canvas, { clientX: 300, clientY: 56 });
+        expect(setInteractiveMock.mock.calls.at(-1)).toEqual([true]);
+
+        pushState({ ...STATE, annotating: false });
+        expect(setInteractiveMock.mock.calls.at(-1)).toEqual([false]);
+      });
+
+      /** A press on Draw leaves the pointer on the pill, which is still there. */
+      test("keep the window clickable when the mode ends under a pointer on the pill", async () => {
+        drawing();
+        const { container } = render(<CompanionSurfacePage />);
+        await pinSurface(container);
+        const canvas = canvasOf(container);
+        fireEvent.mouseMove(canvas, { clientX: 200, clientY: 122 });
+        expect(setInteractiveMock.mock.calls.at(-1)).toEqual([true]);
+
+        pushState({ ...STATE, annotating: false });
+        expect(setInteractiveMock.mock.calls.at(-1)).toEqual([true]);
+      });
+    });
+  });
+});
+
+/**
+ * The popover's short form on a call's bar: a row joined to the bar while it
+ * docks to the top or bottom, and a count of what was put off.
+ */
+describe("prompts on the call's bar", () => {
+  const APPROVALS = {
+    kind: "approvals" as const,
+    id: "req-1,req-2,req-3",
+    items: [
+      { id: "req-1", title: "Read the Downloads folder", detail: "" },
+      { id: "req-2", title: "Open Safari", detail: "" },
+      { id: "req-3", title: "Send an email", detail: "" },
+    ],
+  };
+
+  /** The row the bar carries, not the copy kept out of sight to measure. */
+  const promptRowOf = (container: HTMLElement): HTMLElement | null =>
+    Array.from(
+      container.querySelectorAll<HTMLElement>("[data-companion-prompt-row]"),
+    ).find((row) => row.closest("[inert]") === null) ?? null;
+
+  const buttonIn = (root: HTMLElement, name: string) =>
+    Array.from(root.querySelectorAll("button")).find(
+      (button) =>
+        button.textContent === name ||
+        button.getAttribute("aria-label") === name,
+    ) ?? null;
+
+  test("carries the short form as a row and passes its presses on", async () => {
+    Object.assign(STATE, {
+      call: LISTENING_CALL,
+      popover: APPROVALS,
+      popoverView: "row",
+    });
+    const { container } = render(<CompanionSurfacePage />);
+
+    const row = await waitFor(() => {
+      const found = promptRowOf(container);
+      if (found === null) {
+        throw new Error("Expected the prompt row");
+      }
+      return found;
+    });
+    expect(row.textContent).toContain("Need your OK on 3 things");
+    fireEvent.click(buttonIn(row, "Review")!);
+    fireEvent.click(buttonIn(row, "Not Now")!);
+
+    expect(setPopoverViewMock.mock.calls).toEqual([
+      ["req-1,req-2,req-3", "expanded"],
+      ["req-1,req-2,req-3", "deferred"],
+    ]);
+  });
+
+  /** Reviewed, the list joins the bar too: one shape, not a window above it. */
+  test("carries the reviewed list on the bar and reports how tall it stands", async () => {
+    Object.assign(STATE, {
+      call: LISTENING_CALL,
+      popover: APPROVALS,
+      popoverView: "expanded",
+    });
+    const { container } = render(<CompanionSurfacePage />);
+
+    await waitFor(() => {
+      const rows = Array.from(container.querySelectorAll("li")).filter(
+        (row) => row.closest("[inert]") === null,
+      );
+      if (rows.length !== 3) {
+        throw new Error("Expected the list on the bar");
+      }
+    });
+    expect(promptRowOf(container)).toBeNull();
+    expect(attachedHeightMock.mock.calls.at(-1)?.[0]).toBe("req-1,req-2,req-3");
+  });
+
+  test("answers a single approval from the row", async () => {
+    Object.assign(STATE, {
+      call: LISTENING_CALL,
+      popover: { ...APPROVALS, id: "req-1", items: [APPROVALS.items[0]] },
+      popoverView: "row",
+    });
+    const { container } = render(<CompanionSurfacePage />);
+
+    const row = await waitFor(() => {
+      const found = promptRowOf(container);
+      if (found === null) {
+        throw new Error("Expected the prompt row");
+      }
+      return found;
+    });
+    fireEvent.click(buttonIn(row, "Allow")!);
+
+    expect(answerPopoverMock.mock.calls).toEqual([
+      [{ kind: "allow", itemId: "req-1" }, "req-1"],
+    ]);
+  });
+
+  /** A column has no edge for a line of words; the popover's window has it. */
+  test("carries no row on a bar docked to a side", async () => {
+    Object.assign(STATE, {
+      dock: "left",
+      call: LISTENING_CALL,
+      popover: APPROVALS,
+      popoverView: "row",
+    });
+    const { container } = render(<CompanionSurfacePage />);
+    // The call's own controls, so the state is known to have landed.
+    await waitFor(() => {
+      if (container.querySelector(".flex-col") === null) {
+        throw new Error("Expected the column");
+      }
+    });
+
+    expect(promptRowOf(container)).toBeNull();
+  });
+
+  test("carries no row off a call", async () => {
+    Object.assign(STATE, { popover: APPROVALS, popoverView: "row" });
+    const { container } = render(<CompanionSurfacePage />);
+    await pinSurface(container);
+
+    expect(promptRowOf(container)).toBeNull();
+  });
+
+  test("counts what was put off, and a press lists it again", async () => {
+    Object.assign(STATE, {
+      call: LISTENING_CALL,
+      popover: APPROVALS,
+      popoverView: "deferred",
+    });
+    const { container } = render(<CompanionSurfacePage />);
+
+    const badge = await waitFor(() => {
+      const found = buttonIn(container, "3 things need your OK");
+      if (found === null) {
+        throw new Error("Expected the count");
+      }
+      return found;
+    });
+    expect(promptRowOf(container)).toBeNull();
+    expect(badge.textContent).toBe("3");
+    fireEvent.click(badge);
+
+    expect(setPopoverViewMock.mock.calls).toEqual([
+      ["req-1,req-2,req-3", "expanded"],
+    ]);
+  });
+
+  test("counts nothing while nothing is put off", async () => {
+    Object.assign(STATE, {
+      call: LISTENING_CALL,
+      popover: APPROVALS,
+      popoverView: "row",
+    });
+    const { container } = render(<CompanionSurfacePage />);
+    await waitFor(() => {
+      if (promptRowOf(container) === null) {
+        throw new Error("Expected the prompt row");
+      }
+    });
+
+    expect(buttonIn(container, "3 things need your OK")).toBeNull();
+  });
+
+  /**
+   * The row goes under a hand that has not moved when it is answered, and no
+   * mouse-move arrives to say the pointer is now over the desktop.
+   */
+  test("gives the desktop back when the row goes under a still pointer", async () => {
+    Object.assign(STATE, {
+      call: LISTENING_CALL,
+      popover: APPROVALS,
+      popoverView: "row",
+    });
+    const { container } = render(<CompanionSurfacePage />);
+    await pinSurface(container);
+    const shelf = await waitFor(() => {
+      const found = promptRowOf(container)?.parentElement?.parentElement;
+      if (!(found instanceof HTMLElement)) {
+        throw new Error("Expected the shelf");
+      }
+      return found;
+    });
+    pin(shelf, { left: 400, right: 700, top: 10, bottom: 60 });
+    fireEvent.mouseMove(canvasOf(container), { clientX: 500, clientY: 30 });
+    expect(setInteractiveMock.mock.calls.at(-1)).toEqual([true]);
+
+    pushState({
+      ...STATE,
+      call: LISTENING_CALL,
+      popover: APPROVALS,
+      popoverView: "deferred",
+    });
+
+    expect(setInteractiveMock.mock.calls.at(-1)).toEqual([false]);
+  });
+});
+
+describe("the microphone picker on the call's bar", () => {
+  const chevronOf = (container: HTMLElement, label: string) =>
+    Array.from(
+      container.querySelectorAll<HTMLButtonElement>(
+        `button[aria-label="${label}"]`,
+      ),
+    ).find((button) => button.closest("[inert]") === null) ?? null;
+
+  test("its chevron opens the picker and reads held while it is showing", async () => {
+    Object.assign(STATE, { call: LISTENING_CALL, voicesPickable: true });
+    const { container } = render(<CompanionSurfacePage />);
+
+    const mic = await waitFor(() => {
+      const found = chevronOf(container, "Choose microphone");
+      if (found === null) {
+        throw new Error("Expected the microphone chevron");
+      }
+      return found;
+    });
+    fireEvent.click(mic);
+    expect(togglePickerMock.mock.calls).toEqual([["microphones"]]);
+    expect(mic.getAttribute("aria-pressed")).toBe("false");
+
+    pushState({
+      ...STATE,
+      call: LISTENING_CALL,
+      voicesPickable: true,
+      popover: {
+        kind: "microphones",
+        id: "microphones",
+        options: [],
+        selected: "",
+        needsPermission: false,
+      },
+      popoverView: "expanded",
+    });
+    expect(
+      chevronOf(container, "Choose microphone")!.getAttribute("aria-pressed"),
+    ).toBe("true");
+  });
+
+  test("draws no voice picker even when voices are available", async () => {
+    Object.assign(STATE, { call: LISTENING_CALL, voicesPickable: true });
+    const { container } = render(<CompanionSurfacePage />);
+    await waitFor(() => {
+      if (chevronOf(container, "Choose microphone") === null) {
+        throw new Error("Expected the microphone chevron");
+      }
+    });
+    expect(chevronOf(container, "Choose voice")).toBeNull();
+  });
+
+  test("is not drawn for a shell with nowhere to send the press", async () => {
+    hasPickers = false;
+    Object.assign(STATE, { call: LISTENING_CALL });
+    const { container } = render(<CompanionSurfacePage />);
+    await waitFor(() => {
+      if (chevronOf(container, "Mute microphone") === null) {
+        throw new Error("Expected the call bar");
+      }
+    });
+    expect(chevronOf(container, "Choose microphone")).toBeNull();
   });
 });

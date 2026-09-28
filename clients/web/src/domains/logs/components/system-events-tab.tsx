@@ -197,6 +197,7 @@ function EventRow({ event }: { event: AssistantSystemEvent }) {
           <button
             type="button"
             onClick={() => setDetailsOpen((o) => !o)}
+            aria-expanded={detailsOpen}
             className="text-body-small-default flex items-center gap-1"
             style={{ color: "var(--content-tertiary)" }}
           >
@@ -246,11 +247,7 @@ export function SystemEventsTab({ assistantId }: SystemEventsTabProps) {
       if (!lastPage.next) {
         return undefined;
       }
-      const loaded = allPages.reduce(
-        (acc, page) => acc + page.results.length,
-        0,
-      );
-      return loaded;
+      return allPages.reduce((acc, page) => acc + page.results.length, 0);
     },
   });
 

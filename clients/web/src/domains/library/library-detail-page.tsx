@@ -21,6 +21,7 @@ import { isReadOnlyApp } from "@/types/app-types";
 import { useTranslation } from "@/i18n";
 
 interface LoadedApp {
+  assistantId: string;
   appId: string;
   dirName?: string;
   name: string;
@@ -62,6 +63,7 @@ export function LibraryDetailPage() {
         }
         primeAppHtmlCache(assistantId, result.appId, result.html);
         setApp({
+          assistantId,
           appId: result.appId,
           dirName: result.dirName,
           name: result.name,
@@ -84,6 +86,13 @@ export function LibraryDetailPage() {
   const handleClose = useCallback(() => {
     void navigate(routes.library.root);
   }, [navigate]);
+
+  const handleNavigateAppRoute = useCallback(
+    (href: string) => {
+      void navigate(href);
+    },
+    [navigate],
+  );
 
   useEdgeSwipeBack({
     containerRef: swipeContainerRef,
@@ -185,6 +194,7 @@ export function LibraryDetailPage() {
           html={app.html}
           assistantId={assistantId}
           onClose={handleClose}
+          onNavigateAppRoute={handleNavigateAppRoute}
           {...(isReadOnlyApp(app.origin)
             ? {}
             : {

@@ -1,9 +1,9 @@
-import { randomUUID } from "node:crypto";
-
 import { z } from "zod";
 
 import {
   addDocumentConversation,
+  createDocument,
+  DEFAULT_DOCUMENT_TITLE,
   deleteDocument,
   findInDocument,
   findRecentEmptyDocumentByTitle,
@@ -11,7 +11,6 @@ import {
   getDocumentsForConversation,
   isDocumentAssociatedWithConversation,
   replaceInDocument,
-  saveDocument,
   searchDocumentsByTitle,
   updateDocumentContent,
 } from "../../documents/document-store.js";
@@ -22,10 +21,6 @@ import {
   nullAsOmitted,
 } from "../shared/zod-tool-schema.js";
 import type { ToolContext, ToolExecutionResult } from "../types.js";
-
-function isPrivilegedDocumentActor(context: ToolContext): boolean {
-  return canActOnPrivilegedDocuments(context);
-}
 
 export function documentNotFound(surfaceId: string): ToolExecutionResult {
   return {
@@ -43,7 +38,7 @@ export function canAccessDocument(
   context: ToolContext,
 ): boolean {
   return (
-    isPrivilegedDocumentActor(context) ||
+    canActOnPrivilegedDocuments(context) ||
     isDocumentAssociatedWithConversation(surfaceId, context.conversationId)
   );
 }
@@ -163,6 +158,7 @@ export function executeDocumentOpen(
       surfaceId: doc.surfaceId,
       title: doc.title,
       initialContent: doc.content,
+      revision: doc.revision,
     });
 
     context.sendToClient({
@@ -249,6 +245,7 @@ function maybeReuseEmptyDocument(
       surfaceId,
       markdown: initialContent,
       mode: "replace",
+      revision: update.revision,
     });
 
     context.sendToClient({
@@ -287,7 +284,7 @@ export function executeDocumentCreate(
     return invalidToolInputResult("document_create", parsedInput.error);
   }
   throwIfCancelled(context);
-  const title = parsedInput.data.title || "Untitled Document";
+  const title = parsedInput.data.title || DEFAULT_DOCUMENT_TITLE;
   const initialContent = parsedInput.data.initial_content || "";
 
   const reused = maybeReuseEmptyDocument(title, initialContent, context);
@@ -295,21 +292,21 @@ export function executeDocumentCreate(
     return reused;
   }
 
-  const surfaceId = `doc-${randomUUID()}`;
-
   // Persist the document so any client (web or macOS) can fetch it via
   // GET /v1/documents/:id. The macOS client may later update the row
   // via document_save; ON CONFLICT DO UPDATE handles that.
-  const wordCount = initialContent
-    .split(/\s+/)
-    .filter((w) => w.length > 0).length;
-  saveDocument({
-    surfaceId,
+  const created = createDocument({
     conversationId: context.conversationId,
     title,
     content: initialContent,
-    wordCount,
   });
+  if (!created.success) {
+    return {
+      content: JSON.stringify({ success: false, error: created.error }),
+      isError: true,
+    };
+  }
+  const { surfaceId, revision } = created;
 
   // Send document_editor_show message to open the built-in RTE
   if (context.sendToClient) {
@@ -319,6 +316,7 @@ export function executeDocumentCreate(
       surfaceId,
       title,
       initialContent,
+      revision,
     });
 
     context.sendToClient({
@@ -446,6 +444,7 @@ export function executeDocumentUpdate(
       surfaceId,
       markdown: applied,
       mode,
+      revision: result.revision,
     });
 
     return {
@@ -522,7 +521,7 @@ export function executeDocumentList(
   const docs = query
     ? searchDocumentsByTitle(
         query,
-        isPrivilegedDocumentActor(context)
+        canActOnPrivilegedDocuments(context)
           ? {}
           : { conversationId: context.conversationId },
       )
@@ -689,16 +688,14 @@ export function executeDocumentReplaceText(
   }
 
   if (context.sendToClient && result.content_changed) {
-    const doc = getDocumentById(surfaceId);
-    if (doc) {
-      context.sendToClient({
-        type: "document_editor_update",
-        conversationId: context.conversationId,
-        surfaceId,
-        markdown: doc.content,
-        mode: "replace",
-      });
-    }
+    context.sendToClient({
+      type: "document_editor_update",
+      conversationId: context.conversationId,
+      surfaceId,
+      markdown: result.content,
+      mode: "replace",
+      revision: result.revision,
+    });
   }
 
   return {

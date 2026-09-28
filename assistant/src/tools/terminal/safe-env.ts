@@ -7,8 +7,12 @@
  */
 import { readdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 
-import { pathListDelimiter } from "@vellumai/environments/shell";
+import {
+  pathListDelimiter,
+  prependUniquePathEntries,
+} from "@vellumai/environments/shell";
 
 import { getGatewayInternalBaseUrl } from "../../config/env.js";
 import { getDataDir, getWorkspaceDir } from "../../util/platform.js";
@@ -55,14 +59,16 @@ export const SAFE_ENV_VARS = [
   "VELLUM_MIGRATION_EXPORT_ALLOWED_HOSTS",
   "VELLUM_MIGRATION_IMPORT_ALLOWED_HOSTS",
   "CES_MANAGED_MODE",
-  // Socket path only. The CES HTTP bearer (`CES_SERVICE_TOKEN`) and
-  // `CES_CREDENTIAL_URL` stay in the assistant process: child shells must
-  // not inherit a vault token they can printenv or log.
-  "CES_LOCAL_SOCKET",
+  "CES_CREDENTIAL_URL",
+  "CES_SERVICE_TOKEN",
+  // Child processes (bash, skill sandbox, scheduled scripts) reach CES
+  // over IPC via `CES_BOOTSTRAP_SOCKET_DIR`. CES HTTP credentials are
+  // forwarded so children can fail over to CES HTTP while that transport
+  // still exists.
   // Per-instance port of the assistant-managed Qdrant sidecar, so skill and
   // bash-tool subprocesses that use the vector helpers (e.g. embed/search over
   // `@vellumai/plugin-api`) resolve the same local sidecar as the daemon
-  // (127.0.0.1:<port>). `QDRANT_URL` is intentionally excluded — it flips
+  // (127.0.0.1:<port>). `QDRANT_URL` is intentionally excluded: it flips
   // QdrantManager into external mode and bypasses the local managed lifecycle.
   "QDRANT_HTTP_PORT",
   "IS_CONTAINERIZED",
@@ -80,6 +86,10 @@ export const SAFE_ENV_VARS = [
   "VELLUM_MINIKUBE_STORAGE_SIZE",
   "VELLUM_BACKUP_DIR",
   "VELLUM_BACKUP_KEY_PATH",
+  // VELLUM_PLUGIN_NAME is intentionally absent. The daemon injects the
+  // owning plugin install name after sanitizing the child environment.
+  // Inheriting a parent-supplied value would let an arbitrary process
+  // claim another plugin's credential scope.
 ] as const;
 
 export const WINDOWS_SAFE_ENV_VARS = [
@@ -264,6 +274,7 @@ function appendUniquePathEntries(
 export function buildSanitizedEnv(
   hostPlatform: NodeJS.Platform = process.platform,
   sourceEnv: NodeJS.ProcessEnv = process.env,
+  options?: { execPath?: string },
 ): Record<string, string> {
   const env: Record<string, string> = {};
   const isKataRuntime = isKataFamilyRuntime(sourceEnv.VELLUM_SANDBOX_RUNTIME);
@@ -340,5 +351,29 @@ export function buildSanitizedEnv(
   if (!env.LC_ALL) {
     env.LC_ALL = utf8Locale;
   }
+  prependWindowsAssistantDir(
+    env,
+    hostPlatform,
+    options?.execPath ?? process.execPath,
+  );
   return env;
+}
+
+function prependWindowsAssistantDir(
+  env: Record<string, string>,
+  hostPlatform: NodeJS.Platform,
+  execPath: string,
+): void {
+  if (hostPlatform !== "win32") {
+    return;
+  }
+  const execDir = dirname(execPath);
+  try {
+    if (!statSync(join(execDir, "assistant.exe")).isFile()) {
+      return;
+    }
+  } catch {
+    return;
+  }
+  env.PATH = prependUniquePathEntries(env.PATH, [execDir], hostPlatform);
 }

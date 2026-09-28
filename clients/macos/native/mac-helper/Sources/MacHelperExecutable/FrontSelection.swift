@@ -1,6 +1,7 @@
 import AppKit
 import ApplicationServices
 import Carbon
+import MacHelperCore
 
 /// The text selected in the application in front.
 ///
@@ -31,7 +32,7 @@ enum FrontSelection {
         let truncated: Bool
         /// Whether the control the selection sits in takes text, so a hold
         /// asked to change the selection can put the result back over it.
-        /// See `isEditable`.
+        /// Unknown editability produces an unavailable read instead.
         let editable: Bool
     }
 
@@ -84,14 +85,19 @@ enum FrontSelection {
         var trusted: Bool
         var promptShown = false
         var bundleId: String?
+        /// Whether the application in front renders with Chromium. See
+        /// `isChromium`.
+        var chromium = false
         var focused = false
         var role: String?
         var path: Path = .none
         var chars = 0
         var selection: Selection?
+        var unavailable = false
+        var activationError: AXError?
 
         var logLine: String {
-            "trusted=\(trusted) prompt=\(promptShown) app=\(bundleId ?? "-") focused=\(focused) role=\(role ?? "-") path=\(path.rawValue) chars=\(chars) editable=\(selection?.editable ?? false)"
+            "trusted=\(trusted) prompt=\(promptShown) app=\(bundleId ?? "-") chromium=\(chromium) focused=\(focused) role=\(role ?? "-") path=\(path.rawValue) chars=\(chars) editable=\(selection?.editable ?? false) unavailable=\(unavailable) activationErr=\(activationError.map { String($0.rawValue) } ?? "-")"
         }
     }
 
@@ -118,6 +124,9 @@ enum FrontSelection {
         let role: String?
         var bundleId: String?
         var trusted = true
+        /// Whether the application in front renders with Chromium. See
+        /// `isChromium`.
+        var chromium = false
         /// Why the focused element could not be read, when it could not be.
         /// Two very different things end up as `focused=false`, and only the
         /// log can tell them apart afterwards: an application that says
@@ -125,7 +134,7 @@ enum FrontSelection {
         var error: AXError?
 
         var logLine: String {
-            "trusted=\(trusted) app=\(bundleId ?? "-") focused=\(focused) role=\(role ?? "-") takesText=\(takesText) err=\(error.map { String($0.rawValue) } ?? "-")"
+            "trusted=\(trusted) app=\(bundleId ?? "-") chromium=\(chromium) focused=\(focused) role=\(role ?? "-") takesText=\(takesText) err=\(error.map { String($0.rawValue) } ?? "-")"
         }
     }
 
@@ -145,7 +154,14 @@ enum FrontSelection {
                 trusted: false
             )
         }
-        let bundleId = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        let frontApp = NSWorkspace.shared.frontmostApplication
+        let bundleId = frontApp?.bundleIdentifier
+        let chromium = isChromium(frontApp)
+        // Too late for this read, which answers without the tree below, but
+        // it gives the next hold's selection read a tree to find.
+        if chromium, let pid = frontApp?.processIdentifier {
+            turnOnChromiumAccessibility(pid)
+        }
         let systemWide = AXUIElementCreateSystemWide()
         AXUIElementSetMessagingTimeout(systemWide, requestTimeoutSeconds)
         var focusedRef: CFTypeRef?
@@ -164,12 +180,20 @@ enum FrontSelection {
             // that is not an element. A failure to ask has not seen the text
             // field it would be withholding from, so it answers the way an
             // untrusted read does.
-            let conclusive = status == .noValue || status == .attributeUnsupported
+            //
+            // Chromium's "nothing focused" is not conclusive either: it keeps
+            // its web content's accessibility tree off until an assistive
+            // app turns it on, and asking for the focused element does not.
+            // With it off, a composer the caret is sitting in reads as
+            // nothing focused on every hold, not just the first.
+            let conclusive = !chromium
+                && (status == .noValue || status == .attributeUnsupported)
             return Focus(
                 focused: false,
                 takesText: !conclusive,
                 role: nil,
                 bundleId: bundleId,
+                chromium: chromium,
                 error: status == .success ? nil : status
             )
         }
@@ -178,10 +202,61 @@ enum FrontSelection {
         let role = stringAttribute(focused, kAXRoleAttribute as CFString)
         return Focus(
             focused: true,
-            takesText: takesText(focused, role: role),
+            takesText: takesText(focused, role: role, chromium: chromium),
             role: role,
-            bundleId: bundleId
+            bundleId: bundleId,
+            chromium: chromium
         )
+    }
+
+    /// Answers from `isChromium`, by bundle path. An application's frameworks
+    /// do not change while it runs, and this is asked at the end of every hold.
+    private nonisolated(unsafe) static var chromiumBundles: [String: Bool] = [:]
+
+    /// Whether the application renders with Chromium: Chrome and the browsers
+    /// built on it, Electron apps, CEF apps. Every one of them carries
+    /// Chromium's resource pack inside a framework, whatever the framework is
+    /// named ("Electron Framework", "Google Chrome Framework", or an app's
+    /// own), which the Accessibility attributes cannot tell apart from a
+    /// native app's.
+    private static func isChromium(_ app: NSRunningApplication?) -> Bool {
+        guard let bundlePath = app?.bundleURL?.path else {
+            return false
+        }
+        if let known = chromiumBundles[bundlePath] {
+            return known
+        }
+        let frameworks = URL(fileURLWithPath: bundlePath)
+            .appendingPathComponent("Contents/Frameworks")
+        let found = ((try? FileManager.default.contentsOfDirectory(atPath: frameworks.path)) ?? [])
+            .filter { $0.hasSuffix(".framework") }
+            .contains {
+                FileManager.default.fileExists(
+                    atPath: frameworks
+                        .appendingPathComponent($0)
+                        .appendingPathComponent("Resources/chrome_100_percent.pak")
+                        .path
+                )
+            }
+        chromiumBundles[bundlePath] = found
+        return found
+    }
+
+    /// Ask a Chromium application to build its web content's accessibility
+    /// tree, which it keeps off until an assistive app asks for it. With it
+    /// off, the focused element and its selected text do not exist to be
+    /// read. Electron's manual flag avoids enhanced UI's window-management
+    /// side effects; Chrome requires the enhanced UI flag.
+    ///
+    /// Activation is debounced by Chromium for two seconds. Retried reads
+    /// must not set the flag again or they postpone the tree's availability.
+    @discardableResult
+    private static func turnOnChromiumAccessibility(_ pid: pid_t) -> AXError {
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, requestTimeoutSeconds)
+        return ChromiumAccessibility.enable { attribute in
+            AXUIElementSetAttributeValue(app, attribute as CFString, kCFBooleanTrue)
+        }
     }
 
     /// Whether text pasted right now would land in this element.
@@ -197,7 +272,15 @@ enum FrontSelection {
     /// marks get their turn: a text control's role, and a selected text
     /// range, which is the generic sign of something with a caret in it and
     /// catches the editors that answer to neither of the others.
-    private static func takesText(_ element: AXUIElement, role: String?) -> Bool {
+    ///
+    /// **The one exception is a Chromium group.** Web editors hand focus to a
+    /// wrapper that reports its text as unwritable while the editor inside it
+    /// takes the paste: Slack's composer is an `AXGroup` around its real
+    /// `AXTextArea`. Only that role is let through. A read-only field, a
+    /// button or a link in Chromium still answers no.
+    private static func takesText(
+        _ element: AXUIElement, role: String?, chromium: Bool
+    ) -> Bool {
         if isDisabled(element) {
             return false
         }
@@ -205,7 +288,7 @@ enum FrontSelection {
         case .settable:
             return true
         case .fixed:
-            return false
+            return chromium && role == chromiumWrapperRole
         case .unknown:
             break
         }
@@ -217,6 +300,8 @@ enum FrontSelection {
             element, kAXSelectedTextRangeAttribute as CFString, &rangeRef
         ) == .success
     }
+
+    private static let chromiumWrapperRole = "AXGroup"
 
     /// What an element says about writing its text: that it can be written,
     /// that it cannot, or nothing usable. The third is its own answer because
@@ -273,10 +358,12 @@ enum FrontSelection {
     }
 
     /// The current selection, and how it was found.
-    static func read() -> Outcome {
+    static func read(activateChromium: Bool = true) -> Outcome {
         var outcome = Outcome(trusted: AXIsProcessTrusted())
-        outcome.bundleId = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        let frontApp = NSWorkspace.shared.frontmostApplication
+        outcome.bundleId = frontApp?.bundleIdentifier
         if !outcome.trusted {
+            outcome.unavailable = true
             if !promptedForTrust {
                 promptedForTrust = true
                 outcome.promptShown = true
@@ -284,16 +371,22 @@ enum FrontSelection {
             }
             return outcome
         }
+        outcome.chromium = isChromium(frontApp)
+        if activateChromium, outcome.chromium, let pid = frontApp?.processIdentifier {
+            outcome.activationError = turnOnChromiumAccessibility(pid)
+        }
 
         let systemWide = AXUIElementCreateSystemWide()
         AXUIElementSetMessagingTimeout(systemWide, requestTimeoutSeconds)
         var focusedRef: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
+        let focusStatus = AXUIElementCopyAttributeValue(
             systemWide, kAXFocusedUIElementAttribute as CFString, &focusedRef
-        ) == .success,
+        )
+        guard focusStatus == .success,
             let focusedValue = focusedRef,
             CFGetTypeID(focusedValue) == AXUIElementGetTypeID()
         else {
+            outcome.unavailable = outcome.chromium || (focusStatus != .noValue && focusStatus != .attributeUnsupported)
             return outcome
         }
         let focused = focusedValue as! AXUIElement
@@ -301,13 +394,13 @@ enum FrontSelection {
         outcome.focused = true
         outcome.role = stringAttribute(focused, kAXRoleAttribute as CFString)
 
-        var text = stringAttribute(focused, kAXSelectedTextAttribute as CFString) ?? ""
+        let selectedText = stringAttribute(focused, kAXSelectedTextAttribute as CFString)
+        var text = selectedText ?? ""
+        let range = isBlank(text) ? selectedRange(focused) : nil
         var path = Path.selectedText
         if isBlank(text) {
-            // Some text views answer the range but not the selected text
-            // itself; the value is the whole document, and the range picks
-            // the selection out of it.
-            text = selectionFromRange(focused) ?? ""
+            // Some text views expose the range and value but not selected text.
+            text = selectionFromRange(focused, range: range) ?? ""
             path = .range
         }
         if isBlank(text) {
@@ -323,6 +416,7 @@ enum FrontSelection {
         }
         guard !isBlank(text) else {
             outcome.path = path == .copySkipped ? .copySkipped : .none
+            outcome.unavailable = range.map { $0.length > 0 } ?? (selectedText == nil)
             return outcome
         }
 
@@ -336,9 +430,17 @@ enum FrontSelection {
         // and only the copy carries its selection. Known edge: an editor
         // that copies the current line on an empty selection (VS Code) reads
         // as a selection nothing is over.
-        let editable = path == .copy
-            ? textControlRoles.contains(outcome.role ?? "")
-            : isEditable(focused)
+        let editable: Bool
+        if path == .copy {
+            editable = textControlRoles.contains(outcome.role ?? "") && !isDisabled(focused)
+        } else {
+            let status = settability(focused)
+            guard status != .unknown else {
+                outcome.unavailable = true
+                return outcome
+            }
+            editable = status == .settable && !isDisabled(focused)
+        }
         // Whitespace decides only whether anything is selected. What is
         // selected travels as it is: the indentation of a selected snippet is
         // part of what the user is asking about.
@@ -352,25 +454,11 @@ enum FrontSelection {
         return outcome
     }
 
-    /// Whether the focused element takes text: its value or its selected text
-    /// is reported settable. Text fields and text views say so; static text,
-    /// web pages outside a contenteditable and read-only views do not. Asked
-    /// rather than inferred from the role because a text view can be
-    /// read-only and a web area can be an editor.
-    ///
-    /// An element that will not say reads as no here. This decides whether a
-    /// selection can be written back over, and writing over the user's text
-    /// on a guess is the mistake worth avoiding; `takesText` weighs the same
-    /// answer the other way, since what it risks is a paste going nowhere.
-    private static func isEditable(_ element: AXUIElement) -> Bool {
-        settability(element) == .settable
-    }
-
     private static func isBlank(_ text: String) -> Bool {
         text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    private static func selectionFromRange(_ element: AXUIElement) -> String? {
+    private static func selectedRange(_ element: AXUIElement) -> CFRange? {
         var rangeRef: CFTypeRef?
         guard AXUIElementCopyAttributeValue(
             element, kAXSelectedTextRangeAttribute as CFString, &rangeRef
@@ -381,9 +469,14 @@ enum FrontSelection {
             return nil
         }
         var range = CFRange()
-        guard AXValueGetValue(rangeValue as! AXValue, .cfRange, &range), range.length > 0 else {
+        guard AXValueGetValue(rangeValue as! AXValue, .cfRange, &range) else {
             return nil
         }
+        return range
+    }
+
+    private static func selectionFromRange(_ element: AXUIElement, range: CFRange?) -> String? {
+        guard let range, range.length > 0 else { return nil }
         guard let value = stringAttribute(element, kAXValueAttribute as CFString) else {
             return nil
         }

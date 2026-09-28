@@ -1,4 +1,12 @@
 {
+  "askQuestionDetail": {
+    "heading": "{count, plural, one {Pregunta} other {Preguntas}}"
+  },
+  "documentChat": {
+    "saveFailed": "No se pudo guardar el documento. Tu mensaje sigue aquí. Intenta enviarlo de nuevo.",
+    "viewConversation": "Ver conversación",
+    "reopenDocument": "Reabrir documento"
+  },
   "acpChatPlanBlock": {
     "plan": "Plan"
   },
@@ -18,6 +26,7 @@
   },
   "acpConnectAffordance": {
     "connectButton": "Conectar",
+    "dismissButton": "Descartar",
     "errorFallback": "No se pudo conectar Claude. Inténtalo de nuevo.",
     "pastePlaceholder": "Pega tu clave",
     "saveButton": "Guardar",
@@ -35,6 +44,7 @@
     "closeRunDetail": "Cerrar el detalle de la ejecución",
     "goToNewest": "Ir al más reciente",
     "inputLabel": "Entrada",
+    "modelLabel": "Modelo",
     "objective": "Objetivo",
     "outputLabel": "Salida",
     "sendSteerAria": "Enviar instrucción de orientación",
@@ -54,12 +64,28 @@
     "takingLonger": "Tu asistente está tardando más de lo esperado.",
     "tryAgain": "Reintentar"
   },
+  "markAllDoneConfirmDialog": {
+    "confirm": "Marcar todo como hecho",
+    "message": "{count, plural, one {¿Marcar como hecha la conversación en “{groupName}”? Sale de la barra lateral y te espera en Todos los chats, donde puedes reabrirla.} other {¿Marcar como hechas las # conversaciones en “{groupName}”? Salen de la barra lateral y te esperan en Todos los chats, donde puedes reabrirlas.}}",
+    "title": "Marcar todo como hecho"
+  },
+  "mobileDetailSheet": {
+    "title": "Detalles de la actividad"
+  },
   "activityStepsPanel": {
     "backAria": "Volver a todos los pasos",
     "backTooltip": "Todos los pasos",
     "closeSteps": "Cerrar pasos",
-    "thinkingTitle": "Pensando",
+    "screenshotAria": "Vista previa de la captura de pantalla de {activity}",
+    "screenshotFallbackAria": "Vista previa de la captura de pantalla del ordenador",
+    "screenshotFallbackTitle": "Captura de pantalla del ordenador",
+    "screenshotTitle": "Captura de pantalla de {activity}",
     "viewThinkingAria": "Ver razonamiento"
+  },
+  "computerUseScreenshotPreview": {
+    "unavailable": "La captura de pantalla más reciente no está disponible.",
+    "unavailableShowingPrevious": "La captura de pantalla más reciente no está disponible. Se muestra la captura anterior.",
+    "updating": "Actualizando la captura de pantalla..."
   },
   "addToChatSheet": {
     "camera": "Cámara",
@@ -86,6 +112,95 @@
   },
   "assistantContentDisclosure": {
     "earlierActivity": "Actividad anterior"
+  },
+  "actionDisplay": {
+    "click": "Haciendo clic",
+    "type": "Escribiendo",
+    "keyPress": "Pulsando una tecla",
+    "scroll": "Desplazando",
+    "drag": "Arrastrando",
+    "hover": "Pasando el cursor",
+    "observe": "Observando",
+    "navigate": "Navegando",
+    "terminal": "Ejecutando un comando"
+  },
+  "allChatsPage": {
+    "band": {
+      "previous30Days": "Últimos 30 días",
+      "previous7Days": "Últimos 7 días",
+      "today": "Hoy",
+      "yesterday": "Ayer"
+    },
+    "chip": {
+      "all": "Todos",
+      "background": "En segundo plano",
+      "done": "Hecho"
+    },
+    "empty": "Aún no hay chats aquí.",
+    "filterAria": "Filtrar chats",
+    "loadError": "No se pudieron cargar tus chats.",
+    "loading": "Cargando chats",
+    "noMatches": "Ningún chat coincide con «{query}».",
+    "retry": "Reintentar",
+    "searchPlaceholder": "Buscar chats",
+    "title": "Todos los chats",
+    "close": "Cerrar todos los chats",
+    "openChat": "Ir a la conversación",
+    "doneLabel": "{title}, completado",
+    "unread": "Sin leer",
+    "running": "En curso",
+    "needsAttention": "Requiere atención",
+    "runningCount": "{count, plural, one {# tarea en curso} other {# tareas en curso}}"
+  },
+  "sessionGroupRow": {
+    "mode": {
+      "computerUse": "Sesión de ordenador",
+      "browser": "Sesión del navegador",
+      "liveVision": "Sesión de visión en directo",
+      "ambient": "Sesión ambiental"
+    },
+    "durationSeconds": "{count, plural, one {# s} other {# s}}",
+    "durationMinutes": "{count, plural, one {# min} other {# min}}",
+    "working": "Trabajando",
+    "workingWithDuration": "Trabajando · {duration}",
+    "waiting": "Esperando",
+    "waitingWithDuration": "Esperando · {duration}",
+    "finishing": "Finalizando",
+    "finishingWithDuration": "Finalizando · {duration}",
+    "completedWithDurationAndEnd": "{duration} · Finalizó a las {endTime}",
+    "completedWithDuration": "{duration}",
+    "completedWithEnd": "Finalizó a las {endTime}",
+    "interrupted": "Interrumpida",
+    "interruptedWithDurationAndEnd": "Interrumpida · {duration} · Finalizó a las {endTime}",
+    "interruptedWithDurationAndLastActivity": "Interrumpida · {duration} · Última actividad a las {lastActivityTime}",
+    "interruptedWithLastActivity": "Interrumpida · Última actividad a las {lastActivityTime}",
+    "interruptedWithEnd": "Interrumpida · Finalizó a las {endTime}",
+    "disconnected": "Conexión perdida",
+    "disconnectedWithDurationAndLastActivity": "Conexión perdida · {duration} · Última actividad a las {lastActivityTime}",
+    "disconnectedWithLastActivity": "Conexión perdida · Última actividad a las {lastActivityTime}",
+    "timingUnavailable": "Horario no disponible"
+  },
+  "assistantDesktop": {
+    "fitView": "Ajustar",
+    "panView": "Desplazar",
+    "controlView": "Controlar",
+    "panHint": "Arrastra para desplazarte. Toca para hacer clic.",
+    "hideAria": "Ocultar escritorio virtual",
+    "closeAria": "Cerrar vista previa del escritorio virtual",
+    "moveAria": "Mover vista previa del escritorio virtual (teclas de flecha)",
+    "resizeAria": "Cambiar tamaño de la vista previa del escritorio virtual (teclas de flecha)",
+    "expandAria": "Ampliar escritorio virtual",
+    "busy": "Otro usuario está usando el escritorio virtual.",
+    "connecting": "Conectando con el escritorio virtual…",
+    "failed": "No se pudo iniciar el escritorio virtual.",
+    "lost": "Se perdió la conexión con el escritorio virtual.",
+    "openAria": "Abrir el escritorio virtual de {name}",
+    "openUnnamedAria": "Abrir escritorio virtual",
+    "reconnectButton": "Reconectar",
+    "title": "Escritorio",
+    "unavailable": "El escritorio virtual no está disponible en este asistente.",
+    "checkingSetup": "Comprobando el escritorio virtual…",
+    "setupRequestFailed": "No se pudo comprobar la instalación. Vuelve a conectar para intentarlo de nuevo."
   },
   "assistantNavItem": {
     "newChat": "Chat nuevo"
@@ -270,6 +385,22 @@
     "unsupported": "Este dispositivo no puede abrir una cámara.",
     "uploadFailed": "No se pudo enviar esa foto."
   },
+  "cameraExplainer": {
+    "close": "Cerrar",
+    "gotIt": "Entendido",
+    "liveBody": "{name} mira mientras mueves la cámara. Solo habla de lo que {name} ve.",
+    "liveBodyDesktop": "{name} mira mientras mueves la cámara. Solo habla de lo que {name} ve. Detenlo cuando quieras.",
+    "liveTag": "En vivo",
+    "liveTitle": "En vivo",
+    "photoBody": "Toma una foto. {name} ve solo esa foto.",
+    "photoTitle": "Foto",
+    "privacy": "Todo lo que {name} ve se queda en el espacio de trabajo privado de {name}. El modo en vivo termina cuando cierras la cámara.",
+    "subtitle": "Elige cómo {name} ve lo que estás enfocando. Puedes cambiar cuando quieras.",
+    "title": "¿Foto o en vivo?",
+    "tryLive": "Probar en vivo ahora",
+    "tryLiveDesktop": "Probar en vivo",
+    "yourAssistant": "tu asistente"
+  },
   "cameraShutterHint": {
     "live": "En vivo · Toca para detener",
     "liveDescription": "Toca para detener el video en vivo.",
@@ -291,10 +422,11 @@
   },
   "cameraViewOptions": {
     "buttonAria": "Opciones de vista de la cámara",
-    "gateHudDescription": "El panel de ajuste de lo que conserva el modo en vivo.",
-    "gateHudTitle": "Lectura del filtro de fotogramas",
-    "keptFrameDescription": "El último fotograma enviado en vivo, junto a tus fotos. El envío continúa igualmente.",
-    "keptFrameTitle": "Último fotograma",
+    "gateHudDescription": "Superposición de depuración: cómo el modo en vivo elige qué fotogramas enviar.",
+    "gateHudTitle": "Ajuste del filtro de fotogramas",
+    "howItWorks": "Cómo funcionan Foto y En vivo",
+    "keptFrameDescription": "Muestra el fotograma más reciente que envió el modo en vivo.",
+    "keptFrameTitle": "Último fotograma compartido",
     "title": "Mostrar"
   },
   "cardSurface": {
@@ -356,6 +488,24 @@
     "dismiss": "Descartar",
     "removeAria": "Quitar {filename}"
   },
+  "emailReferenceChip": {
+    "noSubject": "(sin asunto)",
+    "captionReceived": "Recibido · De {name} · {date}",
+    "captionReceivedUndated": "Recibido · De {name}",
+    "captionSent": "Enviado · Para {name} · {date}",
+    "captionSentUndated": "Enviado · Para {name}",
+    "tooltip": "{subject}\n{caption}",
+    "removeAria": "Quitar el correo {subject}"
+  },
+  "emailReferenceCard": {
+    "noSubject": "(sin asunto)",
+    "captionReceived": "Recibido · De {name} · {date}",
+    "captionReceivedUndated": "Recibido · De {name}",
+    "captionSent": "Enviado · Para {name} · {date}",
+    "captionSentUndated": "Enviado · Para {name}",
+    "tooltip": "{subject}\n{caption}",
+    "openAria": "Abrir el correo {subject} en la bandeja"
+  },
   "chatBody": {
     "dropFiles": "Suelta archivos para adjuntarlos"
   },
@@ -375,8 +525,8 @@
   },
   "chatConversationHeader": {
     "archived": "[Archivado]",
-    "newChat": "Chat nuevo",
-    "untitled": "Sin título"
+    "done": "[Hecho]",
+    "newChat": "Chat nuevo"
   },
   "chatInfoPanel": {
     "appsTitle": "Apps",
@@ -396,7 +546,17 @@
     "seeAllAppsAria": "Ver todas las apps",
     "seeAllFilesAria": "Ver todos los documentos e imágenes",
     "seeAllFramesAria": "Ver todos los fotogramas de la cámara",
-    "title": "Información del chat"
+    "title": "Información del chat",
+    "retry": "Reintentar",
+    "retrySourceAria": "Reintentar {source}",
+    "documentsSource": "Documentos",
+    "attachmentsSource": "Archivos adjuntos",
+    "sourceLoading": "Cargando {source}…",
+    "sourceLoadFailed": "No se pudo cargar: {source}.",
+    "sourceRefreshFailed": "No se pudo actualizar: {source}. Se muestran los resultados guardados.",
+    "sourcePageFailed": "No se pudieron cargar más elementos de {source}.",
+    "framesUnsupported": "La clasificación de fotogramas de cámara no está disponible en esta versión del asistente.",
+    "loadedHistory": "Los archivos adjuntos solo incluyen el historial de chat cargado."
   },
   "chatLayout": {
     "navigationAria": "Navegación"
@@ -460,6 +620,9 @@
     "title": "Limpiando tu asistente…",
     "warningAria": "advertencia"
   },
+  "coachmarkPress": {
+    "turn": "Hice clic en {label}. ¿Y ahora qué?"
+  },
   "collapsedGroupIcon": {
     "noConversations": "No hay conversaciones"
   },
@@ -516,6 +679,7 @@
     "warningTitle": "Esto parece una clave de API"
   },
   "composerSettingsMenu": {
+    "autoPreview": "Auto · {profile}",
     "accessAria": "Acceso del asistente: {label}",
     "assistantAccess": "Acceso del asistente",
     "assistantAccessTitle": "Acceso del asistente",
@@ -603,8 +767,10 @@
     "copyConversation": "Copiar conversación completa",
     "copyConversationId": "Copiar ID de conversación",
     "delete": "Eliminar",
+    "done": "Hecho",
     "forkConversation": "Bifurcar conversación",
     "inspect": "Analizar conversación",
+    "markAsDone": "Marcar como hecho",
     "markRead": "Marcar como leída",
     "markUnread": "Marcar como no leída",
     "moveToGroup": "Mover al grupo",
@@ -614,6 +780,7 @@
     "refresh": "Actualizar",
     "removeFromGroup": "Quitar del grupo",
     "rename": "Cambiar nombre",
+    "reopen": "Reabrir",
     "shareFeedback": "Enviar comentarios",
     "triggerAriaLabel": "Acciones de conversación",
     "unarchive": "Desarchivar",
@@ -638,10 +805,12 @@
     "ariaLabelUnavailable": "Recursos de la conversación, no se pudieron cargar",
     "ariaLabelUnseen": "Recursos de la conversación, {count, plural, one {# elemento} other {# elementos}} (cambios sin ver)",
     "label": "{count, plural, one {# recurso} other {# recursos}}",
-    "labelUnavailable": "No se pudieron cargar los recursos"
-  },
-  "conversationRow": {
-    "untitled": "Sin título"
+    "labelUnavailable": "No se pudieron cargar los recursos",
+    "labelPartial": "No se pudieron cargar algunos recursos",
+    "ariaLabelPartial": "Recursos de la conversación, algunos no se pudieron cargar",
+    "labelLoaded": "{count, plural, one {# recurso cargado} other {# recursos cargados}}",
+    "ariaLabelLoaded": "Recursos de la conversación, {count, plural, one {# elemento cargado} other {# elementos cargados}}",
+    "ariaLabelLoadedUnseen": "Recursos de la conversación, {count, plural, one {# elemento cargado} other {# elementos cargados}} (cambios sin ver)"
   },
   "conversationStarterDock": {
     "caption": "Prueba algunas sugerencias:"
@@ -652,10 +821,6 @@
   "copyBlockSurface": {
     "copied": "Copiado",
     "copy": "Copiar"
-  },
-  "copyButton": {
-    "copied": "Copiado",
-    "copyFailed": "No se pudo copiar al portapapeles."
   },
   "copyIdToClipboard": {
     "conversationCopied": "ID de conversación copiado al portapapeles.",
@@ -673,8 +838,8 @@
   },
   "csvPreview": {
     "emptyFile": "Este archivo está vacío",
-    "summary": "{rows} filas x {columns} columnas",
-    "summaryTruncated": "{rows} filas x {columns} columnas (truncado)"
+    "summary": "{rows, plural, one {# fila} other {# filas}} x {columns, plural, one {# columna} other {# columnas}}",
+    "summaryTruncated": "{rows, plural, one {# fila} other {# filas}} x {columns, plural, one {# columna} other {# columnas}} (truncado)"
   },
   "dailyLimitBanner": {
     "skipConfirmTitle": "¿Omitir el límite de créditos de hoy?",
@@ -688,8 +853,7 @@
     "cancel": "Cancelar",
     "confirm": "Eliminar",
     "message": "¿Eliminar “{title}”? Esto borra la conversación y sus mensajes de forma permanente. Los recursos y recuerdos relacionados pueden seguir existiendo. Esta acción no se puede deshacer.",
-    "title": "Eliminar conversación",
-    "untitled": "Sin título"
+    "title": "Eliminar conversación"
   },
   "deletedMessageRow": {
     "label": "Este mensaje fue eliminado"
@@ -732,8 +896,8 @@
     "close": "Cerrar",
     "closeDocumentAria": "Cerrar documento",
     "comments": "Comentarios",
+    "commentsWithOpenCount": "{count, plural, one {Comentarios, # abierto} other {Comentarios, # abiertos}}",
     "export": "Exportar",
-    "hideComments": "Ocultar comentarios",
     "menuAria": "Opciones del documento",
     "rename": "Cambiar nombre",
     "renameFailed": "No se pudo cambiar el nombre del documento.",
@@ -743,11 +907,22 @@
     "saving": "Guardando…",
     "wordCount": "{count, plural, one {# palabra} other {# palabras}}"
   },
+  "documentConversation": {
+    "unavailable": "No se puede abrir la conversación del documento. Inténtalo de nuevo.",
+    "updateRequired": "Actualiza tu asistente para iniciar una conversación vinculada.",
+    "prepareFailed": "No se pudo preparar la conversación del documento. Tus cambios siguen disponibles.",
+    "feedbackPrompt": "Revisa y atiende mis comentarios sobre \"{title}\".",
+    "missing": "La conversación de este documento no está disponible. Puedes seguir editando o iniciar una nueva conversación vinculada.",
+    "start": "Iniciar una conversación vinculada",
+    "retry": "Intentar de nuevo",
+    "back": "Volver"
+  },
   "documentViewerPage": {
     "exportFailed": "No se pudo exportar el PDF",
     "notFound": "Documento no encontrado."
   },
   "dynamicPageSurface": {
+    "collapse": "Contraer",
     "titleFallback": "Contenido dinámico"
   },
   "exportProgressModal": {
@@ -787,6 +962,7 @@
     "accepted": "Aceptados: {types}",
     "dropHint": "Arrastra y suelta archivos aquí, o haz clic para explorar",
     "maxSize": "Tamaño máximo: {size}",
+    "removeFile": "Eliminar {name}",
     "upload": "Subir",
     "uploading": "Subiendo..."
   },
@@ -804,6 +980,7 @@
     "deleteGroup": "Eliminar grupo",
     "deleteGroupWithConversations": "Eliminar grupo…",
     "groupByChannel": "Agrupar por canal",
+    "markAllAsDone": "Marcar todo como hecho…",
     "markAllRead": "Marcar todas como leídas",
     "moveSectionDown": "Bajar sección",
     "moveSectionUp": "Subir sección",
@@ -889,7 +1066,8 @@
     "muted": "Silenciado",
     "reconnecting": "Reconectando…",
     "speaking": "Hablando…",
-    "thinking": "Pensando…"
+    "thinking": "Pensando…",
+    "working": "Trabajando en ello…"
   },
   "llmCallErrorCard": {
     "chipCode": "Código",
@@ -908,7 +1086,13 @@
     "pictureInPictureUnavailable": "Imagen sobre imagen no está disponible"
   },
   "localFileLink": {
-    "unavailable": "Este archivo no está disponible aquí"
+    "closePreview": "Cerrar vista previa: {filename}",
+    "fileOptions": "Opciones del archivo: {filename}",
+    "openInWorkspace": "Abrir en el espacio de trabajo: {filename}",
+    "openPreview": "Abrir vista previa: {filename}",
+    "unavailable": "Este archivo no está disponible aquí",
+    "unavailableLabel": "Archivo no disponible: {filename}",
+    "viewImage": "Ver imagen: {filename}"
   },
   "localFileMenu": {
     "download": "Descargar",
@@ -1121,20 +1305,34 @@
     "title": "Archivos"
   },
   "messageHoverActions": {
+    "autoRouted": "Auto · {profile}",
     "bookmark": "Marcador",
     "copied": "Copiado",
     "copy": "Copiar",
+    "copyFailed": "No se pudo copiar el mensaje.",
     "forkFromHere": "Bifurcar desde aquí",
     "inspect": "Inspeccionar",
+    "loading": "Leyendo…",
     "openInSlack": "Abrir en Slack",
+    "playFailed": "No se pudo leer este mensaje.",
+    "readAloud": "Leer en voz alta",
     "removeBookmark": "Quitar marcador",
     "retry": "Reintentar",
+    "stop": "Detener",
     "summarizeUpToHere": "Resumir hasta aquí"
   },
   "messageLongPressActions": {
     "bookmark": "Marcar",
     "copied": "Copiado",
+    "copy": "Copiar",
+    "copyFailed": "No se pudo copiar el mensaje.",
+    "forkFromHere": "Bifurcar desde aquí",
+    "inspect": "Inspeccionar",
+    "openInSlack": "Abrir en Slack",
+    "readAloud": "Leer en voz alta",
     "removeBookmark": "Quitar marcador",
+    "stop": "Detener",
+    "summarizeUpToHere": "Resumir hasta aquí",
     "title": "Acciones del mensaje"
   },
   "micPermissionPrimer": {
@@ -1187,6 +1385,7 @@
     "defaultDescription": "Conecta {name} para que pueda usarlo en esta tarea.",
     "dismiss": "Descartar",
     "missingDetails": "Faltan detalles del asistente o del proveedor.",
+    "tenantHostInvalid": "Introduce un {label} válido, por ejemplo {placeholder}",
     "thisAccount": "esta cuenta",
     "waiting": "Esperando...",
     "yourAssistant": "Tu asistente"
@@ -1269,12 +1468,15 @@
   },
   "preferencesMenu": {
     "admin": "Admin",
+    "earnCredits": "Gana créditos gratis",
     "preferences": "Preferencias",
     "settings": "Ajustes",
     "shareFeedback": "Compartir comentarios"
   },
   "preferencesUsagePanel": {
     "addCreditsAriaLabel": "Añadir créditos",
+    "dailyExhausted": "Uso diario agotado. Añade créditos para continuar.",
+    "dailyTitle": "Uso diario",
     "exhausted": "Añade créditos para continuar.",
     "extraCredits": "Usando créditos de uso adicional",
     "pctUsed": "{pct}% usado",
@@ -1367,6 +1569,10 @@
     "ariaLabel": "Citar y responder",
     "cancel": "Cancelar",
     "placeholder": "Escribe tu respuesta…"
+  },
+  "rawDisclosure": {
+    "input": "Entrada sin procesar",
+    "output": "Salida sin procesar"
   },
   "rawTab": {
     "copyRequestPayloadAriaLabel": "Copiar carga de la solicitud",
@@ -1466,6 +1672,8 @@
     "submitFailed": "No se pudo enviar el secreto. Inténtalo de nuevo."
   },
   "secretPromptCard": {
+    "showValue": "Mostrar valor",
+    "hideValue": "Ocultar valor",
     "cancel": "Cancelar",
     "domains": "Dominios: {list}",
     "placeholder": "Introduce el valor secreto...",
@@ -1506,12 +1714,17 @@
   "sidebarListContextMenu": {
     "newGroup": "Grupo nuevo…"
   },
+  "sidebarSectionViewAll": {
+    "label": "Ver todos los chats"
+  },
+  "chatsSection": {
+    "doneEmptyBody": "Los chats que marcas como hechos te esperan en Todos los chats.",
+    "doneEmptyTitle": "Todo al día.",
+    "emptyBody": "Inicia un chat nuevo y aparecerá aquí.",
+    "emptyTitle": "Aún no hay chats."
+  },
   "singleActivity": {
     "webSearch": "Búsqueda web"
-  },
-  "skillCreatedCard": {
-    "view": "Ver",
-    "viewAria": "Ver {name}"
   },
   "skillDetailPanel": {
     "actionsAria": "Acciones de habilidad",
@@ -1523,21 +1736,20 @@
     "titleFallback": "Habilidad"
   },
   "skillExecuteDetail": {
-    "parameters": "Parámetros",
-    "rawInput": "Entrada sin procesar",
-    "runningSuffix": " · en ejecución"
+    "runningSuffix": " · en ejecución",
+    "unnamedTool": "Herramienta de habilidad"
   },
   "skillLoadCard": {
     "view": "Ver"
   },
   "skillLoadDetail": {
+    "failed": "No se pudo cargar",
+    "loading": "Cargando habilidad…",
     "loadingAria": "Cargando habilidad",
+    "notApproved": "No aprobada",
     "provides": "Proporciona",
+    "unnamedSkill": "Habilidad",
     "usedSkill": "Habilidad usada"
-  },
-  "skillLoadOutput": {
-    "output": "Salida",
-    "outputFormatAria": "Formato de salida"
   },
   "skillToolList": {
     "fromSkill": "De {name}"
@@ -1566,8 +1778,6 @@
     "noEventsYet": "Aún no hay eventos",
     "objective": "Objetivo",
     "output": "Salida",
-    "showLess": "Mostrar menos",
-    "showMore": "Mostrar más",
     "stopSubagentAria": "Detener subagente",
     "timeline": "Línea de tiempo"
   },
@@ -1607,7 +1817,9 @@
   "tableSurface": {
     "copied": "Copiado",
     "copy": "Copiar",
-    "copyAria": "Copiar tabla como markdown"
+    "copyAria": "Copiar tabla como markdown",
+    "copyFailed": "No se pudo copiar la tabla.",
+    "table": "Tabla"
   },
   "taskPreferencesSurface": {
     "continue": "Continuar",
@@ -1624,10 +1836,34 @@
   "textSelectionPopover": {
     "reply": "Responder"
   },
+  "thinkingDetail": {
+    "title": "Pensando"
+  },
   "tiptapDocumentEditor": {
     "adding": "Añadiendo…",
+    "blockquote": "Cita",
+    "bold": "Negrita",
+    "bulletList": "Lista con viñetas",
+    "code": "Código",
     "comment": "Comentar",
-    "feedbackPlaceholder": "Añade tu comentario…"
+    "feedbackPlaceholder": "Añade tu comentario…",
+    "heading1": "Título 1",
+    "heading2": "Título 2",
+    "heading3": "Título 3",
+    "italic": "Cursiva",
+    "link": "Enlace",
+    "linkAddress": "Dirección del enlace",
+    "linkApply": "Aplicar enlace",
+    "linkInvalid": "Usa una dirección web o de correo",
+    "linkPlaceholder": "Pega o escribe un enlace",
+    "linkRemove": "Quitar enlace",
+    "orderedList": "Lista numerada",
+    "paragraph": "Texto",
+    "placeholder": "Empieza a escribir…",
+    "remoteEditConflict": "Se conservaron tus cambios donde el asistente modificó el mismo texto, así que parte de su edición no se aplicó.",
+    "strike": "Tachado",
+    "textStyle": "Estilo de texto: {style}",
+    "toolbarAria": "Formato"
   },
   "toolCallChip": {
     "allow": "Permitir",
@@ -1655,10 +1891,19 @@
     "command": "Comando",
     "denied": "Esta llamada a la herramienta no se aprobó, así que no se ejecutó.",
     "emptyOutput": "La herramienta no devolvió ninguna salida.",
-    "input": "Entrada",
     "output": "Salida",
     "requestedChanges": "Cambios solicitados",
     "running": "Ejecutando…"
+  },
+  "toolInputParameters": {
+    "parameters": "Parámetros",
+    "moreCount": "{count, plural, one {# más en Entrada sin procesar} other {# más en Entrada sin procesar}}"
+  },
+  "toolOutputSection": {
+    "moreCount": "{count, plural, one {# más en Salida sin procesar} other {# más en Salida sin procesar}}"
+  },
+  "valueFields": {
+    "copyValue": "Copiar {label}"
   },
   "toolStepPill": {
     "openAria": "Abrir {label}",
@@ -1682,9 +1927,6 @@
     "assistantBusy": "Tu asistente está ocupado. Inténtalo de nuevo cuando termine de responder.",
     "retryFailed": "No se pudo reintentar la respuesta",
     "summarizeFailed": "No se pudo resumir la conversación"
-  },
-  "useNativeWidgetSnapshotSync": {
-    "untitled": "Sin título"
   },
   "useSendMessage": {
     "commandFailed": "No se pudo ejecutar ese comando. Inténtalo de nuevo.",
@@ -1714,6 +1956,7 @@
     "seed": "Hola, acabo de iniciar una conversación de voz contigo. Este mensaje se envía automáticamente. Salúdame en una frase corta y luego pregúntame en qué quiero trabajar."
   },
   "voiceErrors": {
+    "selectionUnavailable": "No se pudo leer el texto seleccionado. No se pegó nada. Vuelve a seleccionar el texto e inténtalo de nuevo; puedes copiar tus palabras dictadas.",
     "nativeSttNoTranscript": "El dictado nativo de {clientName} no devolvió una transcripción. Revisa el reconocimiento de voz nativo en los ajustes del sistema e inténtalo de nuevo."
   },
   "voiceFirstRunCard": {
@@ -1779,12 +2022,12 @@
     "workflowFinished": "Flujo de trabajo finalizado"
   },
   "wakeDetailPanel": {
-    "close": "Cerrar",
     "details": "Detalles",
     "result": "Resultado",
     "runStatus": "Estado de la ejecución",
     "title": "La conversación se activó",
-    "workflow": "Flujo de trabajo"
+    "workflow": "Flujo de trabajo",
+    "closeAria": "Cerrar detalles"
   },
   "weatherForecastDisplay": {
     "celsius": "°C",
@@ -1794,13 +2037,10 @@
     "now": "Ahora"
   },
   "webFetchDetailView": {
-    "content": "Contenido",
     "fetchFailed": "La obtención falló.",
-    "fetching": "Obteniendo…",
-    "noContent": "No se extrajo contenido.",
-    "rawResult": "Resultado sin procesar",
-    "viewExtracted": "Ver extraído",
-    "viewRaw": "Ver sin procesar"
+    "mayRequireJavaScript": "Es posible que esta página necesite JavaScript para mostrarlo todo, así que puede faltar parte del contenido.",
+    "startIndexPastEnd": "La lectura empezó después del final de esta página, así que no se leyó nada.",
+    "truncated": "Solo se leyó parte de esta página."
   },
   "webSearchDetailView": {
     "noSources": "No se encontraron fuentes.",
@@ -1844,6 +2084,21 @@
   "workspacePathLink": {
     "openTitle": "Abrir {path}"
   },
+  "xlsxPreview": {
+    "beyondPreviewLimit": "Esta hoja solo tiene celdas más allá del límite de previsualización",
+    "emptySheet": "Esta hoja está vacía",
+    "sheetUnreadable": "No se pudo leer esta hoja",
+    "sheetsAria": "Hojas",
+    "sheetsOmitted": "{count, plural, one {# hoja más no se muestra} other {# hojas más no se muestran}}",
+    "summary": "{sheet}: {rows, plural, one {# fila} other {# filas}} x {columns, plural, one {# columna} other {# columnas}}",
+    "summaryTruncated": "{sheet}: {rows, plural, one {# fila} other {# filas}} x {columns, plural, one {# columna} other {# columnas}} (truncado)",
+    "summaryColumnsCut": "{sheet}: {rows, plural, one {# fila} other {# filas}} x {columns, number} de {total, plural, one {# columna} other {# columnas}}",
+    "summaryRowsCut": "{sheet}: {rows, number} de {total, plural, one {# fila} other {# filas}} x {columns, plural, one {# columna} other {# columnas}}",
+    "summaryBothCut": "{sheet}: {rows, number} de {totalRows, plural, one {# fila} other {# filas}} x {columns, number} de {totalColumns, plural, one {# columna} other {# columnas}}",
+    "countsColumnsCut": "{rows, plural, one {# fila} other {# filas}} x {columns, number} de {total, plural, one {# columna} other {# columnas}}",
+    "countsRowsCut": "{rows, number} de {total, plural, one {# fila} other {# filas}} x {columns, plural, one {# columna} other {# columnas}}",
+    "countsBothCut": "{rows, number} de {totalRows, plural, one {# fila} other {# filas}} x {columns, number} de {totalColumns, plural, one {# columna} other {# columnas}}"
+  },
   "transcript": {
     "noResponse": "Decidió no responder",
     "reactionAddedSelf": "Reaccionó con {emoji}",
@@ -1867,5 +2122,53 @@
     "failedReplacementRejected": "Vellum rechazó la credencial de reemplazo. Inicia sesión en la plataforma Vellum y vuelve a intentarlo.",
     "failedUnconfirmed": "El reemplazo se guardó, pero no se pudo confirmar con Vellum. Puede que empiece a funcionar en breve.",
     "failedGeneric": "No se pudo restaurar el acceso. Inténtalo de nuevo en un momento."
+  },
+  "sidebarExpandRow": {
+    "expand": "Expandir",
+    "collapse": "Contraer"
+  },
+  "cameraFrameGrid": {
+    "count": "{count, plural, one {# fotograma de cámara} other {# fotogramas de cámara}}",
+    "timeRange": "Guardados de {first} a {last}",
+    "savedTime": "Guardado: {time}",
+    "pendingAria": "Fotograma de cámara, la imagen aún se está cargando. {time}",
+    "timeUnavailable": "Hora no disponible"
+  },
+  "desktopHelpCard": {
+    "showPreview": "Mostrar vista previa en directo",
+    "needsHelp": "El escritorio virtual necesita tu ayuda.",
+    "stepIn": "Intervenir",
+    "done": "Listo",
+    "skip": "Omitir",
+    "showMore": "Mostrar más",
+    "showLess": "Mostrar menos"
+  },
+  "rememberDetail": {
+    "saved": "Guardado",
+    "saving": "Guardando",
+    "notSaved": "No guardado"
+  },
+  "recallDetail": {
+    "searchedFor": "Se buscó",
+    "scope": "{depth} · {sources}",
+    "answer": "Respuesta",
+    "evidence": "{count, plural, one {# resultado} other {# resultados}}",
+    "noEvidence": "No apareció nada relevante.",
+    "degraded": "No se pudo buscar por completo en algunos lugares",
+    "degradedSource": "{source}: {error}"
+  },
+  "recallLabels": {
+    "source": "{source, select, memory {Memoria} conversations {Conversaciones} workspace {Archivos del espacio de trabajo} other {{source}}}",
+    "depth": "{depth, select, fast {Búsqueda rápida} standard {Búsqueda estándar} deep {Búsqueda profunda} other {Búsqueda}}"
+  },
+  "freeTierDailyLimitBanner": {
+    "addCredits": "Añadir créditos",
+    "subtitle": "Has usado el uso gratuito de hoy. Se reinicia a las {resetPhrase}. Mejora tu plan o añade créditos para continuar.",
+    "title": "Uso gratuito diario agotado",
+    "viewPlans": "Ver planes"
+  },
+  "emailNavItem": {
+    "label": "Correo",
+    "unpin": "Quitar Correo"
   }
 }

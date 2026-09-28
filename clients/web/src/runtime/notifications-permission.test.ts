@@ -22,10 +22,12 @@ mock.module("@/runtime/native-auth", () => ({
 }));
 mock.module("@/runtime/platform-detection", () => ({
   isNativeAndroid: () => false,
+  isNativeIOS: () => false,
 }));
 mock.module("@/runtime/push-registration", () => ({
   hasSessionConfirmedRemotePushRegistration: () => false,
   extractPushConversationId: () => undefined,
+  extractScopedPushTapPayload: () => null,
 }));
 mock.module("@/runtime/android-notification-channels", () => ({
   ANDROID_ALERTS_CHANNEL_ID: "vellum-alerts",
@@ -45,7 +47,7 @@ mock.module("@/generated/daemon/sdk.gen", () => ({
   },
 }));
 
-const { postLocalNotification, __resetNotificationsStateForTests } =
+const { postLocalNotification, requestBrowserNotificationPermission, __resetNotificationsStateForTests } =
   await import("@/runtime/notifications");
 
 // ── Notification stub ────────────────────────────────────────────────────────
@@ -110,7 +112,8 @@ const intent = (deliveryId: string, title: string) => ({
 
 describe("ensureNotificationPermission single-flight", () => {
   test("intents arriving during an unanswered prompt post once it is granted", async () => {
-    // Three intents land back-to-back while the user is in another app.
+    const permissionRequest = requestBrowserNotificationPermission();
+    // Intents share the explicit permission request in progress.
     const inFlight = [
       postLocalNotification(intent("d1", "Test 1")),
       postLocalNotification(intent("d2", "Test 2")),
@@ -124,6 +127,7 @@ describe("ensureNotificationPermission single-flight", () => {
 
     // The user returns and clicks Allow.
     settlePrompt?.("granted");
+    await permissionRequest;
     await Promise.all(inFlight);
 
     expect(posted).toEqual(["Test 1", "Test 2", "Test 3"]);
@@ -137,9 +141,11 @@ describe("ensureNotificationPermission single-flight", () => {
   });
 
   test("a denial is reported as such and never re-prompts", async () => {
+    const permissionRequest = requestBrowserNotificationPermission();
     const first = postLocalNotification(intent("d1", "Test 1"));
     await reachPrompt();
     settlePrompt?.("denied");
+    await permissionRequest;
     await first;
 
     await postLocalNotification(intent("d2", "Test 2"));
@@ -168,4 +174,24 @@ describe("ensureNotificationPermission single-flight", () => {
     expect(posted).toEqual(["Test 1"]);
     expect(promptCallCount).toBe(0);
   });
+});
+
+test("background events never open a browser permission prompt", async () => {
+  await postLocalNotification(intent("d1", "Test 1"));
+  expect(promptCallCount).toBe(0);
+  expect(posted).toEqual([]);
+  expect(ackArgs[0]?.body).toEqual({
+    deliveryId: "d1", success: false, errorMessage: "Notification authorization prompt",
+  });
+});
+
+test("an explicit gesture retries an unanswered browser permission prompt", async () => {
+  const first = requestBrowserNotificationPermission();
+  expect(promptCallCount).toBe(1);
+  settlePrompt?.("default");
+  expect(await first).toBe("prompt");
+  const second = requestBrowserNotificationPermission();
+  expect(promptCallCount).toBe(2);
+  settlePrompt?.("granted");
+  expect(await second).toBe("granted");
 });

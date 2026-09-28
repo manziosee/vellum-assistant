@@ -46,6 +46,10 @@ export const containsPoint = (
  * a larger creature's height would hand the window the dead corners beside the
  * pill to swallow presses in.
  *
+ * A call docked to a side of the display stands the pill up under the
+ * creature, and the strip turns with it: the pill's own column wide, and as
+ * tall as the gap between the creature's bottom and the pill's top.
+ *
  * Degenerate when the two overlap, which reads as no bridge at all: the strip's
  * left edge lands past its right, and no point is inside it.
  */
@@ -53,6 +57,14 @@ export const bridgeRect = (
   avatar: SurfaceRect,
   pill: SurfaceRect,
 ): SurfaceRect => {
+  if (pill.top >= avatar.bottom) {
+    return {
+      left: pill.left,
+      right: pill.right,
+      top: avatar.bottom,
+      bottom: pill.top,
+    };
+  }
   const row = { top: pill.top, bottom: pill.bottom };
   return pill.left >= avatar.right
     ? { left: avatar.right, right: pill.left, ...row }
@@ -152,9 +164,8 @@ export interface CompanionLayout {
   /**
    * How far past the avatar's centre the introduction's card starts, in points.
    *
-   * Its own distance rather than the pill's, because the pill stands on the
-   * creature's baseline rather than being centred on it: a card stepped off the
-   * creature alone lands inside a pill that reaches past the creature's box.
+   * The pill and creature share a centre, so this clears whichever box extends
+   * farther toward the card.
    */
   introStepOff: (cardGrowth: CompanionCardGrowth) => number;
 }
@@ -162,12 +173,10 @@ export interface CompanionLayout {
 /**
  * The surface's geometry for one pair of boxes.
  *
- * Derived here rather than in each component, because the pill and the
- * introduction card both hang off the creature by these same distances:
- * `CompanionSurface` steps the pill off the avatar's edge across the gap, and
- * `CompanionIntro` clears whatever that leaves standing on its side. Two copies
- * of this arithmetic drifting is a card placed somewhere other than beside the
- * pill it describes.
+ * Derived here rather than in each component, because the pill, creature, and
+ * introduction card share the same anchor. Two copies of this arithmetic
+ * drifting would put the card somewhere other than beside the pill it
+ * describes.
  */
 export function companionLayoutFor(
   avatarBox: number,
@@ -179,13 +188,9 @@ export function companionLayoutFor(
   const gap = companionGapFor(avatarBox, optionsBox);
   const nearEdge = companionNearEdgeFor(avatarBox, optionsBox);
   const inUnits = (points: number): number => points / scale;
-  // One rule read on each side: whichever of the creature's box and the pill
-  // reaches further from the centre. The pill's bottom is the creature's
-  // baseline, so downward it reaches that baseline and upward it reaches a
-  // whole options box back past it, and the creature's own half box is what
-  // stands there when the creature is the larger.
-  const reachUp = Math.max(avatarHalf, optionsBox - baseline);
-  const reachDown = Math.max(avatarHalf, baseline);
+  // The pill is centred on the creature and contains its leading slot, so both
+  // sides clear whichever box reaches further from their shared centre.
+  const surfaceHalf = Math.max(avatarHalf, optionsBox / 2);
   return {
     scale,
     avatarRel: avatarBox / optionsBox,
@@ -203,7 +208,6 @@ export function companionLayoutFor(
         units < 0 ? `calc(50% - ${-units}px)` : `calc(50% + ${units}px)`;
       return growth === "left" ? { right: line } : { left: line };
     },
-    introStepOff: (cardGrowth) =>
-      (cardGrowth === "up" ? reachUp : reachDown) + gap,
+    introStepOff: () => surfaceHalf + gap,
   };
 }

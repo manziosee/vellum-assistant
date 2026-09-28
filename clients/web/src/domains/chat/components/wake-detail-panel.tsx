@@ -38,12 +38,11 @@ export function WakeDetailPanel({ payload, onClose }: WakeDetailPanelProps) {
     <DetailShell
       Glyph={Sparkles}
       title={payload.title || t("wakeDetailPanel.title")}
-      closeLabel={t("wakeDetailPanel.close")}
-      closeTooltip={t("wakeDetailPanel.close")}
+      closeLabel={t("wakeDetailPanel.closeAria")}
       closeVariant="outlined"
       onClose={onClose}
     >
-      <dl className="flex flex-col gap-6">
+      <dl className="flex flex-col gap-5">
         {sections.workflow && (
           <DetailField label={t("wakeDetailPanel.workflow")}>
             {sections.workflow}
@@ -75,7 +74,7 @@ export function WakeDetailPanel({ payload, onClose }: WakeDetailPanelProps) {
         )}
 
         {payload.metadata.length > 0 && (
-          <div className="flex flex-col gap-6">
+          <div className="flex flex-col gap-5">
             {payload.metadata.map((item) => (
               <DetailField key={item.label} label={item.label}>
                 {item.value}
@@ -117,7 +116,7 @@ function ResultBody({ result }: { result: string }) {
         >
           {rows.map((row) => (
             <div key={row.key} className="flex flex-col gap-0.5">
-              <span className="text-body-small-default text-[var(--content-tertiary)]">
+              <span className="text-label-medium-default text-[var(--content-tertiary)]">
                 {row.key}
               </span>
               <span className="whitespace-pre-wrap break-words">

@@ -1,5 +1,6 @@
 import { mkdirSync, rmSync } from "node:fs";
 
+import { TrustClassSchema } from "@vellumai/gateway-client";
 import {
   and,
   asc,
@@ -22,16 +23,25 @@ import {
 import { v4 as uuid, v7 as uuidv7 } from "uuid";
 import { z } from "zod";
 
+import {
+  forgetActivationConversation,
+  forgetAllActivationConversations,
+} from "../activation/progress-store.js";
+import { TolerantModeSessionSchema } from "../api/mode-session.js";
 import type { ChannelId, InterfaceId } from "../channels/types.js";
 import { parseChannelId, parseInterfaceId } from "../channels/types.js";
 import { CHANNEL_IDS, isChannelId } from "../channels/types.js";
 import { getConfig } from "../config/loader.js";
+import { isSidebarDoneEnabled } from "../config/sidebar-done-gate.js";
 import { findDisplayTurnEndIndex } from "../conversations/message-consolidation.js";
 import { findConversation } from "../daemon/conversation-registry.js";
 import { conversationMetadataSyncTag } from "../daemon/message-types/sync.js";
 import type { TrustContext } from "../daemon/trust-context-types.js";
 import { clearAllConversationIds } from "../home/feed-writer.js";
-import type { ConversationDeletedInputContext } from "../hooks/types.js";
+import type {
+  ConversationDeletedInputContext,
+  MessageDeletedInputContext,
+} from "../hooks/types.js";
 import { readProviderMetadata } from "../messaging/read-provider-metadata.js";
 import { HOOKS } from "../plugin-api/constants.js";
 import { forkConversationMemory } from "../plugins/defaults/memory/fork-conversation-memory.js";
@@ -39,8 +49,8 @@ import { indexMessageNow } from "../plugins/defaults/memory/indexer.js";
 import { runHook } from "../plugins/pipeline.js";
 import type { ContentBlock } from "../providers/types.js";
 import { getCurrentSeq } from "../runtime/assistant-stream-state.js";
+import { publishConversationListAndMetadataChanged } from "../runtime/sync/resource-sync-events.js";
 import { publishSyncInvalidation } from "../runtime/sync/sync-publisher.js";
-import { trustClassSchema } from "../runtime/trust-class.js";
 import { UserError } from "../util/errors.js";
 import { getLogger } from "../util/logger.js";
 import { getLogsDbPath } from "../util/logs-db-path.js";
@@ -77,7 +87,6 @@ import { ensureDisplayOrderMigration } from "./conversation-display-order-migrat
 import { ensureGroupMigration } from "./conversation-group-migration.js";
 import {
   isReferentialFork,
-  type LineageBound,
   type LineageConversationRow,
   lineageMessageFilter,
   lineageMessagesAfterFilter,
@@ -85,11 +94,15 @@ import {
   REFERENTIAL_FORK_STRATEGY,
   resolveConversationLineage,
 } from "./conversation-lineage.js";
+import { repairConversationModeSessionBoundaries } from "./conversation-mode-sessions.js";
 import { deleteConversationRowsInBatches } from "./conversation-row-batch-delete.js";
 import {
   BACKGROUND_CONVERSATION_TYPES,
+  COMPUTER_USE_SCREENSHOT_ATTACHMENT_IDS_KEY,
+  computerUseScreenshotAttachmentIdsFromMetadata,
   type ConversationCreateType,
   type ConversationOrigin,
+  isEchoSuppressedUserMessage,
   isHiddenMessageMetadata,
   isNoResponseMetadata,
   isReactionMessageMetadata,
@@ -117,6 +130,11 @@ import {
 } from "./job-handlers/message-lexical.js";
 import { buildLifecycleTelemetryEvent } from "./lifecycle-events-store.js";
 import { resolveMessageContentBlocks } from "./message-content-file.js";
+import {
+  loadMessageBound,
+  type MessagesAfterRef,
+  resolveMessagesAfterBound,
+} from "./message-cursor.js";
 import { mergeMessageMetadata } from "./message-metadata.js";
 import {
   rawAll,
@@ -228,6 +246,29 @@ function purgeWatchTimelineForDeletedConversation(id: string): void {
   }
 }
 
+/**
+ * Release a deleted conversation from the activation checklist.
+ *
+ * The checklist records which task was launched into which conversation in a
+ * workspace file the cascade never reaches, so a delete that skipped this
+ * would leave the task's row stuck on Working, pointing at a conversation the
+ * user can no longer open and offering no way to launch the task again. A
+ * finished task keeps its record and only loses the dead link.
+ *
+ * Fired from the shared primitive so every delete caller cleans up, and
+ * best-effort for the same reason as the rest of the post-transaction
+ * cleanup: the conversation row is already gone, so throwing here would turn
+ * a completed delete into an error the caller cannot usefully retry.
+ */
+function forgetActivationLinkForDeletedConversation(id: string): void {
+  void forgetActivationConversation(id).catch((err: unknown) => {
+    log.warn(
+      { err, conversationId: id },
+      "Failed to release a deleted conversation from the activation checklist",
+    );
+  });
+}
+
 function deletePendingTelemetryEventsForConversation(id: string): void {
   const telemetry = getTelemetryDb({ createIfMissing: false });
   if (!telemetry || !dedicatedTableExists(telemetry, "telemetry_events")) {
@@ -297,6 +338,8 @@ const backgroundToolCompletionMetadataSchema = z.object({
 
 export const messageMetadataSchema = z
   .object({
+    /** Immutable ownership of this transcript row by a recorded mode session. */
+    modeSession: TolerantModeSessionSchema,
     /**
      * Epoch ms the content actually happened, when that differs from when
      * the row was written. Set wherever persistence lags the event: a queued
@@ -347,7 +390,7 @@ export const messageMetadataSchema = z
      * trust status changes later. Used by the memory write gate (indexer)
      * and read gate (conversation history loading) to enforce trust-aware access.
      */
-    provenanceTrustClass: trustClassSchema.optional(),
+    provenanceTrustClass: TrustClassSchema.optional(),
     /**
      * Model that actually served this assistant row, carried on the agent
      * loop's `message_complete` event (the provider's `response.model`, the
@@ -362,6 +405,22 @@ export const messageMetadataSchema = z
     provenanceSourceChannel: channelIdSchema.optional(),
     provenanceGuardianExternalUserId: z.string().optional(),
     provenanceRequesterIdentifier: z.string().optional(),
+    /**
+     * Contact id of the person who wrote this row, from the gateway trust
+     * verdict at persist time. Stamped only on a person's own message or
+     * reaction (`actorAuthorProvenance`), never on rows the assistant writes
+     * during their turn: the other `provenance*` fields describe the turn,
+     * this one the author. Absent when the author resolved to no contact.
+     */
+    provenanceContactId: z.string().optional(),
+    /**
+     * Set on a backfilled row whose sender was looked up but no usable gateway
+     * verdict came back, so its trust class is the guardian-address fallback
+     * and it names no author. Distinguishes that row from a sender the gateway
+     * resolved as a stranger, so the lookup can be re-run later. Live ingress
+     * never persists such a row: it denies a turn whose verdict failed.
+     */
+    provenanceLookupFailed: z.boolean().optional(),
     automated: z.boolean().optional(),
     /**
      * Transcript-suppression flag: the row is a machine signal (e.g. the
@@ -373,12 +432,17 @@ export const messageMetadataSchema = z
      * treat message text as organic user input.
      */
     hidden: z.boolean().optional(),
+    /** A hidden voice continuation trigger whose finished reply can raise a push. */
+    voiceContinuationResult: z.boolean().optional(),
     /**
      * Marks a role-`"user"` row that opened a live phone or in-app voice turn.
      * Test with {@link isVoiceSessionUserMessage}, which documents why the
      * channel/interface fields cannot stand in for it.
      */
     voiceSessionTurn: z.boolean().optional(),
+    [COMPUTER_USE_SCREENSHOT_ATTACHMENT_IDS_KEY]: z
+      .array(z.string())
+      .optional(),
     /**
      * Discriminates daemon-authored rows from ordinary turns.
      * `"system_card"` marks pre-composed status cards (the /compact, /clean,
@@ -430,10 +494,10 @@ export const messageMetadataSchema = z
      */
     attachmentStoredPaths: z.record(z.string(), z.string()).optional(),
     /**
-     * Marks a role-`"user"` row whose arrival interrupted a turn that had made
-     * no tool call yet. `loadFromDb` rebuilds the LLM-facing
-     * `<interrupted_turn>` note from it; the row's own content is exactly what
-     * the user sent, so clients render nothing extra.
+     * Marks a role-`"user"` row whose arrival interrupted a running turn.
+     * `loadFromDb` rebuilds the LLM-facing `<interrupted_turn>` note from it;
+     * the row's own content is exactly what the user sent, so clients render
+     * nothing extra.
      */
     interruptedPriorTurn: z.boolean().optional(),
     memoryInjectedBlock: z.string().optional(),
@@ -538,6 +602,12 @@ export function isProviderErrorMetadata(
  * assistant rows, and turn grouping closes on them, so display merging and
  * the turn resolver agree on boundaries. Takes the raw persisted `metadata`
  * JSON string; malformed JSON and non-assistant roles are never standalone.
+ *
+ * The web folds adjacent assistant rows again after pagination and reads the
+ * same rule off the wire projection in its own `isStandaloneAssistantMessage`
+ * (clients/web/src/domains/chat/utils/is-standalone-assistant-message.ts). A
+ * kind added here without a matching flag and check there merges on the
+ * client anyway.
  */
 export function isStandaloneAssistantMessage(
   role: string,
@@ -877,6 +947,11 @@ interface InsertMessageCoreParams {
   /** Answered synchronously at the top of every insert attempt. See
    *  {@link AddMessageOptions.insertPrecondition}. */
   insertPrecondition?: () => boolean;
+  /** The row is a reservation booked ahead of the content that will fill it
+   *  ({@link reserveMessage}), so it carries nothing to read yet. */
+  reserved?: boolean;
+  /** See {@link AddMessageOptions.skipResurface}. */
+  skipResurface?: boolean;
 }
 
 /**
@@ -964,6 +1039,8 @@ async function insertMessageCore(
     clientMessageId,
     id,
     insertPrecondition,
+    reserved,
+    skipResurface,
   } = params;
   warnOnModelInvisibleContent(content, conversationId);
   const db = getDb();
@@ -989,7 +1066,7 @@ async function insertMessageCore(
 
   // The timestamp is recomputed each attempt so a late retry doesn't persist a
   // stale `updatedAt`.
-  return withSqliteRetry(
+  const inserted = await withSqliteRetry(
     (): InsertedMessage => {
       // Asked at the top of EVERY attempt, and synchronously, because that is
       // the scope the answer holds for. Contention retries this function after
@@ -1114,6 +1191,32 @@ async function insertMessageCore(
     },
     { op: "insertMessageCore", context: { conversationId } },
   );
+
+  // A message the user reads brings a Done conversation back to the list.
+  // Four kinds of insert are not that: the echo-suppressed set, which never
+  // renders in the transcript; the empty row `reserveMessage` books for an LLM
+  // call that has not run yet, whose content arrives at the finalize seam and
+  // resurfaces from there; a row whose producer declared it bookkeeping ABOUT
+  // the conversation rather than activity in it (`skipResurface`); and a
+  // deduplicated insert, which wrote no row at all. Best-effort: a failure
+  // here must not escalate into a failed persist.
+  if (
+    !inserted.deduplicated &&
+    !reserved &&
+    !skipResurface &&
+    !isEchoSuppressedUserMessage(metadata)
+  ) {
+    try {
+      resurfaceArchivedConversation(conversationId, inserted.createdAt);
+    } catch (err) {
+      log.warn(
+        { err, conversationId, messageId: inserted.id },
+        "Failed to resurface Done conversation after message insert",
+      );
+    }
+  }
+
+  return inserted;
 }
 
 /**
@@ -1815,7 +1918,25 @@ function populateForkContentsInProcess(args: PopulateForkContentsArgs): void {
     });
   }
 
-  widenForkSightFrameTags(messagesToCopy, forkedMessageIds, attachmentIdMap);
+  remapForkWorkspaceAttachmentRefs(
+    messagesToCopy,
+    forkedMessageIds,
+    attachmentIdMap,
+  );
+  widenForkAttachmentIdTags(
+    messagesToCopy,
+    forkedMessageIds,
+    attachmentIdMap,
+    SIGHT_FRAME_ATTACHMENT_IDS_KEY,
+    sightFrameAttachmentIdsFromMetadata,
+  );
+  widenForkAttachmentIdTags(
+    messagesToCopy,
+    forkedMessageIds,
+    attachmentIdMap,
+    COMPUTER_USE_SCREENSHOT_ATTACHMENT_IDS_KEY,
+    computerUseScreenshotAttachmentIdsFromMetadata,
+  );
 
   // Set lastMessageAt to the max createdAt of copied messages so the
   // forked conversation sorts correctly by message recency.
@@ -1861,31 +1982,99 @@ function populateForkContentsInProcess(args: PopulateForkContentsArgs): void {
 }
 
 /**
- * Extend the copied rows' camera-frame tags to name the fork's cloned
- * attachment ids alongside the source ids they were written with.
+ * Remap copied workspace references to the fork-scoped attachment ids created
+ * by the relink loop.
  *
- * A fork leaves its rows describing their attachments two different ways:
- * `messages.content` is copied byte for byte and still names the SOURCE
- * attachment ids, while `message_attachments` is re-linked to freshly CLONED
- * rows under new ids. Readers split along that seam. Camera-frame retention
- * matches the tag against the ids in the content blocks (source ids), and the
- * compactor builds its image manifest from the links (cloned ids) and stamps
- * those onto the frames it rebuilds. A tag naming only one vocabulary goes
- * blind on the other, so it names both.
+ * The same source attachment can be linked to several copied messages. The
+ * shared map keeps every copied reference and message link on one cloned row,
+ * while references to attachments outside the copied window stay unchanged.
+ */
+function remapForkWorkspaceAttachmentRefs(
+  messagesToCopy: MessageRow[],
+  forkedMessageIds: Map<string, string>,
+  attachmentIdMap: Map<string, string>,
+): void {
+  if (attachmentIdMap.size === 0) {
+    return;
+  }
+
+  const db = getDb();
+  for (const message of messagesToCopy) {
+    const forkedMessageId = forkedMessageIds.get(message.id);
+    if (!forkedMessageId) {
+      continue;
+    }
+
+    const remappedContent = remapWorkspaceAttachmentRefs(
+      message.content,
+      attachmentIdMap,
+    );
+    if (remappedContent === message.content) {
+      continue;
+    }
+
+    db.update(messages)
+      .set({ content: JSON.stringify(remappedContent) })
+      .where(eq(messages.id, forkedMessageId))
+      .run();
+  }
+}
+
+function remapWorkspaceAttachmentRefs(
+  value: unknown,
+  attachmentIdMap: ReadonlyMap<string, string>,
+): unknown {
+  if (Array.isArray(value)) {
+    let changed = false;
+    const remapped = value.map((entry) => {
+      const next = remapWorkspaceAttachmentRefs(entry, attachmentIdMap);
+      changed ||= next !== entry;
+      return next;
+    });
+    return changed ? remapped : value;
+  }
+
+  if (value == null || typeof value !== "object") {
+    return value;
+  }
+
+  const record = value as Record<string, unknown>;
+  let changed = false;
+  const remapped: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(record)) {
+    let next = remapWorkspaceAttachmentRefs(entry, attachmentIdMap);
+    if (
+      key === "attachmentId" &&
+      record.type === "workspace_ref" &&
+      typeof entry === "string"
+    ) {
+      next = attachmentIdMap.get(entry) ?? entry;
+    }
+    changed ||= next !== entry;
+    remapped[key] = next;
+  }
+  return changed ? remapped : value;
+}
+
+/**
+ * Extend a copied row's attachment-id metadata to name cloned ids alongside
+ * the source ids it was written with.
  *
- * Widening rather than remapping is deliberate: replacing the source ids would
- * fix the compactor's frames by breaking every frame the fork holds directly,
- * which is the common case. Extra ids are inert, since an id no block carries
- * simply never matches.
+ * Copied message content uses the fork-scoped ids, while metadata begins as a
+ * copy of the source row. Naming both ids preserves compatibility with readers
+ * of either vocabulary. Extra ids are inert because an id no block or linked
+ * attachment carries simply never matches.
  *
  * Runs after the attachment loop because that loop is what produces the id map.
  * Only rows that actually carry a tag are rewritten, so an ordinary fork does
  * no extra writes.
  */
-function widenForkSightFrameTags(
+function widenForkAttachmentIdTags(
   messagesToCopy: MessageRow[],
   forkedMessageIds: Map<string, string>,
   attachmentIdMap: Map<string, string>,
+  metadataKey: string,
+  readIds: (metadata: Record<string, unknown> | null | undefined) => string[],
 ): void {
   if (attachmentIdMap.size === 0) {
     return;
@@ -1897,7 +2086,7 @@ function widenForkSightFrameTags(
       continue;
     }
     const sourceMetadata = parseMessageMetadata(message.metadata);
-    const sourceIds = sightFrameAttachmentIdsFromMetadata(sourceMetadata);
+    const sourceIds = readIds(sourceMetadata);
     if (sourceIds.length === 0) {
       continue;
     }
@@ -1921,7 +2110,7 @@ function widenForkSightFrameTags(
       .set({
         metadata: JSON.stringify({
           ...(forkedMetadata ?? {}),
-          [SIGHT_FRAME_ATTACHMENT_IDS_KEY]: [...widened],
+          [metadataKey]: [...widened],
         }),
       })
       .where(eq(messages.id, forkedMessageId))
@@ -2307,6 +2496,7 @@ export function deleteConversation(id: string): DeletedMemoryIds {
   }
 
   purgeWatchTimelineForDeletedConversation(id);
+  forgetActivationLinkForDeletedConversation(id);
 
   // Notify `conversation-deleted` hooks (e.g. the memory plugin failing its
   // still-pending jobs for this conversation). Fire-and-forget from this
@@ -2459,6 +2649,7 @@ export async function deleteConversationGently(
   }
 
   purgeWatchTimelineForDeletedConversation(id);
+  forgetActivationLinkForDeletedConversation(id);
 
   // Notify `conversation-deleted` hooks — fire-and-forget, same contract as
   // the synchronous delete primitive.
@@ -2500,6 +2691,17 @@ export interface AddMessageOptions {
    * during that sleep.
    */
   insertPrecondition?: () => boolean;
+  /**
+   * The row is the assistant's bookkeeping ABOUT this conversation rather than
+   * activity in it, so it must not bring the conversation back from Done (see
+   * {@link resurfaceArchivedConversation}). The producer declares this, because
+   * only the producer knows which of the two a row is.
+   *
+   * The retrospective skill card is the case: a pass runs once a conversation
+   * has gone idle, which is exactly when the user has just marked it done, so
+   * a card that resurfaced would bounce fresh done chats back into the sidebar.
+   */
+  skipResurface?: boolean;
 }
 
 /**
@@ -2513,8 +2715,14 @@ export async function addMessage(
   content: string,
   options?: AddMessageOptions,
 ) {
-  const { metadata, skipIndexing, clientMessageId, id, insertPrecondition } =
-    options ?? {};
+  const {
+    metadata,
+    skipIndexing,
+    clientMessageId,
+    id,
+    insertPrecondition,
+    skipResurface,
+  } = options ?? {};
   const inserted = await insertMessageCore({
     conversationId,
     role,
@@ -2523,6 +2731,7 @@ export async function addMessage(
     clientMessageId,
     id,
     ...(insertPrecondition ? { insertPrecondition } : {}),
+    ...(skipResurface ? { skipResurface } : {}),
   });
 
   if (inserted.deduplicated) {
@@ -2608,16 +2817,6 @@ function loadLineageRow(id: string): LineageConversationRow | null {
     })
     .from(conversations)
     .where(eq(conversations.id, id))
-    .get();
-  return row ?? null;
-}
-
-/** The `(createdAt, id)` bound of a single message, or null when it is gone. */
-function loadMessageBound(messageId: string): LineageBound | null {
-  const row = getDb()
-    .select({ createdAt: messages.createdAt, id: messages.id })
-    .from(messages)
-    .where(eq(messages.id, messageId))
     .get();
   return row ?? null;
 }
@@ -2780,8 +2979,8 @@ export interface ConversationAttachmentListing {
  * Driven from `messages` so the lineage predicate rides
  * `idx_messages_conversation_created_at`. An attachment linked to more than
  * one row is listed once, on the newest row that carries it. Tool-result rows
- * are left out: the transcript never shows them, and the assistant row carries
- * the promoted copy of every image a tool produced.
+ * are left out: reply-linked output belongs in Files, while tool-result-only
+ * media stays available through tool history.
  *
  * The lineage-wide select still reads every linked row: an exact `total` and
  * the metadata-derived flags are only known after the role and visibility
@@ -2943,83 +3142,93 @@ export function selectNewestSightFrameCapture(
 }
 
 /**
- * Count messages in a conversation that were created strictly after the
- * `afterMessageId` reference message. If `afterMessageId` is `null` or empty,
- * counts all messages in the conversation. If the referenced message no
- * longer exists (e.g. deleted by a separate flow), returns 0 — callers
- * decide how to react to a vanished reference, and the conservative answer
- * here is "no new work."
+ * Count messages in a conversation created strictly after the `after`
+ * reference. `null`, `""`, or a cursor with an empty id counts every message.
+ * The reference resolves through `resolveMessagesAfterBound`: a live row's
+ * `(createdAt, id)` is authoritative, a `MessageCursor` whose row has been
+ * deleted still bounds the count from the `createdAt` it carries, and a bare
+ * id whose row is gone counts 0: a caller holding only an id has no
+ * defensible starting point, and the conservative answer is "no new work."
  *
  * Used by the memory-retrospective trigger check to decide whether to fire
  * the message-count trigger without loading message bodies.
  */
 export function countMessagesAfter(
   conversationId: string,
-  afterMessageId: string | null,
+  after: MessagesAfterRef,
 ): number {
   const db = getDb();
   const segments = resolveLineage(conversationId);
-  if (afterMessageId === null || afterMessageId === "") {
-    const row = db
-      .select({ c: count() })
-      .from(messages)
-      .where(lineageMessageFilter(segments))
-      .get();
-    return row?.c ?? 0;
-  }
-  const ref = loadMessageBound(afterMessageId);
-  if (!ref) {
+  const start = resolveMessagesAfterBound(after);
+  if (start.kind === "vanished") {
     return 0;
   }
-  // Tie-breaker on `messages.id` so rows that share a millisecond timestamp
-  // with the reference are not permanently skipped. Mirrors the
-  // `(createdAt, id)` cursor pattern used by the backfill job-handler and
-  // turn-events-store.
   const row = db
     .select({ c: count() })
     .from(messages)
-    .where(lineageMessagesAfterFilter(segments, ref))
+    .where(
+      start.kind === "all"
+        ? lineageMessageFilter(segments)
+        : lineageMessagesAfterFilter(segments, start.bound),
+    )
     .get();
   return row?.c ?? 0;
 }
 
 /**
- * Return messages in a conversation created strictly after the
- * `afterMessageId` reference. If the reference is `null`/empty, returns all
- * messages. If the reference doesn't exist, returns an empty array (mirrors
- * `countMessagesAfter`'s conservative semantics). Used by the
- * memory-retrospective job handler to load the message slice it processes.
+ * Return messages in a conversation created strictly after the `after`
+ * reference, in `(createdAt, id)` order. Resolves the reference exactly as
+ * `countMessagesAfter` does, returning an empty array where that returns 0.
+ * Used by the memory-retrospective job handler to load the message slice it
+ * processes.
  */
 export function getMessagesAfter(
   conversationId: string,
-  afterMessageId: string | null,
+  after: MessagesAfterRef,
 ): MessageRow[] {
   const db = getDb();
   const segments = resolveLineage(conversationId);
-  if (afterMessageId === null || afterMessageId === "") {
-    // Secondary `asc(messages.id)` matches the non-null path's cursor
-    // ordering, so callers tracking `cutoffMessageId` across runs see a
-    // consistent ordering when multiple rows share a millisecond timestamp.
-    return db
-      .select()
-      .from(messages)
-      .where(lineageMessageFilter(segments))
-      .orderBy(asc(messages.createdAt), asc(messages.id))
-      .all()
-      .map(parseMessage);
-  }
-  const ref = loadMessageBound(afterMessageId);
-  if (!ref) {
+  const start = resolveMessagesAfterBound(after);
+  if (start.kind === "vanished") {
     return [];
   }
-  // Same `(createdAt, id)` cursor as `countMessagesAfter` — rows sharing
-  // the reference's millisecond timestamp would otherwise be skipped.
+  // Secondary `asc(messages.id)` mirrors the bound's tie-breaker, so callers
+  // tracking `cutoffMessageId` across runs see a consistent ordering when
+  // multiple rows share a millisecond timestamp.
   return db
     .select()
     .from(messages)
-    .where(lineageMessagesAfterFilter(segments, ref))
+    .where(
+      start.kind === "all"
+        ? lineageMessageFilter(segments)
+        : lineageMessagesAfterFilter(segments, start.bound),
+    )
     .orderBy(asc(messages.createdAt), asc(messages.id))
     .all()
+    .map(parseMessage);
+}
+
+/** Read a bounded conversation window in insertion order, including timestamp ties. */
+export function getRecentConversationMessages(
+  conversationId: string,
+  limit: number,
+  beforeMessageId?: string,
+): MessageRow[] {
+  return getDb()
+    .select()
+    .from(messages)
+    .where(
+      and(
+        eq(messages.conversationId, conversationId),
+        beforeMessageId === undefined
+          ? undefined
+          : sql`rowid < (SELECT rowid FROM messages WHERE id = ${beforeMessageId} AND conversation_id = ${conversationId})`,
+      ),
+    )
+    .orderBy(sql`rowid DESC`)
+    .limit(limit)
+    .all()
+    .reverse()
     .map(parseMessage);
 }
 
@@ -3388,6 +3597,62 @@ export function unarchiveConversation(id: string): boolean {
     "UPDATE conversations SET archived_at = NULL, updated_at = ? WHERE id = ?",
     now,
     id,
+  );
+  return true;
+}
+
+/**
+ * Bring a Done conversation back to the list because a message the user reads
+ * landed in it at `activityAt`.
+ *
+ * Under the `sidebar-done` gate "Done" is a completion mark, not a deletion:
+ * the conversation keeps its schedules and its channel threads, so anything
+ * the user would read arriving in it has to be reachable again. Two seams call
+ * this, which between them cover every ingest path without a per-provider
+ * hook: {@link insertMessageCore}, where each durable append lands (channel
+ * inbound, web and CLI sends, wake tail messages, assistant-initiated
+ * notification bodies), and the turn's finalize effect, where a streamed
+ * assistant reply becomes readable content.
+ *
+ * Rows the user never reads resurface nothing. `insertMessageCore` excludes
+ * the echo-suppressed set (hidden signals, subagent and ACP notifications, and
+ * the `<background_event>` trigger each wake persists); the empty row an LLM
+ * call reserves before it runs, so a call rejected before producing anything
+ * leaves the conversation Done; and any row whose producer passed
+ * {@link AddMessageOptions.skipResurface}. Retrospectives and memory
+ * consolidation are excluded by construction: they append to a fork or to a
+ * conversation of their own, never to the conversation under review.
+ *
+ * The clear is conditional on `archived_at <= activityAt` in one statement, so
+ * a Done mark the user makes after this activity (while a turn's deferred tail
+ * is still settling, or from the daemon while a worker runs the turn) wins
+ * instead of being erased by it.
+ *
+ * No-ops when the gate is off, which is the shipped behavior: nothing but the
+ * unarchive route clears `archived_at`.
+ */
+export function resurfaceArchivedConversation(
+  conversationId: string,
+  activityAt: number,
+): boolean {
+  if (!isSidebarDoneEnabled(getConfig())) {
+    return false;
+  }
+  const now = Date.now();
+  const changed = rawRun(
+    "conversation:resurface",
+    "UPDATE conversations SET archived_at = NULL, updated_at = ? WHERE id = ? AND archived_at IS NOT NULL AND archived_at <= ?",
+    now,
+    conversationId,
+    activityAt,
+  );
+  if (changed === 0) {
+    return false;
+  }
+  publishConversationListAndMetadataChanged("reordered", conversationId);
+  log.info(
+    { conversationId },
+    "Resurfaced Done conversation on user-visible activity",
   );
   return true;
 }
@@ -4089,6 +4354,16 @@ export async function clearAll(): Promise<{
 
   void clearAllConversationIds();
 
+  // The wipe took every conversation the checklist could be pointing at, so
+  // release all of them at once rather than one delete at a time. Same
+  // best-effort contract as the per-conversation path.
+  void forgetAllActivationConversations().catch((err: unknown) => {
+    log.warn(
+      { err },
+      "clearAll: failed to release conversations from the activation checklist",
+    );
+  });
+
   return { conversations: convCount, messages: msgCount };
 }
 
@@ -4224,6 +4499,24 @@ export function purgeConversationSegments(
   return segmentIds;
 }
 
+/** Repair derived mode-session boundaries without changing delete success. */
+function repairModeSessionBoundariesAfterDelete(conversationId: string): void {
+  const maxAttempts = 2;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      repairConversationModeSessionBoundaries(conversationId);
+      return;
+    } catch (err) {
+      if (attempt === maxAttempts) {
+        log.warn(
+          { err, conversationId, attempts: maxAttempts },
+          "Failed to repair mode session boundaries after message deletion; continuing",
+        );
+      }
+    }
+  }
+}
+
 export function deleteLastExchange(conversationId: string): number {
   const db = getDb();
 
@@ -4265,12 +4558,12 @@ export function deleteLastExchange(conversationId: string): number {
 
   // Collect attachment IDs linked to the messages being deleted so we can
   // scope orphan cleanup to only those candidates (not freshly uploaded ones).
-  const messageIds = db
-    .select({ id: messages.id })
+  const deletedRows = db
+    .select({ id: messages.id, createdAt: messages.createdAt })
     .from(messages)
     .where(condition)
-    .all()
-    .map((r) => r.id);
+    .all();
+  const messageIds = deletedRows.map((r) => r.id);
   const candidateAttachmentIds =
     messageIds.length > 0
       ? db
@@ -4317,6 +4610,21 @@ export function deleteLastExchange(conversationId: string): number {
     enqueueDeleteMessageLexical(deletedMessageId);
   }
 
+  // Notify `message-deleted` hooks for each removed row, as the
+  // single-message primitive does: undo removes the same tail a regenerate
+  // does, and a hook keeping a cursor on one of these rows needs its position.
+  for (const row of deletedRows) {
+    void runHook(HOOKS.MESSAGE_DELETED, {
+      conversationId,
+      messageId: row.id,
+      createdAt: row.createdAt,
+    } satisfies MessageDeletedInputContext);
+  }
+
+  if (deleted > 0) {
+    repairModeSessionBoundariesAfterDelete(conversationId);
+  }
+
   return deleted;
 }
 
@@ -4358,6 +4666,7 @@ export async function reserveMessage(
     content: inflightRef ? JSON.stringify({ ref: inflightRef }) : "[]",
     ...(inflightRef ? { finalized: 0 as const } : {}),
     metadata,
+    reserved: true,
   });
 }
 
@@ -4555,9 +4864,13 @@ export function deleteMessageById(
     .map((r) => r.attachmentId)
     .filter((id): id is string => id !== undefined);
 
-  // Look up the conversation before the transaction so we can recalculate lastMessageAt.
+  // Look up the conversation before the transaction so we can recalculate
+  // lastMessageAt, and the row's createdAt for the `message-deleted` hook.
   const msgRow = db
-    .select({ conversationId: messages.conversationId })
+    .select({
+      conversationId: messages.conversationId,
+      createdAt: messages.createdAt,
+    })
     .from(messages)
     .where(eq(messages.id, messageId))
     .get();
@@ -4613,6 +4926,17 @@ export function deleteMessageById(
   // not go through the conversation-level purge.
   if (msgRow) {
     enqueueDeleteMessageLexical(messageId);
+
+    // Notify `message-deleted` hooks (e.g. the memory plugin stamping a
+    // retrospective cursor that sat on this row). Fire-and-forget from this
+    // synchronous primitive, like `conversation-deleted`; the context carries
+    // the row's position because the row itself is gone.
+    void runHook(HOOKS.MESSAGE_DELETED, {
+      conversationId: msgRow.conversationId,
+      messageId,
+      createdAt: msgRow.createdAt,
+    } satisfies MessageDeletedInputContext);
+    repairModeSessionBoundariesAfterDelete(msgRow.conversationId);
   }
 
   return result;

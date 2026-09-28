@@ -12,7 +12,7 @@ import { getLogger } from "../../logger.js";
 import { requestHasVelayBridgeAuth } from "../../velay/bridge-auth.js";
 import {
   extractVelayAttestedContext,
-  isPlatformManaged,
+  acceptsVelayAttestation,
   requireBoundGuardian,
   requireManagedGuardian,
 } from "./guardian-pin.js";
@@ -103,12 +103,14 @@ async function checkLiveVoiceAuth(
     return {};
   }
 
-  // Managed/cloud path: velay validates the browser wsToken and injects
-  // X-Velay-* context into the tunnel frame. Trust it only when this request
-  // also has the process-local proof injected by the gateway's own loopback
-  // bridge. A direct request to a reachable gateway can spoof X-Velay-* names,
-  // but cannot know the bridge proof value.
-  if (isPlatformManaged()) {
+  // Velay path: velay validates the browser wsToken and injects X-Velay-*
+  // context into the tunnel frame. Trust it only when this request also has
+  // the process-local proof injected by the gateway's own loopback bridge. A
+  // direct request to a reachable gateway can spoof X-Velay-* names, but
+  // cannot know the bridge proof value. Taken by managed pods and by locally
+  // hosted gateways with a velay tunnel alike; the Twilio media socket has no
+  // such branch because it authenticates a gateway-minted relay token.
+  if (acceptsVelayAttestation(config)) {
     const velayContext = extractVelayAttestedContext(req);
     if (velayContext) {
       if (requestHasVelayBridgeAuth(req)) {
@@ -116,7 +118,7 @@ async function checkLiveVoiceAuth(
         // turn with the guardian's trust context. The velay attestation proves
         // the caller is *a* platform user who traversed velay, not that they
         // are THIS assistant's guardian, so cross-check the velay user id
-        // against the stored `platform_user_id` (the same guardian check the
+        // against the bound platform user id (the same guardian check the
         // edge-auth middleware applies to guardian routes under the managed
         // bypass). Without it, any velay-authorized org user reaching this
         // assistant would be stamped guardian downstream.
@@ -141,8 +143,9 @@ async function checkLiveVoiceAuth(
       }
       log.warn("Live voice WS: ignoring velay context without bridge proof");
     }
-    // No (or incomplete) velay attestation — fall through to the actor-JWT
-    // path below so a managed deployment still accepts a valid actor edge JWT.
+    // No (or incomplete) velay attestation: fall through to the actor-JWT
+    // path below so a velay-reachable gateway still accepts a valid actor
+    // edge JWT.
   }
 
   const authHeader = req.headers.get("authorization");

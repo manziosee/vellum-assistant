@@ -13,10 +13,15 @@ import { clampProviderString } from "../content-block-size.js";
 import { fileBlockToProviderText } from "../file-block-text.js";
 import { requestSupportsInlineAudio } from "../inline-audio-support.js";
 import {
+  isMalformedToolCallFinishReason,
+  malformedToolCallError,
+} from "../malformed-tool-call.js";
+import {
   base64Source,
   mediaSourceByteLength,
   resolveMediaReferences,
 } from "../media-resolve.js";
+import { supportsForcedToolChoiceWithThinking } from "../model-catalog.js";
 import { PLACEHOLDER_EMPTY_TURN } from "../placeholder-sentinels.js";
 import { recordProviderRequestDiagnostics } from "../request-diagnostics.js";
 import { createStreamTimeout } from "../stream-timeout.js";
@@ -27,6 +32,7 @@ import type {
   Provider,
   ProviderResponse,
   SendMessageOptions,
+  ToolUseContent,
 } from "../types.js";
 import {
   ContextOverflowError,
@@ -51,6 +57,15 @@ import {
   coerceObjectParamsToJsonString,
   decodeCoercedObjectArgs,
 } from "./coerce-object-args.js";
+import {
+  applyGemini3UnsignedToolCallFallback,
+  attachGoogleThoughtSignatureIfNeeded,
+  classifyGoogleThoughtSignatureRetry,
+  geminiThoughtSignaturesByToolCallId,
+  type GoogleToolCallExtraContent,
+  thoughtSignatureFromToolUseMetadata,
+  toolUseMetadataFromChatCompletionsDelta,
+} from "./google-thought-signature.js";
 import {
   isOpenAICompatInlineAudio,
   OPENAI_COMPAT_MAX_INLINE_AUDIO_BYTES,
@@ -197,6 +212,12 @@ export interface OpenAIChatCompletionsProviderOptions {
    *  (Fireworks, Together) keep sending `none` / forced choices. Enabled for
    *  the generic `openai-compatible` adapter, whose upstream is unknown. */
   omitToolChoiceWhenReasoning?: boolean;
+  /** Wire field for the output-token limit. OpenAI and OpenAI-compatible
+   *  backends use `max_completion_tokens`. OpenRouter defaults to
+   *  `max_tokens` because its parameter router matches that key on
+   *  `require_parameters` routes; see
+   *  {@link OpenAIChatCompletionsProvider.resolveOutputTokenLimitField}. */
+  outputTokenLimitField?: "max_completion_tokens" | "max_tokens";
 }
 
 const log = getLogger("chat-completions");
@@ -204,7 +225,13 @@ const log = getLogger("chat-completions");
 /** Wire-level reasoning_effort values. The OpenAI SDK type doesn't include
  *  `"max"`, but Fireworks accepts it for DeepSeek V4; the assignment to
  *  `params.reasoning_effort` casts through this union. */
-export type ReasoningEffortWire = "none" | "low" | "medium" | "high" | "xhigh" | "max";
+export type ReasoningEffortWire =
+  | "none"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh"
+  | "max";
 
 const REASONING_EFFORT_RANK: Record<ReasoningEffortWire, number> = {
   none: 0,
@@ -332,6 +359,41 @@ function protectJsonSchemaToolResult(payload: string): string {
     : payload;
 }
 
+function carriesReasoningOptOut(params: unknown): boolean {
+  const p = params as {
+    reasoning_effort?: unknown;
+    reasoning?: { effort?: unknown } | null;
+  };
+  return (
+    p.reasoning_effort === "none" ||
+    (typeof p.reasoning === "object" &&
+      p.reasoning !== null &&
+      p.reasoning.effort === "none")
+  );
+}
+
+function stripReasoningParams(params: unknown): void {
+  const p = params as Record<string, unknown>;
+  delete p.reasoning_effort;
+  delete p.reasoning;
+}
+
+/**
+ * `baseURL|model|routing` keys whose request succeeded on the attempt directly
+ * after the opt-out was stripped. Later requests skip the opt-out up front
+ * instead of paying a rejected round-trip on every call. A success that needed
+ * a further compat retry proves nothing about the opt-out, so it is not
+ * recorded. Routing (OpenRouter's `provider` body field) is part of the key
+ * because opt-out support belongs to the upstream backend, not the model slug.
+ * Process-lifetime only: a restart re-learns with one rejected request per key.
+ */
+const reasoningOptOutRejecters = new Set<string>();
+
+/** Test-only: forget learned reasoning opt-out rejections. */
+export function resetReasoningOptOutRejectersForTests(): void {
+  reasoningOptOutRejecters.clear();
+}
+
 /**
  * True when the request carried an explicit reasoning opt-out (`"none"` sent
  * as flat `reasoning_effort` or nested `reasoning.effort`) and the provider
@@ -341,16 +403,7 @@ function protectJsonSchemaToolResult(payload: string): string {
  * model-default reasoning beats a hard failure.
  */
 function isReasoningOptOutRejection(error: unknown, params: unknown): boolean {
-  const p = params as {
-    reasoning_effort?: unknown;
-    reasoning?: { effort?: unknown } | null;
-  };
-  const optedOut =
-    p.reasoning_effort === "none" ||
-    (typeof p.reasoning === "object" &&
-      p.reasoning !== null &&
-      p.reasoning.effort === "none");
-  if (!optedOut) {
+  if (!carriesReasoningOptOut(params)) {
     return false;
   }
   if (!isClientErrorStatus(error)) {
@@ -388,9 +441,15 @@ export function isThinkingEnabledOnWire(params: unknown): boolean {
  * rejected it because thinking/reasoning mode forbids that parameter.
  * DeepSeek thinking mode 400s with `Thinking mode does not support this
  * tool_choice` for any explicit value, including `"auto"` and `"none"`.
- * One retry without `tool_choice` lets the same provider succeed instead of
- * failing over to a different backend.
+ * Kimi 400s with `tool_choice 'specified' is incompatible with thinking
+ * enabled`. One retry without `tool_choice` lets the same provider succeed
+ * instead of failing over to a different backend.
  */
+const THINKING_MODE_TOOL_CHOICE_REJECTION_PATTERNS: RegExp[] = [
+  /does not support this tool_choice/i,
+  /tool_choice\s+'specified'\s+is incompatible with thinking/i,
+];
+
 function isThinkingModeToolChoiceRejection(
   error: unknown,
   params: unknown,
@@ -402,8 +461,9 @@ function isThinkingModeToolChoiceRejection(
   if (!isClientErrorStatus(error)) {
     return false;
   }
-  return /does not support this tool_choice/i.test(
-    openaiCompatErrorHaystack(error),
+  const haystack = openaiCompatErrorHaystack(error);
+  return THINKING_MODE_TOOL_CHOICE_REJECTION_PATTERNS.some((pattern) =>
+    pattern.test(haystack),
   );
 }
 
@@ -541,8 +601,10 @@ function isMissingReasoningContentRejection(
 
 /**
  * True when the request included an assistant `reasoning` / `reasoning_content`
- * extra and the provider rejected it as an unknown message property. One retry
- * without those extras lets a strict Chat Completions schema succeed.
+ * extra and the provider rejected it as an unknown or unsupported message
+ * property. One retry without those extras lets a strict Chat Completions
+ * schema succeed. Groq phrases this as
+ * `property 'reasoning_content' is unsupported`.
  */
 function isUnknownAssistantReasoningFieldRejection(
   error: unknown,
@@ -561,7 +623,7 @@ function isUnknownAssistantReasoningFieldRejection(
   if (!haystackNamesAssistantReasoningField(haystack)) {
     return false;
   }
-  return /unknown|unexpected|unrecognized|additional propert|extra (?:field|property)|not (?:a )?valid|invalid (?:argument|parameter|field|property)/i.test(
+  return /unknown|unexpected|unrecognized|unsupported|not supported|additional propert|extra (?:field|property)|not (?:a )?valid|invalid (?:argument|parameter|field|property)/i.test(
     haystack,
   );
 }
@@ -634,6 +696,79 @@ function flattenContentPartsToStrings(params: unknown): boolean {
   return flattened;
 }
 
+type OpenAICompatRetryKind =
+  | "reasoning-opt-out"
+  | "thinking-tool-choice"
+  | "missing-reasoning-content"
+  | "unknown-reasoning-field"
+  | "missing-thought-signature"
+  | "unknown-extra-content"
+  | "chat-template";
+
+function classifyOpenAICompatRetry(
+  error: unknown,
+  params: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming,
+  thoughtSignaturesByCallId: ReadonlyMap<string, string>,
+): { kind: OpenAICompatRetryKind; message: string; apply: () => void } | null {
+  if (isReasoningOptOutRejection(error, params)) {
+    return {
+      kind: "reasoning-opt-out",
+      message:
+        "Model rejected the explicit reasoning opt-out; retrying without reasoning params",
+      apply: () => stripReasoningParams(params),
+    };
+  }
+  if (isThinkingModeToolChoiceRejection(error, params)) {
+    return {
+      kind: "thinking-tool-choice",
+      message:
+        "Upstream rejected tool_choice in thinking mode; retrying without tool_choice",
+      apply: () => {
+        delete params.tool_choice;
+      },
+    };
+  }
+  if (isMissingReasoningContentRejection(error, params)) {
+    return {
+      kind: "missing-reasoning-content",
+      message:
+        "Upstream requires reasoning_content round-trip; retrying with empty field on assistant messages",
+      apply: () => {
+        backfillEmptyReasoningContent(params);
+      },
+    };
+  }
+  if (isUnknownAssistantReasoningFieldRejection(error, params)) {
+    return {
+      kind: "unknown-reasoning-field",
+      message:
+        "Upstream rejected assistant reasoning field; retrying without it",
+      apply: () => {
+        stripAssistantReasoningFields(params);
+      },
+    };
+  }
+  const thoughtSignatureRetry = classifyGoogleThoughtSignatureRetry(params, {
+    isClientError: isClientErrorStatus(error),
+    haystack: openaiCompatErrorHaystack(error),
+    capturedByCallId: thoughtSignaturesByCallId,
+  });
+  if (thoughtSignatureRetry) {
+    return thoughtSignatureRetry;
+  }
+  if (isChatTemplateRejection(error, params)) {
+    return {
+      kind: "chat-template",
+      message:
+        "Upstream chat template rejected structured message content; retrying with flattened plain-text content",
+      apply: () => {
+        flattenContentPartsToStrings(params);
+      },
+    };
+  }
+  return null;
+}
+
 /**
  * Translate the neutral (Anthropic-shaped) `tool_choice` carried on the call
  * config into the OpenAI chat-completions wire format. Callers express
@@ -680,6 +815,24 @@ const OPENAI_SUPPORTED_IMAGE_TYPES = new Set([
   "image/webp",
 ]);
 
+/**
+ * Persistable view of the chat.completions create params. A `logit_bias`
+ * preset (e.g. `suppress-cjk`) is ~5.3k deterministic entries (~68KB);
+ * summarize it so inspector rows don't balloon. The full map still went
+ * out on the wire.
+ */
+function inspectableChatCompletionsRequest(
+  params: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming,
+): unknown {
+  if (!params.logit_bias) {
+    return params;
+  }
+  return {
+    ...params,
+    logit_bias: `<${Object.keys(params.logit_bias).length} token biases omitted>`,
+  };
+}
+
 // Think-tag scanning primitives are shared with the TTS reasoning filter
 // (util/think-tag-stream.ts) so the two stream parsers cannot drift. This
 // provider keeps its exact historical behavior: case-sensitive, <think> only.
@@ -711,6 +864,7 @@ export class OpenAIChatCompletionsProvider implements Provider {
   private coerceObjectArgsToJsonString: boolean;
   private salvageXmlToolCalls: boolean;
   private omitToolChoiceWhenReasoning: boolean;
+  private outputTokenLimitField: "max_completion_tokens" | "max_tokens";
 
   constructor(
     apiKey: string,
@@ -742,6 +896,8 @@ export class OpenAIChatCompletionsProvider implements Provider {
       options.salvageXmlToolCalls ?? shouldSalvageXmlToolCalls(model);
     this.omitToolChoiceWhenReasoning =
       options.omitToolChoiceWhenReasoning ?? false;
+    this.outputTokenLimitField =
+      options.outputTokenLimitField ?? "max_completion_tokens";
   }
 
   get defaultModel(): string {
@@ -772,12 +928,16 @@ export class OpenAIChatCompletionsProvider implements Provider {
     // wire, to be decoded back on the response. Empty unless
     // `coerceObjectArgsToJsonString` is enabled.
     const coercedObjectKeys = new Map<string, string[]>();
+    let inspectableRequest: unknown | undefined;
 
     try {
+      const thoughtSignaturesByCallId =
+        geminiThoughtSignaturesByToolCallId(messages);
       const openaiMessages = await this.toOpenAIMessages(
         messages,
         systemPrompt,
         requestSupportsInlineAudio(modelOverride ?? this.model),
+        modelOverride ?? this.model,
       );
 
       recordProviderRequestDiagnostics({
@@ -794,7 +954,8 @@ export class OpenAIChatCompletionsProvider implements Provider {
         };
 
       if (maxTokens) {
-        params.max_completion_tokens = maxTokens;
+        params[this.resolveOutputTokenLimitField(modelOverride ?? this.model)] =
+          maxTokens;
       }
 
       // Profile-scoped token biasing (e.g. the `suppress-cjk` preset). Resolved
@@ -874,7 +1035,18 @@ export class OpenAIChatCompletionsProvider implements Provider {
           const thinkingOn = isThinkingEnabledOnWire(params);
           const skipAutoDefault = thinkingOn && toolChoice === "auto";
           const skipAllChoices = thinkingOn && this.omitToolChoiceWhenReasoning;
-          if (!skipAutoDefault && !skipAllChoices) {
+          const skipIncompatibleForcedChoice =
+            thinkingOn &&
+            !supportsForcedToolChoiceWithThinking(
+              this.name,
+              modelOverride ?? this.model,
+            ) &&
+            (toolChoice === "required" || typeof toolChoice === "object");
+          if (
+            !skipAutoDefault &&
+            !skipAllChoices &&
+            !skipIncompatibleForcedChoice
+          ) {
             params.tool_choice = toolChoice;
           }
         }
@@ -973,10 +1145,16 @@ export class OpenAIChatCompletionsProvider implements Provider {
 
       const toolCallMap = new Map<
         number,
-        { id: string; name: string; args: string }
+        {
+          id: string;
+          name: string;
+          args: string;
+          providerMetadata?: ToolUseContent["providerMetadata"];
+        }
       >();
       const toolProgress = createToolProgressEmitter(onEvent);
       let finishReason = "unknown";
+      let upstreamFinishReason: string | undefined;
       let responseModel = modelOverride ?? this.model;
       let promptTokens = 0;
       let completionTokens = 0;
@@ -994,75 +1172,56 @@ export class OpenAIChatCompletionsProvider implements Provider {
         if (extraBody) {
           Object.assign(params, extraBody);
         }
-        const createStream = () =>
-          this.client.chat.completions.create(params, {
+        const optOutKey = `${this.client.baseURL}|${params.model}|${JSON.stringify(
+          (params as { provider?: unknown }).provider ?? null,
+        )}`;
+        if (
+          reasoningOptOutRejecters.has(optOutKey) &&
+          carriesReasoningOptOut(params)
+        ) {
+          stripReasoningParams(params);
+        }
+        const createStream = () => {
+          // Snapshot after extra-body merge and any in-place compat retries
+          // so inspector rows match the params that actually went on the wire.
+          inspectableRequest = inspectableChatCompletionsRequest(params);
+          return this.client.chat.completions.create(params, {
             signal: timeoutSignal,
             ...(Object.keys(requestHeaders).length > 0
               ? { headers: requestHeaders }
               : {}),
           });
+        };
+        const attemptedCompatRetries = new Set<OpenAICompatRetryKind>();
+        let lastCompatRetry: OpenAICompatRetryKind | undefined;
         let stream: Awaited<ReturnType<typeof createStream>>;
-        try {
-          stream = await createStream();
-        } catch (error) {
-          if (isReasoningOptOutRejection(error, params)) {
+        for (;;) {
+          try {
+            stream = await createStream();
+            if (lastCompatRetry === "reasoning-opt-out") {
+              reasoningOptOutRejecters.add(optOutKey);
+            }
+            break;
+          } catch (error) {
+            const retry = classifyOpenAICompatRetry(
+              error,
+              params,
+              thoughtSignaturesByCallId,
+            );
+            if (!retry || attemptedCompatRetries.has(retry.kind)) {
+              throw error;
+            }
+            attemptedCompatRetries.add(retry.kind);
+            lastCompatRetry = retry.kind;
             log.warn(
               {
                 provider: this.name,
                 model: modelOverride ?? this.model,
                 error: error instanceof Error ? error.message : String(error),
               },
-              "Model rejected the explicit reasoning opt-out; retrying without reasoning params",
+              retry.message,
             );
-            delete params.reasoning_effort;
-            delete (params as unknown as Record<string, unknown>).reasoning;
-            stream = await createStream();
-          } else if (isThinkingModeToolChoiceRejection(error, params)) {
-            log.warn(
-              {
-                provider: this.name,
-                model: modelOverride ?? this.model,
-                error: error instanceof Error ? error.message : String(error),
-              },
-              "Upstream rejected tool_choice in thinking mode; retrying without tool_choice",
-            );
-            delete params.tool_choice;
-            stream = await createStream();
-          } else if (isMissingReasoningContentRejection(error, params)) {
-            log.warn(
-              {
-                provider: this.name,
-                model: modelOverride ?? this.model,
-                error: error instanceof Error ? error.message : String(error),
-              },
-              "Upstream requires reasoning_content round-trip; retrying with empty field on assistant messages",
-            );
-            backfillEmptyReasoningContent(params);
-            stream = await createStream();
-          } else if (isUnknownAssistantReasoningFieldRejection(error, params)) {
-            log.warn(
-              {
-                provider: this.name,
-                model: modelOverride ?? this.model,
-                error: error instanceof Error ? error.message : String(error),
-              },
-              "Upstream rejected assistant reasoning field; retrying without it",
-            );
-            stripAssistantReasoningFields(params);
-            stream = await createStream();
-          } else if (isChatTemplateRejection(error, params)) {
-            log.warn(
-              {
-                provider: this.name,
-                model: modelOverride ?? this.model,
-                error: error instanceof Error ? error.message : String(error),
-              },
-              "Upstream chat template rejected structured message content; retrying with flattened plain-text content",
-            );
-            flattenContentPartsToStrings(params);
-            stream = await createStream();
-          } else {
-            throw error;
+            retry.apply();
           }
         }
 
@@ -1150,11 +1309,27 @@ export class OpenAIChatCompletionsProvider implements Provider {
                     entry.args,
                   );
                 }
+                const providerMetadata =
+                  toolUseMetadataFromChatCompletionsDelta(tc);
+                if (
+                  providerMetadata &&
+                  !thoughtSignatureFromToolUseMetadata(entry.providerMetadata)
+                ) {
+                  entry.providerMetadata = providerMetadata;
+                }
               }
             }
 
             if (choice.finish_reason) {
               finishReason = choice.finish_reason;
+            }
+            // OpenRouter normalizes upstream finish reasons and carries the
+            // raw value in `native_finish_reason`.
+            const nativeFinishReason = (
+              choice as { native_finish_reason?: string | null }
+            ).native_finish_reason;
+            if (nativeFinishReason) {
+              upstreamFinishReason = nativeFinishReason;
             }
           }
 
@@ -1189,6 +1364,23 @@ export class OpenAIChatCompletionsProvider implements Provider {
         }
       } finally {
         cleanupTimeout();
+      }
+
+      const malformedFinishReason = [upstreamFinishReason, finishReason].find(
+        isMalformedToolCallFinishReason,
+      );
+      if (malformedFinishReason) {
+        log.warn(
+          {
+            provider: this.name,
+            model: responseModel,
+            finishReason,
+            upstreamFinishReason,
+            streamedTextLength: contentText.length,
+          },
+          "Response ended on a malformed tool call",
+        );
+        throw malformedToolCallError(this.name, malformedFinishReason);
       }
 
       if (this.parseThinkTags && pendingContent) {
@@ -1271,6 +1463,9 @@ export class OpenAIChatCompletionsProvider implements Provider {
           id: tc.id,
           name: tc.name,
           input,
+          ...(tc.providerMetadata
+            ? { providerMetadata: tc.providerMetadata }
+            : {}),
         });
       }
 
@@ -1284,11 +1479,19 @@ export class OpenAIChatCompletionsProvider implements Provider {
               content: contentText || null,
               tool_calls:
                 toolCallMap.size > 0
-                  ? Array.from(toolCallMap.values()).map((tc) => ({
-                      id: tc.id,
-                      type: "function",
-                      function: { name: tc.name, arguments: tc.args },
-                    }))
+                  ? Array.from(toolCallMap.values()).map((tc) =>
+                      attachGoogleThoughtSignatureIfNeeded(
+                        {
+                          id: tc.id,
+                          type: "function",
+                          function: { name: tc.name, arguments: tc.args },
+                        },
+                        thoughtSignatureFromToolUseMetadata(
+                          tc.providerMetadata,
+                        ),
+                        modelOverride ?? this.model,
+                      ),
+                    )
                   : undefined,
             },
             finish_reason: finishReason,
@@ -1334,15 +1537,9 @@ export class OpenAIChatCompletionsProvider implements Provider {
         },
         stopReason: finishReason,
         // `rawRequest` is persisted to the request-log DB and inspector on every
-        // call. A `logit_bias` preset (e.g. `suppress-cjk`) is ~5.3k deterministic
-        // entries (~68KB); summarize it here so logs don't balloon. The full map
-        // still went out on the wire above.
-        rawRequest: params.logit_bias
-          ? {
-              ...params,
-              logit_bias: `<${Object.keys(params.logit_bias).length} token biases omitted>`,
-            }
-          : params,
+        // call, including 4xx throws below. A `logit_bias` preset is summarized
+        // so logs don't balloon. The full map still went out on the wire above.
+        rawRequest: inspectableRequest,
         rawResponse,
       };
     } catch (error) {
@@ -1369,6 +1566,9 @@ export class OpenAIChatCompletionsProvider implements Provider {
             maxTokens: overflow.maxTokens,
             statusCode: error.status,
             cause: error,
+            ...(inspectableRequest !== undefined
+              ? { rawRequest: inspectableRequest }
+              : {}),
           });
         }
         if (detectVisionNotSupported(error, normalized.message)) {
@@ -1379,9 +1579,13 @@ export class OpenAIChatCompletionsProvider implements Provider {
             error.status,
             // Stamp the reason so classification is status-independent (a vision
             // rejection returned as 401/403 must not read as an invalid key).
-            abortReason
-              ? { abortReason, reason: "vision_unsupported" }
-              : { reason: "vision_unsupported" },
+            {
+              reason: "vision_unsupported" as const,
+              ...(abortReason ? { abortReason } : {}),
+              ...(inspectableRequest !== undefined
+                ? { rawRequest: inspectableRequest }
+                : {}),
+            },
           );
         }
         const retryAfterMs = extractRetryAfterMs(error.headers);
@@ -1396,6 +1600,7 @@ export class OpenAIChatCompletionsProvider implements Provider {
           apiErrorParam?: string;
           requestId?: string;
           rawBody?: string;
+          rawRequest?: unknown;
           reason?: ProviderErrorReason;
         } = { cause: error };
         if (retryAfterMs !== undefined) {
@@ -1422,6 +1627,9 @@ export class OpenAIChatCompletionsProvider implements Provider {
         if (normalized.reason) {
           errorOptions.reason = normalized.reason;
         }
+        if (inspectableRequest !== undefined) {
+          errorOptions.rawRequest = inspectableRequest;
+        }
         throw new ProviderError(
           formattedMessage,
           this.name,
@@ -1435,7 +1643,13 @@ export class OpenAIChatCompletionsProvider implements Provider {
         }`,
         this.name,
         undefined,
-        abortReason ? { cause: error, abortReason } : { cause: error },
+        {
+          cause: error,
+          ...(abortReason ? { abortReason } : {}),
+          ...(inspectableRequest !== undefined
+            ? { rawRequest: inspectableRequest }
+            : {}),
+        },
       );
     }
   }
@@ -1474,6 +1688,15 @@ export class OpenAIChatCompletionsProvider implements Provider {
     return this.maxReasoningEffort;
   }
 
+  /** Per-request output-token-limit wire key. Defaults to the constructor
+   *  `outputTokenLimitField`. Subclasses override when support varies by
+   *  model. */
+  protected resolveOutputTokenLimitField(
+    _model: string,
+  ): "max_completion_tokens" | "max_tokens" {
+    return this.outputTokenLimitField;
+  }
+
   /**
    * Per-model sparse `reasoning_effort` support. Subclasses return the
    * accepted values for models that 4xx on in-between tiers (e.g. GLM 5.3's
@@ -1492,6 +1715,7 @@ export class OpenAIChatCompletionsProvider implements Provider {
     messages: Message[],
     systemPrompt?: string,
     audioInputEnabled = false,
+    model = this.model,
   ): Promise<OpenAI.Chat.Completions.ChatCompletionMessageParam[]> {
     // Swap any persisted attachment references back to inline base64 before
     // serializing, so the block transforms below can read `source.data`.
@@ -1513,7 +1737,7 @@ export class OpenAIChatCompletionsProvider implements Provider {
     const emittedToolCallIds = new Set<string>();
     for (const msg of messages) {
       if (msg.role === "assistant") {
-        const assistantMessage = this.toOpenAIAssistantMessage(msg);
+        const assistantMessage = this.toOpenAIAssistantMessage(msg, model);
         for (const toolCall of assistantMessage.tool_calls ?? []) {
           emittedToolCallIds.add(toolCall.id);
         }
@@ -1591,11 +1815,14 @@ export class OpenAIChatCompletionsProvider implements Provider {
   /** Convert an assistant message with text + tool_use blocks to OpenAI format. */
   private toOpenAIAssistantMessage(
     msg: Message,
+    model: string,
   ): OpenAI.Chat.Completions.ChatCompletionAssistantMessageParam {
     const textParts: string[] = [];
     const reasoningParts: string[] = [];
-    const toolCalls: OpenAI.Chat.Completions.ChatCompletionMessageToolCall[] =
-      [];
+    const toolCalls: Array<
+      OpenAI.Chat.Completions.ChatCompletionMessageToolCall &
+        GoogleToolCallExtraContent
+    > = [];
 
     for (const block of msg.content) {
       switch (block.type) {
@@ -1609,14 +1836,20 @@ export class OpenAIChatCompletionsProvider implements Provider {
           }
           break;
         case "tool_use":
-          toolCalls.push({
-            id: block.id,
-            type: "function",
-            function: {
-              name: block.name,
-              arguments: JSON.stringify(block.input),
-            },
-          });
+          toolCalls.push(
+            attachGoogleThoughtSignatureIfNeeded(
+              {
+                id: block.id,
+                type: "function",
+                function: {
+                  name: block.name,
+                  arguments: JSON.stringify(block.input),
+                },
+              },
+              thoughtSignatureFromToolUseMetadata(block.providerMetadata),
+              model,
+            ),
+          );
           break;
         case "server_tool_use":
           textParts.push(`[Web search: ${block.name}]`);
@@ -1635,6 +1868,7 @@ export class OpenAIChatCompletionsProvider implements Provider {
       };
 
     if (toolCalls.length > 0) {
+      applyGemini3UnsignedToolCallFallback(toolCalls, model);
       result.tool_calls = toolCalls;
     }
 

@@ -2,9 +2,10 @@
  * Shared helper for computer-use skill wrapper scripts.
  *
  * Each wrapper calls forwardComputerUseProxyTool() to delegate execution to
- * the proxy resolver, which forwards the call to the connected desktop client.
+ * the proxy resolver, which selects the connected or virtual desktop.
  */
 
+import { formatDesktopAppRequired } from "../capability-offer.js";
 import { throwIfCancelled } from "../shared/abort.js";
 import type { ToolContext, ToolExecutionResult } from "../types.js";
 
@@ -45,7 +46,7 @@ export function forwardComputerUseProxyTool(
   }
   if (!context.proxyToolResolver) {
     return Promise.resolve({
-      content: `Cannot execute ${toolName}: no proxy resolver available. This tool requires a connected desktop client.`,
+      content: formatDesktopAppRequired("screen"),
       isError: true,
     });
   }

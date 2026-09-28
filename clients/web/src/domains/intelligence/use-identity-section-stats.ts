@@ -19,10 +19,10 @@ import {
   documentsGetOptions,
   schedulesGetQueryKey,
   skillsGetOptions,
-  workspaceTreeGetOptions,
 } from "@/generated/daemon/@tanstack/react-query.gen";
 import { useTranslation } from "@/i18n";
 import { installedPluginsQueryOptions } from "@/lib/installed-plugins-query";
+import { workspaceTreeQueryOptions } from "@/lib/workspace-tree-query";
 import { fetchSchedules } from "@/utils/schedules";
 
 export interface SchedulePreview {
@@ -62,16 +62,11 @@ const SCHEDULE_PREVIEW_COUNT = 3;
 interface UseIdentitySectionStatsOptions {
   /** Skip the plugin fetch on assistants without the plugin routes. */
   supportsPlugins: boolean;
-  /**
-   * Skip the reads behind cards the native mobile shells don't render
-   * (see `NATIVE_MOBILE_HIDDEN_KEYS` in `components/identity-sections.ts`).
-   */
-  isNativeMobile: boolean;
 }
 
 export function useIdentitySectionStats(
   assistantId: string,
-  { supportsPlugins, isNativeMobile }: UseIdentitySectionStatsOptions,
+  { supportsPlugins }: UseIdentitySectionStatsOptions,
 ): Record<string, IdentitySectionStat | undefined> {
   const { t } = useTranslation("intelligence");
   const path = { assistant_id: assistantId };
@@ -100,11 +95,13 @@ export function useIdentitySectionStats(
     select: (data) => data.documents.length,
     ...common,
   });
+  // Shares the workspace browser's root listing cache entry (see
+  // `lib/workspace-tree-query.ts`), so a file created, renamed, or deleted
+  // there refreshes this count too.
   const workspace = useQuery({
-    ...workspaceTreeGetOptions({ path }),
+    ...workspaceTreeQueryOptions({ assistantId }),
     select: (data) => data.entries.length,
     ...common,
-    enabled: !isNativeMobile,
   });
   const contacts = useQuery({
     ...contactsGetOptions({ path }),

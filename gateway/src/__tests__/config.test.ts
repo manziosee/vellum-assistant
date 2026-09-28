@@ -17,7 +17,6 @@ describe("config: hardcoded defaults", () => {
     expect(config.maxEmailWebhookPayloadBytes).toBe(350 * 1024 * 1024);
     expect(config.maxAttachmentBytes).toEqual({
       telegram: 20 * 1024 * 1024,
-      telegramOutbound: 50 * 1024 * 1024,
       slack: 100 * 1024 * 1024,
       whatsapp: 16 * 1024 * 1024,
       discord: 100 * 1024 * 1024,
@@ -72,6 +71,41 @@ describe("config: hardcoded defaults", () => {
     } finally {
       if (saved !== undefined) process.env.GATEWAY_TRUST_PROXY = saved;
       else delete process.env.GATEWAY_TRUST_PROXY;
+    }
+  });
+
+  test("runtimeProxyRequireAuth is disabled only by RUNTIME_PROXY_REQUIRE_AUTH", () => {
+    const saved = process.env.RUNTIME_PROXY_REQUIRE_AUTH;
+    try {
+      process.env.RUNTIME_PROXY_REQUIRE_AUTH = "false";
+      expect(loadConfig().runtimeProxyRequireAuth).toBe(false);
+
+      process.env.RUNTIME_PROXY_REQUIRE_AUTH = "true";
+      expect(loadConfig().runtimeProxyRequireAuth).toBe(true);
+    } finally {
+      if (saved !== undefined) {
+        process.env.RUNTIME_PROXY_REQUIRE_AUTH = saved;
+      } else {
+        delete process.env.RUNTIME_PROXY_REQUIRE_AUTH;
+      }
+    }
+  });
+
+  test("runtimeProxyRequireAuth ignores workspace config", () => {
+    const saved = process.env.RUNTIME_PROXY_REQUIRE_AUTH;
+    delete process.env.RUNTIME_PROXY_REQUIRE_AUTH;
+    writeFileSync(
+      join(testWorkspaceDir, "config.json"),
+      JSON.stringify({ gateway: { runtimeProxyRequireAuth: false } }),
+    );
+
+    try {
+      expect(loadConfig().runtimeProxyRequireAuth).toBe(true);
+    } finally {
+      if (saved !== undefined) {
+        process.env.RUNTIME_PROXY_REQUIRE_AUTH = saved;
+      }
+      writeFileSync(join(testWorkspaceDir, "config.json"), "{}");
     }
   });
 

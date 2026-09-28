@@ -17,6 +17,7 @@ import {
   wrapUntrustedContent,
 } from "../security/untrusted-content.js";
 import { getLogger } from "../util/logger.js";
+import { safeStringSlice } from "../util/unicode.js";
 import { isLexicalBackfillComplete } from "./checkpoints.js";
 import { unseenAttentionStateConditions } from "./conversation-attention-store.js";
 import type { ConversationRow } from "./conversation-crud.js";
@@ -115,6 +116,16 @@ export function hasLexicalTokens(text: string): boolean {
  */
 export type ArchiveStatusFilter = "active" | "archived" | "all";
 
+/**
+ * Which bucket a listing covers.
+ *
+ * The persisted {@link ConversationType} values plus `"all"`, a read-side
+ * union that exists only here: no row carries it, and nothing writes it. It
+ * lets one paginated request span a user's whole history, which is what a
+ * full-history view needs and what three interleaved cursors cannot give it.
+ */
+export type ConversationListTypeFilter = ConversationType | "all";
+
 function archiveStatusClause(status: ArchiveStatusFilter) {
   switch (status) {
     case "active":
@@ -191,6 +202,25 @@ function surfacedVisibilitySql(alias = "conversations"): string {
   return (
     `(${alias}.surfaced_at IS NOT NULL` +
     ` AND ${alias}.conversation_type != 'private'` +
+    ` AND (${alias}.source IS NULL OR ${alias}.source != 'subagent'))`
+  );
+}
+
+/**
+ * Raw SQL predicate for the background **umbrella**: background and scheduled
+ * rows together, matched on `conversation_type` or on the system group the
+ * producer filed them in, with subagent runs excluded so the sidebar never
+ * surfaces them.
+ *
+ * Shared by the `"background"` bucket of {@link conversationTypeClause} and by
+ * the `"all"` bucket, which is the union of that one with the standard
+ * listing, so the combined read can never admit a row either bucket alone
+ * would have withheld.
+ */
+function backgroundUmbrellaSql(alias = "conversations"): string {
+  return (
+    `((${alias}.conversation_type IN ('background', 'scheduled')` +
+    ` OR COALESCE(${alias}.group_id, 'system:all') IN ('system:background', 'system:scheduled'))` +
     ` AND (${alias}.source IS NULL OR ${alias}.source != 'subagent'))`
   );
 }
@@ -288,6 +318,11 @@ function ungroupedSql(alias = "conversations"): string {
  *   Background and Scheduled sidebar sections from one request.
  * - `"scheduled"` — scheduled rows only, so the Scheduled section can load
  *   independently of the broader background backlog without over-fetching it.
+ * - `"all"`: the union of `"standard"` and `"background"`, so one paginated
+ *   request covers a user's whole history instead of interleaving three. Not
+ *   a bypass of the visibility rules: it is exactly those two predicates
+ *   OR-ed, with the legacy `private` type excluded on top, so nothing reaches
+ *   it that neither bucket would have returned.
  *
  * `group_id` is matched alongside `conversationType` so conversations routed to
  * `system:background` / `system:scheduled` (heartbeat, reminders, schedule-job
@@ -295,7 +330,7 @@ function ungroupedSql(alias = "conversations"): string {
  * correct bucket. Subagent runs are excluded from the background/scheduled
  * buckets so the sidebar never surfaces them.
  */
-function conversationTypeClause(type: ConversationType) {
+function conversationTypeClause(type: ConversationListTypeFilter) {
   const notSubagent = sql`(${conversations.source} IS NULL OR ${conversations.source} != 'subagent')`;
   switch (type) {
     case "standard":
@@ -304,9 +339,20 @@ function conversationTypeClause(type: ConversationType) {
       // standardListingVisibilitySql for the full predicate semantics.
       return sql.raw(standardListingVisibilitySql());
     case "background":
-      return sql`(${conversations.conversationType} IN ('background', 'scheduled') OR group_id IN ('system:background', 'system:scheduled')) AND ${notSubagent}`;
+      return sql.raw(backgroundUmbrellaSql());
     case "scheduled":
       return sql`(${conversations.conversationType} = 'scheduled' OR group_id = 'system:scheduled') AND ${notSubagent}`;
+    case "all":
+      /* `private` is excluded explicitly rather than left to the two arms.
+         The standard arm already drops it everywhere, but the umbrella
+         matches on the system group as well as on the type, so a legacy
+         private row filed in `system:background` would otherwise arrive
+         through it. Those rows exist transiently after an in-place snapshot
+         restore, before migration cleanup deletes them. */
+      return sql.raw(
+        `((${standardListingVisibilitySql()} OR ${backgroundUmbrellaSql()})` +
+          ` AND conversations.conversation_type != 'private')`,
+      );
   }
 }
 
@@ -320,7 +366,7 @@ function conversationTypeClause(type: ConversationType) {
  * transposition waiting to happen.
  */
 export interface ConversationListFilter {
-  conversationType?: ConversationType;
+  conversationType?: ConversationListTypeFilter;
   archiveStatus?: ArchiveStatusFilter;
   originChannel?: string;
   /**
@@ -955,19 +1001,6 @@ function likeContainsPattern(query: string): string {
 }
 
 /**
- * Whether the sparse Qdrant `messages_lexical` index — the only source of
- * message-content matches — is a safe read source. Content matching is
- * unavailable (title matches only) until the one-time upgrade backfill has
- * fully drained: a partially populated collection would silently miss older
- * content (an empty result — not a throw). Indexing itself is unconditional
- * host infrastructure, so completion is the only gate; the recall read site
- * applies the same one via the shared {@link isLexicalBackfillComplete}.
- */
-function isMessageContentSearchAvailable(): boolean {
-  return isLexicalBackfillComplete();
-}
-
-/**
  * Full-text search across message content.
  *
  * Message-content candidates come from the sparse `messages_lexical` Qdrant
@@ -975,9 +1008,9 @@ function isMessageContentSearchAvailable(): boolean {
  * merged with a `LIKE` match on conversation titles; matching conversations
  * return with their relevant messages, ordered by most recently updated.
  *
- * Content matching is index-only — there is no `messages.content` scan
+ * Content matching is index-only: there is no `messages.content` scan
  * fallback and no other content source. Only the title arm can match while
- * the index is not a safe read source ({@link isMessageContentSearchAvailable}),
+ * the index is not a safe read source ({@link isLexicalBackfillComplete}),
  * for a query that tokenizes to nothing under the shared tokenizer (non-ASCII
  * or single-char input like "你", "é", "C++"), or when the Qdrant lexical
  * lookup fails (logged). An unindexed or unreachable index yields fewer
@@ -1016,7 +1049,7 @@ export async function searchConversations(
   const maxMsgsPerConv = opts?.maxMessagesPerConversation ?? 3;
 
   const hasTokens = hasLexicalTokens(trimmed);
-  const contentSearchAvailable = isMessageContentSearchAvailable();
+  const contentSearchAvailable = isLexicalBackfillComplete();
 
   // LIKE pattern for title matching (message-content indexes don't cover titles).
   const titlePattern = likeContainsPattern(query);
@@ -1443,8 +1476,7 @@ function buildExcerptFromText(
   if (!match) {
     // Neither the query nor any of its tokens is present (e.g. the lexical
     // index matched JSON structure instead); fall back to the text start.
-    return text
-      .slice(0, EXCERPT_WINDOW * 2)
+    return safeStringSlice(text, 0, EXCERPT_WINDOW * 2)
       .replace(/\s+/g, " ")
       .trim();
   }
@@ -1453,9 +1485,9 @@ function buildExcerptFromText(
     text.length,
     match.index + match.length + EXCERPT_WINDOW,
   );
-  const excerpt =
+  return (
     (start > 0 ? "\u2026" : "") +
     text.slice(start, end).replace(/\s+/g, " ").trim() +
-    (end < text.length ? "\u2026" : "");
-  return excerpt;
+    (end < text.length ? "\u2026" : "")
+  );
 }

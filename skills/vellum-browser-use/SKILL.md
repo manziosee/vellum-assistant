@@ -46,6 +46,8 @@ The response includes:
 - `recommendedMode` — the best available backend (use this)
 - `modes[]` — per-mode status with `available`, `summary`, and `userActions` (remediation steps)
 
+For `--virtual-desktop`, Chrome and desktop components are included in the assistant image. Browser and computer use start the existing desktop without installing dependencies. If components are missing, report the image problem; do not install packages or launch a separate Chrome process.
+
 ## Browser Modes
 
 Use `--browser-mode <mode>` on the `assistant browser` parent command to pin the browser backend:
@@ -176,6 +178,14 @@ The response includes a `screenshots` array with `mediaType` and `data` (base64)
 5. Use `click`, `type`, `press-key`, `scroll`, `select-option`, or `hover` to interact
 6. `assistant browser extract` or `assistant browser screenshot --output <path>` to capture results
 7. **Always** `assistant browser detach` when you are done — this releases the debugger so the user can browse freely
+
+## Human verification
+
+Treat every CAPTCHA and bot-detection challenge as a request for human help, including drag-to-verify sliders, press-and-hold checks, verification checkboxes and image puzzles. Stop before interacting with the challenge, even if its controls look easy to automate. Do not try it yourself, retry it, or script a solution.
+
+In the virtual desktop, request the desktop-help card immediately, using one short sentence for the needed action. Wait for Done or Skip. After Done, take a fresh snapshot; if verification remains, ask for help again. On other browser backends, ask the user to complete verification in their browser and wait for confirmation.
+
+For ordinary logins, use saved credentials or securely prompt for missing credentials, then fill the form yourself. A CAPTCHA on a login page still requires human help.
 
 ## Interaction Strategies
 

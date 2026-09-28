@@ -99,6 +99,8 @@ const BASELINE: Record<string, readonly string[]> = {
     "../../../../../persistence/schema/index.js",
     "../../../../../security/untrusted-content.js",
     "../../../../api/events/memory-recalled.js",
+    "../../../../api/events/tool-result.js",
+    "../../../../api/remember-tool.js",
     "../../../../api/responses/memory-v3-selection-log.js",
     "../../../../config/assistant-feature-flags.js",
     "../../../../config/default-profile-catalog.js",
@@ -129,6 +131,9 @@ const BASELINE: Record<string, readonly string[]> = {
     "../../../../daemon/embedding-reconcile.js",
     "../../../../daemon/trust-context.js",
     "../../../../daemon/turn-latency-sub-spans.js",
+    // mcp-setup capability cards list configured server names from the
+    // workspace mcp.json document. No plugin-api equivalent.
+    "../../../../mcp/workspace-mcp-config.js",
     "../../../../notifications/background-failure-signal.js",
     "../../../../persistence/checkpoints.js",
     "../../../../persistence/conversation-types.js",
@@ -163,6 +168,7 @@ const BASELINE: Record<string, readonly string[]> = {
     "../../../../util/json.js",
     "../../../../util/logger.js",
     "../../../../util/platform.js",
+    "../../../api/remember-tool.js",
     "../../../channels/types.js",
     "../../../config/loader.js",
     "../../../config/memory-v3-gate.js",
@@ -190,6 +196,9 @@ const BASELINE: Record<string, readonly string[]> = {
     "../../../daemon/trust-context.js",
     "../../../home/job-handlers/conversation-starters.js",
     "../../../media/job-handlers/media-processing.js",
+    // The skill-update receipt job announces a burst through the
+    // notification pipeline's single entry point. No plugin-api equivalent.
+    "../../../notifications/emit-signal.js",
     "../../../permissions/types.js",
     "../../../persistence/auto-analysis-constants.js",
     "../../../persistence/checkpoints.js",
@@ -210,6 +219,16 @@ const BASELINE: Record<string, readonly string[]> = {
     "../../../persistence/job-handlers/message-lexical.js",
     "../../../persistence/job-utils.js",
     "../../../persistence/jobs-store.js",
+    // The retrospective cursor is a `(createdAt, id)` bound that must keep
+    // working after its message row is deleted. The resolver lives beside
+    // the persistence after-reads it also drives, so the plugin's
+    // accounting imports it rather than re-deriving the bound. No
+    // plugin-api equivalent.
+    "../../../persistence/message-cursor.js",
+    // Named any-state `createdAt` lookup the cursor bookkeeping uses for
+    // forks and the timestamp backfill; the messages-read boundary guard
+    // requires the read to live in persistence. No plugin-api equivalent.
+    "../../../persistence/message-reads.js",
     "../../../persistence/raw-query.js",
     "../../../persistence/schema/index.js",
     "../../../prompts/persona-resolver.js",
@@ -259,6 +278,12 @@ const BASELINE: Record<string, readonly string[]> = {
     "zod",
   ],
   "platform-hosted": ["node:fs/promises", "node:path"],
+  // Host-internal surface snapshot and task_progress parser. UI surfaces
+  // stay host-owned, so there is no plugin-api equivalent.
+  "task-progress": [
+    "../../../../daemon/conversation-surface-snapshots.js",
+    "../../../../runtime/task-progress.js",
+  ],
   session: [
     "../../../config/loader.js",
     "../../types.js",

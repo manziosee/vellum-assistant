@@ -24,6 +24,7 @@ import { extractPreferences } from "../notifications/preference-extractor.js";
 import { createPreference } from "../notifications/preferences-store.js";
 import {
   addMessage,
+  getMessageById,
   isEchoSuppressedUserMessage,
   isHiddenMessageMetadata,
   isSuppressedQueuedMessage,
@@ -44,12 +45,14 @@ import { stampTurnOutcome } from "../telemetry/turn-outcome.js";
 import { getLogger } from "../util/logger.js";
 import type { CleanResult, Conversation } from "./conversation.js";
 import { repairInterruptedToolUseBlocks } from "./conversation-interrupt-repair.js";
+import { discardQueueOnAbort } from "./conversation-lifecycle.js";
 import {
   CONVERSATION_BUSY_MESSAGE,
   persistQueuedMessageBody,
   serializePersistedUserMessageContent,
 } from "./conversation-messaging.js";
 import type {
+  QueuedDispatch,
   QueuedMessage,
   QueueDrainReason,
 } from "./conversation-queue-manager.js";
@@ -64,7 +67,7 @@ import { preactivateHostProxySkills } from "./host-proxy-preactivation.js";
 import type { UserMessageAttachment } from "./message-protocol.js";
 import { buildTransportHints } from "./transport-hints.js";
 import { sameTrustIdentity, type TrustContext } from "./trust-context-types.js";
-import { turnOrRestingTrust } from "./trust-context-types.js";
+import { restingTrust, turnOrRestingTrust } from "./trust-context-types.js";
 import { resolveVerificationSessionIntent } from "./verification-session-intent.js";
 
 const log = getLogger("conversation-process");
@@ -506,8 +509,8 @@ export async function drainQueue(
     if (!next) {
       return;
     }
-    return dispatchDrainWithRestore(conversation, [next], true, () =>
-      drainSingleMessage(conversation, next, reason, true),
+    return dispatchDrainWithRestore(conversation, [next], true, (signal) =>
+      drainSingleMessage(conversation, next, reason, true, signal),
     );
   }
 
@@ -520,17 +523,17 @@ export async function drainQueue(
     if (!next) {
       return;
     }
-    return dispatchDrainWithRestore(conversation, [next], false, () =>
-      drainSingleMessage(conversation, next, reason),
+    return dispatchDrainWithRestore(conversation, [next], false, (signal) =>
+      drainSingleMessage(conversation, next, reason, false, signal),
     );
   }
   if (batch.length === 1) {
-    return dispatchDrainWithRestore(conversation, batch, false, () =>
-      drainSingleMessage(conversation, batch[0], reason),
+    return dispatchDrainWithRestore(conversation, batch, false, (signal) =>
+      drainSingleMessage(conversation, batch[0], reason, false, signal),
     );
   }
-  return dispatchDrainWithRestore(conversation, batch, false, () =>
-    drainBatch(conversation, batch, reason),
+  return dispatchDrainWithRestore(conversation, batch, false, (signal) =>
+    drainBatch(conversation, batch, reason, signal),
   );
 }
 
@@ -555,11 +558,46 @@ async function dispatchDrainWithRestore(
   conversation: Conversation,
   messages: QueuedMessage[],
   steered: boolean,
-  dispatch: () => Promise<void>,
+  dispatch: (signal?: AbortSignal) => Promise<void>,
 ): Promise<void> {
+  const runId = messages[0]?.cronRunId ?? null;
+  const controller = new AbortController();
+  const pending =
+    (conversation.pendingQueuedDispatches ??= new Map()).get(runId) ??
+    new Set<QueuedDispatch>();
+  const queuedDispatch = { controller, messages };
+  pending.add(queuedDispatch);
+  conversation.pendingQueuedDispatches.set(runId, pending);
+  const cancelDispatch = () => {
+    const unpersisted: QueuedMessage[] = [];
+    for (const message of messages) {
+      if (getMessageById(message.requestId, conversation.conversationId)) {
+        message.onEvent({
+          type: "generation_cancelled",
+          conversationId: conversation.conversationId,
+        });
+      } else {
+        unpersisted.push(message);
+      }
+    }
+    if (unpersisted.length === 0) {
+      return;
+    }
+    requeueDrainedMessages(
+      conversation,
+      unpersisted,
+      steered,
+      "Restoring cancelled dispatch for queue teardown",
+    );
+    discardQueueOnAbort(conversation, (queued) => unpersisted.includes(queued));
+  };
+  controller.signal.addEventListener("abort", cancelDispatch, { once: true });
   try {
-    return await dispatch();
+    return await dispatch(controller.signal);
   } catch (err) {
+    if (controller.signal.aborted) {
+      return;
+    }
     const alreadyRestored =
       typeof err === "object" && err !== null && restoredDrainErrors.has(err);
     if (!alreadyRestored) {
@@ -574,6 +612,12 @@ async function dispatchDrainWithRestore(
       );
     }
     throw err;
+  } finally {
+    controller.signal.removeEventListener("abort", cancelDispatch);
+    pending.delete(queuedDispatch);
+    if (pending.size === 0) {
+      conversation.pendingQueuedDispatches.delete(runId);
+    }
   }
 }
 
@@ -651,6 +695,7 @@ async function drainSingleMessage(
   next: QueuedMessage,
   reason: QueueDrainReason,
   steered = false,
+  signal?: AbortSignal,
 ): Promise<void> {
   // Another turn already owns the processing lock: requeue before touching
   // ANY conversation state. The lock holder installed its own per-turn
@@ -748,9 +793,11 @@ async function drainSingleMessage(
   // a different actor's context if a concurrent request mutates the live fields.
   // Trust comes from the queued message, not the live slot: the slot holds
   // whichever actor sent most recently, which is this sender only when nobody
-  // else sent while this message waited.
-  conversation.currentTurnTrustContext =
-    next.trustContext ?? conversation.trustContext;
+  // else sent while this message waited. Held in a local as well, because the
+  // field is writable out-of-band across the awaits between here and the loop
+  // call below.
+  const turnTrustContext = next.trustContext ?? restingTrust(conversation);
+  conversation.currentTurnTrustContext = turnTrustContext;
   conversation.currentTurnChannelCapabilities =
     conversation.channelCapabilities;
 
@@ -759,6 +806,11 @@ async function drainSingleMessage(
     next.content,
     buildSlashContext(next.content, conversation),
   );
+
+  if (signal?.aborted) {
+    await drainQueue(conversation);
+    return;
+  }
 
   // Unknown slash — persist the exchange and continue draining.
   // Persist each message before pushing to conversation.messages so that a
@@ -1085,8 +1137,12 @@ async function drainSingleMessage(
   try {
     persistResult = await conversation.persistUserMessage({
       content: resolvedContent,
+      cronRunId: next.cronRunId,
+      signal,
+      insertPrecondition: () => !signal?.aborted,
       attachments: next.attachments,
       requestId: next.requestId,
+      activeSurfaceId: next.activeSurfaceId,
       metadata: { ...next.metadata, sentAt: next.sentAt },
       displayContent: next.displayContent,
       clientMessageId: next.clientMessageId,
@@ -1098,6 +1154,10 @@ async function drainSingleMessage(
         : {}),
     });
   } catch (err) {
+    if (signal?.aborted) {
+      await drainQueue(conversation);
+      return;
+    }
     const message = err instanceof Error ? err.message : String(err);
     // runAgentLoop never ran, so its finally block won't clear this
     conversation.preactivatedSkillIds = undefined;
@@ -1153,6 +1213,7 @@ async function drainSingleMessage(
       messageId: userMessageId,
       requestId: next.requestId,
       clientMessageId: next.clientMessageId,
+      modeSession: conversation.modeSessions.getTurnOwner(next.requestId),
     });
     // The row this echo announces is already durably persisted, so advance
     // the snapshot↔stream anchor to the echo's seq (stamped inline by the
@@ -1220,10 +1281,10 @@ async function drainSingleMessage(
     cronRunId?: string | null;
   } = {
     isUserMessage: true,
-    // Carry the sender's trust into the run. The loop re-initializes the
-    // per-turn snapshot on entry, so without this the stamp above is undone
-    // and the turn reverts to the conversation's most recent actor.
-    turnTrustContext: conversation.currentTurnTrustContext,
+    // Carry the sender's trust into the run from the local captured at the
+    // commit: the loop re-initializes the per-turn snapshot on entry, and the
+    // field is writable out-of-band across the awaits above.
+    turnTrustContext,
   };
   if (next.isInteractive !== undefined) {
     drainLoopOptions.isInteractive = next.isInteractive;
@@ -1271,6 +1332,7 @@ async function drainBatch(
   conversation: Conversation,
   batch: QueuedMessage[],
   reason: QueueDrainReason,
+  signal?: AbortSignal,
 ): Promise<void> {
   // Another turn already owns the processing lock: requeue the whole batch
   // before touching ANY conversation state, mirroring `drainSingleMessage`.
@@ -1358,9 +1420,9 @@ async function drainBatch(
   // The head's trust governs the batch, which is sound only because
   // `buildPassthroughBatch` refuses to coalesce messages from different
   // actors; without that boundary this would run a tail under the head's
-  // trust.
-  conversation.currentTurnTrustContext =
-    head.trustContext ?? conversation.trustContext;
+  // trust. Held in a local for the same reason as the single-message drain.
+  const turnTrustContext = head.trustContext ?? restingTrust(conversation);
+  conversation.currentTurnTrustContext = turnTrustContext;
   conversation.currentTurnChannelCapabilities =
     conversation.channelCapabilities;
 
@@ -1405,6 +1467,9 @@ async function drainBatch(
       qm.content,
       buildSlashContext(qm.content, conversation),
     );
+    if (signal?.aborted) {
+      break;
+    }
     if (qmSlash.kind !== "passthrough") {
       // Defensive recovery. `buildPassthroughBatch` should make this
       // unreachable, but if it ever fires we must avoid stranding
@@ -1442,9 +1507,15 @@ async function drainBatch(
         conversation.preactivatedSkillIds = undefined;
         const remaining = batch.slice(1);
         if (remaining.length >= 2) {
-          await drainBatch(conversation, remaining, reason);
+          await drainBatch(conversation, remaining, reason, signal);
         } else if (remaining.length === 1) {
-          await drainSingleMessage(conversation, remaining[0], reason);
+          await drainSingleMessage(
+            conversation,
+            remaining[0],
+            reason,
+            false,
+            signal,
+          );
         } else {
           await drainQueue(conversation);
         }
@@ -1460,8 +1531,12 @@ async function drainBatch(
       let batchPersistResult: { id: string; deduplicated: boolean };
       const persistOptions = {
         content: qmContent,
+        cronRunId: qm.cronRunId,
+        signal,
+        insertPrecondition: () => !signal?.aborted,
         attachments: qm.attachments,
         requestId: qm.requestId,
+        activeSurfaceId: qm.activeSurfaceId,
         metadata: { ...qm.metadata, sentAt: qm.sentAt },
         displayContent: qm.displayContent,
         clientMessageId: qm.clientMessageId,
@@ -1489,9 +1564,15 @@ async function drainBatch(
           // processing via persistUserMessage.
           const remaining = batch.slice(1);
           if (remaining.length >= 2) {
-            await drainBatch(conversation, remaining, reason);
+            await drainBatch(conversation, remaining, reason, signal);
           } else if (remaining.length === 1) {
-            await drainSingleMessage(conversation, remaining[0], reason);
+            await drainSingleMessage(
+              conversation,
+              remaining[0],
+              reason,
+              false,
+              signal,
+            );
           } else {
             await drainQueue(conversation);
           }
@@ -1502,6 +1583,9 @@ async function drainBatch(
       lastUserMessageId = batchPersistResult.id;
       persistedMessageIds.push(batchPersistResult.id);
     } catch (err) {
+      if (signal?.aborted) {
+        break;
+      }
       const message = err instanceof Error ? err.message : String(err);
       if (i === 0 && message === CONVERSATION_BUSY_MESSAGE) {
         // The head hit lock contention before any batch state was set:
@@ -1541,9 +1625,15 @@ async function drainBatch(
         conversation.preactivatedSkillIds = undefined;
         const remaining = batch.slice(1);
         if (remaining.length >= 2) {
-          await drainBatch(conversation, remaining, reason);
+          await drainBatch(conversation, remaining, reason, signal);
         } else if (remaining.length === 1) {
-          await drainSingleMessage(conversation, remaining[0], reason);
+          await drainSingleMessage(
+            conversation,
+            remaining[0],
+            reason,
+            false,
+            signal,
+          );
         } else {
           await drainQueue(conversation);
         }
@@ -1572,6 +1662,7 @@ async function drainBatch(
         messageId: lastUserMessageId,
         requestId: qm.requestId,
         clientMessageId: qm.clientMessageId,
+        modeSession: conversation.modeSessions.getTurnOwner(qm.requestId),
       });
       // Advance the snapshot↔stream anchor to this echo's seq — the batched
       // row persisted just above and the agent loop for the batch has not
@@ -1654,6 +1745,9 @@ async function drainBatch(
       "drainBatch: no messages persisted successfully; skipping runAgentLoop",
     );
     conversation.preactivatedSkillIds = undefined;
+    if (signal?.aborted) {
+      await drainQueue(conversation);
+    }
     return;
   }
 
@@ -1673,6 +1767,9 @@ async function drainBatch(
   // side correlation (message_complete / generation_cancelled /
   // generation_handoff) surfaces a requestId that actually has a DB row.
   conversation.currentRequestId = lastSuccessfulRequestId;
+  conversation.currentTurnWorkOrigins = successfulBatch.map(
+    ({ sentAt, metadata }) => ({ sentAt, metadata }),
+  );
   conversation.currentActiveSurfaceId = lastSuccessfulActiveSurfaceId;
   conversation.currentPage = lastSuccessfulCurrentPage;
 
@@ -1703,9 +1800,9 @@ async function drainBatch(
     cronRunId?: string | null;
   } = {
     isUserMessage: true,
-    // Same reason as the single-message drain: the loop re-initializes the
-    // per-turn snapshot, so the head's trust has to travel with the call.
-    turnTrustContext: conversation.currentTurnTrustContext,
+    // Same reason as the single-message drain: the head's trust travels from
+    // the local captured at the commit, not a late read of the field.
+    turnTrustContext,
   };
   if (lastPushEligibleUserMessageId !== undefined) {
     drainLoopOptions.notifyUserMessageId = lastPushEligibleUserMessageId;
@@ -1838,20 +1935,37 @@ export async function processMessage(
     metadata: callerMetadata,
     trustContext: committingTrustContext,
   } = options;
+  const priorRestingTrust = restingTrust(conversation);
   if (committingTrustContext) {
     conversation.setTrustContext(committingTrustContext);
   }
-  await conversation.ensureActorScopedHistory();
-  // Snapshot persona context at turn start so later tool turns can't pick up
-  // a different actor's context if a concurrent request mutates the live fields.
-  //
   // Held in a local as well as on the conversation: the field is writable
   // out-of-band while this turn is in flight (`agent-wake` stamps it and
   // restores the prior value in a `finally`), so reading it back at the agent
   // loop call below would reintroduce the late read this capture exists to
-  // avoid. The local is what the loop runs under.
-  const turnTrustContext = conversation.trustContext;
+  // avoid. The local is what the loop runs under. Captured before the history
+  // reload for the same reason: that await is one of the windows a writer can
+  // land in.
+  const turnTrustContext = restingTrust(conversation);
   conversation.currentTurnTrustContext = turnTrustContext;
+  try {
+    await conversation.ensureActorScopedHistory();
+  } catch (err) {
+    // This is the commitment point for the turn, so the stamp above is
+    // correct, but a reload that fails starts no turn: the conversation must
+    // not be left attributed to a sender that never ran. Guarded on identity
+    // so a writer that legitimately moved the slot across the await keeps it.
+    // Only the resting slot needs putting back; `runAgentLoopImpl` re-seeds
+    // the per-turn field at the head of every turn, so no later dispatch can
+    // inherit it.
+    if (
+      committingTrustContext &&
+      restingTrust(conversation) === committingTrustContext
+    ) {
+      conversation.setTrustContext(priorRestingTrust ?? null);
+    }
+    throw err;
+  }
   conversation.currentTurnAuthContext = conversation.authContext;
   conversation.currentTurnSourceActorPrincipalId =
     sourceActorPrincipalId ?? conversation.authContext?.actorPrincipalId;
@@ -2279,6 +2393,7 @@ export async function processMessage(
       content: resolvedContent,
       attachments,
       requestId,
+      activeSurfaceId,
       displayContent,
       scripted,
       ...(callerMetadata ? { metadata: callerMetadata } : {}),

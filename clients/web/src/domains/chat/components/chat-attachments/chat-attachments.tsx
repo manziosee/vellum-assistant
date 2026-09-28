@@ -8,6 +8,7 @@ import { Button, cn } from "@vellumai/design-library";
 import { AttachmentChip } from "@/domains/chat/components/chat-attachments/attachment-chip";
 import { AttachmentLoadingChip } from "@/domains/chat/components/chat-attachments/attachment-loading-chip";
 import { AttachmentTile } from "@/domains/chat/components/chat-attachments/attachment-tile";
+import { EmailReferenceChip } from "@/domains/chat/components/chat-attachments/email-reference-chip";
 import { useAttachmentFilePicker } from "@/domains/chat/components/chat-attachments/use-attachment-file-picker";
 import { useAttachmentPreview } from "@/domains/chat/components/chat-attachments/use-attachment-preview";
 import { useFailedPreviewIds } from "@/domains/chat/components/chat-attachments/use-failed-preview-ids";
@@ -15,10 +16,7 @@ import type {
   ChatAttachment,
   UploadedAttachment,
 } from "@/domains/chat/composer-store";
-import {
-  classifyAttachment,
-  middleTruncate,
-} from "@/domains/chat/components/chat-attachments/utils";
+import { classifyAttachment, middleTruncate } from "@/utils/attachment-utils";
 
 interface ChatAttachmentsStripProps {
   attachments: ChatAttachment[];
@@ -38,7 +36,9 @@ interface ChatAttachmentsStripProps {
  * still uploading or already carries a decodable preview. Anything else keeps
  * the chip, which is the only place its filename or its error shows.
  */
-function isTiledImage(att: ChatAttachment): boolean {
+function isTiledImage(
+  att: ChatAttachment,
+): att is Extract<ChatAttachment, { kind: "uploading" | "uploaded" }> {
   if (att.kind !== "uploading" && att.kind !== "uploaded") {
     return false;
   }
@@ -103,6 +103,7 @@ export const ChatAttachmentsStrip: FC<ChatAttachmentsStripProps> = ({
   return (
     <>
       <div
+        data-owns-horizontal-scroll=""
         className={cn(
           "flex gap-2 overflow-x-auto px-3 pb-1.5 [&::-webkit-scrollbar]:hidden [scrollbar-width:none]",
           // The card insets its content 12px on mobile, against the 8px a
@@ -165,9 +166,21 @@ export const ChatAttachmentsStrip: FC<ChatAttachmentsStripProps> = ({
                   iconOnly={<X />}
                   onMouseDown={pressGuard}
                   onClick={() => onRemove(att.localId)}
-                  aria-label={t("chatAttachments.removeAria", { filename: att.filename })}
+                  aria-label={t("chatAttachments.removeAria", {
+                    filename: att.filename,
+                  })}
                 />
               </div>
+            );
+          }
+          if (att.kind === "email-reference") {
+            return (
+              <EmailReferenceChip
+                key={att.localId}
+                attachment={att}
+                onRemove={onRemove}
+                pressGuard={pressGuard}
+              />
             );
           }
           if (att.kind === "failed") {
@@ -186,7 +199,9 @@ export const ChatAttachmentsStrip: FC<ChatAttachmentsStripProps> = ({
                   size="compact"
                   onMouseDown={pressGuard}
                   onClick={() => onRemove(att.localId)}
-                  aria-label={t("chatAttachments.removeAria", { filename: att.filename })}
+                  aria-label={t("chatAttachments.removeAria", {
+                    filename: att.filename,
+                  })}
                   className="ml-0.5 underline"
                 >
                   {t("chatAttachments.dismiss")}

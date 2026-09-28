@@ -13,14 +13,18 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, mock, test } from "bun:test";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { MemoryRouter } from "react-router";
 
 import type * as SectionConversations from "@/domains/chat/use-section-conversations";
 import type { SidebarSection } from "@/domains/chat/use-sidebar-state";
+import { ASSISTANT_SECTION_LABEL } from "@/domains/chat/utils/sidebar-section-icon";
 import type { Conversation } from "@/types/conversation-types";
 import { useAssistantIdentityStore } from "@/stores/assistant-identity-store";
 
 /** What the section query answers with, per test. */
 let sectionRows: Conversation[] = [];
+/** Whether that answer is the section's real membership, per test. */
+let sectionResolved = true;
 
 mock.module(
   "@/domains/chat/use-section-conversations",
@@ -30,7 +34,7 @@ mock.module(
       hasMore: false,
       loadMore: () => {},
       getAllRows: () => Promise.resolve(sectionRows),
-      isPending: false,
+      resolved: sectionResolved,
     }),
   }),
 );
@@ -51,7 +55,12 @@ function conv(conversationId: string, title: string): Conversation {
 }
 
 function assistantSection(): SidebarSection {
-  return { type: "assistant", key: "assistant", label: "On My Mind", all: [] };
+  return {
+    type: "assistant",
+    key: "assistant",
+    label: ASSISTANT_SECTION_LABEL,
+    all: [],
+  };
 }
 
 function chatsSection(): SidebarSection {
@@ -70,51 +79,62 @@ function renderSection(section: SidebarSection, overlayCards = false) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
+  /* The header's "View all chats" is a route link, so the section needs the
+     router it always has in the app. */
   return render(
-    <QueryClientProvider client={queryClient}>
-      <ConversationListProvider
-        value={{
-          overlayCards,
-          processingConversationIds: new Set<string>(),
-          attentionConversationIds: new Set<string>(),
-          onSelect: () => {},
-        }}
-      >
-        <CollapsibleNavSection.Root
-          type="multiple"
-          defaultValue={[section.key]}
+    <MemoryRouter>
+      <QueryClientProvider client={queryClient}>
+        <ConversationListProvider
+          value={{
+            overlayCards,
+            processingConversationIds: new Set<string>(),
+            attentionConversationIds: new Set<string>(),
+            onSelect: () => {},
+          }}
         >
-          <SidebarSectionItem
-            section={section}
-            assistantId="asst-1"
-            groupMenu={() => ({})}
-          />
-        </CollapsibleNavSection.Root>
-      </ConversationListProvider>
-    </QueryClientProvider>,
+          <CollapsibleNavSection.Root
+            type="multiple"
+            defaultValue={[section.key]}
+          >
+            <SidebarSectionItem
+              section={section}
+              assistantId="asst-1"
+              groupMenu={() => ({})}
+            />
+          </CollapsibleNavSection.Root>
+        </ConversationListProvider>
+      </QueryClientProvider>
+    </MemoryRouter>,
   );
 }
 
 afterEach(() => {
   cleanup();
   sectionRows = [];
+  sectionResolved = true;
   useAssistantIdentityStore.getState().clearIdentity();
 });
 
 describe("SidebarSectionItem — the assistant-initiated section", () => {
-  test("names the header after the assistant once it has a name", () => {
+  /* The section opens directly under the assistant's own pill, so a header
+     that repeated her name said it twice; it speaks in her voice instead. */
+  test("titles the header in the assistant's voice, named or not", () => {
     useAssistantIdentityStore.getState().setIdentity("Ada", "0.12.0", "asst-1");
-    renderSection(assistantSection());
+    const named = renderSection(assistantSection());
+    expect(screen.getByText("From me")).toBeTruthy();
+    expect(screen.queryByText(/Ada/)).toBeNull();
+    named.unmount();
 
-    expect(screen.getByText("From Ada")).toBeTruthy();
+    useAssistantIdentityStore.getState().clearIdentity();
+    renderSection(assistantSection());
+    expect(screen.getByText("From me")).toBeTruthy();
   });
 
-  test("falls back to the neutral header while the assistant is unnamed", () => {
-    // "From Your Assistant" reads as a settings row rather than a byline.
-    renderSection(assistantSection());
-
-    expect(screen.getByText("On My Mind")).toBeTruthy();
-    expect(screen.queryByText(/^From /)).toBeNull();
+  test("draws no glyph on its header", () => {
+    const { container } = renderSection(assistantSection());
+    expect(
+      container.querySelector('[data-slot="collapsible-nav-section-icon"]'),
+    ).toBeNull();
   });
 
   /* On the rail the header is its own accent pill, inset like the New Chat
@@ -140,6 +160,50 @@ describe("SidebarSectionItem — the assistant-initiated section", () => {
     );
     expect(header?.className).not.toContain("rounded-full");
     expect(header?.className).not.toContain("pl-2!");
+  });
+
+  /* On a touch screen every row is backed by the card's surface for the
+     swipe, and the assistant card is the one that tints itself: its tint has
+     to be the surface the rows are backed with, or each row sits in a white
+     cell on the wash. */
+  test("on the overlay, backs its rows with its own tint", () => {
+    const { container } = renderSection(assistantSection(), true);
+
+    const card = container.querySelector<HTMLElement>(
+      "[data-slot='sidebar-section-card'], [class*='--sidebar-card-surface:']",
+    );
+    expect(card).not.toBeNull();
+    expect(card!.className).toContain(
+      "[--sidebar-card-surface:color-mix(in_srgb,var(--avatar-accent,var(--surface-lift))_15%,var(--surface-lift))]",
+    );
+    expect(card!.className).toContain(
+      "[--swipe-item-surface:var(--sidebar-card-surface,var(--surface-lift))]",
+    );
+    expect(card!.className).not.toContain(
+      "[--swipe-item-surface:var(--surface-lift)]",
+    );
+  });
+
+  /* Its rows hover and open in the accent's raised wash, the New Chat
+     pill's own hover, rather than the neutral gray the other cards' rows use.
+     The wash is derived from `--avatar-accent` without a fallback, so where no
+     accent is published it is unset and each state's own neutral fallback
+     stands: an open thread under a custom-image avatar keeps the visible
+     `--surface-active` rather than dissolving into the card. */
+  test("raises a hovered or open row to the New Chat pill's wash, with neutral fallbacks", () => {
+    const { container } = renderSection(assistantSection());
+    const card = container.querySelector<HTMLElement>(
+      "[class*='--sidebar-card-surface:']",
+    );
+    expect(card!.className).toContain(
+      "[--assistant-row-raised:color-mix(in_srgb,var(--avatar-accent)_24%,var(--surface-lift))]",
+    );
+    expect(card!.className).toContain(
+      "[--panel-item-hover:var(--assistant-row-raised,var(--surface-hover))]",
+    );
+    expect(card!.className).toContain(
+      "[--panel-item-active:var(--assistant-row-raised,var(--surface-active))]",
+    );
   });
 
   test("shows the empty state in place of the rows when it has none", () => {
@@ -169,10 +233,28 @@ describe("SidebarSectionItem — every other section", () => {
     expect(screen.getAllByText("Lease renewal").length).toBeGreaterThan(0);
   });
 
-  test("gets no empty state and no assistant header when it is empty", () => {
+  test("gets no assistant empty state or header when it is empty", () => {
     renderSection(chatsSection());
 
     expect(screen.queryByText("Nothing on my mind yet.")).toBeNull();
     expect(screen.getByText("Chats")).toBeTruthy();
+  });
+});
+
+describe("SidebarSectionItem — an empty Chats section", () => {
+  test("says so once its own read has answered", () => {
+    renderSection(chatsSection());
+
+    expect(screen.getByText("No chats yet.")).toBeTruthy();
+  });
+
+  /* Before the section's read answers, its rows are a stand-in derived from
+     the foreground page, which can be empty while older chats exist. */
+  test("says nothing while its read has not answered", () => {
+    sectionResolved = false;
+    renderSection(chatsSection());
+
+    expect(screen.queryByText("No chats yet.")).toBeNull();
+    expect(screen.queryByText("All caught up.")).toBeNull();
   });
 });

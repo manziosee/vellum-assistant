@@ -1,4 +1,4 @@
-import type { MouseEvent } from "react";
+import type { MouseEvent, ReactNode } from "react";
 import { useCallback } from "react";
 
 import { Typography } from "@vellumai/design-library";
@@ -9,7 +9,7 @@ import {
   classifyAttachment,
   formatAttachmentSize,
   middleTruncate,
-} from "@/domains/chat/components/chat-attachments/utils";
+} from "@/utils/attachment-utils";
 import type { DisplayAttachment } from "@/domains/chat/types/types";
 import { useIsNativePlatform } from "@/runtime/native-auth";
 import { cn } from "@/utils/misc";
@@ -21,8 +21,19 @@ import { cn } from "@/utils/misc";
  */
 export const ATTACHMENT_TILE_BOX_CLASS = "h-16 w-16 shrink-0 rounded-lg";
 
+export interface AttachmentSquareLabels {
+  primary?: string;
+  /** Null omits the secondary row; undefined keeps the attachment size. */
+  secondary?: string | null;
+  title?: string;
+  ariaLabel?: string;
+}
+
 interface MessageAttachmentSquareProps {
-  attachment: DisplayAttachment;
+  attachment: DisplayAttachment | null;
+  /** Content for a tile awaiting its attachment. Shares the hydrated layout. */
+  placeholder?: ReactNode;
+  labels?: AttachmentSquareLabels;
   /** Called when the user clicks the thumbnail to open a full-screen preview. */
   onPreview?: () => void;
   /** Called when the user clicks a download button. */
@@ -31,6 +42,8 @@ interface MessageAttachmentSquareProps {
    *  blob on a Chromium renderer). Lets the owner null the dead `previewUrl`
    *  so this square falls back to its file-kind icon. */
   onPreviewError?: () => void;
+  /** Omits both caption rows and their layout space. */
+  hideCaptions?: boolean;
 }
 
 /**
@@ -41,12 +54,18 @@ interface MessageAttachmentSquareProps {
  */
 export function MessageAttachmentSquare({
   attachment,
+  placeholder,
+  labels,
   onPreview,
   onDownload,
   onPreviewError,
+  hideCaptions = false,
 }: MessageAttachmentSquareProps) {
-  const { filename, mimeType, sizeBytes, previewUrl, thumbnailUrl } =
-    attachment;
+  const filename = attachment?.filename ?? "";
+  const mimeType = attachment?.mimeType ?? "";
+  const sizeBytes = attachment?.sizeBytes ?? 0;
+  const previewUrl = attachment?.previewUrl ?? null;
+  const thumbnailUrl = attachment?.thumbnailUrl;
   const kind = classifyAttachment(mimeType, filename);
   const hasImagePreview = kind === "image" && previewUrl !== null;
   const backgroundImageUrl =
@@ -57,8 +76,11 @@ export function MessageAttachmentSquare({
   // reads against both `--surface-base` and `--surface-lift` in every theme.
   const showsIcon = !hasImagePreview && backgroundImageUrl === null;
   const isClickable = onPreview != null;
-  const displayName = middleTruncate(filename, 18);
-  const displaySize = formatAttachmentSize(sizeBytes);
+  const displayName = labels?.primary ?? middleTruncate(filename, 18);
+  const displaySize =
+    labels?.secondary === undefined
+      ? formatAttachmentSize(sizeBytes)
+      : labels.secondary;
   const isNative = useIsNativePlatform();
 
   const handleDownloadClick = useCallback(
@@ -71,9 +93,15 @@ export function MessageAttachmentSquare({
 
   return (
     <div
-      role={isClickable ? "button" : hasImagePreview ? "img" : undefined}
-      aria-label={filename}
-      title={filename}
+      role={
+        isClickable
+          ? "button"
+          : hasImagePreview || !attachment
+            ? "img"
+            : undefined
+      }
+      aria-label={labels?.ariaLabel ?? filename}
+      title={labels?.title ?? filename}
       tabIndex={isClickable ? 0 : undefined}
       onClick={isClickable ? onPreview : undefined}
       onKeyDown={
@@ -87,21 +115,36 @@ export function MessageAttachmentSquare({
           : undefined
       }
       data-reveal-row=""
-      className={`group flex flex-col gap-1${isClickable ? " cursor-pointer" : ""}`}
+      className={cn(
+        "group flex flex-col",
+        !hideCaptions && "gap-1",
+        isClickable && "cursor-pointer",
+      )}
     >
       <div className="relative w-fit">
-        <AttachmentPreviewBox
-          className={cn(
-            ATTACHMENT_TILE_BOX_CLASS,
-            "bg-[var(--surface-lift)]",
-            showsIcon && "border border-[var(--border-element)]",
-          )}
-          kind={kind}
-          imageUrl={hasImagePreview ? previewUrl : null}
-          posterUrl={backgroundImageUrl}
-          onImageError={onPreviewError}
-          glyphClassName="h-6 w-6"
-        />
+        {attachment ? (
+          <AttachmentPreviewBox
+            className={cn(
+              ATTACHMENT_TILE_BOX_CLASS,
+              "bg-[var(--surface-lift)]",
+              showsIcon && "border border-[var(--border-element)]",
+            )}
+            kind={kind}
+            imageUrl={hasImagePreview ? previewUrl : null}
+            posterUrl={backgroundImageUrl}
+            onImageError={onPreviewError}
+            glyphClassName="h-6 w-6"
+          />
+        ) : (
+          <div
+            className={cn(
+              ATTACHMENT_TILE_BOX_CLASS,
+              "flex items-center justify-center border border-dashed border-[var(--border-element)] bg-[var(--surface-lift)] text-[var(--content-secondary)]",
+            )}
+          >
+            {placeholder}
+          </div>
+        )}
         {onDownload && (
           <AttachmentDownloadOverlay
             filename={filename}
@@ -110,21 +153,25 @@ export function MessageAttachmentSquare({
           />
         )}
       </div>
-      <Typography
-        variant="label-small-default"
-        className="max-w-[64px] truncate text-[var(--content-tertiary)]"
-      >
-        {displayName}
-      </Typography>
-      {/* The file size adds noise on the narrow native layout, so the native
-          shell hides it; web/electron keep it. */}
-      {!isNative && (
-        <Typography
-          variant="label-small-default"
-          className="text-[var(--content-disabled)]"
-        >
-          {displaySize}
-        </Typography>
+      {!hideCaptions && (
+        <>
+          <Typography
+            variant="label-small-default"
+            className="max-w-[64px] truncate text-[var(--content-tertiary)]"
+          >
+            {displayName}
+          </Typography>
+          {/* The file size adds noise on the narrow native layout, so the native
+              shell hides it; web/electron keep it. */}
+          {!isNative && displaySize !== null && (
+            <Typography
+              variant="label-small-default"
+              className="text-[var(--content-disabled)]"
+            >
+              {displaySize}
+            </Typography>
+          )}
+        </>
       )}
     </div>
   );

@@ -52,10 +52,7 @@ import { noUntranslatedStrings } from "./eslint-rules/no-untranslated-strings.mj
 const TYPOGRAPHY_VARIANTS = [
   ...readFileSync(
     fileURLToPath(
-      new URL(
-        "../../packages/design-library/src/tokens.css",
-        import.meta.url,
-      ),
+      new URL("../../packages/design-library/src/tokens.css", import.meta.url),
     ),
     "utf8",
   ).matchAll(/@utility\s+text-((?:title|body|label|chat)[a-z-]*)\s*\{/g),
@@ -304,9 +301,21 @@ const emDashEnforcedPaths = [
   // panel and its menus draw from, with their stories and tests.
   "src/domains/chat/components/chat-attachments/attachment-preview-box*.{ts,tsx}",
   "src/domains/chat/components/chat-attachments/use-attachment-object-url*.{ts,tsx}",
+  // The drawer's read-only file readers, their grids, and their parsers.
+  "src/domains/chat/components/local-file/preview/**/*.{ts,tsx}",
   "src/components/midline-dot.tsx",
   "src/hooks/use-share-app*.{ts,tsx}",
   "src/utils/share-app-with-toast.ts",
+  // Tool detail: the drawer panel, the per-tool renderers it hosts, and the
+  // shared shell, primitives, and copy button they are built from.
+  "src/domains/chat/components/tool-activity/**/*.{ts,tsx}",
+  "src/domains/chat/components/web-fetch/**/*.{ts,tsx}",
+  "src/domains/chat/components/web-search/**/*.{ts,tsx}",
+  "src/domains/chat/components/tool-detail-panel*.{ts,tsx}",
+  "src/domains/chat/components/tool-detail-story-fixtures.ts",
+  "src/components/detail-primitives.tsx",
+  "src/components/copy-button*.tsx",
+  "src/components/detail-shell*.tsx",
 ];
 
 const eslintConfig = defineConfig([

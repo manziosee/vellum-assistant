@@ -303,6 +303,27 @@ const CATALOG_RECORD: CatalogRecord = {
       "Fast front-door leg fronting live-voice turns under triage-and-escalate: leading-token verdict, holding phrase, or the direct answer.",
     domain: "agentLoop",
   },
+  voiceEscalationJudge: {
+    id: "voiceEscalationJudge",
+    displayName: "Voice Escalation Judge",
+    description:
+      "Second opinion on the voice front door's escalate decision. Uses managed Jev when Vellum-managed inference is available, or an explicitly configured TypeSafe profile; a confident 'needs tools' verdict hands the turn to the escalated leg.",
+    domain: "agentLoop",
+  },
+  voiceContinuationJudge: {
+    id: "voiceContinuationJudge",
+    displayName: "Voice Continuation Judge",
+    description:
+      "Decides from the caller's interruption whether a barged-in request should keep running in the background. Runs only when pinned to a TypeSafe profile.",
+    domain: "agentLoop",
+  },
+  autoProfileRouter: {
+    id: "autoProfileRouter",
+    displayName: "Auto Profile Router",
+    description:
+      "Picks which default profile answers a message when the conversation runs on the Auto profile. Asks managed Jev one choice question over the latest message; when unavailable the turn runs on Balanced.",
+    domain: "agentLoop",
+  },
   voiceContinuationLabel: {
     id: "voiceContinuationLabel",
     displayName: "Voice Continuation Label",

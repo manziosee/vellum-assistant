@@ -159,6 +159,8 @@
   "emailManagedContent": {
     "addressLabel": "Address",
     "checkingSubscription": "Checking subscription…",
+    "completeSetup": "Complete domain setup",
+    "completingSetup": "Completing setup…",
     "confirm": "Confirm",
     "create": "Create",
     "createEmailFailedFallback": "Failed to create email address.",
@@ -175,6 +177,9 @@
     "emailUsernamePlaceholder": "hi",
     "enterSubdomainError": "Enter a subdomain.",
     "enterUsernameError": "Enter an email username.",
+    "inboxSetupBody": "Your assistant's address is created from the Assistant Inbox, where its mail is read. Open it to choose the address.",
+    "inboxSetupButton": "Open Assistant Inbox",
+    "inboxSetupTitle": "Set up email in the Assistant Inbox",
     "register": "Register",
     "registerDomainFailedFallback": "Failed to register domain.",
     "registering": "Registering…",
@@ -187,6 +192,12 @@
     "removeEmailAriaLabel": "Remove email address",
     "removeEmailConfirmMessage": "Are you sure you want to remove <code>{address}</code>? Your assistant will no longer be able to send or receive email at this address.",
     "removeEmailTitle": "Remove Email Address",
+    "repairConfirmMessage": "This keeps your existing email address. Setup will contact the email provider and DNS for <code>{domain}</code>.",
+    "repairConfirmTitle": "Complete domain setup?",
+    "repairFailedFallback": "Domain setup could not start. Try again in a moment.",
+    "repairNoticeBody": "Your email address is ready, but this domain is not set up with the email provider yet. Complete setup to start sending and receiving mail.",
+    "repairNoticeTitle": "Domain setup required",
+    "repairStartedToast": "Domain setup started. Verification usually takes a few minutes.",
     "retry": "Retry",
     "setSubdomainConfirmMessage": "<code>{subdomain}</code> will also become your assistant's public handle. You won't be able to change it once set.",
     "setSubdomainTitle": "Set Subdomain",
@@ -200,5 +211,9 @@
     "upgradeNoticeBody": "Upgrade to a plan that includes an email address for your assistant. No provider setup required.",
     "upgradeNoticeTitle": "Give your assistant its own email address",
     "usageSummary": "{sent} / {limit} sent today · {received} received"
+  },
+  "emailSettingsModal": {
+    "title": "Email settings",
+    "description": "Your assistant's address, its domain, and today's usage."
   }
 }

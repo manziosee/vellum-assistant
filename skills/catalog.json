@@ -323,7 +323,7 @@
         }
       },
       "compatibility": "Designed for Vellum personal assistants",
-      "updatedAt": "2026-09-03T18:19:51.000Z"
+      "updatedAt": "2026-09-12T13:56:38.000Z"
     },
     {
       "id": "gmail-trigger",
@@ -392,7 +392,7 @@
         }
       },
       "compatibility": "Designed for Vellum personal assistants",
-      "updatedAt": "2026-09-01T17:54:05.000Z"
+      "updatedAt": "2026-09-21T21:24:24.000Z"
     },
     {
       "id": "headless-claude-code",
@@ -579,7 +579,7 @@
         }
       },
       "compatibility": "Works on both the Vellum desktop app (local daemon) and the Vellum web app (platform-hosted). Auth flow differs by environment.",
-      "updatedAt": "2026-09-09T20:26:37.000Z"
+      "updatedAt": "2026-09-14T10:34:19.000Z"
     },
     {
       "id": "meme-generator",
@@ -644,7 +644,7 @@
         }
       },
       "compatibility": "Designed for Vellum personal assistants",
-      "updatedAt": "2026-09-09T14:11:35.000Z"
+      "updatedAt": "2026-09-18T21:40:09.000Z"
     },
     {
       "id": "notion",
@@ -765,7 +765,7 @@
         }
       },
       "compatibility": "Designed for Vellum personal assistants",
-      "updatedAt": "2026-09-09T20:26:37.000Z"
+      "updatedAt": "2026-09-17T13:40:51.000Z"
     },
     {
       "id": "public-ingress",
@@ -870,7 +870,7 @@
     {
       "id": "slack",
       "name": "slack",
-      "description": "Read, send, and manage Slack messages via the Web API",
+      "description": "Send, read, and manage Slack messages",
       "metadata": {
         "icon": "assets/icon.svg",
         "emoji": "💬",
@@ -880,7 +880,7 @@
         }
       },
       "compatibility": "Designed for Vellum personal assistants",
-      "updatedAt": "2026-09-09T20:37:43.000Z"
+      "updatedAt": "2026-09-16T20:26:12.000Z"
     },
     {
       "id": "slack-app-setup",
@@ -907,6 +907,28 @@
       },
       "compatibility": "Designed for Vellum personal assistants",
       "updatedAt": "2026-09-03T18:19:51.000Z"
+    },
+    {
+      "id": "spreadsheet-authoring",
+      "name": "spreadsheet-authoring",
+      "description": "Create and edit Excel spreadsheets (.xlsx) whose formulas carry their computed values, so sums and totals show in every viewer, plus date and time formats, recalculating and verifying an existing workbook.",
+      "metadata": {
+        "emoji": "📊",
+        "vellum": {
+          "category": "productivity",
+          "display-name": "Spreadsheet Authoring",
+          "activation-hints": [
+            "User asks for an Excel file, an xlsx export, or a spreadsheet",
+            "User wants a table with totals, sums, or formulas"
+          ],
+          "avoid-when": [
+            "User wants to read or search an existing document",
+            "User wants a plain CSV"
+          ]
+        }
+      },
+      "compatibility": "Needs Python in the assistant's environment with the XlsxWriter package for writing and openpyxl for verifying. Works on desktop and web.",
+      "updatedAt": "2026-09-24T00:15:17.000Z"
     },
     {
       "id": "start-the-day",
@@ -970,7 +992,7 @@
         }
       },
       "compatibility": "Designed for Vellum personal assistants",
-      "updatedAt": "2026-09-10T01:15:52.000Z"
+      "updatedAt": "2026-09-10T12:03:09.000Z"
     },
     {
       "id": "telegram-setup",
@@ -984,7 +1006,8 @@
           "display-name": "Telegram Setup",
           "activation-hints": [
             "Telegram bot setup, webhook configuration, or BotFather token",
-            "User wants to connect Telegram to the assistant"
+            "User wants to connect Telegram to the assistant",
+            "Telegram group, supergroup, or channel messages not arriving"
           ],
           "avoid-when": [
             "User wants to send/receive Telegram messages (use messaging skill instead)"
@@ -992,7 +1015,7 @@
         }
       },
       "compatibility": "Designed for Vellum personal assistants",
-      "updatedAt": "2026-08-06T20:22:56.000Z"
+      "updatedAt": "2026-09-16T19:51:15.000Z"
     },
     {
       "id": "twilio-setup",
@@ -1055,7 +1078,7 @@
         }
       },
       "compatibility": "Designed for Vellum personal assistants",
-      "updatedAt": "2026-09-09T23:37:12.000Z"
+      "updatedAt": "2026-09-21T19:48:23.000Z"
     },
     {
       "id": "vellum-client-capabilities",
@@ -1078,7 +1101,7 @@
         }
       },
       "compatibility": "Designed for Vellum personal assistants",
-      "updatedAt": "2026-09-09T23:37:12.000Z"
+      "updatedAt": "2026-09-10T21:49:56.000Z"
     },
     {
       "id": "vellum-conversation-management",
@@ -1189,7 +1212,7 @@
         }
       },
       "compatibility": "Designed for Vellum personal assistants",
-      "updatedAt": "2026-09-10T00:07:45.000Z"
+      "updatedAt": "2026-09-22T23:46:21.000Z"
     },
     {
       "id": "vellum-self-knowledge",
@@ -1215,7 +1238,7 @@
         }
       },
       "compatibility": "Designed for Vellum personal assistants",
-      "updatedAt": "2026-09-08T20:03:58.000Z"
+      "updatedAt": "2026-09-12T11:45:18.000Z"
     },
     {
       "id": "vellum-skills-catalog",

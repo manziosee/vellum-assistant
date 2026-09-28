@@ -19,6 +19,7 @@ import { makeControlsSpies } from "@/domains/chat/voice/live-voice/live-voice-fa
 import {
   attachLiveVoiceImage,
   dismissLiveVoiceFailure,
+  endLiveVoiceSightSession,
   endLiveVoiceSession,
   getLiveVoiceInputAmplitude,
   getLiveVoicePlaybackProgress,
@@ -27,18 +28,21 @@ import {
   isLiveVoiceSessionOwnedBy,
   isLiveVoiceUserSpeaking,
   LIVE_VOICE_STATE_KEYS,
+  isOnToolStep,
   liveVoiceSurfaceLabelKey,
   minimizeVoiceRoom,
   releaseLiveVoiceTurn,
   PER_JOB_CEILING_MS,
   restoreVoiceRoom,
   sendLiveVoiceSightFrame,
+  startLiveVoiceSightSession,
   setLiveVoiceMuted,
   setLiveVoiceScreenShare,
   stopLiveVoiceResponse,
   subscribeSettledLiveVoiceState,
   updateLiveVoiceSessionConfig,
   useLiveVoiceStore,
+  type LiveVoiceResponsePhase,
   type LiveVoiceSessionState,
 } from "@/domains/chat/voice/live-voice/live-voice-store";
 import { toVoiceAvatarVisual } from "@/domains/chat/voice/voice-room/voice-avatar-state";
@@ -259,12 +263,16 @@ function surfaceLabel(
   reconnecting: boolean,
   assistantAudioActive: boolean,
   muted: boolean,
+  responsePhase: LiveVoiceResponsePhase | null = null,
+  onToolStep = false,
 ): string {
   const key = liveVoiceSurfaceLabelKey(
     state,
     reconnecting,
     assistantAudioActive,
     muted,
+    responsePhase,
+    onToolStep,
   );
   if (!key) {
     return "";
@@ -294,7 +302,60 @@ describe("LIVE_VOICE_STATE_KEYS", () => {
   });
 });
 
+describe("isOnToolStep", () => {
+  test("is a turn with an activity label", () => {
+    expect(
+      isOnToolStep({
+        activityLabel: "Searching the web",
+        pendingApprovalRequestId: null,
+      }),
+    ).toBe(true);
+  });
+
+  test("is not a turn waiting on the user's approval", () => {
+    expect(
+      isOnToolStep({
+        activityLabel: "Waiting for approval",
+        pendingApprovalRequestId: "approval-123",
+      }),
+    ).toBe(false);
+  });
+
+  test("is not a turn with no activity", () => {
+    expect(
+      isOnToolStep({ activityLabel: "", pendingApprovalRequestId: null }),
+    ).toBe(false);
+  });
+});
+
 describe("liveVoiceSurfaceLabelKey", () => {
+  test("shows a neutral working status while an escalated response prepares", () => {
+    expect(surfaceLabel("thinking", false, false, false, "escalated")).toBe(
+      "Working on that…",
+    );
+    expect(surfaceLabel("speaking", false, false, false, "escalated")).toBe(
+      "Working on that…",
+    );
+    expect(surfaceLabel("speaking", false, true, false, "escalated")).toBe(
+      "Speaking…",
+    );
+  });
+
+  test("a turn on a tool step reads as working wherever it would read thinking", () => {
+    expect(surfaceLabel("thinking", false, false, false, null, true)).toBe(
+      "Working on that…",
+    );
+    expect(surfaceLabel("speaking", false, false, false, null, true)).toBe(
+      "Working on that…",
+    );
+    expect(surfaceLabel("speaking", false, true, false, null, true)).toBe(
+      "Speaking…",
+    );
+    expect(surfaceLabel("listening", false, false, false, null, true)).toBe(
+      "Listening…",
+    );
+  });
+
   test("a speaking phase with no audio playing reads as thinking", () => {
     // `speaking` stays set across a mid-turn tool run (the ack was spoken and
     // the assistant is now silent) so every surface says "Thinking…".
@@ -654,6 +715,28 @@ describe("sendLiveVoiceSightFrame", () => {
         useLiveVoiceStore.getState().sessionGeneration,
       ),
     ).toBe(false);
+  });
+});
+
+describe("live voice sight session lifecycle", () => {
+  test("routes start and end through the active session controls", () => {
+    const controls = makeControlsSpies();
+    const startSightSession = mock(
+      (_cameraEpoch: number, _source: "live" | "ambient") => true,
+    );
+    const endSightSession = mock((_cameraEpoch: number) => true);
+    Object.assign(controls, { startSightSession, endSightSession });
+    useLiveVoiceStore.getState().setControls(controls);
+
+    expect(startLiveVoiceSightSession(7, "ambient")).toBe(true);
+    expect(endLiveVoiceSightSession(7)).toBe(true);
+    expect(startSightSession).toHaveBeenCalledWith(7, "ambient");
+    expect(endSightSession).toHaveBeenCalledWith(7);
+  });
+
+  test("reports unsupported when no session lifecycle controls are present", () => {
+    expect(startLiveVoiceSightSession(1, "live")).toBe(false);
+    expect(endLiveVoiceSightSession(1)).toBe(false);
   });
 });
 

@@ -9,8 +9,12 @@
  */
 
 import { arePlatformFeaturesEnabled } from "../../platform/feature-gate.js";
-import { readBundledPluginCatalog } from "./plugin-catalog-local.js";
+import {
+  readBundledLocalPluginCatalog,
+  readBundledPluginCatalog,
+} from "./plugin-catalog-local.js";
 import { fetchPluginCatalogFromPlatform } from "./plugin-catalog-platform.js";
+import { filterPluginCatalogByFeatureFlags } from "./plugin-catalog-visibility.js";
 import type { PluginCatalog, SearchPluginsDeps } from "./search-plugins.js";
 
 /** How long a fetched catalog is served before a refresh is attempted. */
@@ -21,7 +25,39 @@ interface CacheEntry {
   timestamp: number;
 }
 
+type PluginCatalogLoadDeps = Pick<SearchPluginsDeps, "fetch">;
+
 const cache = new Map<string, CacheEntry>();
+
+/**
+ * Add bundled local packages without overriding platform-authoritative rows.
+ * A platform row without an integration borrows the bundled row's
+ * integration of the same name, so an integration the platform omits or
+ * serves malformed never disappears from the catalog.
+ */
+export function mergePlatformCatalogWithBundledLocals(
+  platform: PluginCatalog,
+  bundledLocal: PluginCatalog = readBundledLocalPluginCatalog(),
+): PluginCatalog {
+  const bundledByName = new Map(
+    bundledLocal.matches.map((match) => [match.name, match]),
+  );
+  const platformMatches = platform.matches.map((match) => {
+    const bundledIntegration = bundledByName.get(match.name)?.integration;
+    if (match.integration || !bundledIntegration) {
+      return match;
+    }
+    return { ...match, integration: bundledIntegration };
+  });
+  const seen = new Set(platform.matches.map((match) => match.name));
+  return {
+    ref: platform.ref,
+    matches: [
+      ...platformMatches,
+      ...bundledLocal.matches.filter((match) => !seen.has(match.name)),
+    ].sort((a, b) => a.name.localeCompare(b.name)),
+  };
+}
 
 /**
  * Resolve the full plugin catalog at {@link ref}.
@@ -32,9 +68,9 @@ const cache = new Map<string, CacheEntry>();
  * fetch failure propagates so the caller can surface it (e.g. map a rate-limit
  * to 503) — no stale catalog is ever served.
  */
-export async function getPluginCatalog(
+async function loadPluginCatalog(
   ref: string,
-  deps: SearchPluginsDeps,
+  deps: PluginCatalogLoadDeps,
 ): Promise<PluginCatalog> {
   if (!arePlatformFeaturesEnabled()) {
     return { ...readBundledPluginCatalog(), ref };
@@ -46,8 +82,28 @@ export async function getPluginCatalog(
   }
 
   const catalog = await fetchPluginCatalogFromPlatform(deps, { ref });
-  cache.set(ref, { catalog, timestamp: Date.now() });
-  return catalog;
+  const merged = mergePlatformCatalogWithBundledLocals(catalog);
+  cache.set(ref, { catalog: merged, timestamp: Date.now() });
+  return merged;
+}
+
+/** Installable catalog with feature-flag visibility applied. */
+export async function getPluginCatalog(
+  ref: string,
+  deps: SearchPluginsDeps,
+): Promise<PluginCatalog> {
+  return filterPluginCatalogByFeatureFlags(
+    await loadPluginCatalog(ref, deps),
+    deps.featureFlagEnabled,
+  );
+}
+
+/** Category metadata for plugins already installed, including hidden entries. */
+export async function getPluginCatalogForInstalledMetadata(
+  ref: string,
+  deps: PluginCatalogLoadDeps,
+): Promise<PluginCatalog> {
+  return loadPluginCatalog(ref, deps);
 }
 
 /** Invalidate the cache (for testing or forced refresh). */

@@ -1,4 +1,12 @@
 {
+  "askQuestionDetail": {
+    "heading": "{count, plural, other {問題}}"
+  },
+  "documentChat": {
+    "saveFailed": "無法儲存文件。你的訊息仍在這裡。請重新傳送。",
+    "viewConversation": "查看對話",
+    "reopenDocument": "重新開啟文件"
+  },
   "acpChatPlanBlock": {
     "plan": "計畫"
   },
@@ -18,6 +26,7 @@
   },
   "acpConnectAffordance": {
     "connectButton": "連線",
+    "dismissButton": "關閉",
     "errorFallback": "連線 Claude 失敗。請再試一次。",
     "pastePlaceholder": "貼上您的金鑰",
     "saveButton": "儲存",
@@ -35,6 +44,7 @@
     "closeRunDetail": "關閉執行詳細資料",
     "goToNewest": "前往最新",
     "inputLabel": "輸入",
+    "modelLabel": "模型",
     "objective": "目標",
     "outputLabel": "輸出",
     "sendSteerAria": "傳送引導指令",
@@ -54,12 +64,28 @@
     "takingLonger": "您的助理回應時間超出預期。",
     "tryAgain": "再試一次"
   },
+  "markAllDoneConfirmDialog": {
+    "confirm": "全部標記為已完成",
+    "message": "{count, plural, other {將「{groupName}」中的所有 {count} 個對話標記為已完成？它們將從側邊欄移除，並保留在「所有聊天」中，您可以在那裡重新開啟它們。}}",
+    "title": "全部標記為已完成"
+  },
+  "mobileDetailSheet": {
+    "title": "活動詳細資訊"
+  },
   "activityStepsPanel": {
     "backAria": "返回所有步驟",
     "backTooltip": "所有步驟",
     "closeSteps": "關閉步驟",
-    "thinkingTitle": "思考中",
+    "screenshotAria": "預覽來自「{activity}」的螢幕截圖",
+    "screenshotFallbackAria": "預覽電腦螢幕截圖",
+    "screenshotFallbackTitle": "電腦螢幕截圖",
+    "screenshotTitle": "來自「{activity}」的螢幕截圖",
     "viewThinkingAria": "檢視思考過程"
+  },
+  "computerUseScreenshotPreview": {
+    "unavailable": "最新螢幕截圖無法使用。",
+    "unavailableShowingPrevious": "最新螢幕截圖無法使用。正在顯示上一張螢幕截圖。",
+    "updating": "正在更新螢幕截圖..."
   },
   "addToChatSheet": {
     "camera": "相機",
@@ -86,6 +112,95 @@
   },
   "assistantContentDisclosure": {
     "earlierActivity": "較早的活動"
+  },
+  "actionDisplay": {
+    "click": "點擊",
+    "type": "輸入",
+    "keyPress": "按鍵",
+    "scroll": "捲動",
+    "drag": "拖曳",
+    "hover": "懸停",
+    "observe": "查看",
+    "navigate": "導覽",
+    "terminal": "執行命令"
+  },
+  "allChatsPage": {
+    "band": {
+      "previous30Days": "過去 30 天",
+      "previous7Days": "過去 7 天",
+      "today": "今天",
+      "yesterday": "昨天"
+    },
+    "chip": {
+      "all": "全部",
+      "background": "背景",
+      "done": "已完成"
+    },
+    "empty": "這裡還沒有聊天。",
+    "filterAria": "篩選聊天",
+    "loadError": "無法載入你的聊天。",
+    "loading": "正在載入聊天",
+    "noMatches": "沒有與「{query}」相符的聊天。",
+    "retry": "重試",
+    "searchPlaceholder": "搜尋聊天",
+    "title": "所有聊天",
+    "close": "關閉所有聊天",
+    "openChat": "開啟聊天",
+    "doneLabel": "{title}，已完成",
+    "unread": "未讀",
+    "running": "執行中",
+    "needsAttention": "需要關注",
+    "runningCount": "{count, plural, other {# 個任務正在執行}}"
+  },
+  "sessionGroupRow": {
+    "mode": {
+      "computerUse": "電腦工作階段",
+      "browser": "瀏覽器工作階段",
+      "liveVision": "即時視覺工作階段",
+      "ambient": "環境工作階段"
+    },
+    "durationSeconds": "{count, plural, other {# 秒}}",
+    "durationMinutes": "{count, plural, other {# 分鐘}}",
+    "working": "處理中",
+    "workingWithDuration": "處理中 · {duration}",
+    "waiting": "等待中",
+    "waitingWithDuration": "等待中 · {duration}",
+    "finishing": "即將完成",
+    "finishingWithDuration": "即將完成 · {duration}",
+    "completedWithDurationAndEnd": "{duration} · 結束於 {endTime}",
+    "completedWithDuration": "{duration}",
+    "completedWithEnd": "結束於 {endTime}",
+    "interrupted": "已中斷",
+    "interruptedWithDurationAndEnd": "已中斷 · {duration} · 結束於 {endTime}",
+    "interruptedWithDurationAndLastActivity": "已中斷 · {duration} · 上次活動於 {lastActivityTime}",
+    "interruptedWithLastActivity": "已中斷 · 上次活動於 {lastActivityTime}",
+    "interruptedWithEnd": "已中斷 · 結束於 {endTime}",
+    "disconnected": "連線已中斷",
+    "disconnectedWithDurationAndLastActivity": "連線已中斷 · {duration} · 最後活動時間 {lastActivityTime}",
+    "disconnectedWithLastActivity": "連線已中斷 · 最後活動時間 {lastActivityTime}",
+    "timingUnavailable": "時間資訊無法使用"
+  },
+  "assistantDesktop": {
+    "fitView": "符合螢幕",
+    "panView": "平移",
+    "controlView": "控制",
+    "panHint": "拖曳以平移，輕點以按一下。",
+    "hideAria": "隱藏虛擬桌面",
+    "closeAria": "關閉虛擬桌面預覽",
+    "moveAria": "移動虛擬桌面預覽（方向鍵）",
+    "resizeAria": "調整虛擬桌面預覽大小（方向鍵）",
+    "expandAria": "展開虛擬桌面",
+    "busy": "虛擬桌面正由其他使用者使用中。",
+    "connecting": "正在連線至虛擬桌面…",
+    "failed": "虛擬桌面無法啟動。",
+    "lost": "與虛擬桌面的連線已中斷。",
+    "openAria": "開啟 {name} 的虛擬桌面",
+    "openUnnamedAria": "開啟虛擬桌面",
+    "reconnectButton": "重新連線",
+    "title": "桌面",
+    "unavailable": "此助理不支援虛擬桌面。",
+    "checkingSetup": "正在檢查虛擬桌面設定…",
+    "setupRequestFailed": "無法檢查虛擬桌面設定。請重新連線後再試。"
   },
   "assistantNavItem": {
     "newChat": "新增聊天"
@@ -270,6 +385,22 @@
     "unsupported": "此裝置無法開啟相機。",
     "uploadFailed": "無法傳送該相片。"
   },
+  "cameraExplainer": {
+    "close": "關閉",
+    "gotIt": "知道了",
+    "liveBody": "您移動相機時，{name} 會持續觀看。直接聊聊 {name} 看到的內容。",
+    "liveBodyDesktop": "您移動相機時，{name} 會持續觀看。直接聊聊 {name} 看到的內容。隨時都可以停止。",
+    "liveTag": "即時",
+    "liveTitle": "即時",
+    "photoBody": "拍一張照片。{name} 只會看到那一張照片。",
+    "photoTitle": "相片",
+    "privacy": "{name} 看到的一切都留在 {name} 自己的私人工作區。關閉相機時即時模式就會結束。",
+    "subtitle": "選擇 {name} 要如何看您對準的畫面。隨時都可以切換。",
+    "title": "相片還是即時？",
+    "tryLive": "立即試用即時",
+    "tryLiveDesktop": "試用即時",
+    "yourAssistant": "您的助理"
+  },
   "cameraShutterHint": {
     "live": "即時 · 輕觸停止",
     "liveDescription": "輕觸停止即時視訊。",
@@ -291,10 +422,11 @@
   },
   "cameraViewOptions": {
     "buttonAria": "相機顯示選項",
-    "gateHudDescription": "用於調整即時模式保留哪些畫面的面板。",
-    "gateHudTitle": "影格篩選讀數",
-    "keptFrameDescription": "即時模式傳送的最近一格，顯示在照片旁邊。無論是否顯示，都會繼續傳送。",
-    "keptFrameTitle": "最近一格",
+    "gateHudDescription": "偵錯疊加層：即時模式如何挑選要傳送的畫面。",
+    "gateHudTitle": "影格篩選調校",
+    "howItWorks": "「相片」和「即時」的運作方式",
+    "keptFrameDescription": "顯示即時模式最近傳送的畫面。",
+    "keptFrameTitle": "最近分享的畫面",
     "title": "顯示"
   },
   "cardSurface": {
@@ -356,6 +488,24 @@
     "dismiss": "關閉",
     "removeAria": "移除 {filename}"
   },
+  "emailReferenceChip": {
+    "noSubject": "(無主旨)",
+    "captionReceived": "已接收 · 來自 {name} · {date}",
+    "captionReceivedUndated": "已接收 · 來自 {name}",
+    "captionSent": "已寄出 · 寄給 {name} · {date}",
+    "captionSentUndated": "已寄出 · 寄給 {name}",
+    "tooltip": "{subject}\n{caption}",
+    "removeAria": "移除郵件 {subject}"
+  },
+  "emailReferenceCard": {
+    "noSubject": "(無主旨)",
+    "captionReceived": "已接收 · 來自 {name} · {date}",
+    "captionReceivedUndated": "已接收 · 來自 {name}",
+    "captionSent": "已寄出 · 寄給 {name} · {date}",
+    "captionSentUndated": "已寄出 · 寄給 {name}",
+    "tooltip": "{subject}\n{caption}",
+    "openAria": "在收件匣中開啟郵件 {subject}"
+  },
   "chatBody": {
     "dropFiles": "拖曳檔案以附加"
   },
@@ -375,8 +525,8 @@
   },
   "chatConversationHeader": {
     "archived": "[已封存]",
-    "newChat": "新增聊天",
-    "untitled": "未命名"
+    "done": "[已完成]",
+    "newChat": "新增聊天"
   },
   "chatInfoPanel": {
     "appsTitle": "應用程式",
@@ -396,7 +546,17 @@
     "seeAllAppsAria": "查看全部應用程式",
     "seeAllFilesAria": "查看全部文件與圖片",
     "seeAllFramesAria": "查看全部相機影格",
-    "title": "聊天資訊"
+    "title": "聊天資訊",
+    "retry": "重試",
+    "retrySourceAria": "重試載入{source}",
+    "documentsSource": "文件",
+    "attachmentsSource": "附件",
+    "sourceLoading": "正在載入{source}…",
+    "sourceLoadFailed": "無法載入{source}。",
+    "sourceRefreshFailed": "無法重新整理{source}。正在顯示已儲存的結果。",
+    "sourcePageFailed": "無法載入更多{source}。",
+    "framesUnsupported": "此助理版本不支援攝影機畫面分類。",
+    "loadedHistory": "附件僅來自已載入的聊天記錄。"
   },
   "chatLayout": {
     "navigationAria": "導覽"
@@ -516,6 +676,7 @@
     "warningTitle": "這看起來像一個 API 金鑰"
   },
   "composerSettingsMenu": {
+    "autoPreview": "自動 · {profile}",
     "accessAria": "助理存取權限：{label}",
     "assistantAccess": "助理存取權限",
     "assistantAccessTitle": "助理存取權限",
@@ -603,8 +764,10 @@
     "copyConversation": "複製完整對話",
     "copyConversationId": "複製對話 ID",
     "delete": "刪除",
+    "done": "完成",
     "forkConversation": "分支對話",
     "inspect": "分析對話",
+    "markAsDone": "標記為已完成",
     "markRead": "標示為已讀",
     "markUnread": "標示為未讀",
     "moveToGroup": "移至群組",
@@ -614,6 +777,7 @@
     "refresh": "重新整理",
     "removeFromGroup": "從群組中移除",
     "rename": "重新命名",
+    "reopen": "重新開啟",
     "shareFeedback": "分享意見回饋",
     "triggerAriaLabel": "對話動作",
     "unarchive": "取消歸檔",
@@ -638,10 +802,12 @@
     "ariaLabelUnavailable": "對話資產，無法載入",
     "ariaLabelUnseen": "對話資產，{count, plural, one {# 個項目} other {# 個項目}} (未檢視的變更)",
     "label": "{count, plural, one {# 個資產} other {# 個資產}}",
-    "labelUnavailable": "無法載入資產"
-  },
-  "conversationRow": {
-    "untitled": "未命名"
+    "labelUnavailable": "無法載入資產",
+    "labelPartial": "部分資產無法載入",
+    "ariaLabelPartial": "對話資產，部分無法載入",
+    "labelLoaded": "{count, plural, other {已載入 # 個資產}}",
+    "ariaLabelLoaded": "對話資產，{count, plural, other {已載入 # 個項目}}",
+    "ariaLabelLoadedUnseen": "對話資產，{count, plural, other {已載入 # 個項目}}（有未查看的變更）"
   },
   "conversationStarterDock": {
     "caption": "試試這些建議："
@@ -652,10 +818,6 @@
   "copyBlockSurface": {
     "copied": "已複製",
     "copy": "複製"
-  },
-  "copyButton": {
-    "copied": "已複製",
-    "copyFailed": "無法複製到剪貼簿。"
   },
   "copyIdToClipboard": {
     "conversationCopied": "對話 ID 已複製到剪貼簿。",
@@ -673,8 +835,8 @@
   },
   "csvPreview": {
     "emptyFile": "此檔案為空",
-    "summary": "{rows} 列 x {columns} 欄",
-    "summaryTruncated": "{rows} 列 x {columns} 欄 (已截斷)"
+    "summary": "{rows, plural, other {# 列}} x {columns, plural, other {# 欄}}",
+    "summaryTruncated": "{rows, plural, other {# 列}} x {columns, plural, other {# 欄}} (已截斷)"
   },
   "dailyLimitBanner": {
     "skipConfirmTitle": "略過今日點數限制？",
@@ -688,8 +850,7 @@
     "cancel": "取消",
     "confirm": "刪除",
     "message": "刪除「{title}」？這將永久移除對話及其訊息。相關資產和記憶可能仍會保留。此動作無法復原。",
-    "title": "刪除對話",
-    "untitled": "未命名"
+    "title": "刪除對話"
   },
   "deletedMessageRow": {
     "label": "此訊息已被刪除"
@@ -732,8 +893,8 @@
     "close": "關閉",
     "closeDocumentAria": "關閉文件",
     "comments": "留言",
+    "commentsWithOpenCount": "{count, plural, other {留言，# 則未解決}}",
     "export": "匯出",
-    "hideComments": "隱藏留言",
     "menuAria": "文件選項",
     "rename": "重新命名",
     "renameFailed": "無法重新命名文件。",
@@ -743,11 +904,22 @@
     "saving": "正在儲存…",
     "wordCount": "{count, plural, other {# 個字}}"
   },
+  "documentConversation": {
+    "unavailable": "無法開啟文件對話。請再試一次。",
+    "updateRequired": "請更新助理以開始連結對話。",
+    "prepareFailed": "無法準備文件對話。你的編輯仍然保留。",
+    "feedbackPrompt": "請查看並處理我對「{title}」的評論。",
+    "missing": "此文件的對話無法使用。你可以繼續編輯或開始新的連結對話。",
+    "start": "開始連結對話",
+    "retry": "再試一次",
+    "back": "返回"
+  },
   "documentViewerPage": {
     "exportFailed": "匯出 PDF 失敗",
     "notFound": "找不到文件。"
   },
   "dynamicPageSurface": {
+    "collapse": "收合",
     "titleFallback": "動態內容"
   },
   "exportProgressModal": {
@@ -787,6 +959,7 @@
     "accepted": "已接受：{types}",
     "dropHint": "將檔案拖曳至此，或點擊以瀏覽",
     "maxSize": "最大大小：{size}",
+    "removeFile": "移除 {name}",
     "upload": "上傳",
     "uploading": "正在上傳..."
   },
@@ -831,7 +1004,12 @@
     "stepWarmup": "預熱",
     "surfaceVoice": "語音通話攝影機",
     "thresholds": "閾值",
-    "valueAbsent": "無"
+    "valueAbsent": "無",
+    "forcedNoveltyThresholdLabel": "主動請求閾值",
+    "reasonAnswered": "已請求，但上一張相片已包含該內容。",
+    "reasonSettling": "已停止移動，但靜止時間尚不足。",
+    "stepAnswered": "已顯示",
+    "stepSettling": "保持靜止"
   },
   "groupActions": {
     "archiveAll": "全部封存…",
@@ -839,6 +1017,7 @@
     "deleteGroup": "刪除群組",
     "deleteGroupWithConversations": "刪除群組…",
     "groupByChannel": "依頻道分組",
+    "markAllAsDone": "全部標記為已完成…",
     "markAllRead": "全部標示為已讀",
     "moveSectionDown": "向下移動區段",
     "moveSectionUp": "向上移動區段",
@@ -925,6 +1104,7 @@
     "reconnecting": "正在重新連線…",
     "speaking": "正在說話…",
     "thinking": "正在思考…",
+    "working": "正在處理…",
     "askUnsupported": "該助手尚不支援以此種方式提問。請更新後重試。"
   },
   "llmCallErrorCard": {
@@ -944,7 +1124,13 @@
     "pictureInPictureUnavailable": "子母畫面無法使用"
   },
   "localFileLink": {
-    "unavailable": "此檔案在此處無法使用"
+    "closePreview": "關閉預覽：{filename}",
+    "fileOptions": "檔案選項：{filename}",
+    "openInWorkspace": "在工作區中開啟：{filename}",
+    "openPreview": "開啟預覽：{filename}",
+    "unavailable": "此檔案在此處無法使用",
+    "unavailableLabel": "檔案無法使用：{filename}",
+    "viewImage": "檢視圖片：{filename}"
   },
   "localFileMenu": {
     "download": "下載",
@@ -1157,20 +1343,34 @@
     "title": "檔案"
   },
   "messageHoverActions": {
+    "autoRouted": "自動 · {profile}",
     "bookmark": "書籤",
     "copied": "已複製",
     "copy": "複製",
+    "copyFailed": "無法複製這則訊息。",
     "forkFromHere": "從此處分岔",
     "inspect": "檢查",
+    "loading": "朗讀中…",
     "openInSlack": "在 Slack 中開啟",
+    "playFailed": "無法朗讀這則訊息。",
+    "readAloud": "朗讀",
     "removeBookmark": "移除書籤",
     "retry": "重試",
+    "stop": "停止",
     "summarizeUpToHere": "總結至此"
   },
   "messageLongPressActions": {
     "bookmark": "書籤",
     "copied": "已複製",
+    "copy": "複製",
+    "copyFailed": "無法複製這則訊息。",
+    "forkFromHere": "從此處分岔",
+    "inspect": "檢查",
+    "openInSlack": "在 Slack 中開啟",
+    "readAloud": "朗讀",
     "removeBookmark": "移除書籤",
+    "stop": "停止",
+    "summarizeUpToHere": "總結至此",
     "title": "訊息動作"
   },
   "micPermissionPrimer": {
@@ -1223,6 +1423,7 @@
     "defaultDescription": "連線 {name}，以便我能將其用於此任務。",
     "dismiss": "關閉",
     "missingDetails": "缺少助理或供應商詳細資訊。",
+    "tenantHostInvalid": "請輸入有效的{label}，例如 {placeholder}",
     "thisAccount": "此帳號",
     "waiting": "等待中...",
     "yourAssistant": "您的助理"
@@ -1305,12 +1506,15 @@
   },
   "preferencesMenu": {
     "admin": "管理員",
+    "earnCredits": "賺取免費點數",
     "preferences": "偏好設定",
     "settings": "設定",
     "shareFeedback": "分享意見回饋"
   },
   "preferencesUsagePanel": {
     "addCreditsAriaLabel": "新增點數",
+    "dailyExhausted": "今日用量已用完。新增點數以繼續。",
+    "dailyTitle": "每日用量",
     "exhausted": "新增點數以繼續。",
     "extraCredits": "目前使用額外用量點數",
     "pctUsed": "已使用 {pct}%",
@@ -1403,6 +1607,10 @@
     "ariaLabel": "引用並回覆",
     "cancel": "取消",
     "placeholder": "輸入您的回覆…"
+  },
+  "rawDisclosure": {
+    "input": "原始輸入",
+    "output": "原始輸出"
   },
   "rawTab": {
     "copyRequestPayloadAriaLabel": "複製請求酬載",
@@ -1502,6 +1710,8 @@
     "submitFailed": "提交金鑰失敗。請再試一次。"
   },
   "secretPromptCard": {
+    "showValue": "顯示值",
+    "hideValue": "隱藏值",
     "cancel": "取消",
     "domains": "網域：{list}",
     "placeholder": "輸入金鑰值...",
@@ -1542,12 +1752,11 @@
   "sidebarListContextMenu": {
     "newGroup": "新增群組…"
   },
+  "sidebarSectionViewAll": {
+    "label": "查看所有聊天"
+  },
   "singleActivity": {
     "webSearch": "網路搜尋"
-  },
-  "skillCreatedCard": {
-    "view": "檢視",
-    "viewAria": "檢視 {name}"
   },
   "skillDetailPanel": {
     "actionsAria": "技能動作",
@@ -1559,21 +1768,20 @@
     "titleFallback": "技能"
   },
   "skillExecuteDetail": {
-    "parameters": "參數",
-    "rawInput": "原始輸入",
-    "runningSuffix": " · 執行中"
+    "runningSuffix": " · 執行中",
+    "unnamedTool": "技能工具"
   },
   "skillLoadCard": {
     "view": "檢視"
   },
   "skillLoadDetail": {
+    "failed": "載入失敗",
+    "loading": "正在載入技能…",
     "loadingAria": "正在載入技能",
+    "notApproved": "未獲核准",
     "provides": "提供",
+    "unnamedSkill": "技能",
     "usedSkill": "已使用技能"
-  },
-  "skillLoadOutput": {
-    "output": "輸出",
-    "outputFormatAria": "輸出格式"
   },
   "skillToolList": {
     "fromSkill": "來自 {name}"
@@ -1602,8 +1810,6 @@
     "noEventsYet": "尚無事件",
     "objective": "目標",
     "output": "輸出",
-    "showLess": "顯示較少",
-    "showMore": "顯示更多",
     "stopSubagentAria": "停止子代理",
     "timeline": "時間軸"
   },
@@ -1643,7 +1849,9 @@
   "tableSurface": {
     "copied": "已複製",
     "copy": "複製",
-    "copyAria": "將表格複製為 Markdown"
+    "copyAria": "將表格複製為 Markdown",
+    "copyFailed": "無法複製表格。",
+    "table": "表格"
   },
   "taskPreferencesSurface": {
     "continue": "繼續",
@@ -1660,10 +1868,34 @@
   "textSelectionPopover": {
     "reply": "回覆"
   },
+  "thinkingDetail": {
+    "title": "思考中"
+  },
   "tiptapDocumentEditor": {
     "adding": "正在新增…",
+    "blockquote": "引文",
+    "bold": "粗體",
+    "bulletList": "項目符號清單",
+    "code": "程式碼",
     "comment": "註解",
-    "feedbackPlaceholder": "新增您的意見回饋…"
+    "feedbackPlaceholder": "新增您的意見回饋…",
+    "heading1": "標題 1",
+    "heading2": "標題 2",
+    "heading3": "標題 3",
+    "italic": "斜體",
+    "link": "連結",
+    "linkAddress": "連結網址",
+    "linkApply": "套用連結",
+    "linkInvalid": "請輸入網址或電子郵件地址",
+    "linkPlaceholder": "貼上或輸入連結",
+    "linkRemove": "移除連結",
+    "orderedList": "編號清單",
+    "paragraph": "內文",
+    "placeholder": "開始寫作…",
+    "remoteEditConflict": "助理修改了您正在編輯的同一段文字，已保留您的修改，因此其部分編輯未套用。",
+    "strike": "刪除線",
+    "textStyle": "文字樣式：{style}",
+    "toolbarAria": "格式"
   },
   "toolCallChip": {
     "allow": "允許",
@@ -1691,10 +1923,19 @@
     "command": "指令",
     "denied": "此工具呼叫未獲核准，因此沒有執行。",
     "emptyOutput": "該工具沒有回傳任何輸出。",
-    "input": "輸入",
     "output": "輸出",
     "requestedChanges": "要求的變更",
     "running": "正在執行…"
+  },
+  "toolInputParameters": {
+    "parameters": "參數",
+    "moreCount": "{count, plural, other {另有 # 項，見「原始輸入」}}"
+  },
+  "toolOutputSection": {
+    "moreCount": "{count, plural, other {另有 # 項，見「原始輸出」}}"
+  },
+  "valueFields": {
+    "copyValue": "複製 {label}"
   },
   "toolStepPill": {
     "openAria": "開啟 {label}",
@@ -1718,9 +1959,6 @@
     "assistantBusy": "您的助理正忙。請在回覆完成後再試一次。",
     "retryFailed": "無法重試回應",
     "summarizeFailed": "無法摘要對話"
-  },
-  "useNativeWidgetSnapshotSync": {
-    "untitled": "未命名"
   },
   "useSendMessage": {
     "commandFailed": "無法執行該指令。請再試一次。",
@@ -1816,12 +2054,12 @@
     "workflowFinished": "工作流程已完成"
   },
   "wakeDetailPanel": {
-    "close": "關閉",
     "details": "詳細資料",
     "result": "結果",
     "runStatus": "執行狀態",
     "title": "對話已喚醒",
-    "workflow": "工作流程"
+    "workflow": "工作流程",
+    "closeAria": "關閉詳細資料"
   },
   "weatherForecastDisplay": {
     "celsius": "°C",
@@ -1831,13 +2069,10 @@
     "now": "現在"
   },
   "webFetchDetailView": {
-    "content": "內容",
     "fetchFailed": "擷取失敗。",
-    "fetching": "正在擷取…",
-    "noContent": "未擷取到內容。",
-    "rawResult": "原始結果",
-    "viewExtracted": "檢視已擷取內容",
-    "viewRaw": "檢視原始內容"
+    "mayRequireJavaScript": "此頁面可能需要 JavaScript 才能完整顯示，因此部分內容可能缺失。",
+    "startIndexPastEnd": "讀取起點超出了此頁面的結尾，因此沒有讀取到任何內容。",
+    "truncated": "只讀取了此頁面的一部分。"
   },
   "webSearchDetailView": {
     "noSources": "找不到來源。",
@@ -1880,6 +2115,21 @@
   },
   "workspacePathLink": {
     "openTitle": "開啟 {path}"
+  },
+  "xlsxPreview": {
+    "beyondPreviewLimit": "此工作表的儲存格均超出預覽限制",
+    "emptySheet": "此工作表為空",
+    "sheetUnreadable": "無法讀取此工作表",
+    "sheetsAria": "工作表",
+    "sheetsOmitted": "{count, plural, other {另有 # 個工作表未顯示}}",
+    "summary": "{sheet}：{rows, plural, other {# 列}} x {columns, plural, other {# 欄}}",
+    "summaryTruncated": "{sheet}：{rows, plural, other {# 列}} x {columns, plural, other {# 欄}} (已截斷)",
+    "summaryColumnsCut": "{sheet}：{rows, plural, other {# 列}} x {columns, number} / {total, plural, other {# 欄}}",
+    "summaryRowsCut": "{sheet}：{rows, number} / {total, plural, other {# 列}} x {columns, plural, other {# 欄}}",
+    "summaryBothCut": "{sheet}：{rows, number} / {totalRows, plural, other {# 列}} x {columns, number} / {totalColumns, plural, other {# 欄}}",
+    "countsColumnsCut": "{rows, plural, other {# 列}} x {columns, number} / {total, plural, other {# 欄}}",
+    "countsRowsCut": "{rows, number} / {total, plural, other {# 列}} x {columns, plural, other {# 欄}}",
+    "countsBothCut": "{rows, number} / {totalRows, plural, other {# 列}} x {columns, number} / {totalColumns, plural, other {# 欄}}"
   },
   "transcript": {
     "noResponse": "決定不回覆",
@@ -1924,5 +2174,66 @@
   "assistantSection": {
     "emptyBody": "我隨時都在思考。當有值得您關注的事情時，我會在這裡發起對話。",
     "emptyTitle": "目前還沒有任何想法。"
+  },
+  "chatsSection": {
+    "doneEmptyBody": "標記為已完成的聊天會保留在「所有聊天」中。",
+    "doneEmptyTitle": "全部處理完畢。",
+    "emptyBody": "開始新的聊天後，它會顯示在這裡。",
+    "emptyTitle": "還沒有聊天。"
+  },
+  "sidebarExpandRow": {
+    "expand": "展開",
+    "collapse": "收合"
+  },
+  "assistantSectionToggle": {
+    "hide": "隱藏來自 {name} 的對話",
+    "show": "顯示來自 {name} 的對話"
+  },
+  "coachmarkPress": {
+    "turn": "我點擊了 {label}。接下來呢？"
+  },
+  "cameraFrameGrid": {
+    "count": "{count, plural, other {# 個攝影機畫面}}",
+    "timeRange": "儲存時間：{first} 至 {last}",
+    "savedTime": "儲存於 {time}",
+    "pendingAria": "攝影機畫面，影像仍在載入。{time}",
+    "timeUnavailable": "時間無法取得"
+  },
+  "desktopHelpCard": {
+    "showPreview": "顯示即時預覽",
+    "needsHelp": "虛擬桌面需要你的協助。",
+    "stepIn": "接管",
+    "done": "完成",
+    "skip": "略過",
+    "showMore": "展開",
+    "showLess": "收起"
+  },
+  "rememberDetail": {
+    "saved": "已儲存",
+    "saving": "正在儲存",
+    "notSaved": "未儲存"
+  },
+  "recallDetail": {
+    "searchedFor": "搜尋內容",
+    "scope": "{depth} · {sources}",
+    "answer": "回答",
+    "evidence": "{count, plural, other {# 筆結果}}",
+    "noEvidence": "沒有找到相關內容。",
+    "degraded": "部分位置未能完整搜尋",
+    "degradedSource": "{source}：{error}"
+  },
+  "recallLabels": {
+    "source": "{source, select, memory {記憶} conversations {對話} workspace {工作區檔案} other {{source}}}",
+    "depth": "{depth, select, fast {快速搜尋} standard {標準搜尋} deep {深度搜尋} other {搜尋}}"
+  },
+  "freeTierDailyLimitBanner": {
+    "addCredits": "新增點數",
+    "subtitle": "您已用完今日的免費用量，將在 {resetPhrase} 重設。升級或新增點數以繼續。",
+    "title": "今日免費用量已用完",
+    "viewPlans": "查看方案"
+  },
+  "emailNavItem": {
+    "label": "郵件",
+    "unpin": "取消釘選郵件"
   }
 }

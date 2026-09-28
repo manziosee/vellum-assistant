@@ -159,6 +159,8 @@
   "emailManagedContent": {
     "addressLabel": "Адрес",
     "checkingSubscription": "Проверка подписки…",
+    "completeSetup": "Завершить настройку домена",
+    "completingSetup": "Завершение настройки…",
     "confirm": "Подтвердить",
     "create": "Создать",
     "createEmailFailedFallback": "Не удалось создать адрес почты.",
@@ -175,6 +177,9 @@
     "emailUsernamePlaceholder": "hi",
     "enterSubdomainError": "Ввод поддомена.",
     "enterUsernameError": "Ввод имени пользователя почты.",
+    "inboxSetupBody": "Адрес ассистента создаётся в разделе «Почта ассистента», где читается его почта. Откройте его, чтобы выбрать адрес.",
+    "inboxSetupButton": "Открыть почту ассистента",
+    "inboxSetupTitle": "Настройте почту в разделе «Почта ассистента»",
     "register": "Зарегистрировать",
     "registerDomainFailedFallback": "Не удалось зарегистрировать домен.",
     "registering": "Регистрация…",
@@ -187,6 +192,12 @@
     "removeEmailAriaLabel": "Удалить адрес почты",
     "removeEmailConfirmMessage": "Точно удалить <code>{address}</code>? Ассистент больше не сможет отправлять и получать почту на этот адрес.",
     "removeEmailTitle": "Удалить адрес почты",
+    "repairConfirmMessage": "Текущий адрес почты сохранится. Настройка обратится к почтовому провайдеру и DNS для <code>{domain}</code>.",
+    "repairConfirmTitle": "Завершить настройку домена?",
+    "repairFailedFallback": "Не удалось начать настройку домена. Повторите попытку через минуту.",
+    "repairNoticeBody": "Адрес почты уже есть, но домен ещё не настроен у почтового провайдера. Завершите настройку, чтобы отправлять и получать письма.",
+    "repairNoticeTitle": "Нужна настройка домена",
+    "repairStartedToast": "Настройка домена начата. Проверка обычно занимает несколько минут.",
     "retry": "Повторить",
     "setSubdomainConfirmMessage": "<code>{subdomain}</code> также станет публичным идентификатором ассистента. После установки его нельзя сменить.",
     "setSubdomainTitle": "Задать поддомен",
@@ -200,5 +211,9 @@
     "upgradeNoticeBody": "Переход на план, в котором у ассистента есть свой адрес почты. Настраивать провайдера не нужно.",
     "upgradeNoticeTitle": "Адрес почты для ассистента",
     "usageSummary": "сегодня отправлено {sent} / {limit} · получено {received}"
+  },
+  "emailSettingsModal": {
+    "title": "Настройки почты",
+    "description": "Адрес ассистента, его домен и использование за сегодня."
   }
 }

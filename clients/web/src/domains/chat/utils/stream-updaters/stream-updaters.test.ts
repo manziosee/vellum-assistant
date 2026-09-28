@@ -22,7 +22,7 @@ import {
   upsertToolCall,
 } from "@/domains/chat/utils/stream-updaters/tool-call-updaters";
 import type { MessageCompleteEvent } from "@vellumai/assistant-api";
-import type { ToolActivityMetadata } from "@/assistant/web-activity-types";
+import type { ToolActivityMetadata } from "@vellumai/assistant-api";
 import type { ChatMessageToolCall } from "@/domains/chat/api/event-types";
 import {
   isToolCallCompleted,
@@ -422,6 +422,49 @@ describe("finalizeMessageComplete", () => {
     });
 
     expect(result[1]!.assistantTextVisibility).toBeUndefined();
+    expect(result[1]!.autoRoutedProfile).toBeUndefined();
+  });
+
+  it("stamps the profile Auto routed the turn to onto the live row", () => {
+    const msg = makeAssistantMsg({ id: "live-row", ...seg("Here you go.") });
+
+    const result = finalizeMessageComplete([userMsg, msg], {
+      type: "message_complete",
+      conversationId: "c-1",
+      messageId: "row-A",
+      autoRoutedProfile: "quality-optimized",
+    } as MessageCompleteEvent);
+
+    expect(result[1]!.autoRoutedProfile).toBe("quality-optimized");
+  });
+
+  it("keeps the routed profile on a reply that hands off to a queued turn", () => {
+    const msg = makeAssistantMsg({ id: "live-row", ...seg("Here you go.") });
+
+    const result = finalizeMessageComplete([userMsg, msg], {
+      type: "generation_handoff",
+      conversationId: "c-1",
+      messageId: "row-A",
+      queuedCount: 1,
+      autoRoutedProfile: "cost-optimized",
+    });
+
+    expect(result[1]!.autoRoutedProfile).toBe("cost-optimized");
+  });
+
+  it("stamps the routed profile on a row the completion itself creates", () => {
+    const result = finalizeMessageComplete([userMsg], {
+      type: "message_complete",
+      conversationId: "c-1",
+      messageId: "row-A",
+      attachments: [
+        { id: "att-1", filename: "a.png", mimeType: "image/png", data: "" },
+      ],
+      autoRoutedProfile: "latency-optimized",
+    });
+
+    expect(result[1]!.role).toBe("assistant");
+    expect(result[1]!.autoRoutedProfile).toBe("latency-optimized");
   });
 
   it("keeps a tool-gated reply, whose only text came from send_user_message", () => {
@@ -636,6 +679,27 @@ describe("upsertToolCall", () => {
     input: {} as Record<string, unknown>,
     status: "running" as const,
   };
+
+  it("stamps the first owned tool boundary on an existing or new row", () => {
+    const modeSession = { mode: "browser" as const, id: "session-1" };
+    const existing = upsertToolCall(
+      [userMsg, makeAssistantMsg({ toolCalls: undefined })],
+      toolCall,
+      undefined,
+      undefined,
+      modeSession,
+    );
+    const created = upsertToolCall(
+      [userMsg],
+      toolCall,
+      "assistant-1",
+      undefined,
+      modeSession,
+    );
+
+    expect(existing.at(-1)?.modeSession).toEqual(modeSession);
+    expect(created.at(-1)?.modeSession).toEqual(modeSession);
+  });
 
   it("appends tool call to existing streaming assistant tail", () => {
     const msg = makeAssistantMsg({ toolCalls: undefined });
@@ -1212,6 +1276,66 @@ describe("applyToolResult — cross-message matching", () => {
 });
 
 describe("applyUserMessageEcho", () => {
+  it.each([undefined, "client-1"])(
+    "appends a camera frame without confirming an optimistic send with nonce %s",
+    (clientMessageId) => {
+      const optimistic: DisplayMessage = {
+        id: "optimistic-1",
+        role: "user",
+        isOptimistic: true,
+        clientMessageId,
+        queueStatus: "queued",
+        queuePosition: 1,
+        ...seg("My next question"),
+      };
+      const previous = [optimistic];
+
+      const result = applyUserMessageEcho(
+        previous,
+        {
+          text: "(camera frame)",
+          messageId: "frame-1",
+          cameraFrame: true,
+        },
+        1000,
+      );
+
+      expect(result).toHaveLength(2);
+      expect(result[0]).toBe(optimistic);
+      expect(result[1]).toMatchObject({
+        id: "frame-1",
+        role: "user",
+        isCameraFrame: true,
+        timestamp: 1000,
+      });
+      expect(optimistic).toMatchObject({
+        id: "optimistic-1",
+        isOptimistic: true,
+        queueStatus: "queued",
+        queuePosition: 1,
+      });
+    },
+  );
+
+  it("ignores a camera frame echo already represented by id or merged alias", () => {
+    const frame: DisplayMessage = {
+      id: "frame-1",
+      role: "user",
+      isCameraFrame: true,
+      mergedMessageIds: ["frame-alias"],
+    };
+    const previous = [frame];
+    for (const messageId of ["frame-1", "frame-alias"]) {
+      expect(
+        applyUserMessageEcho(previous, {
+          text: "(camera frame)",
+          messageId,
+          cameraFrame: true,
+        }),
+      ).toBe(previous);
+    }
+  });
+
   it("appends a new id-keyed user row on a passive client", () => {
     /**
      * A client that did not originate the send has no optimistic row, so

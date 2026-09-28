@@ -29,12 +29,16 @@ import {
   LIVE_VOICE_AUDIO_FORMAT,
   type LiveVoiceMetricsServerFrame,
   type LiveVoiceMinimizeRoomServerFrame,
+  type LiveVoiceSessionControl,
+  type LiveVoiceSessionConfig,
+  type LiveVoiceSessionControlServerFrame,
   type LiveVoiceReadyServerFrame,
   type LiveVoiceSpeechStartedServerFrame,
   type LiveVoiceSttFinalServerFrame,
   type LiveVoiceSttPartialServerFrame,
   type LiveVoiceActivityServerFrame,
   type LiveVoiceEntry,
+  type LiveVoiceSightSource,
   type LiveVoiceThinkingServerFrame,
   type LiveVoiceTtsAudioServerFrame,
   type LiveVoiceTtsDoneServerFrame,
@@ -44,6 +48,7 @@ import {
   type LiveVoiceUtteranceEndServerFrame,
   parseServerFrame,
 } from "@/domains/chat/voice/live-voice/protocol";
+import { supportsSightSessions } from "@/lib/backwards-compat/sight-sessions";
 import { detectClientOs } from "@/runtime/platform-detection";
 
 /** Fail the session if no `ready` frame arrives within this window. */
@@ -61,13 +66,13 @@ const CONNECT_TIMEOUT_MS = 10_000;
  */
 export const RETRYABLE_LIVE_VOICE_CLOSE_CODES: ReadonlySet<number> = new Set([
   1012, 1013,
+  // Older relays use a private code for tunnel backpressure.
+  4013,
 ]);
 
 /** Reason a live-voice session failed, surfaced via the `error` event. */
 export type LiveVoiceClientErrorReason =
-  | "connection-failed"
-  | "protocol-error"
-  | "timeout";
+  "connection-failed" | "protocol-error" | "timeout";
 
 export interface LiveVoiceClientError {
   readonly reason: LiveVoiceClientErrorReason;
@@ -200,6 +205,8 @@ export interface LiveVoiceClientEventMap {
   turnCancelled: LiveVoiceTurnCancelledServerFrame;
   /** The completed turn asked the client to dismiss the full-screen room. */
   minimizeRoom: LiveVoiceMinimizeRoomServerFrame;
+  /** The user asked out loud to end the call or mute (see session-control.ts). */
+  sessionControl: LiveVoiceSessionControlServerFrame;
   metrics: LiveVoiceMetricsServerFrame;
   archived: LiveVoiceArchivedServerFrame;
   /**
@@ -257,7 +264,22 @@ export interface LiveVoiceConnectArgs {
    * means the daemon reports the session's entry point as unknown.
    */
   entry?: LiveVoiceEntry;
+  /**
+   * The session controls this client can carry out, sent on the `start`
+   * frame. Omitted means end and mute, which every surface can do; the looks
+   * depend on the device, so the caller works those out.
+   */
+  sessionControls?: readonly LiveVoiceSessionControl[];
 }
+
+/**
+ * What every surface this client runs on (web, the macOS app, iOS) can carry
+ * out: end and mute go through the same store controls everywhere.
+ */
+const DEFAULT_SESSION_CONTROLS: readonly LiveVoiceSessionControl[] = [
+  "end",
+  "mute",
+];
 
 /** Factory so tests can inject a mock WebSocket. Defaults to the global. */
 export type WebSocketFactory = (url: string) => WebSocket;
@@ -287,6 +309,8 @@ export class LiveVoiceChannelClient {
   private silenceThresholdMs: number | undefined;
   private bargeInMinSpeechMs: number | undefined;
   private entry: LiveVoiceEntry | undefined;
+  private sessionControls: readonly LiveVoiceSessionControl[] =
+    DEFAULT_SESSION_CONTROLS;
   // Set once an assistant running daemon code older than the `update_config`
   // frame rejects it with `unknown_type`. We then stop sending config updates
   // for this session so an older assistant is neither killed nor spammed by the
@@ -299,6 +323,7 @@ export class LiveVoiceChannelClient {
   // `unknown_type`, which is indistinguishable from the `update_config`
   // rejection and would latch in-session settings off for the whole session.
   private textInputSupported = false;
+  private sightSessionsSupported = false;
 
   private readonly listeners: {
     [E in LiveVoiceClientEventName]: Set<LiveVoiceClientEventHandler<E>>;
@@ -316,6 +341,7 @@ export class LiveVoiceChannelClient {
     ttsDone: new Set(),
     turnCancelled: new Set(),
     minimizeRoom: new Set(),
+    sessionControl: new Set(),
     metrics: new Set(),
     archived: new Set(),
     attachImageRejected: new Set(),
@@ -367,6 +393,7 @@ export class LiveVoiceChannelClient {
     silenceThresholdMs,
     bargeInMinSpeechMs,
     entry,
+    sessionControls,
   }: LiveVoiceConnectArgs): Promise<void> {
     if (this.state !== "idle") {
       return;
@@ -377,6 +404,7 @@ export class LiveVoiceChannelClient {
     this.silenceThresholdMs = silenceThresholdMs;
     this.bargeInMinSpeechMs = bargeInMinSpeechMs;
     this.entry = entry;
+    this.sessionControls = sessionControls ?? DEFAULT_SESSION_CONTROLS;
 
     let url: string;
     try {
@@ -441,26 +469,27 @@ export class LiveVoiceChannelClient {
   }
 
   /**
-   * Retune the running session's turn-detection knobs ("pause before reply" /
-   * "interrupt sensitivity") without reconnecting. No-op unless the session is
-   * active; each field is optional. The daemon applies changes from the next
-   * utterance.
+   * Update screen-sharing state or turn-detection tuning without reconnecting.
+   * No-op unless active; each field applies independently from the next turn.
    */
-  updateConfig(config: {
-    silenceThresholdMs?: number;
-    bargeInMinSpeechMs?: number;
-  }): void {
+  updateConfig(config: LiveVoiceSessionConfig): void {
     if (this.state !== "active" || this.configUpdatesUnsupported) {
       return;
     }
     this.trySend(
       JSON.stringify({
         type: "update_config",
+        ...(config.screenSharing !== undefined
+          ? { screenSharing: config.screenSharing }
+          : {}),
         ...(config.silenceThresholdMs !== undefined
           ? { silenceThresholdMs: config.silenceThresholdMs }
           : {}),
         ...(config.bargeInMinSpeechMs !== undefined
           ? { bargeInMinSpeechMs: config.bargeInMinSpeechMs }
+          : {}),
+        ...(config.shareTargets !== undefined
+          ? { shareTargets: config.shareTargets }
           : {}),
       }),
     );
@@ -510,6 +539,7 @@ export class LiveVoiceChannelClient {
   sightFrame(
     attachmentId: string,
     timing?: LiveVoiceSightFrameTiming,
+    lifecycle?: { cameraEpoch: number; source: LiveVoiceSightSource },
   ): boolean {
     if (this.state !== "active") {
       return false;
@@ -518,9 +548,26 @@ export class LiveVoiceChannelClient {
       JSON.stringify({
         type: "sight_frame",
         attachmentId,
+        ...(this.sightSessionsSupported && lifecycle ? lifecycle : {}),
         ...(timing ? { timing } : {}),
       }),
     );
+  }
+
+  sightStart(cameraEpoch: number, source: LiveVoiceSightSource): boolean {
+    if (this.state !== "active" || !this.sightSessionsSupported) {
+      return false;
+    }
+    return this.trySend(
+      JSON.stringify({ type: "sight_start", cameraEpoch, source }),
+    );
+  }
+
+  sightEnd(cameraEpoch: number): boolean {
+    if (this.state !== "active" || !this.sightSessionsSupported) {
+      return false;
+    }
+    return this.trySend(JSON.stringify({ type: "sight_end", cameraEpoch }));
   }
 
   /**
@@ -605,6 +652,11 @@ export class LiveVoiceChannelClient {
       // session outright with `credentials_unavailable`, which is precisely
       // the outcome the text-only path exists to avoid.
       textInput: true,
+      sessionControls: this.sessionControls,
+      // Unconditional: every look this client carries out ends in a fresh
+      // frame (the screen share and the room's sight hooks both take one), so
+      // the assistant can answer a look without waiting for more speech.
+      lookFrames: true,
       ...(this.entry ? { entry: this.entry } : {}),
       ...(this.conversationId ? { conversationId: this.conversationId } : {}),
       ...(this.turnDetection ? { turnDetection: this.turnDetection } : {}),
@@ -638,6 +690,7 @@ export class LiveVoiceChannelClient {
         this.clearConnectTimeout();
         this.state = "active";
         this.textInputSupported = frame.textInput === true;
+        this.sightSessionsSupported = supportsSightSessions(frame);
         this.emit("ready", frame);
         return;
       case "busy":
@@ -680,6 +733,9 @@ export class LiveVoiceChannelClient {
       case "minimize_room":
         this.emit("minimizeRoom", frame);
         return;
+      case "session_control":
+        this.emit("sessionControl", frame);
+        return;
       case "metrics":
         this.emit("metrics", frame);
         return;
@@ -708,6 +764,13 @@ export class LiveVoiceChannelClient {
             reason: frame.code === "unknown_type" ? "unsupported" : "failed",
             message: frame.message,
           });
+          return;
+        }
+        if (about === "sight_start") {
+          console.warn(
+            `live-voice: camera tracking unavailable: ${frame.message}`,
+          );
+          this.sightSessionsSupported = false;
           return;
         }
         if (about === "sight_frame") {

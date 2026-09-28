@@ -331,29 +331,24 @@ const TEMPLATES: Partial<Record<NotificationSourceEventName, CopyTemplate>> = {
     body: str(payload.body, "A watcher event occurred"),
   }),
 
-  "watcher.escalation": (payload) => ({
-    title: str(payload.title, "Watcher Escalation"),
-    body: str(payload.body, "A watcher event requires your attention"),
-  }),
-
-  "tool_confirmation.required_action": (payload) => {
-    const toolName = str(payload.toolName, "A tool");
-    return {
-      title: `${toolName} needs your confirmation`,
-      body: `${toolName} requires your confirmation`,
-    };
-  },
-
   // Titled by what was done rather than by the kind of event: the summary's
   // first sentence is the outcome ("Finished the fuel-system diagnostic app"),
-  // which is what a reader scanning the bell wants to see. A summary without
-  // one still gets a title that says something happened.
+  // which is what a reader scanning the bell wants to see. A producer that
+  // names its subject in the payload keeps that name here, read in the same
+  // order the home feed reads it, so the headline is the same whether or not
+  // the classifier ran. A summary with neither still gets a title that says
+  // something happened.
   "activity.complete": (payload) => {
     const summary = nonEmpty(
       typeof payload.summary === "string" ? payload.summary : undefined,
     );
+    const authored = normalizeTitle(
+      readPayloadString(payload, "title") ??
+        readPayloadString(payload, "requestedTitle") ??
+        "",
+    );
     return {
-      title: summary ? deriveTitle(summary) : "Activity complete",
+      title: authored || (summary ? deriveTitle(summary) : "Activity complete"),
       body: summary ?? "An activity has completed",
     };
   },
@@ -377,16 +372,6 @@ const TEMPLATES: Partial<Record<NotificationSourceEventName, CopyTemplate>> = {
       body: summary !== "" ? summary : describeUnclassifiedFailure(payload),
     };
   },
-
-  "quick_chat.response_ready": (payload) => ({
-    title: "Quick chat reply ready",
-    body: str(payload.preview, "Your quick chat response is ready"),
-  }),
-
-  "voice.response_ready": (payload) => ({
-    title: "Voice reply ready",
-    body: str(payload.preview, "A voice response is ready"),
-  }),
 };
 
 /**

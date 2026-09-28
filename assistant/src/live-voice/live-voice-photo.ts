@@ -71,15 +71,21 @@
 
 import { v7 as uuidv7 } from "uuid";
 
+import type { ModeSession } from "../api/mode-session.js";
 import {
   type PersistMessageOptions,
   persistQueuedMessageBody,
 } from "../daemon/conversation-messaging.js";
+import type {
+  ConversationModeSessionCoordinator,
+  ModeSessionSourceHandle,
+} from "../daemon/conversation-mode-session.js";
 import { findConversation } from "../daemon/conversation-registry.js";
 import {
   getConversationIfExists,
   isSameIncarnation,
 } from "../daemon/conversation-store.js";
+import { bestEffortModeSessionTracking } from "../daemon/mode-session-tracking.js";
 import type { TrustContext } from "../daemon/trust-context-types.js";
 import {
   deleteOrphanAttachments,
@@ -237,6 +243,7 @@ async function enqueueStandaloneImagePersist(
         [ticket.attachmentId],
         ticket.content,
         uuidv7(),
+        kind,
       );
       return { ok: false };
     }
@@ -389,11 +396,18 @@ function reclaimOrDefer(
   attachmentIds: readonly string[],
   content: string,
   messageId: string,
+  kind: "photo" | "sight_frame",
 ): void {
   if (reclaimDroppedFrame(attachmentIds)) {
     return;
   }
-  deferFrameReclaimDecision(conversationId, messageId, attachmentIds, content);
+  deferFrameReclaimDecision(
+    conversationId,
+    messageId,
+    attachmentIds,
+    content,
+    kind,
+  );
 }
 
 /** Conversations with a standalone-image persist still in flight. */
@@ -429,6 +443,8 @@ interface PendingFrameReclaim {
   attachmentIds: readonly string[];
   /** Row text, so a frame found to have landed can still be announced. */
   content: string;
+  /** The echo shape used if a later recheck finds the row. */
+  kind: "photo" | "sight_frame";
   attempts: number;
 }
 
@@ -465,12 +481,14 @@ function deferFrameReclaimDecision(
   messageId: string,
   attachmentIds: readonly string[],
   content: string,
+  kind: "photo" | "sight_frame",
 ): void {
   pendingFrameReclaims.push({
     conversationId,
     messageId,
     attachmentIds,
     content,
+    kind,
     attempts: 0,
   });
   scheduleFrameReclaimRecheck();
@@ -521,6 +539,7 @@ function announceDeferredImage(pending: PendingFrameReclaim): void {
       pending.conversationId,
       pending.content,
       pending.messageId,
+      pending.kind,
     );
   } catch (err) {
     log.warn(
@@ -678,6 +697,7 @@ function persistStandaloneImage(
     | "onUndiscardedAttachments"
   >,
   acceptedIncarnation?: number,
+  modeSessionSource?: ModeSessionSourceHandle,
 ): Promise<LiveVoicePhotoResult> {
   let incarnation: number | null;
   try {
@@ -700,6 +720,7 @@ function persistStandaloneImage(
         uuidv7(),
         [attachmentId],
         persistOptions.content,
+        kind,
       );
     }
     return Promise.resolve({ ok: false });
@@ -715,9 +736,55 @@ function persistStandaloneImage(
         [attachmentId],
         persistOptions.content,
         uuidv7(),
+        kind,
       );
     }
     return Promise.resolve({ ok: false });
+  }
+  const requestId = uuidv7();
+  let modeSessionCoordinator: ConversationModeSessionCoordinator | undefined;
+  let modeSession: ModeSession | undefined;
+  if (modeSessionSource) {
+    const conversation = findConversation(conversationId);
+    modeSessionCoordinator = conversation?.modeSessions;
+    let owner: ModeSession | undefined;
+    let trackingFailed = false;
+    try {
+      owner = modeSessionCoordinator?.claimTurn(
+        requestId,
+        modeSessionSource,
+        Date.now(),
+      );
+    } catch (err) {
+      trackingFailed = true;
+      log.warn(
+        { err, conversationId, attachmentId },
+        "Standalone camera image could not claim its accepted session owner",
+      );
+    }
+    if (
+      !conversation ||
+      (!trackingFailed && owner?.id !== modeSessionSource.id)
+    ) {
+      log.warn(
+        { conversationId, attachmentId },
+        "Standalone camera image lost its accepted session owner",
+      );
+      bestEffortModeSessionTracking("stale camera claim release", () =>
+        modeSessionCoordinator?.releaseTurn(requestId),
+      );
+      reclaimOrDefer(
+        conversationId,
+        [attachmentId],
+        persistOptions.content,
+        requestId,
+        kind,
+      );
+      return Promise.resolve({ ok: false });
+    }
+    if (owner) {
+      modeSession = { id: owner.id, mode: owner.mode };
+    }
   }
   return enqueueStandaloneImagePersist(
     conversationId,
@@ -732,8 +799,19 @@ function persistStandaloneImage(
         incarnation,
         persistOptions,
         queueWaitMs,
+        requestId,
+        modeSession,
       ),
-  );
+  ).finally(() => {
+    try {
+      modeSessionCoordinator?.releaseTurn(requestId);
+    } catch (err) {
+      log.warn(
+        { err, conversationId, attachmentId },
+        "Standalone camera image could not release its session owner",
+      );
+    }
+  });
 }
 
 /**
@@ -754,7 +832,7 @@ function dropReplacedImage(
     "Standalone image dropped: its conversation was replaced before the write",
   );
   if (kind === "sight_frame") {
-    reclaimOrDefer(conversationId, [attachmentId], content, uuidv7());
+    reclaimOrDefer(conversationId, [attachmentId], content, uuidv7(), kind);
   }
   return { ok: false };
 }
@@ -772,11 +850,10 @@ async function writeStandaloneImage(
     | "onUndiscardedAttachments"
   >,
   queueWaitMs: number,
+  requestId: string,
+  modeSession?: ModeSession,
 ): Promise<LiveVoicePhotoResult> {
   const { content } = persistOptions;
-  // The id the row is inserted under, so a failure can ask whether the insert
-  // landed before deciding the frame is safe to reclaim.
-  const requestId = uuidv7();
   // Ids the persist materialized for this attempt and then could not delete.
   // A frame already linked elsewhere is cloned into this conversation under a
   // fresh id, and nothing but the persist knows it: reclaiming under the id
@@ -806,7 +883,7 @@ async function writeStandaloneImage(
         "Standalone image dropped: its conversation was deleted while it waited",
       );
       if (kind === "sight_frame") {
-        reclaimOrDefer(conversationId, [attachmentId], content, uuidv7());
+        reclaimOrDefer(conversationId, [attachmentId], content, uuidv7(), kind);
       }
       return { ok: false };
     }
@@ -831,7 +908,7 @@ async function writeStandaloneImage(
         "Standalone image timed out waiting for the conversation to go idle",
       );
       if (kind === "sight_frame") {
-        reclaimOrDefer(conversationId, [attachmentId], content, uuidv7());
+        reclaimOrDefer(conversationId, [attachmentId], content, uuidv7(), kind);
       }
       return { ok: false };
     }
@@ -853,6 +930,7 @@ async function writeStandaloneImage(
         ...persistOptions,
         attachments,
         requestId,
+        publishModeSessionChanges: false,
         // Asked again in the insert's own tick, about both things that can
         // stop being true across the awaits the persist takes to materialize
         // the attachment and build its content.
@@ -882,7 +960,13 @@ async function writeStandaloneImage(
       // of.
       conversation.markHistoryStaleForForeignScope(persistOptions.trustContext);
 
-      announcePersistedImage(conversationId, content, persisted.id);
+      announcePersistedImage(
+        conversationId,
+        content,
+        persisted.id,
+        kind,
+        modeSession,
+      );
 
       return {
         ok: true,
@@ -930,7 +1014,13 @@ async function writeStandaloneImage(
       // `ensureActorScopedHistory` reloads instead of reusing what it holds.
       findConversation(conversationId)?.markHistoryStale();
       try {
-        announcePersistedImage(conversationId, content, requestId);
+        announcePersistedImage(
+          conversationId,
+          content,
+          requestId,
+          kind,
+          modeSession,
+        );
       } catch (announceErr) {
         log.warn(
           { err: announceErr, conversationId, messageId: requestId },
@@ -946,6 +1036,7 @@ async function writeStandaloneImage(
           [attachmentId, ...strandedClones],
           content,
           requestId,
+          kind,
         );
       } else {
         // The store would not say whether the row landed. The refusal below
@@ -957,6 +1048,7 @@ async function writeStandaloneImage(
           requestId,
           [attachmentId, ...strandedClones],
           content,
+          kind,
         );
       }
     }
@@ -974,12 +1066,16 @@ function announcePersistedImage(
   conversationId: string,
   text: string,
   messageId: string,
+  kind: "photo" | "sight_frame",
+  modeSession?: ModeSession,
 ): void {
   broadcastMessage({
     type: "user_message_echo",
     text,
     conversationId,
     messageId,
+    ...(kind === "sight_frame" ? { cameraFrame: true as const } : {}),
+    ...(modeSession ? { modeSession } : {}),
   });
   recordConversationPersistedSeq(conversationId, getCurrentSeq());
   publishConversationMessagesChanged(conversationId);
@@ -1087,6 +1183,7 @@ export async function persistAmbientSightFrame(
   surface: SightFrameSurface,
   trustContext?: TrustContext,
   acceptedIncarnation?: number,
+  modeSessionSource?: ModeSessionSourceHandle,
 ): Promise<LiveVoicePhotoResult> {
   return persistStandaloneImage(
     conversationId,
@@ -1094,7 +1191,9 @@ export async function persistAmbientSightFrame(
     "sight_frame",
     {
       content: SIGHT_FRAME_MESSAGE_CONTENT,
-      metadata: surface === "voice" ? { voiceSessionTurn: true } : {},
+      metadata: {
+        ...(surface === "voice" ? { voiceSessionTurn: true } : {}),
+      },
       ...(trustContext ? { trustContext } : {}),
       scripted: true,
       // The camera sampled this, nobody sent it. Indexing it would feed
@@ -1107,5 +1206,6 @@ export async function persistAmbientSightFrame(
       sightFrameAttachmentIds: [attachmentId],
     },
     acceptedIncarnation,
+    modeSessionSource,
   );
 }

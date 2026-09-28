@@ -485,6 +485,17 @@ import { migrateChannelInboundMessageIdIndex } from "./migrations/374-channel-in
 import { migrateCreateChannelOutboundPosts } from "./migrations/375-create-channel-outbound-posts.js";
 import { migrateNotificationDeliveriesCanonicalMessageId } from "./migrations/376-notification-deliveries-canonical-message-id.js";
 import { migrateAddSubagentBudgetStopReason } from "./migrations/377-add-subagent-budget-stop-reason.js";
+import { migrateCreateConversationToolSurfaces } from "./migrations/378-create-conversation-tool-surfaces.js";
+import { migrateOAuthProvidersResponseOkField } from "./migrations/379-oauth-providers-response-ok-field.js";
+import { migrateConversationToolSurfacesDelegateIndependentTasks } from "./migrations/380-conversation-tool-surfaces-delegate-independent-tasks.js";
+import {
+  downCreateConversationModeSessions,
+  migrateCreateConversationModeSessions,
+} from "./migrations/381-create-conversation-mode-sessions.js";
+import { migrateCreateClientConnectionEvents } from "./migrations/382-create-client-connection-events.js";
+import { migrateNormalizeOpencodeHostConnections } from "./migrations/383-normalize-opencode-host-connections.js";
+import { migrateAddDocumentRevision } from "./migrations/384-add-document-revision.js";
+import { migrateCreateDocumentRevisions } from "./migrations/385-create-document-revisions.js";
 import type { MigrationStep } from "./migrations/run-migrations.js";
 
 export const migrationSteps: MigrationStep[] = [
@@ -1606,9 +1617,52 @@ export const migrationSteps: MigrationStep[] = [
   {
     name: "migrateAddSubagentBudgetStopReason",
     run: migrateAddSubagentBudgetStopReason,
-    // The column guard treats a missing table as nothing-to-do, so the table
-    // must be checkpointed first or a repair flow could permanently checkpoint
-    // this as a no-op.
+    // The column guard reads the table's columns and the ALTER throws on a
+    // missing table, so the table must be checkpointed first or a repair flow
+    // that failed to create it would fail this step needlessly.
     dependsOn: ["migrateCreateSubagentsTable"],
   },
+  migrateCreateConversationToolSurfaces,
+  {
+    name: "migrateOAuthProvidersResponseOkField",
+    run: migrateOAuthProvidersResponseOkField,
+    // The column guard reads the table's columns, and an `ALTER` on a missing
+    // table throws, so the table must be checkpointed first or a repair flow
+    // that failed to create it would either fail this step needlessly or, if
+    // the error were swallowed, checkpoint it as done against no table.
+    dependsOn: ["createOAuthTables"],
+  },
+  {
+    name: "migrateConversationToolSurfacesDelegateIndependentTasks",
+    run: migrateConversationToolSurfacesDelegateIndependentTasks,
+    // Same column-guard shape as the step above: the guard reads the table's
+    // columns and the `ALTER` throws on a missing table, so the table's own
+    // step must be checkpointed first.
+    dependsOn: ["migrateCreateConversationToolSurfaces"],
+  },
+  {
+    name: "migrateCreateConversationModeSessions",
+    run: migrateCreateConversationModeSessions,
+    rollback: [
+      {
+        version: 58,
+        description: "Create conversation-owned mode session lifecycle records",
+        down: downCreateConversationModeSessions,
+      },
+    ],
+  },
+  migrateCreateClientConnectionEvents,
+  {
+    name: "migrateNormalizeOpencodeHostConnections",
+    run: migrateNormalizeOpencodeHostConnections,
+    // Reads and rewrites provider_connections.base_url; the table and the
+    // column come from these steps, so a database where either failed must
+    // not checkpoint this one against nothing.
+    dependsOn: [
+      "migrateCreateProviderConnections",
+      "migrateProviderConnectionBaseUrlAndModels",
+    ],
+  },
+  migrateAddDocumentRevision,
+  migrateCreateDocumentRevisions,
 ];

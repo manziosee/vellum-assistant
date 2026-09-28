@@ -67,15 +67,15 @@ export function LiveVoiceButton({
   const { t } = useTranslation("chat");
   const button = (
     <Button
-      // Filled `primary` (black) so the voice entry point carries the same
-      // prominence as the send button it shares the composer's send slot with
-      // (both `Button variant="primary"` icon-only, so identical footprint +
-      // fill) — rather than a low-emphasis ghost that reads as secondary.
-      variant="primary"
+      // Filled in the assistant's accent, so the voice entry point carries the
+      // same prominence and the same colour as the send button it shares the
+      // composer's send slot with (both `Button variant="accent"` icon-only,
+      // so identical footprint + fill) rather than a low-emphasis ghost that
+      // reads as secondary.
+      variant="accent"
       iconOnly={<AudioLines strokeWidth={2} />}
       // The row's own signal sizes the circle, so the primitive's mobile growth
-      // steps aside; the fill is the `primary` token the design's light circle
-      // resolves to.
+      // steps aside.
       iconOnlyGlyphClassName={mobileRow ? MOBILE_GLYPH_CLASS : undefined}
       expandOnMobile={!mobileRow}
       className={mobileRow ? MOBILE_CONTROL_CLASS : undefined}

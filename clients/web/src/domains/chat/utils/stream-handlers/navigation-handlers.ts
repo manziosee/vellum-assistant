@@ -1,4 +1,5 @@
 import { dispatchOpenUrl } from "@/domains/chat/utils/oauth-popup-links";
+import { canHandleForegroundDirective } from "@/runtime/window-attention";
 import { getSettingsRouteForClientTab } from "@/utils/settings-navigation";
 
 import { recordDiagnostic } from "@/lib/diagnostics";
@@ -7,7 +8,10 @@ import { submitSurfaceAction } from "@/domains/chat/api/surfaces";
 import { useAssistantIdentityStore } from "@/stores/assistant-identity-store";
 import { useConversationStore } from "@/stores/conversation-store";
 import { isChannelSetupType, useViewerStore } from "@/stores/viewer-store";
-import { revealConversationView } from "@/utils/conversation-navigation";
+import {
+  keptAppId,
+  revealConversationView,
+} from "@/utils/conversation-navigation";
 import { useResolvedAssistantsStore } from "@/stores/resolved-assistants-store";
 import { useSubagentStore } from "@/domains/chat/subagent-store";
 import { useWorkflowStore } from "@/domains/chat/workflow-store";
@@ -23,6 +27,10 @@ export function handleOpenUrl(
   event: OpenUrlEvent,
   ctx: StreamHandlerContext,
 ): void {
+  if (!canHandleForegroundDirective(ctx.isNative)) {
+    return;
+  }
+
   const outcome = dispatchOpenUrl(event.url, {
     isNative: ctx.isNative,
     push: ctx.router.push,
@@ -63,6 +71,10 @@ export function handleOpenConversation(
   event: OpenConversationEvent,
   ctx: StreamHandlerContext,
 ): void {
+  if (!canHandleForegroundDirective(ctx.isNative)) {
+    return;
+  }
+
   if (event.focus === false) {
     return;
   }
@@ -79,13 +91,17 @@ export function handleOpenConversation(
     useWorkflowStore.getState().reset();
   }
   useConversationStore.getState().setActiveConversationId(event.conversationId);
-  ctx.router.push(routes.conversation(event.conversationId));
+  ctx.router.push(routes.conversation(event.conversationId, keptAppId()));
 }
 
 export function handleNavigateSettings(
   event: NavigateSettingsEvent,
   ctx: StreamHandlerContext,
 ): void {
+  if (!canHandleForegroundDirective(ctx.isNative)) {
+    return;
+  }
+
   const route = getSettingsRouteForClientTab(event.tab);
   if (!route) {
     ctx.setError({ message: `Unknown settings tab: ${event.tab}` });
@@ -127,6 +143,10 @@ export function handleOpenPanel(
   event: OpenPanelEvent,
   ctx: StreamHandlerContext,
 ): void {
+  if (!canHandleForegroundDirective(ctx.isNative)) {
+    return;
+  }
+
   if (event.panelType !== "channel_setup") {
     reportOpenPanelOutcome(event, ctx, "nack", "unknown_panel_type");
     return;

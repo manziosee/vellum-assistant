@@ -7,9 +7,10 @@
  * Not a Zustand store. The bus has no state; what looks like state
  * (the handler set) is a registry, not user-observable application
  * state, so Zustand's selector + re-render machinery does not apply.
- * Handlers fire synchronously from `publish()` so a burst of events
- * is not collapsed into a single React commit. See
- * `STATE_MANAGEMENT.md` for the convention carve-out.
+ * Handlers fire synchronously from `publish()` and never through
+ * reactive state, where a burst written inside one batched commit would
+ * surface only its last event. See `STATE_MANAGEMENT.md` for the
+ * convention carve-out.
  *
  * Producers:
  *   - `runtime/event-sources/*` for host-environment signals
@@ -25,6 +26,7 @@
  */
 
 import type { AssistantEventEnvelope } from "@vellumai/assistant-api";
+import { captureError } from "@/lib/sentry/capture-error";
 import type { CommandUrlProvenance } from "@/runtime/native-deep-link";
 
 /**
@@ -134,22 +136,9 @@ export interface BusEventMap {
   /** Page hidden / app backgrounded. */
   "app.hidden": { signal: AppHiddenSignal };
   /**
-   * The Electron window this renderer runs in gained or lost the user's
-   * attention: on screen, unminimized, and holding keyboard focus. Separate
-   * from `app.resume` / `app.hidden`, which report only whether the window is
-   * on screen. A window sitting visible behind another app is still showing
-   * the transcript, so the consumers that release the camera hardware must not
-   * act on a focus change; this edge exists for the ones that ask whether the
-   * user is watching, today the web presence reporter that suppresses a
-   * redundant push.
-   *
-   * The first payload publishes as well, so a consumer that read attention
-   * before the host reported any is corrected rather than left waiting for
-   * the next real edge.
-   *
-   * Off Electron this never fires. `document.hasFocus()` is window-level and
-   * false for a visible tab in an unfocused browser window, so visibility
-   * stays the browser's contract for whether a conversation is on screen.
+   * Window attention changes from the Electron host or browser focus/blur.
+   * Separate from visibility lifecycle events: losing focus reports presence
+   * as away without stopping foreground hardware work in an on-screen window.
    */
   "app.attention": { attended: boolean };
   /** Browser reported the network came back. Fires alongside `app.resume`. */
@@ -437,12 +426,16 @@ export function publish<K extends BusEventName>(
     try {
       (handler as (p: typeof payload) => void)(payload);
     } catch (err) {
-      // One bad subscriber must not block downstream subscribers.
-      // Console-log rather than re-throw or call Sentry directly so
-      // the bus stays free of a hard dependency on the reporting
-      // layer (subscribers already log their own captures via Sentry
-      // when they care about it).
-      console.error("[event-bus] handler threw", event, err);
+      // One bad subscriber must not block downstream subscribers, and its
+      // error must not stop here either: a handler that throws has skipped
+      // the rest of its work for this event, and most subscribers have no
+      // catch of their own. `captureError` logs to the console and reports
+      // to Sentry, tagged with the event so one failing handler groups apart
+      // from another's.
+      captureError(err, {
+        context: "event_bus.handler",
+        tags: { bus_event: event },
+      });
     }
   }
 }

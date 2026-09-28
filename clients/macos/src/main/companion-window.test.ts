@@ -1,20 +1,31 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { EventEmitter } from "node:events";
 
 import {
   companionAnnotationInkSchema,
   companionAnnotationStrokeSchema,
+  companionAnnotationToolSchema,
   companionCoachmarkSchema,
   COMPANION_COACHMARK_MAX,
+  COMPANION_INTRO_BEATS,
+  COMPANION_INTRO_CALL_CONTROLS,
+  COMPANION_INTRO_VERSION,
   COMPANION_BASE_AVATAR_BOX,
+  COMPANION_BASE_CAPTURE_PICKER_WIDTH,
   COMPANION_BASE_MAX_PILL_WIDTH,
   COMPANION_BASE_RESTING_PILL_HEIGHT,
+  COMPANION_POPOVER_INSET,
   VOICE_START_REQUEST_TTL_MS,
   COMPANION_SIZES,
   companionLowerReachFor,
   companionBoxFor,
   companionCardSideFor,
+  companionGapFor,
   companionNearEdgeFor,
   companionScaleFor,
+  type CompanionDock,
+  type CompanionIntroBeat,
+  type CompanionIntroReport,
   type CompanionSize,
   type CompanionSizeAxis,
   type CompanionSurfaceState,
@@ -48,8 +59,22 @@ const pushes: CompanionSurfaceState[] = [];
 /** Every command main has handed to the app's renderer, most recent last. */
 const dispatched: VellumCommand[] = [];
 
+/**
+ * Commands and pushes to the app's window in one list, because the order
+ * between the two is the thing some cases are about: a run that says it is
+ * over before it asks for the session it ends on has already lost the press.
+ */
+const mainTimeline: string[] = [];
+
 /** How many times a press had to build a window before it could land. */
 let windowsRaised = 0;
+
+/**
+ * Whether the window a press builds goes away again while it loads. Closing
+ * one releases the wait on purpose, so the build answers and the send that
+ * follows it lands nowhere.
+ */
+let windowClosesMidLoad = false;
 
 /** Whether the app's window exists, which is what decides between those two. */
 let mainWindowOpen = true;
@@ -64,20 +89,35 @@ let mainWindowVisible = true;
  */
 let companionOpen = true;
 
+/** Every channel main has sent the app's window, most recent last. */
+const mainSends: { channel: string; payload: unknown }[] = [];
+
 /**
  * The app's window, as far as this module reads it: whether it exists and
  * whether it is showing. One object, so a focus event can name it by identity.
+ *
+ * Its renderer is `mainRenderer`, the same object IPC sends arrive from, which
+ * is what the real pairing is: main compares the window's own renderer against
+ * the one that pulled, and the app's window is where both come from.
  */
 const mainWindow = {
   isDestroyed: () => false,
   isVisible: () => mainWindowVisible,
+  getBounds: () => ({ x: 120, y: 80, width: 1200, height: 760 }),
+  get webContents() {
+    return mainRenderer;
+  },
 };
+
+/** The surface window's own lifecycle listeners, so a case can fire one. */
+const surfaceListeners: { event: string; listener: () => void }[] = [];
 
 /** Where the canvas's origin is, which is what the window reports and moves. */
 let origin = { x: 0, y: 0 };
 
 /** Every bounds main has asked the window server for, most recent last. */
 const boundsSet: { x: number; y: number; width: number; height: number }[] = [];
+const surfaceLevels: { floating: boolean; level?: string }[] = [];
 
 const surface = {
   webContents: {
@@ -91,8 +131,36 @@ const surface = {
   close: () => {
     companionOpen = false;
   },
-  on: () => {},
+  // Recorded rather than dropped, so a case can close the surface the way the
+  // window server does and let main run the teardown that hangs off it: a
+  // staged run is unstaged there, and its landing timer cancelled with it.
+  on: (event: string, listener: () => void) => {
+    surfaceListeners.push({ event, listener });
+  },
+  once: (event: string, listener: () => void) => {
+    const once = () => {
+      const index = surfaceListeners.findIndex((entry) => entry.listener === once);
+      surfaceListeners.splice(index, 1);
+      listener();
+    };
+    surfaceListeners.push({ event, listener: once });
+  },
   isDestroyed: () => false,
+  setAlwaysOnTop: (floating: boolean, level?: string) => {
+    surfaceLevels.push({ floating, level });
+  },
+  /** Whether it may become key, which a form on the bar lends it. */
+  focusable: false,
+  setFocusable: (focusable: boolean) => {
+    surface.focusable = focusable;
+  },
+  /** Whether it is key: `focus` makes it so, and nothing here resigns it. */
+  key: false,
+  focus: () => {
+    if (surface.focusable) {
+      surface.key = true;
+    }
+  },
   /** Whether the surface is on screen: off it while the app is in front. */
   visible: true,
   hide: () => {
@@ -116,7 +184,19 @@ const surface = {
   },
 };
 
-type Invoker = (args: unknown[]) => unknown;
+type Invoker = (args: unknown[], sender?: unknown) => unknown;
+
+/**
+ * The renderer behind IPC sends, including the lifecycle a running call owns
+ * and the one a subscription for the introduction's reports does. `send` is
+ * what main pushes through, so it is also the app window's `webContents`.
+ */
+const mainRenderer = Object.assign(new EventEmitter(), {
+  send: (channel: string, payload: unknown) => {
+    mainSends.push({ channel, payload });
+    mainTimeline.push(`${channel}:${String(payload)}`);
+  },
+});
 
 /** Channel to handler, with the channel's schema applied the way `on` does. */
 const listeners = new Map<string, Invoker>();
@@ -127,9 +207,13 @@ const register =
   (
     channel: string,
     schema: { parse: (input: unknown) => unknown },
-    fn: (args: never) => unknown,
+    fn: (args: never, event: { sender: EventEmitter }) => unknown,
   ): void => {
-    into.set(channel, (args) => fn(schema.parse(args) as never));
+    into.set(channel, (args, sender) =>
+      fn(schema.parse(args) as never, {
+        sender: (sender ?? mainRenderer) as EventEmitter,
+      }),
+    );
   };
 
 /**
@@ -139,6 +223,13 @@ const register =
  * it off.
  */
 let reducedMotion = true;
+
+/**
+ * What the system answers about the microphone, which every report of the
+ * introduction is stamped with: the run says different things about the Talk
+ * and the last beat depending on it.
+ */
+let micStatus = "granted";
 
 /**
  * The display the window server answers for whatever point it is asked, the
@@ -170,6 +261,7 @@ mock.module("electron", () => ({
   BrowserWindow: { getAllWindows: () => [] },
   systemPreferences: {
     getAnimationSettings: () => ({ prefersReducedMotion: reducedMotion }),
+    getMediaAccessStatus: () => micStatus,
   },
   app: {
     on: (event: string, listener: (...args: unknown[]) => void) => {
@@ -187,7 +279,14 @@ mock.module("electron", () => ({
       copied.push(text);
     },
   },
-  shell: { openExternal: () => Promise.resolve() },
+  // The browser a popover's link opens in. Recorded, since what a case has
+  // to say is which links were let through.
+  shell: {
+    openExternal: (url: string) => {
+      opened.push(url);
+      return Promise.resolve();
+    },
+  },
   screen: {
     getCursorScreenPoint: () => ({ x: 0, y: 0 }),
     getDisplayNearestPoint: () => nearestDisplay,
@@ -201,6 +300,9 @@ mock.module("electron", () => ({
 
 /** Every text main has put on the pasteboard, most recent last. */
 const copied: string[] = [];
+
+/** Every link main has opened in the browser, most recent last. */
+const opened: string[] = [];
 
 /** Main's display listeners, so a case can rearrange the displays. */
 const screenListeners: { event: string; listener: () => void }[] = [];
@@ -298,11 +400,31 @@ let located: unknown = {
  */
 let locateHeldBy: Promise<void> | null = null;
 
+/** Every surface main read the controls of, and what the helper answers. */
+const targetReadsAsked: unknown[] = [];
+let targetElements: {
+  elements: {
+    label: string;
+    role: string;
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  }[];
+  candidateCount: number;
+} | null = null;
+
 mock.module("./companion-capture-sources", () => ({
   listCaptureSources: async () => listedSources,
   resolveCapturePick: (pick: unknown) => resolvedPickAsync(pick),
-  captureTargetFrame: async (target: unknown) => {
+  captureTargetFrame: async (
+    target: unknown,
+    onError?: (err: unknown) => void,
+  ) => {
     framesAsked.push(target);
+    if (frameError !== null) {
+      onError?.(frameError);
+    }
     return capturedFrame;
   },
   captureSourceThumbnail: async (target: unknown) => {
@@ -313,6 +435,10 @@ mock.module("./companion-capture-sources", () => ({
     boundsAsked.push(windowId);
     return windowBounds;
   },
+  readTargetElements: async (target: unknown) => {
+    targetReadsAsked.push(target);
+    return targetElements;
+  },
   locateOnTarget: async (target: unknown, query: string) => {
     locatesAsked.push({ target, query });
     if (locateHeldBy !== null) {
@@ -320,6 +446,41 @@ mock.module("./companion-capture-sources", () => ({
     }
     return located;
   },
+}));
+
+/** Whether the helper holds Screen Recording, as main reads it. */
+let screenGranted = true;
+/** What a frame was refused with, or null when frames come back. */
+let frameError: unknown = null;
+/** The refusal the permission module recognises as a missing grant. */
+const SCREEN_REFUSAL = new Error("Screen Recording permission denied");
+/** Every permission main sent the user to Settings for. */
+const settingsOpened: string[] = [];
+const permissionPresentationListeners: (() => void)[] = [];
+const presentPermission = (): void => {
+  for (const listener of permissionPresentationListeners) {
+    listener();
+  }
+};
+
+mock.module("./screen-recording-permission", () => ({
+  screenRecordingGranted: async () => screenGranted,
+  isScreenRecordingRefusal: (err: unknown) => err === SCREEN_REFUSAL,
+  answerScreenRecordingRefusal: async (ask: () => Promise<unknown>) => {
+    await ask();
+  },
+}));
+
+mock.module("./permissions-service", () => ({
+  onPermissionPresentation: (listener: () => void) => {
+    permissionPresentationListeners.push(listener);
+    return () => {};
+  },
+  getPermissionsService: () => ({
+    openSettings: async (kind: string) => {
+      settingsOpened.push(kind);
+    },
+  }),
 }));
 
 mock.module("./ipc", () => ({
@@ -336,11 +497,23 @@ mock.module("./main-window", () => ({
   // window being destroyed; whether it is showing decides, with the app's
   // activation, whether the surface is on the screen.
   current: () => (mainWindowOpen ? mainWindow : null),
+  // Lands nowhere with no window to land in, exactly as the real one does.
   dispatchToMain: (command: VellumCommand) => {
+    if (!mainWindowOpen) {
+      return;
+    }
     dispatched.push(command);
+    mainTimeline.push(`command:${command.kind}`);
   },
   ensureVisible: () => {
     windowsRaised += 1;
+    // A build leaves a window behind, which is what the command it was built
+    // for is then sent to. Unless the case says it went away while loading:
+    // the wait is released either way, and `current()` is what tells them
+    // apart.
+    if (!windowClosesMidLoad) {
+      mainWindowOpen = true;
+    }
     return Promise.resolve();
   },
   onMainWindowVisibilityChange: (listener: () => void) => {
@@ -371,6 +544,7 @@ type GlowWindow = {
   close: () => void;
   isDestroyed: () => boolean;
   on: () => void;
+  once: (event: string, listener: () => void) => void;
   /** Whether the frame is on screen: hidden while its window is not. */
   visible: boolean;
   hide: () => void;
@@ -395,17 +569,27 @@ type GlowWindow = {
   focus: () => void;
 };
 let glow: GlowWindow | null = null;
+/**
+ * Every other window main has opened, by kind: the frame, and the edges a
+ * call's drag can drop the bar on. `glow` is the frame's own alias, since most
+ * cases about a second window are about that one.
+ */
+const others = new Map<string, GlowWindow>();
 const glowPushes: CompanionSurfaceState[] = [];
 /** The BrowserWindow options the frame was last opened with. */
 let glowOptions: Record<string, unknown> | undefined;
 
 const openGlow = (options: {
+  kind: string;
   position?: { x: number; y: number } | (() => { x: number; y: number });
   width: number;
   height: number;
   browserWindow?: Record<string, unknown>;
 }): GlowWindow => {
-  glowOptions = options.browserWindow;
+  const frame = options.kind === "companion-watch-frame";
+  if (frame) {
+    glowOptions = options.browserWindow;
+  }
   const at =
     typeof options.position === "function"
       ? options.position()
@@ -428,11 +612,16 @@ const openGlow = (options: {
     },
     close: () => {
       window.closed = true;
-      glow = null;
+      others.delete(options.kind);
+      if (frame) {
+        glow = null;
+      }
     },
     isDestroyed: () => false,
     on: () => {},
-    visible: true,
+    once: () => {},
+    // Main shows the frame itself, once its page has drawn: see `drawFrame`.
+    visible: !frame,
     hide: () => {
       window.visible = false;
     },
@@ -459,9 +648,16 @@ const openGlow = (options: {
       }
     },
   };
-  glow = window;
+  others.set(options.kind, window);
+  if (frame) {
+    glow = window;
+  }
   return window;
 };
+
+/** The edges a call's drag can drop the bar on, while a drag is in flight. */
+const zonesWindow = (): GlowWindow | null =>
+  others.get("companion-dock-zones") ?? null;
 
 mock.module("@vellumai/electron-desktop/floating-window", () => ({
   createFloatingWindow: (options: {
@@ -479,7 +675,11 @@ mock.module("@vellumai/electron-desktop/floating-window", () => ({
     return surface;
   },
   getFloatingWindow: (kind: string) =>
-    kind === "companion" ? (companionOpen ? surface : null) : glow,
+    kind === "companion"
+      ? companionOpen
+        ? surface
+        : null
+      : (others.get(kind) ?? null),
 }));
 
 mock.module("@vellumai/electron-desktop/avatar", () => ({
@@ -520,18 +720,41 @@ const sizes: Record<CompanionSizeAxis, CompanionSize> = {
   options: "small",
 };
 
+/**
+ * The edge the store holds for the call bar, which is what the next call reads
+ * and what a drop writes.
+ */
+let storedDock: CompanionDock = "bottom";
+
+/**
+ * The highest introduction the install has been through, which is the whole of
+ * what decides whether a surface reaching the screen is due a run. Held here
+ * rather than answered once, so a case can owe this install a run and then
+ * watch the record close behind it.
+ */
+let introSeen = Number.MAX_SAFE_INTEGER;
+
 mock.module("@vellumai/electron-desktop/window-state", () => ({
   readCompanionSize: (axis: CompanionSizeAxis) => sizes[axis],
   readCompanionHidden: () => false,
   writeCompanionSize: (axis: CompanionSizeAxis, size: CompanionSize) => {
     sizes[axis] = size;
   },
+  readCompanionCallDock: () => storedDock,
+  writeCompanionCallDock: (dock: CompanionDock) => {
+    storedDock = dock;
+  },
   writeCompanionHidden: () => {},
   // Stubbed rather than omitted, like every other export here: the module
   // under test imports these, and one missing from a whole-module mock is a
   // load-time failure for the file rather than a failing case.
-  readCompanionIntroSeen: () => true,
-  writeCompanionIntroSeen: () => {},
+  readCompanionIntroSeenVersion: () => introSeen,
+  writeCompanionIntroSeen: (version: number) => {
+    introSeen = version;
+  },
+  clearCompanionIntroSeen: () => {
+    introSeen = 0;
+  },
 }));
 
 // Dynamic, so the mocks above are installed before the module graph loads:
@@ -542,7 +765,9 @@ const {
   avatarOffsetFor,
   companionContextMenuTemplate,
   defaultAvatarCentre,
+  dockedAvatarCentre,
   geometryFor,
+  nearestDock,
   placeCanvas,
   callOnUpdate,
   callSurfaceFor,
@@ -550,19 +775,34 @@ const {
   COMPANION_GLIDE_MS,
   dialOnTalk,
   glideProgress,
+  introEndsOnSession,
   introOnAdvance,
+  openCompanionWindow: openCompanionWindowImpl,
+  replayCompanionIntro,
+  setCompanionSurfaceVisible,
   resetCompanionSurfacePosition,
   setCompanionSurfaceSize,
   shouldShowCompanionSurface,
+  surfaceAwayFor,
   showCompanionCoachmarks,
   installCompanionWindow,
+  shownPopover,
 } = await import("./companion-window");
+
+const { popoverBoundsFor, POPOVER_GAP } =
+  await import("./companion-popover-window");
 
 const {
   __resetFrameScrollWatchForTesting,
   frameScrollEnded,
   provideFrameScrollWatch,
 } = await import("./frame-scroll-watch");
+
+const {
+  __resetCoachmarkPressWatchForTesting,
+  coachmarkPressed,
+  provideCoachmarkPressWatch,
+} = await import("./coachmark-press-watch");
 
 installCompanionWindow();
 
@@ -572,13 +812,16 @@ installCompanionWindow();
  */
 beforeEach(() => {
   __resetFrameScrollWatchForTesting();
+  __resetCoachmarkPressWatchForTesting();
   sizes.avatar = "small";
   sizes.options = "small";
   setCompanionSurfaceSize("avatar", "small");
   origin = { x: 0, y: 0 };
   nearestDisplay = NEAREST_DISPLAY;
   boundsSet.length = 0;
+  surfaceLevels.length = 0;
   glow = null;
+  others.clear();
   glowPushes.length = 0;
   displays = [
     {
@@ -595,13 +838,22 @@ beforeEach(() => {
   windowBounds = null;
   boundsAsked.length = 0;
   copied.length = 0;
+  opened.length = 0;
   resolvedPick = null;
   picksResolved.length = 0;
   // The user is working somewhere else, with the app's window open behind
   // them: the state the surface exists for.
   mainWindowOpen = true;
   mainWindowVisible = true;
+  mainSends.length = 0;
   companionOpen = true;
+  // Introduced already, which is what every case that is not about the run
+  // needs: a run due would stage the surface over the app's window and move
+  // every placement case's answer.
+  introSeen = Number.MAX_SAFE_INTEGER;
+  micStatus = "granted";
+  windowClosesMidLoad = false;
+  mainTimeline.length = 0;
   fireAppEvent("did-resign-active");
   surface.visible = true;
 });
@@ -614,6 +866,31 @@ const setFlags = (next: Record<string, boolean>): void => {
   }
 };
 
+/**
+ * Let a press reach the renderer it was handed to. The hand-off answers on a
+ * microtask even when a window is already there, and the introduction's last
+ * beat is walked on that answer.
+ */
+const settleHandoff = async (): Promise<void> => {
+  for (let i = 0; i < 4; i++) {
+    await Promise.resolve();
+  }
+};
+
+/**
+ * Close the surface the way the window server does: the flag goes first, since
+ * main reads it to tell this close from a window it has already replaced.
+ */
+const closeSurface = (): void => {
+  companionOpen = false;
+  for (const entry of [...surfaceListeners]) {
+    if (entry.event === "closed") {
+      entry.listener();
+    }
+  }
+  surfaceListeners.length = 0;
+};
+
 /** Fire main's visibility listeners, as show, hide, and destroy all do. */
 const fireVisibilityChange = (): void => {
   for (const listener of [...visibilityListeners]) {
@@ -623,11 +900,42 @@ const fireVisibilityChange = (): void => {
 
 /** Send on a channel exactly as a renderer would, schema and all. */
 const send = (channel: string, ...args: unknown[]): void => {
+  sendFrom(undefined, channel, ...args);
+};
+
+/** {@link send}, from a renderer other than the app window's. */
+const sendFrom = (
+  sender: unknown,
+  channel: string,
+  ...args: unknown[]
+): void => {
   const listener = listeners.get(channel);
   if (!listener) {
     throw new Error(`No listener registered for ${channel}`);
   }
-  listener(args);
+  listener(args, sender);
+};
+
+/** The frame's page reporting its border drawn, from the frame's own window. */
+const drawFrame = (): void => {
+  if (!glow) {
+    throw new Error("No frame to draw");
+  }
+  sendFrom(glow.webContents, "vellum:companion:frameDrawn");
+};
+
+/**
+ * The reports main held for a window that was not there to take them, as the
+ * app's window pulls them on mount.
+ */
+const takeReports = (): CompanionIntroReport[] => {
+  const pull = invocable.get("vellum:companion:takeIntroReports");
+  if (!pull) {
+    throw new Error(
+      "No handler registered for vellum:companion:takeIntroReports",
+    );
+  }
+  return pull([]) as CompanionIntroReport[];
 };
 
 /** The state a renderer mounting on the surface would pull. */
@@ -637,6 +945,40 @@ const state = (): CompanionSurfaceState => {
     throw new Error("No handler registered for vellum:companion:getState");
   }
   return pull([]) as CompanionSurfaceState;
+};
+
+/**
+ * What the app's window pulls on mount: whether to dim itself for a run. The
+ * fact a window built mid-press reads, so it is asked for the way one would.
+ */
+const introStage = (): boolean => {
+  const pull = invocable.get("vellum:companion:getIntroStage");
+  if (!pull) {
+    throw new Error("No handler registered for vellum:companion:getIntroStage");
+  }
+  return pull([]) as boolean;
+};
+
+/** Whether the app should announce the due introduction before it begins. */
+const introAnnouncement = (): boolean => {
+  const pull = invocable.get("vellum:companion:getIntroAnnouncement");
+  if (!pull) {
+    throw new Error(
+      "No handler registered for vellum:companion:getIntroAnnouncement",
+    );
+  }
+  return pull([]) as boolean;
+};
+
+/** Accept the app announcement and begin the surface's introduction. */
+const acceptIntroAnnouncement = (): void => {
+  send("vellum:companion:answerIntroAnnouncement", "start");
+};
+
+/** Open the surface the way the installed app does after accepting its announcement. */
+const openCompanionWindow = (): void => {
+  openCompanionWindowImpl();
+  acceptIntroAnnouncement();
 };
 
 /** A context as the app's window publishes one. */
@@ -1195,6 +1537,295 @@ describe("the surface a call takes", () => {
 });
 
 /**
+ * The edge a call's bar rests on. The bottom by default, and any of the four
+ * once the user has dragged the bar there mid-call and let go: the drag moves
+ * the surface as freely as an idle drag does, the edges are shown for as long
+ * as it is in flight, and the release docks the bar to the nearest one. The
+ * sides stand the bar up, which is a canvas of another shape.
+ *
+ * Under "Reduce motion", as the call's cases are, so each move lands in the
+ * beat it is asked for.
+ */
+describe("the edge a call's bar docks to", () => {
+  const SCREEN = { x: 0, y: 0, width: 1440, height: 900 };
+  const SIDE = geometryFor("small", "small", "left");
+  /** The canvas main is drawing in, read off the last bounds it asked for. */
+  const canvas = (): typeof GEOMETRY =>
+    boundsSet.at(-1)?.height === SIDE.canvasHeight ? SIDE : GEOMETRY;
+  const centre = (): { x: number; y: number } => ({
+    x: origin.x + canvas().canvasWidth / 2,
+    y: origin.y + avatarOffsetFor(state().cardGrowth, canvas()),
+  });
+  /** Where a dock lands the avatar, read back the way `avatarCentre` reads it. */
+  const landing = (
+    dock: CompanionDock,
+    geometry: typeof GEOMETRY = GEOMETRY,
+  ): { x: number; y: number } => {
+    const placed = placeCanvas(
+      dockedAvatarCentre(dock, SCREEN, geometry),
+      SCREEN,
+      geometry,
+    );
+    return {
+      x: placed.origin.x + geometry.canvasWidth / 2,
+      y: placed.origin.y + avatarOffsetFor(placed.cardGrowth, geometry),
+    };
+  };
+  /** Drag the bar so the avatar rests on a point, mid-call or not. */
+  const dragTo = (point: { x: number; y: number }): void => {
+    send("vellum:companion:moveBy", point.x - centre().x, point.y - centre().y);
+  };
+  const release = (): void => {
+    send("vellum:companion:release");
+  };
+
+  beforeEach(() => {
+    mainWindowOpen = true;
+    storedDock = "bottom";
+  });
+
+  /**
+   * Leave the bar docked to the bottom for the next case, the way a fresh
+   * install has it. The module holds the dock it was last dropped on, and a
+   * reset mid-call is the one way back that goes through the store.
+   */
+  afterEach(() => {
+    send("vellum:voiceActivity:end");
+    send("vellum:voiceActivity:control", { action: "endSession" });
+    send("vellum:companion:startVoice");
+    resetCompanionSurfacePosition();
+    send("vellum:voiceActivity:control", { action: "endSession" });
+    storedDock = "bottom";
+  });
+
+  describe("geometryFor", () => {
+    test("builds the ordinary canvas for the top and bottom", () => {
+      expect(geometryFor("small", "small", "top")).toEqual(GEOMETRY);
+      expect(geometryFor("small", "small", "bottom")).toEqual(GEOMETRY);
+    });
+
+    /**
+     * The column is centred on the avatar, so the canvas has to reach as far
+     * below it as above; and it has to hold half the column, the gap and the
+     * whole creature standing at its end.
+     */
+    test("builds a canvas symmetric about the avatar for a side", () => {
+      for (const dock of ["left", "right"] as const) {
+        const side = geometryFor("small", "small", dock);
+        expect(side.riseAbove).toBe(side.dropBelow);
+        expect(side.canvasHeight).toBe(side.riseAbove * 2);
+        const scale = companionScaleFor(side.optionsBox);
+        expect(side.riseAbove).toBeGreaterThanOrEqual(
+          (COMPANION_BASE_MAX_PILL_WIDTH * scale) / 2 + side.avatarBox,
+        );
+      }
+    });
+
+    /**
+     * The capture picker stands beside the column, facing the middle of the
+     * screen, so half the canvas has to hold the column's cross reach, the
+     * gap and the whole card. Never narrower than the row's canvas.
+     */
+    test("reaches past the column far enough to hold the capture picker", () => {
+      for (const [avatar, options] of [
+        ["small", "small"],
+        ["huge", "small"],
+        ["small", "huge"],
+      ] as const) {
+        const side = geometryFor(avatar, options, "left");
+        const row = geometryFor(avatar, options);
+        expect(side.canvasWidth).toBeGreaterThanOrEqual(row.canvasWidth);
+        expect(side.canvasWidth / 2).toBeGreaterThanOrEqual(
+          companionLowerReachFor(side.avatarBox, side.optionsBox) +
+            companionGapFor(side.avatarBox, side.optionsBox) +
+            COMPANION_BASE_CAPTURE_PICKER_WIDTH *
+              companionScaleFor(side.optionsBox),
+        );
+      }
+    });
+  });
+
+  describe("dockedAvatarCentre", () => {
+    test("is the bottom centre for the bottom", () => {
+      expect(dockedAvatarCentre("bottom", SCREEN, GEOMETRY)).toEqual(
+        defaultAvatarCentre(SCREEN, GEOMETRY),
+      );
+    });
+
+    /** As high as the canvas above the avatar lets the window server go. */
+    test("settles as high as the work area allows for the top", () => {
+      const top = landing("top");
+      expect(top.x).toBe(SCREEN.width / 2);
+      expect(top.y).toBe(SCREEN.y + DROP_BELOW);
+    });
+
+    test("stands the sides at the display's vertical centre, a margin in", () => {
+      const reach = companionLowerReachFor(SIDE.avatarBox, SIDE.optionsBox);
+      expect(dockedAvatarCentre("left", SCREEN, SIDE)).toEqual({
+        x: 2 + reach,
+        y: SCREEN.height / 2,
+      });
+      expect(dockedAvatarCentre("right", SCREEN, SIDE)).toEqual({
+        x: SCREEN.width - 2 - reach,
+        y: SCREEN.height / 2,
+      });
+    });
+  });
+
+  describe("nearestDock", () => {
+    test("is the edge the point is closest to", () => {
+      expect(nearestDock({ x: 700, y: 850 }, SCREEN)).toBe("bottom");
+      expect(nearestDock({ x: 700, y: 40 }, SCREEN)).toBe("top");
+      expect(nearestDock({ x: 30, y: 450 }, SCREEN)).toBe("left");
+      expect(nearestDock({ x: 1400, y: 450 }, SCREEN)).toBe("right");
+    });
+
+    test("resolves a tie to the bottom, the shape the bar is designed around", () => {
+      expect(nearestDock({ x: 720, y: 450 }, SCREEN)).toBe("bottom");
+    });
+
+    test("measures against the work area it is given, not the origin", () => {
+      const second = { x: 1440, y: 0, width: 1920, height: 1080 };
+      expect(nearestDock({ x: 1460, y: 500 }, second)).toBe("left");
+    });
+  });
+
+  test("a call goes to the remembered edge rather than the bottom", () => {
+    storedDock = "top";
+    // The dock is read once at load, so this case reaches it the way a drop
+    // does; the store's read is `window-state.test.ts`'s subject.
+    send("vellum:voiceActivity:start", START);
+    dragTo({ x: 700, y: 30 });
+    release();
+    send("vellum:voiceActivity:end");
+    send("vellum:companion:startVoice");
+    expect(centre()).toEqual(landing("top"));
+    expect(state().dock).toBe("top");
+  });
+
+  /**
+   * The window is built with the call and kept hidden, so the drag has a
+   * window to show rather than one to build and load.
+   */
+  test("a drag mid-call shows the edges and names the one it is heading for", () => {
+    expect(zonesWindow()).toBeNull();
+    send("vellum:companion:startVoice");
+    expect(zonesWindow()?.visible).toBe(false);
+    expect(zonesWindow()?.bounds).toEqual(SCREEN);
+    dragTo({ x: 100, y: 450 });
+    const zones = zonesWindow();
+    expect(zones?.visible).toBe(true);
+    expect(zones?.level).toEqual(["floating", -1]);
+    expect(state().docking).toBe("left");
+    dragTo({ x: 700, y: 60 });
+    expect(state().docking).toBe("top");
+  });
+
+  /**
+   * A click on the creature mid-call is a press the renderer reports moves
+   * for, jitter and all, and it must not flash the edges or move the bar.
+   */
+  test("a press that barely moves is a click, not a drag", () => {
+    send("vellum:companion:startVoice");
+    const docked = centre();
+    send("vellum:companion:moveBy", 1, -1);
+    expect(zonesWindow()?.visible).toBe(false);
+    expect(state().docking).toBeUndefined();
+    release();
+    expect(centre()).toEqual({ x: docked.x + 1, y: docked.y - 1 });
+    expect(state().dock).toBe("bottom");
+  });
+
+  test("an idle drag shows no edges", () => {
+    dragTo({ x: 100, y: 450 });
+    expect(zonesWindow()).toBeNull();
+    expect(state().docking).toBeUndefined();
+    release();
+    expect(state().dock).toBe("bottom");
+  });
+
+  test("the release docks the bar to the edge it was heading for and remembers it", () => {
+    send("vellum:companion:startVoice");
+    dragTo({ x: 100, y: 450 });
+    release();
+    expect(zonesWindow()?.visible).toBe(false);
+    expect(state().docking).toBeUndefined();
+    expect(state().dock).toBe("left");
+    expect(storedDock).toBe("left");
+    expect(centre()).toEqual(landing("left", SIDE));
+  });
+
+  /** The column needs a canvas of its own shape, and the row wants the old one back. */
+  test("a side dock stands the canvas up for the call and lays it back down after", () => {
+    send("vellum:companion:startVoice");
+    dragTo({ x: 1400, y: 450 });
+    release();
+    expect(boundsSet.at(-1)?.height).toBe(SIDE.canvasHeight);
+    expect(state().avatarBox).toBe(SIDE.avatarBox);
+    send("vellum:voiceActivity:end");
+    expect(boundsSet.at(-1)?.height).toBe(GEOMETRY.canvasHeight);
+  });
+
+  test("goes home after a call docked to a side", () => {
+    dragTo({ x: 300, y: 200 });
+    const home = centre();
+    send("vellum:companion:startVoice");
+    dragTo({ x: 1400, y: 450 });
+    release();
+    send("vellum:voiceActivity:end");
+    expect(centre()).toEqual(home);
+  });
+
+  test("the next call stands the bar up on the side it was left on", () => {
+    send("vellum:companion:startVoice");
+    dragTo({ x: 1400, y: 450 });
+    release();
+    send("vellum:voiceActivity:end");
+    send("vellum:companion:startVoice");
+    expect(centre()).toEqual(landing("right", SIDE));
+    expect(boundsSet.at(-1)?.height).toBe(SIDE.canvasHeight);
+  });
+
+  test("a call ending under a drag takes the edges down with it", () => {
+    send("vellum:companion:startVoice");
+    dragTo({ x: 100, y: 450 });
+    expect(zonesWindow()?.visible).toBe(true);
+    send("vellum:voiceActivity:end");
+    expect(zonesWindow()).toBeNull();
+    expect(state().docking).toBeUndefined();
+    // A release arriving after the call has nothing left to dock.
+    release();
+    expect(state().dock).toBe("bottom");
+  });
+
+  test("a reset mid-call puts the bar back on the bottom for this call and the next", () => {
+    send("vellum:companion:startVoice");
+    dragTo({ x: 100, y: 450 });
+    release();
+    expect(state().dock).toBe("left");
+    resetCompanionSurfacePosition();
+    expect(state().dock).toBe("bottom");
+    expect(storedDock).toBe("bottom");
+    expect(centre()).toEqual(landing("bottom"));
+    send("vellum:voiceActivity:end");
+    expect(centre()).toEqual(landing("bottom"));
+  });
+
+  test("the edges follow a drag onto another display", () => {
+    send("vellum:companion:startVoice");
+    const second = displays[1];
+    if (second === undefined) {
+      throw new Error("Expected a second display");
+    }
+    dragTo({ x: 100, y: 450 });
+    nearestDisplay = second;
+    dragTo({ x: 1500, y: 500 });
+    expect(zonesWindow()?.bounds).toEqual(second.workArea);
+    expect(state().docking).toBe("left");
+  });
+});
+
+/**
  * The menu's "Reset Position": the pill goes back to where the surface opens,
  * the bottom centre of its display, from wherever the user dragged it.
  *
@@ -1653,6 +2284,7 @@ describe("the light a watch session puts on the display", () => {
       }),
     );
     await Bun.sleep(0);
+    drawFrame();
     expect(glow?.visible).toBe(true);
     // Minimized: the helper no longer lists it.
     windowBounds = null;
@@ -1714,7 +2346,23 @@ describe("the picker behind Teach", () => {
   test("lists what a session could read on demand", async () => {
     const list = invocable.get("vellum:companion:listCaptureSources");
     expect(list).toBeDefined();
-    expect(await list?.([])).toEqual(listedSources);
+    expect(await list?.([])).toEqual({
+      ...listedSources,
+      screenRecordingGranted: true,
+    });
+  });
+
+  test("says when nothing listed could be captured for want of the grant", async () => {
+    screenGranted = false;
+    try {
+      const list = invocable.get("vellum:companion:listCaptureSources");
+      expect(await list?.([])).toEqual({
+        ...listedSources,
+        screenRecordingGranted: false,
+      });
+    } finally {
+      screenGranted = true;
+    }
   });
 
   test("a press with no pick is the toggle it always was", () => {
@@ -1902,20 +2550,77 @@ describe("the session main holds", () => {
  * and every wrong answer here is either a run that repeats or one that ends
  * before it has said anything.
  */
+/**
+ * The last card advertises two ways into a conversation and only one of them is
+ * a press on it: a double tap on the key reaches the window that owns the voice
+ * key and starts a session directly. So main finishes the run on the session
+ * itself, and this is the rule that decides which sessions count.
+ */
+describe("introEndsOnSession", () => {
+  test("a session on the last beat is the run's finish", () => {
+    expect(introEndsOnSession("try")).toBe(true);
+  });
+
+  // Every other beat is the run being interrupted by the user's own business.
+  // Main holds the beat, so the card picks up where it left off afterwards.
+  test("a session on any earlier beat leaves the run alone", () => {
+    expect(introEndsOnSession("idle")).toBe(false);
+    expect(introEndsOnSession("key")).toBe(false);
+    expect(introEndsOnSession("mute")).toBe(false);
+  });
+
+  test("a session with no run going finishes nothing", () => {
+    expect(introEndsOnSession(null)).toBe(false);
+  });
+});
+
 describe("introOnAdvance", () => {
   test("walks to the next beat", () => {
+    expect(introOnAdvance("idle", "next")).toBe("meet");
     expect(introOnAdvance("meet", "next")).toBe("talk");
-    expect(introOnAdvance("talk", "next")).toBe("menu");
+    expect(introOnAdvance("talk", "next")).toBe("key");
+    expect(introOnAdvance("key", "next")).toBe("share");
+    expect(introOnAdvance("share", "next")).toBe("draw");
+    expect(introOnAdvance("draw", "next")).toBe("mute");
+    expect(introOnAdvance("mute", "next")).toBe("try");
   });
 
   // Past the last beat there is no next one, and `null` is what main reads as
   // the run being over and worth recording.
   test("falls off the end of the last beat", () => {
-    expect(introOnAdvance("menu", "next")).toBe(null);
+    expect(introOnAdvance("try", "next")).toBe(null);
+  });
+
+  test("walks back to the beat before", () => {
+    expect(introOnAdvance("try", "back")).toBe("mute");
+    expect(introOnAdvance("share", "back")).toBe("key");
+    expect(introOnAdvance("key", "back")).toBe("talk");
+    expect(introOnAdvance("talk", "back")).toBe("meet");
+    expect(introOnAdvance("meet", "back")).toBe("idle");
+  });
+
+  // Back is the one control in the run that reads as recoverable, so the far
+  // end of it holds rather than ending the run: a first beat that vanished on
+  // a press for the previous one would be the press that proves otherwise.
+  test("holds at the first beat rather than ending the run", () => {
+    expect(introOnAdvance("idle", "back")).toBe("idle");
+  });
+
+  // The offer a beat makes to do the thing for real. The session withdraws the
+  // card on its own, so the run has to be left exactly where it was.
+  test("taking up a beat's offer leaves the run on that beat", () => {
+    expect(introOnAdvance("talk", "try")).toBe("talk");
+    expect(introOnAdvance("share", "try")).toBe("share");
+  });
+
+  // Except on the last beat, which is itself the offer: taking it is the finish
+  // of the run, not a session to come back from.
+  test("the last beat's offer ends the run", () => {
+    expect(introOnAdvance("try", "try")).toBe(null);
   });
 
   test("dismiss ends the run from any beat", () => {
-    expect(introOnAdvance("meet", "dismiss")).toBe(null);
+    expect(introOnAdvance("idle", "dismiss")).toBe(null);
     expect(introOnAdvance("talk", "dismiss")).toBe(null);
   });
 
@@ -1924,8 +2629,320 @@ describe("introOnAdvance", () => {
   // beat rather than only in theory.
   test("stays over once it is over", () => {
     expect(introOnAdvance(null, "next")).toBe(null);
+    expect(introOnAdvance(null, "back")).toBe(null);
     expect(introOnAdvance(null, "dismiss")).toBe(null);
   });
+});
+
+describe("the introduction announcement", () => {
+  const openDueAnnouncement = (): void => {
+    companionOpen = false;
+    introSeen = 0;
+    openCompanionWindowImpl();
+  };
+
+  afterEach(() => {
+    setCompanionSurfaceVisible(false);
+    mainSends.length = 0;
+  });
+
+  test("holds a due run until the app announces it", () => {
+    openDueAnnouncement();
+
+    expect(introAnnouncement()).toBe(true);
+    expect(state().intro).toBeNull();
+    expect(introStage()).toBe(false);
+    send("vellum:companion:startVoice");
+    expect(mainTimeline).not.toContain("command:startVoice");
+  });
+
+  test("starts and stages the run after the user accepts", () => {
+    openDueAnnouncement();
+
+    acceptIntroAnnouncement();
+
+    expect(introAnnouncement()).toBe(false);
+    expect(state().intro).toBe("idle");
+    expect(introStage()).toBe(true);
+    expect(introSeen).toBe(0);
+  });
+
+  test("records a skipped announcement without exposing the run", () => {
+    openDueAnnouncement();
+
+    send("vellum:companion:answerIntroAnnouncement", "dismiss");
+
+    expect(introAnnouncement()).toBe(false);
+    expect(state().intro).toBeNull();
+    expect(introStage()).toBe(false);
+    expect(introSeen).toBe(COMPANION_INTRO_VERSION);
+  });
+
+  test("clears an interrupted run when assistant readiness is lost", () => {
+    setName("Example Assistant");
+    openDueAnnouncement();
+    acceptIntroAnnouncement();
+    send("vellum:companion:advanceIntro", "next");
+    expect(state().intro).not.toBeNull();
+
+    setName(null);
+
+    expect(companionOpen).toBe(false);
+    expect(state().intro).toBeNull();
+    expect(introStage()).toBe(false);
+    expect(introAnnouncement()).toBe(false);
+    expect(introSeen).toBe(0);
+
+    setName("Example Assistant");
+    expect(introAnnouncement()).toBe(true);
+    expect(state().intro).toBeNull();
+    expect(introStage()).toBe(false);
+    setName(null);
+  });
+
+  test("announces the modal after the previous introduction was seen", () => {
+    companionOpen = false;
+    introSeen = 2;
+    openCompanionWindowImpl();
+
+    expect(introAnnouncement()).toBe(true);
+    send("vellum:companion:answerIntroAnnouncement", "dismiss");
+    expect(introSeen).toBe(COMPANION_INTRO_VERSION);
+  });
+
+  test("does not announce the current introduction twice", () => {
+    companionOpen = false;
+    introSeen = COMPANION_INTRO_VERSION;
+    openCompanionWindowImpl();
+
+    expect(introAnnouncement()).toBe(false);
+  });
+
+  test("replay returns to the informational introduction before any coachmarks", () => {
+    setName("Example Assistant");
+    openDueAnnouncement();
+    acceptIntroAnnouncement();
+    send("vellum:companion:advanceIntro", "next");
+
+    replayCompanionIntro();
+    for (const entry of [...surfaceListeners]) {
+      if (entry.event === "closed") {
+        entry.listener();
+      }
+    }
+
+    expect(introAnnouncement()).toBe(true);
+    expect(state().intro).toBeNull();
+    expect(introStage()).toBe(false);
+    acceptIntroAnnouncement();
+    expect(state().intro).toBe("idle");
+    expect(introStage()).toBe(true);
+    setName(null);
+  });
+});
+
+/**
+ * The last beat's press, which is the one beat that does the thing for real.
+ *
+ * It is also the only press that has to reach TWO places in a particular
+ * order: the app is asked for a session, and the run that asked is then over.
+ * The app's first-run voice card stands down while a run is on, so that this
+ * offer reaches a session rather than a third card
+ * (`clients/web/src/domains/chat/voice/live-voice/voice-entry-guards.ts`).
+ * Told the run was over first, it would put itself in front of the one press
+ * the whole run was building to.
+ */
+describe("taking the introduction's last offer", () => {
+  const centre = (): { x: number; y: number } => ({
+    x: origin.x + GEOMETRY.canvasWidth / 2,
+    y: origin.y + avatarOffsetFor(state().cardGrowth, GEOMETRY),
+  });
+
+  beforeEach(() => {
+    reducedMotion = true;
+  });
+  const openStagedRun = (beat: CompanionIntroBeat = "idle"): void => {
+    companionOpen = false;
+    introSeen = 0;
+    openCompanionWindow();
+    for (
+      let index = 0;
+      index < COMPANION_INTRO_BEATS.indexOf(beat);
+      index += 1
+    ) {
+      send("vellum:companion:advanceIntro", "next");
+    }
+    expect(state().intro).toBe(beat);
+    mainTimeline.length = 0;
+  };
+
+  // A run is main's own state, and the `try` that ends one leaves the surface
+  // flying home on a timer. Closing the window is how main tears both down, so
+  // every case here leaves through it rather than into the next one.
+  afterEach(() => {
+    closeSurface();
+    reducedMotion = true;
+  });
+
+  test.each([...COMPANION_INTRO_BEATS])(
+    "the ordinary avatar call path is blocked during %s",
+    async (beat) => {
+      openStagedRun(beat);
+      send("vellum:companion:startVoice");
+      await settleHandoff();
+      expect(mainTimeline).not.toContain("command:startVoice");
+      expect(state().dialing).not.toBe(true);
+      expect(state().intro).toBe(beat);
+    },
+  );
+
+  test("asks for the session before it says the run is over", async () => {
+    openStagedRun("try");
+
+    send("vellum:companion:advanceIntro", "try");
+    await settleHandoff();
+
+    expect(mainTimeline).toEqual([
+      "command:startVoice",
+      "vellum:companion:introStage:false",
+    ]);
+  });
+
+  /**
+   * The gap the order alone does not close. Closing the app's window leaves the
+   * surface on screen with the run still on it, so the press has to build a
+   * renderer before anything can hear it, and that renderer PULLS the staging
+   * as it mounts. A run ended while it was loading is one it pulls as already
+   * over, and the first-run card takes the press.
+   */
+  test("holds the run open while a renderer is built for the press", async () => {
+    openStagedRun("try");
+    mainWindowOpen = false;
+
+    send("vellum:companion:advanceIntro", "try");
+
+    // Still staged: nothing has heard the press yet.
+    expect(introStage()).toBe(true);
+    expect(mainTimeline).toEqual([]);
+
+    await settleHandoff();
+
+    // The window the press built gets the command, and only then is told the
+    // run is over.
+    expect(windowsRaised).toBeGreaterThan(0);
+    expect(mainTimeline).toEqual([
+      "command:startVoice",
+      "vellum:companion:introStage:false",
+    ]);
+    expect(introStage()).toBe(false);
+  });
+
+  /**
+   * The other end of holding it open. Closing the window a press built while
+   * it loads releases the wait on purpose and the send lands nowhere, which is
+   * the user closing the window and nothing happening. The offer has not been
+   * taken, so the run is exactly where it was: ending it here would record an
+   * introduction the user never got and fly the surface home on a press that
+   * did nothing.
+   */
+  test("leaves the run alone when the press reaches nothing", async () => {
+    openStagedRun("try");
+    mainWindowOpen = false;
+    windowClosesMidLoad = true;
+
+    send("vellum:companion:advanceIntro", "try");
+    await settleHandoff();
+
+    expect(windowsRaised).toBeGreaterThan(0);
+    expect(mainTimeline).toEqual([]);
+    expect(state().intro).toBe("try");
+    expect(introStage()).toBe(true);
+  });
+
+  test("and the run is over, so no card waits for the call to end", async () => {
+    openStagedRun("try");
+
+    send("vellum:companion:advanceIntro", "try");
+    await settleHandoff();
+
+    expect(state().intro).toBe(null);
+  });
+
+  test.each([
+    ["call", true],
+    ["call", false],
+    ["declined", true],
+    ["skipped", true],
+    ["external call", true],
+  ] as const)(
+    "returns to the bottom after %s (reduced motion: %s)",
+    async (ending, reduceMotion) => {
+      reducedMotion = reduceMotion;
+      openStagedRun("try");
+      if (ending === "skipped") {
+        send("vellum:companion:advanceIntro", "next");
+      } else {
+        if (ending !== "external call") {
+          send("vellum:companion:advanceIntro", "try");
+          await settleHandoff();
+        }
+        if (ending !== "declined") {
+          send("vellum:voiceActivity:start", START);
+        }
+        send("vellum:voiceActivity:end");
+      }
+      if (!reduceMotion) {
+        await Bun.sleep(COMPANION_GLIDE_MS + 80);
+      }
+      expect(centre()).toEqual(
+        defaultAvatarCentre(NEAREST_DISPLAY.workArea, GEOMETRY),
+      );
+    },
+  );
+
+  test.each(["app focus", "window focus", "tour end"] as const)(
+    "lets permission UI cover the tour and restores its level on %s",
+    (restore) => {
+      openStagedRun();
+      presentPermission();
+      presentPermission();
+      fireAppEvent("did-resign-active");
+      fireAppEvent("browser-window-focus", surface);
+      expect(surfaceLevels).toEqual([{ floating: false, level: undefined }]);
+      expect(state().intro).toBe("idle");
+      if (restore === "tour end") {
+        send("vellum:companion:advanceIntro", "dismiss");
+      } else if (restore === "window focus") {
+        fireAppEvent("browser-window-focus", mainWindow);
+      } else {
+        fireAppEvent("did-become-active");
+      }
+      expect(surfaceLevels.at(-1)).toEqual({
+        floating: true,
+        level: "floating",
+      });
+      expect(state().intro).toBe(restore === "tour end" ? null : "idle");
+    },
+  );
+
+  test("does not lower the companion outside the tour", () => {
+    presentPermission();
+    expect(surfaceLevels).toEqual([]);
+  });
+
+  test.each(["talk", "key"] as const)(
+    "a rehearsal on %s never starts a call",
+    async (beat) => {
+      openStagedRun(beat);
+
+      send("vellum:companion:advanceIntro", "try");
+      await settleHandoff();
+
+      expect(mainTimeline).toEqual([]);
+      expect(state().intro).toBe(beat);
+      expect(introStage()).toBe(true);
+    },
+  );
 });
 
 /**
@@ -1957,6 +2974,31 @@ describe("shouldShowCompanionSurface", () => {
 });
 
 /**
+ * Whether the surface steps off the screen for the app being in front, and the
+ * one exception: the introduction, which is staged on the app's own window
+ * because that is where a new user is looking.
+ */
+describe("surfaceAwayFor", () => {
+  test("steps off the screen while the app is in front", () => {
+    expect(surfaceAwayFor(true, true, false)).toBe(true);
+  });
+
+  test("stays for an app in front whose window is put away", () => {
+    expect(surfaceAwayFor(true, false, false)).toBe(false);
+  });
+
+  test("stays once the user has left the app", () => {
+    expect(surfaceAwayFor(false, true, false)).toBe(false);
+  });
+
+  // The case the flag exists for: a run explaining the surface must not be
+  // played to an empty screen.
+  test("holds a staged introduction in front of the app's own window", () => {
+    expect(surfaceAwayFor(true, true, true)).toBe(false);
+  });
+});
+
+/**
  * The canvas as a function of the size the user picked (JARVIS-1549).
  *
  * The avatar's box is not a style: the pill's reach, the card's height and the
@@ -1979,11 +3021,11 @@ describe("geometryFor", () => {
       CompanionSize,
       { maxReach: number; canvasWidth: number; canvasHeight: number }
     > = {
-      small: { maxReach: 322, canvasWidth: 692, canvasHeight: 267 },
-      medium: { maxReach: 445, canvasWidth: 962, canvasHeight: 374 },
-      large: { maxReach: 662, canvasWidth: 1420, canvasHeight: 547 },
-      huge: { maxReach: 879, canvasWidth: 1878, canvasHeight: 720 },
-      ridiculous: { maxReach: 1140, canvasWidth: 2520, canvasHeight: 1035 },
+      small: { maxReach: 322, canvasWidth: 692, canvasHeight: 306 },
+      medium: { maxReach: 445, canvasWidth: 962, canvasHeight: 435 },
+      large: { maxReach: 662, canvasWidth: 1420, canvasHeight: 624 },
+      huge: { maxReach: 879, canvasWidth: 1878, canvasHeight: 813 },
+      ridiculous: { maxReach: 1140, canvasWidth: 2520, canvasHeight: 1230 },
     };
     for (const size of COMPANION_SIZES) {
       const { maxReach, canvasWidth, canvasHeight } = geometryFor(size, size);
@@ -2039,16 +3081,16 @@ describe("geometryFor", () => {
         COMPANION_BASE_AVATAR_BOX,
         COMPANION_BASE_AVATAR_BOX,
       ),
-    ).toBe(300);
+    ).toBe(332);
     const sides: Record<
       CompanionSize,
       { riseAbove: number; dropBelow: number }
     > = {
-      small: { riseAbove: 221, dropBelow: 46 },
-      medium: { riseAbove: 305, dropBelow: 69 },
-      large: { riseAbove: 455, dropBelow: 92 },
-      huge: { riseAbove: 605, dropBelow: 115 },
-      ridiculous: { riseAbove: 805, dropBelow: 230 },
+      small: { riseAbove: 260, dropBelow: 46 },
+      medium: { riseAbove: 366, dropBelow: 69 },
+      large: { riseAbove: 532, dropBelow: 92 },
+      huge: { riseAbove: 698, dropBelow: 115 },
+      ridiculous: { riseAbove: 1000, dropBelow: 230 },
     };
     for (const size of COMPANION_SIZES) {
       const { riseAbove, dropBelow } = geometryFor(size, size);
@@ -2143,9 +3185,9 @@ describe("geometryFor with the two axes apart", () => {
       optionsBox: 32,
       maxReach: 355,
       canvasWidth: 830,
-      riseAbove: 274,
+      riseAbove: 362,
       dropBelow: 115,
-      canvasHeight: 389,
+      canvasHeight: 477,
     });
     // A base half box, the base gap, and a pill twice as wide.
     expect(BIG_OPTIONS).toEqual({
@@ -2484,6 +3526,43 @@ describe("the watch session main relays", () => {
   });
 
   /**
+   * Taps of the voice key, which the introduction's drawn keycap answers. The
+   * key's edges reach only the window that claimed the binding, so this count
+   * is the surface's only evidence that the real key was pressed.
+   */
+  test("carries the voice key's taps into pushed state", () => {
+    send("vellum:companion:setContext", context({ voiceKeyTaps: 2 }));
+    expect(state().voiceKeyTaps).toBe(2);
+  });
+
+  /** A publisher that reports no taps has reported none. */
+  test("reads a context with no taps as no taps", () => {
+    send("vellum:companion:setContext", context());
+    expect(state().voiceKeyTaps).toBe(0);
+  });
+
+  /**
+   * Presses of a call's shortcut, which the three call beats' chips answer.
+   * The chord reaches only the window that armed it, so this count and the
+   * control it names are the surface's only evidence of one.
+   */
+  test("carries the shortcut presses and their control into pushed state", () => {
+    send(
+      "vellum:companion:setContext",
+      context({ introChordPresses: 2, introChordControl: "draw" }),
+    );
+    expect(state().introChordPresses).toBe(2);
+    expect(state().introChordControl).toBe("draw");
+  });
+
+  /** A publisher that reports no presses has heard none, and names nothing. */
+  test("reads a context with no shortcut presses as none", () => {
+    send("vellum:companion:setContext", context());
+    expect(state().introChordPresses).toBe(0);
+    expect(state().introChordControl).toBeUndefined();
+  });
+
+  /**
    * One channel carries the whole snapshot, so a context that flips watching is
    * a single push. Pushing the fact separately from the context it arrived with
    * would send the surface two states for one publish, the first of them stale.
@@ -2626,6 +3705,34 @@ describe("the offer of Vellum's dictation on the surface", () => {
     expect(windowsRaised).toBe(0);
   });
 
+  test("forwards pop-out recovery offers and clears to main without raising the app", () => {
+    const popout = new EventEmitter();
+    const offer = {
+      reason: "paste-failed" as const,
+      text: "make this friendlier",
+    };
+    sendFrom(popout, "vellum:companion:setUnplacedDictationOffer", offer);
+    sendFrom(popout, "vellum:companion:setUnplacedDictationOffer", null);
+    expect(dispatched).toEqual([
+      { kind: "setUnplacedDictationOffer", offer },
+      { kind: "setUnplacedDictationOffer", offer: null },
+    ]);
+    expect(windowsRaised).toBe(0);
+  });
+
+  test("rejects malformed recovery offers", () => {
+    for (const offer of [
+      { reason: "claimed", text: "words" },
+      { reason: "paste-failed" },
+      { reason: "paste-failed", text: "x".repeat(2001) },
+    ]) {
+      expect(() =>
+        send("vellum:companion:setUnplacedDictationOffer", offer),
+      ).toThrow();
+    }
+    expect(dispatched).toEqual([]);
+  });
+
   /**
    * The one answer main acts on itself. It owns the pasteboard, and neither
    * window either side of it can write one: the surface's never takes focus,
@@ -2700,6 +3807,648 @@ describe("the offer of Vellum's dictation on the surface", () => {
     expect(dispatched).toEqual([
       { kind: "answerDictationOffer", answer: "copy", offerId: "offer-2" },
     ]);
+  });
+});
+
+/**
+ * The popover beside the surface: approvals, a credential, a card or a surface
+ * to open, published by the app's window and drawn in a window of its own, or
+ * as a row of a call's bar.
+ */
+describe("the popover beside the surface", () => {
+  const ONE = {
+    kind: "approvals" as const,
+    id: "req-1",
+    items: [
+      {
+        id: "req-1",
+        title: "Run a command",
+        detail: "Lists the files in your home folder.",
+      },
+    ],
+  };
+  const THREE = {
+    kind: "approvals" as const,
+    id: "req-1,req-2,req-3",
+    items: [
+      ONE.items[0],
+      { id: "req-2", title: "Open Safari", detail: "" },
+      { id: "req-3", title: "Send an email", detail: "" },
+    ],
+  };
+  const SECRET = {
+    kind: "secret" as const,
+    id: "sec-1",
+    service: "Booking.com",
+    detail: "",
+    label: "Password",
+    placeholder: "",
+  };
+  const CARD = {
+    kind: "card" as const,
+    id: "surf-1",
+    title: "A picture",
+    subtitle: "",
+    body: "![a](https://example.com/a.png)",
+    actions: [],
+  };
+
+  const popoverWindow = (): GlowWindow | null =>
+    others.get("companion-popover") ?? null;
+
+  const show = (popover: object, width = 300, height = 60): void => {
+    send("vellum:companion:setContext", context({ popover }));
+    send(
+      "vellum:companion:setPopoverSize",
+      (popover as { id: string }).id,
+      width,
+      height,
+    );
+  };
+
+  beforeEach(() => {
+    send("vellum:voiceActivity:end");
+    send("vellum:companion:setContext", context());
+    dispatched.length = 0;
+    windowsRaised = 0;
+  });
+
+  test("passes the popover through on the state, in its short form", () => {
+    send("vellum:companion:setContext", context({ popover: THREE }));
+
+    expect(state().popover).toEqual(THREE);
+    expect(state().popoverView).toBe("row");
+  });
+
+  test("a card has no short form and is always drawn whole", () => {
+    send("vellum:companion:setContext", context({ popover: CARD }));
+
+    expect(state().popoverView).toBe("expanded");
+  });
+
+  test("drops a popover that fails its bounds and keeps the rest", () => {
+    send(
+      "vellum:companion:setContext",
+      context({
+        watching: true,
+        popover: {
+          ...ONE,
+          items: [{ ...ONE.items[0], title: "x".repeat(10_000) }],
+        },
+      }),
+    );
+
+    expect(state().popover).toBeUndefined();
+    expect(state().watching).toBe(true);
+  });
+
+  /** Otherwise it would open at the size of whatever it showed last. */
+  test("is not shown until its page reports a size for it", () => {
+    send("vellum:companion:setContext", context({ popover: ONE }));
+    expect(popoverWindow()?.visible).toBe(false);
+
+    send("vellum:companion:setPopoverSize", "req-1", 320, 68);
+
+    expect(popoverWindow()?.visible).toBe(true);
+    expect(popoverWindow()?.bounds.width).toBe(320);
+    expect(popoverWindow()?.bounds.height).toBe(68);
+  });
+
+  test("a size reported for another popover shows nothing", () => {
+    const fresh = {
+      ...ONE,
+      id: "req-9",
+      items: [{ ...ONE.items[0], id: "req-9" }],
+    };
+    send("vellum:companion:setContext", context({ popover: fresh }));
+
+    send("vellum:companion:setPopoverSize", "req-0", 320, 68);
+
+    expect(popoverWindow()?.visible).toBe(false);
+  });
+
+  /** Answering one approval in the list must not blink the list away. */
+  test("stays on screen while the same kind of popover is measured again", () => {
+    show(THREE);
+
+    send("vellum:companion:setContext", context({ popover: ONE }));
+
+    expect(popoverWindow()?.visible).toBe(true);
+  });
+
+  test("goes away when there is nothing to show", () => {
+    show(ONE);
+
+    send("vellum:companion:setContext", context());
+
+    expect(popoverWindow()?.visible).toBe(false);
+  });
+
+  test("stands above the idle creature, centred on it", () => {
+    show(CARD, 380, 200);
+
+    const bounds = popoverWindow()?.bounds;
+    expect(bounds).toBeDefined();
+    expect(bounds?.height).toBe(200);
+  });
+
+  /** A call's bar docked to an edge carries the short form as a row itself. */
+  test("keeps its window away while a bottom-docked call's bar carries it", () => {
+    send("vellum:voiceActivity:start", START);
+    resetCompanionSurfacePosition();
+    show(THREE);
+
+    expect(popoverWindow()?.visible === true).toBe(false);
+    expect(state().popoverView).toBe("row");
+  });
+
+  /** Reviewed, the list joins the bar too: one shape, one glow. */
+  test("keeps its window away while the bar carries the reviewed list", () => {
+    send("vellum:voiceActivity:start", START);
+    resetCompanionSurfacePosition();
+    show(THREE, 400, 180);
+
+    send("vellum:companion:setPopoverView", "req-1,req-2,req-3", "expanded");
+
+    expect(popoverWindow()?.visible === true).toBe(false);
+    expect(state().popoverView).toBe("expanded");
+  });
+
+  /** A list or a form is taller than the card room the canvas keeps. */
+  test("grows the canvas to hold what the bar carries, and gives it back", () => {
+    send("vellum:voiceActivity:start", START);
+    resetCompanionSurfacePosition();
+    show(THREE, 400, 180);
+    send("vellum:companion:setPopoverView", "req-1,req-2,req-3", "expanded");
+    const before = boundsSet.at(-1)?.height ?? 0;
+
+    send("vellum:companion:setAttachedPopoverHeight", "req-1,req-2,req-3", 700);
+    const grown = boundsSet.at(-1)?.height ?? 0;
+    expect(grown).toBeGreaterThan(before);
+    expect(grown).toBeGreaterThanOrEqual(700);
+
+    send("vellum:companion:setContext", context());
+    expect(boundsSet.at(-1)?.height ?? 0).toBeLessThan(grown);
+  });
+
+  test("a height reported for another popover grows nothing", () => {
+    send("vellum:voiceActivity:start", START);
+    resetCompanionSurfacePosition();
+    show(THREE, 400, 180);
+    const count = boundsSet.length;
+
+    send("vellum:companion:setAttachedPopoverHeight", "req-0", 700);
+
+    expect(boundsSet.length).toBe(count);
+  });
+
+  /** The form takes typing, and the bar's window is the one drawing it. */
+  test("lends the surface's window the keyboard for a form on the bar", () => {
+    send("vellum:voiceActivity:start", START);
+    resetCompanionSurfacePosition();
+    show(SECRET);
+
+    send("vellum:companion:setPopoverView", "sec-1", "expanded");
+    expect(surface.focusable).toBe(true);
+    expect(surface.key).toBe(true);
+
+    send("vellum:companion:setPopoverView", "sec-1", "deferred");
+    expect(surface.focusable).toBe(false);
+  });
+
+  test("put off, shows nothing, and a new popover shows itself again", () => {
+    show(ONE);
+
+    send("vellum:companion:setPopoverView", "req-1", "deferred");
+    expect(state().popoverView).toBe("deferred");
+    expect(popoverWindow()?.visible).toBe(false);
+
+    show(THREE);
+    expect(state().popoverView).toBe("row");
+    expect(popoverWindow()?.visible).toBe(true);
+  });
+
+  /** Answering one approval in the list leaves the list open on the rest. */
+  test("stays reviewed while approvals are answered", () => {
+    show(THREE);
+    send("vellum:companion:setPopoverView", "req-1,req-2,req-3", "expanded");
+
+    send("vellum:companion:setContext", context({ popover: ONE }));
+
+    expect(state().popoverView).toBe("expanded");
+  });
+
+  test("forgets how it was shown once nothing is left", () => {
+    show(THREE);
+    send("vellum:companion:setPopoverView", "req-1,req-2,req-3", "expanded");
+    send("vellum:companion:setContext", context());
+
+    send("vellum:companion:setContext", context({ popover: THREE }));
+
+    expect(state().popoverView).toBe("row");
+  });
+
+  test("a view for a popover no longer standing is dropped", () => {
+    show(ONE);
+
+    send("vellum:companion:setPopoverView", "req-0", "deferred");
+
+    expect(state().popoverView).toBe("row");
+  });
+
+  /** The credential form takes typing, and nothing else on the popover does. */
+  test("lends the keyboard to the credential form and takes it back", () => {
+    show(SECRET);
+    expect(popoverWindow()?.key).toBe(false);
+
+    send("vellum:companion:setPopoverView", "sec-1", "expanded");
+    expect(popoverWindow()?.focusable).toBe(true);
+    expect(popoverWindow()?.key).toBe(true);
+
+    send("vellum:companion:setPopoverView", "sec-1", "deferred");
+    expect(popoverWindow()?.focusable).toBe(false);
+  });
+
+  test("steps off with the surface while the app is in front", () => {
+    show(ONE);
+
+    fireAppEvent("did-become-active");
+    expect(popoverWindow()?.visible).toBe(false);
+
+    fireAppEvent("did-resign-active");
+    expect(popoverWindow()?.visible).toBe(true);
+  });
+
+  test("takes prompts only while the surface is on screen", () => {
+    const takesPrompts = (): unknown =>
+      invocable.get("vellum:companion:takesPrompts")?.([]);
+
+    expect(takesPrompts()).toBe(true);
+
+    fireAppEvent("did-become-active");
+    expect(takesPrompts()).toBe(false);
+
+    fireAppEvent("did-resign-active");
+    surface.close();
+    expect(takesPrompts()).toBe(false);
+  });
+
+  /** Pressed, it goes: waiting on the submission leaves time to press again. */
+  test("takes an answered approval off at once, and drops a second press", () => {
+    send("vellum:companion:setContext", context({ popover: THREE }));
+
+    send(
+      "vellum:companion:answerPopover",
+      { kind: "allow", itemId: "req-1" },
+      "req-1,req-2,req-3",
+    );
+    send(
+      "vellum:companion:answerPopover",
+      { kind: "allow", itemId: "req-1" },
+      "req-2,req-3",
+    );
+
+    expect(dispatched).toHaveLength(1);
+    expect(state().popover).toEqual({
+      ...THREE,
+      id: "req-2,req-3",
+      items: THREE.items.slice(1),
+    });
+  });
+
+  test("takes the credential form off once confirmed", () => {
+    send("vellum:companion:setContext", context({ popover: SECRET }));
+
+    send(
+      "vellum:companion:answerPopover",
+      { kind: "secret", value: "hunter2" },
+      "sec-1",
+    );
+    send(
+      "vellum:companion:answerPopover",
+      { kind: "secret", value: "hunter2" },
+      "sec-1",
+    );
+
+    expect(dispatched).toHaveLength(1);
+    expect(state().popover).toBeUndefined();
+  });
+
+  /** The window stops publishing it, and the hold has nothing left to hide. */
+  test("forgets an answer once the prompt is gone from what is published", () => {
+    send("vellum:companion:setContext", context({ popover: ONE }));
+    send(
+      "vellum:companion:answerPopover",
+      { kind: "deny", itemId: "req-1" },
+      "req-1",
+    );
+    send("vellum:companion:setContext", context());
+
+    // The same request id published again is a prompt the user has not seen.
+    send("vellum:companion:setContext", context({ popover: ONE }));
+
+    expect(state().popover).toEqual(ONE);
+  });
+
+  /** Several voices are tried in a row, so a pick leaves the list up. */
+  test("keeps the voice picker up after a pick, and passes the pick on", () => {
+    const VOICES = {
+      kind: "voices" as const,
+      id: "voices",
+      groups: [
+        {
+          accent: "American",
+          voices: [
+            { id: "aura-1", label: "Warm", sampleUrl: "", isDefault: true },
+            { id: "aura-2", label: "Bright", sampleUrl: "", isDefault: false },
+          ],
+        },
+      ],
+      selected: "aura-1",
+    };
+    send("vellum:companion:setContext", context({ popover: VOICES }));
+
+    send(
+      "vellum:companion:answerPopover",
+      { kind: "pick", optionId: "aura-2" },
+      "voices",
+    );
+
+    expect(state().popover).toEqual(VOICES);
+    expect(dispatched).toEqual([
+      {
+        kind: "answerCompanionPopover",
+        popoverId: "voices",
+        answer: { kind: "pick", optionId: "aura-2" },
+      },
+    ]);
+  });
+
+  test("a chevron's press opens its picker in the window holding the call", () => {
+    send("vellum:companion:togglePicker", "microphones");
+
+    expect(dispatched).toEqual([
+      { kind: "toggleCompanionPicker", picker: "microphones" },
+    ]);
+    expect(windowsRaised).toBe(0);
+  });
+
+  test("the voice chevron follows what the window publishes", () => {
+    send("vellum:companion:setContext", context({ voicesPickable: true }));
+    expect(state().voicesPickable).toBe(true);
+
+    send("vellum:companion:setContext", context());
+    expect(state().voicesPickable).toBe(false);
+  });
+
+  test("an answer travels without raising the app", () => {
+    send("vellum:companion:setContext", context({ popover: ONE }));
+
+    send(
+      "vellum:companion:answerPopover",
+      { kind: "allow", itemId: "req-1" },
+      "req-1",
+    );
+
+    expect(dispatched).toEqual([
+      {
+        kind: "answerCompanionPopover",
+        popoverId: "req-1",
+        answer: { kind: "allow", itemId: "req-1" },
+      },
+    ]);
+    expect(windowsRaised).toBe(0);
+  });
+
+  /** Another request joining the list renames it, but not the row pressed. */
+  test("an approval's answer lands after the list around it changed", () => {
+    const others = {
+      ...THREE,
+      id: "req-2,req-3,req-4",
+      items: [
+        ...THREE.items.slice(1),
+        { id: "req-4", title: "Save the file", detail: "" },
+      ],
+    };
+    send("vellum:companion:setContext", context({ popover: others }));
+
+    send(
+      "vellum:companion:answerPopover",
+      { kind: "deny", itemId: "req-2" },
+      "req-2,req-3",
+    );
+
+    expect(dispatched).toHaveLength(1);
+  });
+
+  test("an answer naming what no longer stands is dropped", () => {
+    send("vellum:companion:setContext", context({ popover: ONE }));
+
+    send(
+      "vellum:companion:answerPopover",
+      { kind: "allow", itemId: "req-7" },
+      "req-1",
+    );
+    send(
+      "vellum:companion:answerPopover",
+      { kind: "secret", value: "hunter2" },
+      "sec-1",
+    );
+
+    expect(dispatched).toEqual([]);
+  });
+
+  test("open brings the app forward on the conversation", async () => {
+    send("vellum:companion:setContext", context({ popover: CARD }));
+
+    send("vellum:companion:answerPopover", { kind: "open" }, "surf-1");
+    await Promise.resolve();
+
+    expect(windowsRaised).toBe(1);
+    expect(dispatched).toEqual([
+      {
+        kind: "answerCompanionPopover",
+        popoverId: "surf-1",
+        answer: { kind: "open" },
+      },
+      { kind: "currentConversation" },
+    ]);
+  });
+
+  test("is given up when the app's window is destroyed", () => {
+    send("vellum:companion:setContext", context({ popover: ONE }));
+
+    mainWindowOpen = false;
+    fireVisibilityChange();
+
+    expect(state().popover).toBeUndefined();
+  });
+
+  test("opens web links in the browser", () => {
+    send("vellum:companion:openLink", "https://example.com/a?b=c");
+
+    expect(opened).toEqual(["https://example.com/a?b=c"]);
+  });
+
+  /** A link is model output: any other scheme hands the press to whatever claims it. */
+  test("refuses every link that is not http or https", () => {
+    for (const url of [
+      "file:///etc/passwd",
+      "javascript:alert(1)",
+      "vellum://workspace/x",
+      "not a url",
+    ]) {
+      send("vellum:companion:openLink", url);
+    }
+
+    expect(opened).toEqual([]);
+  });
+});
+
+describe("shownPopover", () => {
+  const LIST = {
+    kind: "approvals" as const,
+    id: "a,b",
+    items: [
+      { id: "a", title: "A", detail: "" },
+      { id: "b", title: "B", detail: "" },
+    ],
+  };
+
+  test("passes a popover with nothing answered through as it is", () => {
+    expect(shownPopover(LIST, () => false)).toBe(LIST);
+  });
+
+  test("names what is left of a list for the rows left", () => {
+    expect(shownPopover(LIST, (id) => id === "a")).toEqual({
+      ...LIST,
+      id: "b",
+      items: [LIST.items[1]],
+    });
+  });
+
+  test("shows nothing once everything is answered", () => {
+    expect(shownPopover(LIST, () => true)).toBeUndefined();
+    expect(
+      shownPopover(
+        { kind: "surface", id: "s", title: "Form" },
+        (id) => id === "s",
+      ),
+    ).toBeUndefined();
+  });
+});
+
+describe("popoverBoundsFor", () => {
+  const workArea = { x: 0, y: 0, width: 1440, height: 900 };
+
+  test("hangs above the anchor, centred on it", () => {
+    const bounds = popoverBoundsFor(
+      { centre: { x: 720, y: 860 }, side: "above", clearance: 20, workArea },
+      { width: 344, height: 200 },
+    );
+
+    expect(bounds.x + bounds.width / 2).toBe(720);
+    // The card's edge, inside the window's transparent inset, keeps the gap.
+    expect(bounds.y + bounds.height - COMPANION_POPOVER_INSET).toBe(
+      860 - 20 - POPOVER_GAP,
+    );
+  });
+
+  test("hangs beside a column docked to the left", () => {
+    const bounds = popoverBoundsFor(
+      { centre: { x: 40, y: 450 }, side: "right", clearance: 20, workArea },
+      { width: 344, height: 200 },
+    );
+
+    expect(bounds.x + COMPANION_POPOVER_INSET).toBe(40 + 20 + POPOVER_GAP);
+    expect(bounds.y + bounds.height / 2).toBe(450);
+  });
+
+  /** Pushed back on screen on its own side, it would cover the surface. */
+  test("goes to the opposite side when its own has no room", () => {
+    const bounds = popoverBoundsFor(
+      { centre: { x: 720, y: 60 }, side: "above", clearance: 20, workArea },
+      { width: 344, height: 200 },
+    );
+
+    expect(bounds.y).toBeGreaterThan(60);
+  });
+
+  test("stays inside the work area at the display's edge", () => {
+    const bounds = popoverBoundsFor(
+      { centre: { x: 10, y: 860 }, side: "above", clearance: 20, workArea },
+      { width: 344, height: 200 },
+    );
+
+    expect(bounds.x).toBeGreaterThanOrEqual(0);
+  });
+});
+
+/**
+ * The app's window owns the live session while main only holds the snapshot
+ * drawn on this surface. If that owner disappears, its socket and microphone
+ * disappear with it and the snapshot must not keep claiming a call is live.
+ */
+describe("the call's renderer ownership", () => {
+  beforeEach(() => {
+    mainWindowOpen = true;
+    send("vellum:voiceActivity:end");
+  });
+
+  test("is given up when the window is destroyed", () => {
+    send("vellum:voiceActivity:start", START);
+    expect(state().call).toEqual(START);
+    const before = pushes.length;
+
+    mainWindowOpen = false;
+    fireVisibilityChange();
+
+    expect(state().call).toBeNull();
+    expect(pushes.length).toBeGreaterThan(before);
+    expect(pushes.at(-1)?.call).toBeNull();
+  });
+
+  test("survives the window merely being hidden", () => {
+    send("vellum:voiceActivity:start", START);
+
+    mainWindowVisible = false;
+    fireVisibilityChange();
+
+    expect(state().call).toEqual(START);
+    send("vellum:voiceActivity:end");
+  });
+
+  test("is given up when its renderer loads a new document", () => {
+    send("vellum:voiceActivity:start", START);
+
+    mainRenderer.emit("did-start-navigation", {
+      isMainFrame: true,
+      isSameDocument: false,
+    });
+
+    expect(state().call).toBeNull();
+    expect(pushes.at(-1)?.call).toBeNull();
+  });
+
+  test("is given up when its renderer process exits", () => {
+    send("vellum:voiceActivity:start", START);
+
+    mainRenderer.emit("render-process-gone");
+
+    expect(state().call).toBeNull();
+    expect(pushes.at(-1)?.call).toBeNull();
+  });
+
+  test("survives same-document app navigation", () => {
+    send("vellum:voiceActivity:start", START);
+
+    mainRenderer.emit("did-start-navigation", {
+      isMainFrame: true,
+      isSameDocument: true,
+    });
+
+    expect(state().call).toEqual(START);
+    send("vellum:voiceActivity:end");
   });
 });
 
@@ -3021,6 +4770,52 @@ describe("Share on the companion surface", () => {
     expect(dispatched).toEqual([{ kind: "toggleWatch" }]);
   });
 
+  test("a pick without the grant sends the user to it and starts nothing", async () => {
+    screenGranted = false;
+    settingsOpened.length = 0;
+    const resolvedBefore = picksResolved.length;
+    try {
+      send("vellum:companion:setScreenShare", {
+        kind: "display",
+        displayId: 2,
+      });
+      await Bun.sleep(0);
+      expect(settingsOpened).toEqual(["screen"]);
+      expect(picksResolved).toHaveLength(resolvedBefore);
+      expect(dispatched).toEqual([]);
+    } finally {
+      screenGranted = true;
+    }
+  });
+
+  test("a frame refused for want of the grant sends the user to it", async () => {
+    settingsOpened.length = 0;
+    frameError = SCREEN_REFUSAL;
+    capturedFrame = null;
+    try {
+      const capture = invocable.get("vellum:companion:captureScreen");
+      expect(await capture?.([{ kind: "display", displayId: 2 }])).toBeNull();
+      await Bun.sleep(0);
+      expect(settingsOpened).toEqual(["screen"]);
+    } finally {
+      frameError = null;
+    }
+  });
+
+  test("a frame missed for any other reason sends nobody anywhere", async () => {
+    settingsOpened.length = 0;
+    frameError = new Error("The window to capture is no longer on screen");
+    capturedFrame = null;
+    try {
+      const capture = invocable.get("vellum:companion:captureScreen");
+      expect(await capture?.([{ kind: "window", windowId: 7 }])).toBeNull();
+      await Bun.sleep(0);
+      expect(settingsOpened).toEqual([]);
+    } finally {
+      frameError = null;
+    }
+  });
+
   test("takes a frame of the shared target from the helper", async () => {
     const capture = invocable.get("vellum:companion:captureScreen");
     expect(capture).toBeDefined();
@@ -3032,6 +4827,49 @@ describe("Share on the companion surface", () => {
     expect(framesAsked).toEqual([{ kind: "display", displayId: 2 }]);
     capturedFrame = null;
     expect(await capture?.([{ kind: "window", windowId: 7 }])).toBeNull();
+  });
+
+  test("reads the shared surface's controls as fractions of that surface", async () => {
+    const read = invocable.get("vellum:companion:shareTargets");
+    expect(read).toBeDefined();
+    windowBounds = { x: 100, y: 50, width: 1000, height: 500 };
+    targetElements = {
+      elements: [
+        {
+          label: "root_Filters",
+          role: "AXButton",
+          x: 200,
+          y: 100,
+          width: 100,
+          height: 50,
+        },
+      ],
+      candidateCount: 1,
+    };
+    targetReadsAsked.length = 0;
+    try {
+      expect(await read?.([{ kind: "window", windowId: 7 }])).toEqual({
+        targets: [
+          {
+            id: expect.stringMatching(/^t[0-9a-z]+$/),
+            label: "root_Filters",
+            role: "AXButton",
+            x: 0.1,
+            y: 0.1,
+            width: 0.1,
+            height: 0.1,
+          },
+        ],
+        total: 1,
+      });
+      expect(targetReadsAsked).toEqual([{ kind: "window", windowId: 7 }]);
+      // No tree to read is no snapshot, and the caller goes on without one.
+      targetElements = null;
+      expect(await read?.([{ kind: "window", windowId: 7 }])).toBeNull();
+    } finally {
+      windowBounds = null;
+      targetElements = null;
+    }
   });
 
   test("takes a picker preview of one row from the helper", async () => {
@@ -3231,6 +5069,34 @@ describe("companion window: drawing on what is shared", () => {
   });
 
   /**
+   * What a press on the frame draws is main's for the reason the mode is:
+   * the pill chooses it and the frame draws with it, and both read it off
+   * the pushed state. Kept across the mode and the share, since it decides
+   * nothing about where a click goes and a user who reached for the box
+   * expects it under their hand next time.
+   */
+  test("the tool is the pencil until the pill says otherwise, and is kept", () => {
+    shareDisplay();
+    expect(state().annotationTool).toBe("freehand");
+    send("vellum:companion:setAnnotationTool", "box");
+    expect(state().annotationTool).toBe("box");
+
+    send("vellum:companion:setAnnotating", true);
+    send("vellum:companion:setAnnotating", false);
+    expect(state().annotationTool).toBe("box");
+
+    send("vellum:companion:setContext", context());
+    expect(state().annotationTool).toBe("box");
+  });
+
+  test("the wire refuses a tool it does not know", () => {
+    expect(companionAnnotationToolSchema.safeParse("star").success).toBe(false);
+    expect(companionAnnotationToolSchema.safeParse("circle").success).toBe(
+      true,
+    );
+  });
+
+  /**
    * A frame taking presses takes the wheel with them, and it cannot forward
    * a wheel event it has taken. So on the first one the renderer sees, the
    * frame steps aside for the rest of the scroll, with mouse-move forwarded
@@ -3363,6 +5229,7 @@ describe("companion window: drawing on what is shared", () => {
    */
   test("drawing on lends the frame key status, so its pencil can show", () => {
     shareDisplay();
+    drawFrame();
     expect(glow?.focusable).toBe(false);
     expect(glow?.key).toBe(false);
     send("vellum:companion:setAnnotating", true);
@@ -3386,6 +5253,7 @@ describe("companion window: drawing on what is shared", () => {
   /** The mode is still on across a scroll, and the mouse is coming back. */
   test("a scroll the frame steps aside for leaves its key status alone", () => {
     shareDisplay();
+    drawFrame();
     send("vellum:companion:setAnnotating", true);
     send("vellum:companion:setFrameScrolling", true);
     expect(glow?.focusable).toBe(true);
@@ -3399,9 +5267,49 @@ describe("companion window: drawing on what is shared", () => {
     send("vellum:companion:setContext", context());
     expect(glow).toBeNull();
     shareDisplay();
+    drawFrame();
     send("vellum:companion:setAnnotating", true);
     expect(glow?.focusable).toBe(true);
     expect(glow?.key).toBe(true);
+  });
+
+  /**
+   * Shown before its page has drawn the border, a frame on a whole display
+   * stays blank: the screen keeps the empty window it was shown with. So main
+   * holds it until the page says the border is there.
+   */
+  test("a new frame stays off the screen until its page draws the border", () => {
+    shareDisplay();
+    expect(glow?.visible).toBe(false);
+    drawFrame();
+    expect(glow?.visible).toBe(true);
+  });
+
+  test("placing the frame again before the border is drawn leaves it hidden", () => {
+    shareDisplay();
+    shareDisplay();
+    expect(glow?.visible).toBe(false);
+  });
+
+  test("a drawn report from another window does not show the frame", () => {
+    shareDisplay();
+    send("vellum:companion:frameDrawn");
+    expect(glow?.visible).toBe(false);
+  });
+
+  test("drawing turned on before the border is drawn takes key with it", () => {
+    shareDisplay();
+    send("vellum:companion:setAnnotating", true);
+    expect(glow?.key).toBe(false);
+    drawFrame();
+    expect(glow?.visible).toBe(true);
+    expect(glow?.key).toBe(true);
+  });
+
+  test("a page that never reports is shown anyway", async () => {
+    shareDisplay();
+    await Bun.sleep(3100);
+    expect(glow?.visible).toBe(true);
   });
 
   /**
@@ -3648,6 +5556,68 @@ describe("companion window: pointing at what is shared", () => {
     await showCompanionCoachmarks([MARK], CALL);
     await showCompanionCoachmarks([], CALL);
     expect(state().coachmarks).toBeUndefined();
+  });
+
+  /**
+   * The user's own way to take the marks down, from the pill. The share is
+   * what the marks are about and it goes on; the frame stays around it. The
+   * count is read as a difference, since it is main's own and outlives a
+   * case.
+   */
+  describe("the pill's Clear", () => {
+    const clears = (): number => state().marksCleared ?? 0;
+
+    test("takes the marks down and leaves the share running", async () => {
+      await shareAndSee();
+      await showCompanionCoachmarks([MARK], CALL);
+      const before = clears();
+      send("vellum:companion:clearMarks");
+      expect(state().coachmarks).toBeUndefined();
+      expect(state().screenShare).toEqual(DISPLAY);
+      expect(clears()).toBe(before + 1);
+    });
+
+    /**
+     * The user's own ink is on the frame's window and main never sees it,
+     * so the press reaches it as a step in a count on the pushed state. The
+     * step has to happen whether or not the assistant had marks up, since
+     * the ink is the other thing the press is about.
+     */
+    test("steps the count the frame drops its ink on, marks up or not", () => {
+      shareDisplay();
+      send("vellum:companion:setAnnotating", true);
+      const before = clears();
+      send("vellum:companion:clearMarks");
+      send("vellum:companion:clearMarks");
+      expect(clears()).toBe(before + 2);
+      // The mode is the user's, and stays where they put it.
+      expect(state().annotating).toBe(true);
+    });
+
+    test("is nothing with nothing shared", () => {
+      const before = clears();
+      send("vellum:companion:clearMarks");
+      expect(clears()).toBe(before);
+    });
+
+    /** The race `screen_clear_marks` runs, with the same answer. */
+    test("outranks a lookup still out when it is pressed", async () => {
+      windowBounds = { x: 100, y: 50, width: 1000, height: 500 };
+      await shareAndSee(WINDOW);
+      let letGo!: () => void;
+      locateHeldBy = new Promise<void>((resolve) => {
+        letGo = resolve;
+      });
+      const drawing = showCompanionCoachmarks([{ target: "Share" }], CALL);
+      send("vellum:companion:clearMarks");
+      letGo();
+
+      expect(await drawing).toEqual({
+        kind: "refused",
+        refusal: "superseded",
+      });
+      expect(state().coachmarks).toBeUndefined();
+    });
   });
 
   /**
@@ -3929,6 +5899,117 @@ describe("companion window: pointing at what is shared", () => {
     expect(result).toEqual({
       kind: "placed",
       marks: [{ kind: "region", ...MARK }],
+    });
+  });
+
+  /**
+   * A mark says go and press that, and the press is the step being done. The
+   * frame is click-through while marks stand, so the press is heard from the
+   * helper: main tells it where the control is, and is told which one was
+   * pressed.
+   */
+  describe("hearing the press", () => {
+    /** Every set of rectangles the helper was asked to watch, in order. */
+    const watches: unknown[][] = [];
+
+    beforeEach(() => {
+      watches.length = 0;
+      dispatched.length = 0;
+      // A window the control can be found on; without bounds there is no
+      // surface to measure against and nothing is drawn.
+      windowBounds = { x: 100, y: 50, width: 1000, height: 500 };
+      provideCoachmarkPressWatch((rects) => {
+        watches.push([...rects]);
+      });
+    });
+
+    test("a named control is watched at the frame the tree reported", async () => {
+      await shareAndSee(WINDOW);
+      await showCompanionCoachmarks([{ target: "Share" }], CALL);
+
+      // The tree's frame in screen points, not the fraction the arrow is
+      // aimed at: a press is tested against the control's hit area.
+      expect(watches).toEqual([[{ x: 120, y: 80, width: 60, height: 20 }]]);
+    });
+
+    test("a press takes the marks down and tells the call which control", async () => {
+      await shareAndSee(WINDOW);
+      await showCompanionCoachmarks([{ target: "Share" }], CALL);
+
+      coachmarkPressed(0);
+
+      expect(dispatched).toEqual([
+        { kind: "coachmarkPressed", label: "Share" },
+      ]);
+      expect(state().coachmarks).toBeUndefined();
+      // The watch went with the marks, so a second press on the same control
+      // reports nothing.
+      coachmarkPressed(0);
+      expect(dispatched).toHaveLength(1);
+    });
+
+    /**
+     * The control is on a window, and windows move. The frame follows the
+     * window, and the marks with it; a rectangle left where the control was
+     * would miss the press on it and take a press on empty desktop for it.
+     */
+    test("the watch follows the window the control is on", async () => {
+      await shareAndSee(WINDOW);
+      await showCompanionCoachmarks([{ target: "Share" }], CALL);
+      expect(watches).toEqual([[{ x: 120, y: 80, width: 60, height: 20 }]]);
+
+      windowBounds = { x: 300, y: 150, width: 1000, height: 500 };
+      await Bun.sleep(300);
+
+      expect(watches.at(-1)).toEqual([
+        { x: 320, y: 180, width: 60, height: 20 },
+      ]);
+      coachmarkPressed(0);
+      expect(dispatched).toEqual([
+        { kind: "coachmarkPressed", label: "Share" },
+      ]);
+    });
+
+    /** Image bounds do not establish a control's hit area. */
+    test("bounds alone do not arm a control press watch", async () => {
+      await shareAndSee();
+      await showCompanionCoachmarks([MARK], CALL);
+
+      expect(watches).toEqual([]);
+      coachmarkPressed(0);
+      expect(dispatched).toEqual([]);
+    });
+
+    test("clearing the marks takes the watch down", async () => {
+      await shareAndSee(WINDOW);
+      await showCompanionCoachmarks([{ target: "Share" }], CALL);
+      await showCompanionCoachmarks([], CALL);
+
+      expect(watches.at(-1)).toEqual([]);
+      coachmarkPressed(0);
+      expect(dispatched).toEqual([]);
+    });
+
+    test("the share ending takes the watch down", async () => {
+      await shareAndSee(WINDOW);
+      await showCompanionCoachmarks([{ target: "Share" }], CALL);
+      send("vellum:companion:setContext", context());
+
+      expect(watches.at(-1)).toEqual([]);
+    });
+
+    /** Pointing at the same control for a second step arms a second press. */
+    test("pointing again arms the watch again", async () => {
+      await shareAndSee(WINDOW);
+      await showCompanionCoachmarks([{ target: "Share" }], CALL);
+      coachmarkPressed(0);
+      await showCompanionCoachmarks([{ target: "Share" }], CALL);
+
+      coachmarkPressed(0);
+      expect(dispatched).toEqual([
+        { kind: "coachmarkPressed", label: "Share" },
+        { kind: "coachmarkPressed", label: "Share" },
+      ]);
     });
   });
 
@@ -4260,5 +6341,543 @@ describe("companion window: pointing at what is shared", () => {
     expect(
       many.every((m) => companionCoachmarkSchema.safeParse(m).success),
     ).toBe(true);
+  });
+});
+
+/**
+ * What main reports about a run, which is the whole of what anybody will ever
+ * know about how the introduction went.
+ *
+ * Main is the reporting side because it is the only side that sees a whole run:
+ * the run is due before the surface's window exists, the tray's hide is
+ * answered here, and a session started by a double tap on the voice key reaches
+ * neither renderer. The app's own window carries the reports out, so what these
+ * cases watch is what main sends it.
+ */
+/**
+ * Which chord the run is asking the app's window to listen for.
+ *
+ * Three beats draw a call control beside the shortcut that reaches it, and the
+ * chip on that card lights when the real keys are pressed. Only the app's
+ * window can hear a chord, and only main knows which beat is up, so main says
+ * when a card is asking and for what. It matters more than a push usually
+ * would: while the binding is armed the host takes Option+S, so a beat named
+ * here that is not on screen is a key taken out of the user's own editor.
+ */
+describe("the chord the introduction asks for", () => {
+  /** Every control main has named for the app's window, most recent last. */
+  const asked = (): (string | null)[] =>
+    mainSends
+      .filter((sent) => sent.channel === "vellum:companion:introChord")
+      .map((sent) => sent.payload as string | null);
+
+  /** What a window mounting mid-run pulls, which is the beat rather than the push. */
+  const introChord = (): string | null => {
+    const pull = invocable.get("vellum:companion:getIntroChord");
+    if (!pull) {
+      throw new Error(
+        "No handler registered for vellum:companion:getIntroChord",
+      );
+    }
+    return pull([]) as string | null;
+  };
+
+  /** An install owed a run, with the surface reaching the screen. */
+  const startIntro = (): void => {
+    introSeen = 0;
+    companionOpen = false;
+    openCompanionWindow();
+    mainSends.length = 0;
+  };
+
+  /** Walk the run forward, which is what the card's Next does. */
+  const walk = (steps: number): void => {
+    for (let i = 0; i < steps; i++) {
+      send("vellum:companion:advanceIntro", "next");
+    }
+  };
+
+  afterEach(() => {
+    // Ended through the tray's own path, the way the reports' cases end theirs:
+    // main holds the beat across a window closing, so only an answer to the
+    // introduction clears it.
+    setCompanionSurfaceVisible(false);
+    takeReports();
+    mainSends.length = 0;
+  });
+
+  /** Five of the eight beats draw no control, and the run opens on one of them. */
+  test("asks for nothing on a beat that draws no control", () => {
+    startIntro();
+
+    expect(introChord()).toBeNull();
+    expect(asked()).toEqual([]);
+  });
+
+  test("names the control once the run reaches a beat that draws one", () => {
+    startIntro();
+
+    // idle, meet, talk, key, and then the first of the call's three.
+    walk(4);
+
+    expect(state().intro).toBe("share");
+    expect(introChord()).toBe("share");
+    expect(asked()).toEqual(["share"]);
+  });
+
+  /**
+   * One push per change rather than one per press. The beat moves on every
+   * Next and this answer moves four times in a whole run, and each move of it
+   * arms or releases a binding out on the desktop.
+   */
+  test("says nothing walking between beats that ask for nothing", () => {
+    startIntro();
+
+    walk(3);
+
+    expect(state().intro).toBe("key");
+    expect(asked()).toEqual([]);
+  });
+
+  /**
+   * Read off the contract's own list rather than spelled again here, because
+   * that list is what the card draws its chips from and what the binding takes
+   * its keys from: a control added there and not armed here is a shortcut
+   * printed on a card that nothing is listening for.
+   */
+  test("names every control the contract carries, in the run's order", () => {
+    startIntro();
+
+    walk(COMPANION_INTRO_BEATS.length - 1);
+
+    expect(asked().filter((control) => control !== null)).toEqual([
+      ...COMPANION_INTRO_CALL_CONTROLS,
+    ]);
+  });
+
+  /** The last of the three is walked off onto the offer, which asks for none. */
+  test("gives the key back when the run walks off the last of them", () => {
+    startIntro();
+    walk(6);
+    mainSends.length = 0;
+
+    walk(1);
+
+    expect(state().intro).toBe("try");
+    expect(introChord()).toBeNull();
+    expect(asked()).toEqual([null]);
+  });
+
+  /** A run refused mid-beat is a binding nobody is left to release. */
+  test("gives the key back when the run is dismissed on one of them", () => {
+    startIntro();
+    walk(4);
+    mainSends.length = 0;
+
+    send("vellum:companion:advanceIntro", "dismiss");
+
+    expect(introChord()).toBeNull();
+    expect(asked()).toEqual([null]);
+  });
+});
+
+describe("the introduction's reports", () => {
+  /** Every report main has handed the app's window, most recent last. */
+  const reports = (): CompanionIntroReport[] =>
+    mainSends
+      .filter((sent) => sent.channel === "vellum:companion:introReport")
+      .map((sent) => sent.payload as CompanionIntroReport);
+
+  /**
+   * An install owed a run, with the surface reaching the screen. The surface is
+   * closed first because a run is only decided as one opens, which is the one
+   * moment the introduction is ever due.
+   */
+  const startIntro = (): void => {
+    introSeen = 0;
+    companionOpen = false;
+    openCompanionWindow();
+  };
+
+  /**
+   * The app's window, listening.
+   *
+   * Main pushes only to a renderer that has said it is there, which is the pull
+   * its subscription makes on mount, so every case about a push has to have one
+   * made first. The real window makes it from its own effect; here it is the
+   * pull itself that stands for it.
+   */
+  beforeEach(() => {
+    takeReports();
+    mainSends.length = 0;
+  });
+
+  /**
+   * A dial, a session or a run left going here would outlive the case that
+   * started it, and the next case's reports are read off the same list.
+   *
+   * The run is ended through the tray's own path because main holds the beat
+   * across a window closing: only an answer to the introduction clears it, and
+   * this file's surface has no window server to fire a `closed` at.
+   */
+  afterEach(() => {
+    send("vellum:voiceActivity:end");
+    setCompanionSurfaceVisible(false);
+    takeReports();
+    mainSends.length = 0;
+  });
+
+  test("reports the run exposed once the surface is on the screen", () => {
+    startIntro();
+
+    expect(reports()).toEqual([
+      {
+        event: "exposed",
+        beat: "idle",
+        introVersion: COMPANION_INTRO_VERSION,
+        micGranted: true,
+        at: expect.any(Number),
+      },
+    ]);
+  });
+
+  // An install that has already been introduced is not exposed to anything.
+  test("says nothing for a surface with no run due", () => {
+    companionOpen = false;
+    openCompanionWindow();
+
+    expect(reports()).toEqual([]);
+  });
+
+  /**
+   * The beat the run moved *to*, which is what makes drop-off a card rather
+   * than a run: the question every one of these rows answers is how many people
+   * got this far.
+   */
+  test("reports each beat the run reaches", () => {
+    startIntro();
+    mainSends.length = 0;
+
+    send("vellum:companion:advanceIntro", "next");
+    send("vellum:companion:advanceIntro", "next");
+
+    expect(reports().map((report) => [report.event, report.beat])).toEqual([
+      ["advanced", "meet"],
+      ["advanced", "talk"],
+    ]);
+  });
+
+  // A step back is a card reached again, and reported as one: how far a user
+  // got is a distinct count per beat, not a sum of rows.
+  test("reports a step back as the beat it lands on", () => {
+    startIntro();
+    send("vellum:companion:advanceIntro", "next");
+    mainSends.length = 0;
+
+    send("vellum:companion:advanceIntro", "back");
+
+    expect(reports().map((report) => [report.event, report.beat])).toEqual([
+      ["advanced", "idle"],
+    ]);
+  });
+
+  test("reports the run completed when the last card is walked off", () => {
+    startIntro();
+    for (const _beat of COMPANION_INTRO_BEATS.slice(1)) {
+      send("vellum:companion:advanceIntro", "next");
+    }
+    mainSends.length = 0;
+
+    send("vellum:companion:advanceIntro", "next");
+
+    expect(reports()).toEqual([
+      {
+        event: "completed",
+        beat: "try",
+        introVersion: COMPANION_INTRO_VERSION,
+        micGranted: true,
+        at: expect.any(Number),
+      },
+    ]);
+  });
+
+  // The beat a run was refused on is the whole of what a dismissal says.
+  test("reports a dismissal on the beat it was made from", () => {
+    startIntro();
+    send("vellum:companion:advanceIntro", "next");
+    send("vellum:companion:advanceIntro", "next");
+    mainSends.length = 0;
+
+    send("vellum:companion:advanceIntro", "dismiss");
+
+    expect(reports().map((report) => [report.event, report.beat])).toEqual([
+      ["dismissed", "talk"],
+    ]);
+  });
+
+  /**
+   * Putting the surface away from the tray mid-run is an answer to the
+   * introduction, and main already records it as one. So it reports as one too:
+   * a run nobody ever came back to is not a run that completed.
+   */
+  test("reports the surface being put away as a dismissal", () => {
+    startIntro();
+    mainSends.length = 0;
+
+    setCompanionSurfaceVisible(false);
+
+    expect(reports().map((report) => [report.event, report.beat])).toEqual([
+      ["dismissed", "idle"],
+    ]);
+  });
+
+  test.each(["denied", "not-determined", "restricted", "unknown"])(
+    "keeps the final step open when microphone access is %s",
+    async (status) => {
+      startIntro();
+      for (const _beat of COMPANION_INTRO_BEATS.slice(1)) {
+        send("vellum:companion:advanceIntro", "next");
+      }
+      micStatus = status;
+      dispatched.length = 0;
+      mainSends.length = 0;
+      send("vellum:companion:advanceIntro", "try");
+      await settleHandoff();
+      expect(dispatched).toEqual([]);
+      expect(state().intro).toBe("try");
+      expect(reports()).toEqual([]);
+    },
+  );
+
+  /**
+   * The last beat's press is the one thing in the run that does what it
+   * describes, so it is both the offer taken and the finish. Two rows, because
+   * they are two questions: how many people took it, and how many got here.
+   */
+  test("reports the offer taken and the run finished on the last beat", async () => {
+    startIntro();
+    for (const _beat of COMPANION_INTRO_BEATS.slice(1)) {
+      send("vellum:companion:advanceIntro", "next");
+    }
+    mainSends.length = 0;
+
+    send("vellum:companion:advanceIntro", "try");
+    // The last beat's press is counted where it lands, and it lands once the
+    // renderer has the session it asks for.
+    await settleHandoff();
+
+    expect(reports().map((report) => [report.event, report.beat])).toEqual([
+      ["offer_taken", "try"],
+      ["completed", "try"],
+    ]);
+  });
+
+  test("reports a session on the last beat as the offer taken", () => {
+    startIntro();
+    for (const _beat of COMPANION_INTRO_BEATS.slice(1)) {
+      send("vellum:companion:advanceIntro", "next");
+    }
+    mainSends.length = 0;
+
+    send("vellum:voiceActivity:start", START);
+
+    expect(reports().map((report) => [report.event, report.beat])).toEqual([
+      ["offer_taken", "try"],
+      ["completed", "try"],
+    ]);
+  });
+
+  // A session started from anywhere else is the user's own business
+  // interrupting the run, which main holds the beat through.
+  test("says nothing for a session started mid-run", () => {
+    startIntro();
+    send("vellum:companion:advanceIntro", "next");
+    mainSends.length = 0;
+
+    send("vellum:voiceActivity:start", START);
+
+    expect(reports()).toEqual([]);
+  });
+
+  /**
+   * Both facts a row has to be read against ride every report: which
+   * introduction this was, and whether the microphone was already granted. The
+   * second changes what two of the beats say, so a run without it is a
+   * different run.
+   */
+  test("stamps every report with the run and the microphone", () => {
+    micStatus = "denied";
+    startIntro();
+    send("vellum:companion:advanceIntro", "next");
+    send("vellum:companion:advanceIntro", "dismiss");
+
+    expect(reports().length).toBe(3);
+    for (const report of reports()) {
+      expect(report.introVersion).toBe(COMPANION_INTRO_VERSION);
+      expect(report.micGranted).toBe(false);
+    }
+  });
+
+  /**
+   * The run's answer, taken once, and not asked again.
+   *
+   * The last beat asks for the microphone and waits for the answer before it
+   * starts anything, so a run that began without the grant can end holding it.
+   * Read afresh per report, that run would put its exposure in one cohort and
+   * its finish in the other, and the conversions would land where none of the
+   * exposures are.
+   */
+  test("holds the microphone answer the run began with", () => {
+    micStatus = "not-determined";
+    startIntro();
+
+    // The grant made mid-run, which is what the last beat's press wins.
+    micStatus = "granted";
+    send("vellum:companion:advanceIntro", "next");
+    send("vellum:companion:advanceIntro", "dismiss");
+
+    expect(reports().length).toBe(3);
+    expect(reports().every((report) => !report.micGranted)).toBe(true);
+  });
+
+  // The next run asks again: it is a new run, and the answer it began with is
+  // the one the cards it is about to show will read.
+  test("asks again when a new run begins", () => {
+    micStatus = "denied";
+    startIntro();
+    send("vellum:companion:advanceIntro", "dismiss");
+    micStatus = "granted";
+    mainSends.length = 0;
+
+    startIntro();
+
+    expect(reports().map((report) => report.micGranted)).toEqual([true]);
+  });
+
+  /**
+   * Main's clock, so a held report says when it happened rather than when it
+   * was collected. The one moment this exists for can be handed over a launch
+   * later, and an ending dated to that launch is unplaceable.
+   */
+  test("stamps a held report with the moment it happened", () => {
+    startIntro();
+    mainSends.length = 0;
+    mainWindowOpen = false;
+
+    const before = Date.now();
+    setCompanionSurfaceVisible(false);
+    const after = Date.now();
+
+    const [held] = takeReports();
+    expect(held?.at).toBeGreaterThanOrEqual(before);
+    expect(held?.at).toBeLessThanOrEqual(after);
+  });
+
+  /**
+   * The ending that happens with nobody to tell. A user reaching the tray has
+   * often put the app's window away first, and the run's ending is the one row
+   * the funnel cannot infer from the others, so it is held for the window that
+   * comes back rather than dropped.
+   */
+  test("holds a report made with no window to take it", () => {
+    startIntro();
+    mainSends.length = 0;
+    mainWindowOpen = false;
+
+    setCompanionSurfaceVisible(false);
+
+    expect(reports()).toEqual([]);
+    const held = takeReports();
+    expect(held.map((report) => [report.event, report.beat])).toEqual([
+      ["dismissed", "idle"],
+    ]);
+    // Taken, not read: a second window must not report the same moment again.
+    expect(takeReports()).toEqual([]);
+  });
+
+  /**
+   * A run is not bounded by its cards, so what is held has to be bounded by
+   * something else.
+   *
+   * `back` and `next` walk both ways, and a reader crossing the same three
+   * cards makes a moment each time. With the app's window closed for the whole
+   * run every one of those would be held, and a buffer that evicted oldest
+   * first would throw away the exposure and keep the ending: a conversion out
+   * of nothing, which is worse than holding neither.
+   */
+  test("holds a beat once however many times the reader crosses it", () => {
+    mainWindowOpen = false;
+    startIntro();
+    for (let pass = 0; pass < 12; pass += 1) {
+      send("vellum:companion:advanceIntro", "next");
+      send("vellum:companion:advanceIntro", "back");
+    }
+    send("vellum:companion:advanceIntro", "dismiss");
+
+    const held = takeReports();
+    // The exposure, `meet` and `idle` crossed once each however many times they
+    // were walked over, and the ending. Nothing evicted.
+    expect(held.map((report) => [report.event, report.beat])).toEqual([
+      ["exposed", "idle"],
+      ["advanced", "meet"],
+      ["advanced", "idle"],
+      ["dismissed", "idle"],
+    ]);
+  });
+
+  /**
+   * And when something does have to go, it is never the exposure. It is the
+   * denominator of every rate the funnel computes, so a buffer that kept an
+   * ending and dropped the exposure it belongs to would report a conversion out
+   * of nothing.
+   *
+   * Reached here by replaying the run, which is the developer tray's item and
+   * the only way to make more of these than one run can.
+   */
+  test("evicts anything before it evicts an exposure", () => {
+    mainWindowOpen = false;
+    for (let run = 0; run < 9; run += 1) {
+      startIntro();
+      send("vellum:companion:advanceIntro", "dismiss");
+    }
+
+    const held = takeReports();
+    expect(held.length).toBe(16);
+    // Two rows short of the eighteen made, and both of them endings.
+    expect(held.filter((report) => report.event === "exposed").length).toBe(9);
+    expect(held[0]?.event).toBe("exposed");
+  });
+
+  /**
+   * A loaded window is not a listening one.
+   *
+   * The bundle parses before React mounts the effect that subscribes, and the
+   * run walks on its own: a hover on the creature finishes the first beat with
+   * no press at all, so a report really can fall in that gap. Main waits to be
+   * told rather than guessing from the window, and everything until then is
+   * held for the pull that does the telling.
+   */
+  test("holds reports until the renderer says it is listening", () => {
+    // The subscription going the way a reload takes it: the window lives, its
+    // listeners do not.
+    mainRenderer.emit("destroyed");
+
+    startIntro();
+
+    expect(reports()).toEqual([]);
+    expect(takeReports().map((report) => report.event)).toEqual(["exposed"]);
+  });
+
+  // And once it has said so, the rest of the run goes straight there.
+  test("pushes to the renderer that pulled", () => {
+    mainRenderer.emit("destroyed");
+    startIntro();
+    takeReports();
+    mainSends.length = 0;
+
+    send("vellum:companion:advanceIntro", "next");
+
+    expect(reports().map((report) => report.event)).toEqual(["advanced"]);
+    expect(takeReports()).toEqual([]);
   });
 });

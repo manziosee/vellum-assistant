@@ -226,9 +226,7 @@ function getIdentity() {
   const content = readFileSync(identityPath, "utf-8");
   const fields = parseIdentityFields(content);
 
-  const version = APP_VERSION;
-
-  const createdAt = resolveIdentityCreatedAt(identityPath);
+  const createdAt = resolveHatchedAtReadOnly(identityPath);
 
   return {
     name: fields.name ?? "",
@@ -236,13 +234,9 @@ function getIdentity() {
     personality: fields.personality ?? "",
     emoji: fields.emoji ?? "",
     home: fields.home ?? "",
-    version,
+    version: APP_VERSION,
     createdAt,
   };
-}
-
-function resolveIdentityCreatedAt(identityPath: string): string | undefined {
-  return resolveHatchedAtReadOnly(identityPath);
 }
 
 // ---------------------------------------------------------------------------

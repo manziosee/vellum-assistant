@@ -3,6 +3,11 @@ import { beforeEach, describe, expect, mock, test } from "bun:test";
 // ── Mocks: declared before imports that depend on them ──────────────
 
 let updateMessageContentShouldThrow = false;
+let assistantName: string | null = null;
+
+mock.module("../daemon/identity-helpers.js", () => ({
+  getAssistantName: () => assistantName,
+}));
 
 const updateMessageContentMock = mock(
   (_messageId: string, _content: string) => {
@@ -30,6 +35,7 @@ import type {
   ChannelDeliveryPayload,
   ChannelDestination,
 } from "../notifications/types.js";
+import type { BroadcastMessageOptions } from "../runtime/assistant-event-hub.js";
 
 function makePayload(
   overrides?: Partial<ChannelDeliveryPayload>,
@@ -55,11 +61,20 @@ function makeDestination(
 function captureBroadcast(): {
   adapter: VellumAdapter;
   sent: AssistantEvent[];
+  conversationIds: Array<string | undefined>;
 } {
   const sent: AssistantEvent[] = [];
-  const adapter = new VellumAdapter((msg) => sent.push(msg));
-  return { adapter, sent };
+  const conversationIds: Array<string | undefined> = [];
+  const adapter = new VellumAdapter((msg, conversationId) => {
+    sent.push(msg);
+    conversationIds.push(conversationId);
+  });
+  return { adapter, sent, conversationIds };
 }
+
+beforeEach(() => {
+  assistantName = null;
+});
 
 describe("VellumAdapter silent flag", () => {
   test("non-urgent (low) urgency broadcasts silent: true", async () => {
@@ -181,6 +196,75 @@ describe("VellumAdapter remotePushDispatched pass-through", () => {
   });
 });
 
+describe("VellumAdapter assistant name", () => {
+  test("broadcasts the current verified assistant name after trimming it", async () => {
+    assistantName = "  Example Assistant  ";
+    const { adapter, sent } = captureBroadcast();
+
+    await adapter.send(makePayload(), makeDestination());
+
+    const intent = sent[0] as Extract<
+      AssistantEvent,
+      { type: "notification_intent" }
+    >;
+    expect(intent.assistantName).toBe("Example Assistant");
+  });
+
+  test("omits the assistant name when it is unavailable", async () => {
+    const { adapter, sent } = captureBroadcast();
+
+    await adapter.send(makePayload(), makeDestination());
+
+    const intent = sent[0] as Extract<
+      AssistantEvent,
+      { type: "notification_intent" }
+    >;
+    expect(intent.assistantName).toBeUndefined();
+    expect("assistantName" in intent).toBe(false);
+  });
+
+  test("omits a blank assistant name", async () => {
+    assistantName = " \t\n ";
+    const { adapter, sent } = captureBroadcast();
+
+    await adapter.send(makePayload(), makeDestination());
+
+    const intent = sent[0] as Extract<
+      AssistantEvent,
+      { type: "notification_intent" }
+    >;
+    expect(intent.assistantName).toBeUndefined();
+    expect("assistantName" in intent).toBe(false);
+  });
+
+  test("reflects a renamed assistant on the next intent", async () => {
+    assistantName = "Assistant A";
+    const { adapter, sent } = captureBroadcast();
+    await adapter.send(makePayload(), makeDestination());
+
+    assistantName = "Assistant B";
+    await adapter.send(makePayload(), makeDestination());
+
+    const intents = sent as Array<
+      Extract<AssistantEvent, { type: "notification_intent" }>
+    >;
+    expect(intents.map((intent) => intent.assistantName)).toEqual([
+      "Assistant A",
+      "Assistant B",
+    ]);
+  });
+
+  test("keeps notification intents outside conversation replay scope", async () => {
+    assistantName = "Example Assistant";
+    const { adapter, sent, conversationIds } = captureBroadcast();
+
+    await adapter.send(makePayload(), makeDestination());
+
+    expect(conversationIds).toEqual([undefined]);
+    expect("conversationId" in sent[0]!).toBe(false);
+  });
+});
+
 describe("VellumAdapter update", () => {
   beforeEach(() => {
     updateMessageContentMock.mockClear();
@@ -277,5 +361,138 @@ describe("VellumAdapter update", () => {
 
     expect(result.success).toBe(false);
     expect(result.error).toBe("DB write failed");
+  });
+});
+
+describe("VellumAdapter guardian scoping", () => {
+  function captureOptions(): {
+    adapter: VellumAdapter;
+    options: Array<BroadcastMessageOptions | undefined>;
+    intents: AssistantEvent[];
+  } {
+    const options: Array<BroadcastMessageOptions | undefined> = [];
+    const intents: AssistantEvent[] = [];
+    const adapter = new VellumAdapter((msg, _conversationId, opts) => {
+      options.push(opts);
+      intents.push(msg);
+    });
+    return { adapter, options, intents };
+  }
+
+  test("a guardian-sensitive intent is delivered only to the guardian's connections", async () => {
+    const { adapter, options, intents } = captureOptions();
+    await adapter.send(
+      makePayload({ sourceEventName: "guardian.question", urgency: "high" }),
+      makeDestination({ metadata: { guardianPrincipalId: "principal-g" } }),
+    );
+
+    expect(options).toEqual([{ targetActorPrincipalId: "principal-g" }]);
+    expect(intents[0]).toMatchObject({
+      targetGuardianPrincipalId: "principal-g",
+    });
+  });
+
+  test("an ordinary intent is broadcast to every connection", async () => {
+    const { adapter, options } = captureOptions();
+    await adapter.send(
+      makePayload({ sourceEventName: "schedule.notify" }),
+      makeDestination({ metadata: { guardianPrincipalId: "principal-g" } }),
+    );
+
+    expect(options).toEqual([{ targetActorPrincipalId: undefined }]);
+  });
+
+  test.each(["chat.assistant_reply", "schedule.result", "activity.complete"])(
+    "%s remains recipient-scoped without the legacy guardian-card marker",
+    async (sourceEventName) => {
+      const intents: AssistantEvent[] = [];
+      const scopes: Array<BroadcastMessageOptions | undefined> = [];
+      const adapter = new VellumAdapter((message, _conversationId, options) => {
+        intents.push(message);
+        scopes.push(options);
+      });
+      const result = await adapter.send(
+        makePayload({
+          sourceEventName,
+          urgency: "medium",
+          contextPayload: {
+            completion: {
+              workId: "task-1",
+              conversationId: "conv-result",
+              recipientPrincipalId: "principal-g",
+              owner: "parent_continuation",
+            },
+          },
+        }),
+        makeDestination({ metadata: { guardianPrincipalId: "principal-g" } }),
+      );
+
+      expect(result.success).toBe(true);
+      expect(scopes).toEqual([{ targetActorPrincipalId: "principal-g" }]);
+      expect(intents[0]).toMatchObject({
+        silent: false,
+        targetGuardianPrincipalId: undefined,
+      });
+    },
+  );
+
+  test("a completion with no resolved recipient sends no preview", async () => {
+    const { adapter, sent } = captureBroadcast();
+    const result = await adapter.send(
+      makePayload({ sourceEventName: "chat.assistant_reply" }),
+      makeDestination(),
+    );
+
+    expect(result).toEqual({
+      success: false,
+      error: "completion recipient unavailable",
+    });
+    expect(sent).toEqual([]);
+  });
+
+  test.each([
+    null,
+    {},
+    {
+      workId: "task-1",
+      conversationId: "conv-private",
+      recipientPrincipalId: "principal-1",
+      owner: "unknown",
+    },
+  ])(
+    "malformed ownership %j never broadcasts a private preview",
+    async (completion) => {
+      const { adapter, options, intents } = captureOptions();
+      const result = await adapter.send(
+        makePayload({
+          sourceEventName: "activity.complete",
+          urgency: "high",
+          copy: { title: "Private result", body: "Sensitive result preview." },
+          contextPayload: { completion },
+        }),
+        makeDestination({ metadata: { guardianPrincipalId: "principal-1" } }),
+      );
+
+      expect(result).toEqual({
+        success: false,
+        error: "completion recipient unavailable",
+      });
+      expect(intents).toEqual([]);
+      expect(options).toEqual([]);
+    },
+  );
+
+  test("honors broadcaster presentation independently of urgency", async () => {
+    const { adapter, sent } = captureBroadcast();
+    await adapter.send(
+      makePayload({
+        sourceEventName: "chat.assistant_reply",
+        urgency: "medium",
+        silent: true,
+      }),
+      makeDestination({ metadata: { guardianPrincipalId: "principal-g" } }),
+    );
+
+    expect(sent[0]).toMatchObject({ silent: true });
   });
 });

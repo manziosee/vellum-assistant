@@ -32,22 +32,29 @@ mock.module("../../daemon/conversation-store.js", () => ({
   getOrCreateConversation: async () => fakeConversation,
 }));
 
-// Vision capability of the image pin's target profile. Install-dependent in
-// production (a BYO provider resolves the profile key through its own column
-// of the intent matrix), so it is scripted rather than read from a catalog.
-let pinProfileSupportsVision = true;
-// Vision capability of the conversation's own profile, which an escalated
-// leg is pinned to. Scripted for the same reason.
-let conversationProfileSupportsVision = true;
-// Per-profile answers that outrank the two switches above, for a mix whose
-// arms differ.
-const visionByProfile = new Map<string, boolean>();
-mock.module("../../plugin-api/vision-support.js", () => ({
-  doesSupportVision: (profile: string) =>
-    visionByProfile.get(profile) ??
-    (profile === "latency-optimized"
-      ? pinProfileSupportsVision
-      : conversationProfileSupportsVision),
+// The escalation judge's verdict for front-door legs, scripted per test.
+let judgeEscalationCalls: Array<{ utterance: string }> = [];
+let judgeEscalationVerdict = false;
+// When set, the judge's verdict waits on this before resolving.
+let judgeEscalationGate: Promise<void> | null = null;
+mock.module("../voice-escalation-judge.js", () => ({
+  judgeEscalation: async (args: { utterance: string }) => {
+    judgeEscalationCalls.push({ utterance: args.utterance });
+    if (judgeEscalationGate) {
+      await judgeEscalationGate;
+    }
+    return {
+      escalate: judgeEscalationVerdict,
+      outcome: judgeEscalationVerdict ? "escalate" : "clear",
+      latencyMs: 0,
+    };
+  },
+}));
+
+const unresolvableProviderNames = new Set<string>();
+mock.module("../../providers/provider-resolvability.js", () => ({
+  dispatchProviderResolvable: (provider: string) =>
+    !unresolvableProviderNames.has(provider),
 }));
 
 // Attachment hydration for the parked-camera-frame path. Only `att-frame-*`
@@ -136,7 +143,12 @@ mock.module("../../persistence/conversation-crud.js", () => ({
   recordConversationPersistedSeq: () => {},
 }));
 
+import {
+  clearHubClients,
+  registerHubClient,
+} from "../../__tests__/helpers/hub-clients.js";
 import { setConfig } from "../../__tests__/helpers/set-config.js";
+import type { PreparedModelCall } from "../../agent/loop.js";
 import { selectWinningProfile } from "../../config/llm-resolver.js";
 import { getConfig } from "../../config/loader.js";
 import { ABORT_WATCHDOG_MS } from "../../daemon/abort-watchdog.js";
@@ -205,6 +217,7 @@ interface FakeConversation {
     opts?: { decisionContext?: string },
   ) => void;
   runAgentLoop: (...args: unknown[]) => Promise<void>;
+  warmPromptCache: (options?: Record<string, unknown>) => Promise<void>;
   getMessages: () => Array<{ role: string; content: unknown[] }>;
   abort: (reason?: unknown) => void;
   loadFromDb: () => Promise<void>;
@@ -304,6 +317,7 @@ function makeFakeConversation(opts: {
       confirmationDecisions.push({ requestId, decision });
     },
     runAgentLoop: () => (opts.runAgentLoop ?? (async () => {}))(),
+    warmPromptCache: async () => {},
     getMessages: () => opts.messages ?? [],
     abort: () => {},
     loadFromDb: async () => {
@@ -721,9 +735,142 @@ describe("startVoiceTurn camera-frame attachments", () => {
       voiceSessionTurn: true,
     });
   });
+
+  test("claims a captured camera source before voice user persistence", async () => {
+    const events: string[] = [];
+    const fake = makeFakeConversation({
+      processing: false,
+      events,
+      onPersist: () => events.push("persisted"),
+    });
+    const claims: Array<{ turnId: string; sourceId: string }> = [];
+    Object.assign(fake.conversation, {
+      modeSessions: {
+        claimTurn: (
+          turnId: string,
+          source: { sourceId: string; id: string; mode: string },
+        ) => {
+          claims.push({ turnId, sourceId: source.sourceId });
+          events.push("claimed");
+          return { id: source.id, mode: source.mode };
+        },
+        releaseTurn: () => {},
+      },
+    });
+    fakeConversation = fake.conversation;
+
+    await startVoiceTurn({
+      ...makeTurnOptions(),
+      content: "what is this",
+      modeSessionSource: {
+        sourceId: "live-voice-camera:voice-1",
+        generation: 7,
+        activation: 1,
+        id: "session-camera",
+        mode: "live_vision",
+      },
+    });
+
+    expect(claims).toHaveLength(1);
+    expect(claims[0]?.sourceId).toBe("live-voice-camera:voice-1");
+    expect(events.indexOf("claimed")).toBeLessThan(events.indexOf("persist"));
+  });
+
+  test("uses preaccepted camera ownership without reclaiming a retired source", async () => {
+    let releaseIdle!: () => void;
+    const idle = new Promise<void>((resolve) => {
+      releaseIdle = resolve;
+    });
+    let reachedAdmission!: () => void;
+    const admissionStarted = new Promise<void>((resolve) => {
+      reachedAdmission = resolve;
+    });
+    const fake = makeFakeConversation({
+      processing: true,
+      waitForIdle: async () => {
+        reachedAdmission();
+        await idle;
+        fake.setProcessingFlag(false);
+        return true;
+      },
+    });
+    const claims: string[] = [];
+    const owner = { id: "session-camera", mode: "live_vision" as const };
+    Object.assign(fake.conversation, {
+      modeSessions: {
+        claimTurn: (turnId: string) => {
+          claims.push(turnId);
+          return undefined;
+        },
+        getTurnOwner: (turnId: string) =>
+          turnId === "preaccepted-request" ? owner : undefined,
+        releaseTurn: () => {},
+      },
+    });
+    fakeConversation = fake.conversation;
+
+    const starting = startVoiceTurn({
+      ...makeTurnOptions(),
+      content: "what is this",
+      preacceptedModeSession: {
+        requestId: "preaccepted-request",
+        source: {
+          sourceId: "live-voice-camera:voice-1",
+          generation: 7,
+          activation: 1,
+          ...owner,
+        },
+      },
+    });
+    await admissionStarted;
+
+    releaseIdle();
+    await starting;
+
+    expect(claims).toEqual([]);
+    expect(fake.lastPersistOpts()?.requestId).toBe("preaccepted-request");
+  });
 });
 
 describe("startVoiceTurn hiddenSyntheticPrompt", () => {
+  test("task announcements retain metadata and cron attribution without a user echo", async () => {
+    const fake = makeFakeConversation({ processing: false });
+    fakeConversation = fake.conversation;
+    const loopOptions: unknown[] = [];
+    fake.conversation.runAgentLoop = async (...args: unknown[]) => {
+      loopOptions.push(args[2]);
+    };
+    const metadata = {
+      subagentNotification: {
+        subagentId: "task-1",
+        label: "Compare options",
+        status: "completed",
+      },
+    };
+    const echoes = await collectUserMessageEchoes(async () => {
+      await startVoiceTurn({
+        ...makeTurnOptions(),
+        content: "Comparison completed",
+        hiddenSyntheticPrompt: true,
+        subagentNotification: {
+          taskId: "task-1",
+          message: "Comparison completed",
+          metadata,
+          cronRunId: "run-123",
+        },
+      });
+    });
+    expect(fake.lastPersistOpts()?.metadata).toMatchObject({
+      ...metadata,
+      hidden: true,
+      scripted: true,
+      voiceSessionTurn: true,
+    });
+    expect(loopOptions).toEqual([
+      expect.objectContaining({ cronRunId: "run-123" }),
+    ]);
+    expect(echoes).toEqual([]);
+  });
   // A caller whose internal instruction is composed per call carries no
   // sentinel for the content comparisons to recognize, so it declares itself.
   const SYNTHETIC_CONTENT =
@@ -831,6 +978,22 @@ describe("startVoiceTurn triage-and-escalate control prompt", () => {
     expect(installed()).toContain(frontDoorDecisionRule({ includeHold: true }));
   });
 
+  test("a hidden look follow-up routes the original request", async () => {
+    const installed = captureInstalledPrompt();
+    const callerUtterance = "Show me where to add a new page.";
+    const content = "(fresh view taken; answer from it now)";
+    await startVoiceTurn({
+      ...makeTurnOptions(),
+      content,
+      routingUtterance: callerUtterance,
+      hiddenSyntheticPrompt: true,
+      voiceControlPrompt: LIVE_VOICE_PROMPT,
+      routingLeg: "front-door",
+    });
+    expect(installed()).toContain(frontDoorDecisionRule({ callerUtterance }));
+    expect(installed()).not.toContain(JSON.stringify(content));
+  });
+
   test("appends the escalated continuation rule to a caller-supplied prompt", async () => {
     const installed = captureInstalledPrompt();
     await startVoiceTurn({
@@ -840,6 +1003,53 @@ describe("startVoiceTurn triage-and-escalate control prompt", () => {
     });
     expect(installed()).toContain(LIVE_VOICE_PROMPT);
     expect(installed()).toContain(escalatedContinuationRule());
+  });
+
+  test("a direct escalated turn keeps the caller-supplied resume prompt verbatim", async () => {
+    const installed = captureInstalledPrompt();
+    await startVoiceTurn({
+      ...makeTurnOptions(),
+      voiceControlPrompt: LIVE_VOICE_PROMPT,
+      routingLeg: "escalated",
+      directEscalated: true,
+    });
+    expect(installed()).toBe(LIVE_VOICE_PROMPT);
+  });
+
+  test("the auto-built phone prompt carries the front-door rule anchored to the caller's words", async () => {
+    const installed = captureInstalledPrompt();
+    await startVoiceTurn({
+      ...makeTurnOptions(),
+      content: "what time is it",
+      routingLeg: "front-door",
+    });
+    expect(installed()).toContain("<voice_call_control>");
+    expect(installed()).toContain(
+      `13. ${frontDoorDecisionRule({ callerUtterance: "what time is it" })}`,
+    );
+  });
+
+  test("a phone sentinel anchors the front-door rule on its persisted form", async () => {
+    const installed = captureInstalledPrompt();
+    await startVoiceTurn({ ...makeTurnOptions(), routingLeg: "front-door" });
+    expect(installed()).toContain(
+      frontDoorDecisionRule({
+        callerUtterance: "(call connected — deliver opening greeting)",
+      }),
+    );
+    expect(installed()).not.toContain(JSON.stringify(CALL_OPENING_MARKER));
+  });
+
+  test("the auto-built phone prompt carries the escalated continuation rule", async () => {
+    const installed = captureInstalledPrompt();
+    await startVoiceTurn({
+      ...makeTurnOptions(),
+      routingLeg: "escalated",
+      spokenEscalationBridge: "One moment.",
+    });
+    expect(installed()).toContain(
+      `13. ${escalatedContinuationRule("One moment.")}`,
+    );
   });
 
   test("leaves a caller-supplied prompt verbatim when no routing leg is set", async () => {
@@ -860,7 +1070,7 @@ describe("default call protocol numbered rules", () => {
     const installed = captureInstalledPrompt();
     await startVoiceTurn(makeTurnOptions());
     expect(installed()).toContain(
-      "12. Speak the caller's language: reply in the language of the caller's most recent actual speech, and follow them if they switch languages mid-call. Synthetic user turns (parenthetical markers like the call-connected and verification-completed notices) are not caller speech and never set the language. Before the caller has spoken, such as on the opening greeting turn, use the language the Task context implies, if any; otherwise default to English.",
+      "11. Speak the caller's language: reply in the language of the caller's most recent actual speech, and follow them if they switch languages mid-call. Synthetic user turns (parenthetical markers like the call-connected and verification-completed notices) are not caller speech and never set the language. Before the caller has spoken, such as on the opening greeting turn, use the language the Task context implies, if any; otherwise default to English.",
     );
   });
 
@@ -1930,7 +2140,7 @@ describe("startVoiceTurn tool-event forwarding", () => {
     fakeConversation = fake.conversation;
   }
 
-  test("tool_use_start delivers the tool name, toolUseId, and input", async () => {
+  test("tool_use_start delivers the tool name, input, and active allowlist", async () => {
     makeEventEmittingConversation([
       {
         type: "tool_use_start",
@@ -1939,6 +2149,11 @@ describe("startVoiceTurn tool-event forwarding", () => {
         toolUseId: "toolu-1",
       },
     ]);
+    (
+      fakeConversation as typeof fakeConversation & {
+        allowedToolNames?: Set<string>;
+      }
+    ).allowedToolNames = new Set(["web_search"]);
 
     const starts: Array<{ toolName: string; detail?: unknown }> = [];
     await startVoiceTurn({
@@ -1952,7 +2167,11 @@ describe("startVoiceTurn tool-event forwarding", () => {
     expect(starts).toEqual([
       {
         toolName: "web_search",
-        detail: { toolUseId: "toolu-1", input: { query: "weather" } },
+        detail: {
+          toolUseId: "toolu-1",
+          input: { query: "weather" },
+          allowedToolNames: new Set(["web_search"]),
+        },
       },
     ]);
   });
@@ -2110,6 +2329,182 @@ describe("front-door leg tool suppression", () => {
   });
 });
 
+describe("desktop skill preactivation", () => {
+  afterEach(() => clearHubClients(assistantEventHub));
+
+  async function preactivatedFor(turn: Record<string, unknown>): Promise<{
+    skillIds: string[];
+    proxyInterfaces: unknown[];
+    skillIdsDuringLoop: string[];
+    promptDuringLoop: string | null;
+  }> {
+    const skillIds: string[] = [];
+    const proxyInterfaces: unknown[] = [];
+    let skillIdsDuringLoop: string[] = [];
+    let prompt: string | null = null;
+    let promptDuringLoop: string | null = null;
+    const fake = makeFakeConversation({
+      processing: false,
+      runAgentLoop: async () => {
+        skillIdsDuringLoop = [...skillIds];
+        promptDuringLoop = prompt;
+      },
+    });
+    Object.assign(fake.conversation, {
+      setVoiceCallControlPrompt: (value: string | null) => {
+        prompt = value;
+      },
+      addPreactivatedSkillId: (id: string) => {
+        skillIds.push(id);
+      },
+      ensureHostProxiesForTurn: (sourceInterface: unknown) => {
+        proxyInterfaces.push(sourceInterface);
+      },
+    });
+    fakeConversation = fake.conversation;
+
+    await startVoiceTurn({
+      ...makeTurnOptions(undefined, "conv-desktop-skills"),
+      userMessageInterface: "macos",
+      ...turn,
+    });
+    await flushMicrotasks();
+    return { skillIds, proxyInterfaces, skillIdsDuringLoop, promptDuringLoop };
+  }
+
+  test("a shared-screen turn receives the annotation instructions and schemas before inference", async () => {
+    registerHubClient({
+      hub: assistantEventHub,
+      clientId: "annotation-client",
+      interfaceId: "macos",
+      actorPrincipalId: "user-123",
+      capabilities: ["host_cu", "host_cu_annotate"],
+    });
+    const result = await preactivatedFor({
+      routingLeg: "escalated",
+      macosDesktopSession: true,
+      screenSharing: true,
+      actorPrincipalId: "user-123",
+    });
+    expect(result.skillIdsDuringLoop).toContain("screen-annotation");
+    expect(result.promptDuringLoop).toContain("ID: screen-annotation");
+    expect(result.promptDuringLoop).toContain(
+      "Use the picture when names cannot identify the control.",
+    );
+    expect(result.promptDuringLoop).toContain("screen_point_at");
+    expect(result.promptDuringLoop).toContain("screen_clear_marks");
+    expect(result.promptDuringLoop).toContain('"target"');
+    expect(result.promptDuringLoop).toContain("skill_execute");
+  });
+
+  test("a shared-screen turn is offered the surface's controls beside the instructions", async () => {
+    registerHubClient({
+      hub: assistantEventHub,
+      clientId: "annotation-client",
+      interfaceId: "macos",
+      actorPrincipalId: "user-123",
+      capabilities: ["host_cu", "host_cu_annotate"],
+    });
+    const result = await preactivatedFor({
+      routingLeg: "escalated",
+      macosDesktopSession: true,
+      screenSharing: true,
+      actorPrincipalId: "user-123",
+      shareTargets: {
+        targets: [
+          {
+            id: "t1",
+            label: "root_Filters",
+            role: "AXButton",
+            section: "Toolbar",
+            x: 0.8,
+            y: 0.05,
+            width: 0.05,
+            height: 0.03,
+          },
+        ],
+        total: 1,
+      },
+    });
+    expect(result.promptDuringLoop).toContain("ID: screen-annotation");
+    expect(result.promptDuringLoop).toContain("<shared_screen_controls>");
+    expect(result.promptDuringLoop).toContain(
+      '- "root_Filters" (button, top right, in "Toolbar")',
+    );
+  });
+
+  test("a shared-screen turn with no snapshot keeps the instructions alone", async () => {
+    registerHubClient({
+      hub: assistantEventHub,
+      clientId: "annotation-client",
+      interfaceId: "macos",
+      actorPrincipalId: "user-123",
+      capabilities: ["host_cu", "host_cu_annotate"],
+    });
+    const result = await preactivatedFor({
+      routingLeg: "escalated",
+      macosDesktopSession: true,
+      screenSharing: true,
+      actorPrincipalId: "user-123",
+    });
+    expect(result.promptDuringLoop).toContain("ID: screen-annotation");
+    expect(result.promptDuringLoop).not.toContain("<shared_screen_controls>");
+  });
+
+  test.each([
+    { screenSharing: false },
+    { actorPrincipalId: "other-user" },
+    { routingLeg: "front-door" },
+    { macosDesktopSession: false },
+  ])(
+    "does not preload annotation for an ineligible turn: %j",
+    async (override) => {
+      registerHubClient({
+        hub: assistantEventHub,
+        clientId: "annotation-client",
+        interfaceId: "macos",
+        actorPrincipalId: "user-123",
+        capabilities: ["host_cu", "host_cu_annotate"],
+      });
+      const result = await preactivatedFor({
+        routingLeg: "escalated",
+        macosDesktopSession: true,
+        screenSharing: true,
+        actorPrincipalId: "user-123",
+        ...override,
+      });
+      expect(result.promptDuringLoop).not.toContain("ID: screen-annotation");
+    },
+  );
+
+  test("an escalated leg of a macOS desktop session starts with computer use active", async () => {
+    const result = await preactivatedFor({
+      routingLeg: "escalated",
+      macosDesktopSession: true,
+    });
+
+    expect(result.skillIdsDuringLoop).toContain("computer-use");
+    expect(result.proxyInterfaces).toEqual(["macos"]);
+  });
+
+  test("a session from any other client leaves the desktop skills to be loaded", async () => {
+    const result = await preactivatedFor({ routingLeg: "escalated" });
+
+    expect(result.skillIds).toEqual([]);
+    expect(result.proxyInterfaces).toEqual([]);
+  });
+
+  test("the toolless front-door leg is never preactivated", async () => {
+    const result = await preactivatedFor({
+      routingLeg: "front-door",
+      macosDesktopSession: true,
+    });
+
+    expect(result.skillIds).toEqual([]);
+    expect(result.proxyInterfaces).toEqual([]);
+  });
+});
+
 describe("cutFrontDoorContentAtVerdict", () => {
   test("null when the content carries no verdict token (committed answer)", () => {
     expect(
@@ -2146,6 +2541,18 @@ describe("cutFrontDoorContentAtVerdict", () => {
     expect(cut?.spokenText).toBe("");
   });
 
+  test("a terminal verdict split across blocks preserves all released speech", () => {
+    const bridge = "Let me check. I will highlight the Rotate control.";
+    const cut = cutFrontDoorContentAtVerdict([
+      { type: "text", text: `${bridge} [` },
+      { type: "text", text: "ESCALATE] " },
+    ]);
+    expect(cut).toEqual({
+      blocks: [{ type: "text", text: bridge }],
+      spokenText: bridge,
+    });
+  });
+
   test("stray verdict tokens inside an answer are stripped, not treated as escalation", () => {
     const cut = cutFrontDoorContentAtVerdict([
       { type: "text", text: "It is Tuesday [0] indeed." },
@@ -2172,7 +2579,7 @@ describe("front-door hub stream gate", () => {
    * `deltas` in order, then ends the leg with `finalEvent`.
    */
   function makeStreamingConversation(
-    deltas: string[],
+    deltas: readonly string[],
     finalEvent:
       | "message_complete"
       | "generation_cancelled" = "message_complete",
@@ -2254,6 +2661,70 @@ describe("front-door hub stream gate", () => {
     );
 
     expect(texts.join("")).toBe("It is Tuesday, and it is sunny.");
+  });
+
+  test("a terminal escalation never broadcasts marker fragments", async () => {
+    makeStreamingConversation([
+      "I will highlight it.",
+      " [",
+      "ESC",
+      "ALATE",
+      "]",
+    ]);
+
+    const texts = await collectBroadcastText(() =>
+      startVoiceTurn({ ...makeTurnOptions(), routingLeg: "front-door" }),
+    );
+
+    expect(texts).toEqual(["I will highlight it.", " "]);
+  });
+
+  test("an answer waits on the escalation judge before reaching the hub", async () => {
+    let openGate!: () => void;
+    judgeEscalationGate = new Promise<void>((resolve) => {
+      openGate = resolve;
+    });
+    judgeEscalationVerdict = false;
+    makeStreamingConversation(["Sure, ", "it's Tuesday."]);
+    try {
+      const whilePending = await collectBroadcastText(() =>
+        startVoiceTurn({ ...makeTurnOptions(), routingLeg: "front-door" }),
+      );
+      expect(whilePending).toEqual([]);
+
+      const afterClear = await collectBroadcastText(async () => {
+        openGate();
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      });
+      expect(afterClear.join("")).toBe("Sure, it's Tuesday.");
+    } finally {
+      judgeEscalationGate = null;
+    }
+  });
+
+  test.each([
+    { deltas: ["Yeah okay, ", "I'll do it."] },
+    { deltas: ["[ASK_GUARDIAN:"] },
+  ])("an overruled answer never reaches the hub: %j", async ({ deltas }) => {
+    judgeEscalationVerdict = true;
+    makeStreamingConversation(deltas);
+
+    const texts = await collectBroadcastText(async () => {
+      const handle = await startVoiceTurn({
+        ...makeTurnOptions(),
+        routingLeg: "front-door",
+      });
+      // What the driver does with an escalate verdict on a held answer.
+      void handle.escalationJudgement?.then((escalate) => {
+        if (escalate) {
+          handle.overrule?.();
+        }
+      });
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    });
+
+    expect(texts).toEqual([]);
+    judgeEscalationVerdict = false;
   });
 
   test("an answer that merely opens with a bracket is released in full", async () => {
@@ -2402,6 +2873,60 @@ describe("transcript hygiene (teardown pass)", () => {
     expect(events).toContain("loadFromDb");
   });
 
+  test("an answer the escalation judge overruled is deleted", async () => {
+    const { events, releaseLoop } = makeReservedRowConversation({
+      holdLoopOpen: true,
+    });
+    getMessageByIdImpl = () => makeRow("I'm adding it to the draft now.");
+
+    const handle = await startVoiceTurn({
+      ...makeTurnOptions(),
+      routingLeg: "front-door",
+    });
+    await flushMicrotasks();
+    handle.overrule?.();
+    releaseLoop();
+    await flushMicrotasks();
+
+    // Only the unheard answer goes: the user row stays for the escalated leg.
+    expect(crudLog.deletes).toEqual(["assistant-row-1"]);
+    expect(events).toContain("loadFromDb");
+  });
+
+  test("a verdict that lands after the model finished still deletes the overruled row", async () => {
+    let openGate!: () => void;
+    judgeEscalationGate = new Promise<void>((resolve) => {
+      openGate = resolve;
+    });
+    judgeEscalationVerdict = true;
+    const { events } = makeReservedRowConversation();
+    getMessageByIdImpl = () => makeRow("Yeah okay, I'll do it.");
+    try {
+      const handle = await startVoiceTurn({
+        ...makeTurnOptions(),
+        routingLeg: "front-door",
+      });
+      void handle.escalationJudgement?.then((escalate) => {
+        if (escalate) {
+          handle.overrule?.();
+        }
+      });
+      // The loop has finished; teardown hygiene waits on the verdict.
+      await flushMicrotasks();
+      expect(crudLog.deletes).toEqual([]);
+
+      openGate();
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await flushMicrotasks();
+
+      expect(crudLog.deletes).toEqual(["assistant-row-1"]);
+      expect(events).toContain("loadFromDb");
+    } finally {
+      judgeEscalationGate = null;
+      judgeEscalationVerdict = false;
+    }
+  });
+
   test("a committed front-door answer (no verdict token) is left untouched", async () => {
     const { events } = makeReservedRowConversation();
     getMessageByIdImpl = () => makeRow("It is Tuesday.");
@@ -2474,6 +2999,25 @@ describe("transcript hygiene (teardown pass)", () => {
     ]);
     expect(crudLog.deletes).toHaveLength(0);
     // The clean row must reach in-memory history and sync consumers.
+    expect(events).toContain("loadFromDb");
+  });
+
+  test("a row ending with a session control marker persists with it stripped", async () => {
+    const { events } = makeReservedRowConversation();
+    getMessageByIdImpl = () =>
+      makeRow("Muting you for thirty seconds. [MUTE:30]");
+
+    await startVoiceTurn({ ...makeTurnOptions(), routingLeg: "front-door" });
+    await flushMicrotasks();
+
+    expect(crudLog.updates).toEqual([
+      {
+        messageId: "assistant-row-1",
+        content: JSON.stringify([
+          { type: "text", text: "Muting you for thirty seconds." },
+        ]),
+      },
+    ]);
     expect(events).toContain("loadFromDb");
   });
 
@@ -2619,11 +3163,7 @@ const PHOTO_HISTORY = [
   },
 ];
 
-describe("startVoiceTurn image-bearing profile pin", () => {
-  beforeEach(() => {
-    pinProfileSupportsVision = true;
-  });
-
+describe("startVoiceTurn with images in history", () => {
   async function runOptionsFor(opts: {
     messages?: Array<{ role: string; content: unknown[] }>;
     turn?: Record<string, unknown>;
@@ -2641,40 +3181,14 @@ describe("startVoiceTurn image-bearing profile pin", () => {
     return runOptions;
   }
 
-  test("a text-only call keeps the call-site profile", async () => {
-    const runOptions = await runOptionsFor({});
-
-    expect(runOptions.overrideProfile).toBeUndefined();
-    expect(runOptions.forceOverrideProfile).toBeUndefined();
-  });
-
-  test("an image in history pins the image-capable profile", async () => {
-    // `callAgent`'s balanced profile carries no guarantee that its model takes
-    // an image, and a model that rejects one fails the whole leg.
+  test("an image in history leaves the call-site profile in place", async () => {
+    // A text-only model gets the image captioned by the image-fallback
+    // plugin, the same as a typed turn, so no profile is pinned for it.
     const runOptions = await runOptionsFor({ messages: PHOTO_HISTORY });
 
-    expect(runOptions.overrideProfile).toBe("latency-optimized");
-    // callAgent is not `mainAgent`, so an unforced override would sit below
-    // the call-site profile and never apply.
-    expect(runOptions.forceOverrideProfile).toBe(true);
-  });
-
-  test("an image nested in a tool result counts too", async () => {
-    const runOptions = await runOptionsFor({
-      messages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "tool_result",
-              contentBlocks: [{ type: "image", source: { data: "abc" } }],
-            },
-          ],
-        },
-      ],
-    });
-
-    expect(runOptions.overrideProfile).toBe("latency-optimized");
+    expect(runOptions.callSite).toBe("callAgent");
+    expect(runOptions.overrideProfile).toBeUndefined();
+    expect(runOptions.forceOverrideProfile).toBeUndefined();
   });
 
   test("a front-door leg is left alone — its own call site pins it", async () => {
@@ -2687,19 +3201,7 @@ describe("startVoiceTurn image-bearing profile pin", () => {
     expect(runOptions.callSite).toBe("voiceFrontDoor");
   });
 
-  test("no pin when the pin target can't take an image either", async () => {
-    // Fireworks: `latency-optimized` resolves to a text-only model while
-    // `balanced` is vision-capable, so pinning would break the very turn the
-    // pin exists to save.
-    pinProfileSupportsVision = false;
-
-    const runOptions = await runOptionsFor({ messages: PHOTO_HISTORY });
-
-    expect(runOptions.overrideProfile).toBeUndefined();
-    expect(runOptions.forceOverrideProfile).toBeUndefined();
-  });
-
-  test("an explicit routing pin wins over the image pin", async () => {
+  test("an explicit routing pin still applies", async () => {
     const runOptions = await runOptionsFor({
       messages: PHOTO_HISTORY,
       turn: { overrideProfile: "quality-optimized" },
@@ -2710,13 +3212,31 @@ describe("startVoiceTurn image-bearing profile pin", () => {
 });
 
 describe("startVoiceTurn escalated-leg profile pin", () => {
+  test.each([
+    { screenAction: true, screenSharing: true, expected: true },
+    { screenAction: false, screenSharing: true, expected: false },
+    { screenAction: true, screenSharing: false, expected: false },
+    {
+      screenAction: true,
+      screenSharing: true,
+      routingLeg: "front-door",
+      expected: false,
+    },
+  ])(
+    "skips fresh memory only for an escalated shared-screen action: %j",
+    async ({ expected, ...turn }) => {
+      const options = await runOptionsFor({ turn });
+      expect(options.skipMemoryRetrieval).toBe(expected);
+    },
+  );
   beforeEach(() => {
-    pinProfileSupportsVision = true;
-    conversationProfileSupportsVision = true;
+    unresolvableProviderNames.clear();
   });
 
   afterEach(() => {
+    unresolvableProviderNames.clear();
     setConfig("llm", {});
+    setConfig("rateLimit", {});
   });
 
   async function runOptionsFor(opts: {
@@ -2748,10 +3268,31 @@ describe("startVoiceTurn escalated-leg profile pin", () => {
     return runOptions;
   }
 
+  function reportPreparedTarget(
+    runOptions: Record<string, unknown>,
+    overrideProfile: string,
+  ): void {
+    const onPrepared = runOptions.onFirstModelCallPrepared as (prepared: {
+      callSite: "mainAgent";
+      overrideProfile: string;
+      forceOverrideProfile: boolean;
+      systemPrompt: string;
+      tools: [];
+    }) => void;
+    onPrepared({
+      callSite: "mainAgent",
+      overrideProfile,
+      forceOverrideProfile: true,
+      systemPrompt: "prepared prompt",
+      tools: [],
+    });
+  }
+
   test("with no chat-model selection the leg keeps the call-site profile", async () => {
     const runOptions = await runOptionsFor({});
 
     expect(runOptions.callSite).toBe("callAgent");
+    expect(runOptions.inferenceCallSite).toBe("mainAgent");
     expect(runOptions.overrideProfile).toBeUndefined();
     expect(runOptions.forceOverrideProfile).toBeUndefined();
   });
@@ -2765,8 +3306,168 @@ describe("startVoiceTurn escalated-leg profile pin", () => {
     const runOptions = await runOptionsFor({});
 
     expect(runOptions.callSite).toBe("callAgent");
+    expect(runOptions.inferenceCallSite).toBe("mainAgent");
     expect(runOptions.overrideProfile).toBe("quality-optimized");
     expect(runOptions.forceOverrideProfile).toBe(true);
+    expect(runOptions.onFirstModelCallPrepared).toBeFunction();
+  });
+
+  test("starts warming the finalized request without awaiting it", async () => {
+    setConfig("llm", { activeProfile: "quality-optimized" });
+    const runOptions = await runOptionsFor({});
+    const warmPromptCache = mock(() => new Promise<void>(() => {}));
+    fakeConversation.warmPromptCache = warmPromptCache;
+    const onFirstModelCallPrepared = runOptions.onFirstModelCallPrepared as (
+      prepared: PreparedModelCall,
+    ) => void;
+    const tools = [
+      {
+        name: "dynamic_tool",
+        description: "Dynamic",
+        input_schema: { type: "object" as const },
+      },
+    ];
+    const turnAbort = new AbortController();
+
+    expect(
+      onFirstModelCallPrepared({
+        callSite: "mainAgent",
+        overrideProfile: "hook-selected-profile",
+        forceOverrideProfile: true,
+        signal: turnAbort.signal,
+        systemPrompt: "hook-edited prompt",
+        tools,
+      }),
+    ).toBeUndefined();
+
+    expect(warmPromptCache).toHaveBeenCalledWith({
+      callSite: "mainAgent",
+      overrideProfile: "hook-selected-profile",
+      forceOverrideProfile: true,
+      signal: turnAbort.signal,
+      systemPrompt: "hook-edited prompt",
+      tools,
+    });
+  });
+
+  test("reports the conversation profile selected for the handoff", async () => {
+    setConfig("llm", { activeProfile: "quality-optimized" });
+    const onEscalationTargetResolved = mock();
+
+    const runOptions = await runOptionsFor({
+      turn: { onEscalationTargetResolved },
+    });
+    reportPreparedTarget(runOptions, "quality-optimized");
+
+    expect(onEscalationTargetResolved).toHaveBeenCalledWith({
+      profile: "quality-optimized",
+      source: "conversation",
+    });
+  });
+
+  test("reports the concrete profile selected from a mix", async () => {
+    setConfig("llm", {
+      activeProfile: "voice-mix",
+      profiles: {
+        "voice-mix": {
+          mix: [
+            { profile: "quality-optimized", weight: 1 },
+            { profile: "cost-optimized", weight: 1 },
+          ],
+        },
+      },
+    });
+    let selectedProfile: string | undefined;
+    selectWinningProfile("mainAgent", getConfig().llm, {
+      overrideProfile: "voice-mix",
+      forceOverrideProfile: true,
+      selectionSeed: "conv-voice-bridge-test",
+      onMixSelected: ({ chosenProfile }) => {
+        selectedProfile = chosenProfile;
+      },
+    });
+    const onEscalationTargetResolved = mock();
+    const runOptions = await runOptionsFor({
+      turn: { onEscalationTargetResolved },
+    });
+
+    // The leg is pinned to the chosen arm itself (see the mix pin test).
+    expect(runOptions.overrideProfile).toBe(selectedProfile);
+    reportPreparedTarget(runOptions, runOptions.overrideProfile as string);
+
+    expect(selectedProfile).toBeDefined();
+    expect(onEscalationTargetResolved).toHaveBeenCalledWith({
+      profile: selectedProfile,
+      source: "conversation",
+    });
+  });
+
+  test("warms the main-agent route when the conversation has no profile pin", async () => {
+    const runOptions = await runOptionsFor({});
+    const warmPromptCache = mock(async () => {});
+    fakeConversation.warmPromptCache = warmPromptCache;
+    const onFirstModelCallPrepared = runOptions.onFirstModelCallPrepared as (
+      prepared: PreparedModelCall,
+    ) => void;
+    onFirstModelCallPrepared({
+      callSite: "mainAgent",
+      forceOverrideProfile: false,
+      systemPrompt: "system prompt",
+      tools: [],
+    });
+
+    expect(warmPromptCache).toHaveBeenCalledWith({
+      callSite: "mainAgent",
+      forceOverrideProfile: false,
+      signal: undefined,
+      systemPrompt: "system prompt",
+      tools: [],
+    });
+  });
+
+  test("does not warm a route whose finalized policy disables caching", async () => {
+    const runOptions = await runOptionsFor({});
+    const warmPromptCache = mock(async () => {});
+    fakeConversation.warmPromptCache = warmPromptCache;
+    const onFirstModelCallPrepared = runOptions.onFirstModelCallPrepared as (
+      prepared: PreparedModelCall,
+    ) => void;
+
+    onFirstModelCallPrepared({
+      callSite: "mainAgent",
+      forceOverrideProfile: false,
+      disableCache: true,
+      systemPrompt: "system prompt",
+      tools: [],
+    });
+
+    expect(warmPromptCache).not.toHaveBeenCalled();
+  });
+
+  test("does not warm when requests are rate limited", async () => {
+    setConfig("rateLimit", { maxRequestsPerMinute: 1 });
+    const runOptions = await runOptionsFor({});
+    const warmPromptCache = mock(async () => {});
+    fakeConversation.warmPromptCache = warmPromptCache;
+
+    expect(runOptions.onFirstModelCallPrepared).toBeFunction();
+    reportPreparedTarget(runOptions, "quality-optimized");
+    expect(warmPromptCache).not.toHaveBeenCalled();
+  });
+
+  test("reports a profile selected by final pre-model routing", async () => {
+    setConfig("llm", { activeProfile: "quality-optimized" });
+    const onEscalationTargetResolved = mock();
+
+    const runOptions = await runOptionsFor({
+      turn: { onEscalationTargetResolved },
+    });
+    reportPreparedTarget(runOptions, "cost-optimized");
+
+    expect(onEscalationTargetResolved).toHaveBeenCalledWith({
+      profile: "cost-optimized",
+      source: "pre_model_hook",
+    });
   });
 
   test("the conversation's own pin wins over the workspace selection", async () => {
@@ -2805,34 +3506,47 @@ describe("startVoiceTurn escalated-leg profile pin", () => {
     expect(unrouted.overrideProfile).toBeUndefined();
   });
 
-  test("an image stays on a conversation profile whose model takes it", async () => {
+  test("an image keeps a text-only conversation profile", async () => {
+    // The escalated leg is the tool-capable brain of the call. Images reach a
+    // text-only model as image-fallback captions, never by swapping the leg
+    // onto the latency-class profile.
     setConfig("llm", { activeProfile: "quality-optimized" });
 
     const runOptions = await runOptionsFor({ messages: PHOTO_HISTORY });
 
     expect(runOptions.overrideProfile).toBe("quality-optimized");
-  });
-
-  test("an image hands a text-only conversation profile to the image pin", async () => {
-    // A model that rejects the image fails the whole leg, so the image pin
-    // outranks the conversation's choice for this one turn.
-    setConfig("llm", { activeProfile: "quality-optimized" });
-    conversationProfileSupportsVision = false;
-
-    const runOptions = await runOptionsFor({ messages: PHOTO_HISTORY });
-
-    expect(runOptions.overrideProfile).toBe("latency-optimized");
     expect(runOptions.forceOverrideProfile).toBe(true);
+    expect(runOptions.inferenceCallSite).toBe("mainAgent");
   });
 
-  test("an image with no image-capable profile anywhere keeps the conversation profile", async () => {
-    setConfig("llm", { activeProfile: "quality-optimized" });
-    conversationProfileSupportsVision = false;
-    pinProfileSupportsVision = false;
+  test("a mix pins the arm serving this conversation, not the mix name", async () => {
+    // The image-fallback check judges the pinned profile, and a mix reads as
+    // vision-capable when any arm is. Pinning the chosen arm keeps a
+    // text-only arm from receiving raw images.
+    setConfig("llm", {
+      activeProfile: "voice-mix",
+      profiles: {
+        "voice-mix": {
+          mix: [
+            { profile: "quality-optimized", weight: 1 },
+            { profile: "cost-optimized", weight: 1 },
+          ],
+        },
+      },
+    });
+    let chosenArm: string | undefined;
+    selectWinningProfile("mainAgent", getConfig().llm, {
+      selectionSeed: "conv-voice-bridge-test",
+      onMixSelected: ({ chosenProfile }) => {
+        chosenArm = chosenProfile;
+      },
+    });
+    expect(chosenArm).toBeDefined();
 
     const runOptions = await runOptionsFor({ messages: PHOTO_HISTORY });
 
-    expect(runOptions.overrideProfile).toBe("quality-optimized");
+    expect(runOptions.overrideProfile).toBe(chosenArm);
+    expect(runOptions.forceOverrideProfile).toBe(true);
   });
 
   test("an explicit routing pin wins over the conversation profile", async () => {
@@ -2845,51 +3559,94 @@ describe("startVoiceTurn escalated-leg profile pin", () => {
     expect(runOptions.overrideProfile).toBe("balanced");
   });
 
-  test("a mix is judged by the arm serving this conversation, not by any arm", async () => {
-    // A mix reads as vision-capable when any arm is, but dispatch expands it
-    // to one arm from the conversation seed. Only that arm's model sees the
-    // image, so only that arm's capability decides whether the image pin
-    // takes over. The pin itself stays the mix's own name, so dispatch lands
-    // on the same arm.
-    const llm = {
-      activeProfile: "voice-mix",
+  test("a mix with no resolvable arm falls back to the main-agent profile", async () => {
+    setConfig("llm", {
+      activeProfile: "stale-mix",
       profiles: {
-        "voice-mix": {
+        "stale-a": {
+          provider: "deleted-connection-a",
+          model: "model-a",
+        },
+        "stale-b": {
+          provider: "deleted-connection-b",
+          model: "model-b",
+        },
+        "stale-mix": {
           mix: [
-            { profile: "quality-optimized", weight: 1 },
-            { profile: "cost-optimized", weight: 1 },
+            { profile: "stale-a", weight: 1 },
+            { profile: "stale-b", weight: 1 },
           ],
         },
       },
-    };
-    setConfig("llm", llm);
-    let chosenArm: string | undefined;
-    selectWinningProfile("mainAgent", getConfig().llm, {
-      selectionSeed: "conv-voice-bridge-test",
-      onMixSelected: ({ chosenProfile }) => {
-        chosenArm = chosenProfile;
+      callSites: {
+        mainAgent: { profile: "quality-optimized" },
       },
     });
-    expect(chosenArm).toBeDefined();
-    const otherArm =
-      chosenArm === "quality-optimized"
-        ? "cost-optimized"
-        : "quality-optimized";
-    try {
-      // Only the unchosen arm takes images: judged as "any arm", the mix
-      // would keep the pin off and the image would reach a text-only model.
-      visionByProfile.set(chosenArm!, false);
-      visionByProfile.set(otherArm, true);
-      const textOnlyArm = await runOptionsFor({ messages: PHOTO_HISTORY });
-      expect(textOnlyArm.overrideProfile).toBe("latency-optimized");
+    unresolvableProviderNames.add("deleted-connection-a");
+    unresolvableProviderNames.add("deleted-connection-b");
+    const runOptions = await runOptionsFor({ messages: PHOTO_HISTORY });
 
-      // Only the chosen arm takes images: no pin needed, the mix stands.
-      visionByProfile.set(chosenArm!, true);
-      visionByProfile.set(otherArm, false);
-      const visionArm = await runOptionsFor({ messages: PHOTO_HISTORY });
-      expect(visionArm.overrideProfile).toBe("voice-mix");
-    } finally {
-      visionByProfile.clear();
+    expect(runOptions.overrideProfile).toBe("quality-optimized");
+  });
+});
+
+describe("startVoiceTurn escalation judge", () => {
+  beforeEach(() => {
+    judgeEscalationCalls = [];
+    judgeEscalationVerdict = false;
+    fakeConversation = makeFakeConversation({ processing: false }).conversation;
+  });
+
+  test("a front-door leg carries the judge's verdict and an overrule", async () => {
+    judgeEscalationVerdict = true;
+
+    const handle = await startVoiceTurn({
+      ...makeTurnOptions(),
+      content: "Text my mom I'm late.",
+      routingLeg: "front-door",
+    });
+
+    expect(judgeEscalationCalls).toEqual([
+      { utterance: "Text my mom I'm late." },
+    ]);
+    expect(await handle.escalationJudgement).toBe(true);
+    expect(typeof handle.overrule).toBe("function");
+  });
+
+  test("escalated, unrouted, and synthetic legs are not judged", async () => {
+    const escalated = await startVoiceTurn({
+      ...makeTurnOptions(),
+      routingLeg: "escalated",
+    });
+    const unrouted = await startVoiceTurn(makeTurnOptions());
+    const synthetic = await startVoiceTurn({
+      ...makeTurnOptions(),
+      routingLeg: "front-door",
+      hiddenSyntheticPrompt: true,
+    });
+
+    expect(judgeEscalationCalls).toEqual([]);
+    for (const handle of [escalated, unrouted, synthetic]) {
+      expect(handle.escalationJudgement).toBeUndefined();
+      expect(handle.overrule).toBeUndefined();
     }
+  });
+
+  test.each([
+    "What do you see on my screen?",
+    "Show me where to add a new page.",
+  ])("a captured look bypasses the text-only judge: %s", async (request) => {
+    judgeEscalationVerdict = true;
+    const handle = await startVoiceTurn({
+      ...makeTurnOptions(),
+      content: "(fresh view taken; answer from it now)",
+      routingUtterance: request,
+      routingLeg: "front-door",
+      hiddenSyntheticPrompt: true,
+    });
+
+    expect(judgeEscalationCalls).toEqual([]);
+    expect(handle.escalationJudgement).toBeUndefined();
+    expect(handle.overrule).toBeUndefined();
   });
 });

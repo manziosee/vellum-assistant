@@ -17,17 +17,17 @@ import { supportsHostProxy } from "../../channels/types.js";
 import { getConfig } from "../../config/loader.js";
 import { HostBashProxy } from "../../daemon/host-bash-proxy.js";
 import { RiskLevel } from "../../permissions/types.js";
+import { applyActivePluginName } from "../../plugins/active-plugin-env.js";
 import { wakeAgentForOpportunity } from "../../runtime/agent-wake.js";
-import {
-  assistantEventHub,
-  broadcastMessage,
-} from "../../runtime/assistant-event-hub.js";
+import { broadcastMessage } from "../../runtime/assistant-event-hub.js";
 import { conversationRevealNonce } from "../../runtime/reveal-nonce.js";
 import { redactSecrets } from "../../security/secret-scanner.js";
 import {
   buildShellInvocation,
+  buildShellSpawnFlags,
   prependUniquePathEntries,
   terminateProcessTree,
+  watchShellProcessStart,
 } from "../../util/host-process.js";
 import { getLogger } from "../../util/logger.js";
 import type { CompletedBackgroundTool } from "../background-tool-registry.js";
@@ -39,7 +39,7 @@ import {
   registerBackgroundTool,
   removeBackgroundTool,
 } from "../background-tool-registry.js";
-import { desktopClientName } from "../client-os.js";
+import { formatDesktopAppRequired } from "../capability-offer.js";
 import {
   attachBoundedStdio,
   MAX_OUTPUT_LENGTH,
@@ -93,8 +93,9 @@ function buildHostBashProxyEnv(conversationId: string): Record<string, string> {
   // Keep nested `assistant` CLI calls in host_bash aligned with the
   // originating conversation so browser IPC can resolve live proxy context.
   env.__CONVERSATION_ID = conversationId;
-  // Secret binding for reveal-derived chat authority — see reveal-nonce.ts.
+  // Secret binding for reveal-derived chat authority. See reveal-nonce.ts.
   env.__REVEAL_NONCE = conversationRevealNonce(conversationId);
+  applyActivePluginName(env, conversationId);
   return env;
 }
 
@@ -142,7 +143,7 @@ export const hostShellInputSchema = z.looseObject({
   target_client_id: z
     .string()
     .describe(
-      "ID of the specific client to execute this command on. Required when multiple clients support host_bash; omit when only one client is connected. Obtain IDs from `assistant clients list --capability host_bash`.",
+      "Optional ID of the specific client to execute this command on. Without it, the most recently active eligible client is used. Obtain IDs from `assistant clients list --capability host_bash`.",
     )
     .optional()
     .catch(undefined),
@@ -164,6 +165,7 @@ export const hostShellTool = {
     input: Record<string, unknown>,
     context: ToolContext,
   ): Promise<ToolExecutionResult> {
+    const cronRunId = context.cronRunId ?? undefined;
     const parsed = hostShellInputSchema.safeParse(input);
     if (!parsed.success) {
       return invalidToolInputResult("host_bash", parsed.error);
@@ -203,20 +205,7 @@ export const hostShellTool = {
     const config = getConfig();
     const { shellDefaultTimeoutSec, shellMaxTimeoutSec } = config.timeouts;
 
-    // Guard: non-host-proxy interfaces need an explicit target when multiple
-    // capable clients are connected to avoid ambiguous untargeted broadcasts.
     const transportInterface = context.transportInterface;
-    if (
-      targetClientId == null &&
-      transportInterface != null &&
-      !supportsHostProxy(transportInterface) &&
-      assistantEventHub.listClientsByCapability("host_bash").length > 1
-    ) {
-      return {
-        content: `Error: multiple clients support host_bash. Specify which client to use with \`target_client_id\`. Run \`assistant clients list --capability host_bash\` to see client IDs and labels.`,
-        isError: true,
-      };
-    }
 
     // Guard: non-host-proxy interfaces with no capable clients connected.
     if (
@@ -226,7 +215,7 @@ export const hostShellTool = {
       !HostBashProxy.instance.isAvailable()
     ) {
       return {
-        content: `Error: no client with host_bash capability is connected. Connect a ${desktopClientName(context)} client to use host_bash from a non-desktop interface.`,
+        content: formatDesktopAppRequired("shell"),
         isError: true,
       };
     }
@@ -329,6 +318,7 @@ export const hostShellTool = {
                   : `Background host command completed (id=${bgId}):`;
             void wakeAgentForOpportunity({
               conversationId: context.conversationId,
+              cronRunId,
               hint: framing,
               source: "background-tool",
               persistTriggerAsEvent: true,
@@ -377,6 +367,7 @@ export const hostShellTool = {
             );
             void wakeAgentForOpportunity({
               conversationId: context.conversationId,
+              cronRunId,
               hint:
                 status === "cancelled"
                   ? `Background host command cancelled (id=${bgId}):`
@@ -390,6 +381,7 @@ export const hostShellTool = {
 
         registerBackgroundTool({
           id: bgId,
+          cronRunId,
           toolName: "host_bash",
           conversationId: context.conversationId,
           command,
@@ -452,6 +444,7 @@ export const hostShellTool = {
     // the active conversation when running through host_bash.
     hostEnv.__CONVERSATION_ID = context.conversationId;
     hostEnv.__REVEAL_NONCE = conversationRevealNonce(context.conversationId);
+    applyActivePluginName(hostEnv, context.conversationId);
 
     if (background) {
       // Check the registry limit BEFORE spawning so we never leak an
@@ -471,9 +464,9 @@ export const hostShellTool = {
         cwd: workingDir,
         env: hostEnv,
         stdio: ["ignore", "pipe", "pipe"],
-        detached: true,
-        windowsHide: true,
+        ...buildShellSpawnFlags(),
       });
+      const launch = watchShellProcessStart(child);
 
       const collector = attachBoundedStdio(child);
       let timedOut = false;
@@ -499,7 +492,9 @@ export const hostShellTool = {
         }
         completed = true;
         clearTimeout(timer);
-        const result = collector.format(code, timedOut, timeoutSec);
+        const result = collector.format(code, timedOut, timeoutSec, {
+          started: launch.didStart(),
+        });
         // Cancel takes precedence over the SIGKILL-induced error result.
         const status = aborted
           ? "cancelled"
@@ -545,6 +540,7 @@ export const hostShellTool = {
               : `Background host command completed (id=${bgId}):`;
         void wakeAgentForOpportunity({
           conversationId: context.conversationId,
+          cronRunId,
           hint: framing,
           source: "background-tool",
           persistTriggerAsEvent: true,
@@ -596,6 +592,7 @@ export const hostShellTool = {
         );
         void wakeAgentForOpportunity({
           conversationId: context.conversationId,
+          cronRunId,
           hint:
             status === "cancelled"
               ? `Background host command cancelled (id=${bgId}):`
@@ -609,6 +606,7 @@ export const hostShellTool = {
 
       registerBackgroundTool({
         id: bgId,
+        cronRunId,
         toolName: "host_bash",
         conversationId: context.conversationId,
         command,
@@ -645,9 +643,9 @@ export const hostShellTool = {
         cwd: workingDir,
         env: hostEnv,
         stdio: ["ignore", "pipe", "pipe"],
-        detached: true,
-        windowsHide: true,
+        ...buildShellSpawnFlags(),
       });
+      const launch = watchShellProcessStart(child);
       const collector = attachBoundedStdio(child, {
         onOutput: context.onOutput,
       });
@@ -673,7 +671,9 @@ export const hostShellTool = {
         clearTimeout(timer);
         context.signal?.removeEventListener("abort", onAbort);
 
-        const result = collector.format(code, timedOut, timeoutSec);
+        const result = collector.format(code, timedOut, timeoutSec, {
+          started: launch.didStart(),
+        });
 
         resolve({
           content: result.content,

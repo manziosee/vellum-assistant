@@ -24,13 +24,15 @@ export {
   PersistentIpcClient,
 } from "./ipc-client.js";
 
-// Outbound delivery contract (daemon → gateway) — Zod schemas + derived types
+// Outbound delivery contract: Zod schemas + derived types
 export {
   ApprovalActionOptionSchema,
   ApprovalUIMetadataSchema,
   AttachmentMetadataSchema,
   ChannelDeliveryResultSchema,
   ChannelReplyPayloadSchema,
+  DELIVER_GATEWAY_REPLY_IPC_METHOD,
+  GatewayReplyRequestSchema,
   MessageAudienceSchema,
   PermissionRequestDetailsSchema,
   StreamOpSchema,
@@ -45,6 +47,7 @@ export type {
   AttachmentMetadata,
   ChannelDeliveryResult,
   ChannelReplyPayload,
+  GatewayReplyRequest,
   MessageAudience,
   PermissionRequestDetails,
   StreamOp,
@@ -104,6 +107,7 @@ export type {
 export {
   ACCESS_DENIED_NOT_APPROVED_REPLY,
   PLUGIN_ADMISSION_DENIED_NOTICE_PATH,
+  PLUGIN_NOTICES_ROUTE_PREFIX,
   PluginAdmissionDeniedNoticeSchema,
 } from "./plugin-admission-denied-contract.js";
 

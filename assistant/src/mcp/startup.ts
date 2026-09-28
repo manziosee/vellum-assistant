@@ -13,13 +13,20 @@
  * further process that starts hosting turns has one call to make.
  */
 
-import { getConfig, invalidateConfigCache } from "../config/loader.js";
+import { invalidateConfigCache } from "../config/loader.js";
 import type { McpConfig } from "../config/schemas/mcp.js";
 import { createMcpToolsFromServer } from "../tools/mcp/mcp-tool-factory.js";
 import { registerMcpTools, unregisterAllMcpTools } from "../tools/registry.js";
 import { getLogger } from "../util/logger.js";
 import { buildEffectiveMcpConfig } from "./effective-config.js";
 import { getMcpServerManager, stopMcpServerManager } from "./manager.js";
+import {
+  EMPTY_MCP_STARTUP_SNAPSHOT,
+  type McpStartupSnapshot,
+} from "./tool-caps.js";
+import { loadWorkspaceMcpConfig } from "./workspace-mcp-config.js";
+
+export type { McpStartupSnapshot } from "./tool-caps.js";
 
 const log = getLogger("mcp-startup");
 
@@ -36,22 +43,29 @@ const log = getLogger("mcp-startup");
  * is a startup step in processes whose other work must not be held hostage to
  * a third-party server being up.
  *
- * @param workspaceMcpConfig The `mcp` block of the assistant config, if any.
- * @returns The number of tools registered across all servers.
+ * @param workspaceMcpConfig The projected workspace MCP config. Callers
+ * that omit it read `/workspace/mcp.json`.
+ * @returns A count snapshot of configured/connected servers and the tools
+ * that reached this process's registry after caps.
  */
 export async function startConfiguredMcpServers(
   workspaceMcpConfig?: McpConfig,
-): Promise<number> {
-  let registered = 0;
+): Promise<McpStartupSnapshot> {
+  let snapshot: McpStartupSnapshot = EMPTY_MCP_STARTUP_SNAPSHOT;
   try {
-    const mcpConfig = buildEffectiveMcpConfig(workspaceMcpConfig);
-    if (Object.keys(mcpConfig.servers).length === 0) {
-      return 0;
+    const mcpConfig = buildEffectiveMcpConfig(
+      workspaceMcpConfig ?? loadWorkspaceMcpConfig(),
+    );
+    const configuredServerCount = Object.keys(mcpConfig.servers).length;
+    snapshot = { ...EMPTY_MCP_STARTUP_SNAPSHOT, configuredServerCount };
+    if (configuredServerCount === 0) {
+      return snapshot;
     }
 
     const manager = getMcpServerManager();
-    const serverToolInfos = await manager.start(mcpConfig);
-    for (const { serverId, serverConfig, tools } of serverToolInfos) {
+    const started = await manager.start(mcpConfig);
+    let registered = 0;
+    for (const { serverId, serverConfig, tools } of started.servers) {
       const mcpTools = createMcpToolsFromServer(
         tools,
         serverId,
@@ -60,16 +74,26 @@ export async function startConfiguredMcpServers(
       );
       registered += registerMcpTools(serverId, mcpTools).length;
     }
+    snapshot = {
+      configuredServerCount: started.configuredServerCount,
+      connectedServerCount: started.connectedServerCount,
+      discoveredToolCount: started.discoveredToolCount,
+      registeredToolCount: registered,
+      droppedToolCount: started.droppedToolCount,
+      truncatedServerIds: started.truncatedServerIds,
+      errorServerCount: started.errorServerCount,
+      needsAuthServerCount: started.needsAuthServerCount,
+    };
   } catch (err) {
     log.error(
-      { err },
+      { err, ...snapshot },
       "MCP server initialization failed, continuing without MCP tools",
     );
-    return registered;
+    return snapshot;
   }
 
-  log.info({ toolCount: registered }, "MCP tools registered");
-  return registered;
+  log.info(snapshot, "MCP tools registered");
+  return snapshot;
 }
 
 /**
@@ -87,9 +111,9 @@ export async function startConfiguredMcpServers(
  * The window between the teardown and the reconnect has no MCP tools
  * registered, so an `mcp__*` call landing inside it fails as an unknown tool.
  *
- * @returns The number of tools registered after the reconnect.
+ * @returns A count snapshot of the tools registered after the reconnect.
  */
-export async function restartConfiguredMcpServers(): Promise<number> {
+export async function restartConfiguredMcpServers(): Promise<McpStartupSnapshot> {
   try {
     await stopMcpServerManager();
   } catch (err) {
@@ -97,5 +121,5 @@ export async function restartConfiguredMcpServers(): Promise<number> {
   }
   unregisterAllMcpTools();
   invalidateConfigCache();
-  return startConfiguredMcpServers(getConfig().mcp);
+  return startConfiguredMcpServers(loadWorkspaceMcpConfig());
 }

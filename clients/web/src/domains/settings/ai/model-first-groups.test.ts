@@ -44,7 +44,9 @@ function input(
 }
 
 function groupLabels(connections: ProviderConnection[]): string[] {
-  return resolveModelFirstGroups(input(connections)).map((group) => group.label);
+  return resolveModelFirstGroups(input(connections)).map(
+    (group) => group.label,
+  );
 }
 
 function groupFor(connections: ProviderConnection[], key: string) {
@@ -89,6 +91,17 @@ describe("resolveModelFirstGroups", () => {
     }
   });
 
+  test("omits structured-decision providers from the section list", () => {
+    expect(groupLabels([])).not.toContain("TypeSafe");
+    expect(groupLabels([])).not.toContain("Jev");
+    expect(groupLabels([connection("jev-key", "typesafe")])).not.toContain(
+      "TypeSafe",
+    );
+    expect(groupLabels([connection("jev-key", "typesafe")])).not.toContain(
+      "Jev",
+    );
+  });
+
   test("merges the providers that list one vendor's work", () => {
     // Fireworks lists the newest MiniMax, OpenRouter the older ones, and
     // MiniMax hosts its own: one section, each model once.
@@ -100,9 +113,9 @@ describe("resolveModelFirstGroups", () => {
       1,
     );
     // A model two providers list still lands in one section, once.
-    expect(namesOf([], "xai").filter((name) => name === "Grok 4.3")).toHaveLength(
-      1,
-    );
+    expect(
+      namesOf([], "xai").filter((name) => name === "Grok 4.3"),
+    ).toHaveLength(1);
     // And a variant only a gateway lists joins its maker's section.
     expect(namesOf([], "openai")).toContain("GPT-5.6 Sol Pro");
   });
@@ -146,7 +159,7 @@ describe("resolveModelFirstGroups", () => {
     expect(namesOf([], "anthropic").slice(0, 3)).toEqual([
       "Claude Fable 5.1",
       "Claude Fable 5",
-      "Claude Opus 5",
+      "Claude Opus 5.5",
     ]);
   });
 
@@ -241,13 +254,14 @@ describe("collapseSectionRows", () => {
     const { shown, hidden } = collapseSectionRows(options);
     expect(shown.map((option) => option.displayName)).toEqual([
       "Claude Fable 5.1",
-      "Claude Opus 5",
+      "Claude Opus 5.5",
       "Claude Sonnet 5",
     ]);
     // The rest follows in catalog order, so revealing it reads as the section
     // carrying on rather than as a second list.
     expect(hidden.map((option) => option.displayName)).toEqual([
       "Claude Fable 5",
+      "Claude Opus 5",
       "Claude Opus 4.8",
       "Claude Opus 4.7",
       "Claude Opus 4.6",
@@ -260,14 +274,14 @@ describe("collapseSectionRows", () => {
   });
 
   test("spends the three rows on three lines, not three versions of one", () => {
-    // Astra is its own line, then each 5.6 flavor is a line of its own, so
-    // the section leads with those rather than walking down through 5.5
-    // and 5.4.
+    // Astra, Sol, and Luna are each a line of their own, so the section
+    // leads with the GPT-6 member of each rather than walking down through
+    // the 5.6 versions.
     const { shown } = collapseSectionRows(optionsFor("openai"));
     expect(shown.map((option) => option.displayName)).toEqual([
       "GPT-6 Astra",
-      "GPT-5.6 Sol",
-      "GPT-5.6 Terra",
+      "GPT-6 Sol",
+      "GPT-6 Luna",
     ]);
   });
 

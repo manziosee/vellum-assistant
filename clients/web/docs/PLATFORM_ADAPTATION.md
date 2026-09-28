@@ -39,6 +39,10 @@ matching Tailwind's `md` breakpoint. Use it for **layout**: how many columns, wh
 stacks, how many chips fit before truncating. Prefer plain `max-md:` classes when CSS can express it,
 and reach for the hook only when the difference is structural (different components, different props).
 
+Keep the ancestry of stateful route content stable when a window crosses a layout breakpoint. Change
+wrapper classes and conditional siblings around one route outlet. Moving the outlet between alternate
+parent branches remounts its subtree and discards local state such as an in-progress composer.
+
 #### Measured sizes: no new JavaScript `clamp()`
 
 The same preference, one level down. `useLayoutViewportSize()` and `useElementSize()`
@@ -196,6 +200,40 @@ reason a variant cannot cover.
 
 ---
 
+## Workspace file picker
+
+Workspace uses the measured pane width from `useSideListRoom()` to keep its
+tree beside the file when there is room. Compact panes, including narrow
+desktop panes, put the tree in a 78%-height `BottomSheet` opened by the file
+switcher in the document card header. The switcher stays mounted for empty,
+loading, missing and loaded files so selection remains available and closing
+the sheet can restore focus to the same button. The layout owns Back and the
+plain Workspace page title. Wide panes retain the inline tree and static
+filename and size header.
+
+Search, folder expansion, sort and hidden-file state live above the two tree
+surfaces. File selection immediately updates the card switcher, clears search
+and closes the sheet. The sheet retains its hidden-file toggle, existing row
+highlight tokens, viewport keyboard insets and detail-sheet drag dismissal.
+
+## Mobile chat detail sheets
+
+Tool calls, grouped activity, subagents, background tasks, workflows, ACP runs, and wake details
+share `MobileDetailSheet` in the chat domain. It adapts viewer data and viewport safe areas to the
+design library's `BottomSheet.Content variant="detail"`: a 90% surface with a visible conversation
+margin, handle-only drag dismissal, and reduced-motion-aware enter/exit animations. The transcript
+stays mounted, and focus returns to the originating row without scrolling it into view.
+
+A control that opens a sheet calls `openDetailSheetFromTrigger`, which marks it as the trigger. The
+sheet rises from the marked control and hands focus back to it on close; a control that opens the
+sheet any other way leaves focus to fall back to the conversation.
+
+The adapter uses the viewport portal host and provides its content element as the portal host for
+nested previews. Nested dialogs consume Escape before the sheet. Android Back uses the existing
+dialog dismissal path, and the sheet registers as an edge-swipe back owner for its mounted lifetime.
+The retained payload belongs to the exiting sheet so clearing viewer state can animate dismissal
+without delaying store updates or closing a subsequently opened panel.
+
 ## Navigation depth and back affordances
 
 Adaptive layout has a second failure mode beyond overlays: a route that is a detail pane beside its
@@ -217,6 +255,26 @@ The rule:
   while iOS expects an in-bar back button plus an edge swipe
   ([HIG: Navigation bars](https://developer.apple.com/design/human-interface-guidelines/navigation-bars)).
   That is an idiom difference at rung 1 or 2, not a reason for a page to render its own header.
+
+About Assistant applies this wholesale. On a phone `IntelligenceLayout` publishes one top bar for
+every destination below the assistant overview: each section, plus the personality stage, which is
+full-bleed and no section but still one drill-down down. The desktop heading row and its back
+chevron render only on a roomy window, and no page under the layout paints a back control of its own.
+The overview is the root and takes no bar.
+
+Contacts is the worked example. The list is `/assistant/contacts` and a contact is
+`/assistant/contacts/:contactId`, two sibling routes rather than a selection held in page state, so
+depth is a property of the URL. `ContactsPage` measures its own pane and reports through
+`intelligence-layout-slots-store` whether the contact is a pushed full screen; `IntelligenceLayout`
+renders the one Back from that report, so a pushed contact backs to the list and everything else
+backs to the assistant overview. The page owns the signal because a mobile-width window can still
+hand it a pane roomy enough to seat the list beside the contact, and there a Back to the list would
+point at a list already on screen. On a phone the list fills the page and opening a contact pushes
+an entry marked with `PUSHED_FROM_LIST_STATE` (`utils/list-detail-navigation.ts`), so `returnToList`
+pops that entry instead of stacking a second copy of the list, and replaces instead when the detail
+was deep-linked and has no list behind it.
+On a window roomy enough to seat both, the same routes render as a list beside a detail and moving
+between rows replaces the entry, since that is not a step to walk back through.
 
 ---
 
@@ -304,6 +362,26 @@ Every route under `ChatLayout` shares a document-level drawer gesture: a rightwa
 the left half of a mobile viewport opens the navigation drawer. A row there keeps its swipe commands
 on the **trailing** edge, or the two gestures resolve to the drawer and the row's leading action is
 unreachable in practice.
+
+The shared drawer/back-swipe detector yields touches inside `data-owns-horizontal-scroll` when
+the marked element's `scrollWidth` exceeds its `clientWidth` by more than 1px. Put the marker on
+the element that actually scrolls: the message Markdown table wrapper, Markdown code block's
+`pre`, structured table wrapper, and composer attachment strip. The detector checks marked
+ancestors, so a fitting inner scroller cannot hide an overflowing outer one. Ownership is decided
+at touchstart, ahead of the text-selection rule, and lasts for the full gesture, including at the
+screen edge and either scroll boundary. Fitting content keeps its existing navigation behavior.
+Use the navigation button or start outside the scroller to open the menu or go back. Drag-to-set
+controls use `data-owns-horizontal-drag` and always own their horizontal drags.
+
+Do not infer gesture ownership from computed overflow styles: `overflow-y: auto` also makes the
+default `overflow-x` compute to `auto`, so incidental horizontal overflow in a vertical page
+scroller could disable navigation across its contents. Give vertical-only scrollers explicit
+`overflow-x-hidden` when horizontal overflow should be clipped.
+
+Run the real-layout gesture regressions with `bun run test:edge-swipe:browser` from `clients/web/`
+after `bunx playwright install chromium webkit`. PR CI runs the same Chromium and WebKit checks.
+These checks use synthetic touch events, plus trusted Chromium touch input; physical iPhone and
+iPad checks remain necessary for native scrolling and navigation arbitration.
 
 Inside the open drawer the contested edge flips: a leftward drag closes it
 ([`useSwipeCloseDrawer`](../src/hooks/use-swipe-close-drawer.ts)). Rows keep both edges there,

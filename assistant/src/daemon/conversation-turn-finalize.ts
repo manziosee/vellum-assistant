@@ -34,12 +34,14 @@ import {
   postTurnTruncateToolResults,
 } from "../context/post-turn-tool-result-truncation.js";
 import { emitAssistantReplyNotification } from "../notifications/assistant-reply-producer.js";
+import { emitBackgroundResultNotification } from "../notifications/background-result-producer.js";
 import { projectAssistantMessage } from "../persistence/conversation-attention-store.js";
 import {
   type ConversationRow,
   getConversation,
   getMessageById,
   parseMessageMetadata,
+  resurfaceArchivedConversation,
 } from "../persistence/conversation-crud.js";
 import { getResolvedConversationDirPath } from "../persistence/conversation-directories.js";
 import { syncMessageToDisk } from "../persistence/conversation-disk-view.js";
@@ -63,6 +65,8 @@ interface TurnTailContext {
 /** Minimal per-run handler state {@link settleTurnContent} consumes. */
 interface TurnContentState {
   readonly lastAssistantMessageId: string | undefined;
+  /** Earlier reply rows that must join the final disk-view export. */
+  readonly assistantMessageIdsToSync: ReadonlySet<string>;
   /** In-flight content writers the turn left behind (see EventHandlerState). */
   readonly inflightWriters: Map<string, InflightContentWriter>;
 }
@@ -148,6 +152,17 @@ export function buildDeferredFinalizeEffect(params: {
         "Failed to project assistant message for attention tracking (non-fatal)",
       );
     }
+    // The row this turn reserved was empty at insert, so this is where its
+    // content becomes readable and a Done conversation earns its way back to
+    // the list. A run that never got this far produced nothing to read.
+    try {
+      resurfaceArchivedConversation(conversationId, finalizedRow.createdAt);
+    } catch (err) {
+      rlog.warn(
+        { err, conversationId, messageId: assistantMessageId },
+        "Failed to resurface Done conversation after finalize (non-fatal)",
+      );
+    }
   };
 }
 
@@ -224,20 +239,31 @@ export async function settleTurnContent(params: {
     );
   }
 
-  // Mirror the final assistant row into the JSONL disk view. Guarded like the
-  // steps above: this runs AFTER the terminal SSE, so a throw here must not
-  // escape into the loop's outer catch and emit a second, contradictory
-  // terminal event for a turn the client already saw complete.
-  try {
-    if (state.lastAssistantMessageId && liveConversation) {
-      syncMessageToDisk(
-        ctx.conversationId,
-        state.lastAssistantMessageId,
-        liveConversation.createdAt,
-      );
+  // Mirror every assistant row finalized by this turn into the JSONL disk
+  // view. Most turns contribute only their last row. A turn that delivered its
+  // reply through `send_user_message` can also contribute an earlier row that
+  // received the reply attachment. Set insertion order preserves the reply's
+  // position, while adding the last row deduplicates the ordinary case where
+  // both ids are the same.
+  if (liveConversation) {
+    const messageIds = new Set(state.assistantMessageIdsToSync);
+    if (state.lastAssistantMessageId) {
+      messageIds.add(state.lastAssistantMessageId);
     }
-  } catch (err) {
-    rlog.warn({ err }, "Failed to sync assistant message to disk (non-fatal)");
+    for (const messageId of messageIds) {
+      try {
+        syncMessageToDisk(
+          ctx.conversationId,
+          messageId,
+          liveConversation.createdAt,
+        );
+      } catch (err) {
+        rlog.warn(
+          { err, messageId },
+          "Failed to sync assistant message to disk (non-fatal)",
+        );
+      }
+    }
   }
 }
 
@@ -274,6 +300,8 @@ export async function runDeferredTurnTail(params: {
    * notification producer's delivery-surface gates.
    */
   replyDeliveredInAppOnly?: boolean;
+  /** Scheduled continuations keep their existing result-delivery owner. */
+  cronRunId?: string | null;
 }): Promise<void> {
   const {
     conversationId,
@@ -339,6 +367,17 @@ export async function runDeferredTurnTail(params: {
       conversation,
     });
   }
+  void emitBackgroundResultNotification({
+    conversationId,
+    assistantMessageId: turnCompleted
+      ? (state.lastAssistantMessageId ?? undefined)
+      : undefined,
+    userMessageId,
+    recoverOnly: !turnCompleted,
+    cronRunId: params.cronRunId,
+    conversation,
+    rlog,
+  });
 
   rlog.info(
     {

@@ -1,4 +1,7 @@
 import type { AnsweredQuestion } from "../api/events/question-answered.js";
+import type { ToolActivityMetadata } from "../api/events/tool-result.js";
+import { resolveCallSiteConfig } from "../config/llm-resolver.js";
+import { getConfig } from "../config/loader.js";
 import type { LLMCallSite } from "../config/schemas/llm.js";
 import { SEND_USER_MESSAGE_TOOL_NAME } from "../config/send-user-message-constants.js";
 import { recordEstimate } from "../context/estimator-calibration.js";
@@ -11,8 +14,10 @@ import {
   getCalibrationProviderKey,
 } from "../context/token-estimator.js";
 import { spoolAndStubOversizedToolResults } from "../context/tool-result-spool.js";
-import type { ToolActivityMetadata } from "../daemon/message-types/web-activity.js";
-import { parseActualTokensFromError } from "../daemon/parse-actual-tokens-from-error.js";
+import {
+  looksLikeContextOverflowError,
+  parseActualTokensFromError,
+} from "../daemon/parse-actual-tokens-from-error.js";
 import type { TrustContext } from "../daemon/trust-context-types.js";
 import type {
   AgentLoopExitReason,
@@ -42,13 +47,11 @@ import type {
   Provider,
   ProviderResponse,
   SendMessageOptions,
+  TextContent,
   ToolDefinition,
   ToolResultContent,
 } from "../providers/types.js";
-import {
-  isContextOverflowError,
-  NATIVE_WEB_SEARCH_TOOL_NAME,
-} from "../providers/types.js";
+import { NATIVE_WEB_SEARCH_TOOL_NAME } from "../providers/types.js";
 import { recordWatchdogEvent } from "../telemetry/watchdog-events-store.js";
 import {
   ABORT_SETTLE_GRACE_MS,
@@ -74,6 +77,7 @@ import {
   isRepairableOrderingError,
   isUserTerminalHistoryError,
 } from "./history-repair/history-repair.js";
+import { buildToolResultFollowUp } from "./tool-result-follow-up.js";
 
 const log = getLogger("agent-loop");
 
@@ -441,25 +445,26 @@ export type AgentEvent =
       /**
        * Emitted when the provider call throws — i.e. the provider
        * rejected the request before returning a usable response. Carries
-       * the loop-level raw request we attempted to send (messages, tools,
-       * system prompt, provider-agnostic config) plus the thrown error.
+       * the wire request we attempted to send plus the thrown error.
        * Consumers (`handleProviderError` in the daemon handlers, the
        * `onEvent` in `agent-wake`) persist these as `llm_request_logs`
        * rows so failed calls are queryable in the LLM inspector instead
        * of only surfacing in pino logs.
        *
-       * `rawRequest` is the loop-level abstract shape rather than the
-       * provider-specific payload (which the provider builds internally
-       * and never returns when it throws). `actualProvider` echoes the
-       * `ProviderError.provider` tag when available so the persisted row
-       * has the same `provider` column value as a successful `usage` row.
+       * `rawRequest` is `ProviderError.rawRequest` when the throw carried
+       * an inspectable SDK/wire payload (including extra body fields such
+       * as `directions`). The loop does not invent a substitute snapshot
+       * of messages/tools/systemPrompt; a missing payload stays missing.
+       * `actualProvider` echoes `ProviderError.provider` so a routed
+       * invocation (e.g. Vellum via a Fireworks default wrapper) is
+       * attributed to the transport that actually ran.
        *
        * Re-thrown by the inner LLM-call try/catch after emission so the
        * outer agent-loop catch still handles abort, the existing `error`
        * event, and the loop break.
        */
       type: "provider_error";
-      rawRequest: unknown;
+      rawRequest?: unknown;
       error: Error;
       actualProvider?: string;
     }
@@ -661,6 +666,18 @@ type AgentLoopContextWindowResolver = () => {
   overflowRecovery: { enabled: boolean; safetyMarginRatio: number };
 };
 
+/** Final request surface after the pre-model hook has settled. */
+export interface PreparedModelCall {
+  callSite?: LLMCallSite;
+  overrideProfile?: string;
+  forceOverrideProfile: boolean;
+  /** Present when the finalized route opts out of prompt caching. */
+  disableCache?: true;
+  signal?: AbortSignal;
+  systemPrompt: string | null;
+  tools: ToolDefinition[];
+}
+
 interface AgentLoopRunOptionsBase {
   /** Input history the run starts from; the loop appends its output onto a copy. */
   messages: Message[];
@@ -688,7 +705,10 @@ interface AgentLoopRunOptionsBase {
   onCheckpoint?: (
     checkpoint: CheckpointInfo,
   ) => CheckpointDecision | Promise<CheckpointDecision>;
+  /** Semantic call site exposed to hooks, events, and loop behavior. */
   callSite?: LLMCallSite;
+  /** Provider-resolution call site when it differs from turn semantics. */
+  inferenceCallSite?: LLMCallSite;
   /**
    * Route this run's user-facing text through the `send_user_message` tool
    * instead of streamed assistant text. The daemon sets it for main-agent runs
@@ -728,6 +748,12 @@ interface AgentLoopRunOptionsBase {
    */
   overrideProfile?: string;
   /**
+   * Who chose `overrideProfile`: `"auto"` when the Auto profile's router
+   * picked it for this turn. Threaded onto each send's config so usage
+   * attribution reports the routed profile under the `auto` source.
+   */
+  overrideProfileOrigin?: "auto";
+  /**
    * Float the override profile above the call-site layers (named site
    * profile + call-site override) for non-main-agent call sites — the
    * resolver's `forceOverrideProfile` escape hatch. Threaded onto each
@@ -738,6 +764,8 @@ interface AgentLoopRunOptionsBase {
    */
   forceOverrideProfile?: boolean;
   resolveOverrideProfile?: () => string | undefined;
+  /** Observe a finalized model request without delaying provider dispatch. */
+  onModelCallPrepared?: (prepared: PreparedModelCall) => void;
   /**
    * When `true`, the loop owns turn-start and mid-loop compaction. The pre-call
    * budget gate runs before the very first provider call — subsuming the
@@ -1048,6 +1076,17 @@ export interface AgentLoopConstructorOptions {
   toolExecutor?: LoopToolExecutor;
   resolveTools?: (history: Message[]) => ToolDefinition[];
   /**
+   * Observer for the final tool array of each provider call, invoked
+   * immediately before the request leaves with exactly what goes on the wire
+   * (after any provider-native tool is appended, past the inter-call throttle
+   * and the pre-model hooks, and not at all once the run is aborted). This is
+   * the only point that sees the sent array: the dynamic `resolveTools`
+   * callback is also consulted out of band (token counting, compaction
+   * estimates), so a consumer that needs "what the last request sent"
+   * subscribes here rather than wrapping the resolver. Must not throw.
+   */
+  onToolsSent?: (tools: ToolDefinition[]) => void;
+  /**
    * Conversation this loop drives. Scopes the loop-held compaction circuit
    * breaker and is the source of truth the loop's pipeline contexts and
    * post-compaction re-injection resolve the live conversation through.
@@ -1087,6 +1126,7 @@ export class AgentLoop {
   private config: AgentLoopConfig;
   private tools: ToolDefinition[];
   private resolveTools: ((history: Message[]) => ToolDefinition[]) | null;
+  private onToolsSent: ((tools: ToolDefinition[]) => void) | null;
   private toolExecutor: LoopToolExecutor | null;
 
   /**
@@ -1122,6 +1162,7 @@ export class AgentLoop {
       tools,
       toolExecutor,
       resolveTools,
+      onToolsSent,
       conversationId,
       resolveConversationDir,
       transformCompactedHistory,
@@ -1131,6 +1172,7 @@ export class AgentLoop {
     this.config = { ...DEFAULT_CONFIG, ...config };
     this.tools = tools ?? [];
     this.resolveTools = resolveTools ?? null;
+    this.onToolsSent = onToolsSent ?? null;
     this.toolExecutor = toolExecutor ?? null;
     this.conversationId = conversationId;
     this.resolveConversationDir = resolveConversationDir ?? null;
@@ -1413,18 +1455,22 @@ export class AgentLoop {
       requestId,
       onCheckpoint,
       callSite,
+      inferenceCallSite,
       suppressAssistantText = false,
       supportsDynamicUi = true,
       trust,
       overrideProfile,
+      overrideProfileOrigin,
       forceOverrideProfile = false,
       resolveOverrideProfile,
+      onModelCallPrepared,
       compactInPlace = false,
       isNonInteractive = false,
       model: runModel,
       latencyTracker,
       injectionLedgerResets,
     } = options;
+    const providerCallSite = inferenceCallSite ?? callSite;
     // Snapshot the system prompt once per run. The instance field is mutable
     // (the conversation may update it between turns), but a single run must
     // use one consistent prompt — an aborted run left detached after the
@@ -1544,7 +1590,7 @@ export class AgentLoop {
       turn: number,
     ): Promise<{
       resultBlocks: ContentBlock[];
-      additionalContextBlocks: ContentBlock[];
+      additionalContextBlocks: TextContent[];
     }> => {
       if (conversationDir) {
         const toolCallByUseId = new Map(
@@ -1569,7 +1615,7 @@ export class AgentLoop {
         180_000;
 
       const resultBlocks: ContentBlock[] = [];
-      const additionalContextBlocks: ContentBlock[] = [];
+      const additionalContextBlocks: TextContent[] = [];
       for (const block of rawBlocks) {
         if (block.type !== "tool_result") {
           resultBlocks.push(block);
@@ -1870,7 +1916,7 @@ export class AgentLoop {
         // unexecutable client tool. The advisor consult's `advisorProfile` can
         // route `subagentSpawn` to a provider/model whose native-search support
         // differs from the construction-time default, so the gate resolves the
-        // routed target (callSite + overrideProfile) via
+        // routed target (providerCallSite + overrideProfile) via
         // `supportsNativeWebSearchFor` rather than the static
         // `this.provider.supportsNativeWebSearch` snapshot; providers without
         // the routing-aware probe fall back to the static flag. This is a SERVER
@@ -1882,7 +1928,7 @@ export class AgentLoop {
           .supportsNativeWebSearchFor
           ? this.provider.supportsNativeWebSearchFor(
               buildNativeWebSearchProbeOptions(
-                callSite,
+                providerCallSite,
                 resolveEffectiveOverrideProfile(),
                 forceOverrideProfile,
                 this.conversationId,
@@ -1901,11 +1947,11 @@ export class AgentLoop {
         //   1. Per-run explicit (`runModel`)
         //   2. Call-site resolved values (filled by
         //      `RetryProvider.normalizeSendMessageOptions` from
-        //      `resolveCallSiteConfig(callSite, llm)`)
+        //      `resolveCallSiteConfig(providerCallSite, llm)`)
         //   3. Conversation defaults (`this.config.*`, from the resolved
         //      default call-site config)
         //
-        // When `callSite` is present we deliberately leave
+        // When `providerCallSite` is present we deliberately leave
         // `max_tokens`/`thinking`/`effort`/`speed` *unset* in `providerConfig`
         // so the normalizer can fill them from the call-site resolution. The
         // normalizer only writes these fields when they're undefined; if we
@@ -1913,10 +1959,10 @@ export class AgentLoop {
         // for these knobs is silently ignored.
         //
         // `toolChoice` and `cacheTtl` are not part of the call-site schema, so
-        // they always come from `this.config` regardless of `callSite`.
+        // they always come from `this.config` regardless of `providerCallSite`.
         const providerConfig: Record<string, unknown> = {};
 
-        if (!callSite) {
+        if (!providerCallSite) {
           providerConfig.max_tokens = this.config.maxTokens;
         }
 
@@ -1924,7 +1970,7 @@ export class AgentLoop {
           providerConfig.model = runModel;
         }
 
-        if (!callSite) {
+        if (!providerCallSite) {
           const thinking = normalizeThinkingConfigForWire(this.config.thinking);
           if (thinking !== undefined) {
             providerConfig.thinking = thinking;
@@ -1963,9 +2009,9 @@ export class AgentLoop {
         // defaults when absent).
         // User-initiated conversation turns default to `mainAgent` in the
         // agent loop's caller; other invocation contexts (heartbeat, filing,
-        // analyze, etc.) pass their own `callSite`.
-        if (callSite) {
-          providerConfig.callSite = callSite;
+        // analyze, etc.) pass their own provider-resolution site.
+        if (providerCallSite) {
+          providerConfig.callSite = providerCallSite;
           providerConfig.usageTracking = "manual";
           // Per-conversation seed for deterministic `mix`-profile expansion.
           // Sourced from the loop's own conversation id so every LLM call in a
@@ -1993,10 +2039,20 @@ export class AgentLoop {
         // `activeProfile` and any call-site named profile. Threading it on
         // every send (rather than once at construction) keeps subagents that
         // share an `AgentLoop` instance but ought to inherit a different
-        // profile correct — and matches how `callSite` is plumbed.
+        // profile correct, matching how the provider call site is plumbed.
         const effectiveOverrideProfile = resolveEffectiveOverrideProfile();
         if (effectiveOverrideProfile) {
           providerConfig.overrideProfile = effectiveOverrideProfile;
+          // The origin describes the turn-start override. A profile switched
+          // in mid-turn (a confirmed profile session) is the user's pick, so
+          // the origin applies only while the effective override is still
+          // the one the turn started with.
+          if (
+            overrideProfileOrigin &&
+            effectiveOverrideProfile === overrideProfile
+          ) {
+            providerConfig.overrideProfileOrigin = overrideProfileOrigin;
+          }
           if (forceOverrideProfile) {
             providerConfig.forceOverrideProfile = true;
           }
@@ -2197,7 +2253,13 @@ export class AgentLoop {
           // resolver layers `llm.profiles[overrideProfile]` at the top of
           // precedence for the user-facing call, so a model router can pick
           // the profile per message; clearing it drops any seeded override.
+          // The hook context is seeded with the effective override, so an
+          // unchanged profile is still the router's pick and keeps its
+          // origin; a profile the hook changed or cleared is the hook's.
           const hookModelProfile = finalPreModelCtx.modelProfile?.trim();
+          if (hookModelProfile !== effectiveOverrideProfile) {
+            delete providerConfig.overrideProfileOrigin;
+          }
           if (hookModelProfile) {
             providerConfig.overrideProfile = hookModelProfile;
             if (forceOverrideProfile) {
@@ -2217,6 +2279,49 @@ export class AgentLoop {
           );
         }
 
+        if (onModelCallPrepared && !signal?.aborted) {
+          const preparedOverrideProfile =
+            typeof providerConfig.overrideProfile === "string" &&
+            providerConfig.overrideProfile.length > 0
+              ? providerConfig.overrideProfile
+              : undefined;
+          try {
+            const preparedForceOverrideProfile =
+              providerConfig.forceOverrideProfile === true;
+            const disableCache =
+              providerCallSite !== undefined &&
+              resolveCallSiteConfig(providerCallSite, getConfig().llm, {
+                ...(preparedOverrideProfile !== undefined
+                  ? { overrideProfile: preparedOverrideProfile }
+                  : {}),
+                ...(preparedForceOverrideProfile
+                  ? { forceOverrideProfile: true }
+                  : {}),
+                ...(this.conversationId !== undefined
+                  ? { selectionSeed: this.conversationId }
+                  : {}),
+              }).disableCache === true;
+            onModelCallPrepared({
+              ...(providerCallSite !== undefined
+                ? { callSite: providerCallSite }
+                : {}),
+              ...(preparedOverrideProfile !== undefined
+                ? { overrideProfile: preparedOverrideProfile }
+                : {}),
+              forceOverrideProfile: preparedForceOverrideProfile,
+              ...(disableCache ? { disableCache: true as const } : {}),
+              ...(signal !== undefined ? { signal } : {}),
+              systemPrompt: providerOptions.systemPrompt ?? null,
+              tools: currentTools,
+            });
+          } catch (preparedError) {
+            rlog.warn(
+              { err: preparedError },
+              "Prepared model-call observer failed; continuing with provider dispatch",
+            );
+          }
+        }
+
         // Announce the LLM-call boundary so downstream handlers (the
         // daemon's persistence pipeline) can reserve an empty assistant row
         // and stamp the resulting `messageId` onto every streaming event the
@@ -2234,13 +2339,18 @@ export class AgentLoop {
         // turn body (tool execution, plugin pipelines, checkpoints), so
         // recording there would risk mis-attributing tool/plugin throws as
         // provider rejections. On provider failure we emit `provider_error`
-        // with the loop-level raw request so consumers can persist it as an
-        // `llm_request_logs` row, then re-throw so the existing outer catch
-        // continues to handle abort sync, the `error` event, and the loop
-        // break unchanged.
+        // with the inspectable wire request from the throw (when present)
+        // so consumers can persist it as an `llm_request_logs` row, then
+        // re-throw so the existing outer catch continues to handle abort
+        // sync, the `error` event, and the loop break unchanged.
         // Latency: the request is about to leave for the provider. The span
         // from here to the first streamed token is time-to-first-token.
         latencyTracker?.mark("request_sent");
+        // Every await that could cancel the call is behind us; a run aborted
+        // during the throttle or a hook never reports an array it did not send.
+        if (!signal?.aborted) {
+          this.onToolsSent?.(currentTools);
+        }
         let response: ProviderResponse;
         try {
           response = await traceAsyncSection("agent-loop:provider-send", () =>
@@ -2255,26 +2365,18 @@ export class AgentLoop {
               llmCallError instanceof Error
                 ? llmCallError
                 : new Error(String(llmCallError));
-            // Strip non-serializable / runtime-only fields from `options`
-            // before snapshotting. `onEvent` is a closure with side effects
-            // and `signal` is an AbortSignal — neither is meaningful in a
-            // persisted log row, and `JSON.stringify` would silently drop or
-            // misrepresent both.
-            const rawRequest = {
-              provider: this.provider.name,
-              messages: sanitizedHistory,
-              tools: providerOptions.tools,
-              systemPrompt: providerOptions.systemPrompt,
-              config: providerOptions.config,
-            };
+            const invocationProvider =
+              errInstance instanceof ProviderError
+                ? errInstance.provider
+                : this.provider.name;
             onEvent({
               type: "provider_error",
-              rawRequest,
+              ...(errInstance instanceof ProviderError &&
+              errInstance.rawRequest !== undefined
+                ? { rawRequest: errInstance.rawRequest }
+                : {}),
               error: errInstance,
-              actualProvider:
-                errInstance instanceof ProviderError
-                  ? errInstance.provider
-                  : this.provider.name,
+              actualProvider: invocationProvider,
             });
           }
           providerCallError = llmCallError;
@@ -2485,6 +2587,7 @@ export class AgentLoop {
             contentBlocks: response.content.length,
             toolUseCount: modelToolUseBlocks.length,
             durationMs: providerDurationMs,
+            cacheReadInputTokens: response.usage.cacheReadInputTokens,
           },
           "LLM call complete",
         );
@@ -2944,16 +3047,20 @@ export class AgentLoop {
 
         toolUseTurns++;
 
-        // Append any guidance a post-tool-use hook surfaced via
-        // `additionalContext` (e.g. tool-error retry coaching) as separate
-        // blocks. They join the provider-bound history below but were not part
-        // of the tool_result events emitted above, so the model sees the
-        // guidance while the client-facing and persisted tool output stay the
-        // tool's actual result.
-        resultBlocks.push(...additionalContextBlocks);
-
-        // Add tool results as a user message and continue the loop.
-        history.push({ role: "user", content: resultBlocks });
+        // Add the tool results, plus any guidance a post-tool-use hook
+        // surfaced via `additionalContext` (e.g. tool-error retry coaching),
+        // as a user message and continue the loop. The guidance joins the
+        // provider-bound history only: it was not part of the tool_result
+        // events emitted above, so the client-facing and persisted tool
+        // output stay the tool's actual result.
+        history.push({
+          role: "user",
+          content: buildToolResultFollowUp(
+            history,
+            resultBlocks,
+            additionalContextBlocks,
+          ),
+        });
 
         // Invoke checkpoint callback after tool results are in history.
         // Handoff takes precedence over the budget gate: a handoff decision
@@ -3086,7 +3193,7 @@ export class AgentLoop {
         // it is disabled (e.g. agent wakes) there is no ladder to drive, so the
         // overflow falls through to the generic error path below.
         if (
-          isContextOverflowError(error) &&
+          looksLikeContextOverflowError(error) &&
           (options.resolveContextWindow?.().overflowRecovery.enabled ?? false)
         ) {
           if (overflowLadderExhausted) {

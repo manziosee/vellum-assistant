@@ -377,3 +377,94 @@ describe("the capture picker", () => {
     ).toBeGreaterThan(0);
   });
 });
+
+describe("where the capture picker stands", () => {
+  const card = (container: HTMLElement): HTMLElement =>
+    container.querySelector<HTMLElement>("[data-companion-capture-picker]")!;
+
+  test("centres over the bar on a row", () => {
+    const { container } = render(<CompanionCapturePicker sources={SOURCES} />);
+    expect(card(container).style.left).toBe("50%");
+    expect(card(container).style.transform).toContain("translate(-50%");
+  });
+
+  /**
+   * A side-docked bar is a column against the display's edge, so a card
+   * centred over it would hang half off the screen.
+   */
+  test("stands beside a side-docked column, on the side it is told", () => {
+    const right = render(
+      <CompanionCapturePicker sources={SOURCES} side="right" />,
+    );
+    expect(card(right.container).style.left).toMatch(/^calc\(50% \+ /);
+    expect(card(right.container).style.right).toBe("");
+    expect(card(right.container).style.top).toBe("50%");
+    expect(card(right.container).style.transform).toBe("translateY(-50%)");
+    cleanup();
+
+    const left = render(
+      <CompanionCapturePicker sources={SOURCES} side="left" />,
+    );
+    expect(card(left.container).style.right).toMatch(/^calc\(50% \+ /);
+    expect(card(left.container).style.left).toBe("");
+  });
+});
+
+describe("the capture picker without Screen Recording", () => {
+  const WITHOUT_GRANT: CompanionCaptureSources = {
+    ...SOURCES,
+    screenRecordingGranted: false,
+  };
+
+  test("asks for the grant in place of the tiles", () => {
+    const asked: WatchCaptureTarget[] = [];
+    const { container } = render(
+      <CompanionCapturePicker
+        sources={WITHOUT_GRANT}
+        captureThumbnail={async (target) => {
+          asked.push(target);
+          return null;
+        }}
+      />,
+    );
+    expect(tiles(container)).toEqual([]);
+    expect(kinds(container)).toEqual([]);
+    expect(
+      container.querySelector('[data-slot="capture-needs-grant"]'),
+    ).not.toBeNull();
+    // Nothing is asked of a helper that could take no picture.
+    expect(asked).toEqual([]);
+  });
+
+  test("the press is the ask", () => {
+    let allowed = 0;
+    const { container } = render(
+      <CompanionCapturePicker
+        sources={WITHOUT_GRANT}
+        onAllowScreenRecording={() => {
+          allowed += 1;
+        }}
+      />,
+    );
+    fireEvent.click(
+      container.querySelector('[data-slot="capture-needs-grant"] button')!,
+    );
+    expect(allowed).toBe(1);
+  });
+
+  test("a list with the grant, or from a shell that does not say, is tiles", () => {
+    for (const sources of [
+      { ...SOURCES, screenRecordingGranted: true },
+      SOURCES,
+    ]) {
+      const { container, unmount } = render(
+        <CompanionCapturePicker sources={sources} />,
+      );
+      expect(tiles(container)).toEqual(["Screen 1", "Screen 2"]);
+      expect(
+        container.querySelector('[data-slot="capture-needs-grant"]'),
+      ).toBeNull();
+      unmount();
+    }
+  });
+});

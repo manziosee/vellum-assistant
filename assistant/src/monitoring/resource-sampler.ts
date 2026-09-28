@@ -44,9 +44,15 @@ import {
   listProcesses,
 } from "../util/process-tree.js";
 import { readActiveConversations } from "./active-conversations.js";
+import { readDaemonHeartbeat } from "./daemon-heartbeat.js";
 import { topProcessesByFd } from "./file-descriptors.js";
+import { sweepInheritedOomProtection } from "./oom-inheritance-sweep.js";
 import { getTrackedDataFiles, readFileResidency } from "./page-cache.js";
 import { topProcessesByMemory } from "./process-memory.js";
+import {
+  createProcessUsageTracker,
+  type ProcessUsageTracker,
+} from "./process-usage.js";
 import { prunePrefixedJsonFiles } from "./prune-snapshots.js";
 import type {
   ResourceSample,
@@ -65,6 +71,8 @@ const SNAPSHOTS_DIR = "snapshots";
 const MAX_SNAPSHOTS = 20;
 /** Cap on retained baseline snapshots (4h of history at the 10min default). */
 const MAX_BASELINE_SNAPSHOTS = 24;
+/** How often the daemon's descendants are checked for inherited OOM protection. */
+const OOM_SWEEP_INTERVAL_MS = 5_000;
 
 /** Snapshot kinds: filename prefix + retention are per-kind so periodic
  * baselines can never evict high-memory forensics. */
@@ -94,6 +102,7 @@ export function computeSampleDeltas(
 export async function takeSample(
   now: number,
   prev: ResourceSample | null = null,
+  processUsage: ProcessUsageTracker | null = null,
 ): Promise<ResourceSample> {
   const currentBytes = getContainerMemoryUsageBytes();
   const limitBytes = getContainerMemoryLimitBytes();
@@ -129,6 +138,11 @@ export async function takeSample(
         }
       : null,
     activeConversations: readActiveConversations(),
+    // Timestamped at the scan, not the tick start: the disk read above can
+    // take seconds, and the CPU rate needs the counters' real interval.
+    processes:
+      processUsage?.sample(Date.now(), readDaemonHeartbeat(now)?.pid ?? null) ??
+      null,
   };
   if (prev != null) {
     sample.deltas = computeSampleDeltas(prev, sample);
@@ -252,6 +266,8 @@ export function startResourceSampler(
   // Watches the daemon's event-loop heartbeat; captures the daemon main
   // thread's kernel state mid-stall when the heartbeat goes stale.
   const stallCapture = createStallCaptureMonitor(dataDir);
+  const processUsage = createProcessUsageTracker();
+  let lastOomSweepAt = 0;
 
   // Skip ticks while a sample is in flight: the disk measurement can take
   // seconds (du over the workspace), and overlapping ticks would all delta
@@ -273,7 +289,7 @@ export function startResourceSampler(
     const now = clock();
     let sample: ResourceSample;
     try {
-      sample = await takeSample(now, prevSample);
+      sample = await takeSample(now, prevSample, processUsage);
       prevSample = sample;
       buffer.append(sample);
     } catch (err) {
@@ -282,9 +298,30 @@ export function startResourceSampler(
     }
 
     try {
-      stallCapture.check(sample, now);
+      // Judge staleness at capture time, not tick start: sampling can take
+      // seconds, and a stall that ended meanwhile must not be captured from
+      // the recovered daemon.
+      stallCapture.check(sample, clock());
     } catch (err) {
       log.warn({ err }, "Daemon stall check failed");
+    }
+
+    if (now - lastOomSweepAt >= OOM_SWEEP_INTERVAL_MS) {
+      lastOomSweepAt = now;
+      const daemonPid = readDaemonHeartbeat(now)?.pid;
+      if (daemonPid != null) {
+        try {
+          const resets = sweepInheritedOomProtection({
+            daemonPid,
+            keepPids: new Set([process.pid]),
+          });
+          for (const reset of resets) {
+            log.warn(reset, "Reset OOM protection inherited from the daemon");
+          }
+        } catch (err) {
+          log.warn({ err }, "OOM inheritance sweep failed");
+        }
+      }
     }
 
     const ratio = sample.memory?.ratio;

@@ -32,11 +32,43 @@ mock.module("../../ipc/cli-client.js", () => ({
 }));
 
 import {
+  NOTIFY_ACTIVATION_PROGRESS_CHANGED_IPC_METHOD,
+  NOTIFY_CONVERSATION_LIST_CHANGED_IPC_METHOD,
   NOTIFY_CONVERSATION_PERSISTED_IPC_METHOD,
   NOTIFY_DOCUMENTS_CHANGED_IPC_METHOD,
+  notifyDaemonActivationProgressChanged,
+  notifyDaemonConversationListChanged,
   notifyDaemonConversationPersisted,
   notifyDaemonDocumentsChanged,
 } from "./worker-daemon-notify.js";
+
+describe("notifyDaemonConversationListChanged", () => {
+  beforeEach(() => {
+    calls.length = 0;
+    nextResult = { ok: true };
+    shouldThrow = false;
+  });
+
+  test("hands the reason and ids to the daemon over the shared IPC method", async () => {
+    await notifyDaemonConversationListChanged("reordered", ["conv-1"]);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.method).toBe(NOTIFY_CONVERSATION_LIST_CHANGED_IPC_METHOD);
+    expect(calls[0]!.params).toEqual({
+      body: { reason: "reordered", conversationIds: ["conv-1"] },
+    });
+  });
+
+  test("swallows a thrown IPC error (best-effort, no throw)", async () => {
+    shouldThrow = true;
+
+    const result = await notifyDaemonConversationListChanged("reordered", [
+      "conv-1",
+    ]);
+    expect(result).toBeUndefined();
+    expect(calls).toHaveLength(1);
+  });
+});
 
 describe("notifyDaemonConversationPersisted", () => {
   beforeEach(() => {
@@ -97,6 +129,40 @@ describe("notifyDaemonDocumentsChanged", () => {
     shouldThrow = true;
 
     const result = await notifyDaemonDocumentsChanged();
+    expect(result).toBeUndefined();
+    expect(calls).toHaveLength(1);
+  });
+});
+
+describe("notifyDaemonActivationProgressChanged", () => {
+  beforeEach(() => {
+    calls.length = 0;
+    nextResult = { ok: true };
+    shouldThrow = false;
+  });
+
+  test("asks the daemon to republish over the shared IPC method", async () => {
+    await notifyDaemonActivationProgressChanged();
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.method).toBe(
+      NOTIFY_ACTIVATION_PROGRESS_CHANGED_IPC_METHOD,
+    );
+    expect(calls[0]!.params).toEqual({ body: {} });
+  });
+
+  test("swallows a failed IPC result (best-effort, no throw)", async () => {
+    nextResult = { ok: false, error: "daemon unreachable" };
+
+    const result = await notifyDaemonActivationProgressChanged();
+    expect(result).toBeUndefined();
+    expect(calls).toHaveLength(1);
+  });
+
+  test("swallows a thrown IPC error (best-effort, no throw)", async () => {
+    shouldThrow = true;
+
+    const result = await notifyDaemonActivationProgressChanged();
     expect(result).toBeUndefined();
     expect(calls).toHaveLength(1);
   });

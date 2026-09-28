@@ -25,8 +25,8 @@ Centralizing through a bus also gives us:
   matching on event shapes.
 - **One place for lifecycle policy.** Tab visibility, network
   reachability, and Capacitor app-state all interact with the SSE
-  connection (tear down on hidden, reopen on resume, bounce on
-  retry). Putting that policy in the bus owner keeps it consistent
+  connection (retain desktop connections while hidden, suspend native mobile
+  after its grace period, and recover on resume or retry). Putting that policy in the bus owner keeps it consistent
   across every consumer.
 - **No polling.** Components that need to react to server-side state
   changes subscribe to a typed event instead of running their own
@@ -43,13 +43,63 @@ Centralizing through a bus also gives us:
 | `clients/web/src/runtime/event-sources/*`                 | One file per host-environment signal (DOM visibility, network online/offline, Capacitor app state, Electron `powerMonitor`, Electron window attention, Electron deep links). Each calls `publish` directly and returns an unsubscribe.                                                                                    |
 | `clients/web/src/runtime/event-sources/lifecycle-edge.ts` | Not a source: the shared seam the DOM-visibility, Capacitor app-state, and Electron window-attention sources publish through. Collapses two reports of one physical foreground / background edge into a single `app.resume` / `app.hidden`.                                                                          |
 | `clients/web/src/lib/lifecycle-diagnostics.ts`            | Bus consumer that records `app.*` / `power.*` signals into the durable lifecycle diagnostics ring so support bundles show whether any resume / visibility / network signal fired, and whether a desktop window reported itself watched (`app.attention`) when a notification did not arrive. Attached once alongside the signal sources in `use-event-bus-init.ts`.                                       |
-| `clients/web/src/assistant/sse-service.ts`                | Non-React owner of the assistant-scoped SSE connection. Opens the stream, republishes envelopes as `sse.event`, drives the bounce policy from `app.*` / `power.*` / `reachability.*` signals.                                                                                                  |
+| `clients/web/src/assistant/sse-service.ts`                | Non-React owner of the assistant-scoped SSE connection. Opens the stream, republishes envelopes as `sse.event` a task's worth at a time (see [SSE envelope delivery](#sse-envelope-delivery)), drives the bounce policy from `app.*` / `power.*` / `reachability.*` signals.                                                                                                  |
 
 The bus is a plain pub/sub module. Handlers fire synchronously from
-`publish()` so a burst of events isn't collapsed into a single React
-commit cycle. The handler `Map` lives in module scope, not in any
-Zustand store — consumers never read it, only register handlers into
-it and dispatch through it.
+`publish()` and never through reactive state: an event held in a store
+field reaches React once per commit, so a burst written inside one
+batched commit would surface only its last event and lose the rest.
+Every published event reaches every handler. The handler `Map` lives in
+module scope, not in any Zustand store: consumers never read it, only
+register handlers into it and dispatch through it.
+
+### SSE envelope delivery
+
+Losing no event is a delivery guarantee. It is not a promise of one
+React commit per event, and `sse.event` is where the difference matters.
+The stream transport hands envelopes over one per microtask (its
+`for await` read loop), and React flushes a synchronous commit in the
+microtask after a store write. Published straight from that callback, a
+network chunk or a reconnect replay of N envelopes is N full commits
+back to back inside one task. That saturates a slower renderer for the
+length of a reply, and it is how the app reached
+`Maximum update depth exceeded`: React counts a commit toward its
+nested-update limit when it finishes with an update still pending, any
+effect that sets state leaves one pending until the task ends, and the
+store write after the fiftieth such commit throws.
+
+`sse-service.ts` therefore queues envelopes and drains the queue from a
+single `MessageChannel` task, publishing each in arrival order, so React
+batches everything the run writes into one commit. The rules the queue
+keeps:
+
+- **Order.** The queue is flushed synchronously before `sse.opened` and
+  `sse.closed` are published and on every teardown path (hidden grace,
+  power, reachability, anchor, debug, detach), so no lifecycle signal
+  overtakes an envelope received before it.
+- **Nothing dropped by a teardown.** A flushed envelope is dispatched
+  exactly as if it had been published on arrival. Only an envelope that
+  arrives after detach is discarded; its `seq` never advanced the
+  reconnect cursor, and the next attach starts cold.
+- **A task, and not a timer or a frame.** Browsers throttle timers in a
+  background tab and stop animation frames, and the stream stays open
+  while desktop tabs remain alive to deliver notifications.
+
+- **A drain survives its own failure.** The queue is consumed as it is
+  published, so if a throw ever escapes `publish`, only the envelope being
+  published is lost and the rest drain on the next task.
+
+A subscriber may rely on seeing every envelope in order. It may not rely
+on React having committed between two envelopes.
+
+### Handler errors
+
+`publish` catches each handler's throw so one failing subscriber cannot
+block the ones after it, and reports it through `captureError`
+(`context: "event_bus.handler"`, tagged `bus_event` with the event name).
+A handler that throws has skipped the rest of its work for that event,
+and most subscribers have no catch of their own, so the report is the
+only trace.
 
 ## Event protocol
 
@@ -70,7 +120,7 @@ Every event name in `BusEventMap` has a typed payload. Producers:
 | `assistant.unreachable`            | `{}`                                                                                          | A daemon SDK request came back 502/503/504: it reached the platform but not the assistant's runtime. `daemonUnreachableInterceptor` publishes it so the connecting overlay appears even when the failure lands on an incidental request rather than on the SSE stream; `lifecycle-service.ts` subscribes and kicks its retry probe.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `app.resume`                       | `{ signal: "visibility" \| "app_state" \| "online" \| "window_attention" }`                   | Page visible, app foregrounded, or network came back online. At most one per physical foreground edge: iOS reports the same edge twice (`visibilitychange` and Capacitor `appStateChange`, milliseconds apart) and `runtime/event-sources/lifecycle-edge.ts` collapses the pair, keeping the label of whichever source arrived first. `signal: "online"` is outside that dedup and always fires. `signal: "window_attention"` is the Electron desktop renderer's only report of this edge, since Vellum windows disable background throttling and the Page Visibility API with it; it tracks whether the window is on screen, not whether it holds focus.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `app.hidden`                       | `{ signal: "visibility" \| "app_state" \| "window_attention" }`                               | Page hidden or app backgrounded. Deduped per physical edge exactly like `app.resume`. Only repeats of the same edge collapse, so a hide landing between two foregrounds is always delivered. Backgrounded is what it means to consumers: they release the camera, drop live capture consent, and abandon an armed shutter press. `assistant/sse-service.ts` is the one consumer that reads the label, and it keeps the stream through a `"window_attention"` hide: a minimized desktop window has no push fallback, so a torn-down stream is a notification lost outright.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `app.attention`                    | `{ attended: boolean }`                                                                       | Electron host only: the window this renderer runs in gained or lost the user's attention, meaning on screen, unminimized, and holding keyboard focus. Separate from `app.resume` / `app.hidden`, which report only whether the window is on screen: a window sitting visible behind another app is still showing the transcript, so the consumers that release the camera hardware must not act on a focus change. Published for every attention change including the first payload, so a consumer that read attention before the host reported any is corrected rather than left waiting for the next edge. `hooks/use-web-presence-report.ts` consumes it and posts `visible: false` the moment focus leaves, so a reply to the conversation that window was showing is not suppressed on the strength of a report that stays fresh for the daemon's whole TTL. Off Electron never fires: `document.hasFocus()` is window-level and false for a visible tab in an unfocused browser window, so visibility stays the browser's contract for whether a conversation is on screen. `runtime/window-attention.ts` exposes the same fact synchronously as `isWindowAttended()`, and `isVisibleToUser()` is the cross-platform predicate consumers should ask. |
+| `app.attention` | `{ attended: boolean }` | Electron per-window focus/visibility reports and browser window focus/blur. Separate from visibility lifecycle events so losing focus does not stop cameras or other on-screen work. Presence and notification suppression use `isClientAttended()`: Electron host attention, browser visibility plus `document.hasFocus()`, or Capacitor foreground visibility. |
 | `app.online`                       | `{}`                                                                                          | `window.online` fired. Always accompanies a paired `app.resume{signal:"online"}`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `app.offline`                      | `{}`                                                                                          | `window.offline` fired.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `reachability.retry-requested`     | `{}`                                                                                          | Burst-limited reachability retry succeeded on recovery into `"ready"` from a degraded phase (`"connecting"`, `"checking"`, or `"failed"`); the bus bounces its SSE. A `"ready"` entered from `"idle"` or `"ready"` confirms an already-healthy stream (boot, remount) and does not publish.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
@@ -340,11 +390,17 @@ export function setupMyStore(): () => void {
 ## Testing
 
 `lib/event-bus.test.ts` covers the pub/sub surface (subscribe,
-unsubscribe, publish, isolation between event names, throwing-handler
-robustness). `assistant/sse-service.test.ts` covers SSE behavior:
-open gating, event re-broadcast, `sse.opened` cause tagging, teardown
+unsubscribe, publish, isolation between event names, and a throwing
+handler: downstream handlers still run, and each throw is reported
+through `captureError` tagged with its event). `assistant/sse-service.test.ts` covers SSE behavior:
+open gating, event re-broadcast, envelope delivery (one task per run,
+ordering against `sse.opened` / `sse.closed` / teardown / detach),
+`sse.opened` cause tagging, teardown
 on `app.hidden`, reopen on `app.resume`, the dedup window, and the
-power-driven bounce paths. `use-event-bus-init.test.tsx` asserts the
+power-driven bounce paths. `assistant/sse-service-react-commits.test.tsx`
+renders a component against the real service and bus and asserts a long
+run of envelopes costs one commit and never trips React's nested-update
+limit. `use-event-bus-init.test.tsx` asserts the
 thin React-adapter contract (don't attach without a resolved id /
 without an active assistant). Each `runtime/event-sources/*` file
 has a colocated unit test exercising its publish contract via
@@ -359,3 +415,51 @@ has a colocated unit test exercising its publish contract via
   — why the bus is a plain pub/sub module, not a Zustand store.
 - [`CAPACITOR.md`](./CAPACITOR.md) — Capacitor `App.appStateChange`
   feeds the bus's `app.resume` / `app.hidden` channels on iOS.
+
+## Open-tab browser notifications
+
+Desktop browser tabs retain the existing assistant SSE connection while hidden.
+Native mobile retains its grace teardown and resume recovery; Electron retains
+its main-process attention bridge. All other `app.hidden` consumers still pause
+foreground work, and hidden or blurred browsers report conversation presence as
+away. A long background still triggers connection recovery on resume.
+
+Imperative browser directives (`open_url`, `open_conversation`,
+`navigate_settings`, and `open_panel`) require a visible, focused tab through
+`runtime/window-attention.ts`'s `canHandleForegroundDirective()`. Unattended tabs
+ignore these directives without replaying them on focus or acknowledging panels;
+notification delivery and state synchronization continue through SSE. Capacitor
+and Electron retain their native handoff behavior regardless of browser focus.
+
+Each browser page publishes its attended account/assistant/conversation scope
+before notification intents arrive. Other tabs check that shared attention at
+delivery time, so a hidden tab stays quiet even if it receives the intent first.
+The existing attention and lifecycle bus signals refresh or clear the lease;
+route, conversation, identity changes, and unmount also clear it. Attended pages
+renew their lease every five seconds and abandoned leases expire after fifteen
+seconds. Suppression acknowledges a handled intent and records no accepted post.
+
+Settings exposes an explicit browser notification permission action. Notification
+arrival never opens a browser permission prompt. Browser delivery uses the
+captured account/connection and assistant identity with the signal correlation ID
+(or delivery ID) for an IndexedDB transaction. A bounded receipt ledger retains
+only accepted posts for ten minutes, with a maximum of 128 receipts. The
+transaction checks session ownership and conversation attention before posting,
+then commits the receipt. This keeps ownership atomic across browser processes,
+where a localStorage write can remain invisible after a Web Lock is released.
+Browser chimes use a separate bounded ownership ledger so prompt, denied, and
+unsupported notification permission produce at most one fallback sound across
+tabs. A sound claim does not create an accepted-post receipt; failed delivery
+remains reported as failed and another tab can retry the browser post.
+Failed posts release the claim; duplicate tabs neither chime nor acknowledge a
+post they did not make. Logout clears localStorage mirrors and attention leases;
+IndexedDB receipts contain only scoped delivery IDs and expirations, with expired
+entries pruned on the next claim. These receipts record browser API acceptance,
+not proof the user saw an OS banner. If the transaction fails after posting, the
+page retains its local receipt and does not repeat the OS side effect.
+
+When IndexedDB is unavailable, localStorage mirrors, Web Locks when supported,
+and a stable scoped Notification tag provide best-effort coordination. Atomic
+cross-tab deduplication is unavailable in that fallback. Tabs that the browser freezes,
+discards, or closes, and sleeping/offline devices, cannot guarantee live delivery.
+Closed-tab Web Push requires a separate service worker and server delivery path.

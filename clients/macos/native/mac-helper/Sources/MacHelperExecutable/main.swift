@@ -66,6 +66,7 @@ final class MacHelper: @unchecked Sendable {
     /// so "held" is per modifier rather than per bit.
     private var modifierHoldMasks: [UInt32] = []
     private var isModifierHoldDown = false
+    private var selectionReadSession = SelectionReadSession()
     /// The chord binding: the modifiers that must be held, and the keys that
     /// mean something with them. Its own binding rather than a mode of the
     /// hold's, because it is a different question about the keyboard: the hold
@@ -91,6 +92,17 @@ final class MacHelper: @unchecked Sendable {
     private var scrollMonitor: Any?
     private var scrollEndReport: DispatchWorkItem?
     private static let scrollEndGap: TimeInterval = 0.12
+    /// The global mouse-down monitor, up only while main is waiting for a
+    /// press on something the assistant is pointing at, and the rectangles
+    /// that press would have to land in. The monitor comes down on the first
+    /// hit: a mark is one step, and the step is done once.
+    ///
+    /// Where a press landed is read here and nowhere else, and only against
+    /// these rectangles: what leaves the process is which of them was hit,
+    /// never the point. An `NSEvent` monitor for the reason the scroll one
+    /// is, so pointing does not depend on Input Monitoring.
+    private var pressMonitor: Any?
+    private var pressRects: [CGRect] = []
     private let outputLock = NSLock()
     private var dictationSession: DictationPartialsSession?
     // Bumped on every dictation.setPartials so a pending speech-authorization
@@ -181,11 +193,11 @@ final class MacHelper: @unchecked Sendable {
         // What is highlighted in the application in front, read when the app
         // asks rather than on every press: a hold that has outlasted the
         // chords passing through it is the one worth reading for.
-        router.register("selection.read") { [weak self] _ in
+        router.register("selection.read") { [weak self] params in
             guard let self else {
                 throw JsonRpcDispatchError.internalError("Helper is shutting down")
             }
-            return self.readFrontSelection()
+            return self.readFrontSelection(expectedHoldId: (params as? [String: Any])?["holdId"] as? Int)
         }
         // Which of the given applications are running, by bundle identifier.
         // The voice key asks before it arms Fn: another app watching the same
@@ -262,6 +274,37 @@ final class MacHelper: @unchecked Sendable {
             }
             return try self.setScrollWatch(enable: enable)
         }
+        // Whether the next press lands on something the assistant is pointing
+        // at. `rects` are where those things are, in screen points with the
+        // origin at the top-left of the primary display; none is the watch
+        // coming down. Reported once, as the index of the rectangle hit.
+        router.register("input.setPressWatch") { [weak self] params in
+            guard let self else {
+                throw JsonRpcDispatchError.internalError("Helper is shutting down")
+            }
+            guard
+                let object = params as? [String: Any],
+                let rects = object["rects"] as? [[String: Any]]
+            else {
+                throw JsonRpcDispatchError.invalidParams(
+                    "input.setPressWatch requires rects"
+                )
+            }
+            let parsed = try rects.map { rect -> CGRect in
+                guard
+                    let x = rect["x"] as? Double,
+                    let y = rect["y"] as? Double,
+                    let width = rect["width"] as? Double,
+                    let height = rect["height"] as? Double
+                else {
+                    throw JsonRpcDispatchError.invalidParams(
+                        "input.setPressWatch rects need x, y, width and height"
+                    )
+                }
+                return CGRect(x: x, y: y, width: width, height: height)
+            }
+            return try self.setPressWatch(rects: parsed)
+        }
         // Where a paste would land, asked when there are words to paste rather
         // than when a hold opens. No hold guard: the hold is over by then, and
         // the words exist whether or not a key is still down.
@@ -270,6 +313,22 @@ final class MacHelper: @unchecked Sendable {
                 throw JsonRpcDispatchError.internalError("Helper is shutting down")
             }
             return self.readFrontFocus()
+        }
+        // Command plus a key, sent to the application in front: the paste
+        // that lands dictation at the cursor and the undo that takes it back.
+        router.register("keys.shortcut") { [weak self] params in
+            guard
+                let object = params as? [String: Any],
+                let name = object["key"] as? String,
+                let key = FrontShortcut.keys[name]
+            else {
+                throw JsonRpcDispatchError.invalidParams(
+                    "keys.shortcut requires key \"v\" or \"z\""
+                )
+            }
+            let outcome = FrontShortcut.post(key: key)
+            self?.log("front shortcut: cmd+\(name) \(outcome.rawValue)")
+            return ["outcome": outcome.rawValue]
         }
         router.register("permission.status") { [weak self] params in
             guard let self else {
@@ -354,10 +413,12 @@ final class MacHelper: @unchecked Sendable {
         case .down:
             guard !isModifierHoldDown else { return }
             isModifierHoldDown = true
+            selectionReadSession.begin(processId: NSWorkspace.shared.frontmostApplication?.processIdentifier)
             params["state"] = "down"
         case .up(let reason):
             guard isModifierHoldDown else { return }
             isModifierHoldDown = false
+            selectionReadSession.end()
             params["state"] = "up"
             params["reason"] = reason.rawValue
         }
@@ -370,15 +431,23 @@ final class MacHelper: @unchecked Sendable {
     /// after the keys are up would sample whatever the user moved on to, and
     /// a hold over that is not the hold that was made. Character counts only
     /// in the log; the text itself is the user's.
-    private func readFrontSelection() -> [String: Any] {
-        guard isModifierHoldDown else {
-            log("front selection: skipped, no hold is open")
-            return [:]
+    private func readFrontSelection(expectedHoldId: Int?) -> [String: Any] {
+        guard let holdId = selectionReadSession.token(
+            processId: NSWorkspace.shared.frontmostApplication?.processIdentifier,
+            expected: expectedHoldId
+        ) else {
+            log("front selection: unavailable, hold or application changed")
+            return ["unavailable": true]
         }
         let readStarted = Date()
-        let outcome = FrontSelection.read()
+        let outcome = FrontSelection.read(activateChromium: expectedHoldId == nil)
         let readMs = Int(Date().timeIntervalSince(readStarted) * 1000)
         log("front selection: \(outcome.logLine) truncated=\(outcome.selection?.truncated ?? false) readMs=\(readMs)")
+        if outcome.unavailable {
+            return SelectionReadSession.unavailableResult(
+                holdId: holdId, trusted: outcome.trusted, chromium: outcome.chromium
+            )
+        }
         guard let selection = outcome.selection else {
             return [:]
         }
@@ -499,6 +568,14 @@ final class MacHelper: @unchecked Sendable {
         guard let key = chordKey(for: event) else {
             return false
         }
+        // A key held down repeats as further key-downs. The press was answered
+        // on the first of them; the repeats are still this app's (left alone
+        // they would type the key's character into the front app) and are
+        // taken without being reported, so a chord that toggles something
+        // toggles it once per press rather than once per repeat.
+        if event.getIntegerValueField(.keyboardEventAutorepeat) != 0 {
+            return true
+        }
         writeNotification(
             method: "hotkey.event",
             params: ["kind": "chord", "state": "down", "key": key]
@@ -610,6 +687,52 @@ final class MacHelper: @unchecked Sendable {
         scrollMonitor = nil
     }
 
+    /// Watch for the next press inside one of `rects`, or stop watching when
+    /// there are none. A new list replaces the old one under a monitor that
+    /// is already up, so pointing at the next step does not take the monitor
+    /// down and put it back.
+    private func setPressWatch(rects: [CGRect]) throws -> [String: Any] {
+        pressRects = rects
+        if rects.isEmpty {
+            removePressMonitor()
+            return ["enabled": false]
+        }
+        if pressMonitor == nil {
+            guard
+                let monitor = NSEvent.addGlobalMonitorForEvents(matching: .leftMouseDown, handler: { [weak self] _ in
+                    self?.handlePress()
+                })
+            else {
+                throw HelperError.eventMonitor("NSEvent.addGlobalMonitorForEvents(.leftMouseDown)")
+            }
+            pressMonitor = monitor
+        }
+        return ["enabled": true]
+    }
+
+    /// A press went down somewhere on the desktop while main is waiting for
+    /// one. Only whether it landed in a watched rectangle is read, and which;
+    /// a press anywhere else is nothing, and keeps the watch up.
+    private func handlePress() {
+        guard let primaryHeight = NSScreen.screens.first?.frame.maxY else {
+            return
+        }
+        let point = PressWatch.flipped(NSEvent.mouseLocation, primaryHeight: primaryHeight)
+        guard let index = PressWatch.hit(point, in: pressRects) else {
+            return
+        }
+        removePressMonitor()
+        writeNotification(method: "input.pressed", params: ["index": index])
+    }
+
+    private func removePressMonitor() {
+        pressRects = []
+        if let pressMonitor {
+            NSEvent.removeMonitor(pressMonitor)
+        }
+        pressMonitor = nil
+    }
+
     private func readCommands() {
         while let line = readLine() {
             guard !line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -639,11 +762,17 @@ final class MacHelper: @unchecked Sendable {
             case "cu.perform":
                 dispatchCuPerform(line: line)
                 return
+            case "cu.cancel":
+                dispatchCuCancel(line: line)
+                return
             case "capture.frame":
                 dispatchCaptureFrame(line: line)
                 return
             case "ax.locate":
                 dispatchAxLocate(line: line)
+                return
+            case "ax.candidates":
+                dispatchAxCandidates(line: line)
                 return
             case "appControl.perform":
                 dispatchAppControlPerform(line: line)
@@ -685,6 +814,27 @@ final class MacHelper: @unchecked Sendable {
             self?.writeResponse(
                 JsonRpcCodec.successResponse(id: id, result: CaptureSources.raise(windowId: windowId))
             )
+        }
+    }
+
+    /// Stop a `cu.perform` still in flight. Runs on the main actor with the
+    /// runner, and returns at once: the running request notices before its
+    /// next action.
+    private func dispatchCuCancel(line: String) {
+        Task { @MainActor in
+            let object = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any]
+            let id = object?["id"] ?? NSNull()
+            let params = object?["params"] as? [String: Any] ?? [:]
+            guard let requestId = params["requestId"] as? String else {
+                self.writeResponse(JsonRpcCodec.errorResponse(
+                    id: id,
+                    code: JsonRpcErrorCode.invalidParams,
+                    message: "cu.cancel requires requestId"
+                ))
+                return
+            }
+            HostCuActionRunner.cancel(requestId: requestId)
+            self.writeResponse(JsonRpcCodec.successResponse(id: id, result: ["cancelled": true]))
         }
     }
 
@@ -740,6 +890,188 @@ final class MacHelper: @unchecked Sendable {
         AXLabel.shortlist(labels, limit: labelsReturned, each: labelLength)
     }
 
+    /// The named controls a shared surface actually shows, each with the part
+    /// of its frame that can be seen, or nil when there is no tree to read.
+    ///
+    /// Shared by `ax.locate` and `ax.candidates` so the list a caller is
+    /// offered is exactly the list a name is later resolved against.
+    ///
+    /// A window names its own tree. A display does not have one, so the
+    /// frontmost window standing on it is the tree to read: a person sharing
+    /// their screen and naming a control means the one they are looking at,
+    /// which is the same window computer use reads.
+    @MainActor
+    private func visibleNamedElements(
+        params: [String: Any]
+    ) async -> (elements: [(element: AXElement, frame: CGRect)], roots: [AXElement])? {
+        let enumerator = AccessibilityTreeEnumerator()
+        let windowId = (params["windowId"] as? NSNumber).map { CGWindowID($0.uint32Value) }
+        let displayId = (params["displayId"] as? NSNumber)?.uint32Value
+        let located = if let windowId {
+            await enumerator.enumerateWindow(windowId: windowId)
+        } else {
+            await enumerator.enumerateCurrentWindow()
+        }
+        guard let tree = located else { return nil }
+
+        // The rectangle the caller is going to measure against: the
+        // display's bounds or the window's, whichever is being shared.
+        // Nothing outside it is on the surface, whatever the tree says.
+        let surface: CGRect? = if let displayId {
+            CGDisplayBounds(CGDirectDisplayID(displayId))
+        } else if let windowId {
+            enumerator.serverWindow(for: windowId)?.bounds
+        } else {
+            nil
+        }
+        let flattened = AccessibilityTreeEnumerator.flattenClipped(tree.elements)
+
+        // Focus is one thing across every monitor, so the window it names
+        // can be standing on a different screen from the one asked about.
+        // The caller normalises what comes back against that screen's
+        // bounds, so a frame from elsewhere resolves to somewhere
+        // arbitrary on it: a tree that is not on the display is no tree.
+        // Read off the whole tree rather than the candidates below, since
+        // where a window is and what it has worth pointing at are two
+        // questions.
+        if let displayId,
+           !AXDisplayMatch.tree(
+               at: flattened.map(\.element.frame),
+               standsOn: CGDisplayBounds(CGDirectDisplayID(displayId))
+           ) {
+            return nil
+        }
+
+        // Anything named and actually on screen is a thing that can be
+        // pointed at, interactive or not: a value someone is reading is as
+        // legitimate a target as a button they are about to press.
+        //
+        // Where it can actually be seen, though. A tree reaches past what
+        // is being shown, in two directions: outward, since a window can
+        // lie across the seam between two monitors, and inward, since a
+        // scroll view keeps the rows above and below the ones on screen at
+        // the frames they would have if they were on screen. The first
+        // draws at a clamped edge, the second squarely over unrelated
+        // content, and both while the answer says it landed exactly.
+        // Neither is a candidate, and a query that named one comes back
+        // with the labels that can be seen instead.
+        //
+        // What comes back is the part that can be seen, not the whole
+        // frame. A control half over the seam between two monitors is
+        // worth pointing at from the shared one, but its middle can be on
+        // the other, and the caller aims at the middle of what it is
+        // given: clipped here, every answer is a rectangle wholly on the
+        // surface it will be measured against.
+        let elements = flattened.compactMap {
+            candidate -> (element: AXElement, frame: CGRect)? in
+            let element = candidate.element
+            guard let name = element.annotationName, !name.isEmpty else { return nil }
+            guard element.frame.width > 0, element.frame.height > 0 else { return nil }
+            var seen = element.frame
+            for bound in [candidate.visible, surface] {
+                guard let bound else { continue }
+                seen = seen.intersection(bound)
+            }
+            guard !seen.isEmpty else { return nil }
+            return (element: element, frame: seen)
+        }
+        return (elements: elements, roots: tree.elements)
+    }
+
+    /// Containers whose name says which part of a window a control is in: a
+    /// toolbar, a sidebar list, a dialog, a web landmark carrying an
+    /// `aria-label`.
+    private static let sectionRoles: Set<String> = [
+        "AXGroup", "AXToolbar", "AXList", "AXOutline", "AXTable", "AXTabGroup",
+        "AXSheet", "AXPopover", "AXMenu", "AXMenuBar", "AXScrollArea",
+        "AXSplitGroup", "AXRadioGroup", "AXLayoutArea",
+    ]
+    private static let sectionLength = 40
+
+    /// The nearest named container above each element, by element id.
+    ///
+    /// Read off the tree already in hand, so it costs a walk and no further
+    /// accessibility IPC.
+    private static func sections(
+        of elements: [AXElement],
+        within section: String? = nil,
+        into result: inout [Int: String]
+    ) {
+        for element in elements {
+            if let section { result[element.id] = section }
+            var inner = section
+            if sectionRoles.contains(element.role),
+               let name = AXLabel.nonBlank(element.annotationName) {
+                inner = AXLabel.singleLine(name, max: sectionLength)
+            }
+            sections(of: element.children, within: inner, into: &result)
+        }
+    }
+
+    /// How many controls `ax.candidates` describes, and how long each name
+    /// may be.
+    ///
+    /// Wider than a refusal's shortlist because the caller prunes and ranks
+    /// what arrives before anything reads it; the bound here only keeps a web
+    /// page of ten thousand elements from becoming the IPC payload.
+    private static let candidatesReturned = 300
+    private static let candidateLabelLength = 200
+
+    /// Every named control a shared surface shows, with its role and the part
+    /// of its frame that can be seen, in screen points.
+    ///
+    /// For a caller that wants to offer the names before one is asked for,
+    /// so the first `ax.locate` names something that is there. The same
+    /// controls `ax.locate` resolves against, in tree order, bounded to
+    /// `candidatesReturned`; `candidateCount` says how many there were.
+    private func dispatchAxCandidates(line: String) {
+        Task { @MainActor in
+            let object = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any]
+            let id = object?["id"] ?? NSNull()
+            let params = object?["params"] as? [String: Any] ?? [:]
+            guard params["windowId"] != nil || params["displayId"] != nil else {
+                self.writeResponse(JsonRpcCodec.errorResponse(
+                    id: id,
+                    code: JsonRpcErrorCode.invalidParams,
+                    message: "ax.candidates requires windowId or displayId"
+                ))
+                return
+            }
+            guard let read = await self.visibleNamedElements(params: params) else {
+                self.writeResponse(JsonRpcCodec.successResponse(id: id, result: [
+                    "found": false,
+                    "reason": "no-tree",
+                ]))
+                return
+            }
+            let elements = read.elements
+            var sections: [Int: String] = [:]
+            Self.sections(of: read.roots, into: &sections)
+            let described: [[String: Any]] = elements.prefix(Self.candidatesReturned).map { entry in
+                var described: [String: Any] = [
+                    "label": AXLabel.singleLine(
+                        entry.element.annotationName ?? "",
+                        max: Self.candidateLabelLength
+                    ),
+                    "role": entry.element.role,
+                    "x": Double(entry.frame.origin.x),
+                    "y": Double(entry.frame.origin.y),
+                    "width": Double(entry.frame.width),
+                    "height": Double(entry.frame.height),
+                ]
+                if let section = sections[entry.element.id] {
+                    described["section"] = section
+                }
+                return described
+            }
+            self.writeResponse(JsonRpcCodec.successResponse(id: id, result: [
+                "found": true,
+                "elements": described,
+                "candidateCount": elements.count,
+            ]))
+        }
+    }
+
     /// Where in a window the control someone named actually is.
     ///
     /// The point of the whole errand: the accessibility tree knows every
@@ -766,94 +1098,16 @@ final class MacHelper: @unchecked Sendable {
                 ))
                 return
             }
-            // A window names its own tree. A display does not have one, so the
-            // frontmost window standing on it is the tree to read: a person
-            // sharing their screen and naming a control means the one they are
-            // looking at, which is the same window computer use reads.
-            let enumerator = AccessibilityTreeEnumerator()
-            let windowId = (params["windowId"] as? NSNumber).map { CGWindowID($0.uint32Value) }
-            let displayId = (params["displayId"] as? NSNumber)?.uint32Value
-            let located = if let windowId {
-                await enumerator.enumerateWindow(windowId: windowId)
-            } else {
-                await enumerator.enumerateCurrentWindow()
-            }
-            guard let tree = located else {
+            guard let elements = await self.visibleNamedElements(params: params)?.elements else {
                 self.writeResponse(JsonRpcCodec.successResponse(id: id, result: [
                     "found": false,
                     "reason": "no-tree",
                 ]))
                 return
-            }
-
-            // The rectangle the caller is going to measure against: the
-            // display's bounds or the window's, whichever is being shared.
-            // Nothing outside it is on the surface, whatever the tree says.
-            let surface: CGRect? = if let displayId {
-                CGDisplayBounds(CGDirectDisplayID(displayId))
-            } else if let windowId {
-                enumerator.serverWindow(for: windowId)?.bounds
-            } else {
-                nil
-            }
-            let flattened = AccessibilityTreeEnumerator.flattenClipped(tree.elements)
-
-            // Focus is one thing across every monitor, so the window it names
-            // can be standing on a different screen from the one asked about.
-            // The caller normalises what comes back against that screen's
-            // bounds, so a frame from elsewhere resolves to somewhere
-            // arbitrary on it: a tree that is not on the display is no tree.
-            // Read off the whole tree rather than the candidates below, since
-            // where a window is and what it has worth pointing at are two
-            // questions.
-            if let displayId,
-               !AXDisplayMatch.tree(
-                   at: flattened.map(\.element.frame),
-                   standsOn: CGDisplayBounds(CGDirectDisplayID(displayId))
-               ) {
-                self.writeResponse(JsonRpcCodec.successResponse(id: id, result: [
-                    "found": false,
-                    "reason": "no-tree",
-                ]))
-                return
-            }
-
-            // Anything named and actually on screen is a thing that can be
-            // pointed at, interactive or not: a value someone is reading is as
-            // legitimate a target as a button they are about to press.
-            //
-            // Where it can actually be seen, though. A tree reaches past what
-            // is being shown, in two directions: outward, since a window can
-            // lie across the seam between two monitors, and inward, since a
-            // scroll view keeps the rows above and below the ones on screen at
-            // the frames they would have if they were on screen. The first
-            // draws at a clamped edge, the second squarely over unrelated
-            // content, and both while the answer says it landed exactly.
-            // Neither is a candidate, and a query that named one comes back
-            // with the labels that can be seen instead.
-            //
-            // What comes back is the part that can be seen, not the whole
-            // frame. A control half over the seam between two monitors is
-            // worth pointing at from the shared one, but its middle can be on
-            // the other, and the caller aims at the middle of what it is
-            // given: clipped here, every answer is a rectangle wholly on the
-            // surface it will be measured against.
-            let elements = flattened.compactMap {
-                candidate -> (element: AXElement, frame: CGRect)? in
-                let element = candidate.element
-                guard let title = element.title, !title.isEmpty else { return nil }
-                guard element.frame.width > 0, element.frame.height > 0 else { return nil }
-                var seen = element.frame
-                for bound in [candidate.visible, surface] {
-                    guard let bound else { continue }
-                    seen = seen.intersection(bound)
-                }
-                guard !seen.isEmpty else { return nil }
-                return (element: element, frame: seen)
             }
             let outcome = AXTargetMatch.locate(
                 query: query,
-                among: elements.map { AXTargetMatch.Candidate(label: $0.element.title ?? "") }
+                among: elements.map { AXTargetMatch.Candidate(label: $0.element.annotationName ?? "") }
             )
 
             switch outcome {
@@ -861,7 +1115,7 @@ final class MacHelper: @unchecked Sendable {
                 let (element, frame) = elements[index]
                 self.writeResponse(JsonRpcCodec.successResponse(id: id, result: [
                     "found": true,
-                    "label": AXLabel.singleLine(element.title ?? "", max: Self.labelLength),
+                    "label": AXLabel.singleLine(element.annotationName ?? "", max: Self.labelLength),
                     "role": element.role,
                     "x": Double(frame.origin.x),
                     "y": Double(frame.origin.y),
@@ -921,9 +1175,14 @@ final class MacHelper: @unchecked Sendable {
                     "height": result.metadata?.screenshotHeightPx ?? 0,
                 ]))
             } catch {
+                let code = if case CaptureError.permissionDenied = error {
+                    JsonRpcErrorCode.permissionDenied
+                } else {
+                    JsonRpcErrorCode.internalError
+                }
                 self.writeResponse(JsonRpcCodec.errorResponse(
                     id: id,
-                    code: JsonRpcErrorCode.internalError,
+                    code: code,
                     message: error.localizedDescription
                 ))
             }
@@ -1392,6 +1651,7 @@ final class MacHelper: @unchecked Sendable {
     private enum PermissionKind: String {
         case speechRecognition
         case inputMonitoring
+        case screen
     }
 
     private func parsePermissionKind(_ params: Any?) throws -> PermissionKind {
@@ -1413,6 +1673,8 @@ final class MacHelper: @unchecked Sendable {
             return speechRecognitionStatus()
         case .inputMonitoring:
             return inputMonitoringStatus()
+        case .screen:
+            return screenRecordingStatus()
         }
     }
 
@@ -1453,11 +1715,27 @@ final class MacHelper: @unchecked Sendable {
         }
     }
 
+    /// Screen Recording as this process holds it. The helper disclaims
+    /// responsibility, so this is the helper's own grant and not the app's:
+    /// the two are separate rows in System Settings.
+    ///
+    /// Never "not-determined": the preflight answers only yes or no, and a
+    /// helper that has never asked reads the same as one that was refused.
+    /// The answer is fixed for the life of a process, so a fresh read comes
+    /// from a fresh launch.
+    private func screenRecordingStatus() -> String {
+        CGPreflightScreenCaptureAccess() ? "granted" : "denied"
+    }
+
     /// The keyboard tap the hold detector reads. Installed when a binding asks
     /// for it and removed once none is left.
     private func ensureMonitorInstalled() throws {
         guard keyboardTap == nil else {
             return
+        }
+        // Only an explicit setup action requests Input Monitoring.
+        guard IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted else {
+            throw HelperError.eventTap("Input Monitoring not granted")
         }
         do {
             try installEventHandlers()
@@ -1553,6 +1831,7 @@ final class MacHelper: @unchecked Sendable {
         activityWatch = false
         releaseMonitorIfUnused()
         removeScrollMonitor()
+        removePressMonitor()
     }
 
     private func writeNotification(method: String, params: Any? = nil) {
@@ -1669,9 +1948,24 @@ if CommandLine.arguments.contains("--front-selection") {
     }
 } else if CommandLine.arguments.contains("--request-input-monitoring") {
     MainActor.assumeIsolated {
+        NSApplication.shared.setActivationPolicy(.accessory)
+        DispatchQueue.main.async {
+            NSApplication.shared.activate(ignoringOtherApps: true)
+            if IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) != kIOHIDAccessTypeGranted {
+                _ = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
+            }
+            NSApplication.shared.terminate(nil)
+        }
+        NSApplication.shared.run()
+    }
+} else if CommandLine.arguments.contains("--request-screen-recording") {
+    // Asking is also what lists the helper under Screen Recording in System
+    // Settings, so this runs before Settings is opened even where macOS will
+    // not show its prompt again.
+    MainActor.assumeIsolated {
         NSApplication.shared.setActivationPolicy(.prohibited)
-        if IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) != kIOHIDAccessTypeGranted {
-            _ = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
+        if !CGPreflightScreenCaptureAccess() {
+            _ = CGRequestScreenCaptureAccess()
         }
         NSApplication.shared.terminate(nil)
     }

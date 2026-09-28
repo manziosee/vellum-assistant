@@ -6,6 +6,7 @@
  */
 import { z } from "zod";
 
+import { prepareComputerUseObservation } from "../../daemon/computer-use-observation.js";
 import { findConversation } from "../../daemon/conversation-registry.js";
 import { ACTOR_PRINCIPALS } from "../auth/route-policy.js";
 import { SAME_ACTOR_FORBIDDEN_DESCRIPTION } from "../auth/same-actor.js";
@@ -36,6 +37,10 @@ const HostCuResultBodySchema = z.object({
   executionError: z.string().optional(),
   secondaryWindows: z.string().optional(),
   userGuidance: z.string().optional(),
+  timings: z
+    .record(z.string(), z.number())
+    .describe("Per-phase helper timings in milliseconds")
+    .optional(),
 });
 
 // ---------------------------------------------------------------------------
@@ -56,6 +61,7 @@ async function handleHostCuResult({ body, headers }: RouteHandlerArgs) {
     executionError,
     secondaryWindows,
     userGuidance,
+    timings,
   } = parseBody(HostCuResultBodySchema, body);
 
   const peeked = pendingInteractions.get(requestId);
@@ -107,7 +113,7 @@ async function handleHostCuResult({ body, headers }: RouteHandlerArgs) {
     throw new NotFoundError("No host CU proxy for conversation");
   }
 
-  conversation.hostCuProxy.processObservation(requestId, {
+  const observation = await prepareComputerUseObservation({
     axTree,
     axDiff,
     screenshot,
@@ -119,7 +125,9 @@ async function handleHostCuResult({ body, headers }: RouteHandlerArgs) {
     executionError,
     secondaryWindows,
     userGuidance,
+    timings,
   });
+  conversation.hostCuProxy.processObservation(requestId, observation);
 
   return { accepted: true };
 }

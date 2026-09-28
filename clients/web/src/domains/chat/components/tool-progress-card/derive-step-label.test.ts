@@ -35,6 +35,7 @@ describe("deriveStepLabel", () => {
       title: "Working",
       info: "echo hello world",
       activity: "",
+      actionDisplayKey: "terminal",
       iconName: "terminal",
     });
   });
@@ -124,8 +125,48 @@ describe("deriveStepLabel", () => {
       title: "Using computer",
       info: "screenshot",
       activity: "",
+      actionDisplayKey: "observe",
       iconName: "monitor",
     });
+  });
+
+  test("classifies browser shell operations without exposing typed values", () => {
+    const cases = [
+      ["click #submit", "click"],
+      ["type very-secret-value", "type"],
+      ["press_key Enter", "keyPress"],
+      ["scroll down", "scroll"],
+      ["drag 10 20", "drag"],
+      ["hover .menu", "hover"],
+      ["screenshot", "observe"],
+      ["navigate https://example.com", "navigate"],
+    ] as const;
+    for (const [operation, actionDisplayKey] of cases) {
+      const result = deriveStepLabel(
+        buildToolCall({
+          name: "host_bash",
+          input: { command: `assistant browser ${operation}` },
+        }),
+      );
+      expect(result.title).toBe("Working");
+      expect(result.actionDisplayKey).toBe(actionDisplayKey);
+    }
+  });
+
+  test("keeps malformed browser and unknown computer actions on existing labels", () => {
+    expect(
+      deriveStepLabel(
+        buildToolCall({
+          name: "host_bash",
+          input: { command: "assistant browser wait 500" },
+        }),
+      ).actionDisplayKey,
+    ).toBeUndefined();
+    expect(
+      deriveStepLabel(
+        buildToolCall({ name: "computer", input: { action: "future_action" } }),
+      ).actionDisplayKey,
+    ).toBeUndefined();
   });
 
   test("mcp__<server>__<method> → Using <server> with method as info", () => {
@@ -235,17 +276,17 @@ describe("deriveStepLabel", () => {
     );
   });
 
-  test("skill_load falls back to input.reason when activity is absent", () => {
+  test("a tool's own reason argument is not read as its status", () => {
     const result = deriveStepLabel(
       buildToolCall({
-        name: "skill_load",
-        input: { name: "deep-research", reason: "Loading research playbook" },
+        name: "app_control_stop",
+        input: { reason: "Task complete" },
       }),
     );
-    expect(result.activity).toBe("Loading research playbook");
+    expect(result.activity).toBe("");
   });
 
-  test("no activity or reason → activity is the empty string", () => {
+  test("no activity → activity is the empty string", () => {
     const result = deriveStepLabel(
       buildToolCall({
         name: "bash",

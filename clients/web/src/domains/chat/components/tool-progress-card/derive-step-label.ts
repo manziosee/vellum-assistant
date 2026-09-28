@@ -13,12 +13,17 @@
 
 import type { ChatMessageToolCall } from "@/domains/chat/api/event-types";
 import {
-  ACTIVITY_KEYS,
+  ACTIVITY_KEY,
   COMMAND_KEYS,
   FILE_PATH_KEYS,
   readToolInputString,
 } from "@/domains/chat/utils/tool-input";
-import { titleCaseToolName } from "@/domains/chat/components/tool-call-chip/utils";
+import {
+  parseBrowserOperation,
+  titleCaseToolName,
+  type BrowserOperation,
+} from "@/domains/chat/components/tool-call-chip/utils";
+import type { ActionDisplayKey } from "@/domains/chat/components/tool-progress-card/action-display-label";
 import { truncate } from "@/domains/chat/utils/truncate";
 
 /**
@@ -48,16 +53,97 @@ export interface StepLabel {
   info: string;
   /**
    * Rich, human-readable activity sentence the daemon attaches to the tool
-   * input (`input.activity`, legacy `input.reason`), mirroring macOS
-   * `reasonDescription`. Empty string when absent. Drives pill/drawer text;
-   * `title` remains the stable phase-grouping key — do NOT fold activity into
-   * `title`.
+   * input (`input.activity`). Empty string when absent. Drives pill/drawer
+   * text; `title` remains the stable phase-grouping key: do NOT fold activity
+   * into `title`.
    */
   activity: string;
+  actionDisplayKey?: ActionDisplayKey;
   iconName: IconName;
 }
 
 const INFO_MAX_LENGTH = 80;
+
+function browserActionDisplayKey(
+  operation: BrowserOperation,
+): ActionDisplayKey | undefined {
+  switch (operation) {
+    case "click":
+      return "click";
+    case "type":
+    case "select":
+    case "fill_credential":
+      return "type";
+    case "press_key":
+      return "keyPress";
+    case "scroll":
+      return "scroll";
+    case "drag":
+      return "drag";
+    case "hover":
+      return "hover";
+    case "screenshot":
+    case "snapshot":
+    case "extract":
+      return "observe";
+    case "navigate":
+    case "back":
+    case "forward":
+    case "refresh":
+    case "close":
+    case "tab":
+      return "navigate";
+    case "wait":
+    case "wait_for":
+    case "unknown":
+      return undefined;
+  }
+}
+
+function computerActionDisplayKey(
+  action: string,
+): ActionDisplayKey | undefined {
+  switch (action.toLowerCase()) {
+    case "click":
+    case "left_click":
+    case "right_click":
+    case "double_click":
+      return "click";
+    case "type":
+    case "insert_text":
+      return "type";
+    case "key":
+    case "keypress":
+    case "key_press":
+    case "press_key":
+      return "keyPress";
+    case "scroll":
+      return "scroll";
+    case "drag":
+      return "drag";
+    case "hover":
+    case "move":
+    case "mouse_move":
+      return "hover";
+    case "screenshot":
+    case "snapshot":
+    case "observe":
+      return "observe";
+    case "navigate":
+    case "open":
+      return "navigate";
+    default:
+      return undefined;
+  }
+}
+
+function shellActionDisplayKey(command: string): ActionDisplayKey | undefined {
+  const browserOperation = parseBrowserOperation(command);
+  if (browserOperation) {
+    return browserActionDisplayKey(browserOperation);
+  }
+  return command ? "terminal" : undefined;
+}
 
 /** Extract the trailing path segment from a file path. Returns `""` if empty. */
 function basename(path: string): string {
@@ -116,9 +202,9 @@ export function deriveStepLabelFromName(
 
   // Rich activity sentence the daemon attaches to the input. Computed once and
   // spread onto every branch so phase-grouping (`title`/`info`/`iconName`)
-  // stays untouched. `readToolInputString` trims and returns "" when neither
-  // key is set.
-  const activity = readToolInputString(inputBag, ...ACTIVITY_KEYS);
+  // stays untouched. `readToolInputString` trims and returns "" when it is
+  // absent.
+  const activity = readToolInputString(inputBag, ACTIVITY_KEY);
 
   const mcp = parseMcpToolName(toolName);
   if (mcp) {
@@ -139,6 +225,7 @@ export function deriveStepLabelFromName(
         title: "Working",
         info: truncate(cleaned, INFO_MAX_LENGTH),
         activity,
+        actionDisplayKey: shellActionDisplayKey(command),
         iconName: "terminal",
       };
     }
@@ -205,6 +292,7 @@ export function deriveStepLabelFromName(
         title: "Using computer",
         info: action,
         activity,
+        actionDisplayKey: computerActionDisplayKey(action),
         iconName: "monitor",
       };
     }

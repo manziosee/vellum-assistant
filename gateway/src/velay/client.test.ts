@@ -33,9 +33,23 @@ let velayWebhooksEnabled = false;
 let webhookRouteReadError: Error | undefined;
 let webhookRouteReads = 0;
 
+let fetchImplFn: (
+  input: string | URL | Request,
+  init?: RequestInit,
+) => Promise<Response> = async () => new Response("not found", { status: 404 });
+
+mock.module("../fetch.js", () => ({
+  fetchImpl: (input: string | URL | Request, init?: RequestInit) =>
+    fetchImplFn(input, init),
+}));
+
 mock.module("../credential-reader.js", () => ({
   getWorkspaceDir: () => workspaceDir,
   readCredential: async () => undefined,
+  readCredentialResult: async () => ({
+    value: undefined,
+    unreachable: false,
+  }),
 }));
 
 mock.module("../db/webhook-ingress-route-store.js", () => ({
@@ -67,11 +81,22 @@ const {
 } = await import("./allowed-paths.js");
 const { VelayTunnelClient, createVelayTunnelClient, enablePublicIngress } =
   await import("./client.js");
+const { applyPlatformIdentityIds, _resetPlatformIdentityForTests } =
+  await import("../platform-identity.js");
 
 const WS_OPEN = WebSocket.OPEN;
 const WS_CLOSED = WebSocket.CLOSED;
 
 function makeCredentials(values: Record<string, string | undefined>) {
+  const assistantId =
+    values[credentialKey("vellum", "platform_assistant_id")]?.trim();
+  if (assistantId) {
+    applyPlatformIdentityIds({
+      assistantId,
+      organizationId: "",
+      userId: "",
+    });
+  }
   return {
     get: async (key: string) => values[key],
     onInvalidate: () => () => {},
@@ -182,6 +207,7 @@ function makeClient(
       gatewayLoopbackBaseUrl: string,
     ) => Promise<VelayHttpResponseFrame>;
     websocketFrames?: VelayWebSocketInboundFrame[];
+    tunnelSend?: { send?: (frame: VelayFrame) => void };
     reconnectDelays?: number[];
     refresh?: { afterMs?: number; busyRetryMs?: number };
     timerCallbacks?: Array<() => void>;
@@ -211,6 +237,9 @@ function makeClient(
             if (overrides.bridgeIdle && onIdle) {
               overrides.bridgeIdle.fire = onIdle;
             }
+            if (overrides.tunnelSend) {
+              overrides.tunnelSend.send = _sendFrame;
+            }
             return {
               handleFrame: (frame: VelayWebSocketInboundFrame) => {
                 overrides.websocketFrames?.push(frame);
@@ -235,8 +264,22 @@ function sendFrame(ws: FakeWebSocket, frame: VelayFrame): void {
 }
 
 async function flushPromises(): Promise<void> {
-  for (let i = 0; i < 6; i++) {
+  for (let i = 0; i < 12; i++) {
     await Promise.resolve();
+  }
+}
+
+const originalAssistantApiKey = process.env.ASSISTANT_API_KEY;
+const originalPlatformUrl = process.env.VELLUM_PLATFORM_URL;
+const originalPlatformAssistantId = process.env.PLATFORM_ASSISTANT_ID;
+const originalPlatformOrgId = process.env.PLATFORM_ORGANIZATION_ID;
+const originalPlatformUserId = process.env.PLATFORM_USER_ID;
+
+function restoreEnv(name: string, value: string | undefined): void {
+  if (value === undefined) {
+    delete process.env[name];
+  } else {
+    process.env[name] = value;
   }
 }
 
@@ -246,10 +289,23 @@ beforeEach(() => {
   velayWebhooksEnabled = false;
   webhookRouteReadError = undefined;
   webhookRouteReads = 0;
+  fetchImplFn = async () => new Response("not found", { status: 404 });
+  delete process.env.ASSISTANT_API_KEY;
+  delete process.env.VELLUM_PLATFORM_URL;
+  delete process.env.PLATFORM_ASSISTANT_ID;
+  delete process.env.PLATFORM_ORGANIZATION_ID;
+  delete process.env.PLATFORM_USER_ID;
+  _resetPlatformIdentityForTests();
 });
 
 afterEach(() => {
   rmSync(workspaceDir, { recursive: true, force: true });
+  restoreEnv("ASSISTANT_API_KEY", originalAssistantApiKey);
+  restoreEnv("VELLUM_PLATFORM_URL", originalPlatformUrl);
+  restoreEnv("PLATFORM_ASSISTANT_ID", originalPlatformAssistantId);
+  restoreEnv("PLATFORM_ORGANIZATION_ID", originalPlatformOrgId);
+  restoreEnv("PLATFORM_USER_ID", originalPlatformUserId);
+  _resetPlatformIdentityForTests();
 });
 
 describe("enablePublicIngress", () => {
@@ -372,6 +428,7 @@ describe("VelayTunnelClient", () => {
       protocols: [VELAY_TUNNEL_SUBPROTOCOL],
       headers: {
         Authorization: "Api-Key api-key-123",
+        "X-Vellum-Velay-Binary-WebSocket": "1",
         "X-Vellum-Velay-Allowed-Paths": VELAY_ALLOWED_PATHS_HEADER_VALUE,
       },
     });
@@ -569,6 +626,50 @@ describe("VelayTunnelClient", () => {
     });
   });
 
+  test("awaits validate before rejecting a mismatched registration", async () => {
+    const sockets: FakeWebSocket[] = [];
+    process.env.ASSISTANT_API_KEY = "api-key-123";
+    process.env.VELLUM_PLATFORM_URL = "https://platform.example.com";
+    fetchImplFn = async () =>
+      new Response(
+        JSON.stringify({
+          assistant_id: "asst-123",
+          organization_id: "org-123",
+          user_id: "user-123",
+        }),
+        { status: 200 },
+      );
+    writeConfig({
+      ingress: { publicBaseUrl: "https://ngrok.example.test" },
+    });
+    const client = makeClient({
+      sockets,
+      credentials: makeCredentials({
+        [credentialKey("vellum", "assistant_api_key")]: "api-key-123",
+      }),
+    });
+
+    client.start();
+    for (let i = 0; i < 50 && sockets.length === 0; i++) {
+      await Promise.resolve();
+      if (i % 5 === 4) {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+    }
+    expect(sockets).toHaveLength(1);
+    sockets[0].readyState = WS_OPEN;
+    sendFrame(sockets[0], {
+      type: VELAY_FRAME_TYPES.registered,
+      assistant_id: "asst-other",
+      public_url: "https://velay-public.example.test",
+    });
+    await flushPromises();
+
+    expect(sockets[0].closes).toEqual([
+      { code: 4008, reason: "assistant ID mismatch" },
+    ]);
+  });
+
   test("backs off repeated open-then-close failures until registration succeeds", async () => {
     const sockets: FakeWebSocket[] = [];
     const reconnectDelays: number[] = [];
@@ -664,6 +765,7 @@ describe("VelayTunnelClient", () => {
       protocols: [VELAY_TUNNEL_SUBPROTOCOL],
       headers: {
         Authorization: "Api-Key api-key-123",
+        "X-Vellum-Velay-Binary-WebSocket": "1",
         "X-Vellum-Velay-Allowed-Paths": VELAY_ALLOWED_PATHS_HEADER_VALUE,
       },
     });
@@ -683,6 +785,11 @@ describe("VelayTunnelClient", () => {
       resolveFirstApiKeyRead = resolve;
     });
     let useFreshCredentials = false;
+    applyPlatformIdentityIds({
+      assistantId: "asst-123",
+      organizationId: "",
+      userId: "",
+    });
     const credentials = {
       get: async (key: string) => {
         if (key === apiKeyCredential) {
@@ -720,6 +827,7 @@ describe("VelayTunnelClient", () => {
       protocols: [VELAY_TUNNEL_SUBPROTOCOL],
       headers: {
         Authorization: "Api-Key api-key-123",
+        "X-Vellum-Velay-Binary-WebSocket": "1",
         "X-Vellum-Velay-Allowed-Paths": VELAY_ALLOWED_PATHS_HEADER_VALUE,
       },
     });
@@ -1021,7 +1129,7 @@ describe("VelayTunnelClient", () => {
     expect(invalidations.count).toBe(1);
   });
 
-  test("dispatches HTTP and WebSocket frames to the loopback bridges", async () => {
+  test("keeps HTTP and WebSocket bridges usable after malformed tunnel messages", async () => {
     const sockets: FakeWebSocket[] = [];
     const websocketFrames: VelayWebSocketInboundFrame[] = [];
     const httpBridge = mock(
@@ -1040,6 +1148,18 @@ describe("VelayTunnelClient", () => {
     client.start();
     await flushPromises();
     sockets[0].readyState = WS_OPEN;
+
+    for (const data of [
+      "not JSON",
+      new Uint8Array().buffer,
+      new Uint8Array([1, 2]).buffer,
+      new Uint8Array([255]),
+      new TextEncoder().encode('{"type":"unknown"}'),
+    ]) {
+      sockets[0].emit("message", { data });
+    }
+    await flushPromises();
+    expect(sockets[0].closes).toEqual([]);
 
     sendFrame(sockets[0], {
       type: VELAY_FRAME_TYPES.httpRequest,
@@ -1083,6 +1203,59 @@ describe("VelayTunnelClient", () => {
       VELAY_FRAME_TYPES.websocketMessage,
       VELAY_FRAME_TYPES.websocketClose,
     ]);
+  });
+
+  test("writes binary envelopes without JSON while control frames remain JSON", async () => {
+    const sockets: FakeWebSocket[] = [];
+    const tunnelSend: { send?: (frame: VelayFrame) => void } = {};
+    const client = makeClient({ sockets, websocketFrames: [], tunnelSend });
+    client.start();
+    await flushPromises();
+    sockets[0].readyState = WS_OPEN;
+    const id = "0123456789abcdef0123456789abcdef";
+    tunnelSend.send!({
+      type: "websocket_binary",
+      connection_id: id,
+      payload: new Uint8Array([0, 255]),
+    });
+    tunnelSend.send!({
+      type: "websocket_close",
+      connection_id: id,
+      code: 1000,
+    });
+    expect(sockets[0].sent).toEqual([
+      new Uint8Array([1, ...new TextEncoder().encode(id), 0, 255]),
+      JSON.stringify({
+        type: "websocket_close",
+        connection_id: id,
+        code: 1000,
+      }),
+    ]);
+    await client.stop();
+  });
+
+  test("dispatches binary tunnel messages and ignores malformed envelopes", async () => {
+    const sockets: FakeWebSocket[] = [];
+    const websocketFrames: VelayWebSocketInboundFrame[] = [];
+    const client = makeClient({ sockets, websocketFrames });
+    client.start();
+    await flushPromises();
+    sockets[0].readyState = WS_OPEN;
+    const id = "0123456789abcdef0123456789abcdef";
+    sockets[0].emit("message", {
+      data: new Uint8Array([1, ...new TextEncoder().encode(id), 0, 255]).buffer,
+    });
+    expect(websocketFrames).toEqual([
+      {
+        type: "websocket_binary",
+        connection_id: id,
+        payload: new Uint8Array([0, 255]),
+      },
+    ]);
+    sockets[0].emit("message", { data: new Uint8Array([1, 2]).buffer });
+    expect(sockets[0].closes).toEqual([]);
+    expect(websocketFrames).toHaveLength(1);
+    await client.stop();
   });
 
   test("ignores websocket messages with invalid message types", async () => {

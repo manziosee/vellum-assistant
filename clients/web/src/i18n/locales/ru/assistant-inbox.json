@@ -1,0 +1,104 @@
+{
+  "assistantInboxHeader": {
+    "title": "Почта",
+    "settingsAria": "Настройки почты"
+  },
+  "addressPill": {
+    "copyAddress": "Скопировать адрес",
+    "copied": "Скопировано",
+    "copyFailed": "Не удалось скопировать адрес."
+  },
+  "assistantInboxPage": {
+    "folderAriaLabel": "Папка почты",
+    "inboxTab": "Полученные",
+    "sentTab": "Отправленные",
+    "inboxEmptyTitle": "Пока пусто",
+    "inboxEmptyBody": "Поделитесь адресом {address}, и всё, что на него придёт, появится здесь.",
+    "sentEmptyTitle": "Отправленных писем пока нет",
+    "sentEmptyBody": "Попросите меня написать кому-нибудь, и я сохраню копию здесь.",
+    "selectPromptTitle": "Выберите письмо, чтобы прочитать его",
+    "selectPromptBody": "Выберите письмо в списке. Отметьте несколько, чтобы начать чат с ними во вложении или удалить их.",
+    "backToList": "К списку",
+    "searchPlaceholder": "Найти письма",
+    "searchAriaLabel": "Искать в этой папке",
+    "searchEmptyTitle": "Ничего не найдено",
+    "searchEmptyBody": "В этой папке ничего не соответствует запросу."
+  },
+  "emailListRow": {
+    "toPrefix": "Кому: {name}",
+    "attachments": "{count, plural, one {# вложение} few {# вложения} many {# вложений} other {# вложения}}",
+    "noSubject": "(без темы)",
+    "selectAria": "Выбрать «{subject}»",
+    "unread": "Непрочитано"
+  },
+  "emailSelectionBar": {
+    "ariaLabel": "Выбранные письма",
+    "count": "{count, plural, one {Выбрано # письмо} few {Выбрано # письма} many {Выбрано # писем} other {Выбрано # письма}}",
+    "mixed": "{received, plural, one {# полученное} few {# полученных} many {# полученных} other {# полученных}} · {sent, plural, one {# отправленное} few {# отправленных} many {# отправленных} other {# отправленных}}",
+    "startChat": "Начать новый чат",
+    "delete": "Удалить из почты",
+    "clear": "Снять выбор"
+  },
+  "deleteEmailsDialog": {
+    "title": "Удалить {count, plural, one {это письмо} few {# письма} many {# писем} other {# письма}}?",
+    "message": "{count, plural, one {Оно исчезнет из почты на этом устройстве.} other {Они исчезнут из почты на этом устройстве.}}",
+    "confirm": "Удалить",
+    "cancel": "Отмена"
+  },
+  "emailDetail": {
+    "from": "От:",
+    "to": "Кому:",
+    "attachments": "Вложения",
+    "askToReply": "Попросить {name} ответить",
+    "loading": "Загружаем письмо…",
+    "loadFailed": "Не удалось загрузить это письмо.",
+    "copyEmail": "Копировать письмо",
+    "copied": "Скопировано",
+    "copyFailed": "Не удалось скопировать письмо."
+  },
+  "emailAddressFields": {
+    "prefixLabel": "Префикс",
+    "prefixPlaceholder": "hi",
+    "handleLabel": "Имя (публичное)",
+    "handlePlaceholder": "my-assistant"
+  },
+  "assistantInboxUpgradeState": {
+    "title": "Дайте {name} почтовый ящик",
+    "subtitle": "Адрес, на который могут писать люди, и одно место, где можно прочитать всё, что приходит.",
+    "perkAddress": "Настоящий адрес на {rootDomain}",
+    "perkReads": "{name} читает, сортирует и отвечает за вас",
+    "perkHistory": "Каждое письмо хранится здесь: входящие и отправленные",
+    "upgradeButton": "Перейти на Super",
+    "seePlans": "Планы",
+    "titleNoName": "Дайте ассистенту почтовый ящик",
+    "perkReadsNoName": "Ассистент читает, сортирует и отвечает за вас",
+    "changeHandle": "Изменить handle ({address})",
+    "planNotice": "Почта не входит в бесплатный план. Перейдите на план с почтой."
+  },
+  "assistantInboxSetupCard": {
+    "headline": "Отлично, давайте всё настроим.",
+    "fieldLabel": "Выберите почтовый handle:",
+    "fieldLabelChooseHandle": "Выберите handle и префикс почты:",
+    "confirm": "Подтвердить",
+    "immutableNotice": "Это имя станет публичным именем ассистента. После установки изменить его нельзя."
+  },
+  "assistantInboxRoute": {
+    "loading": "Открываем почту…",
+    "setupFailed": "Не удалось настроить адрес.",
+    "setupIncomplete": "Адрес не был создан. Попробуйте ещё раз через минуту.",
+    "replyPrompt": "Ответь на письмо с id {id} из твоей почты (от {sender}, тема \"{subject}\"). Сначала прочитай его командой `assistant email download {id}`, затем подготовь ответ и покажи мне перед отправкой.",
+    "mailFailed": "Не удалось загрузить почту.",
+    "retry": "Повторить",
+    "deletedToast": "{count, plural, one {Письмо удалено.} few {Удалено # письма.} many {Удалено # писем.} other {Удалено # письма.}}"
+  },
+  "assistantInboxPageFrame": {
+    "title": "Почта",
+    "back": "Назад"
+  },
+  "assistantInboxSetupSuccess": {
+    "title": "У {name} теперь есть почта.",
+    "titleNoName": "У вашего ассистента теперь есть почта.",
+    "body": "Поделитесь адресом, и всё, что на него придёт, появится здесь.",
+    "openInbox": "Открыть почту"
+  }
+}

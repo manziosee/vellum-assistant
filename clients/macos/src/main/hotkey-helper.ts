@@ -37,11 +37,17 @@ import type {
   HelperState,
   HotkeyEvent,
   HotkeyEventState,
-  HotkeySelection,
+  HotkeySelectionResult,
   ModifierHold,
   ModifierHoldRegistrationResult,
 } from "@vellumai/ipc-contract";
 
+import {
+  coachmarkPressed,
+  provideCoachmarkPressWatch,
+  watchedCoachmarkPress,
+  type CoachmarkPressRect,
+} from "./coachmark-press-watch";
 import { isPointerOnCompanion } from "./companion-pointer";
 import {
   frameScrollEnded,
@@ -51,6 +57,7 @@ import {
 import { handle } from "./ipc";
 import log from "./logger";
 import {
+  JsonRpcHelperError,
   MacHelperClient,
   type MacHelperClientOptions,
   type MacHelperState,
@@ -73,7 +80,10 @@ export type {
   ModifierHoldRegistrationResult,
 };
 
-export type MacHelperPermissionKind = "speechRecognition" | "inputMonitoring";
+export type MacHelperPermissionKind =
+  | "speechRecognition"
+  | "inputMonitoring"
+  | "screen";
 
 export type MacHelperPermissionStatus =
   | "unknown"
@@ -96,6 +106,8 @@ const HOTKEY_EVENT_SCHEMA = z.union([
 ]);
 
 const FRONT_SELECTION_SCHEMA = z.object({
+  unavailable: z.boolean().optional(),
+  holdId: z.number().int().optional(),
   selection: z
     .object({
       text: z.string(),
@@ -106,6 +118,9 @@ const FRONT_SELECTION_SCHEMA = z.object({
     })
     .optional(),
 });
+
+const FRONT_SELECTION_MAX_RETRIES = 30;
+const FRONT_SELECTION_RETRY_DELAY_MS = 100;
 
 const RUNNING_APPS_SCHEMA = z.object({
   running: z.array(z.string()),
@@ -328,25 +343,44 @@ const sendModifierHold = async (
 };
 
 /**
- * What is highlighted in the application in front, or `null` when nothing is
- * or the helper cannot say. A refusal reads as no selection rather than as an
- * error: the hold that asks lands its words at the cursor either way.
+ * Retries Chromium's asynchronous accessibility activation without blocking
+ * the native keyboard monitor. The helper binds retries to the original hold
+ * and application; an unavailable read never becomes permission to paste.
  */
-const readFrontSelection = async (): Promise<HotkeySelection | null> => {
+const readFrontSelection = async (): Promise<HotkeySelectionResult> => {
   try {
-    const result = await client.call("selection.read");
-    const parsed = FRONT_SELECTION_SCHEMA.safeParse(result);
-    if (!parsed.success) {
-      log.warn("[mac-helper] selection read returned an invalid result");
-      return null;
+    let holdId: number | undefined;
+    // Chromium debounces activation for two seconds, so allow tree build time too.
+    for (let attempt = 0; attempt <= FRONT_SELECTION_MAX_RETRIES; attempt++) {
+      const result = await client.call(
+        "selection.read",
+        holdId === undefined ? undefined : { holdId },
+      );
+      const parsed = FRONT_SELECTION_SCHEMA.safeParse(result);
+      if (!parsed.success) {
+        log.warn("[mac-helper] selection read returned an invalid result");
+        return { unavailable: true };
+      }
+      if (!parsed.data.unavailable) {
+        return parsed.data.selection ?? null;
+      }
+      if (
+        parsed.data.holdId === undefined ||
+        attempt === FRONT_SELECTION_MAX_RETRIES
+      ) {
+        return { unavailable: true };
+      }
+      holdId ??= parsed.data.holdId;
+      await new Promise((resolve) =>
+        setTimeout(resolve, FRONT_SELECTION_RETRY_DELAY_MS),
+      );
     }
-    return parsed.data.selection ?? null;
   } catch (err) {
     log.warn(
       `[mac-helper] selection read failed: ${err instanceof Error ? err.message : String(err)}`,
     );
-    return null;
   }
+  return { unavailable: true };
 };
 
 /**
@@ -458,29 +492,108 @@ const sendScrollWatch = async (enable: boolean): Promise<boolean> => {
 };
 
 /**
- * Whether a paste sent to the application in front would land in something
- * that takes text.
- *
- * True on every answer but a confident no. A helper that is not running, not
- * trusted, or slow to answer cannot see a text field that is genuinely there,
- * and the cost of the two mistakes is not the same: withholding a paste that
- * would have worked breaks dictation into that application, where sending one
- * that lands nowhere is caught downstream and the words are offered instead.
+ * Ask the helper to report the next press on something the assistant is
+ * pointing at, or to stop when there is nothing. Wanted-or-not lives in
+ * `coachmark-press-watch.ts`, where the marks put it, so a helper that comes
+ * back from a crash is put back to watching the same rectangles.
  */
-export const frontAppTakesText = async (): Promise<boolean> => {
+const sendPressWatch = async (
+  rects: readonly CoachmarkPressRect[],
+): Promise<boolean> => {
+  try {
+    const result = await client.call("input.setPressWatch", { rects });
+    const parsed = HOTKEY_RESULT_SCHEMA.safeParse(result);
+    return parsed.success && parsed.data.enabled === (rects.length > 0);
+  } catch (err) {
+    log.warn(
+      `[mac-helper] press watch failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return false;
+  }
+};
+
+const INPUT_PRESSED_SCHEMA = z.object({
+  index: z.number().int().nonnegative(),
+});
+
+/**
+ * What the helper can say about where a paste to the application in front
+ * would land.
+ *
+ * `takesText` is true on every answer but a confident no. A helper that is
+ * not running, not trusted, or slow to answer cannot see a text field that is
+ * genuinely there, and the cost of the two mistakes is not the same:
+ * withholding a paste that would have worked breaks dictation into that
+ * application, where sending one that lands nowhere is caught downstream and
+ * the words are offered instead.
+ *
+ * `helperAnswered` says whether the helper replied at all, so the paste that
+ * follows knows whether the helper can be asked to send it.
+ */
+export type FrontAppFocus = { takesText: boolean; helperAnswered: boolean };
+
+export const readFrontAppFocus = async (): Promise<FrontAppFocus> => {
   try {
     const result = await client.call("focus.read");
     const parsed = FRONT_FOCUS_SCHEMA.safeParse(result);
     if (!parsed.success) {
       log.warn("[mac-helper] focus read returned an invalid result");
-      return true;
+      return { takesText: true, helperAnswered: false };
     }
-    return parsed.data.takesText;
+    return { takesText: parsed.data.takesText, helperAnswered: true };
   } catch (err) {
     log.warn(
       `[mac-helper] focus read failed: ${err instanceof Error ? err.message : String(err)}`,
     );
-    return true;
+    return { takesText: true, helperAnswered: false };
+  }
+};
+
+const FRONT_SHORTCUT_SCHEMA = z.object({
+  outcome: z.enum(["posted", "untrusted", "noFrontApp", "failed"]),
+});
+
+/**
+ * Whether the helper sent a shortcut: `posted`; `declined` when it is certain
+ * nothing went (no helper to ask, the helper refused the call, or it said it
+ * did not post); `unknown` when the call was lost after it went out, which
+ * may have been after the keystroke did.
+ */
+export type ShortcutOutcome = "posted" | "declined" | "unknown";
+
+/** Send Command plus `key` to the application in front, from the helper. */
+export const postFrontAppShortcut = async (
+  key: "v" | "z",
+): Promise<ShortcutOutcome> => {
+  let pending: Promise<unknown>;
+  try {
+    pending = client.call("keys.shortcut", { key });
+  } catch (err) {
+    log.warn(
+      `[mac-helper] shortcut not sent: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return "declined";
+  }
+  try {
+    const parsed = FRONT_SHORTCUT_SCHEMA.safeParse(await pending);
+    if (!parsed.success) {
+      log.warn("[mac-helper] shortcut returned an invalid result");
+      return "unknown";
+    }
+    if (parsed.data.outcome !== "posted") {
+      log.warn(
+        `[mac-helper] shortcut cmd+${key} not posted: ${parsed.data.outcome}`,
+      );
+      return "declined";
+    }
+    return "posted";
+  } catch (err) {
+    log.warn(
+      `[mac-helper] shortcut failed: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    // An error the helper sent back means the handler refused the call before
+    // posting anything. Anything else lost the reply, not the request.
+    return err instanceof JsonRpcHelperError ? "declined" : "unknown";
   }
 };
 
@@ -514,6 +627,11 @@ export const requestMacHelperSpeechRecognitionPermission =
 export const requestMacHelperInputMonitoringPermission =
   async (): Promise<void> => {
     await openMacHelperApp(["--request-input-monitoring"]);
+  };
+
+export const requestMacHelperScreenRecordingPermission =
+  async (): Promise<void> => {
+    await openMacHelperApp(["--request-screen-recording"]);
   };
 
 const queryBundledMacHelperPermission = async (
@@ -897,6 +1015,10 @@ const handleHelperState = (state: MacHelperState): void => {
     if (isFrameScrollWatched()) {
       void sendScrollWatch(true);
     }
+    const pressRects = watchedCoachmarkPress();
+    if (pressRects !== null) {
+      void sendPressWatch(pressRects);
+    }
     return;
   }
 
@@ -930,6 +1052,7 @@ let installed = false;
 let unsubscribeHotkeyEvents: (() => void) | null = null;
 let unsubscribeInputActivity: (() => void) | null = null;
 let unsubscribeScrollEnded: (() => void) | null = null;
+let unsubscribePressed: (() => void) | null = null;
 let unsubscribeHelperState: (() => void) | null = null;
 let unsubscribeDictationPartials: (() => void) | null = null;
 let unsubscribeDictationFinalized: (() => void) | null = null;
@@ -963,6 +1086,16 @@ export const installHotkeyHelper = (): void => {
   );
   provideFrameScrollWatch((enable) => {
     void sendScrollWatch(enable);
+  });
+  unsubscribePressed = client.onNotification(
+    "input.pressed",
+    INPUT_PRESSED_SCHEMA,
+    (event) => {
+      coachmarkPressed(event.index);
+    },
+  );
+  provideCoachmarkPressWatch((rects) => {
+    void sendPressWatch(rects);
   });
   unsubscribeDictationPartials = client.onNotification(
     "dictation.partial",
@@ -1125,6 +1258,8 @@ export const __resetForTesting = (): void => {
   unsubscribeInputActivity = null;
   unsubscribeScrollEnded?.();
   unsubscribeScrollEnded = null;
+  unsubscribePressed?.();
+  unsubscribePressed = null;
   unsubscribeHelperState?.();
   unsubscribeHelperState = null;
   unsubscribeDictationPartials?.();

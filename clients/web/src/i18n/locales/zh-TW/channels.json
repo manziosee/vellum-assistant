@@ -159,6 +159,8 @@
   "emailManagedContent": {
     "addressLabel": "地址",
     "checkingSubscription": "正在檢查訂閱…",
+    "completeSetup": "完成網域設定",
+    "completingSetup": "正在完成設定…",
     "confirm": "確認",
     "create": "建立",
     "createEmailFailedFallback": "建立電子郵件地址失敗。",
@@ -175,6 +177,9 @@
     "emailUsernamePlaceholder": "hi",
     "enterSubdomainError": "請輸入子網域。",
     "enterUsernameError": "請輸入電子郵件使用者名稱。",
+    "inboxSetupBody": "助理的地址在助理收件匣中建立，其郵件也在那裡閱讀。開啟收件匣以選擇地址。",
+    "inboxSetupButton": "開啟助理收件匣",
+    "inboxSetupTitle": "在助理收件匣中設定電子郵件",
     "register": "註冊",
     "registerDomainFailedFallback": "註冊網域失敗。",
     "registering": "正在註冊…",
@@ -187,6 +192,12 @@
     "removeEmailAriaLabel": "移除電子郵件地址",
     "removeEmailConfirmMessage": "您確定要移除 <code>{address}</code> 嗎？您的助理將無法再透過此地址傳送或接收電子郵件。",
     "removeEmailTitle": "移除電子郵件地址",
+    "repairConfirmMessage": "將保留您現有的電子郵件地址。設定會為 <code>{domain}</code> 聯絡電子郵件供應商和 DNS。",
+    "repairConfirmTitle": "完成網域設定？",
+    "repairFailedFallback": "無法開始網域設定。請稍後再試。",
+    "repairNoticeBody": "您的電子郵件地址已就緒，但此網域尚未在電子郵件供應商處設定。完成設定後即可開始傳送和接收郵件。",
+    "repairNoticeTitle": "需要設定網域",
+    "repairStartedToast": "已開始網域設定。驗證通常需要幾分鐘。",
     "retry": "重試",
     "setSubdomainConfirmMessage": "<code>{subdomain}</code> 也將成為您助理的公開識別碼。設定後便無法變更。",
     "setSubdomainTitle": "設定子網域",
@@ -200,5 +211,9 @@
     "upgradeNoticeBody": "升級至包含助理電子郵件地址的方案。無需供應商設定。",
     "upgradeNoticeTitle": "為您的助理提供專屬電子郵件地址",
     "usageSummary": "今日已傳送 {sent} / {limit} · 已接收 {received}"
+  },
+  "emailSettingsModal": {
+    "title": "郵件設定",
+    "description": "助理的地址、網域與今天的使用情況。"
   }
 }

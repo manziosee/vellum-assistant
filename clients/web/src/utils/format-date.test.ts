@@ -7,6 +7,8 @@ import {
   formatCompactLocalDate,
   formatFriendlyDate,
   formatFullLocalDate,
+  formatLocalTimeWithSeconds,
+  formatMonthDay,
   formatRelativeDate,
 } from "@/utils/format-date";
 
@@ -31,6 +33,12 @@ const FULL_DATE_OPTIONS: Intl.DateTimeFormatOptions = {
   minute: "2-digit",
   timeZoneName: "short",
 };
+
+/**
+ * Local noon, so the printed calendar day holds whatever the host offset is: a
+ * fixed UTC noon is already the next day from UTC+12 eastward.
+ */
+const SEP_20 = new Date(2026, 8, 20, 12).toISOString();
 
 /** Runs `assert` with the host reporting `tag`, then puts the host back. */
 function underHostLanguage(tag: string, assert: () => void): void {
@@ -159,6 +167,13 @@ describe("the default locale", () => {
     });
   });
 
+  test("formatMonthDay names the month the host's region does", () => {
+    underHostLanguage("en-GB", () => {
+      expect(formatMonthDay(SEP_20)).toBe(formatMonthDay(SEP_20, "en-GB"));
+      expect(formatMonthDay(SEP_20)).not.toBe(formatMonthDay(SEP_20, "en"));
+    });
+  });
+
   test("formatRelativeDate falls back to a date in the host's region", () => {
     underHostLanguage("en-GB", () => {
       const date = new Date(2001, 0, 15, 9, 14);
@@ -230,5 +245,56 @@ describe("the default locale", () => {
         delete (globalThis as { navigator?: Navigator }).navigator;
       }
     }
+  });
+});
+
+describe("seconds-resolution timestamps", () => {
+  test("distinguishes five-second intervals even on older dates", () => {
+    const date = new Date(2001, 0, 15, 14, 30, 5);
+    expect(formatLocalTimeWithSeconds(date.getTime(), "en-GB")).toBe(
+      "14:30:05",
+    );
+    expect(formatLocalTimeWithSeconds(date.getTime() + 5_000, "en-GB")).toBe(
+      "14:30:10",
+    );
+  });
+
+  test("opts in to seconds without changing the compact formatter default", () => {
+    const date = new Date(2001, 0, 15, 14, 30, 5);
+    const iso = date.toISOString();
+    const seconds = date.toLocaleTimeString(formatLocale(), {
+      hour: "numeric",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+    expect(formatCompactLocalDate(iso, { includeSeconds: true })).toBe(
+      `${formatFriendlyDate(date)}, ${seconds}`,
+    );
+    expect(formatCompactLocalDate(iso)).toBe(
+      `${formatFriendlyDate(date)}, ${localTime(date)}`,
+    );
+  });
+
+  test("uses the host region and renders epoch zero", () => {
+    underHostLanguage("en-GB", () => {
+      expect(formatLocalTimeWithSeconds(0)).toBe(
+        new Date(0).toLocaleTimeString("en-GB", {
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+          hourCycle: "h23",
+        }),
+      );
+    });
+  });
+});
+
+describe("formatMonthDay", () => {
+  test("prints a short month and day in en-US", () => {
+    expect(formatMonthDay(SEP_20, "en-US")).toBe("Sep 20");
+  });
+
+  test("an unparseable instant leaves the caller nothing to print", () => {
+    expect(formatMonthDay("not-a-date", "en-US")).toBeNull();
   });
 });

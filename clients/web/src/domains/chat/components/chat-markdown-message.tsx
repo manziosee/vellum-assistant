@@ -18,20 +18,17 @@ import {
   type MarkdownImageComponent,
   MarkdownMessage,
   type MarkdownMessageProps,
+  textLinkVariants,
 } from "@vellumai/design-library";
 import type { DisplayAttachment } from "@/types/attachment-types";
 import { useAttachmentObjectUrl } from "@/domains/chat/components/chat-attachments/use-attachment-object-url";
 import { useAttachmentPreview } from "@/domains/chat/components/chat-attachments/use-attachment-preview";
 import { defaultUrlTransform } from "react-markdown";
-import {
-  EXTERNAL_LINK_CLASS,
-  ExternalLinkGlyph,
-  isWebUrl,
-} from "@/components/external-anchor";
+import { ExternalLinkGlyph, isWebUrl } from "@/components/external-anchor";
 import { handleNativeAnchorClick } from "@/utils/native-anchor";
 
 import {
-  openMarkdownOAuthLinkInPopup,
+  openOAuthUrlInPopup,
   shouldOpenMarkdownLinkInOAuthPopup,
 } from "@/domains/chat/utils/oauth-popup-links";
 import {
@@ -48,13 +45,13 @@ import { classifyMarkdownHref } from "@/domains/chat/utils/local-file-links";
 import {
   toVellumWorkspaceHref,
   WORKSPACE_PATH_TAG,
-} from "@/domains/chat/utils/workspace-path-links";
+} from "@/utils/workspace-path-links";
 import { AppPathLink } from "@/domains/chat/components/app-path-link";
 import { WorkspacePathLink } from "@/domains/chat/components/workspace-path-link";
 import { LocalFileEmbed } from "@/domains/chat/components/local-file/local-file-embed";
 import { LocalFileLink } from "@/domains/chat/components/local-file/local-file-link";
 import { resolveLocalFileTarget } from "@/domains/chat/components/local-file/local-file-target";
-import { toggleLocalFile } from "@/domains/chat/components/local-file/open-local-file";
+import { toggleLocalFile } from "@/components/local-file/open-local-file";
 import { useTranslation } from "@/i18n";
 
 /** Returns true when `href` is a known `vellum://` attachment link. */
@@ -90,7 +87,7 @@ function OAuthAwareLink({
       target="_blank"
       rel={opensOAuthPopup ? undefined : "noopener noreferrer"}
       onClick={(event) => {
-        if (openMarkdownOAuthLinkInPopup(href)) {
+        if (openOAuthUrlInPopup(href)) {
           event.preventDefault();
           return;
         }
@@ -98,7 +95,8 @@ function OAuthAwareLink({
         // route through the native opener there (no-op elsewhere).
         handleNativeAnchorClick(event, href);
       }}
-      className={EXTERNAL_LINK_CLASS}
+      data-slot="text-link"
+      className={textLinkVariants()}
     >
       {children}
       {isWebUrl(href) ? <ExternalLinkGlyph /> : null}
@@ -250,8 +248,10 @@ function WorkspaceInlineImage({
   );
 }
 
-export interface ChatMarkdownMessageProps
-  extends Omit<MarkdownMessageProps, "linkComponent" | "imageComponent"> {
+export interface ChatMarkdownMessageProps extends Omit<
+  MarkdownMessageProps,
+  "linkComponent" | "imageComponent"
+> {
   /**
    * Fallback for file links the document drawer cannot open: a reference with
    * no assistant to read it through, or a `vellum://host/` link with no
@@ -269,6 +269,8 @@ export interface ChatMarkdownMessageProps
   attachments?: DisplayAttachment[];
   /** Active assistant ID for fetching attachment content from the daemon. */
   assistantId?: string | null;
+  /** File actions use product copy; user-authored links keep their captions. */
+  fileLinkLabels?: "action" | "markdown";
   /**
    * Streamed-text reveal sweep (see `rehypeStreamWordFade`): each word is
    * wrapped in a fade span, and while `"revealing"` the words nearest the
@@ -308,9 +310,11 @@ export const ChatMarkdownMessage = memo(function ChatMarkdownMessage({
   content,
   className,
   hardLineBreaks,
+  incremental,
   onVellumLinkClick,
   attachments,
   assistantId,
+  fileLinkLabels = "action",
   streamWordFade,
   redactedCredentialChips,
   workspacePathLinks,
@@ -357,7 +361,8 @@ export const ChatMarkdownMessage = memo(function ChatMarkdownMessage({
             href={href}
             workspacePath={workspacePath}
             assistantId={assistantId ?? undefined}
-            onActivate={
+            labelMode={fileLinkLabels}
+            onOpenFileOptions={
               onVellumLinkClick && !drawerCanOpen
                 ? () => onVellumLinkClick(href, markdownChildrenText(children))
                 : undefined
@@ -379,7 +384,8 @@ export const ChatMarkdownMessage = memo(function ChatMarkdownMessage({
             href={href}
             workspacePath={workspacePath}
             assistantId={assistantId ?? undefined}
-            onActivate={
+            labelMode={fileLinkLabels}
+            onOpenFileOptions={
               onVellumLinkClick && workspacePath !== null && !assistantId
                 ? () =>
                     onVellumLinkClick(
@@ -396,7 +402,7 @@ export const ChatMarkdownMessage = memo(function ChatMarkdownMessage({
 
       return <OAuthAwareLink href={href}>{children}</OAuthAwareLink>;
     },
-    [onVellumLinkClick, assistantId],
+    [onVellumLinkClick, assistantId, fileLinkLabels],
   );
 
   const extraRehypePlugins = useMemo(
@@ -519,6 +525,7 @@ export const ChatMarkdownMessage = memo(function ChatMarkdownMessage({
         content={content}
         className={className}
         hardLineBreaks={hardLineBreaks}
+        incremental={incremental}
         linkComponent={linkComponent}
         imageComponent={imageComponent}
         urlTransform={vellumUrlTransform}

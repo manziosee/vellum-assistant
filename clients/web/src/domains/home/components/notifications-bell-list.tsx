@@ -1,8 +1,9 @@
 import type { Ref, UIEventHandler } from "react";
 
 import type { FeedItem, FeedItemStatus } from "@vellumai/assistant-api";
+import type { GuardianDecisionActionId } from "@vellumai/service-contracts/guardian-requests";
 
-import { HomeRecapRow, type HomeRecapRowDecision } from "../home-recap-row";
+import { HomeRecapRow } from "../home-recap-row";
 import { resolveThreadName } from "../utils";
 
 /** No titles known: every row falls back to its source label, or to nothing. */
@@ -31,7 +32,7 @@ export interface NotificationsBellListProps {
   onDismiss: (itemId: string) => void;
   onToggleRead: (itemId: string, newStatus: FeedItemStatus) => void;
   /** Decides a pending approval from its row; see `HomeRecapRow`. */
-  onDecide?: (item: FeedItem, decision: HomeRecapRowDecision) => void;
+  onDecide?: (item: FeedItem, decision: GuardianDecisionActionId) => void;
   isDecisionPending?: boolean;
   /**
    * Requests with a decision in flight from any surface, whose rows hold
@@ -81,9 +82,8 @@ export function NotificationsBellList({
       // it instead of showing it through.
       className="flex flex-col gap-[var(--app-spacing-md)] overflow-y-auto px-[var(--app-spacing-lg)] pt-[var(--app-spacing-lg)] [--swipe-item-surface:var(--surface-lift)]"
     >
-      {/* The rule between rows lives here rather than on the row, so the
-          last row can drop it: the panel's footer draws its own rule right
-          underneath, and two would double up. */}
+      {/* The rule between rows lives here rather than on the row so the last
+          row can end cleanly at the panel edge. */}
       {items.map((item) => (
         <div
           key={item.id}

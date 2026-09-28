@@ -18,6 +18,7 @@ import {
   createUserMessage,
 } from "../../agent/message-types.js";
 import type { AssistantEvent } from "../../api/index.js";
+import { ModeSessionDescriptorSchema } from "../../api/mode-session.js";
 import {
   BackgroundToolCompletionSchema,
   type ConversationContentBlock,
@@ -41,13 +42,11 @@ import {
   supportsHostProxy,
 } from "../../channels/types.js";
 import { isAssistantFeatureFlagEnabled } from "../../config/assistant-feature-flags.js";
-import { getUserSelectableProfilesForProvider } from "../../config/default-profile-catalog.js";
+import { getConversationProfilesForProvider } from "../../config/default-profile-catalog.js";
 import { isHttpAuthDisabled } from "../../config/env.js";
 import { getConfig } from "../../config/loader.js";
-import {
-  mergeConsecutiveAssistantMessages,
-  mergeToolResultsIntoAssistantMessages,
-} from "../../conversations/message-consolidation.js";
+import { isModeSessionRecoveryHealthy } from "../../config/session-groups-gate.js";
+import { consolidateMessageRows } from "../../conversations/message-consolidation.js";
 import { resolveTurnCommitWaitMs } from "../../daemon/abort-watchdog.js";
 import { createApprovalConversationGenerator } from "../../daemon/approval-generators.js";
 import type { Conversation } from "../../daemon/conversation.js";
@@ -113,7 +112,7 @@ import { recordOnboardingEvent } from "../../onboarding/onboarding-events-store.
 import {
   classifyKind,
   getAttachmentById,
-  getAttachmentMetadataForMessage,
+  getAttachmentMetadataForMessages,
   getAttachmentsByIds,
   resolveAttachmentsForPersist,
 } from "../../persistence/attachments-store.js";
@@ -132,6 +131,7 @@ import {
   isSuppressedQueuedMessage,
   isSystemCardMetadata,
   type MessageRow,
+  parseMessageMetadata,
   recordConversationPersistedSeq,
   setConversationInferenceProfile,
 } from "../../persistence/conversation-crud.js";
@@ -139,9 +139,19 @@ import {
   getConversationByKey,
   getOrCreateConversation,
 } from "../../persistence/conversation-key-store.js";
+import { listConversationModeSessionsByIds } from "../../persistence/conversation-mode-sessions.js";
 import { searchConversations } from "../../persistence/conversation-queries.js";
-import { isNoResponseMetadata } from "../../persistence/conversation-types.js";
+import {
+  AUTO_ROUTED_PROFILE_METADATA_KEY,
+  computerUseScreenshotAttachmentIdsFromMetadata,
+  isNoResponseMetadata,
+  messageMetadataIsAmbientSightKeep,
+} from "../../persistence/conversation-types.js";
 import { linkRequestLogsToMessage } from "../../persistence/llm-request-log-store.js";
+import {
+  mergeMessageMetadata,
+  readModeSessionMetadata,
+} from "../../persistence/message-metadata.js";
 import { assistantTextVisibilityOf } from "../../persistence/user-facing-content.js";
 import { MEMORY_RETROSPECTIVE_FORK_SOURCE } from "../../plugins/defaults/memory/memory-retrospective-constants.js";
 import { normalizeOnboardingContext } from "../../prompts/normalize-onboarding.js";
@@ -159,6 +169,7 @@ import {
   getWorkspaceDir,
   getWorkspacePromptPath,
 } from "../../util/platform.js";
+import { safeStringSlice } from "../../util/unicode.js";
 import { assistantEventHub, broadcastMessage } from "../assistant-event-hub.js";
 import { getCurrentSeq } from "../assistant-stream-state.js";
 import { ACTOR_PRINCIPALS } from "../auth/route-policy.js";
@@ -875,10 +886,31 @@ function displayRowFilter(conversationId: string): (m: MessageRow) => boolean {
 function consolidateDisplayTurns(rows: MessageRow[]): {
   messages: MessageRow[];
   mergedIdMap: Map<string, string[]>;
+  modeSessionActivityMap: Map<string, { firstAt: number; lastAt: number }>;
 } {
-  return mergeConsecutiveAssistantMessages(
-    mergeToolResultsIntoAssistantMessages(rows),
-  );
+  return consolidateMessageRows(rows);
+}
+
+const MAX_REQUESTED_MODE_SESSION_IDS = 100;
+const MAX_MODE_SESSION_ID_LENGTH = 200;
+
+function parseRequestedModeSessionIds(raw: unknown): string[] {
+  if (raw === undefined) {
+    return [];
+  }
+  if (typeof raw !== "string") {
+    throw new BadRequestError(
+      "modeSessionIds must be a comma-separated string",
+    );
+  }
+  const ids = [...new Set(raw.split(",").map((id) => id.trim()))];
+  if (
+    ids.length > MAX_REQUESTED_MODE_SESSION_IDS ||
+    ids.some((id) => id.length === 0 || id.length > MAX_MODE_SESSION_ID_LENGTH)
+  ) {
+    throw new BadRequestError("modeSessionIds contains an invalid session ID");
+  }
+  return ids;
 }
 
 export async function handleListMessages({
@@ -914,6 +946,9 @@ export async function handleListMessages({
   const beforeTimestampRaw = queryParams?.beforeTimestamp;
   const limitRaw = queryParams?.limit;
   const pageRaw = queryParams?.page;
+  const requestedModeSessionIds = parseRequestedModeSessionIds(
+    queryParams?.modeSessionIds,
+  );
 
   // Validate: reject NaN values with 400
   if (beforeTimestampRaw != null && isNaN(Number(beforeTimestampRaw))) {
@@ -1017,8 +1052,47 @@ export async function handleListMessages({
   // consolidation is deferred to compaction for prefix-cache stability.
   // Merge here at query time so renderHistoryContent produces the same
   // contentOrder shape as streaming (consecutive tool refs grouped together).
-  const { messages: consolidatedMessages, mergedIdMap } =
-    consolidateDisplayTurns(rawMessages);
+  const pageModeSessionIds = rawMessages.flatMap((message) => {
+    const owner = readModeSessionMetadata(message.metadata);
+    return owner ? [owner.id] : [];
+  });
+  const summaries = listConversationModeSessionsByIds(resolvedConversationId, [
+    ...new Set([...pageModeSessionIds, ...requestedModeSessionIds]),
+  ]);
+  const validOwners = new Map(
+    summaries.map((summary) => [summary.id, summary.mode]),
+  );
+  const projectionMessages = rawMessages.map((message) => {
+    const owner = readModeSessionMetadata(message.metadata);
+    if (!owner || validOwners.get(owner.id) === owner.mode) {
+      return message;
+    }
+    return {
+      ...message,
+      metadata: mergeMessageMetadata(message.metadata, {
+        modeSession: undefined,
+      }),
+    };
+  });
+  const {
+    messages: consolidatedMessages,
+    mergedIdMap,
+    modeSessionActivityMap,
+  } = consolidateDisplayTurns(projectionMessages);
+  const liveConversation = findConversation(resolvedConversationId);
+  const modeSessions = summaries
+    .filter(
+      (summary) =>
+        isModeSessionRecoveryHealthy() || summary.status !== "active",
+    )
+    .flatMap((summary) => {
+      const descriptor = liveConversation?.modeSessions
+        ? liveConversation.modeSessions.describeSummary(summary)
+        : summary.status !== "active"
+          ? { summary }
+          : undefined;
+      return descriptor ? [descriptor] : [];
+    });
   const assistantSlackDisplayName = getAssistantName()?.trim() || undefined;
 
   // Parse each row's stored content and per-message metadata. Rendering is
@@ -1037,6 +1111,10 @@ export async function handleListMessages({
     let backgroundToolCompletion: ConversationMessage["backgroundToolCompletion"];
     let systemCard: boolean | undefined;
     let noResponse: boolean | undefined;
+    let autoRoutedProfile: string | undefined;
+    const cameraFrame = messageMetadataIsAmbientSightKeep(msg.metadata)
+      ? true
+      : undefined;
     let reaction: ConversationMessage["reaction"];
     let providerError: ConversationMessage["providerError"];
     let deletedAt: number | undefined;
@@ -1053,6 +1131,9 @@ export async function handleListMessages({
         }
         if (isNoResponseMetadata(meta)) {
           noResponse = true;
+        }
+        if (typeof meta[AUTO_ROUTED_PROFILE_METADATA_KEY] === "string") {
+          autoRoutedProfile = meta[AUTO_ROUTED_PROFILE_METADATA_KEY];
         }
         // Channel facts live in the row's provider envelope. A reaction row,
         // either direction, projects its structured fact so clients never
@@ -1136,12 +1217,15 @@ export async function handleListMessages({
       backgroundToolCompletion,
       systemCard,
       noResponse,
+      autoRoutedProfile,
+      cameraFrame,
       reaction,
       providerError,
       slackMessage,
       deletedAt,
       clientMessageId: msg.clientMessageId ?? undefined,
       assistantTextVisibility: assistantTextVisibilityOf(msg.metadata),
+      modeSession: readModeSessionMetadata(msg.metadata),
       // The row's raw stored envelope, carried to the render pass below so it
       // can read the row's own `assistantTextVisibility` marker. Never part of
       // the wire payload, which the serializer builds field by field.
@@ -1162,6 +1246,9 @@ export async function handleListMessages({
   const messages: RuntimeMessagePayload[] = await Promise.all(
     parsed.map(async (m) => {
       const mergedMessageIds = m.id ? (mergedIdMap.get(m.id) ?? []) : [];
+      const modeSessionActivity = m.id
+        ? modeSessionActivityMap.get(m.id)
+        : undefined;
 
       // Hydrate the row's attachments from the DB. A metadata-only query avoids
       // loading large base64 blobs for non-image attachments (documents, audio);
@@ -1172,9 +1259,21 @@ export async function handleListMessages({
       let msgAttachments: RuntimeAttachmentMetadata[] = [];
       if (m.id) {
         const idsToQuery = [m.id, ...mergedMessageIds];
-        const linked = idsToQuery.flatMap((id) =>
-          getAttachmentMetadataForMessage(id),
+        const linkedRows = getAttachmentMetadataForMessages(idsToQuery);
+        const computerUseScreenshotIds = new Set(
+          linkedRows.flatMap((row) =>
+            computerUseScreenshotAttachmentIdsFromMetadata(
+              parseMessageMetadata(row.messageMetadata),
+            ),
+          ),
         );
+        const linked = linkedRows.map((row) => {
+          return {
+            ...row.attachment,
+            computerUseScreenshot:
+              computerUseScreenshotIds.has(row.attachment.id) || undefined,
+          };
+        });
         if (linked.length > 0) {
           msgAttachments = await Promise.all(
             linked.map(async (a) => {
@@ -1213,6 +1312,9 @@ export async function handleListMessages({
                   ? { thumbnailData: a.thumbnailBase64 }
                   : {}),
                 fileBacked: true,
+                ...(a.computerUseScreenshot
+                  ? { computerUseScreenshot: true }
+                  : {}),
               };
             }),
           );
@@ -1325,6 +1427,8 @@ export async function handleListMessages({
       return {
         id: m.id ?? "",
         ...(mergedMessageIds.length > 0 ? { mergedMessageIds } : {}),
+        ...(m.modeSession ? { modeSession: m.modeSession } : {}),
+        ...(modeSessionActivity ? { modeSessionActivity } : {}),
         ...(m.clientMessageId ? { clientMessageId: m.clientMessageId } : {}),
         role: m.role,
         timestamp: new Date(displayTimestamp).toISOString(),
@@ -1353,6 +1457,10 @@ export async function handleListMessages({
           : {}),
         ...(m.systemCard ? { systemCard: true } : {}),
         ...(m.noResponse ? { noResponse: true } : {}),
+        ...(m.autoRoutedProfile
+          ? { autoRoutedProfile: m.autoRoutedProfile }
+          : {}),
+        ...(m.cameraFrame ? { cameraFrame: true as const } : {}),
         // The row's own marker, so a client gates per-row presentation on what
         // this row was written with rather than on the live flag.
         ...(m.assistantTextVisibility
@@ -1413,6 +1521,7 @@ export async function handleListMessages({
         oldestMessageId: oldestMessageId ?? null,
         seq: persistedSeq,
         processing,
+        ...(modeSessions.length > 0 ? { modeSessions } : {}),
       };
     }
 
@@ -1423,10 +1532,16 @@ export async function handleListMessages({
       ...(oldestMessageId != null ? { oldestMessageId } : {}),
       seq: persistedSeq,
       processing,
+      ...(modeSessions.length > 0 ? { modeSessions } : {}),
     };
   }
 
-  return { messages, seq: persistedSeq, processing };
+  return {
+    messages,
+    seq: persistedSeq,
+    processing,
+    ...(modeSessions.length > 0 ? { modeSessions } : {}),
+  };
 }
 
 /**
@@ -1648,7 +1763,9 @@ export async function handleSendMessage(
   }
   if (requestedInferenceProfile !== undefined) {
     const { llm } = getConfig();
-    const profiles = getUserSelectableProfilesForProvider(
+    // The conversation view: a sticky pin runs the main agent's turns, so a
+    // profile whose model returns verdicts rather than text is not offered.
+    const profiles = getConversationProfilesForProvider(
       llm.profiles,
       llm.defaultProvider ?? null,
     );
@@ -2158,7 +2275,7 @@ export async function handleSendMessage(
           publishConversationMessagesChanged(conversationId, originClientId);
         },
         afterRelease: () => {
-          conversation.warmPromptCache();
+          void conversation.warmPromptCache();
         },
       });
 
@@ -3018,6 +3135,7 @@ export async function handleSendMessage(
           messageId,
           requestId,
           clientMessageId,
+          modeSession: conversation.modeSessions.getTurnOwner(requestId),
         });
         // The row this echo announces was durably persisted above, so advance
         // the snapshot↔stream anchor to the echo's seq (stamped inline by
@@ -3289,11 +3407,15 @@ async function generateLlmSuggestion(
 ): Promise<string | null> {
   const log = (await import("../../util/logger.js")).getLogger("runtime-http");
   const truncatedAssistant = escapeXmlContent(
-    assistantText.length > 2000 ? assistantText.slice(-2000) : assistantText,
+    assistantText.length > 2000
+      ? safeStringSlice(assistantText, assistantText.length - 2000)
+      : assistantText,
   );
   const truncatedUser =
     priorUserText && priorUserText.length > 500
-      ? escapeXmlContent(priorUserText.slice(-500))
+      ? escapeXmlContent(
+          safeStringSlice(priorUserText, priorUserText.length - 500),
+        )
       : priorUserText
         ? escapeXmlContent(priorUserText)
         : priorUserText;
@@ -3638,6 +3760,13 @@ export const ROUTES: RouteDefinition[] = [
         required: false,
         description: "Maximum number of messages to return.",
       },
+      {
+        name: "modeSessionIds",
+        type: "string",
+        required: false,
+        description:
+          "Comma-separated mode-session IDs to include with summaries for loaded active groups outside this page.",
+      },
     ],
     responseBody: z.object({
       messages: z
@@ -3671,6 +3800,12 @@ export const ROUTES: RouteDefinition[] = [
         .optional()
         .describe(
           "Whether the agent is currently mid-turn for this conversation, sourced authoritatively from the persisted `processing_started_at` column. `true` means a turn is in flight; `false` means the conversation is idle. Clients use this to recover from a dropped SSE stream: if a turn appears to be running locally but the server reports `processing: false`, the turn has ended (or died) and the UI should stop waiting rather than spin indefinitely. Absent on older daemons that predate this field.",
+        ),
+      modeSessions: z
+        .array(ModeSessionDescriptorSchema)
+        .optional()
+        .describe(
+          "Conversation-owned mode-session summaries referenced by this page or explicitly requested by ID.",
         ),
     }),
     handler: (args) => handleListMessages(args),

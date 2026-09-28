@@ -8,6 +8,8 @@
 import { statSync } from "node:fs";
 import { join } from "node:path";
 
+import { TrustClassSchema } from "@vellumai/gateway-client";
+
 import {
   getApp,
   getAppDirPath,
@@ -81,12 +83,12 @@ import type {
 import type { ContentBlock, Message } from "../providers/types.js";
 import type { TrustClass } from "../runtime/actor-trust-resolver.js";
 import { resolveCapabilities } from "../runtime/capabilities.js";
-import { trustClassSchema } from "../runtime/trust-class.js";
 import type { SubagentState } from "../subagent/types.js";
 import { TERMINAL_STATUSES } from "../subagent/types.js";
 import { canonicalizeInboundIdentity } from "../util/canonicalize-identity.js";
 import { safeParseRecord } from "../util/json.js";
 import { getLogger } from "../util/logger.js";
+import { safeStringSlice } from "../util/unicode.js";
 import { channelSupportsInlineOptions } from "./channel-ui-capability.js";
 import { findConversationOrSubagent } from "./conversation-registry.js";
 import {
@@ -575,7 +577,7 @@ function injectActiveSurfaceContext(
     if (schema && schema !== '"{}"' && schema !== "{}") {
       const truncatedSchema =
         schema.length > MAX_SCHEMA_LENGTH
-          ? schema.slice(0, MAX_SCHEMA_LENGTH) + "… (truncated)"
+          ? safeStringSlice(schema, 0, MAX_SCHEMA_LENGTH) + "… (truncated)"
           : schema;
       lines.push("", `Data schema: ${truncatedSchema}`);
     }
@@ -818,10 +820,15 @@ export function applySightFrameRetention(
  * `null` on the happy path (desktop, full capabilities, no special context)
  * where no block is injected. Split from {@link injectChannelCapabilityContext}
  * so callers can capture the exact injected text for metadata persistence.
+ *
+ * Live vs clientless guidance belongs here, not in tool schemas. Tool
+ * definitions stay identical so the tools cache prefix can reuse; this block
+ * sits later in the system prompt and can describe the current turn.
  */
 export function buildChannelCapabilityBlock(
   caps: ChannelCapabilities,
   clientOs: string | undefined = caps.clientOS,
+  isNonInteractive = false,
 ): string | null {
   // Happy path: desktop with full capabilities and no special context — skip injection.
   if (
@@ -848,7 +855,7 @@ export function buildChannelCapabilityBlock(
   if (clientOs === "macos") {
     lines.push("");
     lines.push(
-      "On macOS, prefer osascript/CLI via `host_bash` over computer use tools, which take over the user's cursor. Use foreground computer use only when no scripting alternative exists or the user explicitly asks.",
+      "On macOS, drive apps with the computer-use skill; `host_bash` is for shell commands.",
     );
   }
 
@@ -873,22 +880,33 @@ export function buildChannelCapabilityBlock(
       "- Do NOT reference the dashboard UI, settings panels, or visual preference pickers.",
     );
     if (!caps.supportsDynamicUi) {
-      if (caps.channel === "slack") {
+      if (isNonInteractive) {
         lines.push(
-          '- Do NOT use app_create. Only use ui_show/ui_update for card surfaces with template: "task_progress"; present all other information as text.',
+          "- ui_show, ui_update, and ui_dismiss persist conversation content for the next capable client that opens this conversation. Do not claim a surface is visible now or wait for an action.",
         );
       } else {
+        if (caps.channel === "slack") {
+          lines.push(
+            '- Do NOT use app_create. Only use ui_show/ui_update for card surfaces with template: "task_progress"; present all other information as text.',
+          );
+        } else {
+          lines.push(
+            "- Do NOT use ui_show, ui_update, or app_create. This channel cannot render them.",
+          );
+        }
         lines.push(
-          "- Do NOT use ui_show, ui_update, or app_create — this channel cannot render them.",
+          "- Present information as well-formatted text instead of dynamic UI.",
         );
       }
-      lines.push(
-        "- Present information as well-formatted text instead of dynamic UI.",
-      );
     }
     if (caps.channel === "whatsapp") {
       lines.push(
         "- Do NOT use markdown tables — use bullet lists instead. No markdown headers — use **bold** or CAPS for emphasis.",
+      );
+    }
+    if (caps.channel === "email") {
+      lines.push(
+        "- Conversation text is not emailed. To reply, run `assistant email send` (see `assistant email send --help`). Use `--reply-to` to keep the thread. Skip a reply only when none is needed.",
       );
     }
   }
@@ -1171,7 +1189,7 @@ function placeholderForBlockType(type: ContentBlock["type"]): string | null {
 function rowToRenderable(row: SlackTranscriptInputRow): RenderableSlackMessage {
   const slackMeta = readSlackMetadataFromMessageMetadata(row.metadata);
   const provenanceTrustClass = row.metadata
-    ? trustClassSchema.safeParse(
+    ? TrustClassSchema.safeParse(
         safeParseRecord(row.metadata).provenanceTrustClass,
       ).data
     : undefined;
@@ -2024,20 +2042,6 @@ export async function composeInjectorChain(ctx: TurnContext): Promise<string> {
 const DEFAULT_PLACEMENT: InjectionPlacement = "append-user-tail";
 
 /**
- * Count leading memory-prefix blocks on a user message's `content`.
- *
- * Delegates to {@link countMemoryPrefixBlocks} from
- * `memory/graph/conversation-graph-memory.js` — the canonical state-machine
- * for locating the memory-prefix boundary. Reusing it here keeps the
- * PKB-context / PKB-reminder / NOW splice rules aligned on a single source
- * of truth so their ordering relative to any memory prefix is stable and
- * testable.
- */
-function countMemoryPrefixBlocksOnContent(content: ContentBlock[]): number {
-  return countMemoryPrefixBlocks(content);
-}
-
-/**
  * Apply one injector block to a `runMessages` array according to its
  * declared {@link InjectionPlacement}:
  *  - `"prepend-user-tail"` — prepend to the tail user message's content.
@@ -2089,9 +2093,7 @@ function applyInjectionBlock(
         { ...userTail, content: [...userTail.content, textBlock] },
       ];
     case "after-memory-prefix": {
-      const memoryPrefixCount = countMemoryPrefixBlocksOnContent(
-        userTail.content,
-      );
+      const memoryPrefixCount = countMemoryPrefixBlocks(userTail.content);
       return [
         ...runMessages.slice(0, -1),
         {
@@ -2149,7 +2151,7 @@ function stripTailV2DynamicMemoryPrefix(
   if (!last || last.role !== "user") {
     return messages;
   }
-  const prefixCount = countMemoryPrefixBlocksOnContent(last.content);
+  const prefixCount = countMemoryPrefixBlocks(last.content);
   if (prefixCount === 0) {
     return messages;
   }
@@ -2527,6 +2529,7 @@ export async function applyRuntimeInjections(
       liveConversation?.getTurnOrRestingTrust() ??
       fallbackTurnTrust(channelCapabilities),
     callSite: options.callSite ?? liveConversation?.currentCallSite,
+    skipMemoryRetrieval: liveConversation?.currentTurnSkipMemoryRetrieval,
     ...injectionInputs,
   };
 
@@ -2852,6 +2855,7 @@ export async function applyRuntimeInjections(
       const channelCapabilityBlock = buildChannelCapabilityBlock(
         channelCapabilities,
         clientOs,
+        options.isNonInteractive === true,
       );
       if (channelCapabilityBlock !== null) {
         channelCapabilitiesCaptured = channelCapabilityBlock;

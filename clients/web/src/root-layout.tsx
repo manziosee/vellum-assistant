@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Outlet, useLocation, useNavigate } from "react-router";
 
@@ -20,6 +20,7 @@ import {
   setLiveVoiceScreenShare,
   useLiveVoiceStore,
 } from "@/domains/chat/voice/live-voice/live-voice-store";
+import { reportCoachmarkPressed } from "@/domains/chat/voice/live-voice/coachmark-press-turn";
 import { useCallChords } from "@/domains/chat/voice/live-voice/use-call-chords";
 import {
   cancelPendingVoiceStart,
@@ -45,7 +46,11 @@ import { setMenuPlatformSession } from "@/runtime/menu";
 import { useVellumCommands } from "@/runtime/vellum-commands";
 import { handleToggleWatchCommand } from "@/runtime/watch-command";
 
-import { navigateToConversation } from "@/utils/conversation-navigation";
+import { autoSendPromptState } from "@/utils/auto-send-prompt";
+import {
+  closeAppRoute,
+  navigateToConversation,
+} from "@/utils/conversation-navigation";
 import { routes } from "@/utils/routes";
 import { shouldSuppressRootStatusBanner } from "@/utils/status-banner-visibility";
 import { useAssistantIdentityInit } from "@/hooks/use-assistant-identity-init";
@@ -70,7 +75,11 @@ import { useAssistantIdentityStore } from "@/stores/assistant-identity-store";
 import { useConversationStore } from "@/stores/conversation-store";
 import { createDraftConversationId } from "@/domains/chat/utils/conversation-selection";
 import { useViewerStore } from "@/stores/viewer-store";
-import { useAssistantAvatar } from "@/hooks/use-assistant-avatar";
+import {
+  resolveAssistantAvatarOwnerScopeId,
+  resolveAssistantNotificationPlatformId,
+  useAssistantAvatar,
+} from "@/hooks/use-assistant-avatar";
 import { useAvatarAccentVar } from "@/hooks/use-avatar-accent-var";
 import { useDynamicFavicon } from "@/hooks/use-dynamic-favicon";
 import { useCompanionMirror } from "@/domains/chat/hooks/use-companion-mirror";
@@ -90,8 +99,12 @@ import {
   usePageSurfaceStore,
 } from "@/stores/page-surface-store";
 import { isPopoutWindow } from "@/runtime/popout-window";
+import { CompanionIntroScrim } from "@/components/companion-intro-scrim";
+import { CompanionTourEntry } from "@/components/companion-tour-entry-lazy";
+import { useCompanionIntroFunnel } from "@/domains/onboarding/companion-intro-funnel";
 import { GlobalPushToTalkBridge } from "@/domains/chat/voice/global-push-to-talk-bridge";
 import { TimezoneSync } from "@/components/timezone-sync";
+import { RoutePendingIndicator } from "@/components/route-pending-indicator";
 import { StatusBanner } from "@/components/status-banner";
 import { UpdateToast } from "@/components/update-toast";
 import { retireAssistant } from "@/assistant/retire-service";
@@ -105,6 +118,12 @@ import { RetireConfirmDialog } from "@/components/retire-confirm-dialog";
 import { useTranslation } from "@/i18n";
 import { toast } from "@vellumai/design-library/components/toast";
 import { answerDictationOffer } from "@/domains/chat/voice/dictation-offer-actions";
+import { answerCompanionPopover } from "@/domains/chat/companion-popover-actions";
+import { toggleCompanionPicker } from "@/domains/chat/companion-popover";
+import { useCompanionPickers } from "@/domains/chat/hooks/use-companion-pickers";
+import { useRequestOrganizationId } from "@/stores/organization-store";
+import { getSelfHostedIngressUrl } from "@/lib/self-hosted/connection";
+import { reconcilePreparedNotificationIdentityOwners } from "@/runtime/notification-avatar";
 
 /**
  * App-level layout route. Owns four cross-route concerns:
@@ -167,19 +186,49 @@ export function RootLayout() {
   useCallChords();
 
   const assistantId = useResolvedAssistantsStore.use.activeAssistantId();
+  const assistants = useResolvedAssistantsStore.use.assistants();
+  const assistantsHydrated =
+    useResolvedAssistantsStore.use.assistantsHydrated();
+  const activeAssistant = assistants.find(
+    (assistant) => assistant.id === assistantId,
+  );
+  const authUser = useAuthStore.use.user();
+  const requestOrganizationId = useRequestOrganizationId();
   const assistantVersion = useAssistantIdentityStore.use.version();
+  const platformAccountId = authUser?.kind === "platform" ? authUser.id : null;
+  const connectionFallback =
+    getSelfHostedIngressUrl() ??
+    (typeof globalThis.location === "undefined"
+      ? null
+      : globalThis.location.href);
+  const notificationScopeId =
+    sessionStatus === "authenticated" && activeAssistant
+      ? resolveAssistantAvatarOwnerScopeId(
+          activeAssistant,
+          platformAccountId,
+          requestOrganizationId,
+          connectionFallback,
+        )
+      : null;
+  const notificationPlatformAssistantId =
+    resolveAssistantNotificationPlatformId(activeAssistant);
   const activeConversationId = useConversationStore.use.activeConversationId();
   const assistantStateKind = useAssistantLifecycleStore(
     (s) => s.assistantState.kind,
   );
   const isAssistantActive = assistantStateKind === "active";
+  const companionReady = isAssistantActive && !isSessionInitializing;
   useClientFeatureFlagSync(!isSessionInitializing, isAssistantActive);
   // Hydrate the assistant identity store (name + version) at the app root so
   // the name is ready on every authenticated route — chat, settings, logs —
   // and the Electron window title / tray / About panel (published below by
   // useElectronIdentitySync) track it everywhere, not only on chat routes.
   // No-ops until an assistant id resolves in a fetchable lifecycle state.
-  useAssistantIdentityInit({ assistantId, assistantStateKind });
+  const { notificationName } = useAssistantIdentityInit({
+    assistantId,
+    assistantStateKind,
+    ownerScopeId: notificationScopeId,
+  });
   useAssistantFeatureFlagSync(assistantId);
   useAssistantResourceSync(assistantId, isAssistantActive);
   useConversationSync(assistantId, isAssistantActive);
@@ -203,14 +252,60 @@ export function RootLayout() {
   // working somewhere else when a session ends.
   useWatchRetroSync();
 
+  // The companion's one-time introduction, which runs on a floating window of
+  // its own and is reported from this one: main decides what happened, and this
+  // is the window that is signed in and holds the user's answer about
+  // analytics. Mounted beside the scrim below, which is here for the same
+  // reason. Inert everywhere there is no companion surface.
+  useCompanionIntroFunnel();
+
   // Keep the browser favicon in sync with the assistant's avatar across
   // every authenticated route (chat, settings, logs, etc.). Mounted here
   // so the favicon persists when navigating between sibling layouts.
-  const avatar = useAssistantAvatar(assistantId);
+  const avatar = useAssistantAvatar(assistantId, {
+    ownerScopeId: notificationScopeId,
+  });
   useDynamicFavicon(avatar.customImageUrl, avatar.components, avatar.traits);
   // Publish the avatar accent as `--avatar-accent` so chat loading shimmers
   // (and any future accent-tinted UI) can read it from plain CSS.
   useAvatarAccentVar(avatar.accentHex);
+  const retainedNotificationIdentityOwners = useMemo(() => {
+    if (sessionStatus === "authenticated" && !assistantsHydrated) {
+      return null;
+    }
+    if (sessionStatus !== "authenticated") {
+      return [];
+    }
+    return assistants
+      .map((assistant) => {
+        const fallback =
+          assistant.id === assistantId ? connectionFallback : null;
+        const scopeId = resolveAssistantAvatarOwnerScopeId(
+          assistant,
+          platformAccountId,
+          requestOrganizationId,
+          fallback,
+        );
+        return scopeId ? { scopeId, assistantId: assistant.id } : null;
+      })
+      .filter((owner) => owner !== null);
+  }, [
+    assistantId,
+    assistants,
+    assistantsHydrated,
+    connectionFallback,
+    platformAccountId,
+    requestOrganizationId,
+    sessionStatus,
+  ]);
+  useEffect(() => {
+    if (!retainedNotificationIdentityOwners) {
+      return;
+    }
+    reconcilePreparedNotificationIdentityOwners(
+      retainedNotificationIdentityOwners,
+    );
+  }, [retainedNotificationIdentityOwners]);
   // Publish the same avatar for the iOS Live Activity, which cannot fetch an
   // image at render time and needs the bytes to travel with the activity.
   useIslandAvatarSource(
@@ -227,8 +322,8 @@ export function RootLayout() {
     avatar.traits,
     avatar.accentHex,
   );
-  // The same avatar again, composited onto its accent disc, for the desktop
-  // notifications that show the assistant as the sender rather than the app.
+  // Prepare the same avatar and exact identity for local notification senders
+  // across web, native mobile, and Electron surfaces.
   useNotificationAvatarSync(
     assistantId,
     avatar.customImageUrl,
@@ -236,9 +331,17 @@ export function RootLayout() {
     avatar.components,
     avatar.traits,
     avatar.accentHex,
+    {
+      scopeId: notificationScopeId,
+      platformAssistantId: notificationPlatformAssistantId,
+      assistantName: notificationName?.name ?? null,
+      assistantNameOwner: notificationName?.owner ?? null,
+      avatarOwner: avatar.owner ?? null,
+      avatarReady: avatar.isSuccess,
+    },
   );
   useElectronStatusSync();
-  useElectronIdentitySync();
+  useElectronIdentitySync(companionReady);
   useLockfileIdentitySync();
   useElectronFeatureFlagBridge();
 
@@ -253,7 +356,22 @@ export function RootLayout() {
   // at the root because downloads start from every domain (chat attachments,
   // workspace files, invoices, inspector exports).
   useDownloadFeedback();
-  useEffect(() => subscribeAndroidBackButtonSource(), []);
+  // Android Back closes a minimized app the WebView history root cannot pop.
+  // The listener is armed once and reads the current entry's recorded return
+  // through the ref.
+  const locationStateRef = useRef(location.state);
+  useEffect(() => {
+    locationStateRef.current = location.state;
+  }, [location.state]);
+  useEffect(
+    () =>
+      subscribeAndroidBackButtonSource({
+        closeAppRoute: () => {
+          closeAppRoute(navigate, { state: locationStateRef.current });
+        },
+      }),
+    [navigate],
+  );
   // Inbound deep-link navigation + window activation. Mounted here
   // (not in `ChatPage`) so a `vellum://thread/...` arriving while
   // the user is on `/assistant/settings`, `/logs`, etc. still
@@ -271,6 +389,8 @@ export function RootLayout() {
   // surface is on screen for as long as the app is, including on routes with no
   // transcript rendered.
   useCompanionMirror();
+  // The microphones and voices the call bar's chevrons open in the popover.
+  useCompanionPickers();
 
   const [feedbackOpen, setFeedbackOpen] = useState(false);
   // Id of the assistant a tray "Retire <assistant>…" command targets. The tray
@@ -355,9 +475,9 @@ export function RootLayout() {
       const draftId = createDraftConversationId();
       useConversationStore.getState().setActiveConversationId(draftId);
       useViewerStore.getState().setMainView("chat");
-      void navigate(
-        `${routes.conversation(draftId)}?prompt=${encodeURIComponent(command.message)}`,
-      );
+      void navigate(routes.conversationWithPrompt(draftId, command.message), {
+        state: autoSendPromptState(),
+      });
     },
     startVoice: () => {
       // The companion surface's Talk, the one sender of this command. See
@@ -422,6 +542,27 @@ export function RootLayout() {
         return;
       }
       void answerDictationOffer(command.answer, command.offerId);
+    },
+    answerCompanionPopover: (command) => {
+      if (command.kind !== "answerCompanionPopover") {
+        return;
+      }
+      void answerCompanionPopover(command.popoverId, command.answer);
+    },
+    toggleCompanionPicker: (command) => {
+      if (command.kind !== "toggleCompanionPicker") {
+        return;
+      }
+      toggleCompanionPicker(command.picker);
+    },
+    // The user pressed a control the assistant was pointing at. Handled here
+    // rather than beside the session's controls for the reason the dial's
+    // cancel is: this layout is mounted on every route the call can be on.
+    coachmarkPressed: (command) => {
+      if (command.kind !== "coachmarkPressed") {
+        return;
+      }
+      reportCoachmarkPressed(command.label);
     },
     // The flag gate and the toggle both live in `watch-command.ts`. This is the
     // one command registered here that can start reading the user's screen, so
@@ -575,9 +716,13 @@ export function RootLayout() {
       <UpdateToast />
       {appShellOwnsTopInset ? <StatusBanner placement="web" /> : null}
       <div
-        className="flex min-w-0 flex-col overflow-hidden w-full"
+        className="relative flex min-w-0 flex-col overflow-hidden w-full"
         style={{ flex: "1 1 0%", minHeight: 0 }}
       >
+        {/* Inside the shell rather than fixed to the viewport, so it sits
+            below the safe-area inset and the status banner instead of under
+            the notch. */}
+        <RoutePendingIndicator />
         <Outlet />
       </div>
 
@@ -587,7 +732,16 @@ export function RootLayout() {
       {/* Headless: keeps daemon config.ui.detectedTimezone fresh on
           focus/zone change. No-ops until an assistant id resolves. */}
       <TimezoneSync />
-      <GlobalPushToTalkBridge assistantId={assistantId} />
+      <GlobalPushToTalkBridge
+        assistantId={assistantId}
+        enabled={companionReady}
+      />
+
+      <CompanionTourEntry avatar={avatar} ready={companionReady} />
+
+      {/* The app dimmed while the companion introduces itself over this
+          window. Inert off Electron and on the shells with no surface. */}
+      <CompanionIntroScrim />
 
       {feedbackOpen ? (
         <ShareFeedbackModalLazy

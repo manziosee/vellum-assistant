@@ -1,6 +1,11 @@
 /**
- * The body of an Output section: the text when there is some, else the sentence
- * that says why there is not.
+ * The body of an Output section: the sentence that says a call did not run when
+ * it was refused, else the text when there is some, else the sentence that says
+ * why there is not.
+ *
+ * A refused call's result is the daemon's instruction to the model ("Do NOT
+ * retry this tool call..."), never output for the reader, so the refusal wins
+ * over any text that arrives with it.
  *
  * Shared by the generic path in `ToolDetailBody` and by every renderer that
  * owns its own output, because otherwise each one re-derives "denied vs empty
@@ -8,8 +13,7 @@
  * would tell a user their declined call returned nothing.
  */
 
-import { Typography } from "@vellumai/design-library";
-
+import { DetailShellNotice } from "@/components/detail-shell";
 import { CodeBlock } from "@/components/detail-primitives";
 import { useTranslation } from "@/i18n";
 
@@ -26,21 +30,22 @@ export function ToolOutputBody({
   isError: boolean;
 }) {
   const { t } = useTranslation("chat");
-  if (text) {
-    return <CodeBlock text={text} tone={isError ? "error" : "default"} />;
+  if (text && !isDenied) {
+    return (
+      <CodeBlock
+        text={text}
+        tone={isError ? "error" : "default"}
+        label={t("toolDetailPanel.output")}
+      />
+    );
   }
   return (
-    <Typography
-      variant="body-small-default"
-      as="p"
-      className="text-[var(--content-tertiary)]"
-      data-testid="tool-output-notice"
-    >
+    <DetailShellNotice placement="section" data-testid="tool-output-notice">
       {isDenied
         ? t("toolDetailPanel.denied")
         : isRunning
           ? t("toolDetailPanel.running")
           : t("toolDetailPanel.emptyOutput")}
-    </Typography>
+    </DetailShellNotice>
   );
 }

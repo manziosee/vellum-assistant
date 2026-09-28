@@ -10,6 +10,9 @@ let mockTavilySecureKey: string | undefined;
 let mockFirecrawlSecureKey: string | undefined;
 let mockKeenableSecureKey: string | undefined;
 let mockFastcrwSecureKey: string | undefined;
+let mockSearxngSecureKey: string | undefined;
+let mockTinyfishSecureKey: string | undefined;
+let mockExaSecureKey: string | undefined;
 let mockManagedSearchProxyResult: any;
 let mockManagedSearchAvailable = true;
 let mockManagedSearchProxyCalls: Array<{
@@ -57,6 +60,15 @@ mock.module("../../../security/secure-keys.js", () => ({
     if (provider === "fastcrw") {
       return mockFastcrwSecureKey;
     }
+    if (provider === "searxng") {
+      return mockSearxngSecureKey;
+    }
+    if (provider === "tinyfish") {
+      return mockTinyfishSecureKey;
+    }
+    if (provider === "exa") {
+      return mockExaSecureKey;
+    }
     return undefined;
   },
 }));
@@ -101,6 +113,9 @@ describe("web_search tool", () => {
     mockFirecrawlSecureKey = undefined;
     mockKeenableSecureKey = undefined;
     mockFastcrwSecureKey = undefined;
+    mockSearxngSecureKey = undefined;
+    mockTinyfishSecureKey = undefined;
+    mockExaSecureKey = undefined;
     mockManagedSearchProxyCalls = [];
     mockManagedSearchAvailable = true;
     mockManagedSearchProxyResult = {
@@ -1140,6 +1155,290 @@ describe("web_search tool", () => {
     expect(result.isError).toBe(false);
     expect(result.content).toContain("Local");
     expect(capturedHeaders?.get("authorization")).toBeNull();
+  });
+
+  // ---- SearXNG provider (keyless, instance URL required) ------------------
+
+  test("SearXNG errors when API Base is missing and does not fetch", async () => {
+    seedWebSearch("your-own", "searxng");
+    let fetchCalls = 0;
+    globalThis.fetch = (async () => {
+      fetchCalls += 1;
+      return new Response("{}", { status: 200 });
+    }) as any;
+
+    const result = await execute({ query: "local search" });
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("SearXNG needs an instance URL");
+    expect(result.activityMetadata?.webSearch?.provider).toBe("searxng");
+    expect(fetchCalls).toBe(0);
+  });
+
+  test("executes SearXNG search against the instance URL without a key", async () => {
+    seedWebSearch("your-own", "searxng", "http://127.0.0.1:8888/");
+    let capturedUrl = "";
+    let capturedHeaders: any = null;
+    globalThis.fetch = (async (url: string, init?: RequestInit) => {
+      capturedUrl = url;
+      capturedHeaders = new Headers(init?.headers);
+      return new Response(
+        JSON.stringify({
+          results: [
+            {
+              title: "SearXNG Result",
+              url: "https://example.com/searx",
+              content: "From a local instance",
+            },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as any;
+
+    const result = await execute({ query: "open source search" });
+    expect(result.isError).toBe(false);
+    expect(capturedUrl).toBe(
+      "http://127.0.0.1:8888/search?q=open+source+search&format=json",
+    );
+    expect(capturedHeaders?.get("authorization")).toBeNull();
+    expect(result.content).toContain("SearXNG Result");
+    expect(result.content).toContain("https://example.com/searx");
+    expect(result.activityMetadata?.webSearch?.provider).toBe("searxng");
+  });
+
+  test("SearXNG maps freshness and sends an optional bearer token", async () => {
+    seedWebSearch("your-own", "searxng", "http://searx.example.com");
+    mockSearxngSecureKey = "searx-token";
+    let capturedUrl = "";
+    let capturedHeaders: any = null;
+    globalThis.fetch = (async (url: string, init?: RequestInit) => {
+      capturedUrl = url;
+      capturedHeaders = new Headers(init?.headers);
+      return new Response(JSON.stringify({ results: [] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as any;
+
+    await execute({ query: "fresh news", freshness: "pd" });
+    expect(capturedUrl).toContain("time_range=day");
+    expect(capturedHeaders?.get("authorization")).toBe("Bearer searx-token");
+
+    await execute({ query: "fresh news", freshness: "pw" });
+    expect(capturedUrl).not.toContain("time_range=");
+  });
+
+  test("SearXNG trims results to the requested count", async () => {
+    seedWebSearch("your-own", "searxng", "http://127.0.0.1:8888");
+    globalThis.fetch = (async () => {
+      return new Response(
+        JSON.stringify({
+          results: [
+            { title: "A", url: "https://a.example.com", content: "a" },
+            { title: "B", url: "https://b.example.com", content: "b" },
+            { title: "C", url: "https://c.example.com", content: "c" },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as any;
+
+    const result = await execute({ query: "test", count: 2 });
+    expect(result.content).toContain("A");
+    expect(result.content).toContain("B");
+    expect(result.content).not.toContain("https://c.example.com");
+  });
+
+  test("SearXNG errors when the instance returns HTML instead of JSON", async () => {
+    seedWebSearch("your-own", "searxng", "http://127.0.0.1:8888");
+    globalThis.fetch = (async () => {
+      return new Response("<!DOCTYPE html><html><body>search</body></html>", {
+        status: 200,
+        headers: { "content-type": "text/html" },
+      });
+    }) as any;
+
+    const result = await execute({ query: "test" });
+    expect(result.isError).toBe(true);
+    expect(result.content).toContain("did not return JSON");
+  });
+
+  // ---- TinyFish provider --------------------------------------------------
+
+  test("executes TinyFish search with X-API-Key and freshness", async () => {
+    seedWebSearch("your-own", "tinyfish");
+    mockTinyfishSecureKey = "tf_test";
+    let capturedUrl = "";
+    let capturedApiKey = "";
+    globalThis.fetch = (async (url: string, init?: RequestInit) => {
+      capturedUrl = url;
+      capturedApiKey = new Headers(init?.headers).get("x-api-key") ?? "";
+      return new Response(
+        JSON.stringify({
+          query: "fresh tools",
+          results: [
+            {
+              position: 1,
+              site_name: "example.com",
+              title: "TinyFish Result",
+              snippet: "Fresh from TinyFish",
+              url: "https://example.com/tinyfish",
+              date: "2026-09-18",
+            },
+          ],
+          total_results: 1,
+          page: 0,
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as any;
+
+    const result = await execute({ query: "fresh tools", freshness: "pw" });
+
+    expect(result.isError).toBe(false);
+    const url = new URL(capturedUrl);
+    expect(`${url.origin}${url.pathname}`).toBe(
+      "https://api.search.tinyfish.ai/",
+    );
+    expect(url.searchParams.get("query")).toBe("fresh tools");
+    expect(url.searchParams.get("recency_minutes")).toBe("10080");
+    expect(capturedApiKey).toBe("tf_test");
+    expect(result.content).toContain("TinyFish Result");
+    expect(result.content).toContain("Fresh from TinyFish");
+    expect(result.activityMetadata?.webSearch?.provider).toBe("tinyfish");
+  });
+
+  test("TinyFish uses a custom API base and trims to count", async () => {
+    seedWebSearch("your-own", "tinyfish", "https://search.example.com/api/");
+    mockTinyfishSecureKey = "tf_test";
+    let capturedUrl = "";
+    globalThis.fetch = (async (url: string) => {
+      capturedUrl = url;
+      return new Response(
+        JSON.stringify({
+          results: [
+            { title: "A", url: "https://a.example.com", snippet: "a" },
+            { title: "B", url: "https://b.example.com", snippet: "b" },
+            { title: "C", url: "https://c.example.com", snippet: "c" },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as any;
+
+    const result = await execute({ query: "test", count: 2 });
+
+    expect(capturedUrl).toContain("https://search.example.com/api/");
+    expect(result.content).toContain("A");
+    expect(result.content).toContain("B");
+    expect(result.content).not.toContain("https://c.example.com");
+    expect(result.activityMetadata?.webSearch?.resultCount).toBe(2);
+  });
+
+  test.each([401, 402, 403])(
+    "TinyFish handles %d access error",
+    async (status) => {
+      seedWebSearch("your-own", "tinyfish");
+      mockTinyfishSecureKey = "tf_test";
+      globalThis.fetch = (async () =>
+        new Response(JSON.stringify({ error: "denied" }), { status })) as any;
+
+      const result = await execute({ query: "test" });
+
+      expect(result.isError).toBe(true);
+      expect(result.activityMetadata?.webSearch?.provider).toBe("tinyfish");
+    },
+  );
+
+  // ---- Exa provider ------------------------------------------------------
+
+  test("Exa search posts the recommended request and maps freshness", async () => {
+    seedWebSearch("your-own", "exa");
+    mockExaSecureKey = "exa_test";
+    let capturedUrl = "";
+    let capturedInit: RequestInit | undefined;
+    globalThis.fetch = (async (url: string, init?: RequestInit) => {
+      capturedUrl = url;
+      capturedInit = init;
+      return new Response(
+        JSON.stringify({
+          requestId: "r1",
+          results: [
+            {
+              title: "Exa Result",
+              url: "https://example.com/exa",
+              publishedDate: "2026-09-18T00:00:00.000Z",
+              highlights: ["Fresh from Exa"],
+            },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as any;
+
+    const result = await execute({
+      query: "fresh tools",
+      freshness: "pw",
+      count: 5,
+    });
+
+    expect(result.isError).toBe(false);
+    expect(capturedUrl).toBe("https://api.exa.ai/search");
+    expect(capturedInit?.method).toBe("POST");
+    const headers = new Headers(capturedInit?.headers);
+    expect(headers.get("x-api-key")).toBe("exa_test");
+    const body = JSON.parse(String(capturedInit?.body));
+    expect(body.query).toBe("fresh tools");
+    expect(body.type).toBe("auto");
+    expect(body.numResults).toBe(5);
+    expect(body.contents.highlights).toBe(true);
+    expect(typeof body.startPublishedDate).toBe("string");
+    const delta = Date.now() - Date.parse(body.startPublishedDate);
+    expect(delta).toBeGreaterThan(7 * 24 * 60 * 60 * 1000 - 60_000);
+    expect(delta).toBeLessThan(7 * 24 * 60 * 60 * 1000 + 60_000);
+    expect(result.content).toContain("Exa Result");
+    expect(result.content).toContain("Fresh from Exa");
+    expect(result.activityMetadata?.webSearch?.provider).toBe("exa");
+  });
+
+  test("Exa omits the date filter without freshness and trims to count", async () => {
+    seedWebSearch("your-own", "exa");
+    mockExaSecureKey = "exa_test";
+    let capturedInit: RequestInit | undefined;
+    globalThis.fetch = (async (_url: string, init?: RequestInit) => {
+      capturedInit = init;
+      return new Response(
+        JSON.stringify({
+          results: [
+            { title: "A", url: "https://a.example.com", highlights: ["a"] },
+            { title: "B", url: "https://b.example.com", highlights: ["b"] },
+            { title: "C", url: "https://c.example.com", highlights: ["c"] },
+          ],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as any;
+
+    const result = await execute({ query: "test", count: 2 });
+
+    const body = JSON.parse(String(capturedInit?.body));
+    expect(body.startPublishedDate).toBeUndefined();
+    expect(result.content).toContain("A");
+    expect(result.content).toContain("B");
+    expect(result.content).not.toContain("https://c.example.com");
+    expect(result.activityMetadata?.webSearch?.resultCount).toBe(2);
+  });
+
+  test.each([401, 402, 403])("Exa handles %d access error", async (status) => {
+    seedWebSearch("your-own", "exa");
+    mockExaSecureKey = "exa_test";
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ error: "denied" }), { status })) as any;
+
+    const result = await execute({ query: "test" });
+
+    expect(result.isError).toBe(true);
+    expect(result.activityMetadata?.webSearch?.provider).toBe("exa");
   });
 
   // ---- Provider fallback --------------------------------------------------

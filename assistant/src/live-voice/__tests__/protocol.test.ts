@@ -77,6 +77,105 @@ describe("parseLiveVoiceClientTextFrame", () => {
     expect(result).toEqual({ ok: true, frame });
   });
 
+  test.each([true, false])(
+    "parses screen sharing state %p",
+    (screenSharing) => {
+      const frame = { type: "update_config", screenSharing } as const;
+      expect(parseLiveVoiceClientTextFrame(JSON.stringify(frame))).toEqual({
+        ok: true,
+        frame,
+      });
+    },
+  );
+
+  test("parses the shared surface's controls, and a clear", () => {
+    const shareTargets = {
+      targets: [
+        {
+          id: "t1",
+          label: "root_Filters",
+          role: "AXButton",
+          section: "Toolbar",
+          x: 0.8,
+          y: 0.05,
+          width: 0.05,
+          height: 0.03,
+        },
+      ],
+      total: 3,
+    };
+    expect(
+      parseLiveVoiceClientTextFrame(
+        JSON.stringify({ type: "update_config", shareTargets }),
+      ),
+    ).toEqual({ ok: true, frame: { type: "update_config", shareTargets } });
+    expect(
+      parseLiveVoiceClientTextFrame(
+        JSON.stringify({ type: "update_config", shareTargets: null }),
+      ),
+    ).toEqual({
+      ok: true,
+      frame: { type: "update_config", shareTargets: null },
+    });
+  });
+
+  test("drops an off-shape control rather than refusing the snapshot", () => {
+    const result = parseLiveVoiceClientTextFrame(
+      JSON.stringify({
+        type: "update_config",
+        shareTargets: {
+          targets: [
+            {
+              id: "t1",
+              label: "Send",
+              role: "AXButton",
+              x: 2,
+              y: 0,
+              width: 0.1,
+              height: 0.1,
+            },
+            {
+              id: "t2",
+              label: "Save",
+              role: "AXButton",
+              x: 0.1,
+              y: 0.1,
+              width: 0.1,
+              height: 0.1,
+            },
+          ],
+          total: 2,
+        },
+      }),
+    );
+    expect(result.ok).toBe(true);
+    if (!result.ok || result.frame.type !== "update_config") {
+      return;
+    }
+    expect(result.frame.shareTargets?.targets.map((t) => t.label)).toEqual([
+      "Save",
+    ]);
+  });
+
+  test("rejects a snapshot with no targets array", () => {
+    expect(
+      parseLiveVoiceClientTextFrame(
+        JSON.stringify({ type: "update_config", shareTargets: { total: 1 } }),
+      ).ok,
+    ).toBe(false);
+  });
+
+  test("rejects malformed screen sharing state", () => {
+    expect(
+      parseLiveVoiceClientTextFrame(
+        JSON.stringify({
+          type: "update_config",
+          screenSharing: "true",
+        }),
+      ).ok,
+    ).toBe(false);
+  });
+
   test("parses an update_config frame with a single field, omitting the other", () => {
     const result = parseLiveVoiceClientTextFrame(
       JSON.stringify({ type: "update_config", silenceThresholdMs: 900 }),
@@ -698,6 +797,53 @@ describe("parseLiveVoiceClientTextFrame", () => {
     });
   });
 
+  test("keeps known session controls and drops unknown ones", () => {
+    const result = validateLiveVoiceClientFrame({
+      type: "start",
+      sessionControls: [
+        "mute",
+        "look_stop",
+        "look_camera",
+        "end",
+        "mute",
+        7,
+        "fly",
+      ],
+      audio: { mimeType: "audio/pcm", sampleRate: 24000, channels: 1 },
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+    // A newer client's controls cost it nothing on an older daemon.
+    expect(result.frame).toMatchObject({
+      type: "start",
+      sessionControls: ["end", "mute", "look_camera", "look_stop"],
+    });
+  });
+
+  test.each([
+    ["absent", {}],
+    ["not an array", { sessionControls: "end" }],
+    ["all unknown", { sessionControls: ["fly"] }],
+  ])(
+    "omits sessionControls from the start frame when %s",
+    (_label, extra: Record<string, unknown>) => {
+      const result = validateLiveVoiceClientFrame({
+        type: "start",
+        ...extra,
+        audio: { mimeType: "audio/pcm", sampleRate: 24000, channels: 1 },
+      });
+
+      expect(result.ok).toBe(true);
+      if (!result.ok) {
+        return;
+      }
+      expect("sessionControls" in result.frame).toBe(false);
+    },
+  );
+
   test("parses the textInput capability on the start frame", () => {
     const result = validateLiveVoiceClientFrame({
       type: "start",
@@ -749,6 +895,54 @@ describe("parseLiveVoiceClientTextFrame", () => {
     expect(result.error).toMatchObject({
       code: "invalid_field",
       field: "textInput",
+      frameType: "start",
+    });
+  });
+
+  test("parses the lookFrames capability on the start frame", () => {
+    const result = validateLiveVoiceClientFrame({
+      type: "start",
+      lookFrames: true,
+      audio: { mimeType: "audio/pcm", sampleRate: 24000, channels: 1 },
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+    expect(result.frame).toMatchObject({ type: "start", lookFrames: true });
+  });
+
+  test("omits lookFrames from the start frame when false", () => {
+    // False and absent mean the same thing: no look frame is coming, so the
+    // session must not wait for one.
+    const result = validateLiveVoiceClientFrame({
+      type: "start",
+      lookFrames: false,
+      audio: { mimeType: "audio/pcm", sampleRate: 24000, channels: 1 },
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) {
+      return;
+    }
+    expect("lookFrames" in result.frame).toBe(false);
+  });
+
+  test("returns a typed protocol error for a non-boolean lookFrames", () => {
+    const result = validateLiveVoiceClientFrame({
+      type: "start",
+      lookFrames: 1,
+      audio: { mimeType: "audio/pcm", sampleRate: 24000, channels: 1 },
+    });
+
+    expect(result.ok).toBe(false);
+    if (result.ok) {
+      return;
+    }
+    expect(result.error).toMatchObject({
+      code: "invalid_field",
+      field: "lookFrames",
       frameType: "start",
     });
   });

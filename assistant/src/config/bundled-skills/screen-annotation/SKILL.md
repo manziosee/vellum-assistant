@@ -8,11 +8,11 @@ metadata:
     display-name: "Screen Annotation"
     category: "system"
     activation-hints:
-      - "User asks where something is, how to do it, or to be walked through it, in an app they share on a call"
+      - "User asks where a control is, or to be walked through doing something themselves, in an app they share"
       - "User wants to be shown, not have it done for them"
       - "The answer is a place on the user's screen"
     avoid-when:
-      - "User wants the assistant to do the thing rather than be shown it (use computer-use)"
+      - "User asks the assistant to do it (click, type, edit), even on a call: use computer-use"
       - "Nothing is being shared, so there is no surface to point at"
 ---
 
@@ -33,7 +33,8 @@ fails saying so. Ask them to share their screen from the call, then point.
 
 ## Say what to point at
 
-**Name the thing.** `{"target": "color balance", "caption": "Click this"}`.
+**Prefer naming the thing for an arrow.**
+`{"target": "color balance", "caption": "Click this"}`.
 The name is looked up on the surface itself, which knows where its controls
 actually are, and an arrow is drawn at it.
 
@@ -46,25 +47,37 @@ nothing, because no control is called that. Give the label on its own:
 The arrow points at the middle of the control and stops just short, so what
 you are sending someone to stays visible the whole time.
 
-You are answered with what was drawn and the name it resolved to, which is not
-always the name you asked for. Say the resolved one out loud: it is the word
-the user can see.
+You are answered with what was drawn and the accessibility name it resolved
+to. Some apps expose internal names such as `ToolbarExportControl` instead of
+the visible label. When a returned name identifies the intended control in
+the shared image, use that exact name as `target`; use the visible label in
+the caption and speech. Do not invent an internal name or choose an unclear
+candidate.
 
-A name the surface does not carry draws nothing and comes back with the names
-it does carry. That is the answer, not a setback: the thing is nearly always
-one of those, so read the list and point again. **Never fall back to
-coordinates for a control you could not find.** A mark drawn at a guess is
-worse than no mark, because someone follows it; the words you say are the
-better tool for a thing you cannot point at. What the user calls something and
-what the surface calls it often differ, which is what the list is for: they
-may say "white balance" where the control reads `color balance`, or "the
-stabilization button" where it reads `stabilization`.
+A failed name lookup draws nothing. It means the accessibility name could
+not be resolved, not that the control is absent from the picture. Read the
+returned names and retry with an exact name when it identifies the intended
+control. Do not cycle through invented internal names.
 
-## Coordinates, for an extent
+**Use the picture when names cannot identify the control.** If the intended
+control is clearly visible in a fresh image of the shared surface, retry in
+the same turn with tight `x`/`y`/`width`/`height` bounds measured from that
+image. This also applies when accessibility information is missing or a name
+matches multiple controls. A failed name lookup does not require the user to
+ask again before you can draw a ring.
 
-For when the size of the thing is the message rather than where it is: a
-region of an image, an area of a canvas, a panel spoken of as a whole. These
-draw a ring around the bounds instead of an arrow at a place.
+If you cannot confidently locate the intended control, get a fresh view or
+ask the user to clarify. Describe its location verbally only when you can
+identify it. Do not invent a location or claim a mark was drawn after a
+failed tool call.
+
+## Coordinates, for a ring
+
+Use bounds for a region, a visual fallback after a failed name lookup, or an
+explicit request to circle a clearly visible control. When the user asks for
+a circle or ring, use bounds directly; a named lookup draws an arrow. The
+same requirement to identify the target in a fresh image applies in every
+case.
 
 Fractions of the shared surface, `0` to `1`, measured against **the picture of
 that surface you were last shown**. `x` and `y` are the top-left corner,
@@ -73,10 +86,11 @@ drawn around them, so a box tight on a button reads as a ring around that
 button, and a box drawn where you think the ring should go puts the ring
 outside that instead.
 
-These are a guess measured off a picture that has been scaled on its way to
-you, and they are only as fresh as the last frame you were sent. If the user
-has scrolled or moved a window since, say what you are pointing at as well as
-drawing it, so a mark that has drifted is still recoverable in words.
+Bounds are measured off a picture that has been scaled on its way to you.
+If the user has scrolled, moved a window, or changed the layout since that
+frame, get a fresh view before measuring. Say what you are pointing at as
+well as drawing it, so the user can check the mark against the intended
+control.
 
 Moving the share is the one kind of drift that is caught for you. A mark
 measured against the surface before the move is refused rather than drawn,
@@ -124,7 +138,14 @@ their ear. Silence is the cue that it is their turn.
 
 **Advance on evidence, not on time.** Move to the next step when a fresh
 picture shows this one done, or when they tell you it is. Do not move on
-because a plausible amount of time has passed. If the next picture shows the
+because a plausible amount of time has passed.
+
+The most direct telling is automatic. When the user clicks the control an
+arrow is pointing at, a message arrives as their turn saying they clicked it,
+by name, and that mark comes down on its own. Treat it as the step done: say
+what comes next and point at it. Nothing arrives for a click anywhere else,
+and nothing arrives for a ring, so for those the picture and their words are
+still the evidence. If the next picture shows the
 step not done, or done to the wrong thing, point at the same place again with
 a shorter caption and say what you saw. Pointing at the next step while the
 previous one is still open is how someone ends up two steps behind a mark.
@@ -140,8 +161,6 @@ step five of four.
 
 ## Shapes
 
-A mark is either an arrow at a place or a ring around an extent, and naming a
-control gives you the arrow. Reach for the ring only when the extent is the
-thing being said: "this whole panel", "this part of the picture". A ring
-around one button says something about where that button ends, which is
-rarely what you mean and is the part most likely to be wrong.
+A named control gives you an arrow. Bounds give you a ring for an extent,
+a control located visually after a failed name lookup, or the circle the
+user explicitly requested.

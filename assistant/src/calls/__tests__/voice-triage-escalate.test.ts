@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test";
 
 import { DEEPGRAM_MULTI_LANGUAGE_CODES } from "../../providers/speech-to-text/deepgram.js";
+import { SCREEN_ACTION_VERDICT_TOKEN } from "../voice-control-protocol.js";
 import {
   capEscalationBridge,
   classifyFrontDoorLeading,
   createFrontDoorStreamGate,
+  createFrontDoorVerdictMachine,
   ESCALATE_VERDICT_TOKEN,
   escalatedContinuationRule,
   ESCALATION_CONTINUATION_CONTENT,
@@ -17,6 +19,7 @@ import {
   isEscalationBridgeComplete,
   MAX_ESCALATION_BRIDGE_CHARS,
   needsFallbackBridge,
+  resolveSpokenEscalationBridge,
   spokenBridgeText,
 } from "../voice-triage-escalate.js";
 
@@ -46,6 +49,13 @@ describe("frontDoorCapabilityDigest", () => {
 });
 
 describe("front-door decision rule", () => {
+  test("only teaches the screen-action bypass during screen sharing", () => {
+    expect(frontDoorDecisionRule()).not.toContain(SCREEN_ACTION_VERDICT_TOKEN);
+    const rule = frontDoorDecisionRule({ screenSharing: true });
+    expect(rule).toContain(SCREEN_ACTION_VERDICT_TOKEN);
+    expect(rule).toContain("skips fresh memory retrieval");
+    expect(rule).toContain("or you are unsure");
+  });
   const rule = frontDoorDecisionRule();
 
   test("demands a leading verdict and teaches the escalate token", () => {
@@ -281,6 +291,34 @@ describe("fallbackEscalationBridgeFor", () => {
   });
 });
 
+describe("resolveSpokenEscalationBridge", () => {
+  test("a real capped bridge is spoken as the model's own speech", () => {
+    expect(resolveSpokenEscalationBridge("Let me check that.", "es")).toEqual({
+      spokenBridge: "Let me check that.",
+      usesFallback: false,
+    });
+  });
+
+  test("an empty or too-short bridge falls back to the localized canned phrase, audio-only", () => {
+    expect(resolveSpokenEscalationBridge("", "es")).toEqual({
+      spokenBridge: FALLBACK_ESCALATION_BRIDGE_BY_LANGUAGE.es,
+      usesFallback: true,
+    });
+    expect(resolveSpokenEscalationBridge("Ok", undefined)).toEqual({
+      spokenBridge: FALLBACK_ESCALATION_BRIDGE,
+      usesFallback: true,
+    });
+  });
+
+  test("a canned phrase the table lacks for the caller's language is English and says so", () => {
+    expect(resolveSpokenEscalationBridge("", "ko")).toEqual({
+      spokenBridge: FALLBACK_ESCALATION_BRIDGE,
+      usesFallback: true,
+      language: "en",
+    });
+  });
+});
+
 describe("capEscalationBridge", () => {
   test("cuts just after the first sentence terminator", () => {
     expect(
@@ -363,13 +401,14 @@ describe("spokenBridgeText", () => {
     expect(spokenBridgeText(ESCALATE_VERDICT_TOKEN)).toBe("");
   });
 
-  test("is empty when the output does not lead with the verdict (an answer)", () => {
-    // A stray token later in an answer is not an escalation under the
-    // verdict-first protocol.
+  test("is empty for an answer with no leading or terminal verdict", () => {
     expect(spokenBridgeText("It is Tuesday.")).toBe("");
-    expect(spokenBridgeText(`Half an answer ${ESCALATE_VERDICT_TOKEN}`)).toBe(
-      "",
-    );
+    expect(spokenBridgeText("The token [1] is reserved.")).toBe("");
+  });
+
+  test("a terminal verdict preserves every sentence already released", () => {
+    const bridge = "Let me check. I will highlight the control.";
+    expect(spokenBridgeText(`${bridge} [ESCALATE]`)).toBe(bridge);
   });
 });
 
@@ -389,7 +428,7 @@ describe("needsFallbackBridge", () => {
 
 describe("classifyFrontDoorLeading", () => {
   test("pending while the stream could still become a verdict token", () => {
-    for (const leading of ["", "[", "[1"]) {
+    for (const leading of ["", "[", "[1", "[E", "[ESCALATE"]) {
       expect(classifyFrontDoorLeading(leading, false)).toBe("pending");
     }
     expect(classifyFrontDoorLeading("[0", true)).toBe("pending");
@@ -405,6 +444,10 @@ describe("classifyFrontDoorLeading", () => {
   });
 
   test("escalate on the leading escalate token", () => {
+    expect(classifyFrontDoorLeading("[ESCALATE]", false)).toBe("escalate");
+    expect(classifyFrontDoorLeading("[ESCALATE] Let me check.", true)).toBe(
+      "escalate",
+    );
     expect(classifyFrontDoorLeading("[1]", false)).toBe("escalate");
     expect(classifyFrontDoorLeading("[1] Let me check.", true)).toBe(
       "escalate",
@@ -447,6 +490,113 @@ describe("live-voice escalation orchestration (end-to-end — TODO)", () => {
     "the escalated answer's TTS follows the bridge audio with no listening window between them",
     () => {},
   );
+});
+
+describe("createFrontDoorVerdictMachine", () => {
+  /** Feed `deltas` through a machine and return the step kinds, in order. */
+  function kinds(deltas: string[], holdEnabled = false): string[] {
+    const machine = createFrontDoorVerdictMachine(holdEnabled);
+    return deltas.map((delta) => machine.push(delta).kind);
+  }
+
+  test("stays pending while the lead could still become a token", () => {
+    expect(kinds(["", "[", "1"])).toEqual(["pending", "pending", "pending"]);
+  });
+
+  test("an answer releases the held lead on the transition, then each delta", () => {
+    const machine = createFrontDoorVerdictMachine(false);
+    expect(machine.push("[")).toEqual({ kind: "pending" });
+    expect(machine.push("A] first")).toEqual({
+      kind: "answer",
+      text: "[A] first",
+    });
+    expect(machine.push(", second")).toEqual({
+      kind: "answer",
+      text: ", second",
+    });
+  });
+
+  test("escalate reports the capped bridge on the delta that completes it", () => {
+    const machine = createFrontDoorVerdictMachine(false);
+    expect(machine.push(`${ESCALATE_VERDICT_TOKEN} One `)).toEqual({
+      kind: "escalate",
+      bridge: null,
+    });
+    expect(machine.push("moment")).toEqual({ kind: "bridging" });
+    expect(machine.push(". Extra text past the cap")).toEqual({
+      kind: "bridge",
+      bridge: "One moment.",
+    });
+    expect(machine.push(" more")).toEqual({ kind: "done" });
+  });
+
+  test("a bridge that completes on the verdict delta is reported with it", () => {
+    const machine = createFrontDoorVerdictMachine(false);
+    expect(machine.push(`${ESCALATE_VERDICT_TOKEN} Let me check.`)).toEqual({
+      kind: "escalate",
+      bridge: "Let me check.",
+    });
+  });
+
+  test("finish hands off a bridge that never hit a terminator", () => {
+    const machine = createFrontDoorVerdictMachine(false);
+    machine.push(`${ESCALATE_VERDICT_TOKEN} Give me a second`);
+    expect(machine.finish()).toEqual({
+      kind: "bridge",
+      bridge: "Give me a second",
+    });
+    expect(machine.push("late")).toEqual({ kind: "done" });
+  });
+
+  test("finish on an answer or a pending lead is done, not a bridge", () => {
+    const answering = createFrontDoorVerdictMachine(false);
+    answering.push("Sure.");
+    expect(answering.finish()).toEqual({ kind: "done" });
+    const undecided = createFrontDoorVerdictMachine(false);
+    undecided.push("[");
+    expect(undecided.finish()).toEqual({ kind: "done" });
+  });
+
+  test("a terminal verdict recovers at completion across every delta boundary", () => {
+    const bridge = "I will highlight the Rotate control on your screen.";
+    const text = `${bridge} [ESCALATE] \n`;
+    for (let split = 1; split < text.length; split++) {
+      const machine = createFrontDoorVerdictMachine(false);
+      expect(machine.push(text.slice(0, split)).kind).toBe("answer");
+      expect(machine.push(text.slice(split)).kind).toBe("answer");
+      expect(machine.finish()).toEqual({ kind: "terminal-escalate", bridge });
+      expect(machine.finish()).toEqual({ kind: "done" });
+      expect(machine.push("late")).toEqual({ kind: "done" });
+    }
+  });
+
+  test.each([
+    "Select option [1]",
+    "The source is listed as [1]",
+    "The source supports this statement. [1]",
+    "I will highlight it. [1]",
+    "The token [ESCALATE] is reserved.",
+    "I will highlight it. [ESCALATE",
+    "The token is `[ESCALATE]`",
+    "The token [1] is reserved.",
+    "I will highlight it. [1",
+    "I will highlight it.[1]",
+    "The token is `[1]`",
+    "I will highlight it. [0]",
+  ])("does not recover a nonterminal or incomplete verdict: %s", (text) => {
+    const machine = createFrontDoorVerdictMachine(false);
+    machine.push(text);
+    expect(machine.finish()).toEqual({ kind: "done" });
+  });
+
+  test("hold is a step only when the leg was taught the token", () => {
+    expect(kinds([HOLD_VERDICT_TOKEN], true)).toEqual(["hold"]);
+    expect(kinds([`${HOLD_VERDICT_TOKEN} trailing`], true)).toEqual(["hold"]);
+    expect(kinds([HOLD_VERDICT_TOKEN], false)).toEqual(["answer"]);
+    const held = createFrontDoorVerdictMachine(true);
+    held.push(HOLD_VERDICT_TOKEN);
+    expect(held.push("anything")).toEqual({ kind: "done" });
+  });
 });
 
 describe("createFrontDoorStreamGate", () => {
@@ -522,15 +672,36 @@ describe("createFrontDoorStreamGate", () => {
     expect(release(["[1] Let me check"], { finish: false })).toEqual([]);
   });
 
+  test("recovering a terminal verdict never releases the answer twice", () => {
+    const deltas = ["I will highlight it.", " [", "ESCALATE", "]"];
+    expect(release(deltas)).toEqual(["I will highlight it.", " "]);
+  });
+
+  test("terminal verdict fragments never escape at any delta boundary", () => {
+    const text = "I will highlight it. [ESCALATE]";
+    for (let split = 1; split < text.length; split++) {
+      expect(release([text.slice(0, split), text.slice(split)]).join("")).toBe(
+        "I will highlight it. ",
+      );
+    }
+  });
+
+  test("an incomplete marker is flushed only on normal completion", () => {
+    expect(release(["An opening bracket ["], { finish: false })).toEqual([
+      "An opening bracket ",
+    ]);
+    expect(release(["An opening bracket ["]).join("")).toBe(
+      "An opening bracket [",
+    );
+  });
+
   test("a hold verdict releases nothing", () => {
     expect(release([HOLD_VERDICT_TOKEN], { holdEnabled: true })).toEqual([]);
   });
 
-  test("the hold token is ordinary text on a leg that was never taught it", () => {
-    // A non-speculative leg's prompt has no hold branch, so its output must
-    // not be swallowed by a token it could only have parroted.
+  test("the hold token is stripped without discarding a non-speculative answer", () => {
     expect(release([`${HOLD_VERDICT_TOKEN} is the index.`])).toEqual([
-      `${HOLD_VERDICT_TOKEN} is the index.`,
+      " is the index.",
     ]);
   });
 

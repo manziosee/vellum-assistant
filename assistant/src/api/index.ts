@@ -1,8 +1,20 @@
 import { z } from "zod";
 
+export {
+  type AskQuestionInput,
+  AskQuestionInputSchema,
+  type RecordedQuestion,
+} from "./ask-question-tool.js";
+export {
+  isComputerUseToolCall,
+  resolveComputerUseToolName,
+} from "./computer-use-tool.js";
+export { type RememberInput, RememberInputSchema } from "./remember-tool.js";
+
 import { AcpAuthRequiredEventSchema } from "./events/acp-auth-required.js";
 import { AcpSessionCompletedEventSchema } from "./events/acp-session-completed.js";
 import { AcpSessionErrorEventSchema } from "./events/acp-session-error.js";
+import { AcpSessionModelUpdateEventSchema } from "./events/acp-session-model-update.js";
 import { AcpSessionSpawnedEventSchema } from "./events/acp-session-spawned.js";
 import { AcpSessionUpdateEventSchema } from "./events/acp-session-update.js";
 import { AcpSessionUsageEventSchema } from "./events/acp-session-usage.js";
@@ -33,6 +45,7 @@ import { ConversationErrorEventSchema } from "./events/conversation-error.js";
 import { ConversationInferenceProfileUpdatedEventSchema } from "./events/conversation-inference-profile-updated.js";
 import { ConversationNoticeEventSchema } from "./events/conversation-notice.js";
 import { ConversationTitleUpdatedEventSchema } from "./events/conversation-title-updated.js";
+import { DesktopActivityChangedEventSchema } from "./events/desktop-activity-changed.js";
 import { DiskPressureStatusChangedEventSchema } from "./events/disk-pressure-status-changed.js";
 import { DocumentCommentCreatedEventSchema } from "./events/document-comment-created.js";
 import { DocumentCommentDeletedEventSchema } from "./events/document-comment-deleted.js";
@@ -43,7 +56,6 @@ import { DocumentEditorUpdateEventSchema } from "./events/document-editor-update
 import { ErrorEventSchema } from "./events/error.js";
 import { GenerationCancelledEventSchema } from "./events/generation-cancelled.js";
 import { GenerationHandoffEventSchema } from "./events/generation-handoff.js";
-import { HeartbeatAlertEventSchema } from "./events/heartbeat-alert.js";
 import { HeartbeatConversationCreatedEventSchema } from "./events/heartbeat-conversation-created.js";
 import { HomeFeedUpdatedEventSchema } from "./events/home-feed-updated.js";
 import { HookEventSchema } from "./events/hook-event.js";
@@ -186,6 +198,10 @@ export {
   type AcpSessionErrorEvent,
   AcpSessionErrorEventSchema,
 } from "./events/acp-session-error.js";
+export {
+  type AcpSessionModelUpdateEvent,
+  AcpSessionModelUpdateEventSchema,
+} from "./events/acp-session-model-update.js";
 export {
   type AcpSessionSpawnedEvent,
   AcpSessionSpawnedEventSchema,
@@ -338,6 +354,10 @@ export {
   ConversationTitleUpdatedEventSchema,
 } from "./events/conversation-title-updated.js";
 export {
+  type DesktopActivityChangedEvent,
+  DesktopActivityChangedEventSchema,
+} from "./events/desktop-activity-changed.js";
+export {
   type DiskPressureBlockedCapability,
   DiskPressureBlockedCapabilitySchema,
   type DiskPressureState,
@@ -380,10 +400,6 @@ export {
   type GenerationHandoffEvent,
   GenerationHandoffEventSchema,
 } from "./events/generation-handoff.js";
-export {
-  type HeartbeatAlertEvent,
-  HeartbeatAlertEventSchema,
-} from "./events/heartbeat-alert.js";
 export {
   type HeartbeatConversationCreatedEvent,
   HeartbeatConversationCreatedEventSchema,
@@ -632,6 +648,18 @@ export {
   ToolOutputChunkSubTypeSchema,
 } from "./events/tool-output-chunk.js";
 export {
+  type RecallDepth,
+  RecallDepthSchema,
+  type RecallEvidenceItem,
+  RecallEvidenceItemSchema,
+  type RecallMetadata,
+  RecallMetadataSchema,
+  type RecallSearchedSource,
+  RecallSearchedSourceSchema,
+  type RecallSource,
+  RecallSourceSchema,
+  type RememberMetadata,
+  RememberMetadataSchema,
   type RiskScopeOption,
   RiskScopeOptionSchema,
   type ToolActivityMetadata,
@@ -720,11 +748,33 @@ export {
   WorkflowStartedEventSchema,
 } from "./events/workflow-started.js";
 export {
+  type ModeSession,
+  type ModeSessionActivity,
+  ModeSessionActivitySchema,
+  type ModeSessionDescriptor,
+  ModeSessionDescriptorSchema,
+  type ModeSessionMode,
+  ModeSessionModeSchema,
+  type ModeSessionRuntimeState,
+  ModeSessionRuntimeStateSchema,
+  ModeSessionSchema,
+  type ModeSessionStatus,
+  ModeSessionStatusSchema,
+  type ModeSessionSummary,
+  ModeSessionSummarySchema,
+  parseModeSession,
+  TolerantModeSessionSchema,
+} from "./mode-session.js";
+export {
   type DictationContext,
   DictationContextSchema,
   type DictationRequest,
   DictationRequestSchema,
 } from "./requests/dictation.js";
+export {
+  type GuardianActionDecisionRequest,
+  GuardianActionDecisionRequestSchema,
+} from "./requests/guardian-actions.js";
 export {
   type BackgroundToolCompletion,
   type ConversationAttachmentBlock,
@@ -791,6 +841,8 @@ export {
   FeedItemStatusSchema,
   type FeedItemType,
   FeedItemTypeSchema,
+  type FeedItemUpdate,
+  FeedItemUpdateSchema,
   type FeedItemUrgency,
   FeedItemUrgencySchema,
   GUARDIAN_TERMINAL_REASON_SUPERSEDED,
@@ -964,6 +1016,7 @@ export const AssistantEventSchema = z.discriminatedUnion("type", [
   AcpAuthRequiredEventSchema,
   AcpSessionCompletedEventSchema,
   AcpSessionErrorEventSchema,
+  AcpSessionModelUpdateEventSchema,
   AcpSessionSpawnedEventSchema,
   AcpSessionUpdateEventSchema,
   AcpSessionUsageEventSchema,
@@ -994,6 +1047,7 @@ export const AssistantEventSchema = z.discriminatedUnion("type", [
   ConversationInferenceProfileUpdatedEventSchema,
   ConversationNoticeEventSchema,
   ConversationTitleUpdatedEventSchema,
+  DesktopActivityChangedEventSchema,
   DiskPressureStatusChangedEventSchema,
   DocumentCommentCreatedEventSchema,
   DocumentCommentDeletedEventSchema,
@@ -1004,7 +1058,6 @@ export const AssistantEventSchema = z.discriminatedUnion("type", [
   ErrorEventSchema,
   GenerationCancelledEventSchema,
   GenerationHandoffEventSchema,
-  HeartbeatAlertEventSchema,
   HeartbeatConversationCreatedEventSchema,
   HomeFeedUpdatedEventSchema,
   HookEventSchema,

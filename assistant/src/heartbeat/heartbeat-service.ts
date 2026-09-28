@@ -1,7 +1,8 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import type { HeartbeatAlertEvent } from "../api/events/heartbeat-alert.js";
+import { channelForBotProvider } from "@vellumai/service-contracts/channels";
+
 import { getConfig } from "../config/loader.js";
 import type { HeartbeatConfig } from "../config/schemas/heartbeat.js";
 import { warmGuardianBindings } from "../contacts/guardian-delivery-reader.js";
@@ -54,6 +55,19 @@ const DEFAULT_CHECKLIST = `- Check in with yourself. Read NOW.md. Is it still ac
 
 const EARLY_HEARTBEAT_THRESHOLD = 3;
 const REENGAGEMENT_COOLDOWN_MS = 18 * 60 * 60 * 1000; // 18 hours
+
+/**
+ * A provider key named by the identity it carries. The keys alone do not say
+ * which is which (`slack` is the integration acting as the connected person,
+ * `slack_channel` is the assistant's own bot), and a heartbeat told to avoid
+ * "slack" would otherwise stop posting through a bot whose credential is fine.
+ */
+function describeUnhealthyProvider(providerKey: string): string {
+  const channel = channelForBotProvider(providerKey);
+  return channel
+    ? `${providerKey} (the ${channel} channel bot)`
+    : `${providerKey} (integration, acts as the connected person)`;
+}
 
 // Stripped-comment form of the guardian persona scaffold. Computed
 // once at module load because stripping comment lines is deterministic
@@ -722,17 +736,6 @@ export class HeartbeatService {
       }
     } catch (err) {
       log.error({ err }, "Credential health check failed");
-      try {
-        broadcastMessage({
-          type: "heartbeat_alert",
-          title: "Credential Health Check Failed",
-          body:
-            "Could not verify OAuth credential health. " +
-            (err instanceof Error ? err.message : String(err)),
-        } satisfies HeartbeatAlertEvent);
-      } catch {
-        // Last resort — alerter itself failed. Already logged above.
-      }
     }
     return [];
   }
@@ -897,32 +900,16 @@ export class HeartbeatService {
       "Heartbeat failed",
     );
 
-    // The runner has already emitted `activity.failed` for the failure;
-    // we still record the run-level error and broadcast the in-app
-    // heartbeat alert so the existing surfacing keeps working.
-    // Map the runner's error classification onto the run-store's status
-    // enum so the run history preserves the timeout / error distinction.
+    // The runner has already emitted `activity.failed` for the failure, so
+    // this only records the run-level error. Map the runner's error
+    // classification onto the run-store's status enum so the run history
+    // preserves the timeout / error distinction.
     const runStatus = result.errorKind === "timeout" ? "timeout" : "error";
-    const transitioned = completeHeartbeatRun(runId, {
+    completeHeartbeatRun(runId, {
       status: runStatus,
       conversationId: conversationId ?? result.conversationId,
       error: result.error?.message ?? "Unknown error",
     });
-
-    // Only fire the in-app alerter when our completion is the one that
-    // actually wrote — otherwise a parallel finalizer (e.g. a startup
-    // recovery sweep) already alerted for this run.
-    if (transitioned) {
-      try {
-        broadcastMessage({
-          type: "heartbeat_alert",
-          title: "Heartbeat Failed",
-          body: result.error?.message ?? "Unknown error",
-        } satisfies HeartbeatAlertEvent);
-      } catch (alertErr) {
-        log.error({ alertErr }, "Failed to broadcast heartbeat alert");
-      }
-    }
   }
 
   private readChecklist(): string {
@@ -945,10 +932,13 @@ ${checklist}
 </heartbeat-checklist>`;
 
     if (unhealthyProviders.length > 0) {
-      const providers = unhealthyProviders.join(", ");
+      const providers = unhealthyProviders
+        .map(describeUnhealthyProvider)
+        .join(", ");
       prompt += `\n\n<credential-status>
-The following providers have broken or expired credentials: ${providers}.
-Do NOT attempt to use tools for these providers — they will fail. Skip any checklist items that depend on them and note the outage in your summary.
+The following credentials are broken or expired: ${providers}.
+Do NOT attempt to use tools for these providers, they will fail. Skip any checklist items that depend on them and note the outage in your summary.
+A channel bot is the assistant's own identity on a channel and a separate credential from the integration of the same name; it is affected only when listed here as a channel bot.
 </credential-status>`;
     }
 

@@ -2,67 +2,125 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Loader2 } from "lucide-react";
 
 import { PlatformLoginNotice } from "@/components/platform-login-notice";
+import { DebugBundleExport } from "@/domains/settings/components/debug-bundle-export";
 import {
-  assistantsAccessConsentRetrieveOptions,
-  assistantsAccessConsentRetrieveSetQueryData,
+  formatRelativeAge,
+  useRelativeAgeTick,
+} from "@/domains/settings/pair-device/relative-age";
+import {
+  assistantsAccessConsentDetailReadOptions,
+  assistantsAccessConsentDetailReadSetQueryData,
 } from "@/generated/api/@tanstack/react-query.gen";
-import { assistantsAccessConsentPartialUpdate } from "@/generated/api/sdk.gen";
+import { assistantsAccessConsentDetailPartialUpdate } from "@/generated/api/sdk.gen";
 import {
-  useActiveAssistantIsPlatformHosted,
+  useActiveAssistantIsSelfHosted,
   useActiveAssistantLifecycleIsLoading,
   usePlatformGate,
 } from "@/hooks/use-platform-gate";
+import { usePlatformAssistantId } from "@/hooks/use-platform-assistant-id";
 import { useTranslation } from "@/i18n";
+import { useResolvedAssistantsStore } from "@/stores/resolved-assistants-store";
+import { Button } from "@vellumai/design-library/components/button";
 import { toast } from "@vellumai/design-library/components/toast";
 import { Toggle } from "@vellumai/design-library/components/toggle";
 
+// setTimeout caps at 2^31-1 ms; a week-long grant fits, but clamp anyway.
+const MAX_REFETCH_DELAY_MS = 2 ** 31 - 1;
+
 export function AccessConsentSetting() {
   const { t } = useTranslation("settings");
-  // platformHostedOnly: this consent toggle is per-assistant — Vellum
-  // admins cannot reach a self-hosted daemon, so the setting has no
-  // meaning whenever the active assistant is self-hosted. The standard
-  // gate would still show it for a logged-in platform session pointed
-  // at a self-hosted assistant.
-  const platformGate = usePlatformGate({ platformHostedOnly: true });
-  // The privacy page is not mounted under `<ActiveAssistantGate>`, so on
-  // a fresh deep-link the lifecycle is still in `{ kind: "loading" }`
-  // when we render — during that window the gate returns `"full"`
-  // (intentionally, to avoid UI flicker on the surrounding card). Pair
-  // it with a strict "positively resolved as platform-hosted" check so
-  // the retrieve query doesn't fire until lifecycle has projected a
-  // platform-hosted assistant.
-  const isPlatformHosted = useActiveAssistantIsPlatformHosted();
+  // The grant applies to hosted and self-hosted assistants alike: staff
+  // open a hosted assistant's disk directly, and a self-hosted one through
+  // the debug bundle the owner exports below. So the standard gate, not
+  // `platformHostedOnly`.
+  const platformGate = usePlatformGate();
+  const isSelfHosted = useActiveAssistantIsSelfHosted();
   // Race-window indicator used for the spinner UX only. Narrow to
-  // `kind: "loading"` so already-resolved non-hosted lifecycle states
-  // (`retired`, `error`) don't show a
-  // permanent spinner — they should fall through to the disabled-toggle
-  // empty state below.
+  // `kind: "loading"` so already-resolved lifecycle states (`retired`,
+  // `error`) don't show a permanent spinner.
   const isLifecycleLoading = useActiveAssistantLifecycleIsLoading();
   const queryClient = useQueryClient();
+  // The privacy page is not under `ActiveAssistantGate`, so read the raw
+  // store and wait for a non-null id. In local mode that id is a lockfile
+  // slug; platform routes take only the registered UUID, so resolve it
+  // first (a UUID resolves to itself).
+  const activeId = useResolvedAssistantsStore.use.activeAssistantId();
+  const { platformAssistantId: assistantId, isLoading: isResolvingId } =
+    usePlatformAssistantId(activeId, platformGate === "full");
+  const canQuery = platformGate === "full" && assistantId !== null;
 
   const { data, isLoading, isError } = useQuery({
-    ...assistantsAccessConsentRetrieveOptions(),
-    enabled: platformGate === "full" && isPlatformHosted,
+    ...assistantsAccessConsentDetailReadOptions({
+      path: { id: assistantId ?? "" },
+    }),
+    enabled: canQuery,
+    // Refetch once the grant lapses so an open tab flips to off on its own
+    // instead of showing a toggle the server no longer honors.
+    refetchInterval: (query) => {
+      const ends = query.state.data?.access_consent_expires_at;
+      if (!query.state.data?.access_consented || !ends) {
+        return false;
+      }
+      const msUntilEnd = new Date(ends).getTime() - Date.now() + 1_000;
+      return Math.min(Math.max(msUntilEnd, 1_000), MAX_REFETCH_DELAY_MS);
+    },
   });
 
+  // A grant lapses on its own (24h by default). Extending is just enabling
+  // again: the server restarts the clock from now. The owner can instead keep
+  // it on until they turn it off.
+  const isOn = data?.access_consented === true;
+  // A platform from before the override omits this field. Then the button
+  // to keep access on is hidden, since that platform could not honor it.
+  const canKeepOn =
+    isOn && typeof data.access_consent_never_expires === "boolean";
+  const neverExpires = isOn && data.access_consent_never_expires === true;
+  const expiresAt =
+    isOn && !neverExpires ? data.access_consent_expires_at : null;
+  useRelativeAgeTick(expiresAt !== null);
+
+  // The target id travels with the mutation rather than being read from
+  // render scope in `onSuccess`: if the active assistant changes while the
+  // PATCH is in flight, the response must land in the cache of the assistant
+  // it was sent for, not whichever one is now on screen.
   const updateConsent = useMutation({
-    mutationFn: async (next: boolean) => {
-      const { data: updated } = await assistantsAccessConsentPartialUpdate({
-        body: { access_consented: next },
-        throwOnError: true,
-      });
+    mutationFn: async ({
+      assistantId: targetId,
+      next,
+      mode,
+    }: {
+      assistantId: string;
+      next: boolean;
+      /** Why the owner is enabling, for the toast and the request body. */
+      mode?: "extend" | "keepOn" | "expireAgain";
+    }) => {
+      const { data: updated } =
+        await assistantsAccessConsentDetailPartialUpdate({
+          path: { id: targetId },
+          body: {
+            access_consented: next,
+            ...(mode === "keepOn" ? { never_expires: true } : {}),
+          },
+          throwOnError: true,
+        });
       return updated;
     },
-    onSuccess: (updated) => {
-      assistantsAccessConsentRetrieveSetQueryData(
+    onSuccess: (updated, variables) => {
+      assistantsAccessConsentDetailReadSetQueryData(
         queryClient,
-        undefined,
+        { path: { id: variables.assistantId } },
         updated,
       );
       toast.success(
-        updated?.access_consented
-          ? t("accessConsentSetting.toastEnabled")
-          : t("accessConsentSetting.toastDisabled"),
+        variables.mode === "extend"
+          ? t("accessConsentSetting.toastExtended")
+          : variables.mode === "keepOn"
+            ? t("accessConsentSetting.toastKeptOn")
+            : variables.mode === "expireAgain"
+              ? t("accessConsentSetting.toastExpiring")
+              : updated?.access_consented
+                ? t("accessConsentSetting.toastEnabled")
+                : t("accessConsentSetting.toastDisabled"),
       );
     },
     onError: () => {
@@ -70,29 +128,22 @@ export function AccessConsentSetting() {
     },
   });
 
-  // Early return must follow every hook above so gate transitions
-  // (e.g. lifecycle flipping to `self_hosted` after the API resolves)
-  // never skip a hook and trigger a hook-order violation. The trailing
-  // divider in `privacy-page.tsx` is also gated on the same condition
-  // so the layout doesn't render two adjacent dividers.
+  // Early return must follow every hook above so gate transitions never
+  // skip a hook. The trailing divider in `privacy-page.tsx` is gated on
+  // the same condition so the layout doesn't render two adjacent dividers.
   if (platformGate === "gated") {
     return null;
   }
 
-  // `isResolving` controls the spinner adjacent to the toggle, NOT the
-  // toggle's disabled state. The `disabled` predicate stays strict on
-  // `!isPlatformHosted` — that catches the click during both the
-  // deep-link race AND already-resolved non-hosted states where the
-  // mutation has no meaning. `isResolving` is narrowed to the genuine
-  // lifecycle-loading window so the spinner doesn't get stuck in
-  // `retired` / `error`, where the
-  // toggle correctly stays disabled and the UI should look like the
-  // empty/error state, not "we're still figuring this out."
-  const isResolving = platformGate === "full" && isLifecycleLoading;
+  // `isResolving` controls the spinner adjacent to the toggle, not its
+  // disabled state, and is narrowed to the genuine lifecycle-loading
+  // window so it doesn't get stuck in `retired` / `error`.
+  const isResolving =
+    platformGate === "full" && (isLifecycleLoading || isResolvingId);
   const checked = data?.access_consented ?? false;
   const disabled =
     platformGate !== "full" ||
-    !isPlatformHosted ||
+    assistantId === null ||
     isLoading ||
     isError ||
     updateConsent.isPending;
@@ -112,6 +163,75 @@ export function AccessConsentSetting() {
               {t("accessConsentSetting.loadError")}
             </p>
           )}
+          {expiresAt !== null && (
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              <p className="text-body-small-lighter text-[var(--content-tertiary)]">
+                {t("accessConsentSetting.expiresAt", {
+                  when: formatRelativeAge(expiresAt),
+                })}
+              </p>
+              <Button
+                variant="outlined"
+                size="compact"
+                disabled={disabled}
+                onClick={() => {
+                  if (assistantId) {
+                    updateConsent.mutate({
+                      assistantId,
+                      next: true,
+                      mode: "extend",
+                    });
+                  }
+                }}
+              >
+                {t("accessConsentSetting.extend")}
+              </Button>
+              {canKeepOn && (
+                <Button
+                  variant="outlined"
+                  size="compact"
+                  disabled={disabled}
+                  onClick={() => {
+                    if (assistantId) {
+                      updateConsent.mutate({
+                        assistantId,
+                        next: true,
+                        mode: "keepOn",
+                      });
+                    }
+                  }}
+                >
+                  {t("accessConsentSetting.keepOn")}
+                </Button>
+              )}
+            </div>
+          )}
+          {neverExpires && (
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              <p className="text-body-small-lighter text-[var(--content-tertiary)]">
+                {t("accessConsentSetting.staysOn")}
+              </p>
+              <Button
+                variant="outlined"
+                size="compact"
+                disabled={disabled}
+                onClick={() => {
+                  if (assistantId) {
+                    updateConsent.mutate({
+                      assistantId,
+                      next: true,
+                      mode: "expireAgain",
+                    });
+                  }
+                }}
+              >
+                {t("accessConsentSetting.expireAgain")}
+              </Button>
+            </div>
+          )}
+          {isOn && isSelfHosted && assistantId !== null && (
+            <DebugBundleExport assistantId={assistantId} />
+          )}
         </div>
         <div className="flex items-center gap-2">
           {platformGate === "disabled" ? null : (
@@ -122,7 +242,11 @@ export function AccessConsentSetting() {
               <Toggle
                 checked={checked}
                 disabled={disabled}
-                onChange={() => updateConsent.mutate(!checked)}
+                onChange={() => {
+                  if (assistantId) {
+                    updateConsent.mutate({ assistantId, next: !checked });
+                  }
+                }}
               />
             </>
           )}

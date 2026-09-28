@@ -11,6 +11,9 @@ export const WEB_SEARCH_PROVIDER_IDS: readonly string[] = [
   "firecrawl",
   "keenable",
   "fastcrw",
+  "searxng",
+  "tinyfish",
+  "exa",
 ];
 
 /** Short display name used in picker UI. */
@@ -25,6 +28,9 @@ export const WEB_SEARCH_PROVIDER_DISPLAY_NAMES: Readonly<
   firecrawl: "Firecrawl",
   keenable: "Keenable",
   fastcrw: "fastCRW",
+  searxng: "SearXNG",
+  tinyfish: "TinyFish",
+  exa: "Exa",
 };
 
 /** Placeholder hint shown in the API-key input. BYOK providers only. */
@@ -37,6 +43,9 @@ export const WEB_SEARCH_PROVIDER_KEY_PLACEHOLDERS: Readonly<
   firecrawl: "fc-...",
   keenable: "keen_... (optional)",
   fastcrw: "crw_live_...",
+  searxng: "token (optional)",
+  tinyfish: "TinyFish API key...",
+  exa: "Exa API key...",
 };
 
 /** localStorage key used to persist each BYOK provider's user-supplied key. */
@@ -48,6 +57,9 @@ export const WEB_SEARCH_PROVIDER_KEY_STORAGE: Readonly<Record<string, string>> =
     firecrawl: "vellum:ai:firecrawlKey",
     keenable: "vellum:ai:keenableKey",
     fastcrw: "vellum:ai:fastcrwKey",
+    searxng: "vellum:ai:searxngKey",
+    tinyfish: "vellum:ai:tinyfishKey",
+    exa: "vellum:ai:exaKey",
   };
 
 /** Provider ids that require a user-supplied API key. */
@@ -58,6 +70,9 @@ export const WEB_SEARCH_BYOK_PROVIDER_IDS: ReadonlySet<string> = new Set([
   "firecrawl",
   "keenable",
   "fastcrw",
+  "searxng",
+  "tinyfish",
+  "exa",
 ]);
 
 /**
@@ -65,11 +80,13 @@ export const WEB_SEARCH_BYOK_PROVIDER_IDS: ReadonlySet<string> = new Set([
  * Save is not gated on a credential for these.
  */
 export const WEB_SEARCH_KEYLESS_BYOK_PROVIDER_IDS: ReadonlySet<string> =
-  new Set(["keenable"]);
+  new Set(["keenable", "searxng"]);
 
 /** Provider ids that show an optional API Base field in settings. */
 export const WEB_SEARCH_API_BASE_PROVIDER_IDS: ReadonlySet<string> = new Set([
   "fastcrw",
+  "searxng",
+  "tinyfish",
 ]);
 
 /** Cloud default API origin when API Base is left empty. */
@@ -77,4 +94,5 @@ export const WEB_SEARCH_PROVIDER_DEFAULT_API_BASE: Readonly<
   Record<string, string>
 > = {
   fastcrw: "https://api.fastcrw.com",
+  tinyfish: "https://api.search.tinyfish.ai",
 };

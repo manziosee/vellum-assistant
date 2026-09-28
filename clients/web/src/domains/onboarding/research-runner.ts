@@ -173,7 +173,10 @@ export function selectRecommendableCapabilities(
     if (!name || !description) {
       continue;
     }
-    if (repoOwner(m.source?.repo) !== VELLUM_PLUGIN_OWNER) {
+    if (
+      m.source?.kind !== "github" ||
+      repoOwner(m.source.repo) !== VELLUM_PLUGIN_OWNER
+    ) {
       continue;
     }
     if (NON_RECOMMENDABLE_PLUGINS.has(name)) {
@@ -351,13 +354,6 @@ export interface ResearchRunnerState {
    * or nothing fit.
    */
   installedPlugins: string[];
-  /**
-   * Map of plugin install name → one-line description, from the fetched
-   * first-party catalog. Lets the UI render each installed plugin with its real
-   * name + description (not just the name). Empty when the catalog was
-   * unavailable (or, after a refresh-resume, not re-fetched).
-   */
-  pluginCatalog: Record<string, string>;
 }
 
 function emptyResearchState(status: ResearchStatus): ResearchRunnerState {
@@ -367,7 +363,6 @@ function emptyResearchState(status: ResearchStatus): ResearchRunnerState {
     droppedClaims: [],
     suggestions: [],
     installedPlugins: [],
-    pluginCatalog: {},
   };
 }
 
@@ -596,13 +591,6 @@ export function useResearchRunner(): UseResearchRunner {
           if (isStale()) {
             return;
           }
-          // Name → description for the fetched catalog, so the UI can show each
-          // installed plugin with its real name + description. Carried on every
-          // state update below (the poll loop replaces state wholesale).
-          const pluginCatalog: Record<string, string> = Object.fromEntries(
-            capabilities.map((c) => [c.name, c.description]),
-          );
-          setState((s) => ({ ...s, pluginCatalog }));
           // Nothing installable (empty/unavailable catalog) — release the click
           // gate so suggestion clicks never wait on the research turn.
           if (validNames.size === 0) {
@@ -888,7 +876,6 @@ export function useResearchRunner(): UseResearchRunner {
                 droppedClaims,
                 suggestions,
                 installedPlugins,
-                pluginCatalog,
               });
               lastClaims = claims;
               lastSuggestions = suggestions;

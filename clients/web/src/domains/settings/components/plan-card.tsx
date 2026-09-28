@@ -22,7 +22,11 @@ import {
 } from "@/domains/settings/billing/plan-spec";
 import { PlanTile } from "@/domains/settings/billing/plan-tile";
 import { UsageBalancePanel } from "@/domains/settings/billing/usage-balance-panel";
-import { captureTakeoverAvatarStash } from "@/lib/billing/takeover-avatar-stash";
+import {
+  UsageBalanceReading,
+  type UsagePeriodEnd,
+  usagePeriodEndLabels,
+} from "@/domains/settings/billing/usage-balance-reading";
 import { useCheckoutDismissRefresh } from "@/domains/settings/billing/use-checkout-dismiss-refresh";
 import {
   formatGraceDate,
@@ -43,7 +47,12 @@ import type {
 import { useTranslation } from "@/i18n";
 import { useBillingBalanceStatus } from "@/hooks/use-billing-balance-status";
 import { useDocumentTheme } from "@/hooks/use-document-theme";
-import { usePlanUsageBalance } from "@/hooks/use-plan-usage-balance";
+import {
+  freeTierDailyRatio,
+  hasExtraCredit,
+  usePlanUsageBalance,
+} from "@/hooks/use-plan-usage-balance";
+import { dailyResetTimePhrase } from "@/utils/daily-reset-time";
 import { openBillingPathInBrowser } from "@/lib/billing/android-billing-handoff";
 import { saveCheckoutIntent } from "@/lib/billing/checkout-intent";
 import { checkoutReturnTarget } from "@/lib/billing/checkout-return-target";
@@ -63,6 +72,7 @@ import {
 import {
   extractMutationError,
   isPackageSwitchEligible,
+  TIER_CHANGE_ELIGIBLE_STATUSES,
 } from "./adjust-plan-utils";
 
 export interface PlanCardProps {
@@ -223,7 +233,6 @@ function RecommendedUpgrade({
           kind: "package",
           packageKey: recommended.key,
         });
-        captureTakeoverAvatarStash(queryClient);
         // Stripe returns with a `session_id`, which opens the
         // post-checkout Pro onboarding wizard — via the billing page on
         // web, via the `billing/checkout-complete` deep link on macOS.
@@ -238,10 +247,7 @@ function RecommendedUpgrade({
       }
     } catch (error) {
       toast.error(
-        extractMutationError(
-          error,
-          t("planCard.checkoutFailedToast"),
-        ),
+        extractMutationError(error, t("planCard.checkoutFailedToast")),
       );
     } finally {
       setPending(false);
@@ -299,11 +305,7 @@ function RecommendedUpgrade({
             className="h-10 border-transparent bg-[var(--system-positive-strong)] hover:bg-[var(--system-positive-strong)] hover:opacity-90 active:bg-[var(--system-positive-strong)]"
             onClick={() => void handleUpgrade()}
             disabled={isPending}
-            leftIcon={
-              isPending ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
-              ) : undefined
-            }
+            loading={isPending}
             data-testid="recommended-upgrade-button"
           >
             {ctaLabel}
@@ -357,8 +359,13 @@ export function PlanCard({ onManage, onTierUpgraded }: PlanCardProps) {
     organizationsBillingSubscriptionRetrieveOptions(),
   );
   const plansQuery = useQuery(organizationsBillingPlansRetrieveOptions());
-  const { balance, availableUsageBalance, totalUsageBalance } =
-    useBillingBalanceStatus();
+  const balanceStatus = useBillingBalanceStatus();
+  const {
+    balance,
+    availableUsageBalance,
+    totalUsageBalance,
+    freeTierDailyLimitReached,
+  } = balanceStatus;
   const [addCreditsOpen, setAddCreditsOpen] = useState(false);
   // Resolved before the early returns below so the usage hook is never
   // conditional; both tolerate data that has not landed yet.
@@ -410,8 +417,6 @@ export function PlanCard({ onManage, onTierUpgraded }: PlanCardProps) {
     Boolean(subscription.cancel_at);
   const isCanceled = subscription.status === "canceled";
   const cancelDate = getEffectiveCancelDate(subscription);
-  const showRenewal =
-    !isCancelling && !isCanceled && subscription.current_period_end;
   const showCancellation = isCancelling && !isCanceled && cancelDate;
 
   const proPlan = findProPlan(plans);
@@ -477,18 +482,55 @@ export function PlanCard({ onManage, onTierUpgraded }: PlanCardProps) {
     : currentPackage
       ? priceLabelFromCents(currentPackage.total_price_cents)
       : null;
-  const priceRow = priceLabel ? (
-    <div className="flex h-10 items-center border-t border-[var(--border-base)]">
-      <Typography
-        as="span"
-        variant="body-large-default"
-        className="text-[var(--content-tertiary)]"
-        data-testid="plan-card-price"
-      >
-        {priceLabel}
-      </Typography>
-    </div>
-  ) : undefined;
+  // The cycle end is dated only where one is coming: not for the free plan,
+  // whose grant is one-time, not for a sub that is ending rather than
+  // renewing, which the header's cancellation line already dates, and not for
+  // a status the platform bears no entitlement for (`unpaid`, `incomplete`,
+  // `paused`, a null status), which keeps its last `current_period_end`
+  // without renewing on it. A sub holding a credit bundle sees that bundle
+  // reset on the date; one holding none only renews (see `UsagePeriodEnd`).
+  const usagePeriodEnd: UsagePeriodEnd | undefined =
+    !isFreePlan &&
+    !isCancelling &&
+    subscription.status != null &&
+    TIER_CHANGE_ELIGIBLE_STATUSES.has(subscription.status) &&
+    subscription.current_period_end
+      ? {
+          at: subscription.current_period_end,
+          kind: subscription.selected_credit_tier != null ? "resets" : "renews",
+        }
+      : undefined;
+  const periodEndLabels = usagePeriodEndLabels(usagePeriodEnd, t);
+  // The footer while there is no reading to chart: the catalog price, with
+  // the cycle-end line beside it, worded by the panel's own helper, so a
+  // renewing sub keeps its date rather than losing it to a summary that has
+  // not loaded. Either alone still makes the row: a Custom or catalog-less
+  // sub has no price to quote but a cycle end to date all the same.
+  const footerRow =
+    priceLabel || periodEndLabels ? (
+      <div className="flex h-10 items-center justify-between gap-3 border-t border-[var(--border-base)]">
+        {priceLabel ? (
+          <Typography
+            as="span"
+            variant="body-large-default"
+            className="text-[var(--content-tertiary)]"
+            data-testid="plan-card-price"
+          >
+            {priceLabel}
+          </Typography>
+        ) : null}
+        {periodEndLabels ? (
+          <Typography
+            as="span"
+            variant="body-small-default"
+            className="whitespace-nowrap text-[var(--content-tertiary)]"
+            data-testid="plan-card-period-end"
+          >
+            {periodEndLabels.line}
+          </Typography>
+        ) : null}
+      </div>
+    ) : undefined;
   // The add-credits strip is only warranted once the wallet behind the bundle
   // is empty too: a sub at 100% whose purchased credits still cover the next
   // turn has nothing to buy. The bar goes red either way.
@@ -498,19 +540,65 @@ export function PlanCard({ onManage, onTierUpgraded }: PlanCardProps) {
   // for chat banners, where a BYOK route never spends the managed wallet.
   const walletEmpty = balance != null && Number(balance) <= 0;
   const creditsExhausted = usage != null && usage.ratio >= 1 && walletEmpty;
-  const usagePanel = usage ? (
-    <UsageBalancePanel
+  const openAddCredits = () => setAddCreditsOpen(true);
+  // The free plan's one-time grant is the account's whole allowance, so its
+  // reading is the overall one; a sub's grant turns over each cycle, so its
+  // reading is the month's.
+  const usageReading = usage ? (
+    <UsageBalanceReading
       ratio={usage.ratio}
+      title={
+        isFreePlan
+          ? t("planCard.usageBalanceTitleOverall")
+          : t("planCard.usageBalanceTitleMonthly")
+      }
+      periodEnd={usagePeriodEnd}
       exhausted={creditsExhausted}
-      onAddCredits={() => setAddCreditsOpen(true)}
+      onAddCredits={openAddCredits}
     />
   ) : null;
-  // The tile trades its price for the usage balance, so the two never state
-  // the same allowance twice. With no bar to trade for (a free account that
-  // was never granted usage, or a platform whose summary reports no grant
-  // figures), the price row stays as the footer rather than leaving the tile
-  // with an empty bottom slot.
-  const currentFooter: ReactNode = usagePanel ?? priceRow;
+  // The free-tier daily reading, above the overall one, only for an org the
+  // platform is enforcing the cap on. Reads as fully used once the overall
+  // grant is spent, so the two bars never disagree about today. Its strip,
+  // which says today's free usage is used up, raises only on the platform's
+  // own daily-reached flag (a pinned bar over an empty grant is the overall
+  // strip's story) and only while nothing but frozen usage credit is left in
+  // the wallet, which is when the platform rejects the next send.
+  const dailyRatio = freeTierDailyRatio(balanceStatus, usage?.ratio ?? null);
+  const dailyExhausted =
+    dailyRatio != null &&
+    freeTierDailyLimitReached &&
+    !hasExtraCredit(balanceStatus);
+  const resetPhrase = dailyResetTimePhrase();
+  const dailyReading =
+    dailyRatio != null ? (
+      <UsageBalanceReading
+        ratio={dailyRatio}
+        exhausted={dailyExhausted}
+        onAddCredits={openAddCredits}
+        title={t("planCard.dailyUsageTitle")}
+        line={t("planCard.dailyUsageResets", { resetPhrase })}
+        barLabel={t("planCard.dailyUsageBar", { resetPhrase })}
+        exhaustedMessage={t("planCard.dailyUsageExhausted")}
+        testId="plan-daily-usage"
+        lineTestId="plan-daily-usage-resets"
+      />
+    ) : null;
+  // The tile trades its price for the usage panel, so the two never state
+  // the same allowance twice. Both readings share the one panel, so their
+  // bars line up. With no reading to chart (a free account that was never
+  // granted usage, or a platform whose summary reports no grant figures),
+  // the footer row stays rather than leaving the tile with an empty bottom
+  // slot.
+  const currentFooter: ReactNode =
+    dailyReading || usageReading ? (
+      <UsageBalancePanel>
+        {dailyReading}
+        {usageReading}
+      </UsageBalancePanel>
+    ) : (
+      footerRow
+    );
 
   return (
     <Card padding="md">
@@ -518,18 +606,6 @@ export function PlanCard({ onManage, onTierUpgraded }: PlanCardProps) {
         <div className="flex items-center justify-between gap-3">
           <div className="flex min-w-0 flex-col gap-1">
             <PlanHeading />
-            {showRenewal && (
-              <Typography
-                variant="body-small-default"
-                as="div"
-                className="leading-snug text-[var(--content-tertiary)]"
-                data-testid="plan-card-renews"
-              >
-                {t("planCard.renewsOn", {
-                  date: formatGraceDate(subscription.current_period_end!),
-                })}
-              </Typography>
-            )}
             {showCancellation && (
               <Typography
                 variant="body-small-default"

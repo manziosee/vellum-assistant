@@ -39,7 +39,17 @@ import {
 } from "@vellumai/service-contracts/platform-credential";
 import { z } from "zod";
 
+import {
+  setPlatformAssistantId,
+  setPlatformBaseUrl,
+  setPlatformOrganizationId,
+  setPlatformUserId,
+} from "../../config/env.js";
 import { isPlatformRemote } from "../../config/env-registry.js";
+import {
+  resolvePlatformOrganizationId,
+  resolvePlatformUserId,
+} from "../../config/platform-identity.js";
 import {
   registerCallbackRoute,
   resolvePlatformCallbackRegistrationContext,
@@ -80,7 +90,12 @@ const PlatformStatusResponseSchema = z.object({
   isPlatform: z.boolean(),
   baseUrl: z.string(),
   assistantId: z.string(),
-  hasAssistantApiKey: z.boolean(),
+  hasAssistantApiKey: z
+    .boolean()
+    .nullable()
+    .describe(
+      "Whether a managed assistant API key is stored. Null when the credential store could not be read, which is not evidence that no key is stored.",
+    ),
   hasWebhookSecret: z.boolean(),
   clientInstallationId: z.string().nullable(),
   available: z.boolean(),
@@ -289,24 +304,12 @@ async function handlePlatformStatus(
 ): Promise<PlatformStatusResponse> {
   const context = await resolvePlatformCallbackRegistrationContext();
 
-  const [orgIdRaw, userIdRaw, webhookSecretRaw] = await Promise.all([
-    getSecureKeyAsync(
-      credentialKey(
-        CREDENTIAL_KEYS.organizationId.service,
-        CREDENTIAL_KEYS.organizationId.field,
-      ),
-    ),
-    getSecureKeyAsync(
-      credentialKey(
-        CREDENTIAL_KEYS.userId.service,
-        CREDENTIAL_KEYS.userId.field,
-      ),
-    ),
+  const [organizationId, userId, webhookSecretRaw] = await Promise.all([
+    resolvePlatformOrganizationId(),
+    resolvePlatformUserId(),
     getSecureKeyAsync(credentialKey("vellum", "webhook_secret")),
   ]);
 
-  const organizationId = orgIdRaw?.trim() ?? "";
-  const userId = userIdRaw?.trim() ?? "";
   const hasWebhookSecret = !!webhookSecretRaw;
 
   return {
@@ -466,6 +469,11 @@ async function handlePlatformDisconnect(
       `Failed to delete credentials: ${failedKeys.join("; ")}`,
     );
   }
+
+  setPlatformBaseUrl(undefined);
+  setPlatformAssistantId(undefined);
+  setPlatformOrganizationId(undefined);
+  setPlatformUserId(undefined);
 
   // Notify connected clients
   broadcastMessage({ type: "platform_disconnected" });

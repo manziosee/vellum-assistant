@@ -67,7 +67,9 @@
  *   3. A SINGLE forced-tool select (`selectPool`) over the whole pool. The
  *      result is this turn's selections — current turn only. Cross-turn
  *      persistence is the injector's job (net-new blocks frozen into history),
- *      not a per-turn re-rendered carry set.
+ *      not a per-turn re-rendered carry set. When the call site resolves to
+ *      TypeSafe, `selectPool` asks one System One noul per numbered candidate
+ *      instead of forcing `select_pages`.
  */
 
 import type { AssistantConfig } from "../../../../config/schema.js";
@@ -89,7 +91,11 @@ import type {
   SelectorPool,
   StableCandidate,
 } from "./pool-select.js";
-import { selectAllPoolCandidates, selectPool } from "./pool-select.js";
+import {
+  MemoryV3RetrievalUnavailableError,
+  selectAllPoolCandidates,
+  selectPool,
+} from "./pool-select.js";
 import {
   type RareTermHit,
   rareTermLane,
@@ -334,17 +340,40 @@ export interface OrchestrateResult {
    *  carried-forward set unioned in. */
   selections: SelectedPage[];
   /** The candidate lanes in cache order; see {@link OrchestrateLanes}. Consumed
-   *  by the selection telemetry (lane attribution), the per-turn pool record
-   *  (`pool-log-store.ts`), and the downstream selector rendering. */
+   *  by selection telemetry for lane attribution and retained as the complete
+   *  retrieval diagnostics even when selector budgeting trims `pool`. */
   lanes: OrchestrateLanes;
   /** Whether the selector LLM judged a non-empty pool this turn (the
    *  `selector_ran` telemetry field). False when the pool was empty, when the
-   *  disabled-selector passthrough kept every candidate, and when a closed
-   *  injection gate hard-skipped selection. On that last path `lanes` still
-   *  carries the stable prefix as computed, but no pool was ever assembled,
-   *  so a false value with empty `selections` means the selector was given
-   *  nothing. */
+   *  disabled-selector passthrough kept every candidate, when a closed
+   *  injection gate hard-skipped selection, and when the selector's provider
+   *  failed and the retained stable candidates were kept unjudged
+   *  (`selectorFailure`). A false value with empty `selections` means the
+   *  selector was given nothing only when `pool` is absent; a failed attempt
+   *  can carry a finder-only pool with no fallback selections. */
   selectorRan: boolean;
+  /** Set when the selector could not be run this turn (provider unavailable,
+   *  or no usable tool call after the re-prompt retries). `selections` then
+   *  holds the retained stable candidates unjudged; finder candidates are
+   *  dropped because they are evidence for a judge, not evidence to inject on
+   *  their own. The
+   *  live injector queues a notice so the person knows this turn drew on
+   *  core memories only. */
+  selectorFailure?: MemoryV3RetrievalUnavailableError;
+  /** The pool as the selector was given it, in one numbering: the
+   *  stable-prefix cards, then the finder lines. Absent when no pool was
+   *  assembled this turn (a closed gate's hard skip). Read by the pool record
+   *  and input capture (`pool-log-store.ts`). */
+  pool?: SelectorPool;
+  /** The exact context strings rendered for the selector request. Absent when
+   *  no selector pool was assembled. */
+  selectorTurn?: MemoryRoutingTurn;
+  /** Whether the selector's recall-safe keep-all fallback fired
+   *  (`selectPool`'s `keptAll`). Absent when no pool was assembled. */
+  keptAll?: boolean;
+  /** The injection gate's reason code for this turn. Absent when the gate
+   *  did not run. */
+  gateReason?: string;
 }
 
 /** Stable-order de-duplication preserving first occurrence. */
@@ -381,7 +410,12 @@ export async function orchestrate(
   // the byte-stable-prefix contract). Built lazily so the gate's bypass path can
   // reuse the exact same construction as the normal step-2 pool assembly.
   const buildStable = (): StableCandidate[] =>
-    [...core, ...hot, ...fresh, ...always].map((slug) => {
+    [
+      ...core.map((slug) => ({ slug, lane: "core" as const })),
+      ...hot.map((slug) => ({ slug, lane: "hot" as const })),
+      ...fresh.map((slug) => ({ slug, lane: "fresh" as const })),
+      ...always.map((slug) => ({ slug, lane: "always" as const })),
+    ].map(({ slug, lane }) => {
       const card = deps.prefixCards.get(slug);
       if (card === undefined) {
         // Lane init renders a card for every core/hot slug; a hole here means
@@ -392,7 +426,7 @@ export async function orchestrate(
           `memory-v3: no pre-rendered card for stable-prefix slug "${slug}"`,
         );
       }
-      return { slug, card };
+      return { slug, card, lane };
     });
 
   // Run the selector over a pool, or pass its candidates straight through when
@@ -402,19 +436,67 @@ export async function orchestrate(
   // selector's recall-safe fallback ONLY — the disabled passthrough is not a
   // selector judgment, so it reports `false` (its turns are excluded from any
   // relevance read by `selector_ran` anyway).
+  //
+  // A selector that cannot run at all (provider unavailable, or no usable
+  // tool call after the re-prompt retries) keeps the stable prefix unjudged
+  // and drops the finder candidates: the stable cards are
+  // conversation-independent and already sit in every turn's pool, while a
+  // finder line is evidence for a judge, not evidence to inject on its own.
+  // The failure rides the result so the injector can tell the person this
+  // turn drew on core memories only.
   const runSelection = (
     pool: SelectorPool,
-  ): Promise<{ selections: SelectedPage[]; keptAll: boolean }> =>
+  ): Promise<{
+    selections: SelectedPage[];
+    keptAll: boolean;
+    pool: SelectorPool;
+    selectorTurn: MemoryRoutingTurn;
+    failure?: MemoryV3RetrievalUnavailableError;
+  }> =>
     timeLatencySubSpan("v3_selection", "Memory selection", async () => {
       if (deps.selectorEnabled === false) {
-        return { selections: selectAllPoolCandidates(pool), keptAll: false };
+        return {
+          selections: selectAllPoolCandidates(pool),
+          keptAll: false,
+          pool,
+          selectorTurn: turn,
+        };
       }
-      const { pages, keptAll } = await selectPool(
-        pool,
-        turn,
-        deps.selectorPrompt,
-      );
-      return { selections: pages, keptAll };
+      try {
+        const selection = await selectPool(pool, turn, deps.selectorPrompt);
+        return {
+          selections: selection.pages,
+          keptAll: selection.keptAll,
+          pool: selection.pool,
+          selectorTurn: selection.turn,
+        };
+      } catch (err) {
+        if (!(err instanceof MemoryV3RetrievalUnavailableError)) {
+          throw err;
+        }
+        const attemptedPool = err.pool ?? pool;
+        const attemptedTurn = err.turn ?? turn;
+        log.warn(
+          {
+            conversationId: turn.conversationId,
+            turnNumber: turn.turnNumber,
+            stableCount: attemptedPool.stable.length,
+            finderCount: attemptedPool.finder.length,
+            err: err.message,
+          },
+          "memory-v3 selector unavailable; keeping the stable prefix unjudged",
+        );
+        return {
+          selections: selectAllPoolCandidates({
+            stable: attemptedPool.stable,
+            finder: [],
+          }),
+          keptAll: false,
+          pool: attemptedPool,
+          selectorTurn: attemptedTurn,
+          failure: err,
+        };
+      }
     });
 
   // Step 1: needle (sync BM25) and the enabled dense lane (async embed +
@@ -760,17 +842,22 @@ export async function orchestrate(
   //     Omitted when the caller did not supply `isResident` (tests,
   //     shadow-less paths). The count reads the same units the injector will
   //     (a closed gate's selections carry no sections, so it counts leads).
-  const selectorRanOver = (poolSize: number): boolean =>
-    deps.selectorEnabled !== false && poolSize > 0;
+  const selectorRanOver = (
+    poolSize: number,
+    failure?: MemoryV3RetrievalUnavailableError,
+  ): boolean =>
+    deps.selectorEnabled !== false && poolSize > 0 && failure === undefined;
   const recordSelection = (
     selections: SelectedPage[],
     poolSize: number,
     keptAll: boolean,
+    failure?: MemoryV3RetrievalUnavailableError,
   ): void => {
     const detail: Record<string, unknown> = {
       gate_reason: gateOutcome?.reason ?? null,
       gate_pass: gateOutcome?.pass ?? null,
-      selector_ran: selectorRanOver(poolSize),
+      selector_ran: selectorRanOver(poolSize, failure),
+      selector_failed: failure !== undefined,
       selector_kept_all: keptAll,
       selected_count: selections.length,
       pool_size: poolSize,
@@ -845,10 +932,25 @@ export async function orchestrate(
           const closed = (
             selections: SelectedPage[],
             selectorRan: boolean,
+            selectorFailure?: MemoryV3RetrievalUnavailableError,
+            judged?: {
+              pool: SelectorPool;
+              selectorTurn: MemoryRoutingTurn;
+              keptAll: boolean;
+            },
           ): OrchestrateResult => ({
             selections,
             lanes: { core, hot, fresh, always, finder: [] },
             selectorRan,
+            gateReason: gate.reason,
+            ...(judged
+              ? {
+                  pool: judged.pool,
+                  selectorTurn: judged.selectorTurn,
+                  keptAll: judged.keptAll,
+                }
+              : {}),
+            ...(selectorFailure ? { selectorFailure } : {}),
           });
           if (deps.gateConfig.bypassForCore) {
             // Select over the stable prefix only. `runSelection` mirrors the
@@ -860,13 +962,26 @@ export async function orchestrate(
             // explicitly configured with `selectorEnabled: false` AND
             // `denseK > 0` (the dense-gated gate only runs with dense hits; the
             // new-user profile sets `denseK: 0`, so the gate never runs for it).
-            const stableOnly = buildStable();
-            const { selections: bypassed, keptAll } = await runSelection({
-              stable: stableOnly,
+            const stableOnly: SelectorPool = {
+              stable: buildStable(),
               finder: [],
-            });
-            recordSelection(bypassed, stableOnly.length, keptAll);
-            return closed(bypassed, selectorRanOver(stableOnly.length));
+            };
+            const {
+              selections: bypassed,
+              keptAll,
+              pool: selectedPool,
+              selectorTurn,
+              failure,
+            } = await runSelection(stableOnly);
+            const selectedPoolSize =
+              selectedPool.stable.length + selectedPool.finder.length;
+            recordSelection(bypassed, selectedPoolSize, keptAll, failure);
+            return closed(
+              bypassed,
+              selectorRanOver(selectedPoolSize, failure),
+              failure,
+              { pool: selectedPool, selectorTurn, keptAll },
+            );
           }
           // Hard skip: the selector is never consulted, so this is a zero
           // selection BY CONSTRUCTION, not a judgment that nothing was relevant.
@@ -971,14 +1086,26 @@ export async function orchestrate(
     "Gate & edge expansion",
     Date.now() - expandStartedAt,
   );
-  const poolSize = stable.length + finderTail.length;
-  const { selections, keptAll } = await runSelection(pool);
-  recordSelection(selections, poolSize, keptAll);
+  const {
+    selections,
+    keptAll,
+    pool: selectedPool,
+    selectorTurn,
+    failure,
+  } = await runSelection(pool);
+  const selectedPoolSize =
+    selectedPool.stable.length + selectedPool.finder.length;
+  recordSelection(selections, selectedPoolSize, keptAll, failure);
 
   return {
     selections,
     lanes: { core, hot, fresh, always, finder },
-    selectorRan: selectorRanOver(poolSize),
+    selectorRan: selectorRanOver(selectedPoolSize, failure),
+    pool: selectedPool,
+    selectorTurn,
+    keptAll,
+    ...(gateOutcome ? { gateReason: gateOutcome.reason } : {}),
+    ...(failure ? { selectorFailure: failure } : {}),
   };
 }
 

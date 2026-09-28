@@ -88,6 +88,7 @@
     "cardHoverLine": {
       "channels": "所有可以联系到我的地方",
       "contacts": "我认识并信任的人",
+      "email": "寄到我收件箱的一切",
       "library": "我为你制作的应用和文档",
       "memory": "我记住的一切",
       "personality": "来吧，调整我的灵魂",
@@ -109,7 +110,11 @@
     },
     "setUpSchedule": "创建定时任务",
     "updateAvatarAndName": "更新头像和名称",
-    "viewMoreSchedules": "{count, plural, other {查看 {count} 个更多…}}"
+    "viewMoreSchedules": "{count, plural, other {查看 {count} 个更多…}}",
+    "lockedBadge": "需要 Super 套餐",
+    "pinEmail": "将邮件固定到侧边菜单",
+    "unpinEmail": "从侧边菜单取消固定邮件",
+    "dismissEmail": "关闭"
   },
   "identitySections": {
     "channels": {
@@ -120,13 +125,13 @@
       "description": "我认识的人",
       "label": "联系人"
     },
+    "email": {
+      "description": "我收发的邮件",
+      "label": "邮件"
+    },
     "library": {
       "description": "我的应用和文档",
       "label": "资料库"
-    },
-    "memory": {
-      "description": "我记住的内容",
-      "label": "记忆"
     },
     "personality": {
       "description": "调整我的说话方式",
@@ -264,7 +269,9 @@
   },
   "pluginToast": {
     "alreadyUpToDate": "{name} 已是最新版本",
+    "cleanupWarning": "插件清理已完成，但有一项警告。",
     "installed": "已安装 {name}",
+    "mcpOAuthCredentialsUnchecked": "凭据存储不可用，因此无法检查该插件之前的 MCP OAuth 凭据。",
     "pluginFallback": "插件",
     "pluginFallbackCapitalized": "插件",
     "removed": "已移除 {name}",
@@ -289,18 +296,15 @@
     "backToConversationAriaLabel": "返回对话",
     "backToSkillsAriaLabel": "返回技能",
     "filesTab": "文件",
-    "fileViewModeAriaLabel": "文件查看模式",
     "historyTab": "历史记录",
     "install": "安装",
     "noFilesAvailable": "无可用文件。",
     "openInWorkspaceAriaLabel": "在工作区中打开",
     "pendingAriaLabel": "待处理",
-    "preview": "预览",
     "remove": "移除",
     "saveFailed": "保存失败",
     "selectAFile": "选择文件",
-    "selectFilePrompt": "选择一个文件以查看其内容。",
-    "source": "来源"
+    "selectFilePrompt": "选择一个文件以查看其内容。"
   },
   "skillDetailPage": {
     "backToConversation": "返回对话",
@@ -446,5 +450,9 @@
     "system": "系统",
     "integrations": "集成",
     "other": "其他"
+  },
+  "assistantHandleLine": {
+    "edit": "编辑用户名 @{handle}",
+    "editTitle": "编辑用户名"
   }
 }

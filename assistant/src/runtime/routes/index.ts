@@ -17,6 +17,7 @@ import { ROUTES as MEMORY_V3_ROUTES } from "../../plugins/defaults/memory/src/me
 import { ROUTES as MEMORY_WORKER_ROUTES } from "../../plugins/defaults/memory/src/memory-worker-routes.js";
 import { ROUTES as ACP_CLAUDE_AUTH_ROUTES } from "./acp-claude-auth-routes.js";
 import { ROUTES as ACP_ROUTES } from "./acp-routes.js";
+import { ROUTES as ACTIVATION_ROUTES } from "./activation-routes.js";
 import { ROUTES as APP_MANAGEMENT_ROUTES } from "./app-management-routes.js";
 import { ROUTES as APP_ROUTES } from "./app-routes.js";
 import { ROUTES as APPROVAL_ROUTES } from "./approval-routes.js";
@@ -24,6 +25,7 @@ import { ROUTES as ATTACHMENT_ROUTES } from "./attachment-routes.js";
 import { ROUTES as AUDIO_ROUTES } from "./audio-routes.js";
 import { ROUTES as AUDIT_ROUTES } from "./audit-routes.js";
 import { ROUTES as AUTH_ROUTES } from "./auth-routes.js";
+import { ROUTES as AUTO_PROFILE_ROUTES } from "./auto-profile-routes.js";
 import { ROUTES as AVATAR_ROUTES } from "./avatar-routes.js";
 import { ROUTES as BACKGROUND_TOOL_ROUTES } from "./background-tool-routes.js";
 import { ROUTES as BACKGROUND_WAKE_ROUTES } from "./background-wake-routes.js";
@@ -38,6 +40,7 @@ import { ROUTES as CALL_ROUTES } from "./call-routes.js";
 import { ROUTES as CHANNEL_AVAILABILITY_ROUTES } from "./channel-availability-routes.js";
 import { ROUTES as CHANNEL_READINESS_ROUTES } from "./channel-readiness-routes.js";
 import { CHANNEL_ROUTES } from "./channel-route-definitions.js";
+import { ROUTES as CHANNEL_SEND_ROUTES } from "./channel-send-routes.js";
 import { ROUTES as CHANNEL_VERIFICATION_ROUTES } from "./channel-verification-routes.js";
 import { ROUTES as CHATGPT_SUBSCRIPTION_AUTH_ROUTES } from "./chatgpt-subscription-auth-routes.js";
 import { ROUTES as CLIENT_ROUTES } from "./client-routes.js";
@@ -57,10 +60,10 @@ import { ROUTES as CONVERSATIONS_IMPORT_ROUTES } from "./conversations-import-ro
 import { ROUTES as CREDENTIAL_PROMPT_ROUTES } from "./credential-prompt-routes.js";
 import { ROUTES as CREDENTIAL_REQUEST_ROUTES } from "./credential-request-routes.js";
 import { ROUTES as CREDENTIAL_ROUTES } from "./credential-routes.js";
-import { ROUTES as DEBUG_BASH_ROUTES } from "./debug-bash-routes.js";
 import { ROUTES as DEBUG_ROUTES } from "./debug-routes.js";
 import { ROUTES as DEFAULT_PROVIDER_ROUTES } from "./default-provider-routes.js";
 import { ROUTES as DEFER_ROUTES } from "./defer-routes.js";
+import { ROUTES as DESKTOP_SETUP_ROUTES } from "./desktop-setup-routes.js";
 import { ROUTES as DIAGNOSTICS_ROUTES } from "./diagnostics-routes.js";
 import { ROUTES as DISK_PRESSURE_ROUTES } from "./disk-pressure-routes.js";
 import { ROUTES as DOCUMENT_COMMENT_ROUTES } from "./document-comments-routes.js";
@@ -190,6 +193,7 @@ export const ROUTES: RouteDefinition[] = [
   ...CHANNEL_VERIFICATION_ROUTES,
   ...CHANNEL_AVAILABILITY_ROUTES,
   ...CHANNEL_READINESS_ROUTES,
+  ...CHANNEL_SEND_ROUTES,
   ...BROWSER_ROUTES,
   ...BROWSER_TABS_ROUTES,
   ...BTW_ROUTES,
@@ -213,9 +217,11 @@ export const ROUTES: RouteDefinition[] = [
   ...CONVERSATION_COMPACTION_ROUTES,
   ...CONVERSATION_QUERY_ROUTES,
   ...CONVERSATION_STARTER_ROUTES,
-  ...DEBUG_BASH_ROUTES,
+  ...ACTIVATION_ROUTES,
+  ...AUTO_PROFILE_ROUTES,
   ...DEBUG_ROUTES,
   ...DEFAULT_PROVIDER_ROUTES,
+  ...DESKTOP_SETUP_ROUTES,
   ...DIAGNOSTICS_ROUTES,
   ...DISK_PRESSURE_ROUTES,
   ...RESOURCE_PRESSURE_ROUTES,

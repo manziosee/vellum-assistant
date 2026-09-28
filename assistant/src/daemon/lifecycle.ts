@@ -57,6 +57,7 @@ import { startScheduler } from "../schedule/scheduler.js";
 import { getSubagentManager } from "../subagent/index.js";
 import { startUsageTelemetryReporter } from "../telemetry/usage-telemetry-reporter.js";
 import { getLogger, initLogger } from "../util/logger.js";
+import { DAEMON_OOM_SCORE_ADJ, setOomScoreAdj } from "../util/oom-priority.js";
 import {
   ensureDataDir,
   getDotEnvPath,
@@ -71,14 +72,12 @@ import { ensureCompleteCustomProfiles } from "../workspace/custom-profile-ensure
 import { ensureDefaultProvider } from "../workspace/default-provider-ensure.js";
 import { WORKSPACE_MIGRATIONS } from "../workspace/migrations/registry.js";
 import { runWorkspaceMigrations } from "../workspace/migrations/runner.js";
-import { startAppSourceWatcher } from "./app-source-watcher.js";
 import { startConfigWatcher } from "./config-watcher.js";
 import { startConversationEvictor } from "./conversation-evictor.js";
 import { writePid } from "./daemon-control.js";
 import {
   setDbMigrating,
   setDbMigrationFailed,
-  setDbReady,
   setStartupComplete,
 } from "./daemon-readiness.js";
 import { startDiskPressureGuardForLifecycle } from "./disk-pressure-guard-lifecycle.js";
@@ -92,6 +91,7 @@ import {
   reconcileInterruptedConversations,
   resumeInterruptedConversations,
 } from "./interrupted-turn-reconciler.js";
+import { recoverModeSessionsBeforeDbReady } from "./mode-session-startup-recovery.js";
 import { startOrphanReaper } from "./orphan-reaper.js";
 import { runProfilerSweep } from "./profiler-run-store.js";
 import {
@@ -115,6 +115,9 @@ export async function runDaemon(): Promise<void> {
   // the event hub real clients subscribe to, so plugin-facing publishes made
   // here fan out locally rather than routing to a daemon over IPC.
   markCurrentProcessAsMainDaemon();
+  // Before the first spawn: every child inherits this value and resets its
+  // own, so the kernel OOM killer takes a tool or worker before the daemon.
+  const oomProtected = setOomScoreAdj(DAEMON_OOM_SCORE_ADJ);
 
   const startupStartedAt = Date.now();
   // dotenv loads before the first log call so the lazy root logger
@@ -122,7 +125,13 @@ export async function runDaemon(): Promise<void> {
   // whatever was in the live environment at process spawn.
   loadDotEnv();
   validateEnv();
-  log.info({ version: APP_VERSION }, "Daemon starting");
+  log.info(
+    {
+      version: APP_VERSION,
+      oomScoreAdj: oomProtected ? DAEMON_OOM_SCORE_ADJ : undefined,
+    },
+    "Daemon starting",
+  );
 
   // Signal handlers install before any blocking startup work — a boot that
   // inherits a large WAL can spend minutes inside `initializeDb()`, and
@@ -291,22 +300,39 @@ export async function runDaemon(): Promise<void> {
         "stream seq floor from persisted anchors failed — continuing startup",
       );
     }
+    const migrationFailureDetails = {
+      failedMigrations: initResult.failedMigrations,
+      deferredMigrations: initResult.deferredMigrations,
+      validationError: initResult.validationError,
+    };
+    const modeSessionRecovery = migrationsOk
+      ? recoverModeSessionsBeforeDbReady()
+      : null;
+    if (modeSessionRecovery?.ok && modeSessionRecovery.interruptedCount > 0) {
+      log.info(
+        { interruptedModeSessions: modeSessionRecovery.interruptedCount },
+        "Recovered active mode sessions as interrupted",
+      );
+    }
+    if (modeSessionRecovery && !modeSessionRecovery.ok) {
+      log.error(
+        { err: modeSessionRecovery.error },
+        "Mode session recovery failed; tracking is unavailable for this boot",
+      );
+    }
     if (migrationsOk) {
-      setDbReady(true);
       log.info("Daemon startup: DB initialized");
     } else {
-      setDbMigrationFailed(undefined, {
-        failedMigrations: initResult.failedMigrations,
-        deferredMigrations: initResult.deferredMigrations,
-        validationError: initResult.validationError,
-      });
+      setDbMigrationFailed(undefined, migrationFailureDetails);
+    }
+    if (!migrationsOk) {
       log.error(
         {
           failedMigrations: initResult.failedMigrations,
           deferredMigrations: initResult.deferredMigrations,
           validationError: initResult.validationError,
         },
-        "Daemon startup: DB opened but one or more migrations failed or were deferred — /readyz will remain unready",
+        "Daemon startup: DB migrations failed; /readyz will remain unready",
       );
     }
     // Migrations have settled (successfully or in the failed degraded mode),
@@ -674,11 +700,11 @@ export async function runDaemon(): Promise<void> {
   // blocked.
   startConsentRefresh();
 
-  // Bring up the daemon's CES connection (process + handshake + reconnect
-  // wiring). Blocks up to a 20s timeout so credential reads route through CES
-  // before provider init; non-fatal — falls back to the direct credential store
-  // on failure. The sidecar accepts exactly one bootstrap connection, so this
-  // happens at the process level.
+  // Open the assistant's CES RPC client (handshake + reconnect wiring).
+  // Blocks up to a 20s timeout so credential reads route through CES before
+  // provider init; non-fatal, falls back to the direct credential store on
+  // failure. CES serves a multi-connection bootstrap socket, so child
+  // processes can open the same `openCesRpcSession` path independently.
   await startCes(config);
 
   // Bring up the plugin layer: install the runtime bridge, register the
@@ -705,10 +731,6 @@ export async function runDaemon(): Promise<void> {
   // to changes: evict conversations so the next turn rebuilds against the new
   // config, and broadcast the relevant resource-changed events to clients.
   startConfigWatcher();
-
-  // Watch app source directories so edits recompile + refresh surfaces across
-  // all conversations.
-  startAppSourceWatcher();
 
   // Start the CLI IPC server. Throws on EADDRINUSE to abort startup when another
   // daemon already holds the socket, so this process never runs background jobs

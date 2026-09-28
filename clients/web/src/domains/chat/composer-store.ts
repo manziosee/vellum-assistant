@@ -23,6 +23,7 @@ import type {
   AttachmentMetadata,
   DisplayAttachment,
 } from "@/types/attachment-types";
+import type { EmailReference } from "@/types/email-reference";
 import { getLocalSetting, setLocalSetting } from "@/utils/local-settings";
 import { uploadChatAttachment } from "@/domains/chat/api/messages";
 import {
@@ -31,7 +32,7 @@ import {
   prepareImageAttachmentForUpload,
 } from "@/domains/chat/components/chat-attachments/attachment-image-resize";
 import { fetchAttachmentContentBlob } from "@/domains/chat/components/chat-attachments/download-attachment";
-import { sniffBlobMimeType } from "@/domains/chat/utils/mime-sniff";
+import { sniffBlobMimeType } from "@/utils/mime-sniff";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -75,11 +76,25 @@ export interface PathReferenceAttachment {
   filename: string;
 }
 
+/**
+ * An email from the assistant's inbox, staged from the inbox page's
+ * selection. Like a path reference nothing is uploaded: the header is folded
+ * into the sent message as a delimited block the assistant reads the fields
+ * from, and it fetches the body itself by id. The renderer holds the header
+ * only, which is what the chip draws.
+ */
+export interface EmailReferenceAttachment {
+  kind: "email-reference";
+  localId: string;
+  email: EmailReference;
+}
+
 export type ChatAttachment =
   | PendingAttachmentUpload
   | UploadedAttachment
   | FailedAttachmentUpload
-  | PathReferenceAttachment;
+  | PathReferenceAttachment
+  | EmailReferenceAttachment;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -218,6 +233,8 @@ export interface ComposerState {
   // --- Attachments ---
   attachments: ChatAttachment[];
   attachmentLastError: string | null;
+  /** Advances when authenticated ownership changes so late async work is ignored. */
+  sessionGeneration: number;
 }
 
 export interface ComposerActions {
@@ -257,7 +274,12 @@ export interface ComposerActions {
    * persisted entry, so the message waits where its own conversation will look
    * for it rather than being filed under a stranger.
    */
-  restoreFailedDraft: (assistantId: string, key: string, text: string) => void;
+  restoreFailedDraft: (
+    assistantId: string,
+    key: string,
+    text: string,
+    sessionGeneration: number,
+  ) => void;
 
   // --- Draft lifecycle (called by chat-session-store.switchToConversation) ---
   /**
@@ -296,12 +318,20 @@ export interface ComposerActions {
    * the assistant can operate against the folder in place.
    */
   addPathReferences: (paths: string[]) => void;
+  /**
+   * Stage inbox emails as `email-reference` attachments. Nothing is uploaded;
+   * the headers ride in the sent message content. An email already staged
+   * (same id) is not staged twice.
+   */
+  addEmailReferences: (emails: EmailReference[]) => void;
   removeAttachment: (localId: string) => void;
   /** Clear all attachments (e.g. after successful send). Does NOT revoke
    * preview URLs — sent message bubbles still need them. */
   resetAttachments: () => void;
   /** Clear all attachments AND revoke preview URLs (e.g. on assistant switch). */
   fullReset: () => void;
+  /** Clear all composer state owned by the authenticated user. */
+  resetForLogout: () => void;
   dismissAttachmentError: () => void;
 }
 
@@ -330,6 +360,7 @@ const useComposerStoreBase = create<ComposerStore>()((set, get) => ({
   restoredDraftConversationId: null,
   attachments: [],
   attachmentLastError: null,
+  sessionGeneration: 0,
 
   // --- Draft input actions ---
   setInput: (value) => {
@@ -356,7 +387,10 @@ const useComposerStoreBase = create<ComposerStore>()((set, get) => ({
     }
   },
 
-  restoreFailedDraft: (assistantId, key, text) => {
+  restoreFailedDraft: (assistantId, key, text, sessionGeneration) => {
+    if (sessionGeneration !== get().sessionGeneration) {
+      return;
+    }
     if (!text.trim()) {
       return;
     }
@@ -632,6 +666,35 @@ const useComposerStoreBase = create<ComposerStore>()((set, get) => ({
     }));
   },
 
+  addEmailReferences: (emails) => {
+    set((s) => {
+      const staged = new Set(
+        s.attachments.flatMap((att) =>
+          att.kind === "email-reference" ? [att.email.id] : [],
+        ),
+      );
+      const additions: EmailReferenceAttachment[] = [];
+      for (const email of emails) {
+        if (staged.has(email.id)) {
+          continue;
+        }
+        staged.add(email.id);
+        additions.push({
+          kind: "email-reference",
+          localId: createLocalId(),
+          email,
+        });
+      }
+      if (additions.length === 0) {
+        return s;
+      }
+      return {
+        attachments: [...s.attachments, ...additions],
+        attachmentLastError: null,
+      };
+    });
+  },
+
   removeAttachment: (localId) => {
     set((s) => {
       const target = s.attachments.find((att) => att.localId === localId);
@@ -669,6 +732,27 @@ const useComposerStoreBase = create<ComposerStore>()((set, get) => ({
       }
       return { attachments: [], attachmentLastError: null };
     });
+    previewUrls.forEach((url) => URL.revokeObjectURL(url));
+    previewUrls.clear();
+  },
+
+  resetForLogout: () => {
+    set((s) => {
+      for (const att of s.attachments) {
+        if (att.kind === "uploading") {
+          cancelledUploads.add(att.localId);
+        }
+      }
+      return {
+        input: "",
+        restoredDraftConversationId: null,
+        attachments: [],
+        attachmentLastError: null,
+        sessionGeneration: s.sessionGeneration + 1,
+      };
+    });
+    draftsMap = new Map();
+    currentAssistantId = null;
     previewUrls.forEach((url) => URL.revokeObjectURL(url));
     previewUrls.clear();
   },
@@ -742,6 +826,17 @@ export function selectPathReferencePaths(
       (att): att is PathReferenceAttachment => att.kind === "path-reference",
     )
     .map((att) => att.path);
+}
+
+/** Inbox emails staged as email-reference attachments, in insertion order. */
+export function selectEmailReferences(
+  attachments: ChatAttachment[],
+): EmailReference[] {
+  return attachments
+    .filter(
+      (att): att is EmailReferenceAttachment => att.kind === "email-reference",
+    )
+    .map((att) => att.email);
 }
 
 // ---------------------------------------------------------------------------

@@ -4,6 +4,7 @@ import { type ReactNode, useEffect, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { AddCreditsModal } from "@/components/add-credits-modal";
+import { ReferralModal } from "@/components/referral-modal";
 import { AutoTopUpCard } from "@/domains/settings/components/auto-top-up-card";
 import {
   organizationsBillingSummaryRetrieveOptions,
@@ -23,7 +24,6 @@ import {
   DailyCreditLimitCard,
 } from "./daily-credit-limit-card";
 import { LowBalanceAlertCard } from "./low-balance-alert-card";
-import { ReferralModal } from "./referral-modal";
 
 export const BOOTSTRAP_MAX_RETRIES = 3;
 export const BOOTSTRAP_RETRY_DELAY_MS = 2000;
@@ -152,7 +152,7 @@ export function BillingPanel() {
     return (
       <div className="mt-4">
         <StatSquare
-          icon={<Coins className="h-4 w-4" aria-hidden />}
+          icon={<Coins />}
           value={<span data-testid="effective-balance">{display}</span>}
           label={t("billingPanel.balanceLabel")}
           tone={effectiveNeg ? "negative" : "default"}

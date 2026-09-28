@@ -1,15 +1,15 @@
 /**
  * `evictConversationsForReload` drops in-memory conversations after a
- * config/prompt/skills reload so the next turn rebuilds them against the new
+ * config/prompt reload so the next turn rebuilds them against the new
  * config. Queued messages live only on the instance being disposed, so the
  * same "not idle while a queue is pending" rule the periodic evictor applies
  * has to hold here: `isProcessing()` reads false in the window between a turn
  * releasing and its queued successor being dispatched.
  *
- * In-flight subagents are the other non-idle case: an async spawn leaves the
- * parent idle between its own tool calls while children are still running.
- * Reload marks that parent stale without aborting the children, then
- * `getOrCreateConversation` rebuilds it once every child is terminal.
+ * In-flight subagents and resident mode-session state are other non-idle
+ * cases. Reload marks the conversation stale without discarding that state,
+ * then `getOrCreateConversation` rebuilds it once every retained lifecycle is
+ * settled.
  */
 import { beforeEach, describe, expect, mock, test } from "bun:test";
 
@@ -26,7 +26,7 @@ mock.module("../subagent/index.js", () => ({
   }),
 }));
 
-import type { Conversation } from "../daemon/conversation.js";
+import { Conversation } from "../daemon/conversation.js";
 import {
   clearConversations,
   conversationIds,
@@ -45,17 +45,38 @@ interface FakeConversation {
 
 function register(
   id: string,
-  state: { processing: boolean; queued: boolean; stale?: boolean },
+  state: {
+    processing: boolean;
+    queued: boolean;
+    modeSessionWork?: boolean;
+    scheduledDispatch?: boolean;
+    stale?: boolean;
+  },
 ): FakeConversation {
   const fake: FakeConversation & Record<string, unknown> = {
     disposed: false,
     markedStale: false,
     conversationId: id,
+    liveVoiceResidencyLeases: 0,
+    pendingQueuedDispatches: state.scheduledDispatch
+      ? new Map([
+          [
+            "run-scheduled",
+            new Set([{ controller: new AbortController(), messages: [] }]),
+          ],
+        ])
+      : new Map(),
     isProcessing: () => state.processing,
     hasQueuedMessages: () => state.queued,
+    modeSessions: {
+      hasResidentWork: () => state.modeSessionWork === true,
+    },
     isStale: () => state.stale === true || fake.markedStale,
-    hasInFlightWork: () =>
-      state.processing || state.queued || activeParents.has(id),
+    hasInFlightWork() {
+      return Conversation.prototype.hasInFlightWork.call(
+        fake as unknown as Conversation,
+      );
+    },
     dispose() {
       fake.disposed = true;
     },
@@ -99,6 +120,18 @@ describe("evictConversationsForReload", () => {
     expect(abortedParents).toEqual([]);
   });
 
+  test("keeps a scheduled dispatch whose processing claim is pending", () => {
+    const pending = register("reload-scheduled", {
+      processing: false,
+      queued: false,
+      scheduledDispatch: true,
+    });
+    evictConversationsForReload();
+    expect(pending.disposed).toBe(false);
+    expect(pending.markedStale).toBe(true);
+    expect(abortedParents).toEqual([]);
+  });
+
   test("marks a mid-turn conversation stale instead of disposing it", () => {
     const busy = register("reload-busy", { processing: true, queued: false });
 
@@ -123,6 +156,43 @@ describe("evictConversationsForReload", () => {
     expect(parent.markedStale).toBe(true);
     expect(findConversation("reload-with-children")).toBeDefined();
     expect(abortedParents).toEqual([]);
+  });
+
+  test("keeps resident mode-session ownership usable across reload eviction", () => {
+    const resident = register("reload-mode-active", {
+      processing: false,
+      queued: false,
+      modeSessionWork: true,
+    });
+
+    evictConversationsForReload();
+
+    expect(resident.disposed).toBe(false);
+    expect(resident.markedStale).toBe(true);
+    expect(findConversation("reload-mode-active")).toBeDefined();
+    expect(abortedParents).toEqual([]);
+  });
+
+  test("keeps a Live voice residency lease until the socket releases it", () => {
+    const resident = register("reload-live-voice", {
+      processing: false,
+      queued: false,
+    });
+    const release = Conversation.prototype.acquireLiveVoiceResidency.call(
+      resident as unknown as Conversation,
+    );
+
+    evictConversationsForReload();
+
+    expect(resident.disposed).toBe(false);
+    expect(resident.markedStale).toBe(true);
+    expect(findConversation("reload-live-voice")).toBeDefined();
+
+    release();
+    evictConversationsForReload();
+
+    expect(resident.disposed).toBe(true);
+    expect(findConversation("reload-live-voice")).toBeUndefined();
   });
 
   test("still evicts other idle conversations when one parent is protected", () => {

@@ -29,6 +29,11 @@ import {
   getConfigReadOnly,
   loadRawConfig,
 } from "../../config/loader.js";
+import { orderProfileKeys } from "../../config/profile-order.js";
+import {
+  nonTextConversationProfileMessage,
+  profileSupportsTextGeneration,
+} from "../../config/profile-text-generation.js";
 import {
   ProfileEntry,
   routingIdentityModelIssue,
@@ -523,9 +528,11 @@ async function handleListProfiles() {
     config.llm.profiles,
     config.llm.defaultProvider ?? null,
   );
+  // Presentation order, the same one the pickers use, rather than the
+  // on-disk insertion order of `llm.profiles`.
   const profiles = await Promise.all(
-    Object.entries(effective).map(async ([name, entry]) => {
-      const record = entry as Record<string, unknown>;
+    orderProfileKeys(effective, config.llm.profileOrder).map(async (name) => {
+      const record = effective[name] as Record<string, unknown>;
       const configIssue = profileConfigIssue(record);
       return {
         name,
@@ -890,6 +897,11 @@ async function handleSetActiveProfile({ body = {} }: RouteHandlerArgs) {
     throw new BadRequestError(
       `Profile "${name}" is disabled and cannot be set as the active profile. Enable it first, or pick another.`,
     );
+  }
+  if (
+    !profileSupportsTextGeneration(entry, effective as Record<string, unknown>)
+  ) {
+    throw new BadRequestError(nonTextConversationProfileMessage(name));
   }
   // No escape hatch here: an active profile that cannot dispatch locks the
   // user out of chat entirely, and nothing about the write signals that.

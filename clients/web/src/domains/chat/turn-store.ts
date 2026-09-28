@@ -18,7 +18,7 @@
 
 import { create } from "zustand";
 
-import type { ToolActivityMetadata } from "@/assistant/web-activity-types";
+import type { ToolActivityMetadata } from "@vellumai/assistant-api";
 import { createSelectors } from "@/utils/create-selectors";
 
 // ---------------------------------------------------------------------------
@@ -99,6 +99,11 @@ export function isSending(phase: TurnPhase): boolean {
     phase === "streaming" ||
     phase === "awaiting_user_input"
   );
+}
+
+/** True while activity output can still append to the current response. */
+export function isActivityLive(phase: TurnPhase): boolean {
+  return phase === "queued" || phase === "thinking" || phase === "streaming";
 }
 
 /** True when we are waiting for the first assistant text delta. */

@@ -3,8 +3,11 @@ import { create } from "zustand";
 import {
   COMPANION_DICTATION_OFFER_MAX,
   type FnClaimant,
+  type UnplacedDictationOffer,
 } from "@vellumai/ipc-contract";
 
+import { forwardUnplacedDictationOffer } from "@/runtime/companion-surface";
+import { isPopoutWindowLifetime } from "@/runtime/popout-window";
 import {
   setInputActivityWatch,
   subscribeToInputActivity,
@@ -13,13 +16,13 @@ import {
 /**
  * A hold's words, parked here while the companion offers them.
  *
- * Two things end a hold with its words still in hand, and both park them
+ * Three things end a hold with its words still in hand, and all park them
  * here. Another dictation app heard the key too and has already pasted its
- * version, since nothing on macOS owns a key; or nothing in the application
- * in front takes text, so no paste was sent at all. The offer is this
- * window's either way, the way a watch retrospective is: the companion draws
- * it and answers it, and the answer comes back here as a command, because
- * this is the side holding the words.
+ * version, since nothing on macOS owns a key; nothing in the application in
+ * front takes text, so no paste was sent at all; or the paste was sent and
+ * did not go through. The main window owns the offer and publishes it to
+ * the companion. Pop-outs forward unplaced words to that window, where
+ * answers and expiry clear the same store that publishes the offer.
  */
 interface OfferedWords {
   /**
@@ -51,7 +54,13 @@ export type DictationOffer =
        */
       frontApp: string | null;
     })
-  | (OfferedWords & { reason: "no-text-field" });
+  | (OfferedWords & { reason: UnplacedReason });
+
+/**
+ * Why words that were never pasted are being offered: nothing in front took
+ * text, or the paste into something that did failed.
+ */
+export type UnplacedReason = UnplacedDictationOffer["reason"];
 
 /**
  * How long an unanswered offer stands. Long enough to read and decide, short
@@ -134,14 +143,18 @@ export function setDictationOffer(
 }
 
 /**
- * Offer words nothing in front would take. Unconditional, where the offer
- * above is not: there is no edit of another app's for this one to replace, so
+ * Offer words that never reached the cursor, because nothing in front would
+ * take them or because the paste failed. Unconditional, where the offer above
+ * is not: there is no edit of another app's for this one to replace, so
  * nothing the user has typed since can make copying the words the wrong
  * thing. Nothing is watched for the same reason.
  */
-export function setUnplacedDictationOffer(text: string): void {
+export function setUnplacedDictationOffer(
+  text: string,
+  reason: UnplacedReason = "no-text-field",
+): void {
   clearDictationOffer();
-  putOffer({ reason: "no-text-field" }, text);
+  putOffer({ reason }, text);
 }
 
 /**
@@ -152,9 +165,17 @@ export function setUnplacedDictationOffer(text: string): void {
 function putOffer(
   reason:
     | { reason: "claimed"; app: FnClaimant; frontApp: string | null }
-    | { reason: "no-text-field" },
+    | { reason: UnplacedReason },
   text: string,
 ): void {
+  const boundedText = text.slice(0, COMPANION_DICTATION_OFFER_MAX);
+  if (
+    reason.reason !== "claimed" &&
+    isPopoutWindowLifetime() &&
+    forwardUnplacedDictationOffer({ reason: reason.reason, text: boundedText })
+  ) {
+    return;
+  }
   const expiry = setTimeout(
     () => clearDictationOffer(),
     DICTATION_OFFER_TTL_MS,
@@ -163,7 +184,7 @@ function putOffer(
     offer: {
       ...reason,
       id: crypto.randomUUID(),
-      text: text.slice(0, COMPANION_DICTATION_OFFER_MAX),
+      text: boundedText,
       expiry,
     },
   });
@@ -175,6 +196,9 @@ export function clearDictationOffer({
 }: { keepWatch?: boolean } = {}): DictationOffer | null {
   if (!keepWatch) {
     disarmDictationOfferWatch();
+    if (isPopoutWindowLifetime()) {
+      forwardUnplacedDictationOffer(null);
+    }
   }
   const { offer } = useDictationOfferStore.getState();
   if (offer === null) {

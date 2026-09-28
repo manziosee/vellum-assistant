@@ -18,9 +18,10 @@
  * The last three stories are the states the sources put the panel in: still
  * loading, loaded and empty, and one source down.
  *
- * The frame is the shipped drawer, so a story opens at its 400px default and
- * the rows fit what that width holds. Drag the drawer's left edge to walk the
- * fit rule out to the mock's wider column.
+ * The frame is the shipped drawer, opened at the width the app gives Chat
+ * Info: a 569px body, which is four file tiles or three app tiles. Drag the
+ * drawer's left edge to walk the fit rule down to what a narrower column
+ * holds.
  *
  * Read the phone stories at the Mobile viewports: there the rows become
  * horizontal strips that run past the panel's body inset to the screen edge.
@@ -34,11 +35,14 @@ import {
   makeMixedAttachments,
   makePreviewableImages,
 } from "@/domains/chat/components/chat-attachments/attachment-fixtures";
+import { CHAT_INFO_DRAWER_WIDTH_PX } from "@/domains/chat/components/chat-info-drawer-width";
 import {
   CHAT_INFO_ASSISTANT_ID,
   CHAT_INFO_CONVERSATION_ID,
   type ChatInfoStoryConversation,
   failChatInfoDocuments,
+  failChatInfoFrames,
+  failChatInfoDocumentRefresh,
   inChatInfoConversation,
 } from "@/domains/chat/components/chat-info-story-fixtures";
 import { DetailPanelStoryFrame } from "@/domains/chat/components/detail-panel-story-frame";
@@ -68,7 +72,7 @@ const WITH_FRAMES: Partial<ChatInfoStoryConversation> = {
 };
 
 const inDrawer: Decorator = (Story) => (
-  <DetailPanelStoryFrame>
+  <DetailPanelStoryFrame defaultWidth={CHAT_INFO_DRAWER_WIDTH_PX}>
     <Story />
   </DetailPanelStoryFrame>
 );
@@ -97,15 +101,15 @@ export default meta;
 type Story = StoryObj<typeof ChatInfoPanel>;
 
 /**
- * The panel as a working conversation leaves it: twelve apps and four files,
- * both more than one line of the default-width drawer holds, so each row is
- * truncated to what fits and offers See All.
+ * The panel as a working conversation leaves it: twelve apps and four files.
+ * One line holds three app tiles and four file tiles here, so Apps is
+ * truncated to what fits and offers See All while every file is on show.
  */
 export const Default: Story = {};
 
 /**
- * A young conversation, sized to the default drawer: one app and one document,
- * so every tile is on show and neither header carries a See All.
+ * A young conversation: one app and one document, so every tile is on show and
+ * neither header carries a See All.
  */
 export const FewAssets: Story = {
   parameters: {
@@ -198,11 +202,7 @@ export const WithCameraFramesMobile: Story = {
   globals: { viewport: { value: "sbMobile", isRotated: false } },
 };
 
-/**
- * The sources have not answered yet. The transcript's own files are on screen
- * from the first paint, and the panel says nothing about what it is missing:
- * a notice here reads as an answer the loaded panel then replaces.
- */
+/** Loaded transcript files remain visible beside source loading notices. */
 export const Loading: Story = {
   parameters: { chatInfo: { pendingSources: true } },
 };
@@ -214,10 +214,7 @@ export const Empty: Story = {
   },
 };
 
-/**
- * The documents source is down with nothing cached under it. The notice heads
- * the body, above the categories that did load.
- */
+/** The documents failure appears within Files, leaving Apps usable. */
 export const LoadFailed: Story = {
   parameters: {
     chatInfo: {
@@ -254,5 +251,20 @@ export const LevelTwoInteraction: Story = {
     await userEvent.click(await canvas.findByLabelText("See all apps"));
     // Finding the back control is the assertion: the second level is up.
     await canvas.findByLabelText("Back to chat info");
+  },
+};
+
+export const FramesUnavailable: Story = {
+  parameters: { chatInfo: { ...WITH_FRAMES, afterSeed: failChatInfoFrames } },
+};
+
+export const FramesUnavailableMobile: Story = {
+  ...FramesUnavailable,
+  globals: { viewport: { value: "sbNarrowPhone", isRotated: false } },
+};
+
+export const CachedRefreshFailed: Story = {
+  parameters: {
+    chatInfo: { ...WITH_FRAMES, afterSeed: failChatInfoDocumentRefresh },
   },
 };

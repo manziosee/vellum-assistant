@@ -15,6 +15,7 @@
  */
 
 import { client } from "@/generated/api/client.gen";
+import { t } from "@/i18n";
 import { getLocalGatewayUrl } from "@/lib/local-mode";
 import type { LockfileAssistant } from "@/runtime/local-mode-host";
 import { fetchGuardianTokenHost } from "@/runtime/local-mode-host";
@@ -88,6 +89,79 @@ export async function exportLocalBundle(
 }
 
 /**
+ * Ask a local/docker assistant's daemon to build a *debug* bundle and PUT it
+ * to a signed URL: `POST /v1/migrations/export-to-gcs` with
+ * `profile: "debug"`. The debug profile carries no credentials and adds the
+ * gateway's database and logs, for Vellum staff to open on a debug clone.
+ * Returns the 202 `job_id`; poll it with {@link pollLocalExportJob}.
+ */
+export async function exportLocalDebugBundle(
+  assistant: LockfileAssistant,
+  uploadUrl: string,
+): Promise<string> {
+  const base = localGatewayBase(assistant);
+  const token = await mintLocalGatewayToken(assistant, base);
+  const response = await fetch(`${base}/v1/migrations/export-to-gcs`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ upload_url: uploadUrl, profile: "debug" }),
+  });
+  if (!response.ok) {
+    throw new TeleportError(
+      "export_failed",
+      `Export failed (HTTP ${response.status}).`,
+    );
+  }
+  const jobId = ((await safeJson(response)) as { job_id?: string } | null)
+    ?.job_id;
+  if (!jobId) {
+    throw new TeleportError(
+      "export_failed",
+      "Export accepted but no job ID was returned.",
+    );
+  }
+  return jobId;
+}
+
+/**
+ * Poll a local/docker assistant's export job: `GET /v1/migrations/jobs/{id}`.
+ * Resolves to the job status; throws once the job reports failure.
+ */
+export async function pollLocalExportJob(
+  assistant: LockfileAssistant,
+  jobId: string,
+): Promise<string> {
+  const base = localGatewayBase(assistant);
+  const token = await mintLocalGatewayToken(assistant, base);
+  const response = await fetch(
+    `${base}/v1/migrations/jobs/${encodeURIComponent(jobId)}`,
+    { headers: { Authorization: `Bearer ${token}` } },
+  );
+  if (response.status >= 500) {
+    return "processing";
+  }
+  if (!response.ok) {
+    throw new TeleportError(
+      "export_job_failed",
+      `Job status check failed (HTTP ${response.status})`,
+    );
+  }
+  const job = (await safeJson(response)) as {
+    status?: string;
+    error?: { message?: string } | string;
+  } | null;
+  if (job?.status === "failed") {
+    const message =
+      typeof job.error === "string" ? job.error : job.error?.message;
+    throw new TeleportError("export_job_failed", message ?? "Export failed");
+  }
+  return job?.status ?? "processing";
+}
+
+/**
  * Import `.vbundle` bytes into a local/docker assistant via its gateway:
  * `POST /v1/migrations/import` (octet-stream body). Throws on a non-2xx status
  * or a `{success:false}` body.
@@ -123,6 +197,39 @@ export async function importLocalBundle(
     throw new TeleportError(
       "import_failed",
       json.error ?? "Import reported failure",
+    );
+  }
+}
+
+/**
+ * Take a gateway backup snapshot of a local assistant now:
+ * `POST /v1/backups/create`. The gateway exports a fresh `.vbundle` and
+ * writes it to its local backup pool plus any configured offsite
+ * destinations, so this call blocks for the full export. Throws on a non-2xx
+ * status or a `{success:false}` body.
+ */
+export async function createLocalBackup(
+  assistant: LockfileAssistant,
+): Promise<void> {
+  const base = localGatewayBase(assistant);
+  const token = await mintLocalGatewayToken(assistant, base);
+  const response = await fetch(`${base}/v1/backups/create`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!response.ok) {
+    throw new TeleportError(
+      "backup_failed",
+      t("settings:teleportCard.backupLocalFailed", {
+        status: response.status,
+      }),
+    );
+  }
+  const json = (await safeJson(response)) as { success?: boolean } | null;
+  if (json && json.success === false) {
+    throw new TeleportError(
+      "backup_failed",
+      t("settings:teleportCard.backupLocalReportedFailure"),
     );
   }
 }

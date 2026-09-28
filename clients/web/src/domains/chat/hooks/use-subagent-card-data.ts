@@ -238,6 +238,7 @@ export function mapToolEventToStep(
     title: label.title,
     info: label.info || content,
     activity: label.activity,
+    actionDisplayKey: label.actionDisplayKey,
     status: "running",
   };
 }
@@ -915,7 +916,13 @@ export function applyDetailEvent(
       payloads.map((payload, i) => ({
         toolCallId: payload.toolCallId,
         toolName: payload.toolName,
-        running: meta[i]!.running,
+        // The timeline never tracks a `web_fetch` as in flight, so a follow-up
+        // that names neither a tool id nor a tool must not close one here
+        // either: the two projections would close different calls.
+        running:
+          meta[i]!.running &&
+          (payload.toolName !== "web_fetch" ||
+            Boolean(event.toolUseId || event.toolName)),
       })),
       event,
     );
@@ -944,11 +951,13 @@ export function applyDetailEvent(
             searchResults: event.isError
               ? []
               : parseWebSearchResultText(event.result ?? event.content),
-            // On failure, keep the full provider/backend error so the nested
-            // detail can show it untruncated — the timeline chip only carries
-            // a `trimTextPreview` snippet. Parity with how a failed tool keeps
-            // its full `result`.
-            result: event.isError ? (event.result ?? event.content) : undefined,
+            // Keep the full result either way. On failure it is the provider
+            // or backend error, shown untruncated where the timeline chip only
+            // carries a `trimTextPreview` snippet. On success it is the text
+            // the model actually read, snippets and any written answer
+            // included, which the source chips drop; the drawer offers it as
+            // Raw output.
+            result: event.result ?? event.content,
           }
         : {
             ...target,

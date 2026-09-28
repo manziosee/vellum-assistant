@@ -2,12 +2,8 @@ import { Loader2 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router";
 
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation } from "@tanstack/react-query";
 
-import {
-  captureTakeoverAvatarStash,
-  clearTakeoverAvatarStash,
-} from "@/lib/billing/takeover-avatar-stash";
 import { organizationsBillingSubscriptionUpgradeCreateMutation } from "@/generated/api/@tanstack/react-query.gen";
 import { useOrgHeaderReadiness } from "@/hooks/use-is-org-ready";
 import { useTranslation } from "@/i18n";
@@ -25,6 +21,8 @@ import { useIsNativeAndroid } from "@/runtime/platform-detection";
 import { useOrganizationStore } from "@/stores/organization-store";
 import { PACKAGE_PARAM, routes } from "@/utils/routes";
 import { Button } from "@vellumai/design-library/components/button";
+import { textLinkVariants } from "@vellumai/design-library/components/text-link";
+import { cn } from "@vellumai/design-library/utils/cn";
 
 /**
  * How far a checkout attempt has got.
@@ -52,7 +50,6 @@ type CheckoutPhase = "idle" | "running" | "handed_off" | "settled";
  */
 function abandonCheckout() {
   clearCheckoutIntent();
-  clearTakeoverAvatarStash();
 }
 
 /**
@@ -140,7 +137,6 @@ function CheckoutPageContent() {
       ? t("checkoutPage.viewPlans")
       : t("checkoutPage.continueSetup");
 
-  const queryClient = useQueryClient();
   const { mutateAsync } = useMutation(
     organizationsBillingSubscriptionUpgradeCreateMutation(),
   );
@@ -205,7 +201,6 @@ function CheckoutPageContent() {
               }
             : { kind: "package", packageKey },
         );
-        captureTakeoverAvatarStash(queryClient);
         setAwaitingReturn(returnTarget === "native");
         void openUrl(result.checkout_url);
         return;
@@ -234,14 +229,7 @@ function CheckoutPageContent() {
       phaseRef.current = "settled";
       setFailed(true);
     }
-  }, [
-    bailTarget,
-    customSelection,
-    mutateAsync,
-    navigate,
-    packageKey,
-    queryClient,
-  ]);
+  }, [bailTarget, customSelection, mutateAsync, navigate, packageKey]);
 
   // The retry the failure and hand-off UIs offer. A failed or abandoned attempt
   // re-runs the upgrade; a missing organization re-runs org resolution instead,
@@ -341,7 +329,10 @@ function CheckoutPageContent() {
           <Link
             to={bailTarget}
             onClick={abandonCheckout}
-            className="text-sm text-[var(--content-tertiary)] underline"
+            className={cn(
+              textLinkVariants({ tone: "quiet" }),
+              "text-sm text-[var(--content-tertiary)]",
+            )}
           >
             {bailLabel}
           </Link>
@@ -369,7 +360,10 @@ function CheckoutPageContent() {
            */}
           <Link
             to={bailTarget}
-            className="text-sm text-[var(--content-tertiary)] underline"
+            className={cn(
+              textLinkVariants({ tone: "quiet" }),
+              "text-sm text-[var(--content-tertiary)]",
+            )}
           >
             {bailLabel}
           </Link>

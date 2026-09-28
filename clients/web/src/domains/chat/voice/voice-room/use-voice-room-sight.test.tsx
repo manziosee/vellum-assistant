@@ -26,8 +26,10 @@ import { useEffect } from "react";
 import { act, cleanup, renderHook } from "@testing-library/react";
 
 import type { UploadAttachmentResult } from "@/domains/chat/api/messages";
+import type { ForcedKeepOptions } from "@/lib/camera/frame-gate";
 import type { FrameSamplerOptions } from "@/lib/camera/frame-sampler";
 import type { NativeFrameSourceOptions } from "@/lib/camera/native-frame-source";
+import { buildDiagnosticsSnapshot } from "@/lib/diagnostics";
 
 import type { VoiceRoomSight } from "./use-voice-room-sight";
 
@@ -47,6 +49,7 @@ const nativeStop = mock(() => {});
 const nativeInvalidate = mock(() => {});
 const nativeSampleNow = mock(() => {});
 mock.module("@/lib/camera/native-frame-source", () => ({
+  NATIVE_PAIR_SPACING_MS: 60,
   createNativeFrameSource: (options: NativeFrameSourceOptions) => {
     nativeSourceOptions = options;
     return {
@@ -79,6 +82,7 @@ const captureVideoFrame = mock(
 const NATIVE_CAPTURE_QUALITY = 85;
 mock.module("@/domains/chat/voice/voice-room/voice-camera", () => ({
   captureVideoFrame,
+  isVoiceCameraSupported: () => true,
   NATIVE_CAPTURE_QUALITY,
 }));
 
@@ -271,7 +275,7 @@ function watchGateReset() {
  * object the source was given is what the hook calls.
  */
 function watchGateArm() {
-  const spy = mock((_nowMs: number) => {});
+  const spy = mock((_nowMs: number, _options?: ForcedKeepOptions) => {});
   (samplerOptions ?? nativeSourceOptions)!.gate.armForcedKeep = spy;
   return spy;
 }
@@ -319,6 +323,51 @@ afterEach(() => {
 });
 
 describe("useVoiceRoomSight: when it samples", () => {
+  test("negotiates one run across a flip and ends it when Live stops", async () => {
+    const startSightSession = mock((_epoch: number, _source: "live") => true);
+    const endSightSession = mock((_epoch: number) => true);
+    Object.assign(controls, { startSightSession, endSightSession });
+    useLiveVoiceStore.getState().setControls(controls);
+    const { view } = renderSight({ live: true });
+
+    expect(startSightSession).toHaveBeenCalledTimes(1);
+    const epoch = startSightSession.mock.calls[0]![0];
+    act(() => {
+      view.rerender({
+        cameraOpen: true,
+        facing: "user",
+        nativePreview: false,
+      });
+    });
+    expect(startSightSession).toHaveBeenCalledTimes(1);
+
+    act(() => {
+      view.result.current.setLive(false);
+    });
+    expect(endSightSession).toHaveBeenCalledWith(epoch);
+  });
+
+  test("rapid off/on starts a fresh run and ends only the current run", async () => {
+    const start = mock((_epoch: number, _source: "live" | "ambient") => true);
+    const end = mock((_epoch: number) => true);
+    Object.assign(controls, { startSightSession: start, endSightSession: end });
+    useLiveVoiceStore.getState().setControls(controls);
+    const { view } = renderSight();
+    const firstEpoch = start.mock.calls[0]![0];
+    act(() => view.result.current.setLive(false));
+    act(() => view.result.current.setLive(true));
+    const nextEpoch = start.mock.calls[1]![0];
+    expect(nextEpoch).not.toBe(firstEpoch);
+    expect(end.mock.calls).toEqual([[firstEpoch]]);
+    await keepFrame();
+    expect(controls.sightFrame.mock.calls[0]?.[2]).toEqual({
+      cameraEpoch: nextEpoch,
+      source: "live",
+    });
+    view.unmount();
+    expect(end.mock.calls).toEqual([[firstEpoch], [nextEpoch]]);
+  });
+
   test("samples the room's viewfinder while Live is running", () => {
     const { video } = renderSight({ live: true });
 
@@ -454,6 +503,10 @@ describe("useVoiceRoomSight: when it samples", () => {
   });
 
   test("a preview that turns native mid-viewfinder swaps the source under Live", () => {
+    const start = mock((_epoch: number, _source: "live" | "ambient") => true);
+    const end = mock((_epoch: number) => true);
+    Object.assign(controls, { startSightSession: start, endSightSession: end });
+    useLiveVoiceStore.getState().setControls(controls);
     const { view } = renderSight({ live: true });
     expect(view.result.current.live).toBe(true);
     expect(samplerStart).toHaveBeenCalledTimes(1);
@@ -475,6 +528,9 @@ describe("useVoiceRoomSight: when it samples", () => {
     expect(view.result.current.live).toBe(true);
     expect(samplerStop).toHaveBeenCalled();
     expect(nativeStart).toHaveBeenCalledTimes(1);
+    expect(start).toHaveBeenCalledTimes(2);
+    expect(start.mock.calls[1]![0]).not.toBe(start.mock.calls[0]![0]);
+    expect(end).toHaveBeenCalledWith(start.mock.calls[0]![0]);
   });
 
   test("a setter held from an earlier render is refused against availability now", () => {
@@ -1509,23 +1565,94 @@ describe("useVoiceRoomSight: transport reconnect", () => {
     expect(view.result.current.heldFrame?.attachmentId).toBe("att-2");
   });
 
-  test("coming back out of the gap clears nothing", async () => {
-    // Only entering a reconnect means a session was replaced. The `ready` that
-    // lowers the flag means the opposite, and a frame shared by then belongs
-    // to the session that is now running.
+  test("pauses keeps until the replacement is ready while preserving Live intent", async () => {
     const { view } = renderSight();
     act(() => {
+      useLiveVoiceStore.getState().setState("connecting");
       useLiveVoiceStore.getState().setReconnecting(true);
     });
     await keepFrame();
-    expect(view.result.current.heldFrame?.attachmentId).toBe("att-1");
-
+    expect(uploadChatAttachment).not.toHaveBeenCalled();
+    expect(controls.sightFrame).not.toHaveBeenCalled();
+    expect(view.result.current.live).toBe(true);
     act(() => {
+      useLiveVoiceStore.getState().setState("listening");
       useLiveVoiceStore.getState().setReconnecting(false);
     });
-
+    await keepFrame();
     expect(view.result.current.heldFrame?.attachmentId).toBe("att-1");
   });
+
+  test.each([false, true])(
+    "announces a fresh run before replacement frames (supported: %s)",
+    async (supported) => {
+      const firstStart = mock(
+        (_epoch: number, _source: "live" | "ambient") => true,
+      );
+      Object.assign(controls, { startSightSession: firstStart });
+      useLiveVoiceStore.getState().setControls(controls);
+      const { view } = renderSight();
+      await keepFrame();
+      const firstEpoch = firstStart.mock.calls[0]![0];
+      expect(controls.sightFrame.mock.calls[0]?.[2]).toEqual({
+        cameraEpoch: firstEpoch,
+        source: "live",
+      });
+      uploadsResolveImmediately = false;
+      await keepFrame();
+
+      act(() => {
+        useLiveVoiceStore.getState().setState("connecting");
+        useLiveVoiceStore.getState().setReconnecting(true);
+      });
+      const sequence: string[] = [];
+      const replacement = makeControlsSpies();
+      const replacementStart = mock(
+        (_epoch: number, _source: "live" | "ambient") => {
+          sequence.push("start");
+          return supported;
+        },
+      );
+      replacement.sightFrame.mockImplementation(() => {
+        sequence.push("frame");
+        return true;
+      });
+      Object.assign(replacement, { startSightSession: replacementStart });
+      act(() => {
+        useLiveVoiceStore.getState().setControls(replacement);
+      });
+      await keepFrame();
+      expect(replacementStart).not.toHaveBeenCalled();
+      expect(replacement.sightFrame).not.toHaveBeenCalled();
+
+      act(() => {
+        useLiveVoiceStore.getState().setState("listening");
+        useLiveVoiceStore.getState().setReconnecting(false);
+      });
+      expect(replacementStart).toHaveBeenCalledTimes(1);
+      const replacementEpoch = replacementStart.mock.calls[0]![0];
+      expect(replacementEpoch).not.toBe(firstEpoch);
+      uploadsResolveImmediately = true;
+      await keepFrame();
+      expect(sequence).toEqual(["start", "frame"]);
+      expect(replacement.sightFrame.mock.calls[0]?.[2]).toEqual(
+        supported
+          ? { cameraEpoch: replacementEpoch, source: "live" }
+          : undefined,
+      );
+      await act(async () => {
+        pendingUploads[0]!({ ok: true, id: "att-old-run" });
+        await flush();
+      });
+      expect(replacement.sightFrame).toHaveBeenCalledTimes(1);
+      expect(deleteChatAttachment).toHaveBeenCalledWith(
+        ASSISTANT_ID,
+        "att-old-run",
+      );
+      expect(view.result.current.live).toBe(true);
+      expect(samplerStart).toHaveBeenCalledTimes(1);
+    },
+  );
 });
 
 describe("useVoiceRoomSight: closing and flipping", () => {
@@ -1643,6 +1770,44 @@ describe("useVoiceRoomSight: closing and flipping", () => {
 });
 
 describe("useVoiceRoomSight: the native preview", () => {
+  test("includes native sampling failures in exported feedback diagnostics", () => {
+    renderSight({ nativePreview: true, live: true });
+    nativeSourceOptions!.onDiagnostics!({
+      event: "sampling",
+      attempts: 2,
+      captureRequests: 4,
+      suppressedCaptures: 0,
+      emptyCaptures: 0,
+      captureTimeouts: 0,
+      decodeFailures: 0,
+      sampleErrors: 0,
+      pairGapRejections: 2,
+      decisions: 0,
+      keeps: 0,
+      lastCaptureMs: 80,
+      maxCaptureMs: 85,
+      lastPairGapMs: 165,
+      maxPairGapMs: 170,
+      pairGapLimitMs: 120,
+    });
+    const snapshot = buildDiagnosticsSnapshot(null);
+    expect(snapshot.lifecycleEvents).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: "native_camera_sampling",
+          details: expect.objectContaining({
+            assistantId: ASSISTANT_ID,
+            conversationId: useLiveVoiceStore.getState().conversationId,
+            pairGapRejections: 2,
+            decisions: 0,
+            lastPairGapMs: 165,
+            pairGapLimitMs: 120,
+          }),
+        }),
+      ]),
+    );
+  });
+
   /** Offer one kept frame to the running poll and settle the upload. */
   async function keepNativeFrame(bytes: number[]): Promise<Blob> {
     const sample = new Blob([new Uint8Array(bytes)], { type: "image/jpeg" });
@@ -1653,7 +1818,7 @@ describe("useVoiceRoomSight: the native preview", () => {
     return sample;
   }
 
-  test("asks the bridge for a sample at the shared capture quality", async () => {
+  test("asks the bridge for a native pair at the shared capture quality", async () => {
     renderSight({ nativePreview: true, live: true });
 
     await nativeSourceOptions!.captureSample();
@@ -1662,6 +1827,7 @@ describe("useVoiceRoomSight: the native preview", () => {
     // photo off the same camera are encoded alike.
     expect(captureNativeVoiceCameraSample).toHaveBeenCalledWith(
       NATIVE_CAPTURE_QUALITY,
+      60,
     );
   });
 
@@ -1818,6 +1984,51 @@ describe("useVoiceRoomSight: refusing the native sample a change caught in fligh
     // a whole interval, and the gate keeps the history a rebuild would drop.
     expect(nativeStop).not.toHaveBeenCalled();
     expect(nativeStart).toHaveBeenCalledTimes(1);
+  });
+
+  test("gates bridge calls during reconnect and invalidates the outgoing samples", async () => {
+    const start = mock((_epoch: number, _source: "live" | "ambient") => true);
+    Object.assign(controls, { startSightSession: start });
+    useLiveVoiceStore.getState().setControls(controls);
+    const { view } = renderSight({ nativePreview: true, live: true });
+    expect(nativeSourceOptions!.canCapture!()).toBe(true);
+    nativeInvalidate.mockClear();
+    act(() => {
+      useLiveVoiceStore.getState().setState("connecting");
+      useLiveVoiceStore.getState().setReconnecting(true);
+      expect(nativeSourceOptions!.canCapture!()).toBe(false);
+    });
+    expect(nativeSourceOptions!.canCapture!()).toBe(false);
+    expect(nativeInvalidate).toHaveBeenCalledTimes(1);
+    expect(captureNativeVoiceCameraSample).not.toHaveBeenCalled();
+    act(() => {
+      useLiveVoiceStore.getState().setState("listening");
+      useLiveVoiceStore.getState().setReconnecting(false);
+    });
+    expect(start).toHaveBeenCalledTimes(2);
+    expect(start.mock.calls[1]![0]).not.toBe(start.mock.calls[0]![0]);
+    expect(nativeSourceOptions!.canCapture!()).toBe(true);
+    expect(await nativeSourceOptions!.captureSample()).toBe(
+      btoa("native-sample"),
+    );
+    expect(view.result.current.live).toBe(true);
+    expect(uploadChatAttachment).not.toHaveBeenCalled();
+    expect(nativeStart).toHaveBeenCalledTimes(1);
+  });
+
+  test("returns actual bridge responses to the sampler for accurate accounting", async () => {
+    renderSight({ nativePreview: true, live: true });
+    captureNativeVoiceCameraSample.mockImplementationOnce(async () => {
+      useLiveVoiceStore.getState().setReconnecting(true);
+      return btoa("native-sample");
+    });
+    await act(async () => {
+      expect(await nativeSourceOptions!.captureSample()).toBe(
+        btoa("native-sample"),
+      );
+      expect(nativeSourceOptions!.canCapture!()).toBe(false);
+    });
+    expect(uploadChatAttachment).not.toHaveBeenCalled();
   });
 
   test("tells the running poll when the transport reconnects", () => {
@@ -2049,5 +2260,95 @@ describe("useVoiceRoomSight: a frame for the question being asked", () => {
 
     expect(uploadChatAttachment).toHaveBeenCalledTimes(1);
     expect(controls.sightFrame).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * The frame a look owes: the assistant said it would take a look through the
+ * camera and says nothing more until a frame reported as one lands.
+ */
+describe("useVoiceRoomSight: a look the assistant asked for", () => {
+  function owe(): void {
+    act(() => {
+      useLiveVoiceStore.getState().setLookFrameRequested("camera", true);
+    });
+  }
+
+  async function forcedKeep(): Promise<void> {
+    act(() => {
+      samplerOptions?.onDecision(
+        { ...KEEP, reason: "forced" as const },
+        performance.now(),
+      );
+    });
+    await flush();
+  }
+
+  // Unlike a question's arm, a look's keeps a view the call already has: the
+  // session is waiting on a frame, and an unchanged scene is still the answer.
+  test("a running Live arms a keep that goes even for an unchanged view", () => {
+    renderSight({ live: true, nativePreview: true });
+    const armed = watchGateArm();
+
+    owe();
+
+    expect(armed).toHaveBeenCalledTimes(1);
+    expect(armed.mock.calls[0]?.[1]).toEqual(
+      expect.objectContaining({ evenIfUnchanged: true }),
+    );
+    expect(nativeSampleNow).toHaveBeenCalledTimes(1);
+    expect(useLiveVoiceStore.getState().lookFrameRequested.camera).toBe(false);
+  });
+
+  test("the keep that answers it is reported as the look's", async () => {
+    renderSight({ live: true });
+    owe();
+
+    await forcedKeep();
+
+    expect(controls.sightFrame).toHaveBeenCalledWith(
+      "att-1",
+      expect.objectContaining({
+        reason: "look",
+        armToKeepMs: expect.any(Number),
+      }),
+    );
+  });
+
+  test("a look that starts Live waits for it, then arms the gate it made", async () => {
+    const { view } = renderSight({ live: false });
+    owe();
+    expect(useLiveVoiceStore.getState().lookFrameRequested.camera).toBe(true);
+
+    act(() => {
+      view.result.current.setLive(true);
+    });
+    expect(useLiveVoiceStore.getState().lookFrameRequested.camera).toBe(false);
+
+    await forcedKeep();
+    expect(controls.sightFrame).toHaveBeenCalledWith(
+      "att-1",
+      expect.objectContaining({ reason: "look" }),
+    );
+  });
+
+  // Whatever the user says next runs a turn of its own that reads the frame,
+  // so the keep is theirs, not the look's.
+  test("a question asked after the look takes the arm over", async () => {
+    act(() => {
+      useLiveVoiceStore.getState().setHandsFree(true);
+    });
+    renderSight({ live: true });
+    owe();
+    act(() => {
+      useLiveVoiceStore.getState().setUtteranceOpen(true);
+    });
+
+    await forcedKeep();
+
+    expect(controls.sightFrame).toHaveBeenCalledWith(
+      "att-1",
+      expect.objectContaining({ reason: "forced" }),
+    );
   });
 });

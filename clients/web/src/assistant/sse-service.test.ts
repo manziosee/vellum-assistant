@@ -10,6 +10,7 @@ import {
 } from "bun:test";
 
 import type { AssistantEventEnvelope } from "@vellumai/assistant-api";
+import { makeEnvelope } from "@/assistant/sse-service.test-helper";
 import * as eventBus from "@/lib/event-bus";
 import { requestSseReconnect } from "@/lib/streaming/sse-reconnect-control";
 import { useSSEConnectedStore } from "@/stores/sse-connected-store";
@@ -79,10 +80,30 @@ mock.module("@/lib/streaming/reconnect-cursor", () => ({
   resetReconnectCursor: resetReconnectCursorMock,
 }));
 
-const { sseService, __setHiddenTeardownGraceMsForTesting } =
-  await import("@/assistant/sse-service");
+const { sseService, __setHiddenTeardownGraceMsForTesting } = await import(
+  "@/assistant/sse-service"
+);
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// The service drains received envelopes from a `MessageChannel` task. A short
+// real timer is the portable way to let that task run.
+const nextTask = () => sleep(5);
+
+/** Hands envelopes to the service one per microtask, as the transport's
+ *  `for await` read loop does. */
+async function deliverAcrossMicrotasks(
+  envelopes: AssistantEventEnvelope[],
+): Promise<void> {
+  for (const envelope of envelopes) {
+    activeOnEvent!(envelope);
+    await Promise.resolve();
+  }
+}
+
+function publishedNames(): string[] {
+  return publishSpy.mock.calls.map(([name]) => name);
+}
 
 // A tiny grace window used by the debounce specs so a hidden-tab teardown
 // can be awaited in a few ms rather than the production 5s. Kept well
@@ -110,7 +131,7 @@ beforeEach(() => {
   // the shared `cancelMock` during a later test. Debounce specs opt into a
   // tiny window locally and await it.
   __setHiddenTeardownGraceMsForTesting(10_000);
-  nativeMobile = false;
+  nativeMobile = true;
   activeOnEvent = null;
   activeOnError = null;
   activeOnReconnect = null;
@@ -150,18 +171,12 @@ describe("sseService.attach — connection lifecycle", () => {
     expect(resetReconnectCursorMock).toHaveBeenCalledTimes(1);
   });
 
-  test("re-broadcasts every SSE envelope on bus.sse.event", () => {
+  test("re-broadcasts every SSE envelope on bus.sse.event", async () => {
     sseService.attach("asst-1");
-    const envelope: AssistantEventEnvelope = {
-      id: "evt-1",
-      emittedAt: new Date().toISOString(),
-      message: {
-        type: "avatar_updated",
-        avatarPath: "/tmp/avatar.png",
-      },
-    };
+    const envelope = makeEnvelope(1);
 
     activeOnEvent!(envelope);
+    await nextTask();
 
     expect(publishSpy).toHaveBeenCalledWith("sse.event", envelope);
   });
@@ -328,6 +343,133 @@ describe("sseService.attach — connection lifecycle", () => {
 // handle creation — so a failing initial connect and its backoff window read
 // as disconnected. Graceful teardowns — which intentionally don't publish
 // `sse.closed` — still flip it back to disconnected via the explicit `false`.
+describe("sseService.attach: envelope delivery", () => {
+  test("a run of envelopes delivered across microtasks publishes in one task, in order", async () => {
+    sseService.attach("asst-1");
+    const envelopes = Array.from({ length: 60 }, (_, i) => makeEnvelope(i + 1));
+    // A microtask queued between two publishes would mean React got a chance
+    // to commit between them. Every publish landing between two probe ticks
+    // is what "one task, no microtask boundary" looks like from outside.
+    const timeline: string[] = [];
+    eventBus.subscribe("sse.event", (envelope) => {
+      timeline.push(`event:${envelope.seq}`);
+      queueMicrotask(() => timeline.push("microtask"));
+    });
+
+    await deliverAcrossMicrotasks(envelopes);
+    expect(timeline).toEqual([]);
+    await nextTask();
+
+    const events = timeline.filter((entry) => entry.startsWith("event:"));
+    expect(events).toEqual(envelopes.map((e) => `event:${e.seq}`));
+    expect(timeline.slice(0, 60)).toEqual(events);
+  });
+
+  test("sse.closed never overtakes envelopes received before it", async () => {
+    sseService.attach("asst-1");
+    activeOnStreamOpen!();
+    publishSpy.mockClear();
+
+    activeOnEvent!(makeEnvelope(1));
+    activeOnEvent!(makeEnvelope(2));
+    activeOnError!(new Error("boom"));
+
+    expect(publishedNames()).toEqual(["sse.event", "sse.event", "sse.closed"]);
+  });
+
+  test("sse.opened on a reconnect never overtakes envelopes received before it", () => {
+    sseService.attach("asst-1");
+    activeOnStreamOpen!();
+    publishSpy.mockClear();
+
+    activeOnEvent!(makeEnvelope(1));
+    activeOnReconnect!("watchdog");
+
+    expect(publishedNames()).toEqual(["sse.event", "sse.opened"]);
+  });
+
+  test("a teardown publishes what the dropped stream already delivered", () => {
+    sseService.attach("asst-1");
+    activeOnStreamOpen!();
+    publishSpy.mockClear();
+
+    activeOnEvent!(makeEnvelope(1));
+    eventBus.publish("power.suspend", {});
+
+    expect(cancelMock).toHaveBeenCalledTimes(1);
+    expect(publishedNames()).toEqual(["power.suspend", "sse.event"]);
+  });
+
+  test("detach publishes what was received, and nothing after it", async () => {
+    const detach = sseService.attach("asst-1");
+    const onEvent = activeOnEvent!;
+    publishSpy.mockClear();
+
+    onEvent(makeEnvelope(1));
+    detach();
+    expect(publishedNames()).toEqual(["sse.event"]);
+
+    onEvent(makeEnvelope(2));
+    await nextTask();
+    expect(publishedNames()).toEqual(["sse.event"]);
+  });
+
+  test("an envelope is published once even when a flush and the drain both run", async () => {
+    sseService.attach("asst-1");
+    activeOnStreamOpen!();
+    publishSpy.mockClear();
+
+    activeOnEvent!(makeEnvelope(1));
+    activeOnReconnect!("error");
+    await nextTask();
+
+    expect(publishedNames()).toEqual(["sse.event", "sse.opened"]);
+  });
+
+  test("a throw escaping publish loses only the envelope it was publishing", async () => {
+    sseService.attach("asst-1");
+    activeOnStreamOpen!();
+    const seen: number[] = [];
+    eventBus.subscribe("sse.event", (envelope) => {
+      seen.push(envelope.seq ?? -1);
+    });
+    // The bus catches handler errors today. This pins the queue against the
+    // day a throw gets past it: the envelopes behind the failing one stay
+    // queued and drain on the next task.
+    publishSpy.mockImplementationOnce(() => {
+      throw new Error("publish failed");
+    });
+
+    activeOnEvent!(makeEnvelope(1));
+    activeOnEvent!(makeEnvelope(2));
+    activeOnEvent!(makeEnvelope(3));
+    expect(() => activeOnError!(new Error("boom"))).toThrow("publish failed");
+    expect(seen).toEqual([]);
+
+    await nextTask();
+    expect(seen).toEqual([2, 3]);
+  });
+
+  test("a handler that reaches a teardown does not reorder the run in progress", async () => {
+    sseService.attach("asst-1");
+    activeOnStreamOpen!();
+    const seen: number[] = [];
+    eventBus.subscribe("sse.event", (envelope) => {
+      seen.push(envelope.seq ?? -1);
+      if (envelope.seq === 1) {
+        eventBus.publish("power.suspend", {});
+      }
+    });
+
+    activeOnEvent!(makeEnvelope(1));
+    activeOnEvent!(makeEnvelope(2));
+    activeOnEvent!(makeEnvelope(3));
+    await nextTask();
+
+    expect(seen).toEqual([1, 2, 3]);
+  });
+});
+
 describe("sseService.attach — SSE-connected store wiring", () => {
   beforeEach(() => {
     useSSEConnectedStore.setState({ isConnected: false });
@@ -581,14 +723,34 @@ describe("sseService.attach: background grace policy", () => {
     detach();
   });
 
-  test("desktop keeps the 5s grace (unchanged by the native bump)", () => {
+  test("desktop browser keeps its hidden connection without a teardown timer", () => {
     nativeMobile = false;
     __setHiddenTeardownGraceMsForTesting(null);
     const detach = sseService.attach("asst-1");
 
-    expect(hideAndReadArmedGrace()).toBe(5_000);
+    expect(hideAndReadArmedGrace()).toBeUndefined();
 
     detach();
+  });
+
+  test("desktop browser delivers events after five seconds, one minute, and five minutes hidden", async () => {
+    nativeMobile = false;
+    __setHiddenTeardownGraceMsForTesting(TEST_HIDDEN_GRACE_MS);
+    const start = Date.now();
+    const detach = sseService.attach("asst-1");
+    activeOnStreamOpen!();
+    eventBus.publish("app.hidden", { signal: "visibility" });
+    await sleep(TEST_HIDDEN_GRACE_MS + 20);
+    for (const elapsed of [5_000, 60_000, 300_000]) {
+      setSystemTime(new Date(start + elapsed));
+      const envelope = makeEnvelope(elapsed);
+      activeOnEvent!(envelope);
+      await nextTask();
+      expect(publishSpy).toHaveBeenCalledWith("sse.event", envelope);
+      expect(cancelMock).not.toHaveBeenCalled();
+    }
+    detach();
+    expect(cancelMock).toHaveBeenCalledTimes(1);
   });
 
   test("a resume after a short background keeps the live socket", () => {
@@ -659,9 +821,9 @@ describe("sseService.attach: background grace policy", () => {
   });
 
   test("a resume after a teardown-and-reopen does not bounce the reopened socket", async () => {
-    // GIVEN the desktop path, where the grace teardown really does fire and
+    // GIVEN a native app whose grace teardown fires before
     // a long system sleep then follows
-    nativeMobile = false;
+    nativeMobile = true;
     __setHiddenTeardownGraceMsForTesting(TEST_HIDDEN_GRACE_MS);
     const start = Date.now();
     sseService.attach("asst-1");

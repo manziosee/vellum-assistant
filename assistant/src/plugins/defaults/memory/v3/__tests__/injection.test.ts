@@ -462,7 +462,31 @@ describe("memoryV3Injector: frozen net-new sections", () => {
     expect(activeIds("conv-voice")).toEqual(new Set());
   });
 
-  test("live retrieval failure queues a degraded-memory notice", async () => {
+  test("screen-action bypass preserves resident sections and retrieval resumes next turn", async () => {
+    liveEnabled = true;
+    turnResults.set(0, result(["page-a"]));
+    const resident = await produceSections("conv-1", 0);
+    expect(resident).not.toBeNull();
+    const before = activeIds("conv-1");
+    observeTurnSpy.mockClear();
+    const ctx = {
+      requestId: "req-screen",
+      conversationId: "conv-1",
+      turnIndex: 1,
+      trust: GUARDIAN_TRUST,
+      callSite: "callAgent" as const,
+      skipMemoryRetrieval: true,
+    };
+    expect(await memoryV3Injector.produce(ctx)).toBeNull();
+    expect(await memoryV3PointerInjector.produce(ctx)).toBeNull();
+    expect(observeTurnSpy).not.toHaveBeenCalled();
+    expect(activeIds("conv-1")).toEqual(before);
+    turnResults.set(2, result(["page-b"]));
+    expect(await produceSections("conv-1", 2)).not.toBeNull();
+    expect(observeTurnSpy).toHaveBeenCalledTimes(1);
+  });
+
+  test("a live orchestration throw queues a degraded-memory notice and no block", async () => {
     liveEnabled = true;
     turnResults.set(
       0,
@@ -481,6 +505,86 @@ describe("memoryV3Injector: frozen net-new sections", () => {
           "Memory is temporarily unavailable, so this response may not use your saved memories. You can retry in a moment.",
         errorCategory: "memory_v3_degraded",
       },
+    ]);
+  });
+
+  test("a selector failure renders the unjudged stable prefix and queues a core-memories-only notice", async () => {
+    liveEnabled = true;
+    turnResults.set(0, {
+      ...result(["page-a", "page-b"]),
+      selectorRan: false,
+      selectorFailure: new MemoryV3RetrievalUnavailableError(
+        "selector unavailable",
+      ),
+    });
+
+    const block = await produceSections("conv-1", 0);
+
+    expect(block).not.toBeNull();
+    expect(block!.text).toContain("# memory/concepts/page-a.md");
+    expect(block!.text).toContain("# memory/concepts/page-b.md");
+    expect(drainConversationNotices("conv-1")).toEqual([
+      {
+        type: "conversation_notice",
+        conversationId: "conv-1",
+        source: "memory_v3",
+        code: "UNKNOWN",
+        userMessage:
+          "Memory selection is temporarily unavailable, so this response draws only on your core memories. You can retry in a moment.",
+        errorCategory: "memory_v3_degraded",
+      },
+    ]);
+  });
+
+  test("a selector failure whose stable prefix renders nothing queues the no-memory notice", async () => {
+    liveEnabled = true;
+    // The only stable page was deleted between lane construction and this
+    // turn's render, so no block attaches and the notice must not claim the
+    // response drew on core memories.
+    turnResults.set(0, {
+      ...result(["missing-page"]),
+      selectorRan: false,
+      selectorFailure: new MemoryV3RetrievalUnavailableError(
+        "selector unavailable",
+      ),
+    });
+
+    await expect(produceSectionsWithoutCommit("conv-1", 0)).resolves.toBeNull();
+
+    expect(drainConversationNotices("conv-1")).toEqual([
+      {
+        type: "conversation_notice",
+        conversationId: "conv-1",
+        source: "memory_v3",
+        code: "UNKNOWN",
+        userMessage:
+          "Memory is temporarily unavailable, so this response may not use your saved memories. You can retry in a moment.",
+        errorCategory: "memory_v3_degraded",
+      },
+    ]);
+  });
+
+  test("a selector failure carrying a billing notice queues that notice instead", async () => {
+    liveEnabled = true;
+    const billing = {
+      source: "memory_v3" as const,
+      code: "PROVIDER_BILLING" as const,
+      userMessage: "Add credits to keep using memory.",
+      errorCategory: "provider_billing",
+    };
+    turnResults.set(0, {
+      ...result(["page-a"]),
+      selectorRan: false,
+      selectorFailure: new MemoryV3RetrievalUnavailableError(
+        "selector unavailable",
+        { conversationNotice: billing },
+      ),
+    });
+
+    await produceSections("conv-1", 0);
+
+    expect(drainConversationNotices("conv-1")).toEqual([
+      { type: "conversation_notice", conversationId: "conv-1", ...billing },
     ]);
   });
 

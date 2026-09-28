@@ -1,0 +1,104 @@
+{
+  "assistantInboxHeader": {
+    "title": "Email",
+    "settingsAria": "Email settings"
+  },
+  "addressPill": {
+    "copyAddress": "Copy email address",
+    "copied": "Copied",
+    "copyFailed": "Couldn't copy the address."
+  },
+  "assistantInboxPage": {
+    "folderAriaLabel": "Mail folder",
+    "inboxTab": "Inbox",
+    "sentTab": "Sent",
+    "inboxEmptyTitle": "Nothing here yet",
+    "inboxEmptyBody": "Share {address} and anything sent there shows up here.",
+    "sentEmptyTitle": "No sent mail yet",
+    "sentEmptyBody": "Ask me to email someone and I'll keep a copy here.",
+    "selectPromptTitle": "Pick an email to read it",
+    "selectPromptBody": "Choose a message from the list. Check several to start a chat with them attached, or to delete them.",
+    "backToList": "Back to list",
+    "searchPlaceholder": "Find emails",
+    "searchAriaLabel": "Search this folder",
+    "searchEmptyTitle": "No matches",
+    "searchEmptyBody": "Nothing in this folder matches your search."
+  },
+  "emailListRow": {
+    "toPrefix": "To {name}",
+    "attachments": "{count, plural, one {# attachment} other {# attachments}}",
+    "noSubject": "(no subject)",
+    "selectAria": "Select \"{subject}\"",
+    "unread": "Unread"
+  },
+  "emailSelectionBar": {
+    "ariaLabel": "Selected emails",
+    "count": "{count, plural, one {# email selected} other {# emails selected}}",
+    "mixed": "{received, plural, one {# received} other {# received}} · {sent, plural, one {# sent} other {# sent}}",
+    "startChat": "Start a new chat",
+    "delete": "Delete from inbox",
+    "clear": "Clear selection"
+  },
+  "deleteEmailsDialog": {
+    "title": "Delete {count, plural, one {this email} other {# emails}}?",
+    "message": "{count, plural, one {It disappears from your inbox on this device.} other {They disappear from your inbox on this device.}}",
+    "confirm": "Delete",
+    "cancel": "Cancel"
+  },
+  "emailDetail": {
+    "from": "From:",
+    "to": "To:",
+    "attachments": "Attachments",
+    "askToReply": "Ask {name} to reply",
+    "loading": "Loading the message…",
+    "loadFailed": "Couldn't load this message.",
+    "copyEmail": "Copy email",
+    "copied": "Copied",
+    "copyFailed": "Couldn't copy the email."
+  },
+  "emailAddressFields": {
+    "prefixLabel": "Prefix",
+    "prefixPlaceholder": "hi",
+    "handleLabel": "Handle (public)",
+    "handlePlaceholder": "my-assistant"
+  },
+  "assistantInboxUpgradeState": {
+    "title": "Give {name} an inbox",
+    "subtitle": "An email address people can write to, and one place to read everything that arrives.",
+    "perkAddress": "A real address on {rootDomain}",
+    "perkReads": "{name} reads, sorts, and replies for you",
+    "perkHistory": "Every message kept here, inbox and sent",
+    "upgradeButton": "Upgrade to Super",
+    "seePlans": "Plans",
+    "titleNoName": "Give your assistant an inbox",
+    "perkReadsNoName": "Your assistant reads, sorts, and replies for you",
+    "changeHandle": "Change handle ({address})",
+    "planNotice": "Email support is not offered as part of a Free plan. Please upgrade to a plan with email support."
+  },
+  "assistantInboxSetupCard": {
+    "headline": "Alright, let’s get you set up.",
+    "fieldLabel": "Select an email handle:",
+    "fieldLabelChooseHandle": "Pick a handle and an email prefix:",
+    "confirm": "Confirm",
+    "immutableNotice": "The handle becomes your assistant's public handle. You won't be able to change it once set."
+  },
+  "assistantInboxRoute": {
+    "loading": "Opening the inbox…",
+    "setupFailed": "Couldn't set up the address.",
+    "setupIncomplete": "The address wasn't created. Try again in a moment.",
+    "replyPrompt": "Reply to the email with id {id} in your inbox (from {sender}, subject \"{subject}\"). Read it with `assistant email download {id}` first, then draft a reply and show it to me before sending.",
+    "mailFailed": "Couldn't load the mail.",
+    "retry": "Try again",
+    "deletedToast": "{count, plural, one {Email deleted.} other {# emails deleted.}}"
+  },
+  "assistantInboxPageFrame": {
+    "title": "Email",
+    "back": "Back"
+  },
+  "assistantInboxSetupSuccess": {
+    "title": "{name} has an inbox.",
+    "titleNoName": "Your assistant has an inbox.",
+    "body": "Share the address and anything sent there shows up here.",
+    "openInbox": "Open inbox"
+  }
+}

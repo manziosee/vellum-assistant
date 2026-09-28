@@ -33,6 +33,10 @@ import {
 import { AnsweredQuestionSchema } from "../events/question-answered.js";
 import { QuestionEntrySchema } from "../events/question-request.js";
 import { ToolActivityMetadataSchema } from "../events/tool-result.js";
+import {
+  ModeSessionActivitySchema,
+  ModeSessionSchema,
+} from "../mode-session.js";
 
 // ---------------------------------------------------------------------------
 // Attachment metadata
@@ -51,6 +55,9 @@ export const ConversationMessageAttachmentSchema = z.object({
   thumbnailData: z.string().optional(),
   /** True when the attachment bytes are backed by a file on disk. */
   fileBacked: z.boolean().optional(),
+  /** True when this computer-use screenshot was placed on the reply
+   *  automatically. Missing or false identifies legacy or explicit placement. */
+  computerUseScreenshot: z.boolean().optional(),
 });
 export type ConversationMessageAttachment = z.infer<
   typeof ConversationMessageAttachmentSchema
@@ -489,6 +496,8 @@ export type ConversationContentBlock = z.infer<
  */
 export const ConversationMessageSchema = z.object({
   id: z.string(),
+  modeSession: ModeSessionSchema.optional(),
+  modeSessionActivity: ModeSessionActivitySchema.optional(),
   /**
    * Server message ids folded into this display row when consecutive
    * assistant messages were consolidated for history rendering.
@@ -615,6 +624,15 @@ export const ConversationMessageSchema = z.object({
    *  sentinel text, and treat the row as the turn's reply so nothing keeps
    *  waiting for one. */
   noResponse: z.boolean().optional(),
+  /** The default profile key the Auto profile routed this turn to
+   *  (`metadata.autoRoutedProfile`). Set only on an assistant row produced by
+   *  a turn that ran on Auto; clients show which profile answered. */
+  autoRoutedProfile: z.string().optional(),
+  /** Set only on standalone ambient camera-frame rows, derived from
+   *  `messageMetadataIsAmbientSightKeep`. Clients may fold consecutive frames
+   *  into the following user message. Absent on shutter photos, spoken turns
+   *  carrying parked frames, and every other row. */
+  cameraFrame: z.literal(true).optional(),
   /** How this assistant row's plain text reached the user, set only on a turn
    *  that routed its reply through the `send_user_message` tool. `"private"`
    *  means the row's text blocks are the model's working notes and the text

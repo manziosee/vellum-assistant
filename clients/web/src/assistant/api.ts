@@ -16,7 +16,6 @@ import {
   assistantsList,
   assistantsRestartDetailCreate,
   assistantsRetireDetailDestroy,
-  assistantsRetireDestroy,
   assistantsRetrieve,
 } from "@/generated/api/sdk.gen";
 import type {
@@ -599,29 +598,25 @@ export async function restartAssistant(
 export type RetireResult =
   { ok: true } | { ok: false; status: number; error: Record<string, unknown> };
 
-export async function retireAssistant(): Promise<RetireResult> {
-  const { error, response } = await assistantsRetireDestroy({
-    throwOnError: false,
-  });
-
-  assertHasResponse(response, error, "Failed to retire assistant.");
-
-  if (response.ok) {
-    return { ok: true };
-  }
-
-  return {
-    ok: false,
-    status: response.status,
-    error: toErrorObject(error, response),
-  };
+export interface RetireAssistantOptions {
+  /**
+   * Platform id of the assistant that inherits this one's managed OAuth
+   * connections (a teleport target). The platform moves the rows before it
+   * revokes the retiring assistant's credentials, so this is the only moment
+   * they can follow the user to the new assistant.
+   */
+  successorAssistantId?: string;
 }
 
 export async function retireAssistantById(
   assistantId: string,
+  options: RetireAssistantOptions = {},
 ): Promise<RetireResult> {
   const { error, response } = await assistantsRetireDetailDestroy({
     path: { id: assistantId },
+    query: options.successorAssistantId
+      ? { successor_assistant_id: options.successorAssistantId }
+      : undefined,
     throwOnError: false,
   });
 

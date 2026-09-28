@@ -1,5 +1,5 @@
 import { useInfiniteQuery } from "@tanstack/react-query";
-import { Loader2, Play, Settings } from "lucide-react";
+import { Play, Settings } from "lucide-react";
 import { useNavigate } from "react-router";
 
 import { DetailShellHeader } from "@/components/detail-shell";
@@ -213,7 +213,7 @@ export function SystemTaskDetailPanel({
       />
 
       {/* Scrollable body */}
-      <div className="flex-1 space-y-6 overflow-y-auto px-[var(--app-spacing-lg)] py-[var(--app-spacing-lg)]">
+      <div className="flex flex-1 flex-col gap-5 overflow-y-auto px-5 py-5">
         <div>
           <InsetDetailCard title={t("scheduleDetail.details")}>
             <div className="space-y-2 text-body-medium-lighter">
@@ -324,13 +324,8 @@ export function SystemTaskDetailPanel({
           {onRunNow ? (
             <Button
               variant="primary"
-              leftIcon={
-                isRunning ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <Play className="h-3.5 w-3.5" />
-                )
-              }
+              loading={isRunning}
+              leftIcon={<Play className="h-3.5 w-3.5" />}
               onClick={onRunNow}
               disabled={runNowDisabled}
             >

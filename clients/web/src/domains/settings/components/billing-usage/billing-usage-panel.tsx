@@ -146,7 +146,7 @@ export function BillingUsagePanel() {
         {/* Stat squares: total spend + event count */}
         <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
           <StatSquare
-            icon={<Coins className="h-4 w-4" aria-hidden />}
+            icon={<Coins />}
             value={
               isLoading ? (
                 <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
@@ -157,7 +157,7 @@ export function BillingUsagePanel() {
             label={t("billingUsagePanel.spendLabel")}
           />
           <StatSquare
-            icon={<Target className="h-4 w-4" aria-hidden />}
+            icon={<Target />}
             value={
               isLoading ? (
                 <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
@@ -174,6 +174,7 @@ export function BillingUsagePanel() {
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
               <button
+                type="button"
                 className="flex items-center gap-1.5 text-body-medium-lighter text-[var(--content-tertiary)] transition-colors hover:text-[var(--content-secondary)]"
                 onClick={() => setDrilldown(null)}
               >

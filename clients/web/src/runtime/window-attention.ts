@@ -2,6 +2,7 @@ import { windowAttentionPayloadSchema } from "@vellumai/ipc-contract";
 import type { WindowAttentionPayload } from "@vellumai/ipc-contract";
 
 import { isElectron } from "@/runtime/is-electron";
+import { isNativePlatform } from "@/runtime/native-auth";
 
 /**
  * Per-capability wrapper for the Electron host's window attention bridge.
@@ -29,13 +30,17 @@ import { isElectron } from "@/runtime/is-electron";
  * the one that suppresses.
  *
  * This module also owns the synchronous reads of the same fact,
- * {@link isWindowAttended} and {@link isVisibleToUser}, because the
+ * {@link isWindowAttended}, {@link isWindowOnScreen}, and
+ * {@link isVisibleToUser}, because the
  * cross-platform branch belongs in the capability wrapper (`docs/ELECTRON.md`)
  * and the last reported state is what both answer from.
  */
 
 /** Last reported attention state, `null` before the first payload. */
 let attended: boolean | null = null;
+
+/** Last reported on-screen state, `null` before the first payload. */
+let onScreen: boolean | null = null;
 
 /**
  * Whether a reported window state means the user can see this window and is
@@ -61,12 +66,28 @@ export function subscribeToWindowAttention(
       const parsed = windowAttentionPayloadSchema.safeParse(payload);
       const next = parsed.success ? parsed.data : null;
       attended = isAttendedPayload(next);
+      if (next !== null) {
+        onScreen = next.visible && !next.minimized;
+      }
       callback(next);
     }) ?? (() => undefined);
   return () => {
     attended = null;
+    onScreen = null;
     unsubscribe();
   };
+}
+
+export function supportsWindowAttention(): boolean {
+  return isElectron() && !!window.vellum?.notifications?.onWindowAttention;
+}
+
+/**
+ * Whether the desktop window is visible and unminimized, without requiring
+ * keyboard focus. Unknown and non-Electron hosts keep foreground work enabled.
+ */
+export function isWindowOnScreen(): boolean {
+  return onScreen ?? true;
 }
 
 /**
@@ -92,18 +113,9 @@ export function isWindowAttended(): boolean {
 }
 
 /**
- * Whether this client is on screen for the user, on every platform.
- *
- * Under Electron that is the main process's window report rather than the
- * DOM, which cannot answer it there. In a browser tab and in the Capacitor
- * shell the DOM is the authority, and `document.visibilityState` is the
- * existing contract for whether a conversation is on screen:
- * `document.hasFocus()` is window-level and false for a visible tab in an
- * unfocused browser window, which is not the same question.
- *
- * The one predicate every "is the user watching this" consumer asks. Reading
- * {@link isWindowAttended} directly instead answers `true` for a hidden
- * browser tab, since no payload ever arrives there.
+ * DOM visibility on browser/mobile hosts, host attention under Electron.
+ * Notification and presence consumers use {@link isClientAttended} to also
+ * require browser window focus.
  */
 export function isVisibleToUser(): boolean {
   if (isElectron()) {
@@ -112,4 +124,20 @@ export function isVisibleToUser(): boolean {
   return (
     typeof document === "undefined" || document.visibilityState === "visible"
   );
+}
+
+/** Notification attention is narrower than visibility in a desktop browser. */
+export function isClientAttended(): boolean {
+  if (!isVisibleToUser()) {
+    return false;
+  }
+  if (isElectron() || isNativePlatform()) {
+    return true;
+  }
+  return typeof document !== "undefined" && document.hasFocus();
+}
+
+/** Browser directives require attention; native hosts own their handoff. */
+export function canHandleForegroundDirective(isNative: boolean): boolean {
+  return isNative || isElectron() || isClientAttended();
 }

@@ -81,12 +81,17 @@ import {
 } from "react";
 
 import {
+  endLiveVoiceSightSession,
   isLiveVoiceUserSpeaking,
+  startLiveVoiceSightSession,
+  takeLiveVoiceLookFrame,
   useLiveVoiceStore,
 } from "@/domains/chat/voice/live-voice/live-voice-store";
 import {
   createSightCapture,
+  LOOK_FRAME_REASON,
   type SightKeepOrigin,
+  type SightCaptureRequest,
 } from "@/domains/chat/voice/live-voice/sight-capture";
 import { useBusSubscription } from "@/hooks/use-bus-subscription";
 import {
@@ -106,8 +111,10 @@ import {
 import { createFrameSampler } from "@/lib/camera/frame-sampler";
 import {
   createNativeFrameSource,
+  NATIVE_PAIR_SPACING_MS,
   type NativeFrameSource,
 } from "@/lib/camera/native-frame-source";
+import { recordLifecycleDiagnostic } from "@/lib/diagnostics";
 import { captureNativeVoiceCameraSample } from "@/runtime/native-voice-camera";
 import { haptic } from "@/utils/haptics";
 
@@ -119,6 +126,22 @@ import {
 
 /** Where a failure is filed, so the tag reads the same from every path. */
 const ERROR_CONTEXT = "voice-room sight: sample/upload frame";
+
+/**
+ * How long the arm for a look's frame waits. A look can be what turned Live
+ * on, so the arm has to outlast the fresh gate's warmup and the view settling
+ * behind it, not just the next poll.
+ */
+const LOOK_KEEP_TTL_MS = 5_000;
+
+let nextCameraEpoch = 1;
+
+function allocateCameraEpoch(): number {
+  const epoch = nextCameraEpoch;
+  nextCameraEpoch =
+    nextCameraEpoch === Number.MAX_SAFE_INTEGER ? 1 : nextCameraEpoch + 1;
+  return epoch;
+}
 
 /** The most recent frame the call was given. */
 export interface VoiceRoomSightFrame {
@@ -201,6 +224,21 @@ export function useVoiceRoomSight(
   const sightFramesUnsupported = useLiveVoiceStore.use.sightFramesUnsupported();
   const [heldFrame, setHeldFrame] = useState<VoiceRoomSightFrame | null>(null);
   const [live, setLiveState] = useState(false);
+  const currentRunRef = useRef<{
+    lifecycle: SightCaptureRequest["lifecycle"];
+  } | null>(null);
+  const startCameraRun = useCallback(() => {
+    if (useLiveVoiceStore.getState().reconnecting) {
+      currentRunRef.current = null;
+      return;
+    }
+    const cameraEpoch = allocateCameraEpoch();
+    currentRunRef.current = {
+      lifecycle: startLiveVoiceSightSession(cameraEpoch, "live")
+        ? { cameraEpoch, source: "live" }
+        : undefined,
+    };
+  }, []);
   // What the capture continuations read. The sampler outlives a render, so it
   // cannot close over a render's value.
   const heldRef = useRef<VoiceRoomSightFrame | null>(null);
@@ -211,6 +249,13 @@ export function useVoiceRoomSight(
    * which is why it is a ref rather than a render's value.
    */
   const armedAtRef = useRef<number | null>(null);
+  /**
+   * When the standing arm was made for a look rather than a question, or null
+   * when it was not. The keep that spends it is the frame the assistant asked
+   * to see, reported as such so the session answers the look from it. A
+   * question's arm made after it replaces the gate's arm, and this with it.
+   */
+  const lookArmedAtRef = useRef<number | null>(null);
   /**
    * The running native poll, so a change it cannot see can reach the sample it
    * has on the bridge.
@@ -432,6 +477,8 @@ export function useVoiceRoomSight(
   const invalidateCaptures = useCallback(() => {
     sight.invalidate();
     hold(null);
+    // The reset drops the gate's arm, so a look waiting on it is gone too.
+    lookArmedAtRef.current = null;
     gateRef.current?.reset(performance.now());
     nativeSourceRef.current?.invalidate();
   }, [hold, sight]);
@@ -453,6 +500,7 @@ export function useVoiceRoomSight(
     // `active`, which a capture in a torn-down loop still reads as the value of
     // the render it started in.
     sight.grantConsent();
+    startCameraRun();
     /**
      * Put a frame the call was given on screen.
      *
@@ -484,10 +532,19 @@ export function useVoiceRoomSight(
      * one an arm asked for, so it carries when the arm was taken; every other
      * keep is the cadence's own.
      */
-    const keepOrigin = (decision: FrameGateDecision): SightKeepOrigin =>
-      decision.reason === "forced" && armedAtRef.current !== null
+    const keepOrigin = (decision: FrameGateDecision): SightKeepOrigin => {
+      if (decision.reason !== "forced") {
+        return { reason: decision.reason };
+      }
+      const lookArmedAtMs = lookArmedAtRef.current;
+      if (lookArmedAtMs !== null) {
+        lookArmedAtRef.current = null;
+        return { reason: LOOK_FRAME_REASON, armedAtMs: lookArmedAtMs };
+      }
+      return armedAtRef.current !== null
         ? { reason: decision.reason, armedAtMs: armedAtRef.current }
         : { reason: decision.reason };
+    };
 
     let stopSampling: () => void;
     if (video) {
@@ -495,12 +552,19 @@ export function useVoiceRoomSight(
         gate,
         onDecision: (decision, nowMs) => {
           recordFrameGateDecision("voice", decision, nowMs);
-          if (!decision.keep) {
+          const run = currentRunRef.current;
+          if (
+            !decision.keep ||
+            !run ||
+            useLiveVoiceStore.getState().reconnecting
+          ) {
             return;
           }
+          const lifecycle = run.lifecycle;
           void sight.capture({
             assistantId,
             keep: keepOrigin(decision),
+            ...(lifecycle ? { lifecycle } : {}),
             produceFrame: (filename) => captureVideoFrame(video, filename),
             onShared,
           });
@@ -509,20 +573,41 @@ export function useVoiceRoomSight(
       sampler.start(video);
       stopSampling = sampler.stop;
     } else {
+      const { conversationId } = useLiveVoiceStore.getState();
       const source = createNativeFrameSource({
         gate,
+        onDiagnostics: (diagnostics) => {
+          recordLifecycleDiagnostic("native_camera_sampling", {
+            assistantId,
+            conversationId,
+            ...diagnostics,
+          });
+        },
+        canCapture: () =>
+          currentRunRef.current !== null &&
+          !useLiveVoiceStore.getState().reconnecting,
         captureSample: () =>
-          captureNativeVoiceCameraSample(NATIVE_CAPTURE_QUALITY),
+          captureNativeVoiceCameraSample(
+            NATIVE_CAPTURE_QUALITY,
+            NATIVE_PAIR_SPACING_MS,
+          ),
         onDecision: (decision, nowMs, sample) => {
           recordFrameGateDecision("voice", decision, nowMs);
-          if (!decision.keep) {
+          const run = currentRunRef.current;
+          if (
+            !decision.keep ||
+            !run ||
+            useLiveVoiceStore.getState().reconnecting
+          ) {
             return;
           }
+          const lifecycle = run.lifecycle;
           // The judged bytes, not a second capture: one round trip, and the
           // frame the transcript ends up with is the one the gate said yes to.
           void sight.capture({
             assistantId,
             keep: keepOrigin(decision),
+            ...(lifecycle ? { lifecycle } : {}),
             produceFrame: async (filename) =>
               new File([sample], filename, { type: "image/jpeg" }),
             onShared,
@@ -534,6 +619,11 @@ export function useVoiceRoomSight(
       stopSampling = source.stop;
     }
     return () => {
+      const lifecycle = currentRunRef.current?.lifecycle;
+      currentRunRef.current = null;
+      if (lifecycle) {
+        endLiveVoiceSightSession(lifecycle.cameraEpoch);
+      }
       // What voids the work in flight for every other way a run can end: an
       // unmount, a closed room, a viewfinder swapped under it, the app being
       // put away. The revocation is the bump, so a run the user ended finds it
@@ -544,9 +634,18 @@ export function useVoiceRoomSight(
       stopSampling();
       gateRef.current = null;
       nativeSourceRef.current = null;
+      lookArmedAtRef.current = null;
       hold(null);
     };
-  }, [active, assistantId, hold, nativePreview, sight, videoRef]);
+  }, [
+    active,
+    assistantId,
+    hold,
+    nativePreview,
+    sight,
+    startCameraRun,
+    videoRef,
+  ]);
 
   /**
    * Whether the user is part-way through saying something, as the session
@@ -604,11 +703,43 @@ export function useVoiceRoomSight(
     }
     const armedAtMs = performance.now();
     armedAtRef.current = armedAtMs;
+    // The question's arm replaces a look's still standing. What the user is
+    // saying now runs a turn of its own, and that turn reads this frame.
+    lookArmedAtRef.current = null;
     gateRef.current?.armForcedKeep(armedAtMs);
     // The browser sampler needs no nudge: its next candidate frame is one
     // video frame away and will consume the arm on its own.
     nativeSourceRef.current?.sampleNow();
   }, [active, muted, userSpeaking]);
+
+  /**
+   * Ask the gate for the frame a look owes: the assistant said "let me look"
+   * and says nothing more until a frame of the camera lands.
+   *
+   * Taken only while Live is running, so a look that is what starts Live
+   * waits here for it, and the arm lands on the gate that run just made.
+   * Unlike a question's arm it keeps a view the last keep already shows: the
+   * session is waiting on a frame, and an unchanged scene is still the answer.
+   * Declared after the sampling effect, which creates that gate, so on the
+   * commit that starts Live this runs against it.
+   */
+  const lookFrameRequested = useLiveVoiceStore.use.lookFrameRequested();
+  useEffect(() => {
+    if (!active || !lookFrameRequested.camera) {
+      return;
+    }
+    const gate = gateRef.current;
+    if (gate === null || !takeLiveVoiceLookFrame("camera")) {
+      return;
+    }
+    const armedAtMs = performance.now();
+    lookArmedAtRef.current = armedAtMs;
+    gate.armForcedKeep(armedAtMs, {
+      evenIfUnchanged: true,
+      ttlMs: LOOK_KEEP_TTL_MS,
+    });
+    nativeSourceRef.current?.sampleNow();
+  }, [active, lookFrameRequested]);
 
   // A flip points the camera somewhere else entirely and mirrors it, so every
   // score against the old baseline is meaningless and every capture still
@@ -630,21 +761,6 @@ export function useVoiceRoomSight(
     invalidateCaptures();
   }, [facing, invalidateCaptures]);
 
-  // A retryable transport close ends the SERVER-side session while the logical
-  // call (and so `sessionGeneration`) deliberately survives the gap. Keeps
-  // already made are in the transcript and stay there, but the pulse tracks
-  // the session that is running, and for the length of the gap none is.
-  //
-  // The flag is the narrowest signal for it: only the transport's `closed`
-  // handler raises it, and it is lowered again on the `ready` that means a
-  // fresh session exists. This effect re-runs only when it changes, so the
-  // early return is what confines the work to the transition INTO the gap:
-  // coming back out of one must not clear a frame shared since.
-  //
-  // The epoch bump is for the upload still in flight when the transport
-  // dropped: the generation survives the gap by design, so it can resolve
-  // after the fresh session is ready with every other guard passing, and a
-  // view from seconds before the gap would be persisted as the current one.
   // A refusal the store could tie to a keep this surface is displaying. Taking
   // the thumbnail down is all it costs here: giving the upload back belongs to
   // the session-lifetime reclaimer, because a minimized room is not mounted
@@ -692,11 +808,15 @@ export function useVoiceRoomSight(
 
   const reconnecting = useLiveVoiceStore.use.reconnecting();
   useEffect(() => {
-    if (!reconnecting) {
-      return;
+    if (reconnecting) {
+      currentRunRef.current = null;
+      invalidateCaptures();
+    } else if (active && gateRef.current && !currentRunRef.current) {
+      // The reconnect flag falls on replacement readiness. Announce ownership
+      // before sampling can send its first frame to that connection.
+      startCameraRun();
     }
-    invalidateCaptures();
-  }, [invalidateCaptures, reconnecting]);
+  }, [active, invalidateCaptures, reconnecting, startCameraRun]);
 
   return { heldFrame, liveAvailable, live, setLive, revokeCaptureConsent };
 }

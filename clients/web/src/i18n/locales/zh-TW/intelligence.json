@@ -88,6 +88,7 @@
     "cardHoverLine": {
       "channels": "所有可以聯絡到我的地方",
       "contacts": "我認識並信任的人",
+      "email": "寄到我收件匣的一切",
       "library": "我為你製作的應用程式和文件",
       "memory": "我記住的一切",
       "personality": "來吧，調整我的靈魂",
@@ -109,7 +110,11 @@
     },
     "setUpSchedule": "建立排程",
     "updateAvatarAndName": "更新頭像和名稱",
-    "viewMoreSchedules": "{count, plural, other {檢視 {count} 個更多…}}"
+    "viewMoreSchedules": "{count, plural, other {檢視 {count} 個更多…}}",
+    "lockedBadge": "需要 Super 方案",
+    "pinEmail": "將郵件釘選到側邊選單",
+    "unpinEmail": "從側邊選單取消釘選郵件",
+    "dismissEmail": "關閉"
   },
   "identitySections": {
     "channels": {
@@ -120,13 +125,13 @@
       "description": "我認識的人",
       "label": "聯絡人"
     },
+    "email": {
+      "description": "我收發的郵件",
+      "label": "郵件"
+    },
     "library": {
       "description": "我的應用程式與文件",
       "label": "資料庫"
-    },
-    "memory": {
-      "description": "我記得的內容",
-      "label": "記憶"
     },
     "personality": {
       "description": "調整我的說話方式",
@@ -264,7 +269,9 @@
   },
   "pluginToast": {
     "alreadyUpToDate": "{name} 已是最新版本",
+    "cleanupWarning": "外掛程式清理已完成，但有一項警告。",
     "installed": "已安裝 {name}",
+    "mcpOAuthCredentialsUnchecked": "憑證儲存空間無法使用，因此無法檢查此外掛程式先前的 MCP OAuth 憑證。",
     "pluginFallback": "外掛程式",
     "pluginFallbackCapitalized": "外掛程式",
     "removed": "已移除 {name}",
@@ -289,18 +296,15 @@
     "backToConversationAriaLabel": "返回對話",
     "backToSkillsAriaLabel": "返回技能",
     "filesTab": "檔案",
-    "fileViewModeAriaLabel": "檔案檢視模式",
     "historyTab": "歷史記錄",
     "install": "安裝",
     "noFilesAvailable": "無可用檔案。",
     "openInWorkspaceAriaLabel": "在工作區中開啟",
     "pendingAriaLabel": "待處理",
-    "preview": "預覽",
     "remove": "移除",
     "saveFailed": "儲存失敗",
     "selectAFile": "選取檔案",
-    "selectFilePrompt": "選取檔案以檢視其內容。",
-    "source": "來源"
+    "selectFilePrompt": "選取檔案以檢視其內容。"
   },
   "skillDetailPage": {
     "backToConversation": "返回對話",
@@ -446,5 +450,9 @@
     "system": "系統",
     "integrations": "整合",
     "other": "其他"
+  },
+  "assistantHandleLine": {
+    "edit": "編輯使用者名稱 @{handle}",
+    "editTitle": "編輯使用者名稱"
   }
 }

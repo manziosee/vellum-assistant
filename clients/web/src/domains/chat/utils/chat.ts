@@ -51,6 +51,7 @@ const GLOBAL_STREAM_EVENT_TYPE_NAMES = [
   "identity_changed",
   "avatar_updated",
   "sync_changed",
+  "desktop_activity_changed",
   "disk_pressure_status_changed",
   // Workspace-wide resource-pressure broadcast, no `conversationId`.
   "resource_pressure_status_changed",
@@ -87,6 +88,7 @@ const GLOBAL_STREAM_EVENT_TYPE_NAMES = [
   "acp_session_spawned",
   "acp_session_update",
   "acp_session_usage",
+  "acp_session_model_update",
   "acp_session_completed",
   "acp_session_error",
   "acp_auth_required",
@@ -136,9 +138,8 @@ const GLOBAL_STREAM_EVENT_TYPE_NAMES = [
   "assistant_status",
   "model_info",
   "schedule_conversation_created",
-  // Heartbeat alert (no conversationId) and heartbeat-created conversation
-  // (announces a *new* conversation) are app-wide, not conversation-scoped.
-  "heartbeat_alert",
+  // A heartbeat-created conversation announces a *new* conversation, so it is
+  // app-wide, not conversation-scoped.
   "heartbeat_conversation_created",
   // Settings/config broadcasts (client-setting push, config.json change, sounds
   // change) carry no `conversationId` — they're app-wide, not conversation-scoped.
@@ -287,6 +288,9 @@ const VOICE_ERROR_MESSAGES: Readonly<Record<string, string>> = {
 };
 
 export function formatVoiceError(code: string): string {
+  if (code === "dictation-selection-unavailable") {
+    return t("chat:voiceErrors.selectionUnavailable");
+  }
   if (code === "native-stt-no-transcript") {
     return t("chat:voiceErrors.nativeSttNoTranscript", {
       clientName: clientOsDisplayName(detectClientOs()),
@@ -478,14 +482,14 @@ export function extractWirePendingQuestion(
  * Find the "Connect Claude Code" prompt a history snapshot carries on one of
  * its tool calls. Unlike a confirmation/question (a live registry entry the
  * daemon stamps and clears when resolved), this rides the failed `acp_spawn`
- * tool call's persisted `errorCode` marker — so on a full reload or an SSE
- * reconnect the inline card restores from history instead of vanishing with
- * the in-memory store. Returns the prompt projected into the interaction-store
- * shape, anchored to the carrying tool call, or null when no tool call failed
- * for a missing Claude token. Scans latest-first for the most recent such
- * failure. The affordance itself self-heals (retires when Claude is already
- * connected), so re-raising a resolved prompt is harmless. Mirrors
- * {@link extractWirePendingQuestion}.
+ * tool call's persisted `errorCode` marker, so a reload or SSE reconnect can
+ * restore the card from history instead of losing it with the in-memory store.
+ * Returns the prompt projected into the interaction-store shape, anchored to
+ * the carrying tool call, or null when no tool call failed for a missing
+ * Claude token or a rejected stored credential. Scans latest-first for the
+ * most recent such failure. Ordinary missing-token markers are raised only
+ * after a connected-status check; `auth_required` is raised without that
+ * check. Mirrors {@link extractWirePendingQuestion}.
  */
 export function extractWirePendingAcpConnect(
   messages: DisplayMessage[],

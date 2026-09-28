@@ -2,6 +2,22 @@ import { act, cleanup, render } from "@testing-library/react";
 import { afterEach, describe, expect, jest, mock, test } from "bun:test";
 import { forwardRef, useImperativeHandle } from "react";
 import { MemoryRouter } from "react-router";
+import type {
+  CompanionIntroBeat,
+  UnplacedDictationOffer,
+} from "@vellumai/ipc-contract";
+import type { CommandHandlers } from "@/runtime/vellum-commands";
+
+let popout = false;
+let commandHandlers: CommandHandlers = {};
+mock.module("@/runtime/popout-window", () => ({
+  isPopoutWindowLifetime: () => popout,
+}));
+mock.module("@/runtime/vellum-commands", () => ({
+  useVellumCommands: (handlers: CommandHandlers) => {
+    commandHandlers = handlers;
+  },
+}));
 
 type TextInsertionStatus =
   | "inserted"
@@ -52,12 +68,16 @@ mock.module("@/domains/chat/components/voice-input-button", () => ({
 }));
 
 type HoldStart = {
-  selection: { text: string; truncated: boolean; editable?: boolean } | null;
+  selection:
+    | { text: string; truncated: boolean; editable?: boolean }
+    | { unavailable: true }
+    | null;
 };
 let holdHandlers: {
   onHoldStart: (start: HoldStart) => void;
   onHoldEnd: () => void;
   onDoubleTap: () => void;
+  onTap: () => void;
 } | null = null;
 mock.module("@/domains/chat/voice/use-voice-key", () => ({
   useVoiceKey: (options: {
@@ -66,6 +86,7 @@ mock.module("@/domains/chat/voice/use-voice-key", () => ({
     }) => void;
     onHoldEnd: () => void;
     onDoubleTap: () => void;
+    onTap: () => void;
   }) => {
     // The hook hands the bridge a selection still being read; the tests
     // describe what it will resolve to.
@@ -74,8 +95,28 @@ mock.module("@/domains/chat/voice/use-voice-key", () => ({
         options.onHoldStart({ selection: Promise.resolve(start.selection) }),
       onHoldEnd: options.onHoldEnd,
       onDoubleTap: options.onDoubleTap,
+      onTap: options.onTap,
     };
   },
+}));
+
+/**
+ * Whether the companion's introduction is staged, which is main's answer and
+ * the only thing that decides whether a tap is worth counting.
+ */
+let mainIntro: CompanionIntroBeat | null = null;
+const readCompanionState = mock(async () => ({ intro: mainIntro }));
+const advanceIntro = mock((_action: string) => undefined);
+const forwardOffer = mock((_offer: UnplacedDictationOffer | null) => true);
+mock.module("@/runtime/companion-surface", () => ({
+  getCompanionState: readCompanionState,
+  advanceCompanionIntro: advanceIntro,
+  forwardUnplacedDictationOffer: forwardOffer,
+}));
+let introStaged = false;
+mock.module("@/runtime/companion-intro-stage", () => ({
+  companionIntroStaged: () => introStaged,
+  useCompanionIntroStaged: () => introStaged,
 }));
 
 const askedTexts: string[] = [];
@@ -187,13 +228,18 @@ const { useConversationStore } = await import("@/stores/conversation-store");
 const { useViewerStore } = await import("@/stores/viewer-store");
 const { useAssistantIdentityStore } =
   await import("@/stores/assistant-identity-store");
+const { useVoiceKeyTapStore } =
+  await import("@/domains/chat/voice/voice-key-tap-store");
 
-const renderBridge = (assistantId: string | null = "assistant-1") => {
+const renderBridge = (
+  assistantId: string | null = "assistant-1",
+  enabled = true,
+) => {
   // The bridge's voice mode shortcut navigates to the conversation surface
   // when a press finds no composer, so it renders under a router in the app.
   render(
     <MemoryRouter>
-      <GlobalPushToTalkBridge assistantId={assistantId} />
+      <GlobalPushToTalkBridge assistantId={assistantId} enabled={enabled} />
     </MemoryRouter>,
   );
   if (!latestVoiceInputProps) {
@@ -221,8 +267,13 @@ afterEach(() => {
   nextAskTaken = true;
   announceAskRefusedMock.mockClear();
   toggleVoiceMock.mockClear();
+  mainIntro = null;
+  readCompanionState.mockClear();
   toastErrorMock.mockClear();
   runningClaimant = null;
+  popout = false;
+  commandHandlers = {};
+  forwardOffer.mockClear();
   clearDictationOffer();
   useVoiceRecordingStore.getState().reset();
   useComposerStore.getState().setInput("");
@@ -230,20 +281,22 @@ afterEach(() => {
   useConversationStore.getState().reset();
   useViewerStore.getState().reset();
   useAssistantIdentityStore.getState().clearIdentity();
+  introStaged = false;
+  advanceIntro.mockClear();
   localStorage.clear();
 });
 
 describe("GlobalPushToTalkBridge", () => {
-  test("inserts the cleaned final transcript into the front app", async () => {
+  test("inserts explicit dictation replacements into the front app", async () => {
     nextTextInsertionStatus = "inserted";
-    nextDictationResult = { mode: "dictation", text: "cleaned global text" };
+    nextDictationResult = { mode: "dictation", text: "Hello Example User" };
     const voiceInput = renderBridge();
 
     await act(async () => {
-      await voiceInput.onTranscript("raw global text");
+      await voiceInput.onTranscript("Hello user one");
     });
 
-    expect(insertedTexts).toEqual(["cleaned global text"]);
+    expect(insertedTexts).toEqual(["Hello Example User"]);
     expect(useComposerStore.getState().input).toBe("");
     expect(toastErrorMock).not.toHaveBeenCalled();
   });
@@ -262,6 +315,41 @@ describe("GlobalPushToTalkBridge", () => {
       formatVoiceError("dictation-paste-blocked"),
       { id: "voice-error:dictation-paste-blocked" },
     );
+  });
+
+  /**
+   * The user is in the application the paste was meant for. The composer
+   * behind this window, in whatever conversation was last selected, is not
+   * somewhere they will think to look, so the words go up on the companion
+   * with a reason that says the paste failed.
+   */
+  test("offers the transcript on the companion when the paste fails", async () => {
+    nextTextInsertionStatus = "blocked";
+    const voiceInput = renderBridge();
+
+    await act(async () => {
+      await voiceInput.onTranscript("fallback text");
+    });
+
+    expect(useDictationOfferStore.getState().offer).toMatchObject({
+      reason: "paste-failed",
+      text: "fallback text",
+    });
+  });
+
+  test("offers the transcript when Automation is denied", async () => {
+    nextTextInsertionStatus = "automation-denied";
+    const voiceInput = renderBridge();
+
+    await act(async () => {
+      await voiceInput.onTranscript("fallback text");
+    });
+
+    expect(useDictationOfferStore.getState().offer).toMatchObject({
+      reason: "paste-failed",
+      text: "fallback text",
+    });
+    expect(useComposerStore.getState().input).toBe("fallback text");
   });
 
   test("lands a soft-landed transcript in the conversation already selected", async () => {
@@ -443,11 +531,11 @@ test("drives its own recorder, not whatever claimed dictation last", async () =>
  * assistant with the selection quoted ahead of them, and nothing is pasted or
  * cleaned up: the cleanup pass rewrites words meant for a document.
  */
-test("a double tap of the voice key is Talk", () => {
+test("a double tap of the voice key is Talk", async () => {
   renderBridge("a1");
 
-  act(() => {
-    holdHandlers?.onDoubleTap();
+  await act(async () => {
+    await holdHandlers?.onDoubleTap();
   });
 
   expect(toggleVoiceMock).toHaveBeenCalledTimes(1);
@@ -457,6 +545,98 @@ test("a double tap of the voice key is Talk", () => {
     expect.any(Function),
     "voice_key",
   );
+});
+
+/**
+ * A single tap is counted for the companion's introduction and for nothing
+ * else, and the introduction runs once.
+ *
+ * The store has no reset, on purpose (`voice-key-tap-store`), so these read the
+ * distance the count moved rather than where it landed.
+ */
+describe("counting taps for the introduction", () => {
+  /** How far the count moves while `body` runs. */
+  const tapsCountedDuring = (body: () => void): number => {
+    const before = useVoiceKeyTapStore.getState().taps;
+    body();
+    return useVoiceKeyTapStore.getState().taps - before;
+  };
+
+  test("does not count a tap with no run staged", () => {
+    renderBridge("a1");
+
+    const counted = tapsCountedDuring(() => {
+      act(() => {
+        holdHandlers?.onTap();
+        holdHandlers?.onTap();
+      });
+    });
+
+    // Fn is the globe key, so these are the emoji picker and the input-source
+    // switch as much as they are anything of ours. Nothing is drawing the count,
+    // so nothing pays for a push.
+    expect(counted).toBe(0);
+  });
+
+  test("counts a tap once a run is staged", () => {
+    renderBridge("a1");
+    introStaged = true;
+
+    const counted = tapsCountedDuring(() => {
+      act(() => {
+        holdHandlers?.onTap();
+        holdHandlers?.onTap();
+      });
+    });
+
+    expect(counted).toBe(2);
+  });
+
+  /**
+   * The gate is read on the tap rather than held on the binding, so a run that
+   * starts under a bridge already mounted is counted without the key being
+   * rebound. Nothing counted while the run was down is waiting to be released
+   * into it: the card would read that backlog as presses already made.
+   */
+  test("counts nothing from before the run when one starts", () => {
+    renderBridge("a1");
+
+    const beforeRun = tapsCountedDuring(() => {
+      act(() => {
+        holdHandlers?.onTap();
+        holdHandlers?.onTap();
+        holdHandlers?.onTap();
+      });
+    });
+    introStaged = true;
+    const duringRun = tapsCountedDuring(() => {
+      act(() => {
+        holdHandlers?.onTap();
+      });
+    });
+
+    expect(beforeRun).toBe(0);
+    expect(duringRun).toBe(1);
+  });
+
+  /** And it closes again with the run, for the install's whole remaining life. */
+  test("stops counting when the run ends", () => {
+    renderBridge("a1");
+    introStaged = true;
+    act(() => {
+      holdHandlers?.onTap();
+    });
+    introStaged = false;
+
+    const counted = tapsCountedDuring(() => {
+      act(() => {
+        holdHandlers?.onTap();
+        holdHandlers?.onTap();
+      });
+    });
+
+    expect(counted).toBe(0);
+  });
 });
 
 /**
@@ -660,6 +840,70 @@ describe("a hold over an editable selection", () => {
     useAssistantIdentityStore.getState().setIdentity("asst", "0.11.9", "a1");
   };
 
+  test("preserves the transcript without pasting or asking when selection capture fails", async () => {
+    withAssistantThatTellsEditsFromQuestions();
+    nextTextInsertionStatus = "inserted";
+    const voiceInput = renderBridge("a1");
+    holdOver({ unavailable: true });
+    await act(async () => {
+      await voiceInput.onTranscript("make this friendlier");
+    });
+    expect(dictationCalls).toEqual([]);
+    expect(insertedTexts).toEqual([]);
+    expect(askedTexts).toEqual([]);
+    expect(useDictationOfferStore.getState().offer).toMatchObject({
+      reason: "paste-failed",
+      text: "make this friendlier",
+    });
+    expect(useComposerStore.getState().input).toBe("make this friendlier");
+    expect(toastErrorMock).toHaveBeenCalledWith(
+      formatVoiceError("dictation-selection-unavailable"),
+      { id: "voice-error:dictation-selection-unavailable" },
+    );
+    expect(useVoiceRecordingStore.getState().dictationInsertionError).toBe(
+      "dictation-selection-unavailable",
+    );
+  });
+
+  test("routes a pop-out capture failure to the main offer and keeps the draft", async () => {
+    popout = true;
+    withAssistantThatTellsEditsFromQuestions();
+    const voiceInput = renderBridge("a1");
+    holdOver({ unavailable: true });
+    await act(async () => {
+      await voiceInput.onTranscript("make this friendlier");
+    });
+
+    const offer = forwardOffer.mock.calls.at(-1)?.[0];
+    expect(offer).toEqual({
+      reason: "paste-failed",
+      text: "make this friendlier",
+    });
+    expect(useDictationOfferStore.getState().offer).toBeNull();
+    expect(useComposerStore.getState().input).toBe("make this friendlier");
+    expect(insertedTexts).toEqual([]);
+    expect(askedTexts).toEqual([]);
+    const command = {
+      kind: "setUnplacedDictationOffer" as const,
+      offer: offer!,
+    };
+    act(() => commandHandlers.setUnplacedDictationOffer?.(command));
+    expect(useDictationOfferStore.getState().offer).toBeNull();
+
+    cleanup();
+    popout = false;
+    renderBridge("a1");
+    act(() => commandHandlers.setUnplacedDictationOffer?.(command));
+    expect(useDictationOfferStore.getState().offer).toMatchObject(offer!);
+    act(() =>
+      commandHandlers.setUnplacedDictationOffer?.({
+        kind: "setUnplacedDictationOffer",
+        offer: null,
+      }),
+    );
+    expect(useDictationOfferStore.getState().offer).toBeNull();
+  });
+
   test("pastes the edit over the selection", async () => {
     withAssistantThatTellsEditsFromQuestions();
     nextTextInsertionStatus = "inserted";
@@ -692,7 +936,7 @@ describe("a hold over an editable selection", () => {
    * at the deadline and read aloud as an answer instead. The rewrite waits on
    * a bound of its own.
    */
-  test("waits past the cleanup's bound for a paragraph's edit", async () => {
+  test("waits past the dictation deadline for a paragraph's edit", async () => {
     withAssistantThatTellsEditsFromQuestions();
     nextTextInsertionStatus = "inserted";
     nextDictationResult = {
@@ -836,4 +1080,92 @@ describe("a hold over an editable selection", () => {
     );
     expect(useComposerStore.getState().input).toBe("Send the files.");
   });
+});
+
+test("double taps with only a staged tour never start a call", async () => {
+  introStaged = true;
+  renderBridge("a1");
+  await act(async () => {
+    await holdHandlers?.onDoubleTap();
+  });
+  expect(toggleVoiceMock).not.toHaveBeenCalled();
+  expect(advanceIntro).not.toHaveBeenCalled();
+});
+
+test.each([true, false])(
+  "the final double tap takes the tour offer when staged=%s",
+  async (staged) => {
+    introStaged = staged;
+    mainIntro = "try";
+    renderBridge("a1");
+    await act(async () => {
+      await holdHandlers?.onDoubleTap();
+    });
+    expect(advanceIntro).toHaveBeenCalledWith("try");
+    expect(advanceIntro).toHaveBeenCalledTimes(1);
+    expect(toggleVoiceMock).not.toHaveBeenCalled();
+  },
+);
+
+test.each(["idle", "meet", "talk", "key", "share", "draw", "mute"] as const)(
+  "a double tap stays a rehearsal on %s",
+  async (beat) => {
+    introStaged = true;
+    mainIntro = beat;
+    renderBridge("a1");
+    await act(async () => {
+      await holdHandlers?.onDoubleTap();
+    });
+    expect(advanceIntro).not.toHaveBeenCalled();
+    expect(toggleVoiceMock).not.toHaveBeenCalled();
+  },
+);
+
+test("ignores the final offer if the voice bridge unmounts during its state read", async () => {
+  let resolve!: (state: { intro: CompanionIntroBeat | null }) => void;
+  readCompanionState.mockReturnValueOnce(new Promise((done) => {
+    resolve = done;
+  }));
+  const view = render(
+    <MemoryRouter>
+      <GlobalPushToTalkBridge assistantId="assistant-1" enabled />
+    </MemoryRouter>,
+  );
+  const pending = holdHandlers?.onDoubleTap();
+  view.unmount();
+  await act(async () => {
+    resolve({ intro: "try" });
+    await pending;
+  });
+  expect(advanceIntro).not.toHaveBeenCalled();
+  expect(toggleVoiceMock).not.toHaveBeenCalled();
+});
+
+test("a tutorial hold does not start dictation", () => {
+  introStaged = true;
+  renderBridge("a1");
+  act(() => holdHandlers?.onHoldStart({ selection: null }));
+  expect(voiceStartMock).not.toHaveBeenCalled();
+});
+
+test("checks the native tour step when the staging notification is stale", async () => {
+  introStaged = false;
+  mainIntro = "key";
+  renderBridge("a1");
+  await act(async () => {
+    await holdHandlers?.onDoubleTap();
+  });
+  expect(readCompanionState).toHaveBeenCalled();
+  expect(toggleVoiceMock).not.toHaveBeenCalled();
+});
+
+test("voice gestures stay inactive before assistant selection is ready", async () => {
+  renderBridge("a1", false);
+  await act(async () => {
+    await holdHandlers?.onDoubleTap();
+    holdHandlers?.onHoldStart({ selection: null });
+  });
+  expect(toggleVoiceMock).not.toHaveBeenCalled();
+  expect(voiceStartMock).not.toHaveBeenCalled();
+  expect(advanceIntro).not.toHaveBeenCalled();
 });

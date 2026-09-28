@@ -8,6 +8,10 @@ import type { CredentialCache } from "../credential-cache.js";
 import { credentialKey } from "../credential-key.js";
 import { mutateConfigFile } from "../config-file-utils.js";
 import { getLogger } from "../logger.js";
+import {
+  ensurePlatformIdentityIds,
+  peekPlatformAssistantId,
+} from "../platform-identity.js";
 import { ExponentialBackoff } from "../util/exponential-backoff.js";
 import { listWebhookIngressRoutes } from "../db/webhook-ingress-route-store.js";
 import {
@@ -24,6 +28,10 @@ import {
   type VelayHttpRequestFrame,
   type VelayRegisteredFrame,
 } from "./protocol.js";
+import {
+  encodeBinaryWebSocketFrame,
+  VELAY_BINARY_WEBSOCKET_HEADER,
+} from "./binary-websocket.js";
 import { VelayWebSocketBridge } from "./websocket-bridge.js";
 
 const log = getLogger("velay-client");
@@ -287,7 +295,9 @@ export class VelayTunnelClient {
   }
 
   private async connect(): Promise<void> {
-    if (!this.running || this.connecting) return;
+    if (!this.running || this.connecting) {
+      return;
+    }
     this.connecting = true;
 
     if (this.isPublicIngressDisabled()) {
@@ -299,16 +309,10 @@ export class VelayTunnelClient {
     }
 
     let apiKeyRaw: string | undefined;
-    let platformAssistantIdRaw: string | undefined;
     try {
-      [apiKeyRaw, platformAssistantIdRaw] = await Promise.all([
-        this.options.credentials.get(
-          credentialKey("vellum", "assistant_api_key"),
-        ),
-        this.options.credentials.get(
-          credentialKey("vellum", "platform_assistant_id"),
-        ),
-      ]);
+      apiKeyRaw = await this.options.credentials.get(
+        credentialKey("vellum", "assistant_api_key"),
+      );
     } catch (err) {
       this.connecting = false;
       log.warn({ err }, "Failed to read Velay tunnel credentials");
@@ -325,7 +329,6 @@ export class VelayTunnelClient {
     }
 
     const apiKey = apiKeyRaw?.trim();
-    const platformAssistantId = platformAssistantIdRaw?.trim() || undefined;
     if (!apiKey) {
       this.connecting = false;
       if (this.consumePendingCredentialRefresh("assistant API key missing")) {
@@ -335,7 +338,8 @@ export class VelayTunnelClient {
       this.scheduleReconnect();
       return;
     }
-    const expectedAssistantId = platformAssistantId;
+    await ensurePlatformIdentityIds();
+    const expectedAssistantId = peekPlatformAssistantId();
 
     let registerUrl: string;
     try {
@@ -355,6 +359,7 @@ export class VelayTunnelClient {
         protocols: [VELAY_TUNNEL_SUBPROTOCOL],
         headers: {
           Authorization: `Api-Key ${apiKey}`,
+          [VELAY_BINARY_WEBSOCKET_HEADER]: "1",
           // Declares the path allowlist Velay enforces for inbound proxied
           // traffic on this tunnel. Read per attempt so a reconnect picks up
           // webhook routes registered since the last one. See
@@ -464,6 +469,7 @@ export class VelayTunnelClient {
       case VELAY_FRAME_TYPES.httpRequest:
         await this.handleHttpRequestFrame(frame, originWs);
         return;
+      case "websocket_binary":
       case VELAY_FRAME_TYPES.websocketOpen:
       case VELAY_FRAME_TYPES.websocketMessage:
       case VELAY_FRAME_TYPES.websocketClose:
@@ -667,7 +673,11 @@ export class VelayTunnelClient {
     }
 
     try {
-      ws.send(JSON.stringify(frame));
+      ws.send(
+        frame.type === "websocket_binary"
+          ? encodeBinaryWebSocketFrame(frame)
+          : JSON.stringify(frame),
+      );
       return true;
     } catch (err) {
       log.warn(

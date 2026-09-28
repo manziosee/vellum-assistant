@@ -37,8 +37,8 @@ import {
 import { useBillingBalanceQueryEnabled } from "@/hooks/use-billing-balance-status";
 import { useBusSubscription } from "@/hooks/use-bus-subscription";
 import { useResumeGrace } from "@/hooks/use-resume-grace";
+import { restoreAcpConnectFromHistory } from "@/domains/chat/hooks/restore-acp-connect-from-history";
 import {
-  extractWirePendingAcpConnect,
   extractWirePendingConfirmation,
   extractWirePendingQuestion,
 } from "@/domains/chat/utils/chat";
@@ -59,8 +59,10 @@ import { useBackgroundTaskStore } from "@/domains/chat/background-task-store";
 import { useChatSessionStore } from "@/domains/chat/chat-session-store";
 import { reconcileSubagentStoreFromNotifications } from "@/domains/chat/hooks/reconcile-subagent-hydration";
 import { isSending, useTurnStore } from "@/domains/chat/turn-store";
+import { useAssistantFeatureFlagStore } from "@/stores/assistant-feature-flag-store";
 
 import {
+  clearConfirmationByRequestId,
   parsePendingSecretState,
   parsePendingConfirmationData,
 } from "@/domains/chat/utils/send-message-utils";
@@ -78,6 +80,7 @@ import {
 } from "@/domains/chat/transcript/use-history-pagination";
 import type { PaginatedHistoryResult } from "@/domains/chat/transcript/types";
 import {
+  patchTranscriptMessages,
   registerHistoryCachePatcher,
   type MessagesUpdater,
 } from "@/domains/chat/transcript/patch-transcript-messages";
@@ -183,6 +186,12 @@ function applyReportedQuestion(params: {
   }
 }
 
+function clearConfirmationTranscriptMarker(requestId: string): void {
+  patchTranscriptMessages((messages) =>
+    clearConfirmationByRequestId(messages, requestId),
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Hook
 // ---------------------------------------------------------------------------
@@ -193,6 +202,7 @@ export function useConversationHistory({
   activeConversationId,
 }: UseConversationHistoryParams): ConversationHistoryResult {
   const queryClient = useQueryClient();
+  const sessionGroupsEnabled = useAssistantFeatureFlagStore.use.sessionGroups();
 
   const pagination = useHistoryPagination({
     assistantId,
@@ -201,6 +211,7 @@ export function useConversationHistory({
       assistantStateKind === "active" &&
       !!assistantId &&
       !!activeConversationId,
+    sessionGroupsEnabled,
   });
 
   /**
@@ -288,6 +299,9 @@ export function useConversationHistory({
       return;
     }
 
+    const generation = ++reconcileGenerationRef.current;
+    let cancelled = false;
+
     // Seq baseline (replay idempotency) + cold-start ring-replay anchor. Tag
     // the frontier with the generation the page's `/messages` request was
     // issued in (falling back to the current generation for pages that carry no
@@ -352,23 +366,27 @@ export function useConversationHistory({
     }
 
     // Restore the inline "Connect Claude Code" card the snapshot carries on a
-    // failed acp_spawn (persisted `acp_claude_oauth_missing` marker). Without
-    // this, a page reload or SSE reconnect wipes the in-memory prompt and the
-    // card silently disappears. Skipped when a prompt is already active;
-    // `showAcpConnect` additionally no-ops a failure already retired this
-    // session (auto-continue or self-heal), so a reseed can't resurrect it.
-    const wirePendingAcpConnect = extractWirePendingAcpConnect(
-      pagination.messages,
-    );
-    if (
-      wirePendingAcpConnect &&
-      !useInteractionStore.getState().pendingAcpConnect
-    ) {
-      useInteractionStore.getState().showAcpConnect({
-        ...wirePendingAcpConnect,
-        conversationId: activeConversationId,
-      });
-    }
+    // failed acp_spawn (persisted `acp_claude_oauth_missing` or
+    // `acp_claude_auth_required` marker). Ordinary missing-token markers wait
+    // for a connected-status check before raising, so a stale marker does not
+    // paint a card that then self-heals. `auth_required` raises immediately.
+    // Skipped when a prompt is already active. `showAcpConnect` additionally
+    // no-ops a failure already retired (auto-continue, self-heal, or a
+    // persisted user Dismiss).
+    const requestedConversationForAcp = activeConversationId;
+    const acpConnectRevisionAtRestore =
+      useInteractionStore.getState().acpConnectRevision;
+    void restoreAcpConnectFromHistory({
+      messages: pagination.messages,
+      assistantId,
+      conversationId: requestedConversationForAcp,
+      revisionAtRestore: acpConnectRevisionAtRestore,
+      isCurrent: () =>
+        !cancelled &&
+        reconcileGenerationRef.current === generation &&
+        useConversationStore.getState().activeConversationId ===
+          requestedConversationForAcp,
+    });
 
     // Refresh embedded surface content into the history cache.
     const requestedConversationForSurfaces = activeConversationId;
@@ -481,7 +499,10 @@ export function useConversationHistory({
     // anything moved underneath it while the request was in flight.
     const questionRevisionBeforeFetch =
       useInteractionStore.getState().questionRevision;
-    const generation = ++reconcileGenerationRef.current;
+    const pendingSecretBeforeFetch =
+      useInteractionStore.getState().pendingSecret;
+    const pendingConfirmationBeforeFetch =
+      useInteractionStore.getState().pendingConfirmation;
     void (async () => {
       // A read that never landed carries no opinion, exactly like an assistant
       // that predates `pendingQuestion`, so it leaves `reported` undefined and
@@ -526,20 +547,65 @@ export function useConversationHistory({
               interactions.pendingSecret as Record<string, unknown>,
             )
           : null;
-        if (parsed_secret) {
-          useInteractionStore.getState().showSecret(parsed_secret);
-        }
         if (
-          interactions.pendingConfirmation &&
-          !useInteractionStore.getState().pendingConfirmation
+          parsed_secret &&
+          useInteractionStore.getState().pendingSecret ===
+            pendingSecretBeforeFetch
+        ) {
+          useInteractionStore.getState().showSecret(parsed_secret);
+        } else if (
+          !interactions.pendingSecret &&
+          pendingSecretBeforeFetch &&
+          useInteractionStore.getState().pendingSecret ===
+            pendingSecretBeforeFetch
         ) {
           useInteractionStore
             .getState()
-            .showConfirmation(
-              parsePendingConfirmationData(
-                interactions.pendingConfirmation as Record<string, unknown>,
-              ),
+            .dismissSecretIfMatches(pendingSecretBeforeFetch.requestId);
+        }
+        if (
+          interactions.pendingConfirmation &&
+          useInteractionStore.getState().pendingConfirmation ===
+            pendingConfirmationBeforeFetch
+        ) {
+          const parsedConfirmation = parsePendingConfirmationData(
+            interactions.pendingConfirmation as Record<string, unknown>,
+          );
+          if (
+            pendingConfirmationBeforeFetch &&
+            pendingConfirmationBeforeFetch.requestId !==
+              parsedConfirmation.requestId
+          ) {
+            const previousRequestId =
+              pendingConfirmationBeforeFetch.requestId;
+            const sessionStore = useChatSessionStore.getState();
+            useInteractionStore.getState().releaseInlineAnchorIfMatches(
+              sessionStore.confirmationToolCallMap.get(previousRequestId) ??
+                pendingConfirmationBeforeFetch.toolUseId,
             );
+            clearConfirmationTranscriptMarker(previousRequestId);
+            sessionStore.deleteConfirmationToolCall(previousRequestId);
+          }
+          useInteractionStore
+            .getState()
+            .showConfirmation(parsedConfirmation);
+        } else if (
+          !interactions.pendingConfirmation &&
+          pendingConfirmationBeforeFetch &&
+          useInteractionStore.getState().pendingConfirmation ===
+            pendingConfirmationBeforeFetch
+        ) {
+          const requestId = pendingConfirmationBeforeFetch.requestId;
+          const sessionStore = useChatSessionStore.getState();
+          useInteractionStore
+            .getState()
+            .dismissConfirmationIfMatches(requestId);
+          useInteractionStore.getState().releaseInlineAnchorIfMatches(
+            sessionStore.confirmationToolCallMap.get(requestId) ??
+              pendingConfirmationBeforeFetch.toolUseId,
+          );
+          clearConfirmationTranscriptMarker(requestId);
+          sessionStore.deleteConfirmationToolCall(requestId);
         }
         // A question parks the turn on the user exactly like a secret or a
         // confirmation does, and the rest of the attention machinery already
@@ -552,7 +618,10 @@ export function useConversationHistory({
         if (
           !interactions.pendingSecret &&
           !interactions.pendingConfirmation &&
-          !interactions.pendingQuestion
+          !interactions.pendingQuestion &&
+          !useInteractionStore.getState().pendingSecret &&
+          !useInteractionStore.getState().pendingConfirmation &&
+          !useInteractionStore.getState().pendingQuestion
         ) {
           useConversationStore
             .getState()
@@ -564,6 +633,9 @@ export function useConversationHistory({
         // inside a void async block.
       }
     })();
+    return () => {
+      cancelled = true;
+    };
     // `pagination.*` other than `dataUpdatedAt` intentionally excluded: they all
     // update together on a committed result, and listing the volatile ones (e.g.
     // `isFetchingOlderPages`) would re-run these side effects on older-page loads.

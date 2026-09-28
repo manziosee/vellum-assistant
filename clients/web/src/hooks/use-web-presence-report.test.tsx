@@ -9,7 +9,7 @@
  * the idle threshold.
  *
  * The Electron renderer reports through the same hook but reads window state
- * from the main process instead of the DOM, so the shared `isVisibleToUser`
+ * from the main process instead of the DOM, so the shared `isClientAttended`
  * predicate is stubbed with the same branch it makes. The predicate itself is
  * covered against a real bridge and a real DOM in
  * `runtime/window-attention.test.ts`. Mount is input in a browser tab and not
@@ -116,9 +116,14 @@ mock.module("@/runtime/is-electron", () => ({
   isElectron: () => electron,
 }));
 
+let nativePlatform = false;
+mock.module("@/runtime/native-auth", () => ({
+  isNativePlatform: () => nativePlatform,
+}));
 let windowAttended = true;
 mock.module("@/runtime/window-attention", () => ({
-  isVisibleToUser: () =>
+  isWindowOnScreen: () => true,
+  isClientAttended: () =>
     electron ? windowAttended : document.visibilityState === "visible",
 }));
 
@@ -188,6 +193,7 @@ function navigateTo(pathname: string) {
 }
 
 beforeEach(() => {
+  nativePlatform = false;
   __resetForTesting();
   useAssistantIdentityStore
     .getState()
@@ -426,25 +432,18 @@ describe("useWebPresenceReport", () => {
     });
   });
 
-  // Focus is not a browser presence input: a visible tab in an unfocused
-  // browser window is still showing the conversation. The attention edge has
-  // one publisher, the Electron source, and it no-ops off Electron.
-  test("a blurred browser tab keeps its visible report", async () => {
+  test("browser attention loss reports away immediately", async () => {
     useConversationStore.getState().setActiveConversationId("conv-1");
     renderReportAt("assistant-1", routes.conversation("conv-1"));
     await flushPresence();
-    expect(postCalls).toHaveLength(1);
-    expect(postCalls[0]?.body).toEqual({
-      visible: true,
+    act(() => {
+      publish("app.attention", { attended: false });
+    });
+    await flushPresence();
+    expect(postCalls.at(-1)?.body).toEqual({
+      visible: false,
       focusedConversationId: "conv-1",
     });
-
-    act(() => {
-      window.dispatchEvent(new Event("blur"));
-    });
-
-    await flushPresence();
-    expect(postCalls).toHaveLength(1);
   });
 
   test("online reconnect while hidden never reports visible", async () => {
@@ -686,7 +685,8 @@ describe("useWebPresenceReport: reconciliation", () => {
       });
     });
 
-    test("a foreground resume reports visible even while the DOM still reads hidden", async () => {
+    test("native foreground resume reports visible even while the DOM still reads hidden", async () => {
+      nativePlatform = true;
       useConversationStore.getState().setActiveConversationId("conv-1");
       renderReportAt("assistant-1", routes.conversation("conv-1"));
       await flushPresence();
@@ -843,6 +843,7 @@ describe("useWebPresenceReport: reconciliation", () => {
 
 describe("useWebPresenceReport: Electron renderer", () => {
   beforeEach(() => {
+  nativePlatform = false;
     electron = true;
     useConversationStore.getState().setActiveConversationId("conv-1");
   });

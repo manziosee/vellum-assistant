@@ -14,6 +14,7 @@ import { z } from "zod";
 
 import { CHANNEL_IDS } from "../../channels/types.js";
 import { isAssistantInitiatedThreadsEnabled } from "../../config/assistant-initiated-threads-gate.js";
+import { localeFromAcceptLanguage } from "../../i18n/index.js";
 import { channelBindingSchema } from "../../messaging/channel-binding-schema.js";
 import {
   type Confidence,
@@ -30,16 +31,14 @@ import {
 import { resolveConversationId } from "../../persistence/conversation-key-store.js";
 import {
   type ConversationListFilter,
+  type ConversationListTypeFilter,
   countConversations,
   countConversationSections,
   countUnreadConversations,
   listConversations,
   listPinnedConversations,
 } from "../../persistence/conversation-queries.js";
-import {
-  ASSISTANT_INITIATED_GROUP_ID,
-  type ConversationType,
-} from "../../persistence/conversation-types.js";
+import { ASSISTANT_INITIATED_GROUP_ID } from "../../persistence/conversation-types.js";
 import { getBindingsForConversations } from "../../persistence/external-conversation-store.js";
 import { listGroups } from "../../persistence/group-crud.js";
 import { UserError } from "../../util/errors.js";
@@ -244,16 +243,21 @@ function parseEnumQueryParam<const T extends readonly string[]>(
   );
 }
 
-function handleListConversations({ queryParams = {} }: RouteHandlerArgs) {
+function handleListConversations({
+  queryParams = {},
+  headers,
+}: RouteHandlerArgs) {
   const limit = Number(queryParams.limit ?? 50);
   const offset = Number(queryParams.offset ?? 0);
   // "background" is the back-compat umbrella (background + scheduled); newer
-  // clients can pass "scheduled" to load only the Scheduled section. Absent
-  // defaults to the standard foreground list.
-  const conversationType: ConversationType =
+  // clients can pass "scheduled" to load only the Scheduled section, or "all"
+  // to page a user's whole history in one cursor. Absent defaults to the
+  // standard foreground list.
+  const conversationType: ConversationListTypeFilter =
     parseEnumQueryParam(queryParams, "conversationType", [
       "background",
       "scheduled",
+      "all",
     ]) ?? "standard";
   // Defaults to `active` so sidebar restores no longer pull archived rows.
   // The Archive page opts into `archived` to render only archived rows
@@ -290,7 +294,9 @@ function handleListConversations({ queryParams = {} }: RouteHandlerArgs) {
      read withholds them, so they appear in their own section and nowhere
      else. Confined to `standard`: the background and scheduled buckets are
      back-compat umbrellas addressed by conversation type, and narrowing them
-     by source would drop rows their callers still page through. Confined to
+     by source would drop rows their callers still page through, while `all`
+     is a whole-history read with no second section to defer those rows to,
+     so withholding there would simply lose them. Confined to
      active reads too: the Archive view asks `archiveStatus=archived` with no
      `groupId`, and the section only ever lists active rows, so withholding
      there would leave an archived section thread visible nowhere. */
@@ -365,6 +371,7 @@ function handleListConversations({ queryParams = {} }: RouteHandlerArgs) {
         // Checks in-memory flag first (hot path), falls back to the
         // persisted `processing_started_at` column for cold conversations.
         isProcessing: isConversationProcessing(conversation.id),
+        locale: localeFromAcceptLanguage(headers?.["accept-language"]),
       }),
     ),
     nextOffset,
@@ -579,8 +586,11 @@ function handleMarkUnread({ body = {}, headers }: RouteHandlerArgs) {
   }
 }
 
-function handleGetConversation({ pathParams = {} }: RouteHandlerArgs) {
-  const detail = buildConversationDetailResponse(pathParams.id!);
+function handleGetConversation({ pathParams = {}, headers }: RouteHandlerArgs) {
+  const detail = buildConversationDetailResponse(
+    pathParams.id!,
+    localeFromAcceptLanguage(headers?.["accept-language"]),
+  );
   if (!detail) {
     throw new NotFoundError(`Conversation ${pathParams.id} not found`);
   }
@@ -622,8 +632,11 @@ export const ROUTES: RouteDefinition[] = [
         type: "string",
         required: false,
         description:
-          'Filter by conversation type. Pass "background" to list background and scheduled conversations together (the back-compat umbrella), or "scheduled" to list only scheduled conversations.',
-        schema: { type: "string", enum: ["background", "scheduled"] },
+          'Filter by conversation type. Pass "background" to list background and scheduled conversations together (the back-compat umbrella), "scheduled" to list only scheduled conversations, or "all" for the union of the standard listing and that umbrella, so one paginated cursor spans every type. Combine "all" with archiveStatus=all for a whole-history read; rows are recency-ordered (COALESCE(last_message_at, updated_at) descending) like every other list read, and pinned rows are never appended to it.',
+        schema: {
+          type: "string",
+          enum: ["background", "scheduled", "all"],
+        },
       },
       {
         name: "archiveStatus",

@@ -99,6 +99,8 @@ export interface CdpTransportEvent {
  * CDP error mapping to the shared `CdpError` taxonomy.
  */
 export interface CdpWsTransport {
+  readonly closed?: boolean;
+
   /**
    * Send a CDP method call over the socket and await its response.
    *
@@ -463,7 +465,10 @@ function createTransport(ws: WsLike): CdpWsTransport {
   ws.addEventListener("close", handleClose);
   ws.addEventListener("error", handleError);
 
-  const transport: CdpWsTransport = {
+  return {
+    get closed() {
+      return disposed || closed;
+    },
     send<T = unknown>(
       method: string,
       params?: Record<string, unknown>,
@@ -602,6 +607,4 @@ function createTransport(ws: WsLike): CdpWsTransport {
       }
     },
   };
-
-  return transport;
 }

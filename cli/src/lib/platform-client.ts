@@ -528,19 +528,7 @@ export async function injectCredentialsIntoAssistant(
     promises.push(inject("vellum:assistant_api_key", params.assistantApiKey));
   }
 
-  promises.push(
-    inject("vellum:platform_assistant_id", params.platformAssistantId),
-  );
-
   promises.push(inject("vellum:platform_base_url", params.platformBaseUrl));
-
-  promises.push(
-    inject("vellum:platform_organization_id", params.organizationId),
-  );
-
-  if (params.userId) {
-    promises.push(inject("vellum:platform_user_id", params.userId));
-  }
 
   if (params.webhookSecret) {
     promises.push(inject("vellum:webhook_secret", params.webhookSecret));
@@ -841,12 +829,13 @@ export async function fetchCurrentUser(
 
 export async function rollbackPlatformAssistant(
   token: string,
+  assistantId: string,
   version?: string,
   platformUrl?: string,
 ): Promise<{ detail: string; version: string | null }> {
   const resolvedUrl = platformUrl || getPlatformUrl();
   const response = await loopbackSafeFetch(
-    `${resolvedUrl}/v1/assistants/rollback/`,
+    `${resolvedUrl}/v1/assistants/${encodeURIComponent(assistantId)}/rollback/`,
     {
       method: "POST",
       headers: await authHeaders(token, platformUrl),

@@ -15,9 +15,8 @@ import { VELLUM_MANAGED_PROVIDER } from "../vellum-model-routing.js";
  *   - platform: route via Vellum managed proxy; no client-side credential.
  *   - none: no auth (e.g. Ollama running locally).
  *   - oauth_subscription: OAuth-based subscription auth (e.g. ChatGPT Codex).
- *
- * Schema-accepted variants (runtime rejects with a clear "not yet shipped" error):
- *   - service_account: service-account credentials (Vertex AI, Bedrock).
+ *   - service_account: Google service-account JSON key (Vertex AI); signs a
+ *     JWT and exchanges it for a bearer token at the embedded token_uri.
  */
 export const AuthSchema = z
   .discriminatedUnion("type", [
@@ -177,6 +176,31 @@ export type ConnectionModel = z.infer<typeof ConnectionModelSchema>;
  * `models` list (openai-compatible endpoints have no fixed upstream, so the
  * user must supply both).
  */
+/**
+ * An openai-compatible connection whose endpoint is opencode.ai is an
+ * OpenCode connection: zen/go rejects requests without the session headers
+ * only the opencode adapter and probe send, so the generic adapter can never
+ * dispatch against it. Applied on create so the row is stored as provider
+ * "opencode" and every provider-keyed path treats it as one.
+ */
+export function normalizeConnectionProvider(
+  provider: string,
+  baseUrl: unknown,
+): string {
+  if (provider !== "openai-compatible" || typeof baseUrl !== "string") {
+    return provider;
+  }
+  let host: string;
+  try {
+    host = new URL(baseUrl).hostname.toLowerCase();
+  } catch {
+    return provider;
+  }
+  return host === "opencode.ai" || host.endsWith(".opencode.ai")
+    ? "opencode"
+    : provider;
+}
+
 export const PROVIDERS_REQUIRING_BASE_URL_AND_MODELS: ReadonlySet<string> =
   new Set(["openai-compatible"]);
 

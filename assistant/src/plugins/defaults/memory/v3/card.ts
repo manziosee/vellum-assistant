@@ -1,3 +1,5 @@
+import { safeStringSlice } from "@vellumai/plugin-api";
+
 import { FRONTMATTER_REGEX, parseFrontmatterFields } from "../frontmatter.js";
 import { injectedConceptHeader } from "../substrate/injected-block-slugs.js";
 import { LINK_SEPARATOR, parseLinkEntry } from "../substrate/page-links.js";
@@ -38,7 +40,7 @@ function renderLinkEntry(entry: string): string {
   }
   const note =
     description.length > LINK_NOTE_MAX_CHARS
-      ? `${description.slice(0, LINK_NOTE_MAX_CHARS).trimEnd()}…`
+      ? `${safeStringSlice(description, 0, LINK_NOTE_MAX_CHARS).trimEnd()}…`
       : description;
   return `${target}${LINK_SEPARATOR}${note}`;
 }
@@ -103,7 +105,7 @@ export function renderCurrentLine(
   }
   const capped =
     collapsed.length > CURRENT_MAX_CHARS
-      ? `${collapsed.slice(0, CURRENT_MAX_CHARS).trimEnd()}…`
+      ? `${safeStringSlice(collapsed, 0, CURRENT_MAX_CHARS).trimEnd()}…`
       : collapsed;
   return `[current: ${capped}]`;
 }

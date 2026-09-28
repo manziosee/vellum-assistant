@@ -37,6 +37,7 @@ import type {
   InstallPluginOptions,
   InstallPluginResult,
 } from "../../lib/install-from-github.js";
+import type { PluginSearchMatch } from "../../lib/search-plugins.js";
 import type {
   PluginUpgradeResult,
   UpgradePluginDeps,
@@ -63,6 +64,22 @@ let stageFixture: ((stagingDir: string) => void) | null = null;
 let installPluginCalls: InstallPluginOptions[] = [];
 let platformInstallCalls: Array<{ name: string; force?: boolean }> = [];
 let upgradePluginCalls: UpgradePluginOptions[] = [];
+let catalogMatches: PluginSearchMatch[] = [];
+let catalogError: Error | null = null;
+const CATALOG_COMMIT = "a".repeat(40);
+
+function githubCatalogMatch(name: string): PluginSearchMatch {
+  return {
+    name,
+    path: `github:example-org/${name}@${CATALOG_COMMIT}`,
+    category: null,
+    source: {
+      kind: "github",
+      repo: `example-org/${name}`,
+      ref: CATALOG_COMMIT,
+    },
+  };
+}
 
 /**
  * Queued daemon IPC responses. The default (empty queue) is a transport
@@ -156,6 +173,15 @@ mock.module("../../lib/install-from-platform.js", () => ({
   ) => {
     platformInstallCalls.push(opts);
     return runFakeInstall(opts.name, deps);
+  },
+}));
+
+mock.module("../../lib/plugin-catalog-cache.js", () => ({
+  getPluginCatalog: async () => {
+    if (catalogError) {
+      throw catalogError;
+    }
+    return { ref: "main", matches: catalogMatches };
   },
 }));
 
@@ -257,6 +283,11 @@ beforeEach(() => {
   installPluginCalls = [];
   platformInstallCalls = [];
   upgradePluginCalls = [];
+  catalogMatches = [
+    githubCatalogMatch("example"),
+    githubCatalogMatch("imessage"),
+  ];
+  catalogError = null;
   ipcResults = [];
   inspectResult = null;
   installTarget = null;
@@ -432,6 +463,55 @@ describe("plugins install - declared-schedules consent", () => {
     expect(confirmCalls.length).toBe(1);
     expect(r.stdout).toContain('Plugin "caveman" declares 2 schedules:');
     expect(r.exitCode).toBe(0);
+  });
+
+  test("a local catalog source bypasses the platform installer", async () => {
+    catalogMatches = [
+      {
+        name: "fathom",
+        path: "local:plugins/mcp-catalog/fathom@1.0.0",
+        category: "productivity",
+        source: {
+          kind: "local",
+          path: "plugins/mcp-catalog/fathom",
+          version: "1.0.0",
+        },
+      },
+    ];
+
+    const r = await runCommand(["plugins", "install", "fathom"]);
+
+    expect(platformInstallCalls).toHaveLength(0);
+    expect(installPluginCalls).toHaveLength(1);
+    expect(installPluginCalls[0]?.trustedSource).toEqual({
+      kind: "local",
+      path: "plugins/mcp-catalog/fathom",
+      version: "1.0.0",
+    });
+    expect(r.exitCode).toBe(0);
+  });
+
+  test("falls back to the platform installer when catalog discovery fails", async () => {
+    catalogError = new Error("catalog unavailable");
+
+    const r = await runCommand(["plugins", "install", "example"]);
+
+    expect(installPluginCalls).toHaveLength(0);
+    expect(platformInstallCalls).toEqual([
+      { name: "example", force: undefined },
+    ]);
+    expect(r.exitCode).toBe(0);
+  });
+
+  test("does not use the outage fallback for a gated integration", async () => {
+    catalogError = new Error("catalog unavailable");
+
+    const r = await runCommand(["plugins", "install", "gamma"]);
+
+    expect(installPluginCalls).toHaveLength(0);
+    expect(platformInstallCalls).toHaveLength(0);
+    expect(r.stderr).toContain("not in the marketplace catalog");
+    expect(r.exitCode).toBe(1);
   });
 });
 
@@ -699,6 +779,39 @@ describe("plugins inspect - schedules surface", () => {
     const r = await runCommand(["plugins", "inspect", "example"]);
 
     expect(r.stdout).toContain("weekly  RRULE:FREQ=WEEKLY;BYDAY=MO  (execute)");
+    expect(r.exitCode).toBe(0);
+  });
+
+  test("renders a bundled package location without a GitHub URL", async () => {
+    inspectResult = {
+      ...inspectionWithSurfaces({
+        skills: [],
+        hooks: [],
+        tools: [],
+        schedules: [],
+      }),
+      installed: false,
+      status: "not-installed",
+      local: null,
+      remote: {
+        kind: "local",
+        repo: "",
+        path: "plugins/mcp-catalog/fathom",
+        commit: "1.0.0",
+        committedAt: null,
+        description: null,
+        homepage: null,
+        license: null,
+        category: "productivity",
+        marketplaceRef: "main",
+        version: "1.0.0",
+      },
+    };
+
+    const r = await runCommand(["plugins", "inspect", "fathom"]);
+
+    expect(r.stdout).toContain("bundled:plugins/mcp-catalog/fathom");
+    expect(r.stdout).not.toContain("https://github.com//");
     expect(r.exitCode).toBe(0);
   });
 });

@@ -87,8 +87,17 @@ graph LR
   nesting existed still parse, since an unindented body line that is not itself
   entry-shaped is read as a continuation.
 - **Consolidation** (`substrate/consolidation-job.ts`) is a background
-  agent conversation that files buffer entries into concept pages, rewrites
-  the aggregate views, and trims the buffer. Scheduling
+  agent conversation that files buffer entries into concept pages and
+  rewrites the aggregate views. The agent never writes the buffer: the job
+  snapshots `buffer.md`, hands the run its pass's entries verbatim in the
+  prompt, and after the run removes exactly those entries itself through
+  `buffer-file.ts` (the module that also owns the append path, so the two
+  writers of the buffer share one protocol). Removal happens only when the
+  run's persisted messages hold a page-writing tool call with a non-error
+  result, the same evidence bar the retrospective's cursor advance uses; a
+  run that wrote nothing, failed, or timed out leaves the buffer intact for
+  the next pass. Entries deferred past the per-run cap and entries appended
+  while the run was in flight are therefore never lost. Scheduling
   (`maybeEnqueueGraphMaintenanceJobs` in `jobs-worker.ts`):
   - interval-based (`memory.v2.consolidation_interval_hours`, default 8h),
     skipped below `MIN_BUFFER_LINES_FOR_CONSOLIDATION` (10) **unless** the
@@ -205,7 +214,15 @@ static substrate context remain available. When the answer depends on a saved pe
 fact that is absent from that context, the front-door rule escalates instead of
 guessing.
 
-The escalated leg runs the ordinary memory pipeline before the quality model.
+The escalated leg normally runs the memory pipeline before the quality model.
+During screen sharing, the front door can emit `[ESCALATE_SCREEN]` for an
+annotation or immediate on-screen action answerable from the screen and
+current conversation. The bridge skips fresh retrieval only when that verdict
+and an active screen share are both present. This per-turn policy gates the
+legacy hook and both v3 injectors, including re-injection, and clears at turn
+release. Static context and historical memory blocks remain available.
+Requests needing saved facts or preferences absent from context, uncertain
+classifications, and ordinary `[ESCALATE]` verdicts retain retrieval.
 V3 retrieval routes on the latest visible caller message, ignoring the hidden
 continuation message used to start that leg. The selector uses low effort to
 keep retrieval latency bounded. This keeps current-turn memory work off the
@@ -260,6 +277,12 @@ weights, router, rerank) live only under `memory.v2.*`, and v3 lane tuning
 under `memory.v3.*`. The `memory.v2.enabled` flag gates only the v2 injection
 engine's turn-time selection; the substrate runs whenever
 `usesConceptPageMemory()` holds.
+
+`memory.v3.poolLog.captureInput` (off by default) makes the v3 selector
+persist its exact per-turn input beside the always-written pool audit
+(`memory_v3_pool_inputs`, `memory_v3_pool_texts`), for offline selector
+evaluation and training data; the memory plugin `AGENTS.md` documents the
+tables.
 
 `src/plugins/defaults/memory/AGENTS.md` carries the details that matter when
 you touch this: the three substrate keys whose names differ from their v2 twin,

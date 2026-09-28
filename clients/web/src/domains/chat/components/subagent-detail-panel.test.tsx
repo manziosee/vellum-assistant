@@ -10,6 +10,7 @@
 
 import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
 import {
+  act,
   cleanup,
   fireEvent,
   render as rtlRender,
@@ -89,15 +90,18 @@ mock.module("@/domains/chat/components/subagent-phase-timeline", () => ({
   ),
 }));
 
+import type { ChatMessageToolCall } from "@/domains/chat/api/event-types";
 import { SubagentDetailPanel } from "@/domains/chat/components/subagent-detail-panel";
-import type { SubagentEntry } from "@/domains/chat/subagent-store";
+import {
+  useSubagentStore,
+  type SubagentEntry,
+} from "@/domains/chat/subagent-store";
+import { emptyHistory } from "@/domains/chat/transcript/rolling-snapshot";
+import { stubOverflow } from "@/hooks/overflow.test-helper";
 
-// The nested tool-detail body (`ToolDetailBody`) resolves the live tool call
-// from the transcript union, which is backed by a TanStack Query cache. Render
-// every case under a provider so drilling into a tool step doesn't throw "No
-// QueryClient set". No history is seeded: with no active conversation the
-// history query stays disabled, so the body falls back to the step's open-time
-// snapshot — exactly the values these tests assert.
+// The live tool-call hook also reads the transcript union, which is backed by a
+// TanStack Query cache. Render every case under a provider so drilling into a
+// tool step doesn't throw "No QueryClient set".
 const queryClient = new QueryClient({
   defaultOptions: { queries: { retry: false } },
 });
@@ -124,8 +128,32 @@ function makeEntry(overrides: Partial<SubagentEntry> = {}): SubagentEntry {
     outputTokens: 0,
     spawnedAt: Date.now(),
     events: [],
+    history: null,
     ...overrides,
   };
+}
+
+/**
+ * `entry` with a history holding `toolCalls`, registered in the subagent store,
+ * which is where the nested tool detail reads a subagent's calls from.
+ */
+function withToolCalls(
+  entry: SubagentEntry,
+  toolCalls: ChatMessageToolCall[],
+): SubagentEntry {
+  const seeded: SubagentEntry = {
+    ...entry,
+    history: {
+      ...emptyHistory(),
+      messages: [
+        { id: `msg-${entry.subagentId}`, role: "assistant", toolCalls },
+      ],
+    },
+  };
+  useSubagentStore.setState((s) => ({
+    byId: { ...s.byId, [seeded.subagentId]: seeded },
+  }));
+  return seeded;
 }
 
 /** Skeleton bars (if any) pulse; real values are plain text. */
@@ -135,6 +163,7 @@ function skeletonCount(container: HTMLElement): number {
 
 afterEach(() => {
   cleanup();
+  useSubagentStore.getState().reset();
 });
 afterAll(() => {
   mock.restore();
@@ -260,7 +289,10 @@ describe("SubagentDetailPanel: detail fetch on open", () => {
     // The child-semantic `conversationId` is deliberately unset on such a
     // stub; gating the fetch on it left the panel permanently empty.
     expect(
-      requestedIdsFor({ conversationId: undefined, parentConversationId: "conv-parent" }),
+      requestedIdsFor({
+        conversationId: undefined,
+        parentConversationId: "conv-parent",
+      }),
     ).toEqual(["sub-1"]);
   });
 
@@ -327,61 +359,20 @@ describe("SubagentDetailPanel — header controls", () => {
   });
 });
 
-/**
- * happy-dom does not compute real layout, so a ref'd element's `scrollHeight`
- * and `clientHeight` are both `0` — the overflow check
- * (`scrollHeight > clientHeight`) would never fire and the "Show more" toggle
- * would never render. To exercise the collapse/expand path deterministically
- * we stub the two getters on `HTMLElement.prototype`: when the objective body
- * is "tall" we report `scrollHeight > clientHeight`; otherwise we report them
- * equal (no overflow). The stub keys off the rendered text so the same prototype
- * patch drives both the overflow and the no-overflow cases. `installOverflow`
- * returns a restore fn the test calls in a `finally`.
- */
-function installOverflow(overflowingText: string) {
-  const scrollDesc = Object.getOwnPropertyDescriptor(
-    HTMLElement.prototype,
-    "scrollHeight",
-  );
-  const clientDesc = Object.getOwnPropertyDescriptor(
-    HTMLElement.prototype,
-    "clientHeight",
-  );
-
-  Object.defineProperty(HTMLElement.prototype, "clientHeight", {
-    configurable: true,
-    get() {
-      return 60; // ~3 clamped lines
-    },
-  });
-  Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
-    configurable: true,
-    get(this: HTMLElement) {
-      // The objective body overflows only when it holds the long text.
-      return this.textContent === overflowingText ? 240 : 60;
-    },
-  });
-
-  return () => {
-    if (scrollDesc) {
-      Object.defineProperty(HTMLElement.prototype, "scrollHeight", scrollDesc);
-    } else {
-      // @ts-expect-error — happy-dom defines no own descriptor by default.
-      delete HTMLElement.prototype.scrollHeight;
-    }
-    if (clientDesc) {
-      Object.defineProperty(HTMLElement.prototype, "clientHeight", clientDesc);
-    } else {
-      // @ts-expect-error — happy-dom defines no own descriptor by default.
-      delete HTMLElement.prototype.clientHeight;
-    }
-  };
-}
-
 describe("SubagentDetailPanel — objective", () => {
-  test("a long objective shows a toggle that expands and collapses the body", () => {
-    const longObjective = "x ".repeat(400).trim();
-    const restore = installOverflow(longObjective);
+  const longObjective = "x ".repeat(400).trim();
+
+  test("is a section heading, like the timeline below it", () => {
+    render(<SubagentDetailPanel entry={makeEntry()} onClose={noop} />);
+    const headings = screen
+      .getAllByRole("heading", { level: 3 })
+      .map((h) => h.textContent);
+    expect(headings).toContain("Objective");
+    expect(headings).toContain("Timeline");
+  });
+
+  test("a long objective folds behind the shared Show more, which opens and closes it", () => {
+    const restore = stubOverflow((el) => el.textContent === longObjective);
     try {
       render(
         <SubagentDetailPanel
@@ -390,18 +381,8 @@ describe("SubagentDetailPanel — objective", () => {
         />,
       );
 
-      const body = screen.getByText(longObjective);
-      // Collapsed by default: clamped and offering "Show more".
-      expect(body.className).toContain("line-clamp-5");
-      const toggle = screen.getByText("Show more");
-
-      fireEvent.click(toggle);
-      // Expanded: clamp removed and the affordance flips to "Show less".
+      fireEvent.click(screen.getByText("Show more"));
       expect(screen.getByText("Show less")).toBeDefined();
-      expect(screen.getByText(longObjective).className).not.toContain(
-        "line-clamp-5",
-      );
-
       fireEvent.click(screen.getByText("Show less"));
       expect(screen.getByText("Show more")).toBeDefined();
     } finally {
@@ -410,7 +391,7 @@ describe("SubagentDetailPanel — objective", () => {
   });
 
   test("a short objective renders no toggle", () => {
-    const restore = installOverflow("never-matches");
+    const restore = stubOverflow(() => false);
     try {
       render(
         <SubagentDetailPanel
@@ -426,14 +407,12 @@ describe("SubagentDetailPanel — objective", () => {
     }
   });
 
-  test("switching to a different subagent resets the expanded objective state", () => {
+  test("an objective opened for one subagent is folded again for the next", () => {
     // The desktop parent reuses this component instance across subagent
-    // switches (no React `key`). Expand the first subagent's long objective,
-    // then re-render the SAME instance with a different subagent whose
-    // objective is short. The expand state must reset and re-measure: the new
-    // objective renders collapsed with no toggle.
-    const longObjective = "x ".repeat(400).trim();
-    const restore = installOverflow(longObjective);
+    // switches (no React `key`), so the objective's own open state has to
+    // reset when the subagent changes, including when the next subagent's
+    // objective is byte-identical.
+    const restore = stubOverflow((el) => el.textContent === longObjective);
     try {
       const { rerender } = render(
         <SubagentDetailPanel
@@ -441,67 +420,26 @@ describe("SubagentDetailPanel — objective", () => {
           onClose={noop}
         />,
       );
-
-      // Expand the first subagent's objective.
       fireEvent.click(screen.getByText("Show more"));
       expect(screen.getByText("Show less")).toBeDefined();
-      expect(screen.getByText(longObjective).className).not.toContain(
-        "line-clamp-5",
-      );
 
-      // Switch to a different subagent with a short objective. Same instance,
-      // different `entry.subagentId`.
-      rerender(
-        <SubagentDetailPanel
-          entry={makeEntry({ subagentId: "sub-2", objective: "Short" })}
-          onClose={noop}
-        />,
-      );
-
-      // State reset + re-measured: collapsed, no stale "Show less"/toggle.
-      const shortBody = screen.getByText("Short");
-      expect(shortBody.className).toContain("line-clamp-5");
-      expect(screen.queryByText("Show less")).toBeNull();
-      expect(screen.queryByText("Show more")).toBeNull();
-    } finally {
-      restore();
-    }
-  });
-
-  test("re-measures overflow when switching to a different subagent with identical objective text", () => {
-    // The render-phase reset forces `objectiveOverflows` to `false` on every
-    // subagent switch. If the measurement effect only depended on the
-    // objective text + expanded flag, switching from subagent A to a DIFFERENT
-    // subagent B with byte-identical (still overflowing) objective text would
-    // change neither dep, the effect would skip, and the toggle would vanish.
-    // Depending on `entry.subagentId` forces a re-measure so "Show more"
-    // survives the switch.
-    const longObjective = "x ".repeat(400).trim();
-    const restore = installOverflow(longObjective);
-    try {
-      const { rerender } = render(
-        <SubagentDetailPanel
-          entry={makeEntry({ subagentId: "sub-1", objective: longObjective })}
-          onClose={noop}
-        />,
-      );
-
-      // Subagent A: overflowing objective offers the toggle.
-      expect(screen.getByText("Show more")).toBeDefined();
-
-      // Switch to a DIFFERENT subagent with an IDENTICAL objective string.
       rerender(
         <SubagentDetailPanel
           entry={makeEntry({ subagentId: "sub-2", objective: longObjective })}
           onClose={noop}
         />,
       );
-
-      // Re-measured despite identical text: the toggle is still present.
       expect(screen.getByText("Show more")).toBeDefined();
-      expect(screen.getByText(longObjective).className).toContain(
-        "line-clamp-5",
+      expect(screen.queryByText("Show less")).toBeNull();
+
+      rerender(
+        <SubagentDetailPanel
+          entry={makeEntry({ subagentId: "sub-3", objective: "Short" })}
+          onClose={noop}
+        />,
       );
+      expect(screen.queryByText("Show more")).toBeNull();
+      expect(screen.queryByText("Show less")).toBeNull();
     } finally {
       restore();
     }
@@ -509,39 +447,51 @@ describe("SubagentDetailPanel — objective", () => {
 });
 
 /**
- * A `tool_call`/`tool_result` pair whose `toolUseId` matches the id the stubbed
- * timeline forwards (`tool-1`), so `buildSubagentStepDetails(entry)` produces a
- * payload the panel can swap into. `completed` overrides whether the call has a
- * result (closed) or is still in flight (running output state).
+ * A bash call whose id matches the id the stubbed timeline forwards (`tool-1`),
+ * in both the timeline events and the history the nested detail reads.
+ * `completed` overrides whether the call has a result (closed) or is still in
+ * flight (running output state).
  */
 function entryWithTool(completed: boolean): SubagentEntry {
   const now = Date.now();
-  return makeEntry({
-    events: [
-      {
-        id: "te-call",
-        type: "tool_call",
-        content: "ls -la",
-        toolName: "bash",
-        toolUseId: "tool-1",
-        input: { command: "ls -la" },
-        timestamp: now,
-      },
-      ...(completed
-        ? [
-            {
-              id: "te-result",
-              type: "tool_result" as const,
-              content: "file-listing-output",
-              result: "file-listing-output",
-              toolName: "bash",
-              toolUseId: "tool-1",
-              timestamp: now + 1000,
-            },
-          ]
-        : []),
-    ],
-  });
+  const toolCall: ChatMessageToolCall = {
+    id: "tool-1",
+    name: "bash",
+    input: { command: "ls -la" },
+    startedAt: now,
+    ...(completed
+      ? { result: "file-listing-output", completedAt: now + 1000 }
+      : {}),
+  };
+  return withToolCalls(
+    makeEntry({
+      events: [
+        {
+          id: "te-call",
+          type: "tool_call",
+          content: "ls -la",
+          toolName: "bash",
+          toolUseId: "tool-1",
+          input: { command: "ls -la" },
+          timestamp: now,
+        },
+        ...(completed
+          ? [
+              {
+                id: "te-result",
+                type: "tool_result" as const,
+                content: "file-listing-output",
+                result: "file-listing-output",
+                toolName: "bash",
+                toolUseId: "tool-1",
+                timestamp: now + 1000,
+              },
+            ]
+          : []),
+      ],
+    }),
+    [toolCall],
+  );
 }
 
 /**
@@ -570,36 +520,185 @@ Content:
 The extracted article body.
 </external_content>`;
 
+/** A single timeline event, so the panel renders its (stubbed) timeline. */
+const TOOL_EVENT: SubagentEntry["events"][number] = {
+  id: "te-call",
+  type: "tool_call",
+  content: "",
+  timestamp: 0,
+};
+
 /**
- * A `web_fetch` call/result pair keyed `fetch-1` (the id the stubbed timeline's
- * fetch pill forwards), so `buildSubagentStepDetails` yields a `web_fetch`
- * payload the panel routes to `WebFetchDetailView`.
+ * A settled `web_fetch` call keyed `fetch-1` (the id the stubbed timeline's
+ * fetch pill forwards), which the panel routes to `WebFetchDetailView`.
  */
 function entryWithWebFetch(): SubagentEntry {
   const now = Date.now();
-  return makeEntry({
-    events: [
-      {
-        id: "te-wf-call",
-        type: "tool_call",
-        content: "{}",
-        toolName: "web_fetch",
-        toolUseId: "fetch-1",
-        input: { url: "https://www.example.com/article" },
-        timestamp: now,
-      },
-      {
-        id: "te-wf-res",
-        type: "tool_result",
-        content: WEB_FETCH_RESULT,
-        result: WEB_FETCH_RESULT,
-        toolName: "web_fetch",
-        toolUseId: "fetch-1",
-        timestamp: now + 1000,
-      },
-    ],
-  });
+  return withToolCalls(makeEntry({ events: [TOOL_EVENT] }), [
+    {
+      id: "fetch-1",
+      name: "web_fetch",
+      input: { url: "https://www.example.com/article" },
+      startedAt: now,
+      result: WEB_FETCH_RESULT,
+      completedAt: now + 1000,
+    },
+  ]);
 }
+
+describe("SubagentDetailPanel: nested detail reads the live call", () => {
+  test("the drawer shows the call's risk level and streamed output, then its result", () => {
+    const entry = withToolCalls(makeEntry({ events: [TOOL_EVENT] }), [
+      {
+        id: "tool-1",
+        name: "bash",
+        input: { command: "npm test" },
+        startedAt: Date.now(),
+        riskLevel: "high",
+        streamedOutput: "partial-output",
+      },
+    ]);
+    render(<SubagentDetailPanel entry={entry} onClose={noop} />);
+    fireEvent.click(screen.getByTestId("timeline-pill"));
+
+    expect(
+      screen.getByTestId("risk-badge").getAttribute("data-risk-level"),
+    ).toBe("high");
+    expect(screen.getByText("partial-output")).toBeDefined();
+
+    // The result lands on the subagent's history while the drawer is open.
+    act(() => {
+      withToolCalls(entry, [
+        {
+          id: "tool-1",
+          name: "bash",
+          input: { command: "npm test" },
+          startedAt: 1,
+          completedAt: 2,
+          riskLevel: "high",
+          result: "all-tests-passed",
+        },
+      ]);
+    });
+    expect(screen.getByText("all-tests-passed")).toBeDefined();
+    expect(screen.queryByTestId("nested-detail-running")).toBeNull();
+  });
+
+  test("a web search shows the query and sources from its activity metadata", () => {
+    const entry = withToolCalls(makeEntry({ events: [TOOL_EVENT] }), [
+      {
+        id: "tool-1",
+        name: "web_search",
+        input: { query: "vellum" },
+        startedAt: 1,
+        completedAt: 2,
+        result: "unparsed provider text",
+        activityMetadata: {
+          webSearch: {
+            query: "vellum assistant",
+            provider: "brave",
+            resultCount: 1,
+            durationMs: 1,
+            results: [
+              {
+                rank: 1,
+                title: "Vellum",
+                url: "https://vellum.ai",
+                domain: "vellum.ai",
+              },
+            ],
+          },
+        },
+      },
+    ]);
+    render(<SubagentDetailPanel entry={entry} onClose={noop} />);
+    fireEvent.click(screen.getByTestId("timeline-pill"));
+
+    expect(screen.getByText("vellum assistant")).toBeDefined();
+    expect(screen.getByText("Sources (1)")).toBeDefined();
+    expect(screen.queryByText("unparsed provider text")).toBeNull();
+  });
+
+  test("a pill whose call is only in the timeline events opens the event-built detail", () => {
+    const events: SubagentEntry["events"] = [
+      {
+        id: "te-call",
+        type: "tool_call",
+        content: "ls",
+        toolName: "bash",
+        toolUseId: "tool-1",
+        input: { command: "ls" },
+        timestamp: 0,
+      },
+      {
+        id: "te-result",
+        type: "tool_result",
+        content: "event-output",
+        result: "event-output",
+        toolName: "bash",
+        toolUseId: "tool-1",
+        timestamp: 10,
+      },
+    ];
+    // History is present but keyed by an id the events never carried (a
+    // positional id from an older assistant), so the canonical lookup misses.
+    const entry = withToolCalls(makeEntry({ events }), [
+      {
+        id: "tool-history-msg-1-0",
+        name: "bash",
+        input: { command: "ls" },
+        result: "canonical-output",
+      },
+    ]);
+    render(<SubagentDetailPanel entry={entry} onClose={noop} />);
+    fireEvent.click(screen.getByTestId("timeline-pill"));
+
+    expect(screen.queryByTestId("timeline")).toBeNull();
+    expect(screen.getByText("event-output")).toBeDefined();
+  });
+
+  test("a finished event-built detail wins over a canonical copy still running", () => {
+    const events: SubagentEntry["events"] = [
+      {
+        id: "te-call",
+        type: "tool_call",
+        content: "ls",
+        toolName: "bash",
+        toolUseId: "tool-1",
+        input: { command: "ls" },
+        timestamp: 0,
+      },
+      {
+        id: "te-result",
+        type: "tool_result",
+        content: "event-output",
+        result: "event-output",
+        toolName: "bash",
+        toolUseId: "tool-1",
+        timestamp: 10,
+      },
+    ];
+    // Seeded from a snapshot older than the result the timeline already has.
+    const entry = withToolCalls(makeEntry({ events }), [
+      { id: "tool-1", name: "bash", input: { command: "ls" } },
+    ]);
+    render(<SubagentDetailPanel entry={entry} onClose={noop} />);
+    fireEvent.click(screen.getByTestId("timeline-pill"));
+
+    expect(screen.getByText("event-output")).toBeDefined();
+  });
+
+  test("a pill with nothing behind it in either source stays on the timeline", () => {
+    render(
+      <SubagentDetailPanel
+        entry={makeEntry({ events: [TOOL_EVENT] })}
+        onClose={noop}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("timeline-pill"));
+    expect(screen.getByTestId("timeline")).toBeDefined();
+  });
+});
 
 describe("SubagentDetailPanel — nested tool detail", () => {
   test("the top-level timeline view shows no breadcrumb", () => {
@@ -645,6 +744,27 @@ describe("SubagentDetailPanel — nested tool detail", () => {
     // shows the icon, not the running indicator.
     expect(screen.queryByTestId("avatar")).toBeNull();
     expect(screen.queryByTestId("nested-detail-running")).toBeNull();
+  });
+
+  test("an opened objective is still open after a step's detail and Back", () => {
+    const longObjective = "x ".repeat(400).trim();
+    const restore = stubOverflow((el) => el.textContent === longObjective);
+    try {
+      render(
+        <SubagentDetailPanel
+          entry={{ ...entryWithTool(true), objective: longObjective }}
+          onClose={noop}
+        />,
+      );
+      fireEvent.click(screen.getByText("Show more"));
+
+      fireEvent.click(screen.getByTestId("timeline-pill"));
+      fireEvent.click(screen.getByLabelText("Back to timeline"));
+
+      expect(screen.getByText("Show less")).toBeDefined();
+    } finally {
+      restore();
+    }
   });
 
   test("'Back' restores the timeline view", () => {
@@ -708,7 +828,7 @@ describe("SubagentDetailPanel — nested tool detail", () => {
 
     rerender(
       <SubagentDetailPanel
-        entry={{ ...entryWithTool(true), subagentId: "sub-2" }}
+        entry={makeEntry({ subagentId: "sub-2", events: [TOOL_EVENT] })}
         onClose={noop}
       />,
     );
@@ -734,6 +854,10 @@ describe("SubagentDetailPanel — nested tool detail", () => {
     ).toBeDefined();
     expect(screen.queryByText("Technical details")).toBeNull();
     expect(screen.queryByText("Output")).toBeNull();
+    // Headed "Thinking" (header and breadcrumb), as every panel heads a
+    // thinking step, not with the "Thought" its payload was built with.
+    expect(screen.getAllByText("Thinking")).toHaveLength(2);
+    expect(screen.queryByText("Thought")).toBeNull();
 
     // Back returns to the timeline.
     fireEvent.click(screen.getByLabelText("Back to timeline"));

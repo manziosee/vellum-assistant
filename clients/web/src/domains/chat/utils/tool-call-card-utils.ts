@@ -14,11 +14,12 @@ import {
 import type {
   ToolActivityMetadata,
   WebSearchResultItem,
-} from "@/assistant/web-activity-types";
+} from "@vellumai/assistant-api";
 import {
   deriveStepLabel,
   type IconName,
 } from "@/domains/chat/components/tool-progress-card/derive-step-label";
+import type { ActionDisplayKey } from "@/domains/chat/components/tool-progress-card/action-display-label";
 import { isSubagentSpawnCall } from "@/domains/chat/transcript/message-content";
 import { readToolInputString } from "@/domains/chat/utils/tool-input";
 import { thinkingPreview } from "@/domains/chat/utils/thinking-preview";
@@ -106,8 +107,7 @@ export type ToolCallCardStep =
       /**
        * Stable key (the originating `tool_call`'s `toolUseId`) that lets the
        * subagent timeline render this search as a clickable pill opening its
-       * nested query + sources detail — matching the key
-       * `buildSubagentStepDetails` emits. Unset for main-chat builders, whose
+       * nested query + sources detail. Unset for main-chat builders, whose
        * searches aren't clickable.
        */
       detailKey?: string;
@@ -141,6 +141,7 @@ export type ToolCallCardStep =
        * fallback used when no activity sentence is present.
        */
       activity: string;
+      actionDisplayKey?: ActionDisplayKey;
       /** Daemon-assigned risk level for the call (e.g. `"low"`), when present. */
       riskLevel?: string;
       iconName: IconName;
@@ -173,6 +174,7 @@ export interface ToolCallCardData {
    * per-kind table in `deriveCurrentStepInfo`.
    */
   currentStepInfo: string;
+  currentStepActionDisplayKey?: ActionDisplayKey;
   /**
    * Kind of the latest step driving the header. `"thinking"` when the run's
    * last built step is a thinking segment (so the card can render a brain
@@ -540,13 +542,35 @@ function computeTotalDurationLabel(
  * drawer payload construction lives in one place. Reuses the same
  * `deriveStepLabel` / status / duration derivations the card row uses, so the
  * drawer opens with identical title/activity/status/duration regardless of
- * which affordance the user clicks.
+ * which affordance the user clicks. A web search carries the query and sources
+ * of the same step the card builds for it, so its drawer shows them rather than
+ * raw input and output; a failed one keeps the generic body, where its error
+ * reads in full.
  */
 export function toolDetailPayloadFromToolCall(
   tc: ChatMessageToolCall,
 ): ToolDetailPayload {
   const { title, activity } = deriveStepLabel(tc);
+  const searchStep =
+    tc.name === "web_search" ? buildStepForToolCall(tc, {}) : null;
+  const search: Pick<
+    ToolDetailPayload,
+    "kind" | "searchQuery" | "searchResults"
+  > =
+    searchStep?.kind === "web_search"
+      ? {
+          kind: "web_search",
+          searchQuery:
+            tc.activityMetadata?.webSearch?.query ||
+            readToolInputString(tc.input ?? {}, "query"),
+          searchResults: [
+            ...searchStep.results,
+            ...(searchStep.overflowResults ?? []),
+          ],
+        }
+      : {};
   return {
+    ...search,
     toolCallId: tc.id,
     toolName: tc.name,
     title,
@@ -554,6 +578,8 @@ export function toolDetailPayloadFromToolCall(
     input: tc.input ?? {},
     result: tc.result,
     streamedOutput: tc.streamedOutput,
+    activityMetadata: tc.activityMetadata,
+    answeredQuestion: tc.answeredQuestion,
     status: deriveToolStepStatus(tc),
     riskLevel: tc.riskLevel,
     riskReason: tc.riskReason,
@@ -562,7 +588,8 @@ export function toolDetailPayloadFromToolCall(
 }
 
 function buildToolStep(tc: ChatMessageToolCall): ToolCallCardStep {
-  const { title, info, activity, iconName } = deriveStepLabel(tc);
+  const { title, info, activity, actionDisplayKey, iconName } =
+    deriveStepLabel(tc);
   return {
     kind: "tool",
     durationLabel: computeToolDurationLabel(tc),
@@ -570,11 +597,21 @@ function buildToolStep(tc: ChatMessageToolCall): ToolCallCardStep {
     title,
     info,
     activity,
+    actionDisplayKey,
     riskLevel: tc.riskLevel,
     iconName,
     toolCallId: tc.id,
     status: deriveToolStepStatus(tc),
   };
+}
+
+function deriveActionDisplayLabel(
+  toolCall: ChatMessageToolCall | undefined,
+): ReturnType<typeof deriveStepLabel> | undefined {
+  if (!toolCall || isWebTool(toolCall)) {
+    return undefined;
+  }
+  return deriveStepLabel(toolCall);
 }
 
 // ---------------------------------------------------------------------------
@@ -786,6 +823,8 @@ export interface ToolCallCardDataOptions {
    * header title stands in for it, and that title has to change with the rest.
    */
   hideThinkingUi?: boolean;
+  /** The owning transcript group is the active trailing group for this turn. */
+  active?: boolean;
 }
 
 export type ToolCallCardItem =
@@ -900,7 +939,10 @@ export function computeToolCallCardDataFromItems(
     }
   }
 
-  const state = deriveCardState(renderableToolCalls);
+  const state = combineCardStates([
+    deriveCardState(renderableToolCalls),
+    ...(options.active ? (["loading"] as const) : []),
+  ]);
 
   // The collapsed header reflects the LATEST built step. When the run ends in
   // a genuine thinking segment (e.g. `tool → thinking`), the header carousels
@@ -910,6 +952,7 @@ export function computeToolCallCardDataFromItems(
   // synthetic web placeholders are preserved.
   let currentStepTitle: string;
   let currentStepInfo: string;
+  let currentStepActionDisplayKey: ActionDisplayKey | undefined;
   let currentStepKind: "thinking" | "tool";
   if (trailingThinkingText !== null) {
     currentStepTitle = "Thinking";
@@ -925,6 +968,10 @@ export function computeToolCallCardDataFromItems(
       renderableToolCalls,
       liveWebActivity,
     );
+    const latestLabel = deriveActionDisplayLabel(renderableToolCalls.at(-1));
+    currentStepActionDisplayKey = latestLabel?.activity
+      ? undefined
+      : latestLabel?.actionDisplayKey;
     currentStepKind = "tool";
   }
 
@@ -938,6 +985,7 @@ export function computeToolCallCardDataFromItems(
   return {
     currentStepTitle,
     currentStepInfo,
+    currentStepActionDisplayKey,
     currentStepKind,
     stepCount,
     totalDurationLabel,

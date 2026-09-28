@@ -142,10 +142,12 @@ import {
   endLiveVoiceSession,
   getLiveVoiceInputAmplitude,
   getLiveVoiceOutputAmplitude,
+  isOnToolStep,
   liveVoiceSurfaceLabelKey,
   minimizeVoiceRoom,
   setLiveVoiceMuted,
   setLiveVoiceOutputMuted,
+  takeLiveVoiceCameraLookRequest,
   useLiveVoiceStore,
 } from "@/domains/chat/voice/live-voice/live-voice-store";
 import { FrameGateHud } from "@/domains/chat/frame-gate-hud";
@@ -160,6 +162,10 @@ import { useResolvedAssistantsStore } from "@/stores/resolved-assistants-store";
 import { useVoicePrefsStore } from "@/stores/voice-prefs-store";
 import { toneForBg } from "@/utils/avatar-tone";
 
+import {
+  CameraExplainer,
+  type CameraExplainerDismissal,
+} from "./camera-explainer";
 import {
   CameraFlashControl,
   liveFlashMode,
@@ -189,6 +195,7 @@ import { toRoomLocal, useRoomBox } from "./use-room-box";
 
 import {
   CAMERA_PILL_INSET,
+  CAMERA_ROW_FLANK_INSET,
   SAFE_AREA_BOTTOM,
   SAFE_AREA_LEFT,
   SAFE_AREA_RIGHT,
@@ -281,7 +288,7 @@ export type VoiceRoomVariant = "fullscreen" | "content" | "sheet";
  * (`z-40` in `chat-layout.tsx`) and, above that, the search palette (`z-50` in
  * `command-palette.tsx`, which also has to clear the drawer it opens over).
  * `z-30` is the shared tier for mobile surfaces that sit under the header, the
- * same one `mobile-app-overlay.tsx` and `mobile-document-overlay.tsx` use.
+ * same one `mobile-app-overlay.tsx` and `mobile-workspace-file-preview-overlay.tsx` use.
  *
  * This only orders the sheet against the app's own chrome. Menus and sheets
  * opened FROM the header (the conversation actions menu, the notifications
@@ -356,6 +363,46 @@ function isTextControl(target: EventTarget | null): boolean {
     target.tagName === "TEXTAREA" ||
     (target instanceof HTMLElement && target.isContentEditable)
   );
+}
+
+/**
+ * What a dialog layered over the room dims it with: the two scrims the design
+ * library's overlay primitives draw, and the dismiss backdrop the camera's view
+ * options portal beside their panel. None of them is inside the dialog it
+ * belongs to, so a press on one reaches none of the handlers that content
+ * carries.
+ *
+ * Each names itself with a slot, the way the library's own overlays do.
+ */
+const NESTED_DIALOG_SCRIM_SELECTOR = `[data-slot="bottom-sheet-overlay"], [data-slot="modal-overlay"], [data-slot="camera-view-settings-backdrop"]`;
+
+/**
+ * Whether an element sits inside a dialog layered over the room.
+ *
+ * The room's own dialog carries {@link ROOM_DIALOG_ATTR} in every variant, so a
+ * `role="dialog"` ancestor without it is something above the room, and what is
+ * above the room owns what lands on it. The pointer and the key ask the same
+ * question, so they ask it here.
+ */
+function isInsideLayeredDialog(element: Element | null): boolean {
+  const owner = element?.closest(`[role="dialog"]`) ?? null;
+  return owner !== null && !owner.hasAttribute(ROOM_DIALOG_ATTR);
+}
+
+/**
+ * Whether a press landed on a dialog layered over the room, scrim included.
+ *
+ * The scrims name themselves, since none of them is inside the dialog it
+ * belongs to; anything else is placed by {@link isInsideLayeredDialog}.
+ */
+function isNestedDialogSurface(target: EventTarget | null): boolean {
+  if (!(target instanceof Element)) {
+    return false;
+  }
+  if (target.closest(NESTED_DIALOG_SCRIM_SELECTOR)) {
+    return true;
+  }
+  return isInsideLayeredDialog(target);
 }
 
 /**
@@ -528,6 +575,11 @@ function VoiceRoomSheet({
           if (isTextControl(event.target)) {
             return;
           }
+          // A dialog layered over the room owns every press on its own
+          // surface, the scrim included, the way it owns Escape.
+          if (isNestedDialogSurface(event.target)) {
+            return;
+          }
           dragControls.start(event);
         }}
         draggable={false}
@@ -609,6 +661,8 @@ function VoiceRoomOverlay({ variant }: { variant: VoiceRoomVariant }) {
   // `speaking` stays set across a mid-turn tool run; gate `responding` on audio
   // actually flowing so the room reads `thinking` while the tool works.
   const assistantAudioActive = useLiveVoiceStore.use.assistantAudioActive();
+  const responsePhase = useLiveVoiceStore.use.responsePhase();
+  const onToolStep = useLiveVoiceStore(isOnToolStep);
   const liveAssistantId = useLiveVoiceStore.use.assistantId();
   const muted = useLiveVoiceStore.use.muted();
   // Muting the assistant needs no hands-free gate: it silences the output
@@ -659,6 +713,8 @@ function VoiceRoomOverlay({ variant }: { variant: VoiceRoomVariant }) {
     reconnecting,
     assistantAudioActive,
     muted,
+    responsePhase,
+    onToolStep,
   );
   const stateLabel = stateLabelKey ? t(stateLabelKey) : "";
 
@@ -673,6 +729,11 @@ function VoiceRoomOverlay({ variant }: { variant: VoiceRoomVariant }) {
   // Where the view-options panel renders. See the host element near the foot
   // of the room, and {@link VIEW_OPTIONS_HOST_LAYER}.
   const [viewOptionsHost, setViewOptionsHost] = useState<HTMLDivElement | null>(
+    null,
+  );
+  // Where the "Photo or Live?" explainer renders. A box of its own rather than
+  // the one above, which is zero-size and so no containing block for a scrim.
+  const [explainerHost, setExplainerHost] = useState<HTMLDivElement | null>(
     null,
   );
 
@@ -705,6 +766,28 @@ function VoiceRoomOverlay({ variant }: { variant: VoiceRoomVariant }) {
   // as the status pill's word below.
   const errorMessage = errorKey ? t(errorKey) : null;
   const cameraOpen = camera.open;
+  // Whether the viewfinder has a decoded frame on screen. The feed is
+  // transparent until it does, so this is what tells the look whether it is
+  // still the thing being seen. The `<video>` raises it on `loadeddata` and
+  // drops it on `emptied`, which is what a flip's release of the stream fires
+  // (`stopCapture` clears `srcObject`) before the replacement stream decodes
+  // its own first frame.
+  const [feedHasFrame, setFeedHasFrame] = useState(false);
+  // Closing unmounts the element, so nothing fires `emptied` on the way out.
+  useEffect(() => {
+    if (!cameraOpen) {
+      setFeedHasFrame(false);
+    }
+  }, [cameraOpen]);
+  // A flip takes the stream away before it asks for the other camera, so the
+  // frame the flag stands for is gone the moment the flip starts. Keyed on the
+  // flag rather than hung off the flip control, so a flip started anywhere
+  // reaches it.
+  useEffect(() => {
+    if (camera.flipping) {
+      setFeedHasFrame(false);
+    }
+  }, [camera.flipping]);
   // Sight rides the viewfinder the shutter already put on screen: while Live is
   // running the gate keeps the frames worth keeping and sends each one as it
   // lands, and the daemon persists it as its own message, so the call can be
@@ -755,6 +838,95 @@ function VoiceRoomOverlay({ variant }: { variant: VoiceRoomVariant }) {
     }
     setLive(false);
   }, [roomVisible, setLive]);
+  // A spoken "look at this" or "stop looking": the session left the ask in the
+  // store because the camera is this room's, and the room may have been
+  // minimized or not yet mounted when it landed. Taken the moment the room
+  // sees it, so a room that mounts later never reopens the camera for an old
+  // ask; Live follows once the viewfinder is up, since Live on a closed camera
+  // is forced back off. A stop closes the viewfinder the way the camera
+  // control does, consent first.
+  //
+  // The ask to enter Live belongs to the open it started, and lasts no longer.
+  // `opening` while that open is in flight; `awaitingLive` once it settled, for
+  // as long as the viewfinder it put up stays up. An open that failed or was
+  // cancelled, or a viewfinder closed before Live could start, drops the ask:
+  // a later open is the user's own, for photos, and must not enter Live and
+  // start sending frames on the strength of an ask that already ran its
+  // course.
+  //
+  // The phase alone cannot say which open settled: a press on the camera
+  // control while the spoken open is still acquiring starts an open of its
+  // own, which the camera lets supersede the first. So each spoken open takes
+  // a token, anything that takes the camera out of the ask's hands (a press, a
+  // spoken stop) moves the token on, and only the open still holding it may
+  // arm Live.
+  const cameraLookRequest = useLiveVoiceStore.use.cameraLookRequest();
+  const [cameraLook, setCameraLook] = useState<
+    "idle" | "opening" | "awaitingLive"
+  >("idle");
+  const cameraLookOpenRef = useRef(0);
+  const dropCameraLook = useCallback(() => {
+    cameraLookOpenRef.current += 1;
+    setCameraLook("idle");
+  }, []);
+  // The camera control's open is the user's own, for photos.
+  const openCameraByHand = useCallback(() => {
+    dropCameraLook();
+    void open();
+  }, [dropCameraLook, open]);
+  useEffect(() => {
+    if (cameraLookRequest === null) {
+      return;
+    }
+    const request = takeLiveVoiceCameraLookRequest();
+    if (request === "stop") {
+      dropCameraLook();
+      if (cameraOpen) {
+        closeCamera();
+      }
+      return;
+    }
+    if (request !== "start" || !cameraSupported) {
+      return;
+    }
+    const attempt = ++cameraLookOpenRef.current;
+    if (cameraOpen) {
+      setCameraLook("awaitingLive");
+      return;
+    }
+    setCameraLook("opening");
+    // `open` settles after the camera has reported whether it came up, so the
+    // render this settles into reads the real `cameraOpen`.
+    void open().finally(() => {
+      if (cameraLookOpenRef.current !== attempt) {
+        return;
+      }
+      setCameraLook((current) =>
+        current === "opening" ? "awaitingLive" : current,
+      );
+    });
+  }, [
+    cameraLookRequest,
+    cameraSupported,
+    cameraOpen,
+    open,
+    closeCamera,
+    dropCameraLook,
+  ]);
+  useEffect(() => {
+    if (cameraLook !== "awaitingLive") {
+      return;
+    }
+    if (!cameraOpen) {
+      setCameraLook("idle");
+      return;
+    }
+    if (!liveAvailable) {
+      return;
+    }
+    setCameraLook("idle");
+    setLive(true);
+  }, [cameraLook, cameraOpen, liveAvailable, setLive]);
   // One value for what the camera is doing, read by the pill, the shutter, the
   // hint and the announcement alike, so no two of them can disagree about it.
   const cameraMode = live ? "live" : "photo";
@@ -768,6 +940,63 @@ function VoiceRoomOverlay({ variant }: { variant: VoiceRoomVariant }) {
   // Live cannot run there is nothing for either to show, so the corner carries
   // no button rather than a panel of switches that do nothing.
   const viewOptionsOffered = liveOffered;
+
+  // The "Photo or Live?" explainer, once per device. It is raised only once the
+  // preview has drawn, never before the camera control is pressed, which is
+  // what keeps it clear of the pre-permission rule in `docs/CAPACITOR.md`.
+  //
+  // Only where Live is offered: two cards describing a mode the user cannot
+  // reach advertise nothing. A spoken "look at this" that arms Live still gets
+  // it, since it is education rather than a gate; the offer to try Live is
+  // what goes, not the explainer.
+  const cameraExplainerSeen = useVoicePrefsStore.use.cameraExplainerSeen();
+  const markCameraExplainerSeen =
+    useVoicePrefsStore.use.markCameraExplainerSeen();
+  const [explainerOpen, setExplainerOpen] = useState(false);
+  // What "the preview is up" means on each path. The native shells draw theirs
+  // behind the web view the moment acquisition succeeds and raise no frame
+  // event to wait for; the browser's `<video>` takes the stream first and
+  // decodes a frame a beat later, and until it does the sheet would be over
+  // the look rather than over anything the camera sees. Same signal the look
+  // stands down on.
+  const previewDrawn = camera.native || feedHasFrame;
+  // Once per camera open. The seen flag is written on dismissal and covers
+  // every later open; this holds the frames in between. Both it and the sheet
+  // come down with the viewfinder, so nothing about one open reaches the next,
+  // and a flip's dropped frame cannot raise it a second time.
+  const explainerShown = useRef(false);
+  // The view options ride `liveOffered` alone while this also waits for a drawn
+  // preview, so on the browser path the panel can be open under the explainer,
+  // and it is still open and still working once the explainer goes.
+  useEffect(() => {
+    if (!cameraOpen) {
+      explainerShown.current = false;
+      setExplainerOpen(false);
+      return;
+    }
+    if (
+      !liveOffered ||
+      !previewDrawn ||
+      cameraExplainerSeen ||
+      explainerShown.current
+    ) {
+      return;
+    }
+    explainerShown.current = true;
+    setExplainerOpen(true);
+  }, [cameraOpen, liveOffered, previewDrawn, cameraExplainerSeen]);
+  // Every way out is a dismissal the device remembers; only one of them acts.
+  const dismissExplainer = useCallback(
+    (how: CameraExplainerDismissal) => {
+      setExplainerOpen(false);
+      markCameraExplainerSeen();
+      if (how === "tryLive" && liveOffered && !live) {
+        setLive(true);
+      }
+    },
+    [live, liveOffered, markCameraExplainerSeen, setLive],
+  );
+
   // The shutter's two acts, which are two different sentences rather than one
   // with the mode pushed into it.
   const shutterLabel = live
@@ -911,13 +1140,9 @@ function VoiceRoomOverlay({ variant }: { variant: VoiceRoomVariant }) {
       // Keyed on the focused dialog rather than the event target, which is what
       // keeps the unguarded behavior the room needs: the key still reaches us
       // when the composer textarea holds focus as the room opens, since that is
-      // inside no dialog at all. The room's own dialog carries
-      // {@link ROOM_DIALOG_ATTR} in every variant, including the sheet, whose
-      // Radix content is the dialog and takes focus on open.
+      // inside no dialog at all.
       const active = document.activeElement;
-      const owner =
-        active instanceof Element ? active.closest(`[role="dialog"]`) : null;
-      if (owner && !owner.hasAttribute(ROOM_DIALOG_ATTR)) {
+      if (isInsideLayeredDialog(active instanceof Element ? active : null)) {
         return;
       }
       event.preventDefault();
@@ -1021,46 +1246,85 @@ function VoiceRoomOverlay({ variant }: { variant: VoiceRoomVariant }) {
           state caption, and the eyes when the avatar has any). A custom-image
           avatar takes the same path with its sampled field color and no eyes,
           so nothing about the bands or the caption depends on avatar type; the
-          centered avatar below fills the middle in its place. */}
-      {!camera.native && look ? (
-        // Held back until the box is measured. That is one pre-paint commit, so the
-        // entrance still plays from the room's first painted frame, but it
-        // grows inside a real rectangle rather than a zero-sized one.
-        box ? (
-          <VoiceRoomColorLook
-            look={look}
-            visual={visual}
-            getAmplitude={getLiveVoiceInputAmplitude}
-            getResponseAmplitude={getLiveVoiceOutputAmplitude}
-            // While assistant captions are on, the transcript's lower zone
-            // already narrates the turn from the caption's own baseline, so the
-            // caption stands down rather than doubling it. The user-only caption
-            // pref leaves it up (a user pill alone doesn't name the assistant's
-            // state).
-            showStateCaption={!showAssistantTranscript}
-            entryOrigin={localEntryOrigin}
-            entrance={choreography.entrance}
-            viewport={box}
-          />
-        ) : null
-      ) : !camera.native ? (
-        <>
-          {/* No avatar resolved yet, so there is no field to paint. The bands
-              are the same component at the same edge; only the ink changes,
-              because the dark voice ink cannot be seen on the void. */}
-          <VoiceRoomAmbientBackground />
-          <VoiceRoomVoiceBands
-            visual={visual}
-            getAmplitude={getLiveVoiceInputAmplitude}
-            getResponseAmplitude={getLiveVoiceOutputAmplitude}
-            ink="accent"
-            viewport={box ?? undefined}
-          />
-          {!showAssistantTranscript ? (
-            <VoiceStateCaption visual={visual} />
-          ) : null}
-        </>
-      ) : null}
+          centered avatar below fills the middle in its place.
+
+          Held out of the paint while a decoded frame is on screen, so the room
+          keeps exactly one opaque layer under its rounded clip. That clip is
+          anti-aliased once per painted layer, so a second layer blends into the
+          first along the corner arc (and, where the box lands on fractional
+          device pixels, along the straight edges too) and draws a fringe around
+          the feed. Until the first frame decodes the viewfinder is transparent,
+          and a flip's release makes it transparent again, so the look is the
+          one layer there and stays up.
+
+          A flip is read from `camera.flipping` rather than from the feed's own
+          events, because it clears `srcObject` synchronously inside the press
+          and `emptied` is only delivered as a queued media task after it: the
+          flag is what is already true in the first commit the press produces,
+          and it stands until the replacement stream is assigned. The start of a
+          flip also drops `feedHasFrame` itself, so the two terms do not depend
+          on `emptied` beating the replacement camera's arrival: the frame flag
+          is already false by the commit that clears `flipping`, whichever of
+          the two lands first.
+
+          `visibility` rather than an unmount, because mounting is what plays the
+          entrance and the look has to come back without replaying it. The
+          wrapper carries no z-index, so it opens no stacking context and the
+          look's own `z-0` / `z-[1]` layers keep resolving against the room box,
+          under the feed at `z-[2]`; `absolute inset-0` hands it the room box's
+          own rect, so the geometry the look lays itself out against is the same
+          rectangle. */}
+      <div
+        data-testid="voice-room-look"
+        className={cn(
+          "absolute inset-0",
+          cameraOpen &&
+            !camera.native &&
+            feedHasFrame &&
+            !camera.flipping &&
+            "invisible",
+        )}
+      >
+        {!camera.native && look ? (
+          // Held back until the box is measured. That is one pre-paint commit, so the
+          // entrance still plays from the room's first painted frame, but it
+          // grows inside a real rectangle rather than a zero-sized one.
+          box ? (
+            <VoiceRoomColorLook
+              look={look}
+              visual={visual}
+              getAmplitude={getLiveVoiceInputAmplitude}
+              getResponseAmplitude={getLiveVoiceOutputAmplitude}
+              // While assistant captions are on, the transcript's lower zone
+              // already narrates the turn from the caption's own baseline, so the
+              // caption stands down rather than doubling it. The user-only caption
+              // pref leaves it up (a user pill alone doesn't name the assistant's
+              // state).
+              showStateCaption={!showAssistantTranscript}
+              entryOrigin={localEntryOrigin}
+              entrance={choreography.entrance}
+              viewport={box}
+            />
+          ) : null
+        ) : !camera.native ? (
+          <>
+            {/* No avatar resolved yet, so there is no field to paint. The bands
+                are the same component at the same edge; only the ink changes,
+                because the dark voice ink cannot be seen on the void. */}
+            <VoiceRoomAmbientBackground />
+            <VoiceRoomVoiceBands
+              visual={visual}
+              getAmplitude={getLiveVoiceInputAmplitude}
+              getResponseAmplitude={getLiveVoiceOutputAmplitude}
+              ink="accent"
+              viewport={box ?? undefined}
+            />
+            {!showAssistantTranscript ? (
+              <VoiceStateCaption visual={visual} />
+            ) : null}
+          </>
+        ) : null}
+      </div>
 
       {/* The browser-fallback viewfinder, when the camera is open.
 
@@ -1083,7 +1347,18 @@ function VoiceRoomOverlay({ variant }: { variant: VoiceRoomVariant }) {
 
           Muted + playsInline + autoPlay lets the fallback stream start inline;
           `aria-hidden` because a live camera feed has nothing to announce and
-          the controls below carry the accessible names. */}
+          the controls below carry the accessible names.
+
+          No surface of its own. A background here is a second opaque layer
+          under the room's rounded clip and fringes its corners exactly the way
+          the look does, in the room's dark instead of the avatar's tone. The
+          feed is left transparent and the look stands behind it until a frame
+          decodes, which is what covers the window between this element mounting
+          and the stream reaching it.
+
+          `loadeddata` is the first decoded frame; `emptied` is the stream being
+          taken away, which a flip does before it acquires the other camera. See
+          {@link feedHasFrame}. */}
       {cameraOpen && !camera.native ? (
         <video
           ref={viewfinderRef}
@@ -1092,6 +1367,8 @@ function VoiceRoomOverlay({ variant }: { variant: VoiceRoomVariant }) {
           autoPlay
           muted
           playsInline
+          onLoadedData={() => setFeedHasFrame(true)}
+          onEmptied={() => setFeedHasFrame(false)}
           className={cn(
             "absolute inset-0 z-[2] size-full object-cover",
             camera.facing === "user" && "-scale-x-100",
@@ -1231,7 +1508,17 @@ function VoiceRoomOverlay({ variant }: { variant: VoiceRoomVariant }) {
           style={{ left: VOICE_ROOM_CORNER_LEFT }}
           className="absolute top-[var(--room-chrome-top)] z-10 flex"
         >
-          <CameraViewSettings panelHost={viewOptionsHost} />
+          <CameraViewSettings
+            panelHost={viewOptionsHost}
+            // Nothing to reset beside it: the seen flag is already written, and
+            // every way out of a re-shown explainer does what it does on the
+            // first. Offered on the same signal the first open waits for, so
+            // the row is absent while the feed has yet to draw and the sheet
+            // never lands over the look rather than over the camera.
+            onShowExplainer={
+              previewDrawn ? () => setExplainerOpen(true) : undefined
+            }
+          />
         </div>
       ) : null}
 
@@ -1439,11 +1726,20 @@ function VoiceRoomOverlay({ variant }: { variant: VoiceRoomVariant }) {
               the shutter off-centre, and the shutter is the target the user
               reaches for without looking. */}
           {cameraOpen ? (
-            <div className="relative flex w-full items-center justify-center">
+            <div
+              className="relative flex w-full items-center justify-center"
+              style={
+                {
+                  "--camera-flank-inset": CAMERA_ROW_FLANK_INSET,
+                } as CSSProperties
+              }
+            >
               {/* Flash on the left, flip on the right, shutter between them:
                   the two things that change how the next photo comes out sit
                   either side of the one that takes it, and neither can be hit
-                  by a thumb reaching for the middle.
+                  by a thumb reaching for the middle. Both hang off one inset,
+                  {@link CAMERA_ROW_FLANK_INSET}, so the pair is a mirror image
+                  around the shutter.
 
                   Present only where it does something, which `flashOffered`
                   above decides: absent rather than a dead control the user has
@@ -1461,10 +1757,7 @@ function VoiceRoomOverlay({ variant }: { variant: VoiceRoomVariant }) {
                           : nextFlashMode(flashMode),
                       )
                     }
-                    // The design's own offset. It is not flip's on the other
-                    // side: the design places the two flanks independently, so
-                    // matching them to each other is a departure from it.
-                    className="absolute left-11"
+                    className="absolute left-[var(--camera-flank-inset)]"
                     testId="voice-room-flash"
                   />
                 </Tooltip>
@@ -1502,7 +1795,7 @@ function VoiceRoomOverlay({ variant }: { variant: VoiceRoomVariant }) {
                 label={t("voiceRoom.flipCamera")}
                 onClick={() => void camera.flipCamera()}
                 surface={controlSurface}
-                className="absolute right-[30px]"
+                className="absolute right-[var(--camera-flank-inset)]"
               >
                 <SwitchCamera className="size-5" />
               </VoiceRoomControl>
@@ -1584,7 +1877,7 @@ function VoiceRoomOverlay({ variant }: { variant: VoiceRoomVariant }) {
                 ? t("voiceRoom.closeCamera")
                 : t("voiceRoom.showCamera")
             }
-            onClick={() => (cameraOpen ? closeCamera() : void open())}
+            onClick={() => (cameraOpen ? closeCamera() : openCameraByHand())}
             pressed={cameraOpen}
             surface={controlSurface}
             data-testid="voice-room-camera-toggle"
@@ -1621,6 +1914,38 @@ function VoiceRoomOverlay({ variant }: { variant: VoiceRoomVariant }) {
           data-testid="camera-view-settings-host"
           className={cn("absolute left-0 top-0", VIEW_OPTIONS_HOST_LAYER)}
         />
+      ) : null}
+
+      {/* The explainer's own host, and the explainer inside it. In the room for
+          the reasons above; full-size, because the scrim and the panel are laid
+          out against it and a zero-size box would collapse both; and
+          press-through, so the shutter and the controls still answer a tap for
+          as long as the explainer is closed (it opts back in for itself).
+          Later than the host above, so it stacks over the panel inside their
+          shared tier. */}
+      {liveOffered ? (
+        <>
+          <div
+            ref={setExplainerHost}
+            data-testid="camera-explainer-host"
+            className={cn(
+              "pointer-events-none absolute inset-0",
+              VIEW_OPTIONS_HOST_LAYER,
+            )}
+          />
+          <CameraExplainer
+            open={explainerOpen}
+            host={explainerHost}
+            // The name lands mid-sentence here, so this fallback is lowercase
+            // where the pill's, which leads one, is not. Blank is the same as
+            // absent, as it is for the pill.
+            assistantName={
+              assistantName?.trim() || t("cameraExplainer.yourAssistant")
+            }
+            tryLiveOffered={!live}
+            onDismiss={dismissExplainer}
+          />
+        </>
       ) : null}
 
       {/* Screen readers get session-state changes here; the avatar is the

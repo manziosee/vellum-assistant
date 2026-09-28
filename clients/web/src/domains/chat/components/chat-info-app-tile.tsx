@@ -42,8 +42,8 @@ export function ChatInfoAppTile({
   const { t } = useTranslation("chat");
 
   const loadHtml = useCallback(
-    () => getCachedAppHtml(assistantId, app.id),
-    [assistantId, app.id],
+    () => getCachedAppHtml(assistantId, app.id, app.updatedAt),
+    [assistantId, app.id, app.updatedAt],
   );
 
   return (
@@ -81,7 +81,7 @@ export function ChatInfoAppTile({
       <Typography
         variant="body-small-default"
         title={app.name}
-        className="truncate text-[var(--content-tertiary)]"
+        className="truncate leading-normal text-[var(--content-tertiary)]"
       >
         {app.name}
       </Typography>

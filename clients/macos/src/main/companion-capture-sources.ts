@@ -38,6 +38,7 @@ import type {
 
 import { runAppleScript } from "./appleScriptExecutor";
 import log from "./logger";
+import type { HelperShareTarget } from "./share-targets";
 import { getSharedCuHelper } from "./sidecar/shared-cu-helper";
 
 /** Chrome, as `NSRunningApplication` names it and as AppleScript addresses it. */
@@ -625,32 +626,39 @@ const capturedFrameSchema = z.object({
 const SHARED_FRAME_MAX_WIDTH = 1600;
 const SHARED_FRAME_MAX_HEIGHT = 1000;
 
+/** How the helper is told which surface a request is about. */
+const helperTargetParams = (
+  target: WatchCaptureTarget,
+): { displayId: number } | { windowId: number } =>
+  target.kind === "display"
+    ? { displayId: target.displayId }
+    : { windowId: target.windowId };
+
 /**
  * One frame of a display or a window at a given size, or nothing when the
  * helper would not take it. The refusal is logged rather than thrown: both
  * callers ask for frames they can do without, and `what` is how the line says
- * which of them was asking.
+ * which of them was asking. `onError` hears why, for a caller that acts on
+ * the reason.
  */
 async function frameOf(
   target: WatchCaptureTarget,
   maxWidth: number,
   maxHeight: number,
   what: string,
+  onError?: (err: unknown) => void,
 ): Promise<ScreenCaptureFrame | null> {
-  const params =
-    target.kind === "display"
-      ? { displayId: target.displayId }
-      : { windowId: target.windowId };
   try {
     return capturedFrameSchema.parse(
       await getSharedCuHelper().call("capture.frame", {
-        ...params,
+        ...helperTargetParams(target),
         maxWidth,
         maxHeight,
       }),
     );
   } catch (err) {
     log.warn(`[companion] could not take a frame of ${what}:`, err);
+    onError?.(err);
     return null;
   }
 }
@@ -660,16 +668,19 @@ async function frameOf(
  * when it could not: the window has gone, the display was unplugged, or
  * Screen Recording is not granted. The refusal is logged rather than thrown,
  * since the caller shares frames on a cadence and one missed frame is not an
- * error the user needs to hear about.
+ * error the call should notice. `onError` hears the reason, since a missing
+ * grant is one the user does need to hear about.
  */
 export async function captureTargetFrame(
   target: WatchCaptureTarget,
+  onError?: (err: unknown) => void,
 ): Promise<ScreenCaptureFrame | null> {
   return frameOf(
     target,
     SHARED_FRAME_MAX_WIDTH,
     SHARED_FRAME_MAX_HEIGHT,
     "the shared target",
+    onError,
   );
 }
 
@@ -806,16 +817,72 @@ export async function locateOnTarget(
   target: WatchCaptureTarget,
   query: string,
 ): Promise<LocatedElement> {
-  const params =
-    target.kind === "display"
-      ? { displayId: target.displayId }
-      : { windowId: target.windowId };
   try {
     return locatedElementSchema.parse(
-      await getSharedCuHelper().call("ax.locate", { ...params, query }),
+      await getSharedCuHelper().call("ax.locate", {
+        ...helperTargetParams(target),
+        query,
+      }),
     );
   } catch (err) {
     log.warn(`[companion] could not locate ${JSON.stringify(query)}:`, err);
     return { found: false, reason: "no-tree" };
+  }
+}
+
+const targetElementsSchema = z.discriminatedUnion("found", [
+  z.object({
+    found: z.literal(true),
+    elements: z.array(
+      z.object({
+        label: z.string(),
+        role: z.string(),
+        section: z.string().optional(),
+        x: z.number(),
+        y: z.number(),
+        width: z.number(),
+        height: z.number(),
+      }),
+    ),
+    candidateCount: z.number().optional(),
+  }),
+  z.object({ found: z.literal(false) }),
+]);
+
+/** Every named control the helper can see on a shared surface. */
+export interface TargetElements {
+  elements: HelperShareTarget[];
+  /** How many there were, which can be more than `elements` carries. */
+  candidateCount: number;
+}
+
+/**
+ * The named controls on `target`, in screen points: the same set
+ * {@link locateOnTarget} resolves a name against, so a name offered from it
+ * is one a lookup can find.
+ *
+ * Never throws. A helper that will not answer is reported as null, the same
+ * as a surface with no tree: the caller goes on without offering names.
+ */
+export async function readTargetElements(
+  target: WatchCaptureTarget,
+): Promise<TargetElements | null> {
+  try {
+    const read = targetElementsSchema.parse(
+      await getSharedCuHelper().call(
+        "ax.candidates",
+        helperTargetParams(target),
+      ),
+    );
+    if (!read.found) {
+      return null;
+    }
+    return {
+      elements: read.elements,
+      candidateCount: read.candidateCount ?? read.elements.length,
+    };
+  } catch (err) {
+    log.warn("[companion] could not read the shared surface's controls:", err);
+    return null;
   }
 }

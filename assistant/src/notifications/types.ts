@@ -46,6 +46,21 @@ export type NotificationDeliveryResult = z.infer<
   typeof NotificationDeliveryResultSchema
 >;
 
+/**
+ * Strongest delivery proof the emit path can report. These are receipts,
+ * not intents: `client_os_posted` is reserved for a client ACK that the
+ * OS banner was posted, which this return path does not observe.
+ */
+export const NotificationReceiptClassSchema = z.enum([
+  "provider_accepted",
+  "gateway_accepted",
+  "client_os_posted",
+  "unknown",
+]);
+export type NotificationReceiptClass = z.infer<
+  typeof NotificationReceiptClassSchema
+>;
+
 // -- Channel adapter data shapes ----------------------------------------------
 
 export const DeliveryResultSchema = z.object({
@@ -99,6 +114,8 @@ export const ChannelDeliveryPayloadSchema = z.object({
   deepLinkTarget: z.record(z.string(), z.unknown()).optional(),
   contextPayload: z.record(z.string(), z.unknown()).optional(),
   urgency: UrgencySchema,
+  /** Local presentation resolved by the broadcaster, independent of urgency. */
+  silent: z.boolean().optional(),
   approvalContext: ApprovalUIMetadataSchema.optional(),
   accessRequestContext: AccessRequestPayloadSchema.optional(),
   /** Source reference for a tool-approval card, projected once by the

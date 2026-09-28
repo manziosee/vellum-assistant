@@ -6,6 +6,8 @@ import type {
   ConversationContentBlock,
   ConversationMessage,
   ConversationMessageSurface,
+  ModeSession,
+  ModeSessionActivity,
 } from "@vellumai/assistant-api";
 import type { ChatMessageToolCall } from "@/domains/chat/api/event-types";
 import type { AssistantTextVisibility } from "@/domains/chat/utils/assistant-text-visibility";
@@ -85,6 +87,10 @@ export interface DisplayMessage {
    * these as aliases so a live SSE row can merge into its collapsed history row.
    */
   mergedMessageIds?: string[];
+  /** Canonical recorded mode-session ownership for this display row. */
+  modeSession?: ModeSession;
+  /** Preserved activity bounds across same-owner history consolidation. */
+  modeSessionActivity?: ModeSessionActivity;
   /**
    * Client-generated correlation nonce, carried from the wire
    * `ConversationMessage["clientMessageId"]`. The originating client mints it
@@ -166,6 +172,10 @@ export interface DisplayMessage {
    *  Mirrors `ConversationMessage["noResponse"]`; renders as a quiet marker
    *  and counts as the turn's reply. */
   isNoResponse?: boolean;
+  /** Standalone ambient camera frame, identified by the wire `cameraFrame`
+   *  marker. The transcript folds frame runs into the following user row;
+   *  never inferred from text. */
+  isCameraFrame?: boolean;
   /** Whether this row's plain text is something the user reads. Mirrors
    *  `ConversationMessage["assistantTextVisibility"]` and the same field on
    *  `message_complete`; `"private"` marks a row whose prose is a scratchpad
@@ -182,6 +192,11 @@ export interface DisplayMessage {
    *  the upsell card instead of a persona bubble; other categories keep the
    *  plain rendering. */
   providerError?: { code?: string; category?: string };
+  /** The default profile key the Auto profile routed this turn to. Mirrors
+   *  `ConversationMessage["autoRoutedProfile"]` and the same field on
+   *  `message_complete`; set only on rows from a turn that ran on Auto, and
+   *  shown beside the timestamp so the pick is visible per message. */
+  autoRoutedProfile?: string;
   /** Unix ms at which the message was deleted on its channel after the
    *  daemon stored it. Mirrors `ConversationMessage["deletedAt"]`; renders as
    *  a tombstone in place of the stored content, which stays for Inspect. */

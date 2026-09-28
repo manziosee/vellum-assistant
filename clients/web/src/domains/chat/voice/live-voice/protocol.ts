@@ -5,8 +5,8 @@
  * `assistant/src/live-voice/protocol.ts`. Field names and shapes mirror that
  * module exactly so the browser client and daemon agree on the wire format.
  *
- * Pure module: no DOM / WebSocket imports. The one import below is a `type`,
- * so it is erased at build time and the module stays side-effect free.
+ * Pure module: no DOM / WebSocket imports. The imports below are types, so
+ * they are erased at build time and the module stays side-effect free.
  *
  * ## Framing
  *
@@ -19,6 +19,7 @@
  */
 
 import type { ClientOs } from "@/runtime/platform-detection";
+import type { ShareTargetSnapshot } from "@vellumai/ipc-contract";
 
 // ---------------------------------------------------------------------------
 // Client frames (text/JSON control frames; audio goes over binary frames)
@@ -83,11 +84,7 @@ export type LiveVoiceTurnDetectionMode = "manual" | "server_vad";
  * unknown downstream rather than failing the session.
  */
 export type LiveVoiceEntry =
-  | "composer"
-  | "companion"
-  | "voice_key"
-  | "voice_key_ask"
-  | "deep_link";
+  "composer" | "companion" | "voice_key" | "voice_key_ask" | "deep_link";
 
 export interface LiveVoiceClientStartFrame {
   readonly type: "start";
@@ -138,7 +135,26 @@ export interface LiveVoiceClientStartFrame {
    * back on `ready` as `audioInput: false`.
    */
   readonly textInput?: boolean;
+  /**
+   * The session controls this client carries out when a reply asks for one
+   * (see {@link LiveVoiceSessionControlServerFrame}). The assistant is taught
+   * only these, so it never says it ended a call this client cannot end.
+   * An older assistant ignores the field and never sends the frame.
+   */
+  readonly sessionControls?: readonly LiveVoiceSessionControl[];
+  /**
+   * This client sends a fresh `sight_frame` with reason `look` right after it
+   * carries out a look control, whether or not a share or the camera was
+   * already running, and the assistant answers the look from that frame
+   * without waiting for the user to speak again. An older assistant ignores
+   * the field and the frame is only a frame.
+   */
+  readonly lookFrames?: boolean;
 }
+
+/** A session control this client carries out on the assistant's behalf. */
+export type LiveVoiceSessionControl =
+  "end" | "mute" | "look_screen" | "look_camera" | "look_stop";
 
 export interface LiveVoiceClientPttReleaseFrame {
   readonly type: "ptt_release";
@@ -153,15 +169,26 @@ export interface LiveVoiceClientEndFrame {
 }
 
 /**
- * Mid-session tuning update — retunes "pause before reply" / "interrupt
- * sensitivity" on the running server_vad session without reconnecting. Each
- * field is optional; the daemon applies changes from the next utterance.
+ * Mid-session screen-sharing state and turn-detection tuning. Each field
+ * is optional; the daemon applies changes from the next utterance.
  */
 export interface LiveVoiceClientUpdateConfigFrame {
   readonly type: "update_config";
   readonly silenceThresholdMs?: number;
   readonly bargeInMinSpeechMs?: number;
+  readonly screenSharing?: boolean;
+  /**
+   * The controls the shared surface offers to be pointed at, from its
+   * accessibility tree. `null` clears what the session holds. An assistant
+   * that predates the field ignores it.
+   */
+  readonly shareTargets?: ShareTargetSnapshot | null;
 }
+
+export type LiveVoiceSessionConfig = Omit<
+  LiveVoiceClientUpdateConfigFrame,
+  "type"
+>;
 
 /**
  * A photo taken while the call is running, identified by the id the normal
@@ -179,6 +206,26 @@ export interface LiveVoiceClientUpdateConfigFrame {
 export interface LiveVoiceClientAttachImageFrame {
   readonly type: "attach_image";
   readonly attachmentId: string;
+}
+
+export type LiveVoiceSightSource = "live" | "ambient";
+
+export interface LiveVoiceClientSightStartFrame {
+  readonly type: "sight_start";
+  readonly cameraEpoch: number;
+  readonly source?: LiveVoiceSightSource;
+}
+
+export interface LiveVoiceClientSightEndFrame {
+  readonly type: "sight_end";
+  readonly cameraEpoch: number;
+}
+
+export interface LiveVoiceClientSightFrameFrame {
+  readonly type: "sight_frame";
+  readonly attachmentId: string;
+  readonly cameraEpoch?: number;
+  readonly source?: LiveVoiceSightSource;
 }
 
 /**
@@ -205,6 +252,9 @@ export type LiveVoiceClientFrame =
   | LiveVoiceClientEndFrame
   | LiveVoiceClientUpdateConfigFrame
   | LiveVoiceClientAttachImageFrame
+  | LiveVoiceClientSightStartFrame
+  | LiveVoiceClientSightEndFrame
+  | LiveVoiceClientSightFrameFrame
   | LiveVoiceClientTextTurnFrame;
 
 // ---------------------------------------------------------------------------
@@ -226,6 +276,7 @@ const LIVE_VOICE_SERVER_FRAME_TYPES = [
   "tts_done",
   "turn_cancelled",
   "minimize_room",
+  "session_control",
   "metrics",
   "archived",
   "error",
@@ -254,6 +305,8 @@ export interface LiveVoiceReadyServerFrame extends LiveVoiceServerFrameBase {
    * that keeps this client from sending one it would reject.
    */
   readonly textInput?: boolean;
+  /** Whether this session accepts camera lifecycle epochs. */
+  readonly sightSessions?: boolean;
   /**
    * Whether the session's speech-to-text leg is live. Absent means yes: an
    * assistant that cannot transcribe refuses the session outright, so every
@@ -336,14 +389,26 @@ export interface LiveVoiceThinkingServerFrame extends LiveVoiceServerFrameBase {
  *
  * The wording is the daemon's, not this layer's, and that is deliberate: the
  * iOS Live Activity is driven both by this socket and by an APNs push the
- * daemon dispatches when this web layer is suspended, the two must carry
- * identical content state, and handing both the same string is the only way to
- * guarantee it. See `assistant/src/live-voice/activity-label.ts`.
+ * daemon dispatches when this web layer is suspended. Structured kinds let
+ * in-conversation surfaces use localized copy while system-level surfaces can
+ * suppress internal detail. See
+ * `assistant/src/live-voice/activity-label.ts`.
  */
 export interface LiveVoiceActivityServerFrame extends LiveVoiceServerFrameBase {
   readonly type: "activity";
   readonly turnId: string;
   readonly label: string;
+  /** Structured reason for the activity, when a client needs custom display. */
+  readonly kind?: "escalation";
+  /** Selected inference profile for diagnostics, never default UI copy. */
+  readonly profile?: string;
+  /** Why the selected profile won for this leg. */
+  readonly profileSource?:
+    | "conversation"
+    | "turn_override"
+    | "image_compatibility"
+    | "pre_model_hook"
+    | "call_site";
   /**
    * The confirmation this turn is blocked on, when the label describes a wait
    * rather than work in flight. Absent otherwise, including on the frame that
@@ -396,6 +461,24 @@ export interface LiveVoiceMinimizeRoomServerFrame extends LiveVoiceServerFrameBa
   readonly turnId: string;
 }
 
+/**
+ * A session control the user asked for out loud: the completed reply ended
+ * with a control marker, and its acknowledgement has been synthesized. Sent
+ * after `tts_done`, so the client still waits for local playback to drain
+ * before acting. `mute` with `durationMs` unmutes again once it elapses;
+ * `look_screen` and `look_camera` start showing the call the screen or the
+ * camera, and `look_stop` stops both.
+ *
+ * The body is not validated by {@link parseServerFrame}; the handler treats
+ * an unknown `action` or a malformed `durationMs` as nothing to do.
+ */
+export interface LiveVoiceSessionControlServerFrame extends LiveVoiceServerFrameBase {
+  readonly type: "session_control";
+  readonly turnId: string;
+  readonly action: LiveVoiceSessionControl;
+  readonly durationMs?: number;
+}
+
 export interface LiveVoiceMetricsServerFrame extends LiveVoiceServerFrameBase {
   readonly type: "metrics";
   /**
@@ -444,8 +527,6 @@ export interface LiveVoiceMetricsServerFrame extends LiveVoiceServerFrameBase {
    * condition as the two fields above.
    */
   readonly endpointDecisionSource?: "front-door" | "provider";
-  /** Which floor-holding ack actually spoke during the turn, if any. */
-  readonly ackSpoken?: "first_delta" | "tool_use";
   /**
    * Spoken progress narrations during the turn. Present only when at least
    * one progress update spoke (otherwise the field is absent, keeping frames
@@ -506,6 +587,7 @@ export type LiveVoiceServerFrame =
   | LiveVoiceTtsDoneServerFrame
   | LiveVoiceTurnCancelledServerFrame
   | LiveVoiceMinimizeRoomServerFrame
+  | LiveVoiceSessionControlServerFrame
   | LiveVoiceMetricsServerFrame
   | LiveVoiceArchivedServerFrame
   | LiveVoiceErrorServerFrame;

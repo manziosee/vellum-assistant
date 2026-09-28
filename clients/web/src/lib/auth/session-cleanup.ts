@@ -1,5 +1,5 @@
 /**
- * Clear user-scoped browser storage on logout.
+ * Clear user-scoped browser storage and process memory on logout.
  *
  * All app-owned localStorage keys use one of two prefixes:
  * - `vellum:` — user-scoped, cleared on logout
@@ -22,7 +22,8 @@
  * - https://web.dev/articles/sign-out-best-practices
  */
 
-import { clearTakeoverAvatarStash } from "@/lib/billing/takeover-avatar-stash";
+import { useChatSessionStore } from "@/domains/chat/chat-session-store";
+import { resetNotificationIdentitySession } from "@/runtime/notification-avatar";
 import { clearCameraGateDebug } from "@/stores/camera-gate-debug-store";
 import { clearUserScopedOverrides } from "@/utils/typed-storage";
 
@@ -73,12 +74,11 @@ function isUserScopedKey(key: string): boolean {
 }
 
 export function clearUserScopedStorage(): void {
-  // The takeover avatar stash can outlive `sessionStorage.clear()` through its
-  // in-memory mirror when the write never reached storage.
-  clearTakeoverAvatarStash();
+  resetNotificationIdentitySession();
+  useChatSessionStore.getState().resetForLogout();
 
-  // Same shape: a typed-storage accessor holds a value in memory when the
-  // device refuses writes, so the key sweep below has nothing to remove.
+  // A typed-storage accessor holds a value in memory when the device refuses
+  // writes, so the key sweep below has nothing to remove.
   clearUserScopedOverrides();
 
   // And again: the camera gate's tuning readout keeps its enable bit in a

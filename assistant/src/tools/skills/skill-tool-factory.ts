@@ -1,4 +1,7 @@
+import { join, resolve } from "node:path";
+
 import type { SkillToolEntry } from "../../config/skills.js";
+import { getBundledSkillsDir } from "../../config/skills.js";
 import { RiskLevel } from "../../permissions/types.js";
 import {
   coerceArrayShapes,
@@ -6,11 +9,13 @@ import {
   coerceStringNumbers,
   validateInputAgainstSchema,
 } from "../../skills/validate-input.js";
+import { computerUseExecutionTarget } from "../computer-use/target.js";
 import { withActivityProperty } from "../schema-transforms.js";
 import { bundledToolInputMisuseMessage } from "../shared/input-misuse.js";
 import { bundledToolInputRepairs } from "../shared/input-repairs.js";
 import type { ExecutionTarget } from "../tool-types.js";
 import type { Tool, ToolContext, ToolExecutionResult } from "../types.js";
+import { formatSkillInputSchema } from "./format-input-schema.js";
 import { runSkillToolScript } from "./skill-script-runner.js";
 
 const riskMap: Record<SkillToolEntry["risk"], RiskLevel> = {
@@ -32,13 +37,21 @@ export function createSkillTool(
   skillDir: string,
   versionHash: string,
   bundled?: boolean,
+  pluginOwner?: string,
 ): Tool {
+  const isComputerUse =
+    bundled &&
+    !pluginOwner &&
+    resolve(skillDir) === resolve(join(getBundledSkillsDir(), "computer-use"));
   return {
     name: entry.name,
     description: entry.description,
     category: entry.category,
     defaultRiskLevel: riskMap[entry.risk],
     executionTarget: entry.execution_target as ExecutionTarget,
+    ...(isComputerUse
+      ? { getExecutionTarget: computerUseExecutionTarget }
+      : {}),
     supportedClientOs: entry.supported_client_os,
 
     input_schema: entry.input_schema as object,
@@ -82,7 +95,7 @@ export function createSkillTool(
         return {
           content:
             misuse ??
-            `Invalid input for tool "${entry.name}": ${validation.errors.join("; ")}. Fix the arguments and retry.`,
+            `Invalid input for tool "${entry.name}": ${validation.errors.join("; ")}. If skill_load is available, load the owning skill for its current instructions. Retry with arguments matching this schema.\n\n${formatSkillInputSchema(entry.input_schema)}`,
           isError: true,
         };
       }
@@ -96,6 +109,7 @@ export function createSkillTool(
           target: entry.execution_target,
           expectedSkillVersionHash: versionHash,
           bundled,
+          pluginOwner,
         },
       );
     },
@@ -113,8 +127,9 @@ export function createSkillToolsFromManifest(
   skillDir: string,
   versionHash: string,
   bundled?: boolean,
+  pluginOwner?: string,
 ): Tool[] {
   return entries.map((entry) =>
-    createSkillTool(entry, skillDir, versionHash, bundled),
+    createSkillTool(entry, skillDir, versionHash, bundled, pluginOwner),
   );
 }

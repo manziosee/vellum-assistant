@@ -165,8 +165,14 @@ const getCatalogSpy = mock(
   },
 );
 
+const getInstalledMetadataCatalogSpy = mock(
+  (ref: string, deps: SearchPluginsDeps): Promise<PluginCatalog> =>
+    getCatalogSpy(ref, deps),
+);
+
 mock.module("../../../cli/lib/plugin-catalog-cache.js", () => ({
   getPluginCatalog: getCatalogSpy,
+  getPluginCatalogForInstalledMetadata: getInstalledMetadataCatalogSpy,
 }));
 
 // Mock uninstallPlugin. The handler's error mapping is the wiring under
@@ -471,6 +477,7 @@ beforeEach(() => {
 describe("GET /v1/plugins", () => {
   beforeEach(() => {
     getCatalogSpy.mockClear();
+    getInstalledMetadataCatalogSpy.mockClear();
     // Default to an empty catalog so every installed plugin's category resolves
     // to `null` (bucketed under "system"). Tests that exercise real categories
     // override this.
@@ -849,6 +856,7 @@ describe("GET /v1/plugins", () => {
     );
 
     const map = await loadCategoryMapBounded();
+    expect(getInstalledMetadataCatalogSpy).toHaveBeenCalledTimes(1);
     expect(map.get("alpha")).toBe("productivity");
   });
 
@@ -1082,6 +1090,64 @@ describe("GET /v1/plugins/search", () => {
     expect("icon" in byName.get("plain-plugin")!).toBe(false);
   });
 
+  test("preserves a bundled MCP package source and integration metadata", async () => {
+    getCatalogSpy.mockImplementation(async (ref) =>
+      catalog(ref, [
+        {
+          name: "fathom",
+          path: "local:plugins/mcp-catalog/fathom@1.0.0",
+          description: "Search meeting transcripts.",
+          category: null,
+          integration: {
+            kind: "mcp",
+            displayName: "Fathom",
+            documentationUrl: "https://example.com/fathom/docs",
+            verifiedAt: "2026-09-15",
+            verification: "documentation-only",
+            setup: {
+              mode: "oauth",
+              instructions: "Connect your Fathom account.",
+            },
+            logo: "fathom.png",
+          },
+          source: {
+            kind: "local",
+            path: "plugins/mcp-catalog/fathom",
+            version: "1.0.0",
+          },
+        },
+      ]),
+    );
+
+    const result = await invokeSearch({ queryParams: { q: "fathom" } });
+
+    expect(result.matches).toEqual([
+      {
+        name: "fathom",
+        path: "local:plugins/mcp-catalog/fathom@1.0.0",
+        description: "Search meeting transcripts.",
+        category: null,
+        integration: {
+          kind: "mcp",
+          displayName: "Fathom",
+          documentationUrl: "https://example.com/fathom/docs",
+          verifiedAt: "2026-09-15",
+          verification: "documentation-only",
+          setup: {
+            mode: "oauth",
+            instructions: "Connect your Fathom account.",
+          },
+          logo: "fathom.png",
+        },
+        source: {
+          kind: "local",
+          path: "plugins/mcp-catalog/fathom",
+          version: "1.0.0",
+        },
+      },
+    ]);
+  });
+
   test("normalizes match categories to the Skills taxonomy (`developer` → `development`, `hobby` → null)", async () => {
     getCatalogSpy.mockImplementation(async (ref) =>
       catalog(ref, [
@@ -1239,8 +1305,12 @@ describe("GET /v1/plugins/search", () => {
 
 async function invokeUninstall(
   args: RouteHandlerArgs = {},
-): Promise<{ name: string; target: string }> {
-  return (await uninstallHandler(args)) as { name: string; target: string };
+): Promise<{ name: string; target: string; warnings?: string[] }> {
+  return (await uninstallHandler(args)) as {
+    name: string;
+    target: string;
+    warnings?: string[];
+  };
 }
 
 describe("DELETE /v1/plugins/:name", () => {
@@ -1276,6 +1346,22 @@ describe("DELETE /v1/plugins/:name", () => {
     await invokeUninstall({ pathParams: { name: "simple-memory" } });
 
     expectPluginsListBroadcast();
+  });
+
+  test("returns non-fatal cleanup warnings from the shared uninstall", async () => {
+    uninstallSpy.mockImplementation(async (opts) => ({
+      name: opts.name,
+      target: `/workspace/.vellum/plugins/${opts.name}`,
+      warnings: ["plugin.uninstall.mcp_oauth_credentials_unchecked"],
+    }));
+
+    const result = await invokeUninstall({
+      pathParams: { name: "simple-memory" },
+    });
+
+    expect(result.warnings).toEqual([
+      "plugin.uninstall.mcp_oauth_credentials_unchecked",
+    ]);
   });
 
   test("threads x-vellum-client-id into the published event's originClientId", async () => {
@@ -1585,6 +1671,50 @@ describe("POST /v1/plugins/install", () => {
         process.env.VELLUM_DISABLE_PLATFORM = prev;
       }
     }
+  });
+
+  test("installs a bundled package from the exact catalog source", async () => {
+    getCatalogSpy.mockImplementation(async (ref) =>
+      catalog(ref, [
+        {
+          name: "fathom",
+          path: "local:plugins/mcp-catalog/fathom@1.0.0",
+          category: null,
+          source: {
+            kind: "local",
+            path: "plugins/mcp-catalog/fathom",
+            version: "1.0.0",
+          },
+        },
+      ]),
+    );
+    installSpy.mockImplementation(async (opts) => ({
+      name: opts.name,
+      target: `/workspace/.vellum/plugins/${opts.name}`,
+      fileCount: 2,
+      ref: "1.0.0",
+      commit: null,
+      committedAt: null,
+    }));
+
+    const result = await invokeInstall({ body: { name: "fathom" } });
+
+    expect(installSpy.mock.calls[0]?.[0]).toEqual({
+      name: "fathom",
+      force: undefined,
+      trustedSource: {
+        kind: "local",
+        path: "plugins/mcp-catalog/fathom",
+        version: "1.0.0",
+      },
+    });
+    expect(result).toEqual({
+      ok: true,
+      name: "fathom",
+      target: "/workspace/.vellum/plugins/fathom",
+      fileCount: 2,
+      ref: "1.0.0",
+    });
   });
 
   test("publishes sync_changed(plugins:list) on a successful install", async () => {
@@ -2759,7 +2889,9 @@ describe("POST /v1/plugins/:name/disable", () => {
       toggleResult(name, "disable"),
     );
 
-    const result = await invokeDisable({ pathParams: { name: "simple-memory" } });
+    const result = await invokeDisable({
+      pathParams: { name: "simple-memory" },
+    });
 
     expect(result).toEqual({ ok: true });
     expect(disablePluginSpy.mock.calls[0]?.[0]).toBe("simple-memory");

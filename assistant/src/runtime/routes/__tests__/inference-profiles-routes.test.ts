@@ -743,6 +743,25 @@ describe("GET inference/profiles honors llm.defaultProvider", () => {
     expect(names.has("balanced")).toBe(true);
   });
 
+  test("lists profiles in profileOrder, then the rest alphabetically", async () => {
+    setConfig("llm", {
+      profiles: {
+        "zed-custom": { source: "user", provider: "anthropic" },
+        auto: { source: "managed" },
+        "alpha-custom": { source: "user", provider: "anthropic" },
+      },
+      profileOrder: ["auto", "balanced", "zed-custom"],
+    });
+    const listed = (await call("inference_profiles_list", {})) as {
+      profiles: Array<{ name: string }>;
+    };
+    const names = listed.profiles.map((profile) => profile.name);
+    expect(names.slice(0, 3)).toEqual(["auto", "balanced", "zed-custom"]);
+    const tail = names.slice(3);
+    expect(tail).toEqual([...tail].sort());
+    expect(tail).toContain("alpha-custom");
+  });
+
   test("expands balanced through a BYOK default provider, not the vellum column", async () => {
     setConfig("llm", {
       defaultProvider: { provider: "anthropic" },
@@ -921,6 +940,29 @@ describe("PUT inference/active-profile validation", () => {
     await expect(
       call("inference_profiles_set_active", { body: { name: "my-fast" } }),
     ).rejects.toThrow(/disabled/);
+  });
+
+  test("rejects a profile whose catalog model does not produce chat text", async () => {
+    setConfig("llm", {
+      profiles: {
+        jev: {
+          source: "user",
+          provider: "typesafe",
+          model: "jev-latest",
+          status: "active",
+        },
+      },
+    });
+    const promise = call("inference_profiles_set_active", {
+      body: { name: "jev" },
+    });
+    await expect(promise).rejects.toBeInstanceOf(BadRequestError);
+    await expect(promise).rejects.toThrow(
+      /structured answers rather than chat text/,
+    );
+    expect(
+      (loadRawConfig().llm as { activeProfile?: string }).activeProfile,
+    ).toBeUndefined();
   });
 
   test("rejects a profile that cannot serve requests — no escape hatch", async () => {

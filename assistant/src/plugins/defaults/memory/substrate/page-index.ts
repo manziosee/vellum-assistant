@@ -19,6 +19,8 @@
  * concept pages or seeded skill entries change.
  */
 
+import { safeStringSlice } from "@vellumai/plugin-api";
+
 import { getLogger } from "../logging.js";
 import {
   CLI_COMMAND_SLUG_PREFIX,
@@ -51,7 +53,11 @@ const SUMMARY_MAX_LENGTH = 200;
  * and corrupt the format the router parses.
  */
 function normalizeSummary(raw: string): string {
-  return raw.replace(/\s+/g, " ").trim().slice(0, SUMMARY_MAX_LENGTH);
+  return safeStringSlice(
+    raw.replace(/\s+/g, " ").trim(),
+    0,
+    SUMMARY_MAX_LENGTH,
+  );
 }
 
 /**

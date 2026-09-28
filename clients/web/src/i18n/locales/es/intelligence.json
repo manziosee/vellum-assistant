@@ -88,6 +88,7 @@
     "cardHoverLine": {
       "channels": "Todos los lugares donde puedes contactarme",
       "contacts": "Las personas que conozco y en quienes confío",
+      "email": "Todo lo que llega a mi bandeja",
       "library": "Las apps y documentos que he creado para ti",
       "memory": "Todo lo que recuerdo",
       "personality": "Adelante, ajusta mi alma",
@@ -109,7 +110,11 @@
     },
     "setUpSchedule": "Crear una",
     "updateAvatarAndName": "Actualizar avatar y nombre",
-    "viewMoreSchedules": "{count, plural, one {Ver # más…} other {Ver # más…}}"
+    "viewMoreSchedules": "{count, plural, one {Ver # más…} other {Ver # más…}}",
+    "lockedBadge": "Requiere el plan Super",
+    "pinEmail": "Fijar Correo al menú lateral",
+    "unpinEmail": "Quitar Correo del menú lateral",
+    "dismissEmail": "Cerrar"
   },
   "identitySections": {
     "channels": {
@@ -120,13 +125,13 @@
       "description": "Personas que conozco",
       "label": "Contactos"
     },
+    "email": {
+      "description": "Lo que envío y recibo",
+      "label": "Correo"
+    },
     "library": {
       "description": "Mis apps y documentos",
       "label": "Biblioteca"
-    },
-    "memory": {
-      "description": "Lo que recuerdo",
-      "label": "Memoria"
     },
     "personality": {
       "description": "Ajusta cómo hablo",
@@ -264,7 +269,9 @@
   },
   "pluginToast": {
     "alreadyUpToDate": "{name} ya está actualizado",
+    "cleanupWarning": "La limpieza del plugin se completó con una advertencia.",
     "installed": "Se instaló {name}",
+    "mcpOAuthCredentialsUnchecked": "El almacenamiento de credenciales no está disponible, por lo que no se pudieron comprobar las credenciales históricas de OAuth de MCP del plugin.",
     "pluginFallback": "el plugin",
     "pluginFallbackCapitalized": "El plugin",
     "removed": "Se quitó {name}",
@@ -289,18 +296,15 @@
     "backToConversationAriaLabel": "Volver a la conversación",
     "backToSkillsAriaLabel": "Volver a las habilidades",
     "filesTab": "Archivos",
-    "fileViewModeAriaLabel": "Modo de vista de archivo",
     "historyTab": "Historial",
     "install": "Instalar",
     "noFilesAvailable": "No hay archivos disponibles.",
     "openInWorkspaceAriaLabel": "Abrir en el espacio de trabajo",
     "pendingAriaLabel": "Pendiente",
-    "preview": "Vista previa",
     "remove": "Quitar",
     "saveFailed": "Error al guardar",
     "selectAFile": "Selecciona un archivo",
-    "selectFilePrompt": "Selecciona un archivo para ver su contenido.",
-    "source": "Código"
+    "selectFilePrompt": "Selecciona un archivo para ver su contenido."
   },
   "skillDetailPage": {
     "backToConversation": "Volver a la conversación",
@@ -431,5 +435,9 @@
       "v1": "Migra mi memoria de v1 a v3. Lo más probable es que sean dos saltos, tu skill «Memory v2 Migration» y luego tu skill «Memory v3 Migration», pero averigua qué necesita realmente mi asistente y sigue exactamente las skills que uses.\n\nEjecútalo en segundo plano y avísame cuando termine, o si algo lo bloquea.",
       "enable": "Vuelve a activar mi memoria. Me gustaría que empieces a recordar cosas de nuestras conversaciones otra vez."
     }
+  },
+  "assistantHandleLine": {
+    "edit": "Editar identificador @{handle}",
+    "editTitle": "Editar identificador"
   }
 }

@@ -108,12 +108,19 @@ function splitOnce(s: string, sep: string): [string, string] {
 }
 
 /** The bundled catalog entry for {@link name} — the source under test. */
-function bundledMatch(name: string): PluginSearchMatch {
+function bundledMatch(name: string): PluginSearchMatch & {
+  source: Extract<PluginSearchMatch["source"], { kind: "github" }>;
+} {
   const match = readBundledPluginCatalog().matches.find((m) => m.name === name);
   if (!match) {
     throw new Error(`bundled catalog has no entry for "${name}"`);
   }
-  return match;
+  if (match.source.kind !== "github") {
+    throw new Error(`bundled catalog entry "${name}" is not GitHub-backed`);
+  }
+  return match as PluginSearchMatch & {
+    source: Extract<PluginSearchMatch["source"], { kind: "github" }>;
+  };
 }
 
 const PNG_SIGNATURE = Buffer.from([
@@ -302,6 +309,32 @@ describe("getPluginDetails (bundled catalog, offline)", () => {
     expect(details.icon).toBeNull();
   });
 
+  test("reads metadata from an installed standard-only plugin.json", async () => {
+    const target = join(workspace, "caveman");
+    mkdirSync(target, { recursive: true });
+    writeFileSync(
+      join(target, "plugin.json"),
+      JSON.stringify({
+        $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        name: "caveman",
+        version: "4.0.0",
+        description: "Installed standard plugin",
+        homepage: "https://example.com/plugin",
+        license: "MIT",
+      }),
+    );
+
+    const details = await getPluginDetails(
+      { name: "caveman" },
+      { fetch: makeFetch({}), workspacePluginsDir: workspace },
+    );
+
+    expect(details.version).toBe("4.0.0");
+    expect(details.description).toBe("Installed standard plugin");
+    expect(details.homepage).toBe("https://example.com/plugin");
+    expect(details.license).toBe("MIT");
+  });
+
   test("surfaces the installed copy's vellum.icon", async () => {
     // GIVEN an installed copy whose package.json declares vellum.icon
     const target = join(workspace, "caveman");
@@ -478,6 +511,49 @@ describe("getPluginDetails (bundled catalog, offline)", () => {
     expect(details.license).toBe("MIT");
     expect(details.readme).toContain("historical");
     expect(details.ref).toBe(historicalRef);
+  });
+
+  test("hides a gated integration at an explicit historical ref", async () => {
+    const historicalRef = "a".repeat(40);
+    let fetchCalls = 0;
+    const fetch = (async () => {
+      fetchCalls += 1;
+      return new Response("unexpected request", { status: 500 });
+    }) as FetchLike;
+
+    await expect(
+      getPluginDetails(
+        { name: "gamma", ref: historicalRef },
+        { fetch, workspacePluginsDir: workspace },
+      ),
+    ).rejects.toBeInstanceOf(PluginDetailsNotFoundError);
+    expect(fetchCalls).toBe(0);
+  });
+
+  test("keeps an installed gated integration visible at an explicit historical ref", async () => {
+    const target = join(workspace, "gamma");
+    mkdirSync(target, { recursive: true });
+    writeFileSync(join(target, "README.md"), "# Installed Gamma");
+    writeFileSync(
+      join(target, "package.json"),
+      JSON.stringify({ version: "1.0.0", description: "local gamma" }),
+    );
+    let fetchCalls = 0;
+    const fetch = (async () => {
+      fetchCalls += 1;
+      return new Response("unexpected request", { status: 500 });
+    }) as FetchLike;
+
+    const details = await getPluginDetails(
+      { name: "gamma", ref: "a".repeat(40) },
+      { fetch, workspacePluginsDir: workspace },
+    );
+
+    expect(details.installed).toBe(true);
+    expect(details.readme).toBe("# Installed Gamma");
+    expect(details.description).toBe("local gamma");
+    expect(details.source).toBeNull();
+    expect(fetchCalls).toBe(0);
   });
 
   test("degrades gracefully when the historical marketplace fetch fails", async () => {

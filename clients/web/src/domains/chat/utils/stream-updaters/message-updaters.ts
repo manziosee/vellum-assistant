@@ -17,7 +17,9 @@ import { messagePlainText } from "@/domains/chat/utils/message-plain-text";
 import { toDisplayAttachments } from "@/utils/display-attachments";
 import type {
   ConversationContentBlock,
+  GenerationHandoffEvent,
   MessageCompleteEvent,
+  ModeSession,
 } from "@vellumai/assistant-api";
 import {
   tailIsAssistant,
@@ -371,7 +373,7 @@ export function finalizeOnIdle(
  */
 export function finalizeMessageComplete(
   prev: DisplayMessage[],
-  event: MessageCompleteEvent,
+  event: MessageCompleteEvent | GenerationHandoffEvent,
   at: number = Date.now(),
 ): DisplayMessage[] {
   const last = prev[prev.length - 1];
@@ -381,6 +383,15 @@ export function finalizeMessageComplete(
   // persisted twin does with no refetch in between.
   const assistantTextVisibility = readAssistantTextVisibility(event);
   const visibility = assistantTextVisibility ? { assistantTextVisibility } : {};
+  // The profile Auto picked for the turn, stamped on the live row from the
+  // same terminal event (completion or handoff) so it shows without waiting
+  // for a history refetch.
+  const autoRoutedProfile = event.autoRoutedProfile
+    ? { autoRoutedProfile: event.autoRoutedProfile }
+    : {};
+  const membership = event.modeSession
+    ? { modeSession: event.modeSession }
+    : {};
 
   if (last?.role !== "assistant") {
     if (!attachments) {
@@ -395,6 +406,8 @@ export function finalizeMessageComplete(
         timestamp: at,
         attachments,
         ...visibility,
+        ...autoRoutedProfile,
+        ...membership,
       },
     ];
   }
@@ -409,6 +422,8 @@ export function finalizeMessageComplete(
       ...(attachments ? { attachments } : {}),
       ...(finalized ?? {}),
       ...visibility,
+      ...autoRoutedProfile,
+      ...membership,
       // Deliberate silence, derived at fold time from the shared sentinel
       // contract: the daemon stamps the durable row after the turn, but the
       // live bubble would otherwise render the raw sentinel until a refetch.
@@ -494,23 +509,40 @@ function findOptimisticUserEchoIdx(
  */
 export function applyUserMessageEcho(
   prev: DisplayMessage[],
-  event: { text: string; messageId?: string; clientMessageId?: string },
+  event: {
+    text: string;
+    messageId?: string;
+    clientMessageId?: string;
+    cameraFrame?: true;
+    modeSession?: ModeSession;
+  },
   at: number = Date.now(),
 ): DisplayMessage[] {
   const serverId = event.messageId;
 
   if (serverId !== undefined) {
-    const alreadyPresent = prev.some(
+    const alreadyPresentIndex = prev.findIndex(
       (m) =>
         m.role === "user" &&
         (m.id === serverId || m.mergedMessageIds?.includes(serverId)),
     );
-    if (alreadyPresent) {
-      return prev;
+    if (alreadyPresentIndex !== -1) {
+      if (!event.modeSession) {
+        return prev;
+      }
+      const next = [...prev];
+      next[alreadyPresentIndex] = {
+        ...prev[alreadyPresentIndex]!,
+        modeSession: event.modeSession,
+      };
+      return next;
     }
   }
 
-  const optimisticIdx = findOptimisticUserEchoIdx(prev, event.clientMessageId);
+  // Ambient camera frames never confirm a typed send.
+  const optimisticIdx = event.cameraFrame
+    ? -1
+    : findOptimisticUserEchoIdx(prev, event.clientMessageId);
   if (optimisticIdx !== -1) {
     if (serverId === undefined) {
       return prev;
@@ -522,6 +554,7 @@ export function applyUserMessageEcho(
       isOptimistic: false,
       queueStatus: undefined,
       queuePosition: undefined,
+      ...(event.modeSession ? { modeSession: event.modeSession } : {}),
     };
     return next;
   }
@@ -531,17 +564,56 @@ export function applyUserMessageEcho(
     {
       id: serverId ?? crypto.randomUUID(),
       ...(serverId === undefined ? { isOptimistic: true } : {}),
-      // Carry the nonce so the folded row shares the persisted server row's
-      // identity keys — the transcript overlay and the reseed prune both
-      // correlate on it (see `messageMatchKeys`).
-      ...(event.clientMessageId
+      // Only ordinary sends share the optimistic row's identity. Camera
+      // frames remain distinct in the transcript overlay and reseed prune.
+      ...(!event.cameraFrame && event.clientMessageId
         ? { clientMessageId: event.clientMessageId }
         : {}),
       role: "user",
+      ...(event.cameraFrame ? { isCameraFrame: true } : {}),
+      ...(event.modeSession ? { modeSession: event.modeSession } : {}),
       textSegments: [event.text],
       contentOrder: [{ type: "text", id: "0" }],
       contentBlocks: [{ type: "text", text: event.text }],
       timestamp: at,
+    },
+  ];
+}
+
+/** Reserve or stamp the assistant row named by a session-owning boundary. */
+export function applyAssistantModeSessionBoundary(
+  prev: DisplayMessage[],
+  messageId: string,
+  modeSession: ModeSession | undefined,
+  at: number = Date.now(),
+): DisplayMessage[] {
+  if (!modeSession) {
+    return prev;
+  }
+  const idx = findAssistantRowIndexByMessageId(prev, messageId);
+  if (idx >= 0) {
+    if (prev[idx]?.modeSession?.id === modeSession.id) {
+      return prev;
+    }
+    const next = [...prev];
+    next[idx] = { ...prev[idx]!, modeSession };
+    return next;
+  }
+  if (tailIsAssistant(prev)) {
+    const next = [...prev];
+    next[next.length - 1] = {
+      ...withMergedAlias(next[next.length - 1]!, messageId),
+      modeSession,
+    };
+    return next;
+  }
+  return [
+    ...prev,
+    {
+      id: messageId,
+      role: "assistant",
+      timestamp: at,
+      modeSession,
     },
   ];
 }

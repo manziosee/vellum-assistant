@@ -1,7 +1,7 @@
 /**
  * Memory v3 — single pool selector.
  *
- * Runs a SINGLE forced-tool call over one unified candidate pool rendered in
+ * Runs a SINGLE selector call over one unified candidate pool rendered in
  * two segments that share one numbering:
  *
  *   1. STABLE PREFIX — the core+hot lane pages as FULL CARDS (head section +
@@ -42,19 +42,31 @@
  *   - infrastructure failure (selector provider unavailable — e.g. a transient
  *     CES credential blip drops the API key — or no usable `tool_use` / schema
  *     mismatch surviving the short re-prompt retry) → throw
- *     {@link MemoryV3RetrievalUnavailableError}. The live injector treats this
- *     as a logged memory miss for the turn; shadow/observation callers swallow
- *     it so v2 retrieval can serve the turn.
+ *     {@link MemoryV3RetrievalUnavailableError}. The orchestrator keeps the
+ *     stable prefix unjudged for the turn and drops the finder candidates,
+ *     recording the pool with `selector_ran = 0`; the live injector renders
+ *     that prefix and queues a notice that the turn drew on core memories
+ *     only.
  */
 
 import type {
   ContentBlock,
   Message,
+  Provider,
+  ProviderResponse,
   ToolUseContent,
 } from "@vellumai/plugin-api";
-import { getConfiguredProvider } from "@vellumai/plugin-api";
+import {
+  getConfiguredProvider,
+  getEffectiveContextWindow,
+  safeStringSlice,
+} from "@vellumai/plugin-api";
 import { z } from "zod";
 
+import {
+  estimatePromptTokensWithTools,
+  estimateTextTokens,
+} from "../../../../context/token-estimator.js";
 import { classifyConversationError } from "../../../../daemon/conversation-error.js";
 import type { PendingConversationNotice } from "../../../../daemon/conversation-notices.js";
 import { redactLogString, truncate } from "../host-utils.js";
@@ -69,6 +81,7 @@ import { retryForResult } from "./llm-retry.js";
 import { findTerm } from "./section-needle.js";
 import { sectionBody } from "./sections.js";
 import {
+  type FinderLane,
   type MemoryRoutingTurn,
   type Section,
   sectionKey,
@@ -90,12 +103,16 @@ const log = getLogger("memory-v3-pool-select");
  */
 export class MemoryV3RetrievalUnavailableError extends Error {
   readonly conversationNotice?: PendingConversationNotice;
+  readonly pool?: SelectorPool;
+  readonly turn?: MemoryRoutingTurn;
 
   constructor(
     message: string,
     options?: {
       cause?: unknown;
       conversationNotice?: PendingConversationNotice;
+      pool?: SelectorPool;
+      turn?: MemoryRoutingTurn;
     },
   ) {
     super(
@@ -104,6 +121,8 @@ export class MemoryV3RetrievalUnavailableError extends Error {
     );
     this.name = "MemoryV3RetrievalUnavailableError";
     this.conversationNotice = options?.conversationNotice;
+    this.pool = options?.pool;
+    this.turn = options?.turn;
   }
 }
 
@@ -127,7 +146,7 @@ function providerBillingNoticeFromError(
 /** A dynamic-tail (finder) candidate: the slug plus the descriptor that
  *  justifies it (a matched section's text for a needle/dense hit, or a
  *  curated link description for an edge page), rendered as a one-line
- *  snippet and prefixed with the surfacing lane when one is supplied. A
+ *  snippet and prefixed with the surfacing lane. A
  *  candidate that also carries its matched `section` and the query `terms`
  *  that scored it (best first) renders a keyword-in-context snippet instead:
  *  a window of the section body around the first of those terms that occurs
@@ -138,7 +157,7 @@ function providerBillingNoticeFromError(
 export interface PoolCandidate {
   slug: Slug;
   descriptor: string;
-  lane?: string;
+  lane: FinderLane;
   section?: Section;
   terms?: string[];
 }
@@ -147,9 +166,12 @@ export interface PoolCandidate {
  *  (`renderCard` output — head section + TOC). Cards must be byte-stable
  *  across turns for the prefix to ride the provider KV cache, which is why
  *  callers pre-render them at lane init rather than per turn. */
+export type StableCandidateLane = "core" | "hot" | "fresh" | "always";
+
 export interface StableCandidate {
   slug: Slug;
   card: string;
+  lane: StableCandidateLane;
 }
 
 /**
@@ -168,6 +190,7 @@ export interface SelectorPool {
 /** Tool name forced via `tool_choice`. Shared constant so tests can match it. */
 const SELECT_PAGES_TOOL_NAME = "select_pages";
 const MEMORY_V3_SELECT_CALL_SITE = "memoryV3SelectL2" as const;
+const SELECTOR_CONTEXT_BUDGET_RATIO = 0.8;
 
 /** Finder-line snippets are truncated to keep the dynamic tail compact. */
 const SNIPPET_MAX_CHARS = 300;
@@ -177,7 +200,8 @@ type PoolSelectorAttemptFailureReason =
   | "provider_error"
   | "missing_tool_use"
   | "unexpected_tool_name"
-  | "schema_mismatch";
+  | "schema_mismatch"
+  | "unusable_answers";
 
 interface PoolSelectorAttemptFailure {
   attempt: number;
@@ -276,7 +300,9 @@ function oneLine(text: string): string {
  * `§<title>: … <window> …`, the window being up to {@link SNIPPET_MAX_CHARS}
  * of the one-line section body centered on the first occurrence of the
  * best-contributing query term that occurs in it (the lead, titled `""`,
- * renders the window alone). `undefined` when no term occurs in the body.
+ * renders the window alone). The window edges never split a surrogate pair:
+ * an orphaned half is invalid UTF-16 and strict provider parsers reject the
+ * whole request. `undefined` when no term occurs in the body.
  */
 function renderKeywordInContext(
   section: Section,
@@ -299,7 +325,7 @@ function renderKeywordInContext(
     const end = Math.min(body.length, start + SNIPPET_MAX_CHARS);
     const window = [
       start > 0 ? "… " : "",
-      body.slice(start, end).trim(),
+      safeStringSlice(body, start, end).trim(),
       end < body.length ? " …" : "",
     ].join("");
     const title = section.title.trim();
@@ -392,12 +418,8 @@ function renderCardSegment(stable: StableCandidate[]): string {
 }
 
 /** A finder line's lane tag: `(lane) `, or `(rare: word) ` for a rare-term
- *  line, keyed on the one word it carries as its term; empty for a candidate
- *  without a lane. */
+ *  line, keyed on the one word it carries as its term. */
 function laneTag(candidate: PoolCandidate): string {
-  if (candidate.lane === undefined) {
-    return "";
-  }
   const word = candidate.lane === "rare" ? candidate.terms?.[0] : undefined;
   return word === undefined
     ? `(${candidate.lane}) `
@@ -405,21 +427,30 @@ function laneTag(candidate: PoolCandidate): string {
 }
 
 /**
+ * One finder line as the selector sees it, minus its pool number: the lane
+ * tag (naming the keyed word for a rare-term line, `(rare: turnip)`), the
+ * slug, and the snippet after a dash
+ * (no dash for a candidate with an empty descriptor). Shared with the pool
+ * input capture (`pool-log-store.ts`), so the persisted text is exactly the
+ * rendered line.
+ */
+export function renderFinderLine(candidate: PoolCandidate): string {
+  const snippet = renderSnippet(candidate);
+  const lane = laneTag(candidate);
+  return snippet.length > 0
+    ? `${lane}${candidate.slug} — ${snippet}`
+    : `${lane}${candidate.slug}`;
+}
+
+/**
  * Render the finder tail: one `[m+i] (lane) slug — snippet` line per
- * candidate, numbered continuing after the `offset` stable-prefix cards. The
- * lane tag is omitted for a candidate without one and names the keyed word
- * for a rare-term line (`(rare: turnip)`); a candidate with an empty
- * descriptor renders without the dash.
+ * candidate ({@link renderFinderLine}), numbered continuing after the
+ * `offset` stable-prefix cards.
  */
 function renderFinderSegment(finder: PoolCandidate[], offset: number): string {
-  const lines = finder.map((c, i) => {
-    const snippet = renderSnippet(c);
-    const id = offset + i + 1;
-    const lane = laneTag(c);
-    return snippet.length > 0
-      ? `[${id}] ${lane}${c.slug} — ${snippet}`
-      : `[${id}] ${lane}${c.slug}`;
-  });
+  const lines = finder.map(
+    (c, i) => `[${offset + i + 1}] ${renderFinderLine(c)}`,
+  );
   return `<candidates>\n${lines.join("\n")}\n</candidates>`;
 }
 
@@ -480,60 +511,105 @@ export function selectAllPoolCandidates(pool: SelectorPool): SelectedPage[] {
   );
 }
 
-/** A selection plus whether it came from the recall-safe keep-all fallback. */
-export interface PoolSelection {
-  pages: SelectedPage[];
-  /** True only when the model OMITTED `ids` and every candidate was kept as the
-   *  recall-safe fallback — NOT when it explicitly selected a large set. The two
-   *  produce the same pages but mean different things (the model gave up judging
-   *  vs it judged everything relevant), and only telemetry can tell them apart. */
-  keptAll: boolean;
+/**
+ * Inclusive noul threshold for TypeSafe pool selection. 0.5 is calibrated
+ * equal yes/no. This sits slightly below that so a plausible candidate is
+ * kept, matching the selector's recall-heavy rule.
+ */
+export const TYPE_SAFE_POOL_KEEP_NOUL = 0.4;
+
+/** Catalog id of the TypeSafe System One provider. */
+const TYPE_SAFE_PROVIDER_ID = "typesafe";
+
+type TypesafeNoulQuestion = {
+  type: "noul";
+  instructions: string;
+  criteria: { yes: string; no: string };
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/**
- * Run the single forced-tool selector over the unified candidate pool. Returns
- * the pages to inject, merged per slug (a page selected as a card and on
- * finder lines yields one entry carrying every selected section), plus a
- * `keptAll` flag marking the recall-safe fallback.
- *
- * An omitted `ids` keeps ALL candidates (the recall-safe "all of these are
- * relevant" signal, `keptAll: true`); an explicit `[]` keeps none; an
- * infrastructure failure (after a short re-prompt retry) keeps none, degrading
- * to the deterministic recall lanes the orchestrator unions in.
- *
- * `systemPrompt` is the selector's instruction scaffold; it defaults to the
- * bundled {@link SYSTEM_PROMPT} and is overridable via `memory.v3.selectorPromptPath`
- * (resolved by {@link resolveSelectorPrompt} at the call site).
- */
-export async function selectPool(
+function noulFromAnswer(answer: unknown): number | undefined {
+  if (typeof answer === "number" && Number.isFinite(answer)) {
+    return answer;
+  }
+  if (
+    isRecord(answer) &&
+    typeof answer.noul === "number" &&
+    Number.isFinite(answer.noul)
+  ) {
+    return answer.noul;
+  }
+  return undefined;
+}
+
+function typesafeCandidateEntries(
+  pool: SelectorPool,
+): Record<string, { slug: Slug; text: string }> {
+  const entries: Record<string, { slug: Slug; text: string }> = {};
+  pool.stable.forEach((candidate, index) => {
+    entries[String(index + 1)] = {
+      slug: candidate.slug,
+      text: candidate.card,
+    };
+  });
+  pool.finder.forEach((candidate, index) => {
+    entries[String(pool.stable.length + index + 1)] = {
+      slug: candidate.slug,
+      text: renderFinderLine(candidate),
+    };
+  });
+  return entries;
+}
+
+function typesafeKeepQuestion(id: string): TypesafeNoulQuestion {
+  return {
+    type: "noul",
+    instructions:
+      `Would the upcoming assistant reply draw on \`candidates.${id}\`? ` +
+      "Lean inclusive. Facts, current task and event state, register, " +
+      "framing, calibration, and relationship texture all count. True when " +
+      "the candidate could plausibly inform the reply.",
+    criteria: {
+      yes: "The reply would draw on this candidate.",
+      no: "The reply would not draw on this candidate.",
+    },
+  };
+}
+
+function buildTypesafeSelectorPayload(
   pool: SelectorPool,
   turn: MemoryRoutingTurn,
-  systemPrompt: string = SYSTEM_PROMPT,
-): Promise<PoolSelection> {
-  const ordered = orderedLines(pool);
-  if (ordered.length === 0) {
-    return { pages: [], keptAll: false };
+  systemPrompt: string,
+): {
+  state: Record<string, unknown>;
+  questions: Record<string, TypesafeNoulQuestion>;
+} {
+  const candidates = typesafeCandidateEntries(pool);
+  const questions: Record<string, TypesafeNoulQuestion> = {};
+  for (const id of Object.keys(candidates)) {
+    questions[id] = typesafeKeepQuestion(id);
   }
+  return {
+    state: {
+      selector_instructions: systemPrompt,
+      candidates,
+      ...(turn.situationalContext
+        ? { situation: turn.situationalContext }
+        : {}),
+      recent_context: turn.recentContext,
+      current_message: turn.currentMessage,
+    },
+    questions,
+  };
+}
 
-  const provider = await getConfiguredProvider(MEMORY_V3_SELECT_CALL_SITE);
-  if (!provider) {
-    log.warn(
-      {
-        callSite: MEMORY_V3_SELECT_CALL_SITE,
-        candidateCount: ordered.length,
-        stableCount: pool.stable.length,
-        finderCount: pool.finder.length,
-      },
-      "pool selector provider unavailable",
-    );
-    throw new MemoryV3RetrievalUnavailableError(
-      "memory-v3 pool selector provider unavailable",
-    );
-  }
-
-  // Two content blocks: the stable prefix (cards) carries the cache
-  // breakpoint; the dynamic tail (finder lines + per-turn context) does not.
-  // See the module doc for the cache contract.
+function buildGenericSelectorMessage(
+  pool: SelectorPool,
+  turn: MemoryRoutingTurn,
+): Message {
   const content: ContentBlock[] = [];
   if (pool.stable.length > 0) {
     content.push(cachedTextBlock(renderCardSegment(pool.stable)));
@@ -548,8 +624,310 @@ export async function selectPool(
   tailParts.push(`<recent_context>${turn.recentContext}</recent_context>`);
   tailParts.push(`<current_message>${turn.currentMessage}</current_message>`);
   content.push({ type: "text", text: tailParts.join("\n") });
+  return { role: "user", content };
+}
 
-  const userMsg: Message = { role: "user", content };
+const STABLE_CANDIDATE_PRIORITY: Record<StableCandidateLane, number> = {
+  core: 0,
+  hot: 5,
+  fresh: 6,
+  always: 7,
+};
+
+const FINDER_CANDIDATE_PRIORITY: Record<FinderLane, number> = {
+  needle: 1,
+  dense: 2,
+  reply: 3,
+  span: 4,
+  entity: 8,
+  rare: 9,
+  edge: 10,
+  learned: 11,
+};
+
+function highestPriorityCandidates(
+  pool: SelectorPool,
+  retainedCount: number,
+): SelectorPool {
+  const ranked = [
+    ...pool.stable.map((candidate, index) => ({
+      segment: "stable" as const,
+      index,
+      poolIndex: index,
+      priority: STABLE_CANDIDATE_PRIORITY[candidate.lane],
+    })),
+    ...pool.finder.map((candidate, index) => ({
+      segment: "finder" as const,
+      index,
+      poolIndex: pool.stable.length + index,
+      priority: FINDER_CANDIDATE_PRIORITY[candidate.lane],
+    })),
+  ]
+    .sort(
+      (left, right) =>
+        left.priority - right.priority || left.poolIndex - right.poolIndex,
+    )
+    .slice(0, retainedCount);
+  const retainedStable = new Set(
+    ranked
+      .filter((candidate) => candidate.segment === "stable")
+      .map((candidate) => candidate.index),
+  );
+  const retainedFinder = new Set(
+    ranked
+      .filter((candidate) => candidate.segment === "finder")
+      .map((candidate) => candidate.index),
+  );
+  return {
+    stable: pool.stable.filter((_, index) => retainedStable.has(index)),
+    finder: pool.finder.filter((_, index) => retainedFinder.has(index)),
+  };
+}
+
+function withoutTrailingCurrentMessage(
+  turn: MemoryRoutingTurn,
+): MemoryRoutingTurn {
+  if (turn.recentContext === turn.currentMessage) {
+    return { ...turn, recentContext: "" };
+  }
+  const duplicateSuffix = `\n${turn.currentMessage}`;
+  if (
+    turn.currentMessage.length === 0 ||
+    !turn.recentContext.endsWith(duplicateSuffix)
+  ) {
+    return turn;
+  }
+  return {
+    ...turn,
+    recentContext: turn.recentContext.slice(0, -duplicateSuffix.length),
+  };
+}
+
+function latestTurnContextSuffix(
+  turn: MemoryRoutingTurn,
+  retainedChars: number,
+): MemoryRoutingTurn {
+  let remaining = retainedChars;
+  const takeSuffix = (value: string): string => {
+    const count = Math.min(remaining, value.length);
+    remaining -= count;
+    return safeStringSlice(value, value.length - count);
+  };
+  const currentMessage = takeSuffix(turn.currentMessage);
+  const recentContext = takeSuffix(turn.recentContext);
+  const situationalContext = turn.situationalContext
+    ? takeSuffix(turn.situationalContext) || undefined
+    : undefined;
+  return {
+    ...turn,
+    currentMessage,
+    recentContext,
+    situationalContext,
+  };
+}
+
+function turnContextChars(turn: MemoryRoutingTurn): number {
+  return (
+    turn.currentMessage.length +
+    turn.recentContext.length +
+    (turn.situationalContext?.length ?? 0)
+  );
+}
+
+function estimateSelectorInputTokens({
+  pool,
+  turn,
+  systemPrompt,
+  provider,
+  model,
+}: {
+  pool: SelectorPool;
+  turn: MemoryRoutingTurn;
+  systemPrompt: string;
+  provider: Provider;
+  model: string;
+}): number {
+  if (provider.name === TYPE_SAFE_PROVIDER_ID) {
+    const payload = buildTypesafeSelectorPayload(pool, turn, systemPrompt);
+    return estimateTextTokens(
+      JSON.stringify({
+        state: payload.state,
+        model,
+        questions: payload.questions,
+      }),
+    );
+  }
+  return estimatePromptTokensWithTools(
+    [buildGenericSelectorMessage(pool, turn)],
+    systemPrompt,
+    [SELECT_PAGES_TOOL],
+    provider.tokenEstimationProvider ?? provider.name,
+  );
+}
+
+interface SelectorPoolBudget {
+  pool: SelectorPool;
+  turn: MemoryRoutingTurn;
+  budgetTokens: number;
+  estimatedInputTokens: number;
+  originalEstimatedInputTokens: number;
+}
+
+function budgetSelectorPool({
+  pool,
+  turn,
+  systemPrompt,
+  provider,
+  model,
+  maxInputTokens,
+}: {
+  pool: SelectorPool;
+  turn: MemoryRoutingTurn;
+  systemPrompt: string;
+  provider: Provider;
+  model: string;
+  maxInputTokens: number;
+}): SelectorPoolBudget {
+  const budgetTokens = Math.max(
+    1,
+    Math.floor(maxInputTokens * SELECTOR_CONTEXT_BUDGET_RATIO),
+  );
+  const estimate = (
+    candidatePool: SelectorPool,
+    candidateTurn: MemoryRoutingTurn,
+  ): number =>
+    estimateSelectorInputTokens({
+      pool: candidatePool,
+      turn: candidateTurn,
+      systemPrompt,
+      provider,
+      model,
+    });
+  const originalEstimatedInputTokens = estimate(pool, turn);
+  if (originalEstimatedInputTokens <= budgetTokens) {
+    return {
+      pool,
+      turn,
+      budgetTokens,
+      estimatedInputTokens: originalEstimatedInputTokens,
+      originalEstimatedInputTokens,
+    };
+  }
+
+  const deduplicatedTurn = withoutTrailingCurrentMessage(turn);
+  const deduplicatedEstimatedInputTokens = estimate(pool, deduplicatedTurn);
+  if (deduplicatedEstimatedInputTokens <= budgetTokens) {
+    return {
+      pool,
+      turn: deduplicatedTurn,
+      budgetTokens,
+      estimatedInputTokens: deduplicatedEstimatedInputTokens,
+      originalEstimatedInputTokens,
+    };
+  }
+
+  const minimumTurn = latestTurnContextSuffix(
+    deduplicatedTurn,
+    deduplicatedTurn.currentMessage.length,
+  );
+  const fittingPool: SelectorPool = {
+    stable: pool.stable.filter(
+      (candidate) =>
+        estimate({ stable: [candidate], finder: [] }, minimumTurn) <=
+        budgetTokens,
+    ),
+    finder: pool.finder.filter(
+      (candidate) =>
+        estimate({ stable: [], finder: [candidate] }, minimumTurn) <=
+        budgetTokens,
+    ),
+  };
+  const candidateCount = fittingPool.stable.length + fittingPool.finder.length;
+  if (candidateCount === 0) {
+    const emptyPool: SelectorPool = { stable: [], finder: [] };
+    return {
+      pool: emptyPool,
+      turn: minimumTurn,
+      budgetTokens,
+      estimatedInputTokens: estimate(emptyPool, minimumTurn),
+      originalEstimatedInputTokens,
+    };
+  }
+
+  const preferredCandidatePool = highestPriorityCandidates(fittingPool, 1);
+  let budgetedTurn = deduplicatedTurn;
+  if (estimate(preferredCandidatePool, budgetedTurn) > budgetTokens) {
+    let low = deduplicatedTurn.currentMessage.length;
+    let high = turnContextChars(deduplicatedTurn);
+    while (low < high) {
+      const retainedChars = Math.ceil((low + high) / 2);
+      const candidateTurn = latestTurnContextSuffix(
+        deduplicatedTurn,
+        retainedChars,
+      );
+      if (estimate(preferredCandidatePool, candidateTurn) <= budgetTokens) {
+        low = retainedChars;
+      } else {
+        high = retainedChars - 1;
+      }
+    }
+    budgetedTurn = latestTurnContextSuffix(deduplicatedTurn, low);
+  }
+
+  let low = 1;
+  let high = candidateCount;
+  while (low < high) {
+    const retainedCount = Math.ceil((low + high) / 2);
+    const candidatePool = highestPriorityCandidates(fittingPool, retainedCount);
+    if (estimate(candidatePool, budgetedTurn) <= budgetTokens) {
+      low = retainedCount;
+    } else {
+      high = retainedCount - 1;
+    }
+  }
+
+  const budgetedPool = highestPriorityCandidates(fittingPool, low);
+  return {
+    pool: budgetedPool,
+    turn: budgetedTurn,
+    budgetTokens,
+    estimatedInputTokens: estimate(budgetedPool, budgetedTurn),
+    originalEstimatedInputTokens,
+  };
+}
+
+function answersFromSelectorResponse(
+  response: ProviderResponse,
+): Record<string, unknown> | null {
+  const raw = response.rawResponse;
+  if (isRecord(raw) && isRecord(raw.answers)) {
+    return raw.answers;
+  }
+  const textBlock = response.content.find((block) => block.type === "text");
+  if (!textBlock || textBlock.type !== "text") {
+    return null;
+  }
+  try {
+    const parsed: unknown = JSON.parse(textBlock.text);
+    return isRecord(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+async function selectPoolWithTypesafe(
+  pool: SelectorPool,
+  turn: MemoryRoutingTurn,
+  ordered: PoolLine[],
+  systemPrompt: string,
+  provider: Provider,
+): Promise<PoolSelection> {
+  const payload = buildTypesafeSelectorPayload(pool, turn, systemPrompt);
+  const userMsg: Message = {
+    role: "user",
+    content: [{ type: "text", text: JSON.stringify(payload) }],
+  };
+
   const failures: PoolSelectorAttemptFailure[] = [];
   let attempt = 0;
   const recordFailure = (
@@ -569,6 +947,267 @@ export async function selectPool(
       candidateCount: ordered.length,
       stableCount: pool.stable.length,
       finderCount: pool.finder.length,
+    };
+    failures.push(diagnostic);
+    log.warn(diagnostic, "pool selector attempt failed");
+  };
+
+  let lastError: unknown = null;
+  const parsed = await retryForResult(async () => {
+    attempt += 1;
+    let response: Awaited<ReturnType<typeof provider.sendMessage>>;
+    try {
+      response = await provider.sendMessage([userMsg], {
+        config: {
+          callSite: MEMORY_V3_SELECT_CALL_SITE,
+          conversationId: turn.conversationId,
+          selectionSeed: turn.conversationId,
+          disableTurnStartCache: true,
+        },
+      });
+      lastError = null;
+    } catch (error) {
+      lastError = error;
+      recordFailure({
+        attempt,
+        reason: "provider_error",
+        error: summarizeError(error),
+      });
+      throw error;
+    }
+    const answers = answersFromSelectorResponse(response);
+    if (!answers) {
+      recordFailure({
+        attempt,
+        reason: "unusable_answers",
+        response: summarizeResponse(response),
+      });
+      return null;
+    }
+    const picked: number[] = [];
+    let parsedCount = 0;
+    for (let index = 0; index < ordered.length; index++) {
+      const noul = noulFromAnswer(answers[String(index + 1)]);
+      if (noul === undefined) {
+        continue;
+      }
+      parsedCount += 1;
+      if (noul >= TYPE_SAFE_POOL_KEEP_NOUL) {
+        picked.push(index);
+      }
+    }
+    if (parsedCount === 0) {
+      recordFailure({
+        attempt,
+        reason: "unusable_answers",
+        response: summarizeResponse(response),
+      });
+      return null;
+    }
+    return {
+      pages: mergeSelectedLines(ordered, picked),
+      keptAll: false,
+      pool,
+      turn,
+    };
+  });
+
+  if (parsed === null) {
+    if (lastError !== null) {
+      const detail =
+        lastError instanceof Error ? lastError.message : String(lastError);
+      const redactedDetail = truncate(
+        redactLogString(detail),
+        ERROR_MESSAGE_MAX_CHARS,
+      );
+      log.warn(
+        {
+          candidateCount: ordered.length,
+          stableCount: pool.stable.length,
+          finderCount: pool.finder.length,
+          callSite: MEMORY_V3_SELECT_CALL_SITE,
+          providerName: provider.name,
+          failures,
+        },
+        "pool selector provider call failed after retries",
+      );
+      throw new MemoryV3RetrievalUnavailableError(
+        `memory-v3 pool selector provider call failed after retries: ${redactedDetail}`,
+        {
+          cause: lastError,
+          conversationNotice: providerBillingNoticeFromError(lastError),
+          pool,
+          turn,
+        },
+      );
+    }
+    log.warn(
+      {
+        candidateCount: ordered.length,
+        stableCount: pool.stable.length,
+        finderCount: pool.finder.length,
+        callSite: MEMORY_V3_SELECT_CALL_SITE,
+        providerName: provider.name,
+        failures,
+      },
+      "pool selector returned no usable TypeSafe answers after retries",
+    );
+    throw new MemoryV3RetrievalUnavailableError(
+      "memory-v3 pool selector returned no usable selection after retries",
+      { pool, turn },
+    );
+  }
+
+  return parsed;
+}
+
+/** A selection plus whether it came from the recall-safe keep-all fallback. */
+export interface PoolSelection {
+  pages: SelectedPage[];
+  /** The exact candidate pool rendered for the selector request. */
+  pool: SelectorPool;
+  /** The exact context strings rendered for the selector request. */
+  turn: MemoryRoutingTurn;
+  /** True only when the model OMITTED `ids` and every candidate was kept as the
+   *  recall-safe fallback — NOT when it explicitly selected a large set. The two
+   *  produce the same pages but mean different things (the model gave up judging
+   *  vs it judged everything relevant), and only telemetry can tell them apart. */
+  keptAll: boolean;
+}
+
+/**
+ * Run the single selector over the unified candidate pool. Returns
+ * the pages to inject, merged per slug (a page selected as a card and on
+ * finder lines yields one entry carrying every selected section), plus a
+ * `keptAll` flag marking the recall-safe fallback.
+ *
+ * On a chat model, an omitted `ids` keeps ALL candidates (the recall-safe
+ * "all of these are relevant" signal, `keptAll: true`); an explicit `[]`
+ * keeps none. TypeSafe answers one noul per candidate and never omits ids,
+ * so `keptAll` is always false on that path. An infrastructure failure
+ * (after a short re-prompt retry) throws
+ * {@link MemoryV3RetrievalUnavailableError}, and the orchestrator keeps the
+ * stable prefix unjudged in its place.
+ *
+ * `systemPrompt` is the selector's instruction scaffold; it defaults to the
+ * bundled {@link SYSTEM_PROMPT} and is overridable via `memory.v3.selectorPromptPath`
+ * (resolved by {@link resolveSelectorPrompt} at the call site).
+ */
+export async function selectPool(
+  pool: SelectorPool,
+  turn: MemoryRoutingTurn,
+  systemPrompt: string = SYSTEM_PROMPT,
+): Promise<PoolSelection> {
+  const originalCandidateCount = pool.stable.length + pool.finder.length;
+  if (originalCandidateCount === 0) {
+    return { pages: [], keptAll: false, pool, turn };
+  }
+
+  const provider = await getConfiguredProvider(MEMORY_V3_SELECT_CALL_SITE, {
+    selectionSeed: turn.conversationId,
+  });
+  if (!provider) {
+    log.warn(
+      {
+        callSite: MEMORY_V3_SELECT_CALL_SITE,
+        candidateCount: originalCandidateCount,
+        stableCount: pool.stable.length,
+        finderCount: pool.finder.length,
+      },
+      "pool selector provider unavailable",
+    );
+    throw new MemoryV3RetrievalUnavailableError(
+      "memory-v3 pool selector provider unavailable",
+      { pool, turn },
+    );
+  }
+
+  const effectiveContextWindow = getEffectiveContextWindow(
+    MEMORY_V3_SELECT_CALL_SITE,
+    { selectionSeed: turn.conversationId },
+  );
+  const budget = budgetSelectorPool({
+    pool,
+    turn,
+    systemPrompt,
+    provider,
+    model: effectiveContextWindow.model,
+    maxInputTokens: effectiveContextWindow.maxInputTokens,
+  });
+  const budgetedPool = budget.pool;
+  const budgetedTurn = budget.turn;
+  const ordered = orderedLines(budgetedPool);
+  if (
+    ordered.length < originalCandidateCount ||
+    turnContextChars(budgetedTurn) < turnContextChars(turn)
+  ) {
+    log.info(
+      {
+        callSite: MEMORY_V3_SELECT_CALL_SITE,
+        providerName: provider.name,
+        model: effectiveContextWindow.model,
+        maxInputTokens: effectiveContextWindow.maxInputTokens,
+        budgetRatio: SELECTOR_CONTEXT_BUDGET_RATIO,
+        budgetTokens: budget.budgetTokens,
+        originalEstimatedInputTokens: budget.originalEstimatedInputTokens,
+        estimatedInputTokens: budget.estimatedInputTokens,
+        originalStableCount: pool.stable.length,
+        retainedStableCount: budgetedPool.stable.length,
+        originalFinderCount: pool.finder.length,
+        retainedFinderCount: budgetedPool.finder.length,
+        originalTurnContextChars: turnContextChars(turn),
+        retainedTurnContextChars: turnContextChars(budgetedTurn),
+      },
+      "trimmed pool selector input to the context budget",
+    );
+  }
+  if (ordered.length === 0) {
+    log.warn(
+      {
+        callSite: MEMORY_V3_SELECT_CALL_SITE,
+        providerName: provider.name,
+        model: effectiveContextWindow.model,
+        maxInputTokens: effectiveContextWindow.maxInputTokens,
+        candidateCount: originalCandidateCount,
+      },
+      "no pool selector candidate fits the context budget",
+    );
+    throw new MemoryV3RetrievalUnavailableError(
+      "memory-v3 pool selector has no candidate that fits the context budget",
+      { pool: budgetedPool, turn: budgetedTurn },
+    );
+  }
+
+  if (provider.name === TYPE_SAFE_PROVIDER_ID) {
+    return selectPoolWithTypesafe(
+      budgetedPool,
+      budgetedTurn,
+      ordered,
+      systemPrompt,
+      provider,
+    );
+  }
+
+  const userMsg = buildGenericSelectorMessage(budgetedPool, budgetedTurn);
+  const failures: PoolSelectorAttemptFailure[] = [];
+  let attempt = 0;
+  const recordFailure = (
+    failure: Omit<
+      PoolSelectorAttemptFailure,
+      | "callSite"
+      | "providerName"
+      | "candidateCount"
+      | "stableCount"
+      | "finderCount"
+    >,
+  ): void => {
+    const diagnostic: PoolSelectorAttemptFailure = {
+      ...failure,
+      callSite: MEMORY_V3_SELECT_CALL_SITE,
+      providerName: provider.name,
+      candidateCount: ordered.length,
+      stableCount: budgetedPool.stable.length,
+      finderCount: budgetedPool.finder.length,
     };
     failures.push(diagnostic);
     log.warn(diagnostic, "pool selector attempt failed");
@@ -595,6 +1234,7 @@ export async function selectPool(
         config: {
           callSite: MEMORY_V3_SELECT_CALL_SITE,
           conversationId: turn.conversationId,
+          selectionSeed: turn.conversationId,
           tool_choice: { type: "tool" as const, name: SELECT_PAGES_TOOL_NAME },
           // The last block of this one-shot message varies every turn; the
           // provider's auto-applied turn-start breakpoint would land on it and
@@ -661,8 +1301,8 @@ export async function selectPool(
       log.warn(
         {
           candidateCount: ordered.length,
-          stableCount: pool.stable.length,
-          finderCount: pool.finder.length,
+          stableCount: budgetedPool.stable.length,
+          finderCount: budgetedPool.finder.length,
           callSite: MEMORY_V3_SELECT_CALL_SITE,
           providerName: provider.name,
           failures,
@@ -674,14 +1314,16 @@ export async function selectPool(
         {
           cause: lastError,
           conversationNotice: providerBillingNoticeFromError(lastError),
+          pool: budgetedPool,
+          turn: budgetedTurn,
         },
       );
     }
     log.warn(
       {
         candidateCount: ordered.length,
-        stableCount: pool.stable.length,
-        finderCount: pool.finder.length,
+        stableCount: budgetedPool.stable.length,
+        finderCount: budgetedPool.finder.length,
         callSite: MEMORY_V3_SELECT_CALL_SITE,
         providerName: provider.name,
         failures,
@@ -690,12 +1332,18 @@ export async function selectPool(
     );
     throw new MemoryV3RetrievalUnavailableError(
       "memory-v3 pool selector returned no usable selection after retries",
+      { pool: budgetedPool, turn: budgetedTurn },
     );
   }
 
   // Omitted `ids` is the recall-safe "keep all candidates" signal.
   if (parsed.ids === undefined) {
-    return { pages: selectAllPoolCandidates(pool), keptAll: true };
+    return {
+      pages: selectAllPoolCandidates(budgetedPool),
+      keptAll: true,
+      pool: budgetedPool,
+      turn: budgetedTurn,
+    };
   }
 
   // Map 1-based IDs over the concatenated numbering, dropping out-of-range
@@ -703,5 +1351,10 @@ export async function selectPool(
   const picked = parsed.ids
     .filter((id) => id >= 1 && id <= ordered.length)
     .map((id) => id - 1);
-  return { pages: mergeSelectedLines(ordered, picked), keptAll: false };
+  return {
+    pages: mergeSelectedLines(ordered, picked),
+    keptAll: false,
+    pool: budgetedPool,
+    turn: budgetedTurn,
+  };
 }
