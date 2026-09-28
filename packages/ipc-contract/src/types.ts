@@ -2162,6 +2162,49 @@ export type CoachmarkResult =
   | { kind: "unresolved"; unresolved: CoachmarkUnresolved };
 
 /**
+ * One control the shared surface offers to be pointed at, read from its
+ * accessibility tree.
+ *
+ * `label` is the name `screen_point_at` resolves a target against, exactly
+ * as the tree carries it, which is often not the visible text: a web app can
+ * name its Filters button `root_Filters`. Offered before the first lookup so
+ * the assistant can name a real control on its first try.
+ */
+export interface ShareTarget {
+  /**
+   * Derived from the role and label, so the same control keeps its id from
+   * one snapshot to the next, and unique within a snapshot. What a caller
+   * scoring every candidate at once names a candidate back by.
+   */
+  id: string;
+  label: string;
+  /** The accessibility role, e.g. `AXButton`. */
+  role: string;
+  /** The nearest named container, e.g. a toolbar or a sidebar list. */
+  section?: string;
+  /** The visible part of the control, as fractions of the shared surface. */
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  /**
+   * How many controls on the surface carry this exact name, present only
+   * when more than one does. A name like that cannot select one of them.
+   */
+  duplicates?: number;
+}
+
+/**
+ * The controls a shared surface offers to be pointed at, pruned and capped
+ * for a prompt: {@link ShareTarget}s in tree order.
+ */
+export interface ShareTargetSnapshot {
+  targets: ShareTarget[];
+  /** Named controls visible on the surface before pruning and capping. */
+  total: number;
+}
+
+/**
  * One frame of a {@link WatchCaptureTarget}, as the helper took it: a JPEG,
  * with the size it was encoded at. Base64 rather than bytes because it
  * crosses the bridge as JSON.
@@ -2612,17 +2655,20 @@ export const companionIntroCallControlFor = (
  * `tray`): the creature, a voice conversation, a composer the surface no
  * longer draws, and where to switch the thing off.
  *
- * **2** is this run. It keeps only the first of those subjects and adds what a
+ * **2** covers only the first of those subjects, what a
  * call can do (the screen, the marks, the mutes), the key that starts a
- * conversation from anywhere, and a press that starts one for real. Nobody who
- * saw the first run has been told any of that, so they are shown this one.
+ * conversation from anywhere, and a press that starts one for real.
+ *
+ * **3** opens with an in-app modal that explains the companion's capabilities
+ * before the user chooses whether to start the guided tour. An install recorded
+ * at version 2 is offered this introduction once.
  *
  * The desktop records the highest version it has run (`window-state.ts`), so a
  * bump is the whole of what it takes to introduce the surface again. Bumping it
  * for a copy edit would be re-explaining the desktop to someone who understood
  * it the first time, which is the cost this number exists to make deliberate.
  */
-export const COMPANION_INTRO_VERSION = 2;
+export const COMPANION_INTRO_VERSION = 3;
 
 /**
  * The subjects the beats belong to, in order, which is what the run's progress

@@ -1,4 +1,13 @@
 {
+  "allChatsPage": {
+    "close": "Закрыть все чаты",
+    "openChat": "Перейти к чату",
+    "doneLabel": "{title}, завершён",
+    "unread": "Не прочитано",
+    "running": "Выполняется",
+    "needsAttention": "Требует внимания",
+    "runningCount": "{count, plural, one {# задача выполняется} few {# задачи выполняются} many {# задач выполняются} other {# задачи выполняются}}"
+  },
   "askQuestionDetail": {
     "heading": "{count, plural, one {Вопрос} few {Вопроса} many {Вопросов} other {Вопроса}}"
   },
@@ -265,6 +274,22 @@
     "unsupported": "Это устройство не может открыть камеру.",
     "uploadFailed": "Не удалось отправить это фото."
   },
+  "cameraExplainer": {
+    "close": "Закрыть",
+    "gotIt": "Понятно",
+    "liveBody": "{name} смотрит, пока вы двигаете камеру. Просто говорите о том, что видит {name}.",
+    "liveBodyDesktop": "{name} смотрит, пока вы двигаете камеру. Просто говорите о том, что видит {name}. Остановить можно в любой момент.",
+    "liveTag": "Эфир",
+    "liveTitle": "Прямой эфир",
+    "photoBody": "Сделайте снимок. {name} видит только этот один снимок.",
+    "photoTitle": "Фото",
+    "privacy": "Всё, что видит {name}, остаётся в собственном приватном рабочем пространстве {name}. Эфир заканчивается, когда вы закрываете камеру.",
+    "subtitle": "Выберите, как {name} видит то, на что вы наводите камеру. Переключить можно в любой момент.",
+    "title": "Фото или прямой эфир?",
+    "tryLive": "Попробовать эфир",
+    "tryLiveDesktop": "Попробовать эфир",
+    "yourAssistant": "ваш ассистент"
+  },
   "cameraShutterHint": {
     "live": "Прямой эфир · Нажмите, чтобы остановить",
     "liveDescription": "Нажмите, чтобы остановить прямой эфир.",
@@ -288,6 +313,7 @@
     "buttonAria": "Параметры отображения камеры",
     "gateHudDescription": "Отладочный слой: как прямой эфир выбирает, какие кадры отправлять.",
     "gateHudTitle": "Настройка фильтра кадров",
+    "howItWorks": "Как работают «Фото» и «Прямой эфир»",
     "keptFrameDescription": "Показывает последний кадр, отправленный в эфире.",
     "keptFrameTitle": "Последний отправленный кадр",
     "title": "Показывать"
@@ -1178,5 +1204,57 @@
     "subtitle": "Вы использовали бесплатный лимит на сегодня. Он сбросится в {resetPhrase}. Обновите план или добавьте кредиты, чтобы продолжить.",
     "title": "Дневной бесплатный лимит исчерпан",
     "viewPlans": "Посмотреть планы"
+  },
+  "emailReferenceChip": {
+    "noSubject": "(без темы)",
+    "captionReceived": "Получено · От {name} · {date}",
+    "captionReceivedUndated": "Получено · От {name}",
+    "captionSent": "Отправлено · Кому: {name} · {date}",
+    "captionSentUndated": "Отправлено · Кому: {name}",
+    "tooltip": "{subject}\n{caption}",
+    "removeAria": "Убрать письмо {subject}"
+  },
+  "emailReferenceCard": {
+    "noSubject": "(без темы)",
+    "captionReceived": "Получено · От {name} · {date}",
+    "captionReceivedUndated": "Получено · От {name}",
+    "captionSent": "Отправлено · Кому: {name} · {date}",
+    "captionSentUndated": "Отправлено · Кому: {name}",
+    "tooltip": "{subject}\n{caption}",
+    "openAria": "Открыть письмо {subject} в почте"
+  },
+  "emailNavItem": {
+    "label": "Почта",
+    "unpin": "Открепить Почту"
+  },
+  "tiptapDocumentEditor": {
+    "adding": "Добавление…",
+    "blockquote": "Цитата",
+    "bold": "Жирный",
+    "bulletList": "Маркированный список",
+    "code": "Код",
+    "comment": "Комментарий",
+    "feedbackPlaceholder": "Добавьте отзыв…",
+    "heading1": "Заголовок 1",
+    "heading2": "Заголовок 2",
+    "heading3": "Заголовок 3",
+    "italic": "Курсив",
+    "link": "Ссылка",
+    "linkAddress": "Адрес ссылки",
+    "linkApply": "Применить ссылку",
+    "linkInvalid": "Укажите веб-адрес или адрес электронной почты",
+    "linkPlaceholder": "Вставьте или введите ссылку",
+    "linkRemove": "Удалить ссылку",
+    "orderedList": "Нумерованный список",
+    "paragraph": "Текст",
+    "placeholder": "Начните писать…",
+    "remoteEditConflict": "Ваши правки сохранены там, где ассистент изменил тот же текст, поэтому часть его правки не применена.",
+    "strike": "Зачёркнутый",
+    "textStyle": "Стиль текста: {style}",
+    "toolbarAria": "Форматирование"
+  },
+  "documentViewerContainer": {
+    "comments": "Комментарии",
+    "commentsWithOpenCount": "{count, plural, one {Комментарии, # открытый} few {Комментарии, # открытых} many {Комментарии, # открытых} other {Комментарии, # открытых}}"
   }
 }

@@ -11,6 +11,7 @@ This file is the cross-system architecture index. Detailed designs live in domai
 | Browser extension                           | [`clients/chrome-extension/README.md`](clients/chrome-extension/README.md)                         |
 | Clients (web, iOS, Android, macOS, Windows) | [`clients/README.md`](clients/README.md)                                                           |
 | Mobile document chat session                | [`clients/web/docs/DOCUMENT_CHAT.md`](clients/web/docs/DOCUMENT_CHAT.md)                           |
+| Native live camera sampling                 | [`clients/android/README.md`](clients/android/README.md#live-camera-sampling)                       |
 | Conversation assets                         | [`clients/web/docs/CONVERSATION_ASSETS.md`](clients/web/docs/CONVERSATION_ASSETS.md)               |
 | Public docs site (`clients/docs`)           | [`clients/docs/README.md`](clients/docs/README.md)                                                 |
 | Assistant memory deep dive                  | [`assistant/docs/architecture/memory.md`](assistant/docs/architecture/memory.md)                   |
@@ -626,6 +627,12 @@ subgraph "Text Q&A Session"
     classDef provider fill:#ef5350,stroke:#c62828,color:#fff
 ```
 
+Computer-use observations pass screenshots through the shared transport
+optimizer before formatting their metadata. Screenshot dimensions come from
+the emitted image bytes. Full-desktop results include per-axis conversion to
+screen points; window/display-scoped captures do not derive this mapping from
+the main display's dimensions. Actions keep their existing screen-point units.
+
 Computer-use screenshots are materialized as canonical attachment rows while
 their tool-result messages are finalized. Every screenshot keeps that
 tool-result link. At turn completion, only the last screenshot-bearing
@@ -962,6 +969,8 @@ For live-voice clients that advertise `lookFrames`, a `LOOK:SCREEN` control obta
 
 **Voice discovery.** The screen-share client sends `update_config.screenSharing` at share start, stop, and reconnect. Tool-capable macOS voice turns with a shared screen load the current `screen-annotation` instructions and tool schemas through the read-only skill loader into their turn context. Preactivation registers executable tools; this load also tells the model how to call them through `skill_execute`, independently of memory skill-card selection. The connected same-actor annotation capability still gates the load. Front-door turns remain toolless, and older clients that omit the optional field retain ordinary skill discovery.
 
+**Names offered before the first lookup.** At share start, at a look, and as the user starts talking, the screen-share client reads the surface's named controls (`vellum:companion:shareTargets`, the helper's `ax.candidates`, the same clipped set `ax.locate` resolves against) once its frame is in hand, and sends the snapshot on `update_config.shareTargets`. Electron main prunes it (`clients/macos/src/main/share-targets.ts`: no 1pt rows, no controls whose middle is off the surface, one entry per exact name with a duplicate count, at most 40 with interactive roles first) and gives each entry a stable id from its role and name plus its nearest named container. The live-voice session keeps the newest snapshot until the share ends, and a tool-capable leg that loads the annotation instructions also receives it as a `<shared_screen_controls>` block (`assistant/src/live-voice/share-targets.ts`): exact names, role, section and a coarse position word, no coordinates. The model can then pass a tree name such as `root_Filters` on its first attempt instead of learning it from a failed lookup. A client or helper without the read sends nothing, and the turn falls back to the lookup's own candidate list.
+
 **Answered in Electron main, not in the helper.** `PointAtExecutor` (`clients/macos/src/main/executors/host-cu-executor.ts`) intercepts the pointing tool and forwards every other tool to the shared native helper. The frame the marks land on belongs to this client, and the shared executor is the transport every desktop client uses. The painter itself is handed in by `host-proxy-adapter.ts` rather than imported, since an executor reaching into the window layer would be the transport depending on what it transports to.
 
 **A name is resolved, not estimated.** A mark either names a control (`{target}`) or gives bounds. Naming is the path that works: `showCompanionCoachmarks` asks the helper's `ax.locate` for the frame the accessibility tree already holds (`AXTargetMatch`, exact match or nothing, with candidates clipped to what can actually be seen on the shared surface), then converts screen points to fractions of that surface. Bounds are for what has no label to find it by, and are the model's guess at where the thing is. `AXTargetMatch` refuses anything it fits more than once: a ring drawn confidently around the wrong control is worse than one not drawn, because the person following it cannot tell.
@@ -986,6 +995,7 @@ graph LR
     LOCATE["ax.locate<br/>AXTargetMatch · clipped"]
     FRAME["Watch frame<br/>companion-coachmarks.tsx"]
 
+    CANDS["ax.candidates<br/>share-targets.ts · pruned"] -->|"update_config.shareTargets · offered before the first call"| SKILL
     SKILL --> BRIDGE
     BRIDGE --> ROUTE
     ROUTE -->|"dispatch to the claiming client"| SSE

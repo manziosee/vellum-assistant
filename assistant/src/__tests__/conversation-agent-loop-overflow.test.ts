@@ -148,7 +148,7 @@ mock.module(
 // agent loop's compaction path consumes, mirroring the real manager's
 // `overflowStepToResult` so the loop sees the rung's reduced history, injection
 // mode, terminal auto-compress flag, and exhaustion.
-function makeOverflowLadderStub(): {
+function makeOverflowLadderStub(stubOpts: { maxInputTokens?: number } = {}): {
   resetOverflowRecovery: () => void;
   reduceOverflowOneRung: (
     msgs: Message[],
@@ -161,6 +161,7 @@ function makeOverflowLadderStub(): {
     signal?: AbortSignal,
   ) => Promise<unknown>;
 } {
+  const maxInputTokens = stubOpts.maxInputTokens ?? 200_000;
   let state: unknown;
   const reduceOverflowOneRung = async (msgs: Message[], opts: unknown) => {
     if (!state) {
@@ -178,7 +179,26 @@ function makeOverflowLadderStub(): {
     },
     reduceOverflowOneRung,
     recoverContextOverflow: async (msgs: Message[], opts: unknown) => {
-      const step = (await reduceOverflowOneRung(msgs, opts)) as {
+      const options = opts as {
+        actualTokens: number | null;
+        isInteractive: boolean;
+      };
+      // Mirror ContextWindowManager.deriveOverflowTurnTarget: compute the
+      // estimation-error-corrected target and include it in the opts the
+      // mock reducer receives, so tests can assert on targetTokens.
+      const estimatedInputTokens = estimatePromptTokens(msgs);
+      const preflightBudget = Math.floor(maxInputTokens * 0.95);
+      const { targetTokens } = computeCorrectedOverflowTarget({
+        preflightBudget,
+        actualTokens: options.actualTokens,
+        estimatedTokens: estimatedInputTokens,
+      });
+      const enrichedOpts = {
+        ...options,
+        targetTokens,
+        estimatedInputTokens,
+      };
+      const step = (await reduceOverflowOneRung(msgs, enrichedOpts)) as {
         messages: Message[];
         estimatedTokens?: number;
         state: {
@@ -460,9 +480,11 @@ mock.module("../memory/archive-store.js", () => ({
 // ── Imports (after mocks) ────────────────────────────────────────────
 
 import { AgentLoop } from "../agent/loop.js";
+import { estimatePromptTokens } from "../context/token-estimator.js";
 import type { Conversation } from "../daemon/conversation.js";
 import { runAgentLoopImpl } from "../daemon/conversation-agent-loop.js";
 import type { QueueDrainReason } from "../daemon/conversation-queue-manager.js";
+import { computeCorrectedOverflowTarget } from "../plugins/defaults/compaction/corrected-target.js";
 import { asConversation } from "./helpers/mock-conversation.js";
 import {
   createMockProvider,
