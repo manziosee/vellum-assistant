@@ -1321,7 +1321,6 @@ export class AgentLoop {
     isNonInteractive: boolean,
     modelProfileKey: string,
     overflowSignal?: { actualTokens: number | null; isInteractive: boolean },
-    minKeepRecentUserTurns?: number,
   ): Promise<CompactionAttempt> {
     const compactionId = crypto.randomUUID();
     const startedAt = Date.now();
@@ -1348,8 +1347,6 @@ export class AgentLoop {
     // attachments for untrusted actors. `overrideProfile` is the turn's
     // resolved inference-profile override for the summary call. `overflowSignal`
     // routes the request through the reduction ladder when present.
-    // `minKeepRecentUserTurns: 0` used for last-resort emergency compaction
-    // after the overflow ladder exhausts with progress.
     const compactResult = await defaultCompact({
       conversationId: this.conversationId,
       messages: history,
@@ -1358,9 +1355,6 @@ export class AgentLoop {
       actorTrustClass: trust.trustClass,
       overrideProfile,
       overflowSignal,
-      ...(minKeepRecentUserTurns !== undefined
-        ? { minKeepRecentUserTurns }
-        : {}),
     });
     // `force: true` bypasses the auto-threshold gate, but early returns
     // for "no eligible messages" / "insufficient messages" still leave
@@ -1536,9 +1530,6 @@ export class AgentLoop {
     // `context_too_large`) instead of looping.
     let overflowLadderExhausted = false;
     let overflowAutoCompressApplied = false;
-    // Set after a last-resort emergency compact fires so it runs at most once
-    // per turn, even if the provider continues to reject.
-    let emergencyCompactAttempted = false;
     // Per-turn suppression for floor-dominated proactive-compaction thrash.
     // Set when a proactive (non-overflow) pass completes WITHOUT clearing the
     // mid-loop gate (the manager returned `exhausted` — it could not get below
@@ -1897,44 +1888,6 @@ export class AgentLoop {
                   // ends instead of looping.
                   overflowLadderExhausted = attempt.exhausted;
                   overflowAutoCompressApplied = attempt.autoCompressApplied;
-                  // Last-resort emergency compact: the reduction ladder is
-                  // spent but the agent made progress this turn (tool use
-                  // appended messages). Try a full-history forced compact with
-                  // minKeepRecentUserTurns: 0 before giving up — this summarizes
-                  // everything before the last tool pair and can recover turns
-                  // the ladder could not.
-                  if (
-                    overflowLadderExhausted &&
-                    toolUseTurns > 0 &&
-                    !emergencyCompactAttempted
-                  ) {
-                    emergencyCompactAttempted = true;
-                    const emergencyAttempt = await this.compact(
-                      history,
-                      requestId,
-                      trust,
-                      signal,
-                      onEvent,
-                      injectionLedgerResets,
-                      resolveEffectiveOverrideProfile() ?? null,
-                      isNonInteractive,
-                      options.modelProfileKey ?? "",
-                      undefined,
-                      0,
-                    );
-                    if (emergencyAttempt.history) {
-                      history = this.applyCompactedHistoryTransform(
-                        emergencyAttempt.history,
-                        rlog,
-                      );
-                      newMessagesStart = history.length;
-                      this.compactionCircuit.lastPostCompactionEstimate =
-                        this.estimateTokens(history);
-                      if (!emergencyAttempt.exhausted) {
-                        overflowLadderExhausted = false;
-                      }
-                    }
-                  }
                 } else {
                   // Proactive (non-overflow) pass. If it exhausted the compactor
                   // without clearing the gate, latch suppression so later gate
